@@ -214,36 +214,34 @@ pub extern "C" fn run_threads() -> i64 {
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
 /// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
 /// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
-/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager spawns both
-/// domains through op-17 v1 records (#1864): each is this module in a **detached 2^18 window of its
-/// own** paid from the `Budget` arg, so each starts with the module's data segments — the guest reads
-/// its "svc"/"o" names there, and every scratch cell sits above the #1094 NULL guard.
-const FORK_TWIN: &str = r#"
+/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The three are three
+/// programs (#2219): the manager spawns the server and the guest — modules the host grants it — through
+/// op-17 v1 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
+/// the `Budget` arg, so each starts with its own data segments — the guest reads its "svc"/"o" names
+/// there, and every scratch cell sits above the #1094 NULL guard.
+const FORK_MANAGER: &str = r#"
 memory 18
-type 0 func (i64) -> (i64)
-type 1 interface { fork: 0, wait: 0 }
-export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-; manager (inst, stdout, budget): spawn the server (func 1), offer its "svc" to the guest (func 4)
-; with our stdout as "o", and return the guest's status
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
-  ; the op-17 v1 record for the server at 17600: version 1 | entry 1, size_log2 18 | no pager,
-  ; module -1 (self) | budget, no grants, no args, region -1 (none); the rest is zero
+; manager (inst, stdout, budget, server, guest): spawn the server, offer its "svc" to the guest with
+; our stdout as "o", and return the guest's status
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
+  ; the op-17 v1 record for the server at 17600: version 1 | entry 0, size_log2 18 | no pager,
+  ; the server module | budget, no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
-  q1v0 = i64.const 4294967297
+  q1v0 = i64.const 1
   i64.store q1a0 q1v0
   q1a2 = i64.const 17616
   q1v2 = i64.const -4294967278
   i64.store q1a2 q1v2
   q1a3 = i64.const 17624
-  vself = i32.const -1
-  i32.store q1a3 vself
+  i32.store q1a3 vsrv
   q1a3b = i64.const 17628
   i32.store q1a3b vbud
   q1a9 = i64.const 17672
-  i32.store q1a9 vself
+  vnone = i32.const -1
+  i32.store q1a9 vnone
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -263,14 +261,14 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; the guest's record at 17696: version 1 | entry 4, the two grants above, otherwise as the server's
+  ; the guest's record at 17696: version 1 | entry 0, the guest module, the two grants above,
+  ; otherwise as the server's
   q2a0 = i64.const 17696
-  q2v0 = i64.const 17179869185
-  i64.store q2a0 q2v0
+  i64.store q2a0 q1v0
   q2a2 = i64.const 17712
   i64.store q2a2 q1v2
   q2a3 = i64.const 17720
-  i32.store q2a3 vself
+  i32.store q2a3 vgst
   q2a3b = i64.const 17724
   i32.store q2a3b vbud
   q2a5 = i64.const 17736
@@ -280,12 +278,20 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   q2v6 = i64.const 2
   i64.store q2a6 q2v6
   q2a9 = i64.const 17768
-  i32.store q2a9 vself
+  i32.store q2a9 vnone
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
+"#;
+
+/// [`FORK_MANAGER`]'s server: serves `"svc"` — `fork` clones its caller, `wait` reaps the twin.
+const FORK_SERVER: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 1, wait: 2 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   br 1()
@@ -312,6 +318,13 @@ block 0 (vpid: i64) {
   return vt
   }
 }
+"#;
+
+/// [`FORK_MANAGER`]'s guest: forks through `"svc"`, and each copy writes its reply to `"o"`.
+const FORK_GUEST: &str = r#"
+memory 18
+data 16684 "svc"
+data 16694 "o"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vp0 = i64.const 16684
@@ -356,25 +369,23 @@ block 4 (vr: i64, vho: i32) {
 /// run_fork` exercises the fork substrate on wasm.
 #[no_mangle]
 pub extern "C" fn run_fork() -> i64 {
-    let Ok(m) = temen_text::parse_module(FORK_TWIN) else {
+    let parse = |src| temen_text::parse_module(src).ok();
+    let (Some(m), Some(server), Some(guest)) =
+        (parse(FORK_MANAGER), parse(FORK_SERVER), parse(FORK_GUEST))
+    else {
         return i64::MIN;
     };
-    let m = std::sync::Arc::new(m);
     let mut host = Host::new();
-    host.set_self_module(&m);
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     // The server's and the guest's windows, and the twin's copy of the guest's (#2106).
     let budget = host.grant_budget(-1, 3 << 18, -1);
+    let server = host.grant_module(&server);
+    let guest = host.grant_module(&guest);
     let mut fuel = 40_000_000u64;
-    let r = match bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(inst), Value::I32(out_h), Value::I32(budget)],
-        &mut fuel,
-        &mut host,
-    ) {
+    let args = [inst, out_h, budget, server, guest].map(Value::I32);
+    let r = match bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host) {
         Some(Ok(vals)) => match vals.first() {
             Some(Value::I64(x)) => *x,
             _ => return i64::MIN,
@@ -2090,7 +2101,7 @@ pub extern "C" fn temen_par_root(
     if let Some(cfg) = par_inst() {
         let mut host = Host::new();
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        host.set_self_module(unsafe { prog_ref(prog) }.module()); // a record's `module = -1`
+        host.set_self_module(unsafe { prog_ref(prog) }.module()); // a record's `module = -1`, its image
         let inst = host.grant_instantiator(0, cfg.win_size);
         let mut args = vec![Value::I32(inst)];
         if let Some(m) = &cfg.module {
@@ -2103,6 +2114,9 @@ pub extern "C" fn temen_par_root(
                 -1,
             )));
         }
+        // #2219: a root that spawns copies of itself finds its child image as `"child"`, as under
+        // the reference powerboxes. Granted after the positional handles, so they keep their values.
+        host.grant_child_image();
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
             unsafe { prog_ref(prog) },

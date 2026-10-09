@@ -322,29 +322,35 @@ block 0 (vsp: i64, vp: i64) {
   },
   inst: {
     mode: 'inst',
-    desc: '§14 sandboxing: the root spawns 8 **detached** children of its own func 1 — each on its OWN ' +
-      'Web Worker, in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the ' +
-      'root was granted — joins them and sums 8 × 5 = 40. One op-17 v1 spawn record serves all eight.',
+    desc: '§14 sandboxing: the root spawns 8 **detached** copies of itself — each on its OWN Web Worker, ' +
+      'in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the root was ' +
+      'granted — joins them and sums 8 × 5 = 40. A copy starts at the program’s `_child` export: the ' +
+      'host grants the program its **child image** as `child`, and one op-17 v1 spawn record serves all eight.',
     src: `memory 16
+data 16384 "child"
+export 0 func "_child" 1   ; where a copy of this program starts: the host grants its image as "child"
 ; the root: (instantiator, budget) -> sum
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32) {
+  vcn = i64.const 16384
+  vcl = i64.const 5
+  vchild = self.resolve vcn vcl         ; this program's child image, by name
   ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 1, size_log2 0 (the declared window) | pager none, module -1 (self) | budget, region -1 (none).
+  ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
   ; Everything else — offset, quota, grants, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967297            ; version 1, entry 1
+  vf0 = i64.const 1                     ; version 1, entry 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vself = i32.const -1
-  i32.store vr3 vself                   ; module -1 (self)
+  i32.store vr3 vchild                  ; module: the child image
   vr3b = i64.const 17436
   i32.store vr3b vbud                   ; budget
   vr9 = i64.const 17480
-  i32.store vr9 vself                   ; region -1 (none)
+  vnone = i32.const -1
+  i32.store vr9 vnone                   ; region -1 (none)
   vi0 = i64.const 0
   br 1(vi0, v0)
 }
@@ -391,7 +397,7 @@ block 6 (vs3: i64) {
   return vs3
   }
 }
-; a child: its own window, its own Worker
+; a copy: its own window, its own Worker
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 5
@@ -406,11 +412,12 @@ block 0 (v0: i64) {
     editable: true,
     lang: 'temen',
     mode: 'io',
-    desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
+    desc: 'A parent spawns the **same child twice** with **different grant lists** — that is ' +
       'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
       'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
-      '`instantiator`, `budget` and `stdout` by name, fills the op-17 spawn record (entry = the child ' +
-      'function, a detached window of its own paid from the budget, no fuel cap) and a 16-byte grant ' +
+      '`instantiator`, `budget`, `stdout` and `child` (its child image, which starts at its `_child` ' +
+      'export) by name, fills the op-17 spawn record (a detached window of its own paid from the budget, ' +
+      'no fuel cap) and a 16-byte grant ' +
       'record, and spawns child A with `{"stdout" → its stdout}` and child B with an empty list. Each ' +
       'child `self.resolve`s `"stdout"`: A finds a re-grant of the parent\'s stream and prints through ' +
       'it; B finds nothing and returns 0. Result 10 (= A·10 + B), stdout "granted" once. Edit the grant ' +
@@ -421,9 +428,12 @@ data 16384 "instantiator"
 data 16400 "stdout"
 data 16408 "granted\\n"
 data 16424 "budget"
+data 16432 "child"
 export 0 func "_start" 0    ; the powerbox entry shape: both reference hosts grant the named powerbox
+export 1 func "_child" 1    ; where a child starts: the host grants this program's child image as "child"
 
-; parent: spawn the child (func 1) twice — A with {"stdout"}, B with nothing — return A*10 + B
+; parent: spawn the child (func 1, through the child image) twice — A with {"stdout"}, B with nothing —
+; return A*10 + B
 func () -> (i64) {
 block 0 () {
   vnp = i64.const 16384
@@ -434,6 +444,9 @@ block 0 () {
   vout = self.resolve vop vol           ; this domain's stdout, by name
   vbp = i64.const 16424
   vbud = self.resolve vbp vol           ; the Budget each child's window is paid from
+  vcp = i64.const 16432
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl         ; this program's child image
   ; the grant record at 17536: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
   vg0 = i64.const 17536
   vopn = i32.const 16400
@@ -444,23 +457,23 @@ block 0 () {
   vg2 = i64.const 17544
   i32.store vg2 vout
   ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 1, size_log2 20 (the declared window) | pager none, module -1 (self) | budget, grants_ptr,
+  ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
   ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967297            ; version 1, entry 1
+  vf0 = i64.const 1                     ; version 1, entry 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vself = i32.const -1
-  i32.store vr3 vself                   ; module -1 (self)
+  i32.store vr3 vchild                  ; module: the child image
   vr3b = i64.const 17436
   i32.store vr3b vbud                   ; budget
   vr5 = i64.const 17448
   i64.store vr5 vg0                     ; grants_ptr
   vr9 = i64.const 17480
-  i32.store vr9 vself                   ; region -1 (none)
+  vnone = i32.const -1
+  i32.store vr9 vnone                   ; region -1 (none)
   ; child A: one grant
   vr6 = i64.const 17456
   vn1 = i64.const 1
@@ -479,8 +492,8 @@ block 0 () {
   }
 }
 
-; child: its own window starts with this module's data segments, so the strings are already there;
-; it resolves "stdout" — a re-grant if the parent listed it — and prints through it, else returns 0
+; child (`_child`): its own window starts with this module's data segments, so the strings are already
+; there; it resolves "stdout" — a re-grant if the parent listed it — and prints through it, else returns 0
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vop = i64.const 16400
@@ -508,22 +521,24 @@ block 2 (vh2: i32) {
   detached: {
     mode: 'onramp',
     debug: true, // steppable: the debug scheduler services op 15 (#1528), under the on-ramp powerbox
-    bp: 37, // a breakpoint just past the join, where `vj` holds what the detached child returned
+    bp: 38, // a breakpoint just past the join, where `vj` holds what the detached child returned
     desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
-      '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **its own func 1** ' +
-      'as a DETACHED child — a fresh 128 KiB window of its own, nothing of the parent addressable — with ' +
+      '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **a copy of itself** ' +
+      '(its child image, which starts at its `_child` export) as a DETACHED child — a fresh 128 KiB window ' +
+      'of its own, nothing of the parent addressable — with ' +
       'the region pre-mapped at 65536 of the child’s window before it starts. The child needs no ' +
       'handle, no `map`, no page-size query: it reads 41 at 65536, stores 82 at 65544, returns 42. After ' +
       '`join` the parent reads 82 back through its own mapping and returns 1000 × 42 + 82 = **42082**. ' +
       'The parent finds its `instantiator`, `addrspace`, `budget` (the detached-window allowance) and ' +
-      '`module` (itself, spawnable) by name through `self.resolve` — the on-ramp powerbox, one thread, ' +
+      '`child` (its child image) by name through `self.resolve` — the on-ramp powerbox, one thread, ' +
       'the bulk data plane between a parent and a child whose memory it cannot otherwise address.',
     src: `memory 17
 data 20480 "instantiator"
 data 20496 "addrspace"
 data 20512 "budget"
-data 20528 "module"
+data 20528 "child"
 export 0 func "_start" 0
+export 1 func "_child" 1
 func () -> (i64) {
 block 0 () {
   vp0 = i64.const 20480
@@ -536,8 +551,8 @@ block 0 () {
   vl2 = i64.const 6
   vbud = self.resolve vp2 vl2
   vp3 = i64.const 20528
-  vl3 = i64.const 6
-  vmod = self.resolve vp3 vl3
+  vl3 = i64.const 5
+  vchild = self.resolve vp3 vl3
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -548,9 +563,9 @@ block 0 () {
   vin = i64.const 41
   i64.store vwo vin
   vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vmod
+  vmh = i64.extend_i32_u vchild
   vz = i64.const 0
-  vent = i64.const 1
+  vent = i64.const 0
   vlog = i64.const 17
   vreg = i64.extend_i32_u vrh
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
