@@ -337,7 +337,7 @@ block 0 (vs: i64) {{
 /// The probe root's report for `child` on every engine: the tree-walk oracle, each bytecode driver
 /// ([`drivers::ALL`]) and the Cranelift JIT.
 fn every_engine(child: &temen_ir::Module) -> Vec<(String, Report)> {
-    let root = detached_probe::root(0);
+    let root = detached_probe::root();
     let powerbox = || {
         let (host, args) = detached_probe::powerbox(child);
         (host, args.map(Value::I32).to_vec())

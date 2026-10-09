@@ -5,12 +5,13 @@
 //! guest resolves its caps by name, sidestepping the `__px_` import-manifest binder that is the one
 //! remaining piece for pure compiled-C).
 //!
-//! Topology (all one module; task ids are deterministic: manager root = 0, server = 1, guest = 2,
-//! twin = 3):
-//! - **manager** (func 0, args = instantiator + the granted libc handle + a budget): spawns the
-//!   **server** (func 1), mints a `child_offer` over its `fork` export, then spawns the **guest**
-//!   (func 3), re-granting BOTH the fork offer (as `"fork"`) and the libc (as `"libc"`) into it;
-//!   joins the guest and returns its result. Both children are detached, paid from the budget.
+//! Topology (one program, whose server and guest run as its child images, #2219; task ids are
+//! deterministic: manager root = 0, server = 1, guest = 2, twin = 3):
+//! - **manager** (func 0, args = instantiator + the granted libc handle + a budget + the two
+//!   images): spawns the **server** (func 1), mints a `child_offer` over its `fork` export, then
+//!   spawns the **guest** (func 3), re-granting BOTH the fork offer (as `"fork"`) and the libc (as
+//!   `"libc"`) into it; joins the guest and returns its result. Both children are detached, paid
+//!   from the budget.
 //! - **server** (func 1): a `svc.wait` loop whose handler (func 2) runs **pid-mode `clone_caller`**.
 //! - **guest** (func 3): resolves `"libc"` + `"fork"` by name, calls `fork()` (retrying on the
 //!   `-EAGAIN` serve/park race — the realistic `while ((pid = fork()) < 0)` shell idiom, see
@@ -41,8 +42,10 @@ type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 data 16684 "fork"
 data 16694 "libc"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vlibc: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
+  q0m = i64.const 17560
+  i32.store q0m vsrv
   q0b = i64.const 17564
   i32.store q0b vbud
   q0p = i64.const 17536
@@ -64,6 +67,8 @@ block 0 (v0: i32, vlibc: i32, vbud: i32) {
   i32.store va4 vfour
   va5 = i64.const 16664
   i32.store va5 vlibc
+  q1m = i64.const 17688
+  i32.store q1m vgst
   q1b = i64.const 17692
   i32.store q1b vbud
   q1p = i64.const 17664
@@ -117,20 +122,30 @@ block 2 (vlibc: i32, vr: i64) {
 }
 "#;
 
-/// [`SRC`] with its spawn records, both detached and paid from the manager's budget: the server
-/// (func 1) at 17536, and the guest (func 3) at 17664, granted `"fork"` and `"libc"` by the list at
-/// 16640.
+/// [`SRC`] with its spawn records, both detached and paid from the manager's budget: the server at
+/// 17536, and the guest at 17664, granted `"fork"` and `"libc"` by the list at 16640. Each is a
+/// child image of the manager's program (#2219) the root is handed: the server of func 1, the guest
+/// of func 3 ([`images`]).
 fn src() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(3)
+        ..SpawnRec::v1(0)
     };
     format!(
         "{SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1(1)),
+        rec::segment(17536, &SpawnRec::v1(0)),
         rec::segment(17664, &guest)
     )
+}
+
+/// The manager's child images (#2219) of its server (func 1) and its guest (func 3), granted in
+/// that order: the root's last two arguments.
+fn images(host: &mut Host, m: &temen_ir::Module) -> [Value; 2] {
+    [1, 3].map(|f| {
+        let image = temen_ir::child_image_at(m, f).expect("child image");
+        Value::I32(host.grant_module(&image))
+    })
 }
 
 #[test]
@@ -139,18 +154,24 @@ fn a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs()
     verify_module(&m).expect("verify");
 
     let mut host = Host::new();
-    host.set_self_module(&m);
     let win = 1u64 << 19;
     // Forkable posix libc on the manager's host (slice 1). The guest inherits it re-granted (slice 3).
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
     let inst = host.grant_instantiator(0, win);
     let budget = host.grant_budget(-1, 64 << 20, -1);
+    let [server, guest] = images(&mut host, &m);
 
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(inst), Value::I32(libc), Value::I32(budget)],
+        &[
+            Value::I32(inst),
+            Value::I32(libc),
+            Value::I32(budget),
+            server,
+            guest,
+        ],
         &mut fuel,
         &mut host,
     )
@@ -199,8 +220,10 @@ data 16800 "fork"
 data 16810 "libc"
 data 16820 "wait"
 data 16830 "budget"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vlibc: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
+  q0m = i64.const 17560
+  i32.store q0m vsrv
   q0b = i64.const 17564
   i32.store q0b vbud
   q0p = i64.const 17536
@@ -231,6 +254,8 @@ block 0 (v0: i32, vlibc: i32, vbud: i32) {
   i32.store va7 vfour
   va8 = i64.const 16680
   i32.store va8 vwaitoff
+  q1m = i64.const 17688
+  i32.store q1m vgst
   q1b = i64.const 17692
   i32.store q1b vbud
   q1p = i64.const 17664
@@ -349,23 +374,29 @@ fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>, i64) {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1(3)
+        ..SpawnRec::v1(0)
     };
     let src = format!(
         "{BUDGET_SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1(1)),
+        rec::segment(17536, &SpawnRec::v1(0)),
         rec::segment(17664, &guest)
     );
     let m = Arc::new(parse_module(&src).expect("parse"));
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    host.set_self_module(&m);
     let win = WINDOW as u64;
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
     let inst = host.grant_instantiator(0, win);
     let budget = host.grant_budget(-1, ceiling, -1);
+    let [server, guest] = images(&mut host, &m);
     let mut fuel = 40_000_000u64;
-    let args = [Value::I32(inst), Value::I32(libc), Value::I32(budget)];
+    let args = [
+        Value::I32(inst),
+        Value::I32(libc),
+        Value::I32(budget),
+        server,
+        guest,
+    ];
     let r = if bytecode {
         temen_interp::bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
             .expect("the fork module runs natively on the bytecode engine")

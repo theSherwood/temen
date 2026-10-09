@@ -3,11 +3,12 @@
 //! its seeded argv and returns the byte count), and a parent "shell" spawns a chosen applet, inherits
 //! stdout into it, `join`s, and returns its status. Spawning different applets yields different
 //! `(stdout, status)` pairs — the guarantee the shell's command dispatch rests on: look a command up,
-//! spawn the matching entry, thread its exit code into `$?`.
+//! spawn the matching applet, thread its exit code into `$?`.
 //!
 //! The name→entry lookup itself is trivial personality glue (a map) and lives above this; here the
-//! entry index is chosen per case, exactly as the shell will compute it. BusyBox-multicall shape (a
-//! detached v1 record spawn with one named grant, + `join`), differential interp==JIT.
+//! entry index is chosen per case, exactly as the shell will compute it, and the host grants the
+//! parent that applet's child image (#2219). BusyBox-multicall shape (a detached v1 record spawn
+//! with one named grant, + `join`), differential interp==JIT.
 //!
 //! Gated `#![cfg(unix)]` like the other JIT differential suites (temen-jit's guard page is unix-only).
 #![cfg(unix)]
@@ -15,7 +16,6 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Trap, Value};
 use temen_ir::{module_args_base, Module, SpawnRec};
 use temen_jit::JitOutcome;
@@ -28,10 +28,10 @@ const TOKEN_AT: u64 = 16700;
 
 /// One module: parent (func 0) plus three applets — func 1 `true` (→0), func 2 `false` (→1), func 3
 /// `echo` (resolve `stdout`, write its 3 argv bytes, →3). The parent stores `token`, lays a `stdout`
-/// grant record, spawns applet `entry` detached through a v1 record paid from its `Budget` that
-/// carries the token as the args payload (it lands at the applet's `module_args_base`), joins, and
-/// returns its status.
-fn src(entry: u32, token: &[u8; 3]) -> String {
+/// grant record, spawns the applet image it is handed detached through a v1 record paid from its
+/// `Budget` that carries the token as the args payload (it lands at the applet's
+/// `module_args_base`), joins, and returns its status.
+fn src(token: &[u8; 3]) -> String {
     let seed: String = token
         .iter()
         .enumerate()
@@ -44,13 +44,13 @@ fn src(entry: u32, token: &[u8; 3]) -> String {
         grants_ptr: 16384,
         grants_n: 1,
         args: (TOKEN_AT, token.len() as u64),
-        ..SpawnRec::v1(entry)
+        ..SpawnRec::v1(0)
     };
     let args = module_args_base();
     format!(
         r#"memory 17
-{rec}func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vout: i32, vbud: i32) {{
+{rec}func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vout: i32, vbud: i32, vapp: i32) {{
   a0 = i64.const 16384
   n100 = i32.const 16484
   i32.store a0 n100
@@ -79,7 +79,9 @@ block 0 (vinst: i32, vout: i32, vbud: i32) {{
   i32.store8 p104 cu
   p105 = i64.const 16489
   i32.store8 p105 ct
-{seed}  rrb = i64.const 17564
+{seed}  rrm = i64.const 17560
+  i32.store rrm vapp
+  rrb = i64.const 17564
   i32.store rrb vbud
   rra0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
@@ -131,17 +133,18 @@ block 0 (vci: i64) {{
     )
 }
 
-/// The module for `entry`, and a host for it with the parent's three args: an `Instantiator`, the
-/// `stdout` it grants the applet, and the `Budget` that pays for the applet's window.
-fn setup(entry: u32, token: &[u8; 3]) -> (Module, Host, [i32; 3]) {
-    let m = parse_module(&src(entry, token)).expect("parse");
+/// The module, and a host for it with the parent's four args: an `Instantiator`, the `stdout` it
+/// grants the applet, the `Budget` that pays for the applet's window, and applet `entry`'s child
+/// image.
+fn setup(entry: u32, token: &[u8; 3]) -> (Module, Host, [i32; 4]) {
+    let m = parse_module(&src(token)).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, WIN as u64);
     let oh = host.grant_stream(StreamRole::Out);
     let bh = host.grant_budget(-1, 1 << 20, -1);
-    (m, host, [ih, oh, bh])
+    let ah = host.grant_module(&temen_ir::child_image_at(&m, entry).expect("applet image"));
+    (m, host, [ih, oh, bh, ah])
 }
 
 fn run_interp(entry: u32, token: &[u8; 3]) -> (Result<Vec<Value>, Trap>, Vec<u8>) {

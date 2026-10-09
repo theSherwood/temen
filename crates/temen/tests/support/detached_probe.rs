@@ -1,8 +1,9 @@
-//! #1867 decision 3 — the escape oracle's **detached-child placement**. A small root spawns a module's
-//! entry as a detached child through a v1 record, so the child runs in a window of its own (base 0, its
-//! declared size). The root waits for the child and joins it if it returned, then reports how the
-//! child ended and whether its own window changed across the child's life: the canary. Every engine is
-//! held to the same report, the bytecode drivers included, which return no window snapshot.
+//! #1867 decision 3 — the escape oracle's **detached-child placement**. A small root spawns a
+//! module as a detached child through a v1 record, so the child runs from its function 0 (#2219)
+//! in a window of its own (base 0, its declared size). The root waits for the child and joins it if
+//! it returned, then reports how the child ended and whether its own window changed across the
+//! child's life: the canary. Every engine is held to the same report, the bytecode drivers
+//! included, which return no window snapshot.
 //!
 //! Included by `irgen.rs` (the differential's detached pass) and `escape_oracle.rs` (the hand-written
 //! pins).
@@ -53,15 +54,15 @@ block 3 (dr: i64) {{
     )
 }
 
-/// The root module: `(instantiator, module, budget) -> (trapped, value, canary)`. It fills the granted
-/// `module` and `budget` into a v1 record for `entry` (the module's declared window, no grants),
-/// digests its own window, spawns the child, and waits for it (`Instantiator.wait`, which answers how
-/// the child ended without inheriting its trap). For a child that returned it joins the child: `trapped`
-/// is 0 and `value` the child's result. For one that trapped, `trapped` is 1 and `value` the trap's
-/// wire code. `canary` is the root's window digest before the spawn xor after the child's life: 0 when
-/// the child never touched the root's window.
-pub fn root(entry: u32) -> Module {
-    let rec = temen_ir::SpawnRec::v1(entry).encode();
+/// The root module: `(instantiator, module, budget) -> (trapped, value, canary)`. It fills the
+/// granted `module` and `budget` into a v1 record (the module's declared window, no grants),
+/// digests its own window, spawns the child, and waits for it (`Instantiator.wait`, which answers
+/// how the child ended without inheriting its trap). For a child that returned it joins the child:
+/// `trapped` is 0 and `value` the child's result. For one that trapped, `trapped` is 1 and `value`
+/// the trap's wire code. `canary` is the root's window digest before the spawn xor after the
+/// child's life: 0 when the child never touched the root's window.
+pub fn root() -> Module {
+    let rec = temen_ir::SpawnRec::v1(0).encode();
     let rec: String = rec.iter().map(|b| format!("\\x{b:02x}")).collect();
     let src = format!(
         "memory {ROOT_LOG2}

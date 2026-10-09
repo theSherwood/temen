@@ -1425,13 +1425,13 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
     assert_outcomes_agree(m, &results, interp, &imem, jit, &jmem, mem_oracle);
 }
 
-/// One differential pass with the entry run as a **detached child** (#1867 decision 3). The child is
-/// `m` plus a wrapper entry that calls func 0 with `args` and returns a digest of its results and of its
-/// own final window ([`detached_probe::digest_func`]); the probe root spawns it, waits for it and joins
-/// it. The interpreter and the JIT must agree on how the child ended — the same digest for a clean run,
-/// a trap under the window passes' policy — and on the root's whole final window, which must also show
-/// that the child never touched it (the canary). Skipped unless the module is a float-free
-/// `mem_oracle` candidate whose entry takes and returns only integers.
+/// One differential pass with the entry run as a **detached child** (#1867 decision 3). The child
+/// is `m` behind a wrapper entry that calls `m`'s func 0 with `args` and returns a digest of its
+/// results and of its own final window ([`detached_probe::digest_func`]); the probe root spawns it,
+/// waits for it and joins it. The interpreter and the JIT must agree on how the child ended — the
+/// same digest for a clean run, a trap under the window passes' policy — and on the root's whole
+/// final window, which must also show that the child never touched it (the canary). Skipped unless
+/// the module is a float-free `mem_oracle` candidate whose entry takes and returns only integers.
 fn differential_pass_detached(m: &Module, args: &[Value], mem_oracle: bool) {
     let Some(mc) = m.memory.filter(|_| mem_oracle) else {
         return;
@@ -1442,7 +1442,7 @@ fn differential_pass_detached(m: &Module, args: &[Value], mem_oracle: bool) {
         return;
     }
     let child = detached_child(m, args, mc.size_log2);
-    let root = detached_probe::root(m.funcs.len() as u32);
+    let root = detached_probe::root();
     let init: Vec<u8> = (0..1usize << detached_probe::ROOT_LOG2)
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
@@ -1484,8 +1484,11 @@ fn differential_pass_detached(m: &Module, args: &[Value], mem_oracle: bool) {
     assert_outcomes_agree(m, &[ValType::I64], child_interp, &[], child_jit, &[], false);
 }
 
-/// `m` plus two functions for the detached pass: a child entry `(i64) -> (i64)` that calls func 0
-/// with `args` and returns a digest of its results and the child's window, and the digest itself.
+/// `m` plus two functions for the detached pass: a child entry `(i64) -> (i64)` that calls `m`'s
+/// func 0 with `args` and returns a digest of its results and the child's window, and the digest
+/// itself. A spawn starts a module at its function 0 (#2219), so the entry takes that slot and
+/// `m`'s func 0 moves to the entry's: index `m.funcs.len()`. `m`'s calls go only forward, so none
+/// calls its func 0 or reaches past its last function, and a `ref.func` of either is only a value.
 fn detached_child(m: &Module, args: &[Value], size_log2: u8) -> Module {
     let f0 = &m.funcs[0];
     let digest = m.funcs.len() + 1;
@@ -1527,8 +1530,15 @@ fn detached_child(m: &Module, args: &[Value], size_log2: u8) -> Module {
         f0.results.len(),
         detached_probe::digest_func(1 << size_log2),
     );
-    let child = temen_text::parse_module(&src)
+    let mut child = temen_text::parse_module(&src)
         .unwrap_or_else(|e| panic!("detached pass: the child does not parse: {e:?}\n{src}"));
+    let entry = m.funcs.len();
+    child.funcs.swap(0, entry);
+    for i in child.funcs[0].blocks.iter_mut().flat_map(|b| &mut b.insts) {
+        if let Inst::Call { func: f @ 0, .. } = i {
+            *f = entry as FuncIdx;
+        }
+    }
     verify_module(&child)
         .unwrap_or_else(|e| panic!("detached pass: the child does not verify: {e:?}\n{src}"));
     child

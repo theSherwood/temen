@@ -46,8 +46,10 @@ type 1 interface { op: 0 }
 export 0 interface "fork" 1 { op: 2 }
 data 16684 "fork"
 data 16694 "libc"
-func (i32, i32, i64, i32) -> (i64) {
-block 0 (v0: i32, vlibc: i32, vgmod: i64, vbud: i32) {
+func (i32, i32, i64, i32, i32) -> (i64) {
+block 0 (v0: i32, vlibc: i32, vgmod: i64, vbud: i32, vsrv: i32) {
+  q0m = i64.const 17560
+  i32.store q0m vsrv
   q0b = i64.const 17564
   i32.store q0b vbud
   q0p = i64.const 17536
@@ -101,8 +103,9 @@ block 0 (vx: i64) {
 "#;
 
 /// [`MANAGER`] with its spawn records, both detached and paid from the manager's budget: the server
-/// (func 1) at 17536, and the guest at 17664 (entry 0 of the module the manager writes in), granted
-/// `"fork"` and `"libc"` by the list at 16640.
+/// at 17536 (the manager's child image of its func 1, #2219, its last argument), and the guest at
+/// 17664 (entry 0 of the module the manager writes in), granted `"fork"` and `"libc"` by the list
+/// at 16640.
 fn manager() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
@@ -111,7 +114,7 @@ fn manager() -> String {
     };
     format!(
         "{MANAGER}{}{}",
-        rec::segment(17536, &SpawnRec::v1(1)),
+        rec::segment(17536, &SpawnRec::v1(0)),
         rec::segment(17664, &guest)
     )
 }
@@ -157,12 +160,12 @@ fn a_childs_named_fork_import_binds_to_the_live_fork_offer_and_forks_twice() {
     verify_module(&guest).expect("verify guest");
 
     let mut host = Host::new();
-    host.set_self_module(&manager);
     let win = 1u64 << 19;
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
     let inst = host.grant_instantiator(0, win);
     let gmod = host.grant_module(&guest);
     let budget = host.grant_budget(-1, 64 << 20, -1);
+    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
 
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
@@ -173,6 +176,7 @@ fn a_childs_named_fork_import_binds_to_the_live_fork_offer_and_forks_twice() {
             Value::I32(libc),
             Value::I64(gmod as i64),
             Value::I32(budget),
+            Value::I32(server),
         ],
         &mut fuel,
         &mut host,

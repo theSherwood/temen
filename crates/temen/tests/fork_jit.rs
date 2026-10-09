@@ -8,11 +8,13 @@
 //! §12.5 carries exactly this state). Tree-walker ≡ bytecode.
 //!
 //! Topology = `clone_caller.rs`'s `SRC_TWIN` (root spawns a serving domain S whose `fork` handler
-//! `clone_caller(100, 200)`s and whose `wait` handler reaps; then the caller C with `"svc"`, `"o"` and
-//! — new — `"jit"` re-granted by name). C: resolve the three, stage the unit, compile + install
-//! (slot 5: C has five functions and a 16-slot table from the root's `Jit` reservation), fork; the
-//! original (reply 100) reaps the twin (reply 200); both write `call.dyn(slot 5) * 1000 + install2`
-//! (= 42 · 1000 + 6) to the shared stdout and return their reply (the run's value is the original's).
+//! `clone_caller(100, 200)`s and whose `wait` handler reaps; then the caller C with `"svc"`, `"o"`
+//! and — new — `"jit"` re-granted by name); S and C are the program's child images (#2219) of its
+//! funcs 1 and 4. C: resolve the three, stage the unit, compile + install (slot 5: C has five
+//! functions — an image keeps every function index — and a 16-slot table from the root's `Jit`
+//! reservation), fork; the original (reply 100) reaps the twin (reply 200); both write
+//! `call.dyn(slot 5) * 1000 + install2` (= 42 · 1000 + 6) to the shared stdout and return their
+//! reply (the run's value is the original's).
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -27,8 +29,8 @@ use temen_verify::verify_module;
 /// Where C stages the unit blob in its own window: above its spawn records.
 const BLOB_OFF: i64 = 17920;
 
-/// The unit: `() -> 42`, declaring the program's memory (`memory 18` — C is a same-module child, so
-/// its re-granted table's precondition is the root's).
+/// The unit: `() -> 42`, declaring the program's memory (`memory 18` — C runs the program's child
+/// image, which keeps its memory, so its re-granted table's precondition is the root's).
 fn blob() -> Vec<u8> {
     let m = parse_module(
         "memory 18\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i32.const 42\n  return v0\n  }\n}\n",
@@ -59,8 +61,10 @@ export 0 interface "svc" 1 {{ fork: 2, wait: 3 }}
 data 16684 "svc"
 data 16694 "o"
 data 16704 "jit"
-func (i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, vout: i32, vjit: i32, vbud: i32) {{
+func (i32, i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, vout: i32, vjit: i32, vbud: i32, vsm: i32, vcm: i32) {{
+  q1m = i64.const 17560
+  i32.store q1m vsm
   q1b = i64.const 17564
   i32.store q1b vbud
   q1p = i64.const 17536
@@ -90,6 +94,8 @@ block 0 (v0: i32, vout: i32, vjit: i32, vbud: i32) {{
   i32.store va7 vnl
   va8 = i64.const 16680
   i32.store va8 vjit
+  q2m = i64.const 17688
+  i32.store q2m vcm
   q2b = i64.const 17692
   i32.store q2b vbud
   q2p = i64.const 17664
@@ -180,11 +186,11 @@ block 4 (vr: i64, vho: i32, vhj: i32, vc: i64, vs0: i64) {{
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1(4)
+        ..SpawnRec::v1(0)
     };
     format!(
         "{src}{}{}",
-        rec::segment(17536, &SpawnRec::v1(1)),
+        rec::segment(17536, &SpawnRec::v1(0)),
         rec::segment(17664, &caller)
     )
 }
@@ -195,18 +201,15 @@ fn run(bytecode: bool) -> (Vec<Value>, Vec<i64>) {
     let m = parse_module(&src()).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    host.set_self_module(&std::sync::Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let jh = grant_jit(&mut host, &m, 4); // 16 install slots, carried into C by the grant
     let hb = host.grant_budget(-1, 64 << 20, -1);
-    let args = [
-        Value::I32(ih),
-        Value::I32(out_h),
-        Value::I32(jh),
-        Value::I32(hb),
-    ];
+    // S and C are the program's child images (#2219) of its funcs 1 and 4.
+    let [sm, cm] =
+        [1, 4].map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));
+    let args = [ih, out_h, jh, hb, sm, cm].map(Value::I32);
     let mut fuel = 40_000_000u64;
     let r = if bytecode {
         bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)

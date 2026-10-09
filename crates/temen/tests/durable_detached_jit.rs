@@ -340,49 +340,60 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
     }
 }
 
-/// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module, `v2`
-/// a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]), `v3`
-/// freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout. It spawns
-/// `NEST` detached at entry 0 with three named grants (#2018): the authority as `"freeze"`, so the
-/// durable child may spawn in turn, the module as `"nest"`, and its stdout as `"stdout"` (#2054). It
-/// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking 1 ms
-/// a time (a durable run on the oracle has one worker, so a waiter must give it up), then the settle
-/// time. Then one fiber resume: the run's only fiber safepoint, where `arm_freeze_after(win, 1)`
-/// freezes the settled tree. Last, it joins the child and returns what the child returns.
+/// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module,
+/// `v2` a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]),
+/// `v3` freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout, and
+/// `v6`, `v7` the programs of the child's own children ([`nest`]). It spawns `NEST` detached at
+/// entry 0 with four named grants (#2018): the authority as `"freeze"`, so the durable child may
+/// spawn in turn, `v6` and `v7` as `"nest"` and `"nest2"`, and its stdout as `"stdout"` (#2054). It
+/// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking
+/// 1 ms a time (a durable run on the oracle has one worker, so a waiter must give it up), then the
+/// settle time. Then one fiber resume: the run's only fiber safepoint, where
+/// `arm_freeze_after(win, 1)` freezes the settled tree. Last, it joins the child and returns what
+/// the child returns.
 const NEST_ROOT: &str = "memory 18 shadow 16448 65536
 data 70000 \"freeze\"
 data 70008 \"nest\"
-data 70064 \"stdout\"
-func (i32, i32, i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {
-  vr0 = i64.const 70016
+data 70016 \"nest2\"
+data 70024 \"stdout\"
+func (i32, i32, i32, i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32) {
+  vr0 = i64.const 70032
   vn0 = i32.const 70000
   i32.store vr0 vn0
-  vr1 = i64.const 70020
+  vr1 = i64.const 70036
   vl0 = i32.const 6
   i32.store vr1 vl0
-  vr2 = i64.const 70024
+  vr2 = i64.const 70040
   i32.store vr2 v3
-  vr3 = i64.const 70032
+  vr3 = i64.const 70048
   vn1 = i32.const 70008
   i32.store vr3 vn1
-  vr4 = i64.const 70036
+  vr4 = i64.const 70052
   vl1 = i32.const 4
   i32.store vr4 vl1
-  vr5 = i64.const 70040
-  i32.store vr5 v1
-  vr6 = i64.const 70048
-  vn2 = i32.const 70064
+  vr5 = i64.const 70056
+  i32.store vr5 v6
+  vr6 = i64.const 70064
+  vn2 = i32.const 70016
   i32.store vr6 vn2
-  vr7 = i64.const 70052
-  vl2 = i32.const 6
+  vr7 = i64.const 70068
+  vl2 = i32.const 5
   i32.store vr7 vl2
-  vr8 = i64.const 70056
-  i32.store vr8 v5
+  vr8 = i64.const 70072
+  i32.store vr8 v7
+  vr9 = i64.const 70080
+  vn3 = i32.const 70024
+  i32.store vr9 vn3
+  vr10 = i64.const 70084
+  vl3 = i32.const 6
+  i32.store vr10 vl3
+  vr11 = i64.const 70088
+  i32.store vr11 v5
   vmh = i64.extend_i32_u v1
   vb = i64.extend_i32_u v2
-  vgp = i64.const 70016
-  vgn = i64.const 3
+  vgp = i64.const 70032
+  vgn = i64.const 4
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
@@ -427,7 +438,7 @@ block 0 (v0: i64, v1: i64) {
 ";
 
 /// #2010 — the child [`NEST_ROOT`] spawns (entry 0) resolves its `"budget"` and `"nest"`, spawns
-/// `"nest"` detached at entry 1, joins it, and returns 100 more than it. The grandchild (entry 1)
+/// `"nest"` (its func 1's image) detached, joins it, and returns 100 more than it. The grandchild
 /// waits a second on a futex nothing notifies, so it is live when the freeze lands, then returns 7.
 const NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
@@ -443,10 +454,9 @@ block 0 (v0: i64, v1: i64) {
   vbw = i64.extend_i32_u vb
   vmw = i64.extend_i32_u vm
   vz = i64.const 0
-  ve = i64.const 1
   vlog = i64.const 17
   vinst = i32.wrap_i64 v0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, ve, vlog, vz)
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vz, vlog, vz)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
@@ -631,9 +641,10 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// #2054 — the same one level down: a child that re-grants the grandchild (entry 1) the stdout it
-/// inherited, joins it, and returns 100 more than it. The grandchild resolves that stdout, waits a
-/// second, writes `X` to it and returns 7, so its bytes reach the root through the child's stream.
+/// #2054 — the same one level down: a child that re-grants the grandchild (`"nest"`, its func 1's
+/// image) the stdout it inherited, joins it, and returns 100 more than it. The grandchild resolves
+/// that stdout, waits a second, writes `X` to it and returns 7, so its bytes reach the root through
+/// the child's stream.
 const PRINT_GRAND_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
@@ -659,10 +670,9 @@ block 0 (v0: i64, v1: i64) {
   vmw = i64.extend_i32_u vm
   vz = i64.const 0
   vgn = i64.const 1
-  ve = i64.const 1
   vlog = i64.const 17
   vinst = i32.wrap_i64 v0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vga, vgn, ve, vlog, vz)
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vga, vgn, vz, vlog, vz)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
@@ -689,14 +699,16 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// #2041 — the same one level down: a child that spawns a grandchild that returns at once, waits for
-/// it to end without joining it, then spawns two that wait a second, and joins those first. Its tree
-/// settles with the child and the slow two live, which it reaches only after the quick one has ended:
-/// the freeze finds the child live, with the quick one completed but not joined. It returns 100 more
-/// than the quick one's 7 and the slow ones' 0.
+/// #2041 — the same one level down: a child that spawns a grandchild that returns at once
+/// (`"nest"`, its func 1's image), waits for it to end without joining it, then spawns two that
+/// wait a second (`"nest2"`, its func 2's image), and joins those first. Its tree settles with the
+/// child and the slow two live, which it reaches only after the quick one has ended: the freeze
+/// finds the child live, with the quick one completed but not joined. It returns 100 more than the
+/// quick one's 7 and the slow ones' 0.
 const COMPLETED_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
+data 90128 \"nest2\"
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vbp = i64.const 90112
@@ -705,16 +717,19 @@ block 0 (v0: i64, v1: i64) {
   vmp = i64.const 90120
   vml = i64.const 4
   vm = self.resolve vmp vml
+  vsp = i64.const 90128
+  vsl = i64.const 5
+  vs = self.resolve vsp vsl
   vbw = i64.extend_i32_u vb
   vmw = i64.extend_i32_u vm
+  vsw = i64.extend_i32_u vs
   vz = i64.const 0
-  vquick = i64.const 1
   vlog = i64.const 17
   vinst = i32.wrap_i64 v0
-  vq = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vquick, vlog, vz)
-  br 1(vinst, vbw, vmw, vq)
+  vq = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vz, vlog, vz)
+  br 1(vinst, vbw, vsw, vq)
 }
-block 1 (vi: i32, vbw1: i64, vmw1: i64, vq1: i32) {
+block 1 (vi: i32, vbw1: i64, vsw1: i64, vq1: i32) {
   vwa = i64.const 66000
   vwe = i32.const 0
   vwt = i64.const 1000000
@@ -722,14 +737,13 @@ block 1 (vi: i32, vbw1: i64, vmw1: i64, vq1: i32) {
   vst = call.cap 6 9 (i32) -> (i32) vi (vq1)
   vz32 = i32.const 0
   vended = i32.ne vst vz32
-  br_if vended 2(vi, vbw1, vmw1, vq1) 1(vi, vbw1, vmw1, vq1)
+  br_if vended 2(vi, vbw1, vsw1, vq1) 1(vi, vbw1, vsw1, vq1)
 }
-block 2 (vi2: i32, vbw2: i64, vmw2: i64, vq2: i32) {
+block 2 (vi2: i32, vbw2: i64, vsw2: i64, vq2: i32) {
   vz2 = i64.const 0
-  vslow = i64.const 2
   vlog2 = i64.const 17
-  vs1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vmw2, vz2, vz2, vslow, vlog2, vz2)
-  vs2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vmw2, vz2, vz2, vslow, vlog2, vz2)
+  vs1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
+  vs2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
   vj1 = call.cap 6 1 (i32) -> (i64) vi2 (vs1)
   vj2 = call.cap 6 1 (i32) -> (i64) vi2 (vs2)
   vjq = call.cap 6 1 (i32) -> (i64) vi2 (vq2)
@@ -758,31 +772,62 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// [`NEST_ROOT`] and the `child` it spawns ([`NEST`] or [`THREAD_NEST`]), instrumented. Both touch
-/// memory, so they take the confined transform.
-fn nest_modules(child: &str) -> (temen_ir::Module, temen_ir::Module) {
-    let confined = |src: &str| {
-        let m = transform_module_assume_confined(&temen_text::parse_module(src).expect("parse"))
-            .expect("transform");
-        temen_verify::verify_module(&m).expect("instrumented module verifies");
-        m
-    };
-    (confined(NEST_ROOT), confined(child))
+/// `src` parsed and instrumented. Every module here touches memory, so each takes the confined
+/// transform.
+fn confined(src: &str) -> temen_ir::Module {
+    confined_module(&temen_text::parse_module(src).expect("parse"))
 }
 
-/// [`NEST_ROOT`]'s powerbox: its `Instantiator`, `nest` as a durable `Module`, a `Budget` of 1 MiB,
-/// freeze authority over detached progeny, and stdout; and its arguments, `settle_ms` among them. The
-/// tree has settled once `live` of the root's descendants are live, so the budget's `spawn` ceiling
-/// is 2 more than `live`: its room then falls to the 2 the root waits for.
-fn nest_powerbox(nest: &temen_ir::Module, settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
+fn confined_module(m: &temen_ir::Module) -> temen_ir::Module {
+    let m = transform_module_assume_confined(m).expect("transform");
+    temen_verify::verify_module(&m).expect("instrumented module verifies");
+    m
+}
+
+/// The `child` [`NEST_ROOT`] spawns ([`NEST`] or another), then the programs its own children run:
+/// the child images (#2219) of its funcs 1 and 2, where it has them. All instrumented: the host
+/// grants each as a durable `Module`, since a durable domain spawns only those (#1501).
+fn nest(child: &str) -> Vec<temen_ir::Module> {
+    let m = temen_text::parse_module(child).expect("parse");
+    let images = (1..m.funcs.len().min(3) as u32)
+        .map(|f| temen_ir::child_image_at(&m, f).expect("child image"));
+    std::iter::once(m.clone())
+        .chain(images)
+        .map(|m| confined_module(&m))
+        .collect()
+}
+
+/// [`NEST_ROOT`] and [`nest`]`(child)`.
+fn nest_modules(child: &str) -> (temen_ir::Module, Vec<temen_ir::Module>) {
+    (confined(NEST_ROOT), nest(child))
+}
+
+/// [`NEST_ROOT`]'s powerbox: its `Instantiator`, the [`nest`] modules as durable `Module`s, a
+/// `Budget` of 1 MiB, freeze authority over detached progeny, and stdout; and its arguments,
+/// `settle_ms` among them. A child with no func 1 or 2 is handed its own module in that image's
+/// place, which it never spawns. The tree has settled once `live` of the root's descendants are
+/// live, so the budget's `spawn` ceiling is 2 more than `live`: its room then falls to the 2 the
+/// root waits for.
+fn nest_powerbox(nest: &[temen_ir::Module], settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
-    let modh = host.grant_durable_module(nest);
+    let mods: Vec<i32> = nest.iter().map(|m| host.grant_durable_module(m)).collect();
     let budget = host.grant_budget(-1, 1 << 20, live + 2);
     let freeze = host.grant_freeze_authority(FreezeScope::DetachedProgeny);
     let out = host.grant_stream(StreamRole::Out);
-    let args = [inst, modh, budget, freeze, settle_ms, out].map(i64::from);
+    let grand = |k: usize| *mods.get(k).unwrap_or(&mods[0]);
+    let args = [
+        inst,
+        mods[0],
+        budget,
+        freeze,
+        settle_ms,
+        out,
+        grand(1),
+        grand(2),
+    ]
+    .map(i64::from);
     (host, args.to_vec())
 }
 
@@ -921,11 +966,13 @@ fn carried(host: &Host) -> Vec<usize> {
         .collect()
 }
 
-/// Restore `art` into a fresh host that re-grants [`NEST`], ready to thaw.
-fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &temen_ir::Module) -> (Host, Vec<u8>) {
+/// Restore `art` into a fresh host that re-grants the [`nest`] modules, ready to thaw.
+fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &[temen_ir::Module]) -> (Host, Vec<u8>) {
     let mut host = Host::new();
     host.set_durable(true);
-    host.grant_durable_module(nest);
+    for m in nest {
+        host.grant_durable_module(m);
+    }
     let mut win = temen_snapshot::restore(art, root, &mut host).expect("restore");
     begin_thaw(&mut win, ARENA, 0);
     (host, win)
@@ -938,7 +985,7 @@ fn nest_thaws(
     art: &[u8],
     froze: Engine,
     root: &temen_ir::Module,
-    nest: &temen_ir::Module,
+    nest: &[temen_ir::Module],
     args: &[i64],
     runs: &[Engine],
     answer: Answer,
@@ -1284,13 +1331,7 @@ fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
 /// answers `answer`, the uninterrupted run's; neither child writes, so nor does any run.
 fn refreezes_every_engine(child: &str, answer: Answer) {
     use Engine::*;
-    let confined = |src: &str| {
-        let m = transform_module_assume_confined(&temen_text::parse_module(src).expect("parse"))
-            .expect("transform");
-        temen_verify::verify_module(&m).expect("instrumented module verifies");
-        m
-    };
-    let (root, child) = (confined(&refreeze_root()), confined(child));
+    let (root, child) = (confined(&refreeze_root()), nest(child));
     let mut wrong = Vec::new();
     let mut runs = Vec::new();
     for e in [Interp, Jit] {
