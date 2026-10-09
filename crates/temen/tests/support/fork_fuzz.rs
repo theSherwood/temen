@@ -31,8 +31,10 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q1b = i64.const 17564
   i32.store q1b vbud
   q1p = i64.const 17536
@@ -55,6 +57,8 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
+  qcm = i64.const 17688
+  i32.store qcm vcm
   q2b = i64.const 17692
   i32.store q2b vbud
   q2p = i64.const 17664
@@ -149,17 +153,18 @@ fn params(data: &[u8]) -> (i64, i64) {
 }
 
 fn build(ro: i64, rt: i64) -> Option<Arc<temen_ir::Module>> {
-    // The spawn records, both detached and paid from the root's budget: S (func 1) at 17536, and C
-    // (func 4) at 17664, granted `"svc"` and `"o"` by the list at 16640.
+    // The spawn records, both detached and paid from the root's budget: S at 17536, and C at 17664,
+    // granted `"svc"` and `"o"` by the list at 16640. Each runs a child image of the program
+    // (#2219): S of func 1, C of func 4, the root's last two arguments.
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(4)
+        ..SpawnRec::v1(0)
     };
     let src = TEMPLATE
         .replace("__RO__", &ro.to_string())
         .replace("__RT__", &rt.to_string())
-        + &rec::segment(17536, &SpawnRec::v1(1))
+        + &rec::segment(17536, &SpawnRec::v1(0))
         + &rec::segment(17664, &caller);
     let m = temen_text::parse_module(&src).ok()?;
     temen_verify::verify_module(&m).ok()?;
@@ -193,16 +198,13 @@ fn observe(
     run: impl FnOnce(&Arc<temen_ir::Module>, &[Value], &mut Host) -> RunOut,
 ) -> Observed {
     let mut host = Host::new();
-    host.set_self_module(m);
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 64 << 20, -1);
-    let r = run(
-        m,
-        &[Value::I32(inst), Value::I32(out), Value::I32(budget)],
-        &mut host,
-    )?;
+    let [s, c] =
+        [1, 4].map(|f| host.grant_module(&temen_ir::child_image_at(m, f).expect("child image")));
+    let r = run(m, &[inst, out, budget, s, c].map(Value::I32), &mut host)?;
     let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Some((r, sorted_i64(&bytes)))
 }

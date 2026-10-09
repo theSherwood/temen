@@ -387,8 +387,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_jit_slot_unit`
 - `temen_par_jit_table_gen`
 - `temen_par_jit_table_log2`
-- `temen_par_jit_unit_wasm_by_slot_len`
-- `temen_par_jit_unit_wasm_by_slot_ptr`
+- `temen_par_jit_unit_wasm_by_id_len`
+- `temen_par_jit_unit_wasm_by_id_ptr`
 - `temen_par_jit_unit_wasm_len`
 - `temen_par_jit_unit_wasm_ptr`
 - `temen_par_last_panic_len`

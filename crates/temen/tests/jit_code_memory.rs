@@ -40,7 +40,7 @@ fn repeated_compiles_do_not_grow_address_space() {
         "memory 16\nfunc (i64) -> (i64) {\nblock 0 (x: i64) {\n  return x\n}\n}\n",
     )
     .unwrap();
-    detached_probe::run_jit(&detached_probe::root(0), &child, &[]).unwrap();
+    detached_probe::run_jit(&detached_probe::root(), &child, &[]).unwrap();
     let before = vm_size_kib();
     // 50 differential iterations ≈ 150+ JIT compiles (each `fuzz_one` runs multiple passes).
     // With the leak, this grew ~4.9 GiB; with `OwnedJit` freeing on drop it is 0.

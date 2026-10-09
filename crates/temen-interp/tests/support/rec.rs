@@ -20,6 +20,18 @@ pub fn segment(at: u64, rec: &SpawnRec) -> String {
     format!("data {at} \"{}\"\n", escape(&rec.encode()))
 }
 
+/// Text-IR stores laying the 16-byte grant record `{name_off, name_len, handle, flags = 0}` at
+/// `at`: the handle in register `handle`, named by the `name_len` bytes at `name_at`. For a handle
+/// the spawner learns at run time; registers are prefixed `p`.
+pub fn grant(p: &str, at: u64, name_at: u64, name_len: usize, handle: &str) -> String {
+    format!(
+        "  {p}rec = i64.const {at}\n  {p}name = i32.const {name_at}\n  i32.store {p}rec {p}name\n\
+         \x20 {p}len = i32.const {name_len}\n  i32.store {p}rec {p}len offset=4\n\
+         \x20 i32.store {p}rec {handle} offset=8\n\
+         \x20 {p}flags = i32.const 0\n  i32.store {p}rec {p}flags offset=12\n"
+    )
+}
+
 /// Text `data` segments for an **empty grant** (#2219): the name `name` at `name_at`, and at `at` the
 /// 16-byte grant record naming it with the `GRANT_EMPTY` handle. The child's import `name` binds
 /// empty: a child image keeps every import of its program, and binds them strictly, so a spawn

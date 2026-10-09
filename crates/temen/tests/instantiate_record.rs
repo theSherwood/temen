@@ -15,8 +15,10 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
+use std::sync::Arc;
+
 use temen_interp::{run_capture_reserved_with_host, Host, StreamRole, Value};
-use temen_ir::SpawnRec;
+use temen_ir::{Module, SpawnRec};
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -261,28 +263,31 @@ fn record_spawn_carries_the_pager_binding() {
     }
 }
 
-/// #1217, the granted-offer shape: the root spawns a **server** child (func 1: one `svc.wait`,
-/// returning its count), mints a `child_offer` over its export, and spawns a **guest** child
-/// (func 3, `guest`) with that offer re-granted by name as `"fork"`; then `join`s the server and
-/// exits its count. Both children are detached, paid from the root's `"budget"`; the `"fork"` name is
-/// a data segment, so the guest finds it in its own window too.
+/// #1217, the granted-offer shape: the root spawns a **server** child (`"server"`, one `svc.wait`,
+/// returning its count), mints a `child_offer` over the server's export, and spawns a **guest**
+/// child (`"guest"`) with that offer re-granted by name as `"fork"`; then `join`s the server and
+/// returns its count. Both children are detached, paid from the root's `"budget"`. The `"fork"`
+/// name is a data segment, so the guest finds it in its own window too.
 fn granted_client_program(guest: &str) -> String {
     let guest_rec = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(3)
+        ..SpawnRec::v1(0)
     };
     format!(
         "\
 memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
+data 16448 \"server\"
+data 16456 \"guest\"
 data 16684 \"fork\"
 {server_rec}{guest_rec}type 0 func (i64) -> (i64)
 type 1 interface {{ op: 0 }}
 export 0 interface \"fork\" 1 {{ op: 2 }}
-import 0 \"exit\" (i32) -> ()
-func 0 () -> () {{
+export 0 func \"server\" 1
+export 1 func \"guest\" 3
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
@@ -292,26 +297,27 @@ block 0 () {{
   vb = self.resolve vbp vbl
   vsb = i64.const 17436
   i32.store vsb vb
+  vsrvp = i64.const 16448
+  vsrvl = i64.const 6
+  vserver = self.resolve vsrvp vsrvl
+  vsrvm = i64.const 17432
+  i32.store vsrvm vserver
+  vgstp = i64.const 16456
+  vgstl = i64.const 5
+  vguest = self.resolve vgstp vgstl
+  vgstm = i64.const 17528
+  i32.store vgstm vguest
   vsp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
   vz0 = i64.const 0
   voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-  va0 = i64.const 16640
-  vnp0 = i32.const 16684
-  i32.store va0 vnp0
-  va1 = i64.const 16644
-  vfour = i32.const 4
-  i32.store va1 vfour
-  va2 = i64.const 16648
-  i32.store va2 voff
-  vgb = i64.const 17532
+{fork_grant}  vgb = i64.const 17532
   i32.store vgb vb
   vgp = i64.const 17504
   vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
   vjs = call.cap 6 1 (i32) -> (i64) v0 (vs)
   vc = i32.wrap_i64 vjs
-  call.import 0 (vc)
-  unreachable
+  return vc
   }}
 }}
 func 1 (i64) -> (i64) {{
@@ -333,8 +339,9 @@ block 0 (v0: i64) {{
   }}
 }}
 ",
-        server_rec = rec::segment(17408, &SpawnRec::v1(1)),
+        server_rec = rec::segment(17408, &SpawnRec::v1(0)),
         guest_rec = rec::segment(17504, &guest_rec),
+        fork_grant = rec::grant("gf", 16640, 16684, 4, "voff"),
     )
 }
 
@@ -342,24 +349,25 @@ block 0 (v0: i64) {{
 /// form (retiring, #2067). Every engine runs both natively (#744).
 fn granted_client_programs(guest: &str) -> [String; 2] {
     let rec = granted_client_program(guest);
-    // `dst = instantiate_detached(budget, self, grants_ptr, grants_n, entry, 17, 0)`, its operands
+    // `dst = instantiate_detached(budget, module, grants_ptr, grants_n, 0, 17, 0)`, its operands
     // named with `x` so the two spawns' names stay distinct.
-    let op15 = |dst: &str, x: &str, entry: u32, grants_ptr: u64, grants_n: u64| {
+    let op15 = |dst: &str, x: &str, module: &str, grants_ptr: u64, grants_n: u64| {
         format!(
-            "vb{x} = i64.extend_i32_u vb\n  vm{x} = i64.const -1\n  vgp{x} = i64.const {grants_ptr}\n  \
-             vgn{x} = i64.const {grants_n}\n  ve{x} = i64.const {entry}\n  vsl{x} = i64.const 17\n  \
-             vq{x} = i64.const 0\n  {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 \
+            "vb{x} = i64.extend_i32_u vb\n  vm{x} = i64.extend_i32_u {module}\n  \
+             vgp{x} = i64.const {grants_ptr}\n  vgn{x} = i64.const {grants_n}\n  \
+             ve{x} = i64.const 0\n  vsl{x} = i64.const 17\n  vq{x} = i64.const 0\n  \
+             {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 \
              (vb{x}, vm{x}, vgp{x}, vgn{x}, ve{x}, vsl{x}, vq{x})"
         )
     };
     let positional = rec
         .replace(
             "vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)",
-            &op15("vs", "s15", 1, 0, 0),
+            &op15("vs", "s15", "vserver", 0, 0),
         )
         .replace(
             "vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)",
-            &op15("vg", "g15", 3, 16640, 1),
+            &op15("vg", "g15", "vguest", 16640, 1),
         );
     assert_eq!(
         positional.matches("call.cap 6 15").count(),
@@ -370,7 +378,7 @@ fn granted_client_programs(guest: &str) -> [String; 2] {
 }
 
 /// The healthy exchange, pinning the program shape: the guest resolves `"fork"` and calls it once
-/// (the handler returns 7), the server's `svc.wait` counts 1, the root exits 1.
+/// (the handler returns 7), the server's `svc.wait` counts 1, the root returns 1.
 #[test]
 fn granted_client_that_calls_once_is_served() {
     for src in granted_client_programs(
@@ -1192,18 +1200,18 @@ fn spawn_bounded_budget_record_is_the_narrowed_jit_gap() {
 
 // ===== #744 (EXEC.md row 4) — guest-served exec: a parent serves its child's "exec" ==============
 
-/// #744 — the **mediation-consistent guest-served exec** (EXEC.md row 4): the parent grants its child a
-/// `"exec"` capability backed by **its own code**, and the child is none-the-wiser. The grant is a
-/// named-grant record whose `handle` carries `GRANT_SERVE_LIVE_TAG` over the parent's impl-export
-/// index (export 0 here, interface `"exec"` with one op `run`) — the record's reserved `flags` word
-/// stays 0 and ignored, as the ABI promises. The parent spawns its own module's func 1 detached
-/// (`positional`: through op 15's argument form instead of a v1 record); the spawn installs into the
-/// CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
-/// `"exec"` by name and calls `run(40, 2)` — which parks it until the PARENT's `svc.wait` serve loop
-/// runs handler func 2 over the parent's live world and replies `42`. The parent joins the child and
-/// exits `join*100 + served` = `42*100 + 1` = `4201`. The parent never holds a self-referential cap
-/// (the offer exists only in the child's table), so there is no reference cycle and nothing to
-/// mis-call.
+/// #744 — the **mediation-consistent guest-served exec** (EXEC.md row 4): the parent grants its
+/// child a `"exec"` capability backed by **its own code**, and the child is none-the-wiser. The
+/// grant is a named-grant record whose `handle` carries `GRANT_SERVE_LIVE_TAG` over the parent's
+/// impl-export index (export 0 here, interface `"exec"` with one op `run`) — the record's reserved
+/// `flags` word stays 0 and ignored, as the ABI promises. The parent spawns `"child"` detached
+/// (`positional`: through op 15's argument form instead of a v1 record); the spawn installs into
+/// the CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
+/// `"exec"` by name and calls `run(40, 2)` — which parks it until the PARENT's `svc.wait` serve
+/// loop runs handler func 2 over the parent's live world and replies `42`. The parent joins the
+/// child and returns `join*100 + served` = `42*100 + 1` = `4201`. The parent never holds a
+/// self-referential cap (the offer exists only in the child's table), so there is no reference
+/// cycle and nothing to mis-call.
 ///
 /// `handle` is a parameter so the fail-closed edge is pinned too: a tag over an impl-export the
 /// parent does not have is refused at spawn (`CapFault`) before any child state is built.
@@ -1211,15 +1219,15 @@ fn serve_live_program(handle: i32, positional: bool) -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     let spawn = if positional {
         "vb64 = i64.extend_i32_s vb
-  vself = i64.const -1
+  vmod = i64.extend_i32_u vchild
   vgp = i64.const 16640
   vg1 = i64.const 1
   vz64 = i64.const 0
-  vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vh (vb64, vself, vgp, vg1, vg1, vz64, vz64)"
+  vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vh (vb64, vmod, vgp, vg1, vz64, vz64, vz64)"
     } else {
         "vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)"
@@ -1229,12 +1237,13 @@ fn serve_live_program(handle: i32, positional: bool) -> String {
 memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
+data 16448 \"child\"
 data 16684 \"exec\"
 {rec}type 0 func (i64, i64) -> (i64)
 type 1 interface {{ run: 0 }}
 export 0 interface \"exec\" 1 {{ run: 2 }}
-import 0 \"exit\" (i32) -> ()
-func 0 () -> () {{
+export 0 func \"child\" 1
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
@@ -1244,15 +1253,14 @@ block 0 () {{
   vb = self.resolve vbp vbl
   vba = i64.const {budget_at}
   i32.store vba vb
-  ; the one grant record at 16640: {{name_off, name_len, handle = TAG | export, flags = 0}}
-  vg = i64.const 16640
-  vgn = i32.const 16684
-  i32.store vg vgn
-  vgl = i32.const 4
-  i32.store vg vgl offset=4
+  vcp = i64.const 16448
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl
+  vma = i64.const {module_at}
+  i32.store vma vchild
+  ; the one grant record at 16640, its handle `TAG | export`
   vgh = i32.const {handle}
-  i32.store vg vgh offset=8
-  {spawn}
+{exec_grant}  {spawn}
   vz = i32.const 0
   vneg = i32.lt_s vch vz
   br_if vneg 2(vch) 1(vh, vch)
@@ -1266,12 +1274,10 @@ block 1 (vh1: i32, vch1: i32) {{
   vt = i64.mul vj vk
   vs = i64.add vt vn
   vc = i32.wrap_i64 vs
-  call.import 0 (vc)
-  unreachable
+  return vc
 }}
 block 2 (verr: i32) {{
-  call.import 0 (verr)
-  unreachable
+  return verr
   }}
 }}
 func 1 (i64) -> (i64) {{
@@ -1295,7 +1301,9 @@ block 0 (va: i64, vb: i64) {{
 }}
 ",
         rec = rec::segment(17408, &child),
+        exec_grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
         budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + rec::MODULE_AT,
     )
 }
 
@@ -1391,11 +1399,10 @@ fn op_15_carries_a_live_self_serve_grant_too() {
 ///
 /// The ordering is forced, not hoped for: the fiber raises a flag and futex-parks, the root waits
 /// for the flag (plus a settle for the resumer to file its park), and only then spawns the client,
-/// which returns at once. After joining the client the root releases the fiber, the thread
-/// returns, and the serve loop reaches `svc.wait` with its only client long gone: it must return
-/// `0`, so the root exits `0`. The flag (byte 0) and the fiber's go-cell (byte 8) are in a
-/// `SharedRegion` the root mints and maps at 65536, and pre-maps into the server's window at the
-/// same offset.
+/// which returns at once. After joining the client the root releases the fiber, the thread returns,
+/// and the serve loop reaches `svc.wait` with its only client long gone: it must return `0`, so the
+/// root returns `0`. The flag (byte 0) and the fiber's go-cell (byte 8) are in a `SharedRegion` the
+/// root mints and maps at 65536, and pre-maps into the server's window at the same offset.
 #[test]
 fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
     let src = granted_client_program("  vz9 = i64.const 0\n  return vz9")
@@ -1508,11 +1515,11 @@ fn store_record_v1(at: u64) -> String {
         .collect()
 }
 
-/// A root that spawns **its own module** (`module = -1`) detached through a v1 record: the child's
-/// window is its own (`size_log2` 17, the module's declared memory), funded by the `"budget"` grant,
-/// with a one-byte args payload (`*` = 42) the child reads back at `module_args_base`. The child
-/// (func 1) returns `payload + 100`; the root exits with the join result. `pager` is `u32::MAX` here;
-/// `extra` rewrites let a test vary the record.
+/// A root that spawns `"child"` detached through a v1 record: the child's window is its own
+/// (`size_log2` 17, the module's declared memory), funded by the `"budget"` grant, with a one-byte
+/// args payload (`*` = 42) the child reads back at `module_args_base`. The child returns
+/// `payload + 100`; the root returns the join result. `pager` is `u32::MAX` here; `extra` rewrites
+/// let a test vary the record.
 fn detached_record_program() -> String {
     let args_base = temen_ir::module_args_base();
     format!(
@@ -1521,9 +1528,10 @@ memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
 data 16416 \"*\"
-import 0 \"exit\" (i32) -> ()
+data 16448 \"child\"
+export 0 func \"child\" 1
 
-func 0 () -> () {{
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
@@ -1531,14 +1539,17 @@ block 0 () {{
   vbp = i64.const 16400
   vbl = i64.const 6
   vb = self.resolve vbp vbl
+  vcp = i64.const 16448
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl
   vb64 = i64.extend_i32_u vb
   v32 = i64.const 32
   vbsh = i64.shl vb64 v32
-  vself = i64.const 4294967295
-  vr0 = i64.const 4294967297
+  vmod = i64.extend_i32_u vchild
+  vr0 = i64.const 1
   vr8 = i64.const 0
   vr16 = i64.const -4294967279
-  vr24 = i64.or vbsh vself
+  vr24 = i64.or vbsh vmod
   vr32 = i64.const 0
   vr40 = i64.const 0
   vr48 = i64.const 0
@@ -1551,8 +1562,7 @@ block 0 () {{
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   vc = i32.wrap_i64 vj
-  call.import 0 (vc)
-  unreachable
+  return vc
   }}
 }}
 
@@ -1571,8 +1581,10 @@ block 0 (v0: i64) {{
     )
 }
 
-/// Run with the Instantiator (`"vm"`), an AddressSpace (`"as"`) and a detached-window budget
-/// (`"budget"`, 1 MiB of `Budget.mem`).
+/// Run with the Instantiator (`"vm"`), an AddressSpace (`"as"`), a detached-window budget
+/// (`"budget"`, 1 MiB of `Budget.mem`), and, under its export name, the child image (#2219) of each
+/// function the program exports: a program exports the functions it spawns. The root returns its
+/// answer.
 fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
     run_detached_with(backend, src, 1 << 20, RunConfig::default())
 }
@@ -1583,40 +1595,56 @@ fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
 fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> Result<i32, String> {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
+    let images: Vec<(String, Arc<Module>)> = m
+        .exports
+        .iter()
+        .map(|e| {
+            let image = temen_ir::child_image_at(&m, e.func).expect("child image");
+            (e.name.clone(), Arc::new(image))
+        })
+        .collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let registry = Imports::new().provide("exit", HostCap::exit());
-        let inst = instantiate_with_imports(m, registry).expect("instantiate");
-        let r = inst.run_with_caps(
-            backend,
-            &cfg,
-            &[
-                (
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                ),
-                ("budget", HostCap::detached_budget(mem)),
-                (
-                    "as",
-                    HostCap::custom(5, 0, |h, win| h.grant_address_space(0, win)),
-                ),
-            ],
-        );
+        let inst = instantiate_with_imports(m, Imports::new()).expect("instantiate");
+        let mut caps = vec![
+            (
+                "vm",
+                HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
+            ),
+            ("budget", HostCap::detached_budget(mem)),
+            (
+                "as",
+                HostCap::custom(5, 0, |h, win| h.grant_address_space(0, win)),
+            ),
+        ];
+        for (name, image) in &images {
+            let image = Arc::clone(image);
+            caps.push((
+                name.as_str(),
+                HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                    h.grant_module(&image)
+                }),
+            ));
+        }
+        let r = inst.run_with_caps(backend, &cfg, &caps);
         let _ = tx.send(r.map(|r| r.outcome).map_err(|e| e.to_string()));
     });
     let outcome = rx
         .recv_timeout(std::time::Duration::from_secs(60))
         .unwrap_or_else(|e| panic!("{backend:?}: the run did not finish: {e}"))?;
     match outcome {
-        Outcome::Exited(code) => Ok(code),
+        Outcome::Returned(v) => match v[..] {
+            [Value::I32(answer)] => Ok(answer),
+            _ => Err(format!("unexpected result {v:?}")),
+        },
         other => Err(format!("unexpected outcome {other:?}")),
     }
 }
 
-/// #1863: a v1 record spawns the parent's own module into a window of its own, and the args
-/// payload arrives at the child's `module_args_base` — identically on every tier.
+/// #1863: a v1 record spawns a child image into a window of its own, and the args payload arrives
+/// at the child's `module_args_base` — identically on every tier.
 #[test]
-fn a_v1_record_spawns_self_detached_with_an_args_payload() {
+fn a_v1_record_spawns_a_child_detached_with_an_args_payload() {
     let src = detached_record_program();
     for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 142, "{b:?}");
@@ -1624,8 +1652,8 @@ fn a_v1_record_spawns_self_detached_with_an_args_payload() {
 }
 
 /// A v1 record whose `size_log2` is `0` asks for the module's declared window — a spawner holding a
-/// module it did not build need not know its size. A nonzero size that is not the declared memory is
-/// still refused, probeably: the root exits 7 when the spawn returns a negative handle.
+/// module it did not build need not know its size. A nonzero size that is not the declared memory
+/// is still refused, probeably: the root returns 7 when the spawn returns a negative handle.
 #[test]
 fn a_v1_record_with_size_zero_gets_the_declared_window() {
     let base = detached_record_program();
@@ -1669,16 +1697,17 @@ fn a_v1_record_with_an_offset_fails_closed() {
     }
 }
 
-/// A root that serves its own detached demand child: the v1 record names impl export 0 as the pager,
-/// and the root waits in `svc.wait` before it joins the child, then exits `byte + serves * 1000`. The
-/// child (func 1) returns the byte at `fault`, its first touch of that page. The pager (func 2) gets
-/// the fault address in the child's coordinates, stores 77 at `addr + 40000` in its own window, and
-/// replies with that address (#1862).
+/// A root that serves its own detached demand child: the v1 record names impl export 0 as the
+/// pager, and the root waits in `svc.wait` before it joins the child, then returns `byte + serves *
+/// 1000`. The child (func 1) returns the byte at `fault`, its first touch of that page. The pager
+/// (func 2) gets the fault address in the child's coordinates, stores 77 at `addr + 40000` in its
+/// own window, and replies with that address (#1862).
 fn detached_pager_program_at(fault: u64) -> String {
     let src = detached_record_program()
         .replace(
-            "import 0 \"exit\" (i32) -> ()\n",
-            "type 0 func (i64) -> (i64)\ntype 1 interface { page: 0 }\nexport 0 interface \"pager\" 1 { page: 2 }\nimport 0 \"exit\" (i32) -> ()\n",
+            "export 0 func \"child\" 1\n",
+            "export 0 func \"child\" 1\ntype 0 func (i64) -> (i64)\ntype 1 interface { page: 0 }\n\
+             export 0 interface \"pager\" 1 { page: 2 }\n",
         )
         // pager = impl export 0
         .replace("  vr16 = i64.const -4294967279\n", "  vr16 = i64.const 17\n")
@@ -1713,7 +1742,7 @@ block 0 (vaddr: i64) {
 
 /// #1862 + #1863: a **detached** demand child — a window the pager cannot address — is served by a
 /// pager that fills its own buffer and replies with its address. The child's first touch (at 20000)
-/// faults into a `page(addr)` the root serves from `svc.wait`; the child reads 77; the root exits
+/// faults into a `page(addr)` the root serves from `svc.wait`; the child reads 77; the root returns
 /// `77 + 1 serve * 1000`.
 #[test]
 fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
@@ -1792,7 +1821,7 @@ fn pager_child_guard_fault_is_fatal() {
 
 /// #1217: a demand child that **never faults** — it returns `5` without touching its window — must
 /// not strand the pager parked in `svc.wait`. The wait returns `0` once the child is gone; the
-/// `join` delivers `5`; the run exits `0 * 1000 + 5`.
+/// `join` delivers `5`; the root returns `0 * 1000 + 5`.
 #[test]
 fn pager_child_that_never_faults_releases_the_parked_pager() {
     let src =
@@ -1841,8 +1870,8 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
 
 /// Owner, 2026-09-29: `Budget.mem` accounts **live** windows — a detached child's window goes back to
 /// the budget that paid for it when the child ends. With a budget of exactly one window (2^17), the
-/// program spawns itself, joins, and spawns itself again: both run (`142 + 142`). Before, the first
-/// spawn spent the budget for good and the second was refused — a program could copy itself once,
+/// program spawns its child, joins, and spawns it again: both run (`142 + 142`). Before, the first
+/// spawn spent the budget for good and the second was refused — a program could spawn one child,
 /// ever.
 #[test]
 fn a_joined_detached_childs_window_returns_to_its_budget() {
@@ -1860,18 +1889,27 @@ fn a_joined_detached_childs_window_returns_to_its_budget() {
     }
 }
 
-/// #1944 — three generations of one `memory 17` module: the root splits its budget into
-/// a node with a `mem` ceiling of `child_ceiling` and spawns func 1 detached, paid from it; func 1
-/// spawns func 2 from its own `"budget"` — the node that paid for it — and returns `join + 20`, or the
-/// refusal's `-errno`. Func 2 returns 3. The root exits with its child's result plus 100.
+/// #1944 — three generations of one `memory 17` module, each a child image (#2219): the root splits
+/// its budget into a node with a `mem` ceiling of `child_ceiling` and spawns `"child"` detached,
+/// paid from it and granted `"grandchild"`; the child spawns `"grandchild"` from its own
+/// `"budget"` — the node that paid for it — and returns `join + 20`, or the refusal's `-errno`. The
+/// grandchild returns 3, and the root returns its child's result plus 100.
 fn three_generations(child_ceiling: i64) -> String {
+    let r1 = SpawnRec {
+        grants_ptr: 16640,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     format!(
         "memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
-{r1}{r2}import 0 \"exit\" (i32) -> ()
+data 16448 \"child\"
+data 16456 \"grandchild\"
+{r1}{r2}export 0 func \"child\" 1
+export 1 func \"grandchild\" 2
 
-func 0 () -> () {{
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 16384
   vl = i64.const 2
@@ -1884,14 +1922,21 @@ block 0 () {{
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, all)
   bf = i64.const 17436
   i32.store bf vsub
-  rp = i64.const 17408
+  cp = i64.const 16448
+  cl = i64.const 5
+  vc1 = self.resolve cp cl
+  mf = i64.const 17432
+  i32.store mf vc1
+  gp = i64.const 16456
+  gl = i64.const 10
+  vc2 = self.resolve gp gl
+{grandchild_grant}  rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (rp)
   vj = call.cap 6 1 (i32) -> (i64) vh (vch)
   k = i64.const 100
   vr = i64.add vj k
   vc = i32.wrap_i64 vr
-  call.import 0 (vc)
-  unreachable
+  return vc
   }}
 }}
 func 1 (i64) -> (i64) {{
@@ -1902,6 +1947,11 @@ block 0 (va: i64) {{
   vb = self.resolve np nl
   bf = i64.const 17532
   i32.store bf vb
+  gp = i64.const 16456
+  gl = i64.const 10
+  vg = self.resolve gp gl
+  mf = i64.const 17528
+  i32.store mf vg
   rp = i64.const 17504
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vz = i32.const 0
@@ -1926,8 +1976,9 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r1 = rec::segment(17408, &SpawnRec::v1(1)),
-        r2 = rec::segment(17504, &SpawnRec::v1(2)),
+        r1 = rec::segment(17408, &r1),
+        r2 = rec::segment(17504, &SpawnRec::v1(0)),
+        grandchild_grant = rec::grant("g", 16640, 16456, 10, "vc2"),
     )
 }
 
@@ -1942,19 +1993,20 @@ fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
 }
 
 /// #1909, INVARIANTS #3 R2 — a detached child's growth past its declared window spends the budget
-/// that paid for the window, on every tier. The root pays for func 1 from a node capped at the child's
-/// 64 KiB window plus 64 KiB; the child grows 64 KiB (it fits), asks for 64 KiB more (`-ENOMEM`), gives
-/// the first back (refunded at once), grows the second (it fits again), and returns a bit per answer.
-/// The root exits `child * 10 + 1` when its node's room is the whole ceiling again after the join: the
-/// child's end handed back the growth it still held.
+/// that paid for the window, on every tier. The root pays for `"child"` from a node capped at the
+/// child's 64 KiB window plus 64 KiB; the child grows 64 KiB (it fits), asks for 64 KiB more
+/// (`-ENOMEM`), gives the first back (refunded at once), grows the second (it fits again), and
+/// returns a bit per answer. The root returns `child * 10 + 1` when its node's room is the whole
+/// ceiling again after the join: the child's end handed back the growth it still held.
 fn growth_program() -> String {
     format!(
         "memory 16
 data 17920 \"vm\"
 data 17928 \"budget\"
-{rec}import 0 \"exit\" (i32) -> ()
+data 16448 \"child\"
+{rec}export 0 func \"child\" 1
 
-func 0 () -> () {{
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 17920
   vl = i64.const 2
@@ -1967,6 +2019,11 @@ block 0 () {{
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vbud (f, m, f)
   rb = i64.const 17436
   i32.store rb vsub
+  mp = i64.const 16448
+  ml = i64.const 5
+  vmod = self.resolve mp ml
+  mf = i64.const 17432
+  i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
@@ -1978,8 +2035,7 @@ block 0 () {{
   vhi = i64.mul vr ten
   vsum = i64.add vhi vfw
   vc = i32.wrap_i64 vsum
-  call.import 0 (vc)
-  unreachable
+  return vc
   }}
 }}
 func 1 (i64, i64) -> (i64) {{
@@ -2016,7 +2072,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1(1)),
+        rec = rec::segment(17408, &SpawnRec::v1(0)),
     )
 }
 
@@ -2029,18 +2085,19 @@ fn a_detached_childs_growth_spends_its_budget_on_every_tier() {
 }
 
 /// #2111 — a region a detached child mints spends the `channel` of the budget that paid for its
-/// window, on every tier. The root pays for func 1 from a node whose `channel` ceiling is one 64 KiB
-/// region; the child mints one (it fits) and asks for a second (`-ENOMEM`), returning a bit per answer.
-/// The root exits `child * 10 + 1` when its node's `channel` room is the whole ceiling again after the
-/// join: the child's end let go of the region it still held.
+/// window, on every tier. The root pays for `"child"` from a node whose `channel` ceiling is one 64
+/// KiB region; the child mints one (it fits) and asks for a second (`-ENOMEM`), returning a bit per
+/// answer. The root returns `child * 10 + 1` when its node's `channel` room is the whole ceiling
+/// again after the join: the child's end let go of the region it still held.
 fn region_program() -> String {
     format!(
         "memory 16
 data 17920 \"vm\"
 data 17928 \"budget\"
-{rec}import 0 \"exit\" (i32) -> ()
+data 16448 \"child\"
+{rec}export 0 func \"child\" 1
 
-func 0 () -> () {{
+func 0 () -> (i32) {{
 block 0 () {{
   vp = i64.const 17920
   vl = i64.const 2
@@ -2053,6 +2110,11 @@ block 0 () {{
   vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i32) vbud (f, f, f, c)
   rb = i64.const 17436
   i32.store rb vsub
+  mp = i64.const 16448
+  ml = i64.const 5
+  vmod = self.resolve mp ml
+  mf = i64.const 17432
+  i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
@@ -2064,8 +2126,7 @@ block 0 () {{
   vhi = i64.mul vr ten
   vsum = i64.add vhi vfw
   vc = i32.wrap_i64 vsum
-  call.import 0 (vc)
-  unreachable
+  return vc
   }}
 }}
 func 1 (i64, i64) -> (i64) {{
@@ -2087,7 +2148,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1(1)),
+        rec = rec::segment(17408, &SpawnRec::v1(0)),
     )
 }
 

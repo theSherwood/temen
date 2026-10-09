@@ -178,7 +178,9 @@ self.onmessage = async (e) => {
   // #1339: get-or-instantiate the unit installed at `slot`, keyed and fetched by its `(domain, unit)`
   // identity — never by the §22 code handle, which the guest revokes right after `install` (the unit
   // stays installed, only its handle dies), so a by-handle fetch came back empty and nulled a live
-  // slot. Cached per Worker; null if the unit has no emitted wasm (interpreter-only).
+  // slot. The slot is read once (#2259): another Worker can install into it between reads, so a
+  // second read could name another unit. Cached per Worker; null if the unit has no emitted wasm
+  // (interpreter-only).
   // The **pending invoke's** unit: its code handle is live for the duration of the `Jit.invoke`, so
   // it is the right cache key here (unlike an installed slot's — see `jitUnitForSlot`). Bytes come
   // from the per-vCPU pending stash the event published.
@@ -198,9 +200,9 @@ self.onmessage = async (e) => {
     if (uid < 0n) return null;
     let inst = jitInstCache.get(uid);
     if (inst) return inst;
-    const len = ex.temen_par_jit_unit_wasm_by_slot_len(slot);
+    const len = ex.temen_par_jit_unit_wasm_by_id_len(uid);
     if (len === 0) return null;
-    const ptr = Number(ex.temen_par_jit_unit_wasm_by_slot_ptr(slot));
+    const ptr = Number(ex.temen_par_jit_unit_wasm_by_id_ptr(uid));
     inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
     jitInstCache.set(uid, inst);
     return inst;
@@ -287,8 +289,8 @@ self.onmessage = async (e) => {
     }
     const cv = ex.temen_par_child_detached(prog, BigInt(ticket), registerForeign(childMem, fbase), slog);
     if (cv === 0) {
-      Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2);
       self.postMessage({ kind: 'fail', why: 'detached child vcpu build failed (codegen path)' });
+      Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2); // after the report (#2259)
       return;
     }
     const paged = ex.temen_par_inst_paged() === 1;
@@ -427,17 +429,13 @@ self.onmessage = async (e) => {
     // it. A Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so par.js's
     // promise would never settle: the vCPU's DOM item would sit `pending` until the harness's 30s
     // `waitForFunction` times out (the silent-flake signature). Convert it into a structured failure —
-    // wake any joiner (a non-root vCPU's completion slot) so a parent's `Atomics.wait` doesn't
-    // cascade-hang, then report `fail` with the trap text so the page/harness self-identifies.
+    // report `fail` with the trap text so the page/harness self-identifies, then wake any joiner (a
+    // non-root vCPU's completion slot) so a parent's `Atomics.wait` doesn't cascade-hang. Report
+    // first (#2259): a woken joiner traps `ThreadFault`, and its report must not reach the page first.
     let evc;
     try {
       evc = ex.temen_par_run(v);
     } catch (err) {
-      if (role !== 'root') {
-        const iv = new Int32Array(memory.buffer);
-        Atomics.store(iv, slot >> 2, 2); // 2 = trapped
-        Atomics.notify(iv, slot >> 2);
-      }
       let why = `vcpu ${role} host trap: ${err && err.message ? err.message : err}`;
       // If the trap was a panic=abort engine panic (surfaces as `unreachable`), the Rust panic hook
       // stashed FILE:LINE + message; the trap left memory intact, so read it back here (I22 (a)).
@@ -449,6 +447,11 @@ self.onmessage = async (e) => {
         }
       } catch { /* accessor absent (older build) or read failed — the trap text alone still ships */ }
       self.postMessage({ kind: 'fail', why });
+      if (role !== 'root') {
+        const iv = new Int32Array(memory.buffer);
+        Atomics.store(iv, slot >> 2, 2); // 2 = trapped
+        Atomics.notify(iv, slot >> 2);
+      }
       return; // don't temen_par_free(v): the instance just trapped; the page terminates this Worker
     }
     if (evc === DONE) {
@@ -461,12 +464,10 @@ self.onmessage = async (e) => {
       return;
     }
     if (evc === TRAP) {
-      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
-      Atomics.notify(i32(), slot >> 2);
       // A member's trap or `exit` is terminal for its whole domain (DESIGN.md §12, I37 — the
       // cooperative driver's `teardown_domains`). For the root domain (the root and its threads) that
       // is the run: report it, and the page tears every Worker down. A §5 detached child's
-      // domain ends with it here; its joiner observes the trap through the slot above.
+      // domain ends with it here; its joiner observes the trap through the slot below.
       // ev_b = 1: the guest called `exit(ev_a)`. Otherwise ev_c/ev_d are the trap name's bytes (a
       // `&'static str` in the shared memory).
       if (rootDomain && ex.temen_par_ev_b(v) === 1n) {
@@ -476,6 +477,10 @@ self.onmessage = async (e) => {
         const name = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n));
         self.postMessage({ kind: 'trap', why: `guest trap: ${name}${role === 'root' ? '' : ` (in a spawned thread)`}` });
       }
+      // Only now wake the joiner (#2259): a root-domain joiner traps `ThreadFault`, and its report
+      // must not reach the page before this one.
+      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
+      Atomics.notify(i32(), slot >> 2);
       ex.temen_par_free(v);
       return;
     }
@@ -618,15 +623,10 @@ self.onmessage = async (e) => {
   }
   } catch (err) {
     // Liveness backstop (see the note at the top): a trap escaped the setup/codegen path above.
-    // Wake any joiner so the parent's `Atomics.wait` on our completion slot doesn't cascade-hang,
-    // then report a structured failure carrying the Rust panic location the hook stashed.
-    try {
-      if (role !== 'root' && slot !== undefined) {
-        const iv = new Int32Array(memory.buffer);
-        Atomics.store(iv, slot >> 2, 2); // 2 = trapped → the parent's deliver_join sees a trap
-        Atomics.notify(iv, slot >> 2);
-      }
-    } catch { /* memory unusable — nothing more we can do */ }
+    // Report a structured failure carrying the Rust panic location the hook stashed, then wake any
+    // joiner so the parent's `Atomics.wait` on our completion slot doesn't cascade-hang. Report
+    // first (#2259): the woken parent traps `ThreadFault`, and its report must not reach the page
+    // first.
     let why = `vcpu ${role} setup/host trap: ${err && err.message ? err.message : err}`;
     try {
       const plen = ex && ex.temen_par_last_panic_len ? ex.temen_par_last_panic_len() : 0;
@@ -636,5 +636,12 @@ self.onmessage = async (e) => {
       }
     } catch { /* accessor absent or memory unusable — the trap text alone still ships */ }
     self.postMessage({ kind: 'fail', why });
+    try {
+      if (role !== 'root' && slot !== undefined) {
+        const iv = new Int32Array(memory.buffer);
+        Atomics.store(iv, slot >> 2, 2); // 2 = trapped → the parent's deliver_join sees a trap
+        Atomics.notify(iv, slot >> 2);
+      }
+    } catch { /* memory unusable — nothing more we can do */ }
   }
 };

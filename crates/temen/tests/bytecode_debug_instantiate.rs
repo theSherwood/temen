@@ -13,7 +13,6 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run_with_host, Host, IrPc, Value};
 use temen_ir::SpawnRec;
@@ -293,17 +292,29 @@ block 0 (v0: i64) {
 }
 "#;
 
-// #1867 — the chain detached: the root `(instantiator, budget) -> i64` spawns the child (func 1)
-// through a v1 record at 17408, paid from its budget. The child resolves its own `"budget"` and
-// spawns the grandchild (func 2) through the record at 17536, paid from it. Each window is its own,
-// so the grandchild writes its marker 200 above its NULL guard, at 16640. Each joins the next; the
-// grandchild returns 77, propagated up.
+// #1867 — the chain detached: the root `(instantiator, budget, c1, c2) -> i64` spawns the child
+// `c1`, func 1's child image (#2219), through a v1 record at 17408, paid from its budget and
+// granted `c2`, func 2's image, as `"g2"` by the list at 16768. The child resolves its own
+// `"budget"` and `"g2"` and spawns the grandchild through the record at 17536, paid from it. Each
+// window is its own, so the grandchild writes its marker 200 above its NULL guard, at 16640. Each
+// joins the next; the grandchild returns 77, propagated up.
 const DETACHED_DEPTH_TWO: &str = r#"memory 17
 data 16700 "budget"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vb: i32) {
+data 16720 "g2"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32, vc1: i32, vc2: i32) {
   rb = i64.const 17436
   i32.store rb vb
+  rm = i64.const 17432
+  i32.store rm vc1
+  ga = i64.const 16768
+  gn = i32.const 16720
+  i32.store ga gn
+  gl = i32.const 2
+  i32.store ga gl offset=4
+  i32.store ga vc2 offset=8
+  gz = i32.const 0
+  i32.store ga gz offset=12
   rp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (rp)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -321,6 +332,11 @@ block 0 (v0: i64) {
   hb = self.resolve np nl
   cb = i64.const 17564
   i32.store cb hb
+  gp = i64.const 16720
+  gl = i64.const 2
+  hg = self.resolve gp gl
+  cm = i64.const 17560
+  i32.store cm hg
   cp = i64.const 17536
   v8 = call.cap 6 17 (i64) -> (i32) v1 (cp)
   v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
@@ -338,20 +354,27 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// A `ScheduledDebugRun` on [`DETACHED_DEPTH_TWO`] with its two spawn records, whose host knows the
-/// module the child and the grandchild run.
+/// A `ScheduledDebugRun` on [`DETACHED_DEPTH_TWO`] with its two spawn records, whose host grants
+/// the root the child images of funcs 1 and 2.
 fn detached_depth_two_session() -> ScheduledDebugRun {
+    let r1 = SpawnRec {
+        grants_ptr: 16768,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     let src = format!(
         "{DETACHED_DEPTH_TWO}{}{}",
-        rec::segment(17408, &SpawnRec::v1(1)),
-        rec::segment(17536, &SpawnRec::v1(2))
+        rec::segment(17408, &r1),
+        rec::segment(17536, &SpawnRec::v1(0))
     );
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let inst = host.grant_instantiator(0, 128 << 10);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(inst), Value::I32(budget)], host)
+    let [c1, c2] =
+        [1, 2].map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));
+    let args = [inst, budget, c1, c2].map(Value::I32);
+    ScheduledDebugRun::new_with_host(&m, 0, &args, host)
         .expect("scheduled debug engine drives a detached depth-2 chain")
 }
 
@@ -397,10 +420,12 @@ fn depth_two_instantiate_matches_the_oracle() {
 #[test]
 fn breakpoint_in_a_grandchild_fires() {
     let mut r = detached_depth_two_session();
-    // The grandchild (func 2) is `const 0` (inst 0), `const 200` (inst 1), `store8` (inst 2), … — so
-    // stop at inst 3, just after the store, when its marker is in its window.
+    // The grandchild runs func 2's image, the second module the run admits at a spawn (module 0 is
+    // the program, 1 the child's image), and an image keeps its function indices. Its func 2 is
+    // `const 0` (inst 0), `const 200` (inst 1), `store8` (inst 2), … — so stop at inst 3, just
+    // after the store, when its marker is in its window.
     let after_store = IrPc {
-        module: 0,
+        module: 2,
         func: 2,
         block: 0,
         inst: 3,

@@ -197,7 +197,16 @@ fn every_park_site_on_every_engine() {
 }
 
 fn instrumented(src: &str) -> Arc<Module> {
-    let mut m = temen_text::parse_module(src).expect("parse");
+    instrumented_module(temen_text::parse_module(src).expect("parse"))
+}
+
+/// Func `f`'s child image (#2219) of `src`, instrumented as [`instrumented`] instruments `src`.
+fn instrumented_image(src: &str, f: u32) -> Arc<Module> {
+    let m = temen_text::parse_module(src).expect("parse");
+    instrumented_module(temen_ir::child_image_at(&m, f).expect("child image"))
+}
+
+fn instrumented_module(mut m: Module) -> Arc<Module> {
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
         shadow: Some(TEST_ARENA),
@@ -810,13 +819,14 @@ block 0 (vx: i64) {
     assert_eq!(h.svc_result(t), Some(42), "{site:?}: the handler's reply");
 }
 
-/// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one dispatch
-/// (op 15, then `child_offer`), while the root resumes a fiber, where the countdown fires. The root
-/// unwinds and rings `C`, which unwinds in its `svc.wait` without serving; `T` then enqueues its call
-/// and parks on the reply, and the freeze re-admits it: its wait is abandoned, its dispatch stays
-/// queued on `C`, and the ticket rides the root's powerbox. Through the codec, the thaw's re-issued
-/// call waits on that ticket and `C` serves the queued dispatch once: `served·1000 + reply`, `1042`.
-/// Issued twice, `C` would serve two.
+/// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one
+/// dispatch (op 15 spawning func 2's child image (#2219), then `child_offer`), while the root
+/// resumes a fiber, where the countdown fires. The root unwinds and rings `C`, which unwinds in its
+/// `svc.wait` without serving; `T` then enqueues its call and parks on the reply, and the freeze
+/// re-admits it: its wait is abandoned, its dispatch stays queued on `C`, and the ticket rides the
+/// root's powerbox. Through the codec, the thaw's re-issued call waits on that ticket and `C`
+/// serves the queued dispatch once: `served·1000 + reply`, `1042`. Issued twice, `C` would serve
+/// two.
 fn reply(site: ParkSite, engine: Engine) {
     reply_from(site, engine, T_CALLS);
 }
@@ -884,9 +894,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vmh = i64.extend_i32_u v1
   vb = i64.extend_i32_u v2
   vz = i64.const 0
-  ve = i64.const 2
   vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, ve, vlog, vz)
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
   vex = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vex)
   vcap64 = i64.extend_i32_u vcap
@@ -932,10 +941,11 @@ block 0 (vx: i64) {
 "#;
     let src = format!("{src}{t}{server}{FIBER}{CALLING_FIBER}");
     let inst = instrumented(&src);
+    let c = instrumented_image(&src, 2);
     let powerbox = || {
         let mut h = durable_host(&inst);
         let i = h.grant_instantiator(0, WINDOW as u64);
-        let m = h.grant_durable_module(&inst);
+        let m = h.grant_durable_module(&c);
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.grant_freeze_authority(FreezeScope::DetachedProgeny);
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
@@ -966,7 +976,7 @@ block 0 (vx: i64) {
 
     let art = temen_snapshot::freeze(&inst, &snap, &h).expect("serialize");
     let mut th = durable_host(&inst);
-    th.grant_durable_module(&inst);
+    th.grant_durable_module(&c);
     let mut twin = temen_snapshot::restore(&art, &inst, &mut th).expect("restore");
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let (res, _, th) = run(engine, &inst, &args, &twin, th);
