@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**348 exports** in 39 families — 301 referenced from JS, 47 referenced by nothing, 23 behind a `cfg`.
+**350 exports** in 39 families — 303 referenced from JS, 47 referenced by nothing, 25 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -44,7 +44,7 @@
 | `trap` | 2 | 2 | 0 |
 | `warm` | 5 | 5 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
-| `x2` | 13 | 13 | 13 |
+| `x2` | 15 | 15 | 15 |
 
 ## Exports by family
 
@@ -505,6 +505,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_x2_call_interp` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_mapped_now` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_nfuncs` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_paged` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_pagestate_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_shim_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_unit` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_slot_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`

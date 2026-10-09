@@ -64,9 +64,10 @@ self.onmessage = async (e) => {
   const x2_now_ms = () => performance.timeOrigin + performance.now();
   // The thread's emitted tier (#1414 B6-3): the coop driver's (`emittedTier`), over the run's
   // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
-  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set and
-  // writes its results at `out`, returning how many, or -(1 + the code the emitted code trapped
-  // with). The emitted code runs on a slice of fuel: each time it spends one it asks for another,
+  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set (and,
+  // on a page-checked tier, `"pagestate"` at its thread's page-state table) and writes its results at
+  // `out`, returning how many, or -(1 + the code the emitted code trapped with). The emitted code
+  // runs on a slice of fuel: each time it spends one it asks for another,
   // which it gets unless the run's `over` byte is set, so a run that ends while this thread is in
   // emitted code stops it within a slice. The emitted tier is not metered: the slice is only how
   // often it looks.
@@ -90,10 +91,10 @@ self.onmessage = async (e) => {
         slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
         shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
         callInterp: (target, argsPtr) => ex.temen_x2_call_interp(target, argsPtr),
-        paged: () => 0,
+        paged: () => ex.temen_x2_paged(),
         mapped: () => x2Mapped,
         mappedNow: () => ex.temen_x2_mapped_now(),
-        pagestatePtr: () => 0,
+        pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
         winPtr: () => x2Win,
         deliverFaultAddr: () => {},
         spillBytes: () => 0,
@@ -108,6 +109,10 @@ self.onmessage = async (e) => {
     }
     x2Tier.syncTableSync();
     for (const g of x2Tier.mappedGlobals) g.value = mapped;
+    if (ex.temen_x2_paged()) {
+      const ps = Number(ex.temen_x2_pagestate_ptr());
+      for (const g of x2Tier.pagestateGlobals) g.value = ps;
+    }
     for (const g of x2Tier.fuelGlobals) g.value = X2_SLICE;
     x2Tier.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
