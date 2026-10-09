@@ -8,7 +8,7 @@
 // child's completion slot; `memory.wait`/`notify` → `Atomics.wait`/`notify` on the futex word. A Worker
 // (not the page) is the only place a browser permits a blocking `Atomics.wait`.
 
-import { foreignImports, registerForeign } from './foreign-mem.js';
+import { foreignImports, foreignMemory, registerForeign, releaseForeign } from './foreign-mem.js';
 import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
@@ -34,7 +34,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime, tierupPaged, childMem, ticket, start, seedLen } = e.data;
+    jitB2, jitRuntime, tierupPaged, childMem, ticket, start, seedLen, x2Mem, x2MemId = -1 } = e.data;
   // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
   // _inst_codegen, temen_par_child*), where the shared-memory races have bitten: a double-free in the
@@ -53,12 +53,18 @@ self.onmessage = async (e) => {
   // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
   // The parallel driver's platform (#1414 B6, `X2_PLATFORM` in lib.rs): each thread of its run is a
   // Worker the page starts on `x2spawn`, with a stack and TLS block of its own allocated here, and
-  // its clock is one every Worker reads alike.
-  const x2_spawn = (threadStart) => {
+  // its clock is one every Worker reads alike. A thread of a detached child steps over the child's own
+  // memory (`memId`, B6-3c), which this Worker minted for the child or registered for its own task:
+  // the new Worker registers it under the same id. A child's memory this Worker only minted is the
+  // child's threads' once its first thread has it, so the memory goes with the child's last thread.
+  const x2_spawn = (threadStart, memId) => {
     const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
     const stackTop = ex.temen_par_alloc(STACK) + STACK;
     const tlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-    self.postMessage({ kind: 'x2spawn', start: threadStart, stackTop, tlsBase });
+    const msg = { kind: 'x2spawn', start: threadStart, stackTop, tlsBase };
+    if (memId >= 0) Object.assign(msg, { x2Mem: foreignMemory(memId), x2MemId: memId });
+    self.postMessage(msg);
+    if (memId >= 0 && memId !== x2MemId) releaseForeign(memId);
     return 0;
   };
   const x2_now_ms = () => performance.timeOrigin + performance.now();
@@ -184,6 +190,7 @@ self.onmessage = async (e) => {
     return;
   }
   if (role === 'x2thread') {
+    if (x2Mem) registerForeign(x2Mem, ex.temen_detached_header_bytes(), x2MemId);
     ex.temen_x2_thread(start);
     if (x2Tier !== null) x2Tier.free();
     self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do

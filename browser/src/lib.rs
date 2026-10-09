@@ -2857,8 +2857,10 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 
 // The imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
 // `///` on an extern block.)
-// - `x2_spawn(start)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. 0 when the
-//   request is posted; nonzero when this agent cannot start Workers.
+// - `x2_spawn(start, mem)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. `mem`
+//   is the foreign memory the thread's window lives in (a detached child's own, [`x2_child_window`]),
+//   or -1: the page hands it to the Worker, which registers it under the same id before it runs the
+//   thread. 0 when the request is posted; nonzero when this agent cannot start Workers.
 // - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
 //   alike (`performance.timeOrigin + performance.now()`).
 // - `x2_tierup(func, argv, argc, win, mapped, over, out)`: run `f{func}(win, env, ...argv)` of the
@@ -2873,7 +2875,7 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
-    fn x2_spawn(start: *mut core::ffi::c_void) -> i32;
+    fn x2_spawn(start: *mut core::ffi::c_void, mem: i32) -> i32;
     fn x2_now_ms() -> f64;
     fn x2_tierup(
         func: u32,
@@ -3172,18 +3174,15 @@ pub extern "C" fn temen_x2_pagestate_ptr() -> *const u8 {
         .unwrap_or(core::ptr::null())
 }
 
-/// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
-#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-type X2Thread = Box<dyn FnOnce() + Send>;
-
-/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, and the
-/// page's clock.
+/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, the
+/// page's clock, and each detached child's window in a `WebAssembly.Memory` of its own.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
-    spawn: |f| {
+    spawn: |f, window| {
         let start = Box::into_raw(Box::new(f));
+        let mem = window.map_or(-1, |id| id as i32);
         // SAFETY: on success the page hands `start` to exactly one Worker, which takes it back.
-        if unsafe { x2_spawn(start.cast()) } == 0 {
+        if unsafe { x2_spawn(start.cast(), mem) } == 0 {
             return Ok(());
         }
         // SAFETY: no Worker will run it, so it is still ours.
@@ -3193,13 +3192,28 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     // SAFETY: a pure import.
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
     tier: None,
+    child_window: Some(x2_child_window),
 };
+
+/// A detached child's window on the parallel driver (#1414 B6-3c): a `WebAssembly.Memory` of its own,
+/// as the per-Worker driver gives one (a header page, then the window, growable to the detached
+/// ceiling), minted on the spawner's Worker and handed to each Worker that runs one of the child's
+/// threads ([`x2_spawn`]'s `mem`).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_child_window(size_log2: u8) -> Option<std::sync::Arc<temen_interp::Region>> {
+    let size = 1u64 << size_log2;
+    let id = foreign_mem::mint(
+        DETACHED_HEADER_BYTES + size,
+        DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
+    )?;
+    Some(std::sync::Arc::new(foreign_region(id, size)))
+}
 
 /// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
 /// passed it. The Worker is the thread's alone, and closes once the thread returns.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
+pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
     // I22: a panic on this thread names its FILE:LINE.
     par_install_panic_capture();
     // SAFETY: `start` came from `X2_PLATFORM.spawn`, and the page handed it to this Worker alone.

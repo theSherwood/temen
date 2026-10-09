@@ -31,16 +31,26 @@ export function adoptMemory(memory) {
 }
 
 const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
+// Views of each registered memory, by id, refreshed when stale (`foreignImports`).
+const u8s = [], i32s = [], i64s = [];
 
 /**
  * Register a child `WebAssembly.Memory`; returns the id the engine names it by. `base` is where the
  * engine's region offset 0 lands in the memory — a detached child's window starts one host header page
  * in (`temen_detached_header_bytes()`), so its region is `[base, …)` and the header below stays the
- * host's (DETACHED_JIT.md §3.1).
+ * host's (DETACHED_JIT.md §3.1). `id` is the next free one, or the id another agent gave the memory,
+ * for a Worker the memory was handed to with it (#1414 B6-3c): such a Worker registers it first, so
+ * the ids it mints after cannot meet it.
  */
-export function registerForeign(memory, base = 0) {
-  mems.push({ m: adoptMemory(memory), base }); // a detached child's memory, shared by its threads' Workers
-  return mems.length - 1;
+export function registerForeign(memory, base = 0, id = mems.length) {
+  if (mems[id] !== undefined) throw new Error(`foreign memory ${id} is already registered`);
+  mems[id] = { m: adoptMemory(memory), base }; // a detached child's memory, shared by its threads' Workers
+  return id;
+}
+
+/** Let go of the memory registered as `id`, and of this agent's views of it. Its id is not reused. */
+export function releaseForeign(id) {
+  mems[id] = u8s[id] = i32s[id] = i64s[id] = undefined;
 }
 
 /** The registered Memory for `id` (e.g. to read a result out). */
@@ -68,7 +78,6 @@ export function foreignImports(engineMemory) {
     }
     return eu8;
   };
-  const u8s = [], i32s = [], i64s = [];
   // `end` is the memory-absolute end of the access (region offset + base + length).
   const child = (id, end) => {
     const v = u8s[id];

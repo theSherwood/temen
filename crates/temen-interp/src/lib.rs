@@ -34881,6 +34881,12 @@ impl Mem {
         !self.has_regions.load(Ordering::Relaxed)
     }
 
+    /// The embedder's id of the memory this window lives in when it is not the engine's own
+    /// ([`Region::Foreign`]): what a thread that steps over the window must be able to reach.
+    pub(crate) fn foreign_id(&self) -> Option<u32> {
+        self.back.foreign_id()
+    }
+
     /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
     /// base plus the window's absolute base offset — or `None` when the backing is non-flat (`Sparse`,
     /// `Paged` or `Foreign`: no contiguous address, so the emitted tier cannot serve this window and it stays

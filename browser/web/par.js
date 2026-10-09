@@ -190,7 +190,8 @@ export function makeRunner({ module, memory, ex }) {
     // seconds later, wherever it is, and one stopped inside the engine's allocator holds its lock for
     // good. Only a stop tears these down too, as the note on `signal` above says.
     const x2threads = new Set();
-    let started = 0;
+    // `childMems`: how many parallel-driver threads ran over a detached child's own memory.
+    let started = 0, childMems = 0;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
         if (signal) {
@@ -204,8 +205,10 @@ export function makeRunner({ module, memory, ex }) {
           w.onmessage = (e) => {
             const m = e.data;
             if (m.kind === 'x2spawn') {
-              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own.
-              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase });
+              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own,
+              // with the detached child's memory its window lives in, if any (B6-3c).
+              if (m.x2Mem) childMems++;
+              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'spawn') {
               // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
               // child's message carries its own win/winSize — the carve; a detached child's carries its
@@ -232,7 +235,7 @@ export function makeRunner({ module, memory, ex }) {
         startVcpu({ role: x2 ? 'x2root' : 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
-      return { value, exit, started, tierups };
+      return { value, exit, started, tierups, childMems };
     } finally {
       for (const w of workers) w.terminate();
       if (signal && signal.aborted) for (const w of x2threads) w.terminate();

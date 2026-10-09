@@ -21,6 +21,10 @@
 // Two more #1865 pins. A root's child of its OWN module (a record's `module = -1`) stays on the
 // interpreter under `instCodegen` even when the granted unit emits a function at the same entry: only a
 // child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails closed.
+//
+// #1414 B6-3c: the same three children on the parallel driver (`x2`), each in a Memory of its own too:
+// the spawning thread's Worker mints it, and the Worker that runs the child's thread is handed it.
+// Non-vacuity: `childMems === 3`, one thread over each child's own memory.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -182,7 +186,7 @@ block 0 (v0: i64) {
 
 const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
-  const once = async (eng, codegen = false, src = { root: rootSrc, child: childSrc, minter }) => {
+  const once = async (eng, codegen = false, src = { root: rootSrc, child: childSrc, minter }, x2 = false) => {
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
   const parse = (src) => {
@@ -198,10 +202,10 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const root = parse(src.root), child = src.child ? parse(src.child) : null;
   const run = makeRunner(eng);
   try {
-    const { value, started, tierups } = await run(root, codegen
+    const { value, started, tierups, childMems } = await run(root, codegen
       ? { instCodegen: true, unit: child, minter: src.minter, winSize: src.winSize }
-      : { inst: true, unit: child, minter: src.minter, winSize: src.winSize });
-    return { value: value.toString(), started, tierups };
+      : { inst: true, unit: child, minter: src.minter, winSize: src.winSize, x2 });
+    return { value: value.toString(), started, tierups, childMems };
   } catch (e) {
     return { err: String(e && e.message ? e.message : e) };
   }
@@ -217,7 +221,8 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const emitted = await once(await loadEngine(fresh), true);
   const self = await once(await loadEngine(fresh), true, { root: selfRootSrc, child: nineUnitSrc, minter: 1 << 16 });
   const carve = await once(await loadEngine(fresh), false, { root: carveRootSrc, child: null, minter: 0, winSize: 1 << 20 });
-  return { ...first, second, emitted, self, carve, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
+  const x2 = await once(await loadEngine(fresh), false, undefined, true);
+  return { ...first, second, emitted, self, carve, x2, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
 }, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC });
 
 await browser.close();
@@ -231,11 +236,14 @@ const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em
 const sf = res.self, cv = res.carve;
 const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 0;
 const carveOk = cv && cv.err === 'guest trap: CapFault';
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk;
+const x2 = res.x2;
+const x2Ok = x2 && !x2.err && x2.value === EXPECT && x2.childMems === 3;
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && x2Ok;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);
 console.log(`  own-module child under instCodegen: value ${sf?.value}/7 emitted ${sf?.tierups}/0${sf?.err ? ` · ERR ${sf.err}` : ''}`);
 console.log(`  carve spawn: ${carveOk ? 'fails closed' : `NOT refused (${cv?.err ?? cv?.value})`}`);
+console.log(`  on the parallel driver: value ${x2?.value}/${EXPECT} threads over a child's own memory ${x2?.childMems}/3${x2?.err ? ` · ERR ${x2.err}` : ''}`);
 console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
 process.exit(ok ? 0 : 1);

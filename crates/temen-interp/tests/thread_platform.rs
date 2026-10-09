@@ -5,12 +5,17 @@
 //! was handed: for every thread it starts, for every tier-up a thread meets, and for stopping
 //! emitted code when the run ends.
 
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+#[path = "support/rec.rs"]
+mod rec;
 
-use temen_interp::bytecode::{self, EmittedCall, EmittedTarget, ThreadPlatform, ThreadTier};
-use temen_interp::{Host, JitValidated, Region, Trap, Value};
-use temen_ir::{Module, ValType};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use temen_interp::bytecode::{
+    self, EmittedCall, EmittedTarget, ThreadPlatform, ThreadStart, ThreadTier,
+};
+use temen_interp::{ForeignOps, Host, JitValidated, Region, Trap, Value};
+use temen_ir::{Module, SpawnRec, ValType};
 use temen_text::parse_module;
 
 /// The root spawns three threads, each adding 1 to the cell at 16384, joins them, and returns the
@@ -76,9 +81,9 @@ fn run(m: &Module, platform: ThreadPlatform) -> Result<Vec<Value>, Trap> {
 static STARTED: AtomicUsize = AtomicUsize::new(0);
 static CLOCK_READS: AtomicUsize = AtomicUsize::new(0);
 
-fn counting_spawn(f: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+fn counting_spawn(f: ThreadStart, window: Option<u32>) -> std::io::Result<()> {
     STARTED.fetch_add(1, Ordering::SeqCst);
-    (ThreadPlatform::OS.spawn)(f)
+    (ThreadPlatform::OS.spawn)(f, window)
 }
 
 fn counting_clock() -> u64 {
@@ -108,7 +113,7 @@ fn every_thread_of_a_run_starts_through_its_hosts_platform() {
 #[test]
 fn a_platform_that_refuses_a_thread_ends_the_run() {
     let platform = ThreadPlatform {
-        spawn: |_| Err(std::io::Error::other("no threads here")),
+        spawn: |_, _| Err(std::io::Error::other("no threads here")),
         ..ThreadPlatform::OS
     };
     assert_eq!(run(&module(SPAWN_THREE), platform), Err(Trap::ThreadFault));
@@ -756,4 +761,232 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
         ..ThreadPlatform::OS
     };
     assert_eq!(run_over(&m, spilling, flat_window()), interpreted);
+}
+
+// ----- a detached child's window in the platform's memory (#1414 B6-3c) -----------------------
+
+/// The root spawns the granted module's entry 0, detached in its declared window, by the v1 record
+/// at 17536, paid from `budget`. A refused spawn is tried once more. The root returns what the
+/// child returned, or the second refusal's errno.
+fn spawn_and_join() -> String {
+    format!(
+        "memory 17
+func (i32, i32, i64) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i64) {{
+  vma = i64.const 17560
+  i32.store vma vmod
+  vb = i32.wrap_i64 vbud
+  vba = i64.const 17564
+  i32.store vba vb
+  vrp = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vz = i32.const 0
+  vneg = i32.lt_s vch vz
+  br_if vneg 1(vinst) 2(vinst, vch)
+}}
+block 1 (vi: i32) {{
+  vrp1 = i64.const 17536
+  vch1 = call.cap 6 17 (i64) -> (i32) vi (vrp1)
+  vz1 = i32.const 0
+  vneg1 = i32.lt_s vch1 vz1
+  br_if vneg1 3(vch1) 2(vi, vch1)
+}}
+block 2 (vi2: i32, vch2: i32) {{
+  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
+  return vr
+}}
+block 3 (ve: i32) {{
+  vr = i64.extend_i32_s ve
+  return vr
+  }}
+}}
+{rec}",
+        rec = rec::segment(17536, &SpawnRec::v1(0)),
+    )
+}
+
+/// The child: it stores 7 at 16400 of its window, and a thread of it stores 35 at 16408. It returns
+/// their sum once the thread is done.
+const CHILD_AND_THREAD: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16400
+  v7 = i64.const 7
+  i64.store va v7
+  vz = i64.const 0
+  t = thread.spawn 1 vz vz
+  j = thread.join t
+  vb = i64.const 16408
+  vt = i64.load vb
+  vs = i64.add v7 vt
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vb = i64.const 16408
+  v35 = i64.const 35
+  i64.store vb v35
+  return v35
+  }
+}
+";
+
+/// Run [`spawn_and_join`] under `platform`, granting it [`CHILD_AND_THREAD`] and a budget of `mem`
+/// bytes.
+fn run_detached(platform: ThreadPlatform, mem: i64) -> Result<Vec<Value>, Trap> {
+    let m = module(&spawn_and_join());
+    let mut host = Host::new();
+    host.set_thread_platform(platform);
+    let inst = host.grant_instantiator(0, 1 << 17);
+    let child = host.grant_module(&module(CHILD_AND_THREAD));
+    let budget = host.grant_budget(-1, mem, -1);
+    let args = [
+        Value::I32(inst),
+        Value::I32(child),
+        Value::I64(budget as i64),
+    ];
+    let mut fuel = 50_000_000;
+    bytecode::compile_and_run_capture_over_parallel_with_host(
+        &m,
+        0,
+        &args,
+        &mut fuel,
+        &[],
+        None,
+        &mut host,
+    )
+    .expect("the parallel driver runs the module")
+    .0
+}
+
+/// The test's own foreign memories, as a browser's are a child's `WebAssembly.Memory`: byte
+/// vectors the engine reaches only through [`FAKE_OPS`].
+static FAKE_MEMS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+fn fake_read(id: u32, off: u64, out: &mut [u8]) {
+    let o = off as usize;
+    out.copy_from_slice(&FAKE_MEMS.lock().unwrap()[id as usize][o..o + out.len()]);
+}
+
+fn fake_write(id: u32, off: u64, data: &[u8]) {
+    let o = off as usize;
+    FAKE_MEMS.lock().unwrap()[id as usize][o..o + data.len()].copy_from_slice(data);
+}
+
+fn fake_fill(id: u32, off: u64, len: u64, b: u8) {
+    FAKE_MEMS.lock().unwrap()[id as usize][off as usize..(off + len) as usize].fill(b);
+}
+
+fn fake_copy(id: u32, dst: u64, src: u64, len: u64) {
+    let range = src as usize..(src + len) as usize;
+    FAKE_MEMS.lock().unwrap()[id as usize].copy_within(range, dst as usize);
+}
+
+/// A load, a store or a compare-exchange: what these guests' runs perform.
+fn fake_atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+    let mut mems = FAKE_MEMS.lock().unwrap();
+    let cell = &mut mems[id as usize][off as usize..(off + width as u64) as usize];
+    let mut raw = [0u8; 8];
+    raw[..cell.len()].copy_from_slice(cell);
+    let old = u64::from_le_bytes(raw);
+    let new = match kind {
+        0 => return old,
+        1 => a,
+        8 if old == a => b,
+        8 => return old,
+        k => unreachable!("atomic kind {k}: these runs load, store and compare-exchange only"),
+    };
+    let len = cell.len();
+    cell.copy_from_slice(&new.to_le_bytes()[..len]);
+    old
+}
+
+fn fake_grow(id: u32, len: u64) -> bool {
+    let mut mems = FAKE_MEMS.lock().unwrap();
+    let m = &mut mems[id as usize];
+    if m.len() < len as usize {
+        m.resize(len as usize, 0);
+    }
+    true
+}
+
+static FAKE_OPS: ForeignOps = ForeignOps {
+    read: fake_read,
+    write: fake_write,
+    fill: fake_fill,
+    copy_within: fake_copy,
+    atomic: fake_atomic,
+    grow: fake_grow,
+};
+
+/// A child window in a fresh foreign memory of the test's own.
+fn fake_child_window(size_log2: u8) -> Option<Arc<Region>> {
+    let len = 1u64 << size_log2;
+    let mut mems = FAKE_MEMS.lock().unwrap();
+    mems.push(vec![0; len as usize]);
+    let id = mems.len() as u32 - 1;
+    Some(Arc::new(Region::foreign(id, len, &FAKE_OPS)))
+}
+
+/// The window each thread [`a_detached_childs_window_is_in_the_platforms_memory`]'s run starts was
+/// spawned over.
+static SPAWNED_OVER: Mutex<Vec<Option<u32>>> = Mutex::new(Vec::new());
+
+fn recording_spawn(f: ThreadStart, window: Option<u32>) -> std::io::Result<()> {
+    SPAWNED_OVER.lock().unwrap().push(window);
+    (ThreadPlatform::OS.spawn)(f, window)
+}
+
+#[test]
+fn a_detached_childs_window_is_in_the_platforms_memory() {
+    let want = Ok(vec![Value::I64(42)]);
+    assert_eq!(
+        run_detached(ThreadPlatform::OS, 1 << 20),
+        want,
+        "7 + 35, in a window of the engine's"
+    );
+    let platform = ThreadPlatform {
+        spawn: recording_spawn,
+        child_window: Some(fake_child_window),
+        ..ThreadPlatform::OS
+    };
+    assert_eq!(run_detached(platform, 1 << 20), want);
+    let mems = FAKE_MEMS.lock().unwrap();
+    assert_eq!(mems.len(), 1, "one child, one memory");
+    let word = |at: usize| i64::from_le_bytes(mems[0][at..at + 8].try_into().unwrap());
+    assert_eq!(
+        (word(16400), word(16408)),
+        (7, 35),
+        "the child and its thread stored into the platform's memory"
+    );
+    assert_eq!(
+        *SPAWNED_OVER.lock().unwrap(),
+        [Some(0), Some(0)],
+        "the child's task and its thread were each spawned over its memory"
+    );
+}
+
+static WINDOWS_ASKED: AtomicUsize = AtomicUsize::new(0);
+
+/// A platform that cannot make the first child window it is asked for, and makes the next in the
+/// engine's own kind of memory.
+fn refuse_the_first_window(size_log2: u8) -> Option<Arc<Region>> {
+    match WINDOWS_ASKED.fetch_add(1, Ordering::SeqCst) {
+        0 => None,
+        _ => Some(Arc::new(
+            Region::owned_zeroed(1 << size_log2, temen_interp::host_page_size()).expect("a window"),
+        )),
+    }
+}
+
+#[test]
+fn a_child_window_the_platform_cannot_make_refuses_the_spawn_and_charges_nothing() {
+    // The budget holds one window. The refused spawn hands it back, so the second spawn finds it.
+    let platform = ThreadPlatform {
+        child_window: Some(refuse_the_first_window),
+        ..ThreadPlatform::OS
+    };
+    assert_eq!(run_detached(platform, 1 << 16), Ok(vec![Value::I64(42)]));
+    assert_eq!(WINDOWS_ASKED.load(Ordering::SeqCst), 2);
 }

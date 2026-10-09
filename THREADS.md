@@ -409,9 +409,11 @@ property, so in practice:
   units mask against the run's window and table. A paged emit checks each access against its
   thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A spilling
   emit pushes its frames' live words to its thread's spill stack, and a `gc.roots` in a bounce scans
-  them with the task beneath (B6-3b-4c).
-  Detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
-  driver (B6-4).
+  them with the task beneath (B6-3b-4c). A detached child's window is a `WebAssembly.Memory` of its
+  own, as on the per-Worker driver (`ThreadPlatform::child_window`): the spawning thread's Worker
+  mints it, and the Worker of each of the child's threads is handed it, so the child's threads
+  interpret over it through `Region::Foreign` (B6-3c-1). Emitted children (B6-3c-2, 3c-3) follow;
+  then it replaces the per-Worker `Vcpu` driver (B6-4).
 
 ### Known wrinkles — all resolved in `4c-wasm`
 

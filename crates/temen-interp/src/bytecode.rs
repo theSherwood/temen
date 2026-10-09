@@ -2235,7 +2235,9 @@ fn admit_detached_child(
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own.
+/// built at once, over a reservation of the engine's own, or over a backing `backing` makes
+/// ([`ThreadPlatform::child_window`]). A backing it cannot make refuses the spawn, and hands the
+/// window's bytes back to the budget that paid for them.
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
@@ -2243,13 +2245,26 @@ fn admit_detached_in_process(
     source: &ModuleSource,
     spawner: Option<(u32, std::sync::Arc<Compiled>)>,
     unit: Option<(u32, u32)>,
+    backing: Option<ChildBacking>,
 ) -> Result<Option<AdmittedChild>, Trap> {
     let Some((mut child, window)) =
         admit_detached_child(host, pm, s, false, source, spawner, unit)?
     else {
         return Ok(None);
     };
-    child.mem = Some(window.build(None, &mut child.host)?);
+    let back = match backing {
+        None => None,
+        Some(make) => match make(window.size_log2) {
+            Some(back) => Some(back),
+            None => {
+                if let Some((budget, bytes)) = child.lease {
+                    host.release_detached(budget, bytes);
+                }
+                return Ok(None);
+            }
+        },
+    };
+    child.mem = Some(window.build(back, &mut child.host)?);
     Ok(Some(child))
 }
 
@@ -8497,7 +8512,8 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn, source, spawner, unit)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn, source, spawner, unit, None)?
+    else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -13962,6 +13978,9 @@ struct SchedCore {
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
+    /// Where a detached child's window lives ([`ThreadPlatform::child_window`]): executor 2's
+    /// platform may give it a backing of its own; the pump builds it in the engine's.
+    child_window: Option<ChildBacking>,
 }
 
 /// The cooperative pump's state for the host's emitted tier (#926): which module-0 calls tier up,
@@ -14438,6 +14457,7 @@ impl SchedCore {
             hooked_twins,
             released_envs,
             clock,
+            child_window: None,
         })
     }
 }
@@ -14557,6 +14577,7 @@ impl CoopSched {
                 hooked_twins,
                 released_envs,
                 clock,
+                child_window: _, // the pump builds every child's window in the engine's memory
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -15044,6 +15065,7 @@ impl SchedCore {
             forked_twins,
             hooked_twins,
             clock,
+            child_window,
             ..
         } = self;
         let EmitTier {
@@ -15818,6 +15840,7 @@ impl SchedCore {
                     &dom.source,
                     spawner,
                     unit,
+                    *child_window,
                 );
                 let child = match admitted {
                     Ok(Some(c)) => c,
@@ -17094,21 +17117,35 @@ struct ThreadRun {
 /// of its own, and a browser's threads can run emitted wasm.
 #[derive(Clone)]
 pub struct ThreadPlatform {
-    /// Start `f` on a thread of its own, which nothing joins. An error refuses the thread.
-    pub spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    /// Start `f` on a thread of its own, which nothing joins. The second argument names the memory
+    /// the thread's window lives in when it is one of [`Self::child_window`]'s
+    /// ([`super::Region::foreign_id`]), which the thread must be able to reach. An error refuses the
+    /// thread.
+    pub spawn: fn(ThreadStart, Option<u32>) -> std::io::Result<()>,
     /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
+    /// Where a detached child's window lives (#1414 B6-3c): a backing of the embedder's own, apart
+    /// from the engine's memory, `2^size_log2` bytes to start with; `None` builds it in the engine's,
+    /// as every other driver does. A backing the embedder cannot make refuses the spawn.
+    pub child_window: Option<ChildBacking>,
 }
+
+/// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
+pub type ThreadStart = Box<dyn FnOnce() + Send>;
+
+/// Make a detached child's window backing of `2^size_log2` bytes ([`ThreadPlatform::child_window`]).
+pub type ChildBacking = fn(u8) -> Option<std::sync::Arc<super::Region>>;
 
 impl ThreadPlatform {
     /// An OS thread per task (D56), the process-wide monotonic clock the pump's busy-poll deadlines
     /// use, and no emitted tier.
     pub const OS: ThreadPlatform = ThreadPlatform {
-        spawn: |f| std::thread::Builder::new().spawn(f).map(drop),
+        spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
+        child_window: None,
     };
 }
 
@@ -17367,6 +17404,7 @@ fn drive_threads(
     if let Some(e) = &eligible {
         core.arm_tierup(e, page_checked);
     }
+    core.child_window = platform.child_window;
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
@@ -17398,7 +17436,7 @@ fn drive_threads(
         let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
         run.state.lock_unpoisoned().live += 1;
         let r = std::sync::Arc::clone(&run);
-        run.start_thread(move || r.watch(&bell, seen));
+        run.start_thread(move || r.watch(&bell, seen), None);
     }
     run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
     // The run is over, and every thread leaves at its next look: wait for them all to go.
@@ -17513,7 +17551,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             release(g);
             for (j, mem, fuel) in made {
                 let r = std::sync::Arc::clone(&run);
-                run.start_thread(move || run_task_thread(r, j, mem, fuel));
+                let window = mem.as_ref().and_then(Mem::foreign_id);
+                run.start_thread(move || run_task_thread(r, j, mem, fuel), window);
             }
             g = run.state.lock_unpoisoned();
         }
@@ -17734,8 +17773,10 @@ impl ThreadRun {
 
     /// Start `f` on a thread of its own, one the run has counted in ([`Threads::live`]). A thread
     /// that cannot start ends the run, which cannot go on without it (D56: a task is a thread).
-    fn start_thread(&self, f: impl FnOnce() + Send + 'static) {
-        if (self.platform.spawn)(Box::new(f)).is_err() {
+    /// Start `f` on a thread of its own, over a window in `window`, the memory
+    /// [`ThreadPlatform::spawn`] must let it reach, if any.
+    fn start_thread(&self, f: impl FnOnce() + Send + 'static, window: Option<u32>) {
+        if (self.platform.spawn)(Box::new(f), window).is_err() {
             let mut g = self.state.lock_unpoisoned();
             g.live -= 1;
             self.end(&mut g);

@@ -273,6 +273,15 @@ impl Region {
         matches!(self, Region::Foreign(_))
     }
 
+    /// The embedder's id of a [`Region::Foreign`] backing, the memory its accesses reach: `None` for
+    /// every other variant.
+    pub fn foreign_id(&self) -> Option<u32> {
+        match self {
+            Region::Foreign(f) => Some(f.id),
+            _ => None,
+        }
+    }
+
     /// Whether [`grow_to`](Region::grow_to) can actually **extend** this backing past its current
     /// length — the two growable variants ([`Region::Foreign`]'s embedder memory, and the
     /// relocatable [`Region::Growable`]). Every other variant is fixed-size, where `grow_to` only
