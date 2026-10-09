@@ -66,7 +66,8 @@ self.onmessage = async (e) => {
   // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
   // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set (and,
   // on a page-checked tier, `"pagestate"` at its thread's page-state table) and writes its results at
-  // `out`, returning how many, or -(1 + the code the emitted code trapped with). The emitted code
+  // `out`, returning how many, or -(1 + the code the emitted code trapped with). On a spilling tier
+  // its frames push to the thread's spill stack, which lives as long as the thread. The emitted code
   // runs on a slice of fuel: each time it spends one it asks for another,
   // which it gets unless the run's `over` byte is set, so a run that ends while this thread is in
   // emitted code stops it within a slice. The emitted tier is not metered: the slice is only how
@@ -90,15 +91,15 @@ self.onmessage = async (e) => {
         slotUnit: (slot) => ex.temen_x2_slot_unit(slot),
         slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
         shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
-        callInterp: (target, argsPtr) => ex.temen_x2_call_interp(target, argsPtr),
+        callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
         paged: () => ex.temen_x2_paged(),
         mapped: () => x2Mapped,
         mappedNow: () => ex.temen_x2_mapped_now(),
         pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
         winPtr: () => x2Win,
         deliverFaultAddr: () => {},
-        spillBytes: () => 0,
-        spillPtr: () => 0,
+        spillBytes: () => ex.temen_x2_spill_bytes(),
+        spillPtr: () => ex.temen_x2_spill_ptr(),
         fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
       });
       const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
