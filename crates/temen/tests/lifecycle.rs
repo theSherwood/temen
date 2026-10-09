@@ -16,28 +16,27 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// `src` with its spawn record (func 1, at 20480), and a host for it: the guest's two args, an
-/// `Instantiator` and the `Budget` that pays for the child its own module spawns. The host also holds
-/// a 64 KiB `SharedRegion` the guest can resolve as `"region"`, over an OS shared-memory object so the
-/// JIT can alias it into a child's window.
-fn setup(src: &str) -> (Module, Host, [i32; 2]) {
-    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(1)));
+/// `src` with its spawn record (at 20480), and a host for it: the guest's three args, an
+/// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
+/// The host also holds a 64 KiB `SharedRegion` the guest can resolve as `"region"`, over an OS
+/// shared-memory object so the JIT can alias it into a child's window.
+fn setup(src: &str) -> (Module, Host, [i32; 3]) {
+    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(0)));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();
-    h.set_self_module(&Arc::new(m.clone()));
     let ih = h.grant_instantiator(0, 128 << 10);
     let bh = h.grant_budget(-1, 1 << 20, -1);
     let region = h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10));
     h.register_cap_name("region", region);
-    (m, h, [ih, bh])
+    let ch = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+    (m, h, [ih, bh, ch])
 }
 
 /// `run` on its own thread with a deadline, so a run that never ends (a child the run waits for)
@@ -93,10 +92,12 @@ fn run_jit(src: &str) -> JitOutcome {
 fn poll_loop(end: &str, child: &str) -> String {
     format!(
         "memory 17
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, vb: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, vb: i32, vmod: i32) {{
   vrb = i64.const 20508
   i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   br 1(v0, vch)
@@ -168,10 +169,12 @@ fn poll_terminal_status_converges_trapping_child() {
 /// `poll` of a child that never finishes is `0` (running), and `detach` lets the parent return
 /// without waiting for it: the child is still spinning when the run ends, and ends with it.
 const POLL_RUNNING_THEN_DETACH: &str = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vb: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32, vmod: i32) {
   vrb = i64.const 20508
   i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vp = call.cap 6 9 (i32) -> (i32) v0 (vch)
@@ -213,8 +216,8 @@ fn poll_running_is_zero_and_detach_does_not_block() {
 /// A kill that did nothing would let it return `7`, and `poll` would report `1`: the test fails fast.
 const KILL_RUNNING: &str = "memory 17
 data 16384 \"region\"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vb: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32, vmod: i32) {
   rn = i64.const 16384
   rl = i64.const 6
   vrg = self.resolve rn rl
@@ -229,6 +232,8 @@ block 0 (v0: i32, vb: i32) {
   i64.store vro2 vgo
   vrb = i64.const 20508
   i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vk = call.cap 6 12 (i32) -> (i32) v0 (vch)
@@ -292,10 +297,12 @@ fn kill_ends_a_running_child_before_it_can_return() {
 /// the result is backend-stable: `0` on the interpreter (kill flags the child, detach drops the claim)
 /// and `0` on the JIT.
 const KILL_DETACH: &str = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vb: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32, vmod: i32) {
   vrb = i64.const 20508
   i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vk = call.cap 6 12 (i32) -> (i32) v0 (vch)
@@ -334,10 +341,12 @@ fn kill_detach_match_interp() {
 /// at the first poll → `1*10 + 1 = 11`. So `== 1` is a deterministic witness that the child executed
 /// concurrently with the parent — the whole point of async children (the substrate for a pipeline).
 const POLL_RUNNING: &str = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vb: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vb: i32, vmod: i32) {
   vrb = i64.const 20508
   i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vfirst = call.cap 6 9 (i32) -> (i32) v0 (vch)

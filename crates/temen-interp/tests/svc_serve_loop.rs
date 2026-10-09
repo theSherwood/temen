@@ -236,8 +236,8 @@ block 0 (va: i64, vb: i64) {
 /// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
 /// attaches the live-callee cap into a rebindable import slot and calls `call.import 0` — the
 /// discovery-then-attach pattern over a live domain. Same enqueue/park/reply machinery. The
-/// serving child is func 1, spawned detached by the record [`slot_caller`] appends at 17600 and
-/// paid from the `Budget` `v1`.
+/// serving child is func 1's child image (#2219, the `Module` `v2`), spawned detached by the record
+/// [`slot_caller`] appends at 17600 and paid from the `Budget` `v1`.
 const SLOT_CALLER: &str = r#"
 memory 17
 type 0 func (i64, i64) -> (i64)
@@ -245,8 +245,10 @@ type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 import 0 "svc.add" (i64, i64) -> (i64) rebindable
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17624
+  i32.store vrm v2
   vrb = i64.const 17628
   i32.store vrb v1
   vrp = i64.const 17600
@@ -283,7 +285,7 @@ block 0 (va: i64, vb: i64) {
 
 /// [`SLOT_CALLER`] with its spawn record.
 fn slot_caller() -> String {
-    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1(1)))
+    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1(0)))
 }
 
 #[test]
@@ -294,7 +296,6 @@ fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
         m
     });
     let mut host = Host::new();
-    host.set_self_module(&m);
     // The rebindable slot's template: typed to the (first-interned) offer interface, unbound.
     host.set_import_bindings(vec![temen_interp::BoundImport {
         type_id: 268435456, // GUEST_IMPL_BASE — the offer's structural intern (D59-deterministic)
@@ -305,9 +306,10 @@ fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
     }]);
     let h = host.grant_instantiator(0, 1u64 << 17);
     let b = host.grant_budget(-1, 1 << 20, -1);
+    let c = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     let mut fuel = 5_000_000u64;
-    let r =
-        run_with_host(&m, 0, &[Value::I32(h), Value::I32(b)], &mut fuel, &mut host).expect("run");
+    let args = [h, b, c].map(Value::I32);
+    let r = run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(142)],
@@ -512,8 +514,9 @@ fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
 /// B's first guest intern, `GUEST_IMPL_BASE`) and calls through it: the call enqueues on A,
 /// parks B's vCPU, A's `svc.wait` serves `add(40, 2)`, and the reply wakes B — two siblings
 /// coordinating through a live peer their parent introduced, no shared memory, no parent
-/// relay. Composite: join(A=1)*100 + join(B=42) = 142. Both are spawned detached by the records
-/// [`sibling_as_service`] appends at 17664 and 17760, paid from the `Budget` `v1`.
+/// relay. Composite: join(A=1)*100 + join(B=42) = 142. Both are child images (#2219) — A of func 1,
+/// the `Module` `v2`, and B of func 2, `v3` — spawned detached by the records [`sibling_as_service`]
+/// appends at 17664 and 17760, paid from the `Budget` `v1`.
 const SIBLING_AS_SERVICE: &str = r#"
 memory 17
 type 0 func (i64, i64) -> (i64)
@@ -521,8 +524,10 @@ type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 3 }
 data 16584 "adder"
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+  vrma = i64.const 17688
+  i32.store vrma v2
   vrba = i64.const 17692
   i32.store vrba v1
   vrpa = i64.const 17664
@@ -537,6 +542,8 @@ block 0 (v0: i32, v1: i32) {
   i32.store va2 vv2
   va3 = i64.const 16648
   i32.store va3 vcap
+  vrmb = i64.const 17784
+  i32.store vrmb v3
   vrbb = i64.const 17788
   i32.store vrbb v1
   vrpb = i64.const 17760
@@ -578,17 +585,16 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// [`SIBLING_AS_SERVICE`] with its spawn records: A is func 1, and B is func 2 granted the list at
-/// 16640.
+/// [`SIBLING_AS_SERVICE`] with its spawn records: B's is granted the list at 16640.
 fn sibling_as_service() -> String {
     let b = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(2)
+        ..SpawnRec::v1(0)
     };
     format!(
         "{SIBLING_AS_SERVICE}{}{}",
-        rec::segment(17664, &SpawnRec::v1(1)),
+        rec::segment(17664, &SpawnRec::v1(0)),
         rec::segment(17760, &b)
     )
 }
@@ -601,12 +607,13 @@ fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
         m
     });
     let mut host = Host::new();
-    host.set_self_module(&m);
     let h = host.grant_instantiator(0, 1u64 << 17);
     let b = host.grant_budget(-1, 1 << 20, -1);
+    let ca = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("A's image"));
+    let cb = host.grant_module(&temen_ir::child_image_at(&m, 2).expect("B's image"));
     let mut fuel = 5_000_000u64;
-    let r =
-        run_with_host(&m, 0, &[Value::I32(h), Value::I32(b)], &mut fuel, &mut host).expect("run");
+    let args = [h, b, ca, cb].map(Value::I32);
+    let r = run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(142)],

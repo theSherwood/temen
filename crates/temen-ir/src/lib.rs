@@ -4146,31 +4146,33 @@ pub const CHILD_EXPORT: &str = "_child";
 /// arena) and data, so a child runs in the window the program declares. It exports neither `_child`
 /// nor anything naming function 0.
 ///
-/// `None` when the program exports no `_child`. `Err` when the entry is function 0 itself, has no §14
-/// child-entry shape ([`child_entry_ok`]), or when the program references function 0 anywhere but an
-/// export: replacing it must not change what the rest of the program calls.
+/// `None` when the program exports no `_child`, else [`child_image_at`] for the function it names.
 pub fn child_image(program: &Module) -> Option<Result<Module, String>> {
     let entry = program
         .exports
         .iter()
         .find(|e| e.name == CHILD_EXPORT)?
         .func;
-    Some(child_image_at(program, entry))
+    Some(child_image_at(program, entry).map_err(|e| format!("`{CHILD_EXPORT}`: {e}")))
 }
 
-fn child_image_at(program: &Module, entry: FuncIdx) -> Result<Module, String> {
+/// #2219 — [`child_image`] for any function `entry` of the program, for a host that chooses which of a
+/// program's functions start its children: one image per function.
+///
+/// `Err` when `entry` is function 0 itself, has no §14 child-entry shape ([`child_entry_ok`]), or when
+/// the program references function 0 anywhere but an export: replacing it must not change what the
+/// rest of the program calls.
+pub fn child_image_at(program: &Module, entry: FuncIdx) -> Result<Module, String> {
     let ef = program
         .funcs
         .get(entry as usize)
-        .ok_or_else(|| format!("`{CHILD_EXPORT}` names function {entry}, which does not exist"))?;
+        .ok_or_else(|| format!("function {entry} does not exist"))?;
     if entry == 0 {
-        return Err(format!(
-            "`{CHILD_EXPORT}` names function 0, the root entry its bootstrap replaces"
-        ));
+        return Err("function 0 is the root entry the child bootstrap replaces".into());
     }
     if !child_entry_ok(&ef.params, &ef.results) {
         return Err(format!(
-            "`{CHILD_EXPORT}` must have a §14 child-entry shape, got {:?} -> {:?}",
+            "function {entry} has no §14 child-entry shape: {:?} -> {:?}",
             ef.params, ef.results
         ));
     }

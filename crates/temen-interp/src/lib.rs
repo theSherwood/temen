@@ -38107,11 +38107,14 @@ block 0 (vsp: i64, v0: i64) {
     /// Domain **scoping**: a live child (own powerbox, same scheduler) traps — only ITS domain
     /// dies; the run continues and the owner observes the death as a value: `poll` (iface 6 op 9)
     /// reports status 2 (trapped, non-propagating — the I37 supervision idiom), which the root
-    /// returns. The owner's world must NOT be torn down. The root spawns the child detached (op 17)
-    /// through the v1 record the test lays at 17536, paying for it from its budget.
+    /// returns. The owner's world must NOT be torn down. The root spawns the child (func 1's child
+    /// image, #2219) detached (op 17) through the v1 record the test lays at 17536, paying for it
+    /// from its budget.
     const CHILD_TRAP_POLLED: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vbud: i32, vmod: i32) {
+  vm = i64.const 17560
+  i32.store vm vmod
   vb = i64.const 17564
   i32.store vb vbud
   vrec = i64.const 17536
@@ -38149,14 +38152,14 @@ block 0 (v0: i64) {
         m.data.push(temen_ir::Data {
             offset: 17536,
             readonly: false,
-            bytes: temen_ir::SpawnRec::v1(1).encode(),
+            bytes: temen_ir::SpawnRec::v1(0).encode(),
         });
         let mut host = Host::new();
-        host.set_self_module(&Arc::new(m.clone()));
         let inst = host.grant_instantiator(0, 128 << 10);
         let budget = host.grant_budget(-1, 1 << 20, -1);
+        let child = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 10_000_000u64;
-        let args = [Value::I32(inst), Value::I32(budget)];
+        let args = [inst, budget, child].map(Value::I32);
         let r = run_with_host(&m, 0, &args, &mut fuel, &mut host);
         assert_eq!(
             r,

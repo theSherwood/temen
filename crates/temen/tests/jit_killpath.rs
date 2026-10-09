@@ -195,16 +195,19 @@ fn jit_unarmed_path_is_unchanged() {
     assert_eq!(jit, JitOutcome::Returned(vec![0]));
 }
 
-/// A §14 parent (a powerbox `_start`) that spawns func 1 detached through a v1 record at 17408, paid
-/// from its `"budget"`, and `join`s it. The child **spins forever**, so the run's kill must reach
+/// A §14 parent (a powerbox `_start`) that spawns its `"child"` (its child image, #2219: func 1,
+/// exported as `_child`) detached through a v1 record at 17408, paid from its `"budget"`, and `join`s
+/// it. The child **spins forever**, so the run's kill must reach
 /// *into the child*: the host's deadline watchdog sets the run's interrupt cell, the parent's parked
 /// `join` traps `OutOfFuel`, and the run's teardown ends the running child with it. Without that, the
 /// run waits on the child and hangs.
 const PARENT_WITH_RUNAWAY_CHILD: &str = "\
 memory 17
 export 0 func \"_start\" 0
+export 1 func \"_child\" 1
 data 16640 \"instantiator\"
 data 16656 \"budget\"
+data 16672 \"child\"
 func () -> (i32) {
 block 0 () {
   vip = i64.const 16640
@@ -215,6 +218,11 @@ block 0 () {
   vb = self.resolve vbp vbl
   vrb = i64.const 17436
   i32.store vrb vb
+  vcp = i64.const 16672
+  vcl = i64.const 5
+  vc = self.resolve vcp vcl
+  vrm = i64.const 17432
+  i32.store vrm vc
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) vi (vrp)
   v6 = call.cap 6 1 (i32) -> (i64) vi (v5)
@@ -242,7 +250,7 @@ fn jit_killpath_stops_runaway_child() {
     }
     let src = format!(
         "{PARENT_WITH_RUNAWAY_CHILD}{}",
-        rec::segment(17408, &SpawnRec::v1(1))
+        rec::segment(17408, &SpawnRec::v1(0))
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");

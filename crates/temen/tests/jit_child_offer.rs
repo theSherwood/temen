@@ -28,8 +28,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536
@@ -61,8 +63,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536
@@ -98,8 +102,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536
@@ -124,18 +130,17 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// `src` with its spawn record (func 1, at 17536), and a host for it: the parent's two args, an
-/// `Instantiator` and the `Budget` that pays for the child its own module spawns.
-fn setup(src: &str) -> (Arc<Module>, Host, [i32; 2]) {
-    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1(1)));
+/// `src` with its spawn record (at 17536), and a host for it: the parent's three args, an
+/// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
+fn setup(src: &str) -> (Arc<Module>, Host, [i32; 3]) {
+    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1(0)));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
-    let am = Arc::new(m);
     let mut host = Host::new();
-    host.set_self_module(&am);
     let ih = host.grant_instantiator(0, 128 << 10);
     let bh = host.grant_budget(-1, 1 << 20, -1);
-    (am, host, [ih, bh])
+    let ch = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+    (Arc::new(m), host, [ih, bh, ch])
 }
 
 fn run_jit_i64_knob(src: &str, handoff: bool) -> i64 {
@@ -263,8 +268,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536
@@ -313,8 +320,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536
@@ -366,8 +375,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (vinst: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vbud: i32, vmod: i32) {
+  vrm = i64.const 17560
+  i32.store vrm vmod
   vrb = i64.const 17564
   i32.store vrb vbud
   vrp = i64.const 17536

@@ -11,15 +11,15 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_jit::JitOutcome;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// func 0 (parent, `(Instantiator, read_end, write_end, Budget)`): spawn a child (func 1) detached
-/// through the v1 record at 20544, paid from the `Budget` and re-granting the **write end** as `"g"`;
+/// func 0 (parent, `(Instantiator, read_end, write_end, Budget, Module)`): spawn the child (the
+/// `Module`, func 1's child image, #2219) detached through the v1 record at 20544, paid from the
+/// `Budget` and re-granting the **write end** as `"g"`;
 /// `join`; then read 2 bytes from the **read end** into window offset 16400 and encode
 /// `read_count * 65536 + byte0 * 256 + byte1`. The child writes `"hi"` (`'h'=104`, `'i'=105`), so the
 /// parent reads count `2` and those bytes → `2*65536 + 104*256 + 105` = `157801` — proving the bytes
@@ -29,8 +29,8 @@ use temen_verify::verify_module;
 /// guard, resolve the granted write end as `"g"`, `Stream.write` the two bytes through it, then
 /// return 7.
 const SRC: &str = "memory 17
-func (i32, i32, i32, i32) -> (i64) {
-block 0 (vinst: i32, vread: i32, vwrite: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vread: i32, vwrite: i32, vbud: i32, vmod: i32) {
   vg = i32.const 103
   vnp1 = i64.const 20480
   i32.store8 vnp1 vg
@@ -42,6 +42,8 @@ block 0 (vinst: i32, vread: i32, vwrite: i32, vbud: i32) {
   i32.store vgr1 vnl1
   vgr2 = i64.const 20496
   i32.store vgr2 vwrite
+  rrm = i64.const 20568
+  i32.store rrm vmod
   rrb = i64.const 20572
   i32.store rrb vbud
   rra0 = i64.const 20544
@@ -85,21 +87,21 @@ block 0 (vci: i64, vca: i64) {
 }
 ";
 
-/// [`SRC`] with its spawn record, and a host for it with the parent's four args.
-fn setup() -> (Module, Host, [i32; 4]) {
+/// [`SRC`] with its spawn record, and a host for it with the parent's five args.
+fn setup() -> (Module, Host, [i32; 5]) {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 128 << 10);
     let (w, r) = host.grant_pipe();
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    (m, host, [ih, r, w, budget])
+    let child = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+    (m, host, [ih, r, w, budget, child])
 }
 
 fn run_interp() -> Result<Vec<Value>, temen_interp::Trap> {

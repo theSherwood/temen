@@ -39,6 +39,7 @@ fn offer_program(n: u64) -> String {
 memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
+data 16416 \"child\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface {{ add: 0 }}
 export 0 interface \"adder\" 1 {{ add: 2 }}
@@ -52,6 +53,11 @@ block 0 () {{
   vbp = i64.const 16400
   vbl = i64.const 6
   vb = self.resolve vbp vbl
+  vcp = i64.const 16416
+  vcl = i64.const 5
+  vcm = self.resolve vcp vcl
+  q0m = i64.const 17560
+  i32.store q0m vcm
   q0b = i64.const 17564
   i32.store q0b vb
   q0a0 = i64.const 17536
@@ -103,8 +109,16 @@ block 0 (va: i64, vb: i64) {{
   return vs
   }}
 }}
-{rec}",
-        rec = rec::segment(17536, &SpawnRec::v1(1))
+{rec}{exit}",
+        rec = rec::segment(
+            17536,
+            &SpawnRec {
+                grants_ptr: 16448,
+                grants_n: 1,
+                ..SpawnRec::v1(0)
+            }
+        ),
+        exit = rec::empty_grant(16448, 16432, "exit"),
     )
 }
 
@@ -120,6 +134,7 @@ fn expected_exit(n: u64) -> i32 {
 fn run(backend: Backend, src: &str) -> i32 {
     let m = parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
+    let child = temen_ir::child_image_at(&m, 1).expect("child image");
     let registry = Imports::new().provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(m, registry).expect("instantiate");
     let r = inst
@@ -132,6 +147,12 @@ fn run(backend: Backend, src: &str) -> i32 {
                     HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
                 ),
                 ("budget", HostCap::detached_budget(1 << 20)),
+                (
+                    "child",
+                    HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                        h.grant_module(&child)
+                    }),
+                ),
             ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));

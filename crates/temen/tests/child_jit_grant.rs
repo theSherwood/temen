@@ -17,7 +17,6 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_encode::encode_module;
 use temen_interp::{bytecode, run_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
@@ -27,7 +26,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// Where the unit blob sits, a data segment above the NULL guard and the grant scratch: the child
-/// runs the parent's module, so its own window holds the blob there too.
+/// runs the parent's child image, which keeps its data, so its own window holds the blob there too.
 const BLOB_OFF: usize = 20480;
 
 /// The unit the child compiles, declaring the module's memory (`memory 17`): `(a, b) -> a + b`, or for
@@ -43,10 +42,10 @@ fn blob(zero_arg: bool) -> Vec<u8> {
     encode_module(&m)
 }
 
-/// func 0 (parent, `(Instantiator, Jit, Budget)`): one grant record at 16384 naming the `Jit` handle
-/// `"jit"` (the name a data segment at 16484 holds), spawn the child detached through a v1 record at
-/// 17536 (entry 1, the parent's module, paid from the `Budget`, grant list `(16384, grants_n)`),
-/// join, return its result.
+/// func 0 (parent, `(Instantiator, Jit, Budget, Module)`): one grant record at 16384 naming the `Jit`
+/// handle `"jit"` (the name a data segment at 16484 holds), spawn the child detached through a v1
+/// record at 17536 (the `Module`, func 1's child image, #2219, paid from the `Budget`, grant list
+/// `(16384, grants_n)`), join, return its result.
 /// func 1 (child, `(Instantiator)`): resolve `"jit"` by name (the same data in its own window),
 /// compile the blob at `BLOB_OFF` `times` times (the last compile's code handle is what it invokes),
 /// invoke `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
@@ -61,7 +60,7 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let spawn = SpawnRec {
         grants_ptr: 16384,
         grants_n: u64::from(grants_n),
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     let child_pre = format!(
         "  n0 = i64.const 16484\n  len3 = i64.const 3\n  hj = self.resolve n0 len3\n  vb = i64.const {}\n  vl = i64.const {}\n  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n",
@@ -89,8 +88,8 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     };
     format!(
         r#"memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vjit: i32, vbud: i32) {{
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32) {{
 {parent_pre}  a0 = i64.const 16384
   n100 = i32.const 16484
   i32.store a0 n100
@@ -102,6 +101,8 @@ block 0 (vinst: i32, vjit: i32, vbud: i32) {{
   a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
+  qm = i64.const 17560
+  i32.store qm vmod
   qb = i64.const 17564
   i32.store qb vbud
   q0a0 = i64.const 17536
@@ -130,16 +131,15 @@ fn table_log2(mode: u32) -> u8 {
 }
 
 /// The parent's host for one run: an `Instantiator`, a `Jit` table (16 install slots for the install
-/// probe) with a `units` compile quota, and a `Budget` that pays for the child. The host knows the
-/// parent's module, which the child runs.
-fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 3]) {
+/// probe) with a `units` compile quota, a `Budget` that pays for the child, and the child.
+fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 128 << 10);
     let jh = grant_jit(&mut host, m, table_log2(mode));
     host.set_jit_quota(units, 1 << 20);
     let bh = host.grant_budget(-1, 1 << 20, -1);
-    (host, [ih, jh, bh])
+    let ch = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    (host, [ih, jh, bh, ch])
 }
 
 /// Run on the tree-walker and on the bytecode engine with the same host setup (a root `Jit` grant of

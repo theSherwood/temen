@@ -139,14 +139,15 @@ block 5 (vsum: i64, vtos: i64) {
 }
 "#;
 
-/// The detached-pipeline parent: mint the region, build the grant record, spawn producer
-/// (entry 0) and consumer (entry 1) DETACHED from the granted module, join both → 410.
+/// The detached-pipeline parent: mint the region, build the grant record, spawn the producer (the
+/// granted stages' module, whose func 0 it is) and the consumer (that module's child image of func 1,
+/// #2219) DETACHED, join both → 410.
 pub const PARENT: &str = r#"
 memory 17
 data 16584 "ring"
 
-func (i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -160,14 +161,14 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i32.store va3 vrh
   vmh = i64.extend_i32_u v2
   vmin = i64.extend_i32_u v3
+  vch = i64.extend_i32_u v4
   vgp = i64.const 16640
   vgn = i64.const 1
   ve0 = i64.const 0
-  ve1 = i64.const 1
   vlog = i64.const 17
   vq = i64.const 0
   vp = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve1, vlog, vq)
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vch, vgp, vgn, ve0, vlog, vq)
   vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   vk = i64.const 100
@@ -188,13 +189,16 @@ pub fn modules() -> (Module, Module) {
     (load(PARENT), load(STAGES))
 }
 
-/// The parent's four arguments in a fresh host: an `Instantiator` and an `AddressSpace` over its
-/// window, the stages' `Module`, and a `Budget` of exactly the two stages' windows.
-pub fn host(stages: &Module) -> (Host, [i32; 4]) {
+/// The parent's five arguments in a fresh host: an `Instantiator` and an `AddressSpace` over its
+/// window, the stages' `Module`, a `Budget` of exactly the two stages' windows, and the stages' child
+/// image of func 1, the consumer.
+pub fn host(stages: &Module) -> (Host, [i32; 5]) {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(stages);
     let hw = host.grant_budget(-1, (2 << 17) as i64, -1);
-    (host, [hi, ha, hm, hw])
+    let consumer = temen_ir::child_image_at(stages, 1).expect("the consumer's image");
+    let hc = host.grant_module(&consumer);
+    (host, [hi, ha, hm, hw, hc])
 }

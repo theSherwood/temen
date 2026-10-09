@@ -17,8 +17,6 @@ mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
-
 use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{Host, Value};
 use temen_ir::{Module, SpawnRec};
@@ -26,7 +24,7 @@ use temen_ir::{Module, SpawnRec};
 /// The node's `mem` ceiling: the child's 64 KiB window and 64 KiB of growth.
 const CEILING: i64 = 2 << 16;
 
-/// A root that pays for func 1 from a node capped at [`CEILING`], and returns
+/// A root that pays for its child (func 1's child image, #2219) from a node capped at [`CEILING`], and returns
 /// `child_result * 1_000_000 + room`, the node's `mem` room once the child has ended. The child, given
 /// `commit` and `release` as `AddressSpace` op lines over `(at, len)`, returns a bit per expected
 /// answer: 1 the first 64 KiB fits, 2 the next 64 KiB is `-ENOMEM`, 4 giving the first back succeeds,
@@ -39,8 +37,10 @@ fn src(commit: &str, release: &str) -> String {
     };
     format!(
         "memory 16
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vbud: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32, vmod: i32) {{
+  rm = i64.const 17432
+  i32.store rm vmod
   f = i64.const -1
   m = i64.const {CEILING}
   vsub = call.cap 14 0 (i64, i64, i64) -> (i64) vbud (f, m, f)
@@ -96,7 +96,7 @@ block 0 (vinst: i64, vas64: i64) {{
         c2 = op("r2", commit, 2),
         r3 = op("r3", release, 1),
         c4 = op("r4", commit, 2),
-        rec = rec::segment(17408, &SpawnRec::v1(1)),
+        rec = rec::segment(17408, &SpawnRec::v1(0)),
     )
 }
 
@@ -106,15 +106,15 @@ fn module(src: &str) -> Module {
     m
 }
 
-/// The root's powerbox: its program registered (a self-spawn), an `Instantiator`, and an unbounded
-/// `Budget` to split.
+/// The root's powerbox: an `Instantiator`, an unbounded `Budget` to split, and the child image of its
+/// func 1.
 fn setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        h.set_self_module(&Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
         let b = h.grant_budget(-1, -1, -1);
-        (h, vec![Value::I32(i), Value::I32(b)])
+        let c = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+        (h, [i, b, c].map(Value::I32).to_vec())
     }
 }
 

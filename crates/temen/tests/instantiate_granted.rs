@@ -17,23 +17,23 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// func 0 (parent, `(Instantiator, grant_handle, Budget)`): spawn the child (func 1) detached through
-/// the v1 record at 20544, paid from the `Budget` and re-granting the parent's `grant_handle` under
+/// func 0 (parent, `(Instantiator, grant_handle, Budget, Module)`): spawn the child (the `Module`,
+/// func 1's child image, #2219) detached through the v1 record at 20544, paid from the `Budget` and
+/// re-granting the parent's `grant_handle` under
 /// the name `"g"` (name at 20480, grant record at 20488), then `join` and return the child's result.
 ///
 /// func 1 (child, `(Instantiator, AddressSpace)`): write the three bytes `"hi\n"` into its own
 /// window above its NULL guard, resolve `"g"` by name, `Stream.write` them through it, then return
 /// `100 * g + 7` — so the join also carries the handle the child was given.
 const SRC: &str = "memory 17\n\
-func (i32, i32, i32) -> (i64) {\n\
-block 0 (vinst: i32, vstream: i32, vbud: i32) {\n\
+func (i32, i32, i32, i32) -> (i64) {\n\
+block 0 (vinst: i32, vstream: i32, vbud: i32, vmod: i32) {\n\
   vg = i32.const 103\n\
   vnp1 = i64.const 20480\n\
   i32.store8 vnp1 vg\n\
@@ -48,6 +48,8 @@ block 0 (vinst: i32, vstream: i32, vbud: i32) {\n\
   vgr3 = i64.const 20500\n\
   vz32 = i32.const 0\n\
   i32.store vgr3 vz32\n\
+  rrm = i64.const 20568\n\
+  i32.store rrm vmod\n\
   rrb = i64.const 20572\n\
   i32.store rrb vbud\n\
   rra0 = i64.const 20544\n\
@@ -88,23 +90,23 @@ fn module() -> Module {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");
     m
 }
 
-/// A host for `m` and the parent's three args. `stream_grant` picks the second: the re-grantable
+/// A host for `m` and the parent's four args. `stream_grant` picks the second: the re-grantable
 /// `Stream` (happy path) or the non-copyable `Instantiator` (negative path), to prove it is refused.
-fn host(m: &Module, stream_grant: bool) -> (Host, [i32; 3]) {
+fn host(m: &Module, stream_grant: bool) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 128 << 10);
     let sh = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);
+    let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     let grant = if stream_grant { sh } else { ih };
-    (host, [ih, grant, budget])
+    (host, [ih, grant, budget, child])
 }
 
 /// Run [`SRC`] on the interpreter: the parent's result and the effective stdout bytes (the child's

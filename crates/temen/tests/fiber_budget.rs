@@ -14,8 +14,6 @@ mod drivers;
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
-
 use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{Host, MemLayout, Value};
 use temen_ir::{Module, SpawnRec, FIBER_STACK};
@@ -24,7 +22,8 @@ use temen_jit::{JitError, JitOutcome};
 /// The child's window: the module's declared memory, which a self-spawned detached child takes.
 const WINDOW: i64 = 1 << 16;
 
-/// A root that pays for func 1 from its `Budget` and returns `child * 10_000_000 + room`: the child's
+/// A root that pays for its child (func 1's child image, #2219) from its `Budget` and returns
+/// `child * 10_000_000 + room`: the child's
 /// result (with `wait`, the trap code it ended with) and the budget's `mem` room once it has ended.
 /// The child returns a bit per expected room: 1 a new fiber spends `FIBER_STACK`, 2 its return hands
 /// it back, 4 a second fiber spends it again.
@@ -32,8 +31,10 @@ fn src(collect: &str) -> String {
     format!(
         "memory 16
 data 20000 \"budget\"
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vbud: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32, vmod: i32) {{
+  rm = i64.const 17432
+  i32.store rm vmod
   rb = i64.const 17436
   i32.store rb vbud
   rp = i64.const 17408
@@ -86,7 +87,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1(1)),
+        rec = rec::segment(17408, &SpawnRec::v1(0)),
     )
 }
 
@@ -96,14 +97,15 @@ fn module(collect: &str) -> Module {
     m
 }
 
-/// A powerbox whose `Budget` holds the child's window and `fibers` fibers' worth of `mem`.
+/// A powerbox whose `Budget` holds the child's window and `fibers` fibers' worth of `mem`, and the
+/// child.
 fn setup(m: &Module, fibers: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        h.set_self_module(&Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
         let b = h.grant_budget(-1, WINDOW + fibers * FIBER_STACK as i64, -1);
-        (h, vec![Value::I32(i), Value::I32(b)])
+        let c = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+        (h, [i, b, c].map(Value::I32).to_vec())
     }
 }
 

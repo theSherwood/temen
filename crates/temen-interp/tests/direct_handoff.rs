@@ -15,8 +15,8 @@ use temen_ir::SpawnRec;
 
 /// One module, three functions: func 0 is the root caller, func 1 is a child **serve loop** (parks
 /// at `svc.wait`, serves, loops), func 2 is the `add` handler behind the child's `adder` offer. The
-/// root spawns the child detached (the record at 17536, paid from the `Budget` `v1`), takes a live
-/// offer over it, and calls it **twice**: the first call parks
+/// root spawns func 1's child image (#2219, the `Module` `v2`) detached (the record at 17536, paid
+/// from the `Budget` `v1`), takes a live offer over it, and calls it **twice**: the first call parks
 /// the root (the child hasn't reached `svc.wait` yet), the child serves it and re-parks — so the
 /// **second** call finds the serve loop parked and takes the handoff path when it is enabled. Both
 /// results are the same with handoff on or off: add(40,2) + add(10,3) = 55.
@@ -26,8 +26,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17560
+  i32.store vrm v2
   vrb = i64.const 17564
   i32.store vrb v1
   vrp = i64.const 17536
@@ -75,8 +77,10 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17624
+  i32.store vrm v2
   vrb = i64.const 17628
   i32.store vrb v1
   vrp = i64.const 17600
@@ -122,23 +126,24 @@ fn run_handoff(
     handoff: bool,
 ) -> Result<Vec<Value>, temen_interp::Trap> {
     let mut host = Host::new();
-    host.set_self_module(module);
     host.set_handoff(handoff);
     let h = host.grant_instantiator(0, 1u64 << 17);
     let b = host.grant_budget(-1, 1 << 20, -1);
+    let m = host.grant_module(&temen_ir::child_image_at(module, 1).expect("child image"));
     let mut fuel = 5_000_000u64;
     run_with_host(
         module,
         0,
-        &[Value::I32(h), Value::I32(b)],
+        &[Value::I32(h), Value::I32(b), Value::I32(m)],
         &mut fuel,
         &mut host,
     )
 }
 
-/// `src` with the v1 record that spawns its serve loop (func 1) at `at`.
+/// `src` with the v1 record at `at` that spawns its serve loop: func 1's child image (#2219), whose
+/// handle the root stores in it.
 fn with_record(src: &str, at: u64) -> String {
-    format!("{src}{}", rec::segment(at, &SpawnRec::v1(1)))
+    format!("{src}{}", rec::segment(at, &SpawnRec::v1(0)))
 }
 
 /// **4d.1 — run-to-completion handoff ≡ enqueue+park.** The same program serves its second live

@@ -15,8 +15,6 @@ mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
-
 use drivers::{agree_on, agree_on_every_driver, Ran, SCHEDULING};
 use temen_interp::{Host, Value};
 use temen_ir::{Module, SpawnRec};
@@ -24,14 +22,17 @@ use temen_ir::{Module, SpawnRec};
 /// The node's `channel` ceiling: one 64 KiB region.
 const CEILING: i64 = 1 << 16;
 
-/// A root that pays for func 1 from a node whose `channel` ceiling is [`CEILING`], and returns
+/// A root that pays for its child (func 1's child image, #2219) from a node whose `channel` ceiling is
+/// [`CEILING`], and returns
 /// `child_result * 1_000_000 + room`, the node's `channel` room once the child has ended. The child
 /// returns a bit per expected answer: 1 the first region is minted, 2 the second is `-ENOMEM`.
 fn src() -> String {
     format!(
         "memory 16
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vbud: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32, vmod: i32) {{
+  rm = i64.const 17432
+  i32.store rm vmod
   f = i64.const -1
   c = i64.const {CEILING}
   vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i64) vbud (f, f, f, c)
@@ -68,7 +69,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1(1)),
+        rec = rec::segment(17408, &SpawnRec::v1(0)),
     )
 }
 
@@ -78,10 +79,10 @@ fn a_minted_region_spends_the_childs_channel_until_it_ends_on_every_driver() {
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        h.set_self_module(&Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
         let b = h.grant_budget(-1, -1, -1);
-        (h, vec![Value::I32(i), Value::I32(b)])
+        let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+        (h, [i, b, c].map(Value::I32).to_vec())
     };
     let want = Ran {
         result: Ok(vec![Value::I64(3 * 1_000_000 + CEILING)]),
@@ -91,19 +92,21 @@ fn a_minted_region_spends_the_childs_channel_until_it_ends_on_every_driver() {
     agree_on_every_driver("create_region", &m, &setup, &want);
 }
 
-/// #2189 — a root that maps a 64 KiB region at 65536 and spawns func 1 detached with the region
-/// pre-mapped at the same offset. The child raises a flag at region byte 0 and waits on the word at
+/// #2189 — a root that maps a 64 KiB region at 65536 and spawns its child (func 1's child image)
+/// detached with the region pre-mapped at the same offset. The child raises a flag at region byte 0 and waits on the word at
 /// byte 8 (for at most 2 s). The root spins until the flag is up, notifies the word until the notify
 /// wakes someone (or gives up), joins, and returns `woken * 10 + the child's wait status`.
 fn shared_futex_src() -> String {
     let child = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     format!(
         "memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vas: i32, vbud: i32) {{
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vas: i32, vbud: i32, vmod: i32) {{
+  vma = i64.const {module_at}
+  i32.store vma vmod
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -169,6 +172,7 @@ block 0 (v0: i64) {{
 }}
 {rec}",
         rec = rec::segment(17408, &child),
+        module_at = 17408 + rec::MODULE_AT,
         budget_at = 17408 + rec::BUDGET_AT,
         region_at = 17408 + 72,
     )
@@ -184,11 +188,11 @@ fn a_notify_on_a_region_word_wakes_the_childs_wait_on_every_scheduling_driver() 
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        h.set_self_module(&Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 17);
         let a = h.grant_address_space(0, 1 << 17);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        (h, vec![Value::I32(i), Value::I32(a), Value::I32(b)])
+        let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+        (h, [i, a, b, c].map(Value::I32).to_vec())
     };
     let want = Ran {
         result: Ok(vec![Value::I64(10)]),
