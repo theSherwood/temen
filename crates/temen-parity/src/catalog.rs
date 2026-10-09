@@ -1142,6 +1142,7 @@ fn process(ops: &mut Vec<Op>) {
         ("reap", self_ty, crate::capcall::REAP),
         ("fuel.remaining", self_ty, crate::capcall::FUEL_REMAINING),
         ("exec_module", self_ty, crate::capcall::EXEC),
+        ("parallelism", self_ty, crate::capcall::PARALLELISM),
     ] {
         push_skip(
             ops,

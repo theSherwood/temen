@@ -206,6 +206,9 @@ The system is four ideas wearing many names:
 - **`fuel.remaining`** — (DESIGN.md §12a; built) authority-neutral self-namespace
   readout of the domain's remaining fuel; backend-identical by the fuel-unification
   safepoint rule. Under caller-pays, per-call cost = read-before − read-after.
+- **`parallelism`** — (self-namespace op 19; built) how many of the domain's vCPUs may
+  run at once: its lane cap when it has one (D66), else the host's worker count. What a
+  guest sizes a thread pool from (`sysconf(_SC_NPROCESSORS_ONLN)`, `GOMAXPROCS`).
 
 ## Guest JIT (§22)
 

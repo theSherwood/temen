@@ -1067,6 +1067,7 @@ fn is_recorded_input(type_id: u32, op: u32) -> bool {
     type_id == cap_id::CLOCK
         || (type_id == cap_id::STREAM && op == 0)
         || type_id == cap_id::HOST_PROC
+        || (type_id == temen_ir::CAP_SELF_TYPE_ID && op == CAP_SELF_PARALLELISM)
 }
 
 /// A [`GuestMem`] wrapper that records every `write_bytes` a capability makes into the guest window
@@ -2286,10 +2287,7 @@ fn drive_arc(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> TracedRun {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, MAX_WORKERS);
+    let workers = pool_workers();
     // B2 `install`: the table reservation the root vCPU builds its dispatch table with (must
     // equal the JIT's `table_reserve_log2`). Read before the host is moved into the Arc below.
     let jit_table_log2 = host.jit_table_log2();
@@ -2407,10 +2405,7 @@ fn drive_arc_shared(
     mem: &mut Option<Mem>,
     cell: &Arc<Mutex<Host>>,
 ) -> TracedRun {
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, MAX_WORKERS);
+    let workers = pool_workers();
     let (jit_table_log2, offer_table_demand, durable, handoff, jit_reapply) = {
         let h = cell.lock_unpoisoned();
         // Install-durability (§12.5): a provider cell with B2-installed units gets them re-applied
@@ -5134,6 +5129,15 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Maximum worker OS threads the executor will spawn for one run (the "N" of M:N). Capped at the
 /// host parallelism. Workers are spawned **lazily** — a single-threaded guest never creates any.
 const MAX_WORKERS: usize = 32;
+
+/// The real pool's worker count: the host's parallelism, at most [`MAX_WORKERS`], and 1 where the
+/// host reports none (wasm). What [`Host::parallelism`] reports for a domain with no lane cap.
+pub fn pool_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_WORKERS)
+}
 
 /// How many ops a vCPU runs on a worker before it yields it to the next runnable vCPU: the real
 /// pool's preemption quantum. Without it a vCPU kept its worker until it parked, so guest threads
@@ -22147,6 +22151,15 @@ pub const CAP_SELF_PIPE: u32 = 16;
 /// went to `reap` first, so `fuel.remaining` takes 13.
 pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 
+/// The reserved self-namespace op for `parallelism`: how many of this domain's vCPUs may run at
+/// once ([`Host::parallelism`]), what a guest sizes a thread pool from (`sysconf(_SC_NPROCESSORS_ONLN)`,
+/// Rust's `available_parallelism`, Go's `GOMAXPROCS`). Its lane cap when it has one (D66), else the
+/// host's worker count. Authority-neutral like `fuel.remaining`: it reads the domain's own grant and
+/// the host's size, and confers nothing. The host answers it, so every engine agrees. The worker
+/// count is the host machine's, so a replay records the answer, as it does a clock read
+/// (DEBUGGING.md W1).
+pub const CAP_SELF_PARALLELISM: u32 = 19;
+
 /// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
 /// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
 /// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
@@ -26134,6 +26147,7 @@ impl Host {
                 let expect = self.table[(h as u32 as usize) & (CAP - 1)].type_id;
                 self.resolve(h, expect).map(|_| vec![0])
             }
+            CAP_SELF_PARALLELISM => Ok(vec![self.parallelism()]),
             _ => Err(Trap::Malformed),
         }
     }
@@ -27047,6 +27061,16 @@ impl Host {
     /// D66 — this domain's lane cap (`-1` = unbounded).
     pub fn lane_cap(&self) -> i64 {
         self.lane_cap
+    }
+
+    /// How many of this domain's vCPUs may run at once, as `self.parallelism` answers it: its lane
+    /// cap when it has one (D66), else the host's worker count ([`pool_workers`]).
+    pub fn parallelism(&self) -> i64 {
+        if self.lane_cap >= 0 {
+            self.lane_cap
+        } else {
+            pool_workers() as i64
+        }
     }
 
     /// D66 — the domain that spawned this one, or `None` for a root.
@@ -31312,8 +31336,11 @@ impl Host {
         // against self interface `idx`), 8 = `export.handle` (reify own offer `idx`).
         // Ops 17 (`self.list`) / 18 (`self.schema`) are **plain** selfops, not packed (#1109) —
         // they carry buffer args and are serviced in the mem-capable reflection block below,
-        // beside `resolve`/`label`.
-        if type_id == temen_ir::CAP_SELF_TYPE_ID && (op & 0xFF) >= 6 && !matches!(op, 17 | 18) {
+        // beside `resolve`/`label` — and so is 19 (`parallelism`), in `self_dispatch`.
+        if type_id == temen_ir::CAP_SELF_TYPE_ID
+            && (op & 0xFF) >= 6
+            && !matches!(op, 17 | 18 | CAP_SELF_PARALLELISM)
+        {
             let idx = op >> 8;
             return match op & 0xFF {
                 6 => Ok(vec![self.self_type_id(idx)? as i32 as i64]),

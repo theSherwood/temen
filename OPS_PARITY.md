@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**465 ops.** Across the two JIT columns: 861 ✅ Full · 55 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
+**466 ops.** Across the two JIT columns: 862 ✅ Full · 56 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
 
 ## scalar integer
 
@@ -506,6 +506,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `fuel.remaining` | ✅ | 🚧 | ✅ | ⛔ | declines the module (folds to the oracle) rather than adding a native op; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `exec_module` | ✅ | 🚧 | 🚧 | ⛔ | eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `parallelism` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## fibers, threads & non-local control
 

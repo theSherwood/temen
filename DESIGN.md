@@ -1461,8 +1461,8 @@ something new is a capability**:
   *Naming the two `self.*` families* (CONSOLIDATION §7): the op space today holds
   **reflection** (`count`/`get`/`resolve`/`label`/`attest`/`provenance`/`type_id`/`covers` —
   the read-only, authority-neutral intrinsic this section defines) and the **domain-runtime
-  verbs** (`svc.*`, `clone_caller`, `fuel.remaining` — operations *on the current domain's
-  runtime*, not reads of its grant table). The verbs live under `self.*` only because it
+  verbs** (`svc.*`, `clone_caller`, `fuel.remaining`, `parallelism` — operations *on the current
+  domain's runtime*, not reads of its grant table). The verbs live under `self.*` only because it
   was the op space needing no wire change when they landed, not because they are reflection.
   Keep the families distinct in prose and docs; an actual op-space split is deliberately
   deferred to a wire rev that happens anyway (same policy as `call.sym`'s vestigial handle
