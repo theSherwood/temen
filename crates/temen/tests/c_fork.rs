@@ -10,14 +10,14 @@
 //! named-offer step of `bind_child_manifest` (the `fork_import.rs` change). The C wrapper
 //! `long fork(void){ return __fork(0,0); }` is the whole POSIX face.
 //!
-//! Topology (manager root = 0, server = 1, guest = 2, twin = 3): the manager (hand-written IR) spawns the
-//! server (its own func 1's child image, #2219: a `svc.wait` loop whose handler runs pid-mode
-//! `clone_caller`), mints a `child_offer` over its
-//! `fork` export, then spawns the **compiled guest module** detached, re-granting the fork offer (as
-//! `"__fork"`, the guest's import name) and the shared stdout stream (as `"stdout"`), and joins. The
-//! guest's `fork()` returns the twin's pid (3) in the original and 0 in the twin; both copies
-//! `write(1, &slot, 8)` their result to the one shared stdout sink. Interp only (the serve substrate is
-//! eval-loop-only, as for every fork test). Gated `#![cfg(unix)]` (needs the chibicc toolchain).
+//! Topology (manager root = 0, server = 1, guest = 2, twin = 3): the manager (hand-written IR)
+//! spawns the server (its own func 1's child image, #2219: a `svc.wait` loop whose handler runs
+//! pid-mode `clone_caller`), mints a `child_offer` over its `fork` export, then spawns the
+//! **compiled guest module** detached, re-granting the fork offer (as `"__fork"`, the guest's
+//! import name) and the shared stdout stream (as `"stdout"`), and joins. The guest's `fork()`
+//! returns the twin's pid (3) in the original and 0 in the twin; both copies `write(1, &slot, 8)`
+//! their result to the one shared stdout sink. Interp only (the serve substrate is eval-loop-only,
+//! as for every fork test). Gated `#![cfg(unix)]` (needs the chibicc toolchain).
 #![cfg(unix)]
 
 use std::process::Command;
@@ -49,6 +49,20 @@ fn spawning(src: &str) -> String {
         rec::segment(17536, &SpawnRec::v1(0)),
         rec::segment(17664, &guest)
     )
+}
+
+/// The host each fork-manager run starts from: one shared stdout sink (so the streams the manager
+/// re-grants land in it), its `stdout`, an `Instantiator` over its 512 KiB window, a 64 MiB
+/// `Budget`, and the fork server it spawns, the child image (#2219) of its func 1. Returns the host
+/// and `[stream, inst, budget, server]`.
+fn fork_host(manager: &temen_ir::Module) -> (Host, [i32; 4]) {
+    let mut host = Host::new();
+    host.shared_stdout();
+    let stream = host.grant_stream(StreamRole::Out);
+    let inst = host.grant_instantiator(0, 1 << 19);
+    let budget = host.grant_budget(-1, 64 << 20, -1);
+    let server = host.grant_module(&temen_ir::child_image_at(manager, 1).expect("server image"));
+    (host, [stream, inst, budget, server])
 }
 
 /// Compile `src` to text IR with the §14 spawnable `--child-entry` ABI.
@@ -301,18 +315,12 @@ block 0 (vpid: i64) {
 
 #[test]
 fn a_compiled_c_program_runs_fork_exec_wait_end_to_end() {
-    let manager = Arc::new(parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager"));
+    let manager = parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager");
     verify_module(&manager).expect("verify exec manager");
     let guest = parse_module_raw(&c_to_ir(EXEC_GUEST_SRC)).expect("parse exec guest");
     verify_module(&guest).expect("verify exec guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let mut fuel = 80_000_000u64;
@@ -394,18 +402,12 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_compiled_c_program_reaps_two_children_with_waitpid_minus_one() {
-    let manager = Arc::new(parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager"));
+    let manager = parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager");
     verify_module(&manager).expect("verify exec manager");
     let guest = parse_module_raw(&c_to_ir(WAITANY_GUEST_SRC)).expect("parse wait-any guest");
     verify_module(&guest).expect("verify wait-any guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let mut fuel = 120_000_000u64;
@@ -456,19 +458,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn waitpid_minus_one_with_no_children_is_echild() {
-    let manager = Arc::new(parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager"));
+    let manager = parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager");
     verify_module(&manager).expect("verify exec manager");
     let guest =
         parse_module_raw(&c_to_ir(WAITANY_NOCHILD_GUEST_SRC)).expect("parse no-child guest");
     verify_module(&guest).expect("verify no-child guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let mut fuel = 80_000_000u64;
@@ -527,18 +523,12 @@ int main(int argc, char **argv) {
 
 #[test]
 fn wait_only_reaps_a_domains_own_children() {
-    let manager = Arc::new(parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager"));
+    let manager = parse_module_raw(&spawning(EXEC_MANAGER)).expect("parse exec manager");
     verify_module(&manager).expect("verify exec manager");
     let guest = parse_module_raw(&c_to_ir(WAIT_SCOPE_GUEST_SRC)).expect("parse scope guest");
     verify_module(&guest).expect("verify scope guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let mut fuel = 120_000_000u64;
@@ -619,21 +609,14 @@ int main(int argc, char **argv) {
 
 #[test]
 fn execve_delivers_argv_to_the_command() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager"));
+    let manager = parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager");
     verify_module(&manager).expect("verify execve manager");
     let guest = parse_module_raw(&c_to_ir(EXECVE_ARGV_GUEST_SRC)).expect("parse argv guest");
     verify_module(&guest).expect("verify argv guest");
     let cmd = parse_module_raw(&c_to_ir(EXECVE_ARGV_CMD_SRC)).expect("parse argv command");
     verify_module(&cmd).expect("verify argv command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -828,9 +811,8 @@ block 0 (vpid: i64) {
 
 #[test]
 fn a_microshell_dispatches_two_named_commands_through_fork_exec_wait() {
-    let manager = Arc::new(
-        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager"),
-    );
+    let manager =
+        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager");
     verify_module(&manager).expect("verify microshell manager");
     let guest = parse_module_raw(&c_to_ir(MICROSHELL_GUEST_SRC)).expect("parse microshell guest");
     verify_module(&guest).expect("verify microshell guest");
@@ -839,13 +821,7 @@ fn a_microshell_dispatches_two_named_commands_through_fork_exec_wait() {
     let two = parse_module_raw(&c_to_ir(MICROSHELL_CMD_TWO_SRC)).expect("parse cmd two");
     verify_module(&two).expect("verify cmd two");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&one);
     let mod2 = host.grant_module(&two);
@@ -928,21 +904,14 @@ int main(int argc, char **argv, char **envp) {
 
 #[test]
 fn execve_delivers_the_environment_to_the_command() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager"));
+    let manager = parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager");
     verify_module(&manager).expect("verify execve manager");
     let guest = parse_module_raw(&c_to_ir(EXECVE_ENV_GUEST_SRC)).expect("parse env guest");
     verify_module(&guest).expect("verify env guest");
     let cmd = parse_module_raw(&c_to_ir(EXECVE_ENV_CMD_SRC)).expect("parse env command");
     verify_module(&cmd).expect("verify env command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1003,8 +972,7 @@ int main(int argc, char **argv, char **envp) {
 
 #[test]
 fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager"));
+    let manager = parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager");
     verify_module(&manager).expect("verify execve manager");
     let shell_src = format!("{FORK_SHIM}\n{SHIM_SHELL_SRC}");
     let cmd_src = format!("{FORK_SHIM}\n{SHIM_CMD_SRC}");
@@ -1013,13 +981,7 @@ fn a_shell_linking_the_process_libc_runs_execvp_with_argv_and_env() {
     let cmd = parse_module_raw(&c_to_ir(&cmd_src)).expect("parse shim command");
     verify_module(&cmd).expect("verify shim command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1111,9 +1073,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_pipes_the_output_of_one_forked_command_into_another() {
-    let manager = Arc::new(
-        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager"),
-    );
+    let manager =
+        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager");
     verify_module(&manager).expect("verify microshell manager");
     let shell_src = format!("{FORK_SHIM}\n{PIPE_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse pipe shell");
@@ -1123,13 +1084,7 @@ fn a_shell_pipes_the_output_of_one_forked_command_into_another() {
     let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
     verify_module(&consumer).expect("verify consumer");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&producer); // granted as "one"
     let mod2 = host.grant_module(&consumer); // granted as "two"
@@ -1213,9 +1168,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
-    let manager = Arc::new(
-        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager"),
-    );
+    let manager =
+        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager");
     verify_module(&manager).expect("verify microshell manager");
     let shell_src = format!("{FORK_SHIM}\n{CONCURRENT_PIPE_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse concurrent pipe shell");
@@ -1226,13 +1180,7 @@ fn a_shell_runs_a_concurrent_pipe_with_a_blocking_read() {
     let consumer = parse_module_raw(&c_to_ir(PIPE_CONSUMER_SRC)).expect("parse consumer");
     verify_module(&consumer).expect("verify consumer");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&producer); // "one"
     let mod2 = host.grant_module(&consumer); // "two"
@@ -1290,9 +1238,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_full_pipe_write_is_bounded_to_the_capacity() {
-    let manager = Arc::new(
-        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager"),
-    );
+    let manager =
+        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager");
     verify_module(&manager).expect("verify microshell manager");
     let shell_src = format!("{FORK_SHIM}\n{BACKPRESSURE_BOUND_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse backpressure shell");
@@ -1301,13 +1248,7 @@ fn a_full_pipe_write_is_bounded_to_the_capacity() {
     let filler = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse filler");
     verify_module(&filler).expect("verify filler");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&filler);
     let mod2 = host.grant_module(&filler);
@@ -1392,9 +1333,8 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_producer_gets_epipe_when_its_consumer_exits() {
-    let manager = Arc::new(
-        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager"),
-    );
+    let manager =
+        parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse microshell manager");
     verify_module(&manager).expect("verify microshell manager");
     let shell_src = format!("{FORK_SHIM}\n{EPIPE_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse epipe shell");
@@ -1404,13 +1344,7 @@ fn a_producer_gets_epipe_when_its_consumer_exits() {
     let consumer = parse_module_raw(&c_to_ir(EPIPE_CONSUMER_SRC)).expect("parse consumer");
     verify_module(&consumer).expect("verify consumer");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&producer); // "one"
     let mod2 = host.grant_module(&consumer); // "two"
@@ -1491,8 +1425,7 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_redirects_a_command_output_to_a_file() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let shell_src = format!("{FORK_SHIM}\n{REDIRECT_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse redirect shell");
@@ -1500,13 +1433,7 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse redirect command");
     verify_module(&cmd).expect("verify redirect command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1603,8 +1530,7 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_appends_a_command_output_to_a_file() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let shell_src = format!("{FORK_SHIM}\n{APPEND_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse append shell");
@@ -1612,13 +1538,7 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let cmd = parse_module_raw(&c_to_ir(REDIRECT_CMD_SRC)).expect("parse append command");
     verify_module(&cmd).expect("verify append command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1722,8 +1642,7 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_redirects_a_file_into_a_command_stdin() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let shell_src = format!("{FORK_SHIM}\n{INPUT_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse input shell");
@@ -1731,13 +1650,7 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let cmd = parse_module_raw(&c_to_ir(INPUT_CMD_SRC)).expect("parse input command");
     verify_module(&cmd).expect("verify input command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1839,8 +1752,7 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_shell_redirects_a_command_stderr_to_a_file() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let shell_src = format!("{FORK_SHIM}\n{STDERR_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse stderr shell");
@@ -1848,13 +1760,7 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let cmd = parse_module_raw(&c_to_ir(STDERR_CMD_SRC)).expect("parse stderr command");
     verify_module(&cmd).expect("verify stderr command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -1956,7 +1862,7 @@ int main(int argc, char **argv) {
 fn a_shell_execs_a_command_with_a_large_bss_buffer() {
     // The shell declares a 256 KiB window; the forked child's exec of the `memory 18` command
     // exercises op-14's window-≥-declared admission.
-    let manager = Arc::new(parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse manager"));
+    let manager = parse_module_raw(&spawning(MICROSHELL_MANAGER)).expect("parse manager");
     verify_module(&manager).expect("verify manager");
     let shell_src = format!("{FORK_SHIM}\n{BIGEXEC_SHELL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&shell_src)).expect("parse bigexec shell");
@@ -1964,13 +1870,7 @@ fn a_shell_execs_a_command_with_a_large_bss_buffer() {
     let cmd = parse_module_raw(&c_to_ir(BIGEXEC_CMD_SRC)).expect("parse bigexec command");
     verify_module(&cmd).expect("verify bigexec command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let mod1 = host.grant_module(&cmd); // "one"
     let mod2 = host.grant_module(&cmd); // "two" (unused)
@@ -2070,8 +1970,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32) {
 
 #[test]
 fn a_nested_compiled_c_guest_execs_a_separate_command() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(NEXEC_MANAGER)).expect("parse nexec manager"));
+    let manager = parse_module_raw(&spawning(NEXEC_MANAGER)).expect("parse nexec manager");
     verify_module(&manager).expect("verify nexec manager");
     let guest = parse_module_raw(&c_to_ir(NEXEC_GUEST_SRC)).expect("parse nexec guest");
     verify_module(&guest).expect("verify nexec guest");
@@ -2219,7 +2118,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32) {
 
 #[test]
 fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
-    let manager = Arc::new(parse_module_raw(&spawning(FS_MANAGER)).expect("parse fs manager"));
+    let manager = parse_module_raw(&spawning(FS_MANAGER)).expect("parse fs manager");
     verify_module(&manager).expect("verify fs manager");
     let guest = parse_module_raw(&c_to_ir(FS_GUEST_SRC)).expect("parse fs guest");
     verify_module(&guest).expect("verify fs guest");
@@ -2444,21 +2343,14 @@ block 0 (vpid: i64) {
 
 #[test]
 fn a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager"));
+    let manager = parse_module_raw(&spawning(EXECVE_MANAGER)).expect("parse execve manager");
     verify_module(&manager).expect("verify execve manager");
     let guest = parse_module_raw(&c_to_ir(EXECVE_GUEST_SRC)).expect("parse execve guest");
     verify_module(&guest).expect("verify execve guest");
     let cmd = parse_module_raw(&c_to_ir(EXECVE_CMD_SRC)).expect("parse execve command");
     verify_module(&cmd).expect("verify execve command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -2645,21 +2537,14 @@ block 0 (vpid: i64) {
 
 #[test]
 fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest = parse_module_raw(&c_to_ir(FS_FORK_GUEST_SRC)).expect("parse fs-fork guest");
     verify_module(&guest).expect("verify fs-fork guest");
     let cmd = parse_module_raw(&c_to_ir(FS_CAT_CMD_SRC)).expect("parse fs-fork command");
     verify_module(&cmd).expect("verify fs-fork command");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
 
@@ -2720,19 +2605,13 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
 
 #[test]
 fn a_compiled_c_program_forks_for_real_and_both_copies_write_through_the_shared_stream() {
-    let manager = Arc::new(parse_module_raw(&spawning(MANAGER)).expect("parse manager"));
+    let manager = parse_module_raw(&spawning(MANAGER)).expect("parse manager");
     verify_module(&manager).expect("verify manager");
     // Parse the guest RAW so its `write`/`__fork` call.syms stay manifest imports the spawn binds.
     let guest = parse_module_raw(&c_to_ir(GUEST_SRC)).expect("parse guest");
     verify_module(&guest).expect("verify guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout(); // unify the stdout stream + the re-granted child stream into one sink
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let mut fuel = 60_000_000u64;
@@ -2833,20 +2712,13 @@ fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork 
 
 #[test]
 fn a_compiled_c_parent_kills_its_forked_child_by_pid() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{KILL_BY_PID_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse kill-by-pid guest");
     verify_module(&guest).expect("verify kill-by-pid guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -2917,20 +2789,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn an_unhandled_sigterm_kills_a_runaway_forked_child_for_real() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{DEFAULT_TERMINATE_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse default-terminate guest");
     verify_module(&guest).expect("verify default-terminate guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3000,20 +2865,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_single_waitpid_call_blocks_until_the_child_exits() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{BLOCKING_WAITPID_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse blocking-waitpid guest");
     verify_module(&guest).expect("verify blocking-waitpid guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3097,20 +2955,13 @@ int main(int argc, char **argv) {
 fn a_ctrl_c_interrupts_a_blocked_personality_waitpid() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{BLOCKING_WAITPID_EINTR_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse waitpid-eintr guest");
     verify_module(&guest).expect("verify waitpid-eintr guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3197,20 +3048,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn isatty_discriminates_the_proto_terminal_and_getppid_names_the_forking_parent() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{ISATTY_PPID_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse isatty-ppid guest");
     verify_module(&guest).expect("verify isatty-ppid guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3291,20 +3135,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn sa_restart_rides_a_parked_wait_through_a_delivered_signal() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{RESTART_WAIT_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse restart-wait guest");
     verify_module(&guest).expect("verify restart-wait guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3396,20 +3233,13 @@ int main(int argc, char **argv) {
 fn a_terminal_ctrl_c_interrupts_a_forked_parent_blocked_in_wait() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{WAIT_EINTR_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse wait-eintr guest");
     verify_module(&guest).expect("verify wait-eintr guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3548,20 +3378,13 @@ int main(int argc, char **argv) {
 fn a_ctrl_c_at_the_parent_never_sweeps_the_childs_wait_park() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{WAIT_SCOPED_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse scoped-wait guest");
     verify_module(&guest).expect("verify scoped-wait guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3659,20 +3482,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{WAITPID_TWIN_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse waitpid-twin guest");
     verify_module(&guest).expect("verify waitpid-twin guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3770,20 +3586,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn a_compiled_c_shell_runs_the_job_control_loop() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{JOB_CONTROL_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse job-control guest");
     verify_module(&guest).expect("verify job-control guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());
@@ -3897,20 +3706,13 @@ int main(int argc, char **argv) {
 
 #[test]
 fn ctrl_z_stops_a_forked_child_and_fg_resumes_it() {
-    let manager =
-        Arc::new(parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager"));
+    let manager = parse_module_raw(&spawning(FS_FORK_MANAGER)).expect("parse fs-fork manager");
     verify_module(&manager).expect("verify fs-fork manager");
     let guest_src = format!("{FORK_SHIM}\n{CTRL_Z_SRC}");
     let guest = parse_module_raw(&c_to_ir(&guest_src)).expect("parse ctrl-z guest");
     verify_module(&guest).expect("verify ctrl-z guest");
 
-    let mut host = Host::new();
-    let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
-    let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
-    let budget = host.grant_budget(-1, 64 << 20, -1);
-    let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));
+    let (mut host, [stream, inst, budget, server]) = fork_host(&manager);
     let gmod = host.grant_module(&guest);
 
     let (posix, make) = temen_posix::cap(4096, 1 << 16, Vec::new());

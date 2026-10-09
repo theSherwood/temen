@@ -58,20 +58,10 @@ fn store_name(p: &str, at: u64, name: &str) -> String {
         .collect()
 }
 
-/// A 16-byte grant record `{name_off, name_len, handle, flags}` at `at`, naming the handle in
-/// register `handle` by the name stored at `name_at`.
+/// A grant record at `at` ([`rec::grant`]) naming the handle in register `handle` by `name`, which
+/// it stores at `name_at`.
 fn store_grant(p: &str, at: u64, name_at: u64, name: &str, handle: &str) -> String {
-    format!(
-        "  {p}r0 = i64.const {at}\n  {p}n0 = i32.const {name_at}\n  i32.store {p}r0 {p}n0\n\
-         \x20 {p}r1 = i64.const {}\n  {p}n1 = i32.const {}\n  i32.store {p}r1 {p}n1\n\
-         \x20 {p}r2 = i64.const {}\n  i32.store {p}r2 {handle}\n\
-         \x20 {p}r3 = i64.const {}\n  {p}n3 = i32.const 0\n  i32.store {p}r3 {p}n3\n{}",
-        at + 4,
-        name.len(),
-        at + 8,
-        at + 12,
-        store_name(p, name_at, name),
-    )
+    rec::grant(p, at, name_at, name.len(), handle) + &store_name(p, name_at, name)
 }
 
 /// The join tail every parent shares: a refused spawn (negative handle) returns its `-errno`, an

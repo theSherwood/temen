@@ -343,7 +343,7 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 /// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module,
 /// `v2` a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]),
 /// `v3` freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout, and
-/// `v6`, `v7` the programs of the child's own children ([`nest`]). It spawns `NEST` detached at
+/// `v6`, `v7` the programs of the child's own children ([`Nest`]). It spawns `NEST` detached at
 /// entry 0 with four named grants (#2018): the authority as `"freeze"`, so the durable child may
 /// spawn in turn, `v6` and `v7` as `"nest"` and `"nest2"`, and its stdout as `"stdout"` (#2054). It
 /// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking
@@ -443,6 +443,7 @@ block 0 (v0: i64, v1: i64) {
 const NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
+export 0 func \"nest\" 1
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vbp = i64.const 90112
@@ -649,6 +650,7 @@ const PRINT_GRAND_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
 data 90128 \"stdout\"
+export 0 func \"nest\" 1
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vbp = i64.const 90112
@@ -709,6 +711,8 @@ const COMPLETED_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
 data 90128 \"nest2\"
+export 0 func \"nest\" 1
+export 1 func \"nest2\" 2
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   vbp = i64.const 90112
@@ -784,50 +788,60 @@ fn confined_module(m: &temen_ir::Module) -> temen_ir::Module {
     m
 }
 
-/// The `child` [`NEST_ROOT`] spawns ([`NEST`] or another), then the programs its own children run:
-/// the child images (#2219) of its funcs 1 and 2, where it has them. All instrumented: the host
-/// grants each as a durable `Module`, since a durable domain spawns only those (#1501).
-fn nest(child: &str) -> Vec<temen_ir::Module> {
-    let m = temen_text::parse_module(child).expect("parse");
-    let images = (1..m.funcs.len().min(3) as u32)
-        .map(|f| temen_ir::child_image_at(&m, f).expect("child image"));
-    std::iter::once(m.clone())
-        .chain(images)
-        .map(|m| confined_module(&m))
-        .collect()
+/// The modules [`NEST_ROOT`] is handed, instrumented: the `child` it spawns ([`NEST`] or another),
+/// and the programs it grants the child as `"nest"` and `"nest2"`: the child images (#2219) of the
+/// functions the child exports under those names, if it does. The host grants each as a durable
+/// `Module`, since a durable domain spawns only those (#1501).
+struct Nest {
+    child: temen_ir::Module,
+    grand: [Option<temen_ir::Module>; 2],
 }
 
-/// [`NEST_ROOT`] and [`nest`]`(child)`.
-fn nest_modules(child: &str) -> (temen_ir::Module, Vec<temen_ir::Module>) {
-    (confined(NEST_ROOT), nest(child))
+impl Nest {
+    fn of(child: &str) -> Nest {
+        let m = temen_text::parse_module(child).expect("parse");
+        let grand = ["nest", "nest2"].map(|name| {
+            let e = m.exports.iter().find(|e| e.name == name)?;
+            Some(confined_module(
+                &temen_ir::child_image_at(&m, e.func).expect("child image"),
+            ))
+        });
+        Nest {
+            child: confined_module(&m),
+            grand,
+        }
+    }
+
+    /// Grant the modules into `host`, in one order for a run and the restore of its artifact: the
+    /// child's handle, then the grandchildren's, an empty grant where the child has none.
+    fn grant(&self, host: &mut Host) -> (i32, [i32; 2]) {
+        let child = host.grant_durable_module(&self.child);
+        let grand = self.grand.each_ref().map(|g| match g {
+            Some(m) => host.grant_durable_module(m),
+            None => temen_interp::GRANT_EMPTY as i32,
+        });
+        (child, grand)
+    }
 }
 
-/// [`NEST_ROOT`]'s powerbox: its `Instantiator`, the [`nest`] modules as durable `Module`s, a
-/// `Budget` of 1 MiB, freeze authority over detached progeny, and stdout; and its arguments,
-/// `settle_ms` among them. A child with no func 1 or 2 is handed its own module in that image's
-/// place, which it never spawns. The tree has settled once `live` of the root's descendants are
-/// live, so the budget's `spawn` ceiling is 2 more than `live`: its room then falls to the 2 the
-/// root waits for.
-fn nest_powerbox(nest: &[temen_ir::Module], settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
+/// [`NEST_ROOT`] and [`Nest::of`]`(child)`.
+fn nest_modules(child: &str) -> (temen_ir::Module, Nest) {
+    (confined(NEST_ROOT), Nest::of(child))
+}
+
+/// [`NEST_ROOT`]'s powerbox: its `Instantiator`, the [`Nest`] modules, a `Budget` of 1 MiB, freeze
+/// authority over detached progeny, and stdout; and its arguments, `settle_ms` among them. The tree
+/// has settled once `live` of the root's descendants are live, so the budget's `spawn` ceiling is 2
+/// more than `live`: its room then falls to the 2 the root waits for.
+fn nest_powerbox(nest: &Nest, settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
-    let mods: Vec<i32> = nest.iter().map(|m| host.grant_durable_module(m)).collect();
+    let (modh, [nest1, nest2]) = nest.grant(&mut host);
     let budget = host.grant_budget(-1, 1 << 20, live + 2);
     let freeze = host.grant_freeze_authority(FreezeScope::DetachedProgeny);
     let out = host.grant_stream(StreamRole::Out);
-    let grand = |k: usize| *mods.get(k).unwrap_or(&mods[0]);
-    let args = [
-        inst,
-        mods[0],
-        budget,
-        freeze,
-        settle_ms,
-        out,
-        grand(1),
-        grand(2),
-    ]
-    .map(i64::from);
+    let args = [inst, modh, budget, freeze, settle_ms, out, nest1, nest2].map(i64::from);
     (host, args.to_vec())
 }
 
@@ -966,13 +980,11 @@ fn carried(host: &Host) -> Vec<usize> {
         .collect()
 }
 
-/// Restore `art` into a fresh host that re-grants the [`nest`] modules, ready to thaw.
-fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &[temen_ir::Module]) -> (Host, Vec<u8>) {
+/// Restore `art` into a fresh host that re-grants the [`Nest`] modules, ready to thaw.
+fn nest_restore(art: &[u8], root: &temen_ir::Module, nest: &Nest) -> (Host, Vec<u8>) {
     let mut host = Host::new();
     host.set_durable(true);
-    for m in nest {
-        host.grant_durable_module(m);
-    }
+    nest.grant(&mut host);
     let mut win = temen_snapshot::restore(art, root, &mut host).expect("restore");
     begin_thaw(&mut win, ARENA, 0);
     (host, win)
@@ -985,7 +997,7 @@ fn nest_thaws(
     art: &[u8],
     froze: Engine,
     root: &temen_ir::Module,
-    nest: &[temen_ir::Module],
+    nest: &Nest,
     args: &[i64],
     runs: &[Engine],
     answer: Answer,
@@ -1331,7 +1343,7 @@ fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
 /// answers `answer`, the uninterrupted run's; neither child writes, so nor does any run.
 fn refreezes_every_engine(child: &str, answer: Answer) {
     use Engine::*;
-    let (root, child) = (confined(&refreeze_root()), nest(child));
+    let (root, child) = (confined(&refreeze_root()), Nest::of(child));
     let mut wrong = Vec::new();
     let mut runs = Vec::new();
     for e in [Interp, Jit] {
