@@ -652,6 +652,241 @@ fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
     );
 }
 
+/// #2220 — the parent `(Instantiator, child module, Budget, mailbox, region)` spawns the child
+/// detached with the mailbox pre-mapped at the child's 128 KiB, then grants the running child
+/// `region` (`Instantiator.grant`, op 19). `FLIP` requests the freeze just before the grant, so the
+/// freeze lands at it, once the grant has taken effect. The parent then maps the mailbox at its own
+/// 128 KiB, posts the child's index of the region in its first word and wakes the child, maps the
+/// region at its own 192 KiB, joins, and returns `index·1_000_000 + child + 2·(what the child
+/// stored)`, read back through its mapping: a thaw that granted again would answer a second index.
+const GRANTING_PARENT: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vmod: i32, vbud: i32, vmb: i32, vgr: i32) {
+  vmb64 = i64.extend_i32_s vmb
+  vwin = i64.const 131072
+  me = i64.extend_i32_s vmod
+  vb = i64.extend_i32_s vbud
+  gz = i64.const 0
+  sl = i64.const 18
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz, gz, gz, vmb64, vwin)
+FLIP
+  vgr64 = i64.extend_i32_s vgr
+  vh = call.cap 6 19 (i32, i64) -> (i32) vinst (ch, vgr64)
+  vlen = i64.const 65536
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vmb (vwin, gz, vlen, vprot)
+  vh64 = i64.extend_i32_s vh
+  i64.atomic.store vwin vh64
+  vone = i32.const 1
+  vwoke = atomic.notify vwin vone
+  vgat = i64.const 196608
+  vm2 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vgr (vgat, gz, vlen, vprot)
+  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vq = i64.const 196624
+  vy = i64.load vq
+  vy2 = i64.add vy vy
+  vs0 = i64.add vr vy2
+  vmil = i64.const 1000000
+  vhm = i64.mul vh64 vmil
+  vs = i64.add vs0 vhm
+  return vs
+  }
+}
+";
+
+/// The child: [`SHARING_CHILD`]'s polled loop, which the freeze cuts, then a wait for the index its
+/// parent posts in the mailbox, parked between looks so the parent runs (`-1` if it never comes).
+/// Through the index the child maps the granted region at its 192 KiB, reads the parent's `2222`,
+/// stores `3333` beside it, and returns what it read. Had the region not come back in its
+/// powerbox, the `map` would fail and the child would read and write its own window.
+const GRANTED_CHILD: &str = "memory 18 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vs0 = i32.wrap_i64 v1
+  vz = i64.const 0
+  vu = call.cap 5 1 (i64, i64) -> (i64) vs0 (vz, vz)
+  br 1(vz)
+}
+block 1 (vi: i64) {
+  vn = i64.const 1000000
+  vc = i64.lt_s vi vn
+  br_if vc 2(vi) 3(vi)
+}
+block 2 (vj: i64) {
+  vo = i64.const 1
+  vk = i64.add vj vo
+  br 1(vk)
+}
+block 3 (vd: i64) {
+  va = i64.const 131072
+  vh = i64.atomic.load va
+  vz = i64.const 0
+  vw = i64.eq vh vz
+  br_if vw 5(vd) 4(vh)
+}
+block 4 (vg: i64) {
+  vr = i32.wrap_i64 vg
+  vat = i64.const 196608
+  vz = i64.const 0
+  vlen = i64.const 65536
+  vprot = i64.const 3
+  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (vat, vz, vlen, vprot)
+  vp = i64.const 196616
+  vx = i64.load vp
+  vq = i64.const 196624
+  vt = i64.const 3333
+  i64.store vq vt
+  return vx
+}
+block 5 (ve: i64) {
+  va = i64.const 131072
+  vz = i64.const 0
+  vto = i64.const 1000000
+  vws = i64.atomic.wait va vz vto
+  vlim = i64.const 1010000
+  vmore = i64.lt_s ve vlim
+  br_if vmore 2(ve) 6()
+}
+block 6 () {
+  vgone = i64.const -1
+  return vgone
+  }
+}
+";
+const GRANTED_WANT: i64 = 2222 + 2 * 3333;
+
+fn granting_parent(flip: bool) -> Module {
+    confined(&GRANTING_PARENT.replace("FLIP", if flip { FLIP } else { "" }))
+}
+
+/// [`sharing_host`] over `mailbox`, and `region`, holding `2222` at byte 8, for the parent to grant.
+fn granting_host(
+    child: &Module,
+    mailbox: Arc<dyn SharedBacking>,
+    region: Arc<dyn SharedBacking>,
+) -> (Host, [Value; 5]) {
+    let (mut host, [inst, modh, budget, mbox]) = sharing_host(child, mailbox);
+    for (o, b) in 2222i64.to_le_bytes().into_iter().enumerate() {
+        region.write_byte(8 + o as u64, b);
+    }
+    let rh = host.grant_shared_region_backed(region);
+    (host, [inst, modh, budget, mbox, Value::I32(rh)])
+}
+
+/// The parent's answer, checked to be `index·1_000_000 + GRANTED_WANT` for some granted index.
+fn granted_answer(answer: i64) -> i64 {
+    assert!(
+        answer / 1_000_000 > 0 && answer % 1_000_000 == GRANTED_WANT,
+        "the parent answered {answer}"
+    );
+    answer
+}
+
+/// The regions the frozen child's powerbox holds: the one its spawn pre-mapped, and the one its
+/// parent granted it once the grant has landed.
+fn child_regions(host: &Host) -> usize {
+    let child = host.captured_detached()[0].host.lock().unwrap();
+    let handles = child.capture_durable_handles().expect("a durable powerbox");
+    handles
+        .iter()
+        .filter(|h| matches!(h.binding, temen_interp::DurableBinding::SharedRegion { .. }))
+        .count()
+}
+
+/// **#2220 — a capability granted into a running child rides a freeze like any other.** The freeze
+/// lands at the grant, so the captured child's powerbox holds the granted region beside the
+/// pre-mapped one; the thaw reloads the index the grant answered and restores the region under it:
+/// the child maps it and reads the bytes carried from before the cut, and the parent reads what the
+/// child stores.
+#[test]
+fn a_region_granted_into_a_running_child_rides_a_freeze() {
+    let child = confined(GRANTED_CHILD);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let (mut host, args) = granting_host(&child, heap_region(), heap_region());
+    let (base, ..) = run(&granting_parent(false), 0, &mut host, &args, &win, None);
+    let want = match base.as_deref() {
+        Ok([Value::I64(x)]) => granted_answer(*x),
+        other => panic!("uninterrupted run: {other:?}"),
+    };
+
+    let parent = granting_parent(true);
+    let (mut fhost, args) = granting_host(&child, heap_region(), heap_region());
+    let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &win, None);
+    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
+    assert_eq!(
+        child_regions(&fhost),
+        2,
+        "the granted region rides in its powerbox"
+    );
+
+    let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.grant_durable_module(&child);
+    let (mut twin, rprots, _) =
+        restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
+    assert_eq!(
+        thawed,
+        Ok(vec![Value::I64(want)]),
+        "the thawed child maps the region its parent granted it, under the same index"
+    );
+}
+
+/// **#2220 — on the native JIT too.** The grant reaches the child through the powerbox the nursery
+/// retains for it, a freeze captures the granted region there, and the JIT thaw and the
+/// interpreter's, from the same artifact, both give the uninterrupted run's answer.
+#[test]
+fn a_region_granted_into_a_running_child_rides_a_jit_freeze() {
+    let child = confined(GRANTED_CHILD);
+    let shm = || temen_run::new_shared_region(LEN);
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (mut host, args) = granting_host(&child, shm(), shm());
+    let image = || MemLayout::image(fresh.clone());
+    let base = run_jit(&granting_parent(false), 0, &mut host, &args, &image()).0;
+    let want = granted_answer(base.expect("uninterrupted run"));
+
+    // The child cannot finish before the freeze reaches it: it waits for an index the parent posts
+    // only after the cut.
+    let parent = granting_parent(true);
+    let (mut fhost, _) = granting_host(&child, shm(), shm());
+    let (res, snap) = run_jit(&parent, 0, &mut fhost, &args, &image());
+    assert_eq!(res, None, "frozen");
+    assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
+    assert_eq!(
+        child_regions(&fhost),
+        2,
+        "the granted region rides in its powerbox"
+    );
+
+    let artifact = freeze_layout(&parent, &snap, SIZE_LOG2, &fhost).expect("rides");
+    let restored = || {
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.set_region_factory(temen_run::new_shared_region);
+        thost.grant_durable_module(&child);
+        let (rwin, rprots, _) =
+            restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+        (thost, rwin, rprots)
+    };
+    let (mut thost, rwin, rprots) = restored();
+    assert_eq!(
+        run_jit(&parent, 0, &mut thost, &args, &thaw_layout(rwin, &rprots)).0,
+        Some(want),
+        "the JIT thaw maps the granted region"
+    );
+    let (mut thost, mut rwin, rprots) = restored();
+    begin_thaw(&mut rwin, TEST_ARENA, 0);
+    assert_eq!(
+        run(&parent, 0, &mut thost, &args, &rwin, Some(&rprots)).0,
+        Ok(vec![Value::I64(want)]),
+        "and so does the interpreter's"
+    );
+}
+
 /// #2051 — a bytecode **reactor** (the browser save-state's engine): func 0 `(AddressSpace)` mints a
 /// region, maps it at 128 KiB and again at 192 KiB, stores `1111` through the first, and returns the
 /// handle; func 1 `(region)` maps a region it is handed at 128 KiB; func 2 (`tick`) stores `3333`

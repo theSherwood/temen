@@ -112,21 +112,6 @@ pub fn translate(src: &str) -> Result<Module, LengError> {
     module_of(&text)
 }
 
-/// Translate a Leng-NIF module to Temen text with **Tier-2 TLS lowering** (NIM.md §3d): a `tvar`
-/// (thread-var) becomes a per-vCPU TLS-block access (`vcpu.tls.get() + off`) instead of a plain
-/// window global. The generated module assumes the runtime has established this thread's TLS base
-/// (`vcpu.tls.set`) before any `tvar` access — the block layout is per-`tvar` offsets from that base.
-pub fn translate_tls_to_text(src: &str) -> Result<String, LengError> {
-    let root = nif::parse(src).map_err(LengError::Parse)?;
-    translate::Translator::new().with_tls().module(&root)
-}
-
-/// [`translate_tls_to_text`] parsed to an TEMEN-IR [`Module`] (unverified; the caller verifies).
-pub fn translate_tls(src: &str) -> Result<Module, LengError> {
-    let text = translate_tls_to_text(src)?;
-    module_of(&text)
-}
-
 /// Translate a **single named proc** out of a full Leng module to Temen text — the "go deep" entry
 /// for real nimony output, where the enclosing module still carries constructs the skeleton does
 /// not lower (`gvar`/`type`/`if`/pointers). The named proc becomes func 0; any call it makes to a
@@ -231,7 +216,7 @@ fn translate_object_module(
     ext_consts: &[(String, i64)],
     c_global_defs: &[String],
     c_global_aliases: &[(String, String)],
-    tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
+    thread_locals: Option<&[(String, translate::TyDesc)]>,
     pooled_funcrefs: &crate::dethash::HashSet<String>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -244,10 +229,9 @@ fn translate_object_module(
     t.import_consts(ext_consts);
     t.import_c_global_defs(c_global_defs);
     t.import_c_global_aliases(c_global_aliases);
-    // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
-    // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
-    if let Some(layout) = tls_layout {
-        t.import_tls_layout(layout, stem);
+    // A program that can start a thread: `tvar`s are thread-locals, and these are the program's.
+    if let Some(ext) = thread_locals {
+        t.import_thread_locals(ext);
     }
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
@@ -352,7 +336,7 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
 /// constructing a `string.0.sysvq0asl` gets the system module's layout automatically, with no
 /// hand-supplied prelude.
 fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
-    link_selected_with_extra(units, Vec::new(), false, false, false)
+    link_selected_with_extra(units, Vec::new(), false, false)
 }
 
 /// Build the **powerbox `_start` link unit** (function 0): a paramless entry that reads the
@@ -514,10 +498,12 @@ fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
 ///
 /// When `synth_start` is set, a powerbox `_start` unit ([`synth_start_unit`]) is linked **first**,
 /// so the merged module is a runnable powerbox entry (function 0 = `_start`, calling `main`).
+///
+/// A program that can start a thread ([`starts_threads`]) gets its `tvar`s as thread-locals (#1715,
+/// NIM.md §3d); in any other, a `tvar` has one instance, and is a plain global.
 fn link_selected_with_extra(
     units: &[(&str, &str, Select)],
     extra: Vec<temen_ir::LinkUnit>,
-    tls: bool,
     manifest: bool,
     synth_start: bool,
 ) -> Result<Module, LengError> {
@@ -572,9 +558,14 @@ fn link_selected_with_extra(
     let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
-    // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
-    // order, to lay out the one shared per-vCPU block below.
-    let mut pooled_tls: Vec<(String, u64)> = Vec::new();
+    // Whether the program can start a thread, and if it can, every unit's thread-locals (stem-suffixed
+    // name → descriptor), which a sibling reaches through `data.sym tls`.
+    let threads = roots
+        .iter()
+        .map(starts_threads)
+        .collect::<Result<Vec<_>, _>>()?
+        .contains(&true);
+    let mut pooled_tls: Vec<(String, translate::TyDesc)> = Vec::new();
     // Pooled **sret procs** across all units (stem-suffixed name → returned aggregate). A caller of
     // an aggregate-returning proc materializes a result temp and passes it as `$sret` — and a proc
     // that does so becomes frame-needing — so the sret set must be known **before** the frame
@@ -601,7 +592,9 @@ fn link_selected_with_extra(
     let mut pooled_c_global_defs: Vec<String> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled_globals.extend(translate::Translator::export_globals(&root, stem, &pooled)?);
+        let (globals, tls) = translate::Translator::export_globals(&root, stem, &pooled, threads)?;
+        pooled_globals.extend(globals);
+        pooled_tls.extend(tls);
         pooled_sret.extend(translate::Translator::export_sret_procs(
             &root, stem, &pooled,
         )?);
@@ -610,9 +603,6 @@ fn link_selected_with_extra(
         )?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
         pooled_c_global_defs.extend(translate::Translator::export_c_global_names(&root));
-        if tls {
-            pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
-        }
     }
     // The C-name alias pool, built **after** `pooled_c_global_defs` is complete: a unit that diverts
     // an `importc` declaration to its C name stops exporting that declaration's nim name, so every
@@ -653,18 +643,6 @@ fn link_selected_with_extra(
             &pooled_funcrefs,
         )?);
     }
-    // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
-    // unit is handed this map, so a `tvar` defined in one unit and referenced from another lower to
-    // the same `vcpu.tls.get()+off` — the offset-agreement a cross-module global gets from `data.sym`.
-    let tls_layout: Option<crate::dethash::HashMap<String, u64>> = tls.then(|| {
-        let mut layout = crate::dethash::HashMap::default();
-        let mut off = 0u64;
-        for (name, size) in &pooled_tls {
-            layout.insert(name.clone(), off);
-            off += size;
-        }
-        layout
-    });
     // Whole-program frame fixpoint: a proc needs a frame if it does itself, or if it calls one that
     // does — transitively, across module boundaries (`program → seq → alloc → alloc.0.`). Each unit
     // then translates knowing the *final* frame-need of every callee, so a cross-module call to a
@@ -718,7 +696,7 @@ fn link_selected_with_extra(
                 &pooled_consts,
                 &pooled_c_global_defs,
                 &pooled_c_global_aliases,
-                tls_layout.as_ref(),
+                threads.then_some(pooled_tls.as_slice()),
                 &pooled_funcrefs,
             )?))
         })
@@ -875,7 +853,7 @@ pub fn link_whole_with_runtime(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false, false, false)
+    link_selected_with_extra(&sel, runtime, false, false)
 }
 
 /// [`link_whole_with_runtime`], but **retaining the raw-syscall leaves** (`write`/`read`/`_exit`,
@@ -893,7 +871,7 @@ pub fn link_whole_with_runtime_manifest(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false, true, false)
+    link_selected_with_extra(&sel, runtime, true, false)
 }
 
 /// [`link_whole_with_runtime_manifest`] **plus a synthesized powerbox `_start`** (function 0): the
@@ -912,7 +890,7 @@ pub fn link_whole_powerbox_manifest(
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, false, true, true)
+    link_selected_with_extra(&sel, runtime, true, true)
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
@@ -1076,9 +1054,9 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("execve", ANY, 24),
     ("clock_gettime", ANY, 25),
     // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
-    // `memfiles`/`osproc`/`terminal`/`rawthreads` declare (#1422). Same posture as the six above and
-    // for the same reason: a playground guest is granted no ambient filesystem, environment, process
-    // table, or OS threads, so every one of these is a **fail-closed stub** — the metadata and
+    // `memfiles`/`osproc`/`terminal` declare (#1422). Same posture as the six above and
+    // for the same reason: a playground guest is granted no ambient filesystem, environment or process
+    // table, so every one of these is a **fail-closed stub** — the metadata and
     // mutation calls report failure, `getcwd`/`c_getenv` report "absent" (a null pointer, i.e. an
     // empty environment and no current directory), and `nanosleep` succeeds immediately.
     //
@@ -1119,15 +1097,29 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // sizes itself from). Pinning makes the next such drift an unbound leaf named at link instead.
     ("sysconf", sig(&[I32], &[I64]), 48),
     ("nativeIoctl", ANY, 49),
-    ("pthread_attr_init", ANY, 50),
-    ("pthread_attr_setstacksize", ANY, 51),
-    ("pthread_attr_destroy", ANY, 52),
-    ("pthread_create", ANY, 53),
-    ("pthread_join", ANY, 54),
+    // **Threads** (#2202): `std/rawthreads`' pthreads, served for real.
+    // - `pthread_create` maps one region from the shim's `mmap`: a start record, the thread's block
+    //   (a copy of the program's thread-local image, #1715) and a data stack. The stack is 1 MiB, the
+    //   main thread's reserve, unless `pthread_attr_setstacksize` put another size in nim's attr blob.
+    //   It `thread.spawn`s an entry that installs the block (`vcpu.tls.set`), calls the start routine
+    //   through `call.dyn`, and unmaps the region when the routine returns.
+    // - `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle.
+    // - A program that declares `pthread_create` links its `tvar`s as thread-locals
+    //   ([`starts_threads`]).
+    // - `syscall` serves `SYS_futex` (202, nimony's amd64 number), which `std/locks`' mutex and
+    //   condition variable wait on: `FUTEX_WAIT` is `i32.atomic.wait` and `FUTEX_WAKE` is
+    //   `atomic.notify`. Any other number fails with `ENOSYS`.
+    // - CPU affinity stays a no-op (rows 55–57).
+    // **Pinned** (#1499): these rows read their arguments, so a shape that drifts is an unbound leaf.
+    ("pthread_attr_init", sig(&[I64], &[I32]), 50),
+    ("pthread_attr_setstacksize", sig(&[I64, I64], &[I32]), 51),
+    ("pthread_attr_destroy", sig(&[I64], &[I32]), 52),
+    ("pthread_create", sig(&[I64, I64, I32, I64], &[I32]), 53),
+    ("pthread_join", sig(&[I64, I64], &[I32]), 54),
     ("cpusetZero", ANY, 55),
     ("cpusetIncl", ANY, 56),
     ("setAffinity", ANY, 57),
-    ("syscall", ANY, 58),
+    ("syscall", sig(&[I64, I64], &[I64]), 58),
     // **The rest of `std/atomics`' builtin family** (#1443). The other six atomics were already here
     // under nim's `atomic*` spelling; these four are what `std/atomics` itself calls, and they were
     // the only thing left once the `cpuRelax` `{.emit.}` stopped failing the link. Each is the IR's
@@ -1189,10 +1181,7 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // forever is precisely the silent-wrong-answer shape this table exists to avoid; -1 says the
     // facility is absent, which is true.
     //
-    // A program that only *imports* these modules now links, which is the point. One that calls
-    // `initPool()` gets nim's own `assert gIoFd >= 0, "epoll_create1 failed"` (threadpool.nim:355) —
-    // a named, immediate failure rather than a pool that looks initialized and silently runs nothing.
-    // Its worker threads were already inert: `pthread_create` is the fail-closed stub at row 53.
+    // A program that only *imports* these modules now links, which is the point.
     ("epoll_create1", ANY, 71),
     ("epoll_ctl", ANY, 72),
     ("epoll_wait", ANY, 73),
@@ -1790,6 +1779,15 @@ fn compute_leaf_index(name: &str, want: Option<(&[ValType], &[ValType])>) -> Opt
         })
         .max_by_key(|(p, s, _)| (p.len(), s.is_some()))
         .map(|(_, _, i)| *i)
+}
+
+/// Whether a unit declares the C import the compute shim starts a thread with, `pthread_create`. A
+/// nim program gets a second vCPU in its window no other way, so a program none of whose units
+/// declares it has one thread.
+fn starts_threads(root: &nif::Node) -> Result<bool, LengError> {
+    Ok(translate::Translator::importc_procs(root)?
+        .iter()
+        .any(|(_, c)| c == "pthread_create"))
 }
 
 /// An import's `(params, results)`, resolved through the module's type section — the `want` side of
@@ -2590,9 +2588,17 @@ fn check_personality_imports(
 }
 
 /// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).
+///
+/// Only the leaves the program references keep their bodies; every other function becomes a trap
+/// (#1407's dead-code stub, which keeps each index). The engines treat a module with a thread or
+/// futex op anywhere in it as threaded, and `pthread_create`, `pthread_join` and `syscall` have them,
+/// so a program that imports none of them must not carry them.
 fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, LengError> {
-    let module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
+    let mut module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
         .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+    let roots: Vec<u32> = exports.iter().map(|(_, f)| *f).collect();
+    temen_ir::stub_unreachable_funcs(&mut module, &roots)
+        .map_err(|e| LengError::Malformed(format!("compute shim dead-code stub: {e:?}")))?;
     Ok(temen_ir::LinkUnit {
         module,
         exports,
@@ -2635,23 +2641,6 @@ fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Mod
     widen(&m1, &mut compute_exports);
 
     Ok((compute_exports, m1))
-}
-
-/// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that
-/// establishes each thread's TLS base. Like [`link_units`], but `tvar`s lower to per-vCPU TLS-block
-/// accesses over one **shared** block layout (so a thread-var defined in one unit — e.g. the
-/// allocator state in `system` — and referenced from another agree on its offset). `runtime` supplies
-/// the pre-built link units that `vcpu.tls.set` a real block base at thread entry (the analog of the
-/// W3 allocator shim); without such a unit the linked module has no valid TLS base to run against.
-pub fn link_units_tls_with_runtime(
-    units: &[LengModule],
-    runtime: Vec<temen_ir::LinkUnit>,
-) -> Result<Module, LengError> {
-    let sel: Vec<(&str, &str, Select)> = units
-        .iter()
-        .map(|u| (u.stem, u.src, Select::Names(u.names)))
-        .collect();
-    link_selected_with_extra(&sel, runtime, true, false, false)
 }
 
 /// A translated Temen value: its SSA id and type. The unit the expression translator threads.
@@ -3348,6 +3337,180 @@ block 19 () {{
             spin = 1 << 20,
         );
         s
+    }
+
+    /// A program that starts threads through the shim the way nim's `std/rawthreads` does
+    /// (`pthread_attr_*`, `pthread_create`, `pthread_join`) and locks the way `std/locks` does, with
+    /// a futex through `syscall`. Four threads each take `n` turns: add `k + 1` to a thread-local,
+    /// then add 1 to a plain shared counter under the lock. `main` returns a mask of what came out
+    /// wrong:
+    /// - bit 0: the counter is not 4·n, so the lock let two threads in;
+    /// - bits 1–4: thread k's thread-local is not n·(k + 1), so it was not the thread's own;
+    /// - bit 5: the root thread's thread-local, 7 before the threads started, changed;
+    /// - bit 6: a `pthread_*` call failed;
+    /// - bits 7–9: a futex wait that times out, one on a word that no longer holds the value it
+    ///   expects, and an unknown syscall don't each fail with `ETIMEDOUT`, `EAGAIN` and `ENOSYS`.
+    #[cfg(unix)]
+    fn threads_driver(n: i64) -> String {
+        use std::fmt::Write;
+        let c = WORDS;
+        // The lock at +0, the counter at +8, nim's attr blob at +16, the handles at +80, the joined
+        // values at +112, a 1 ms timespec at +144, main's syscall arguments at +160, a 0 at +192.
+        let mut data = [0u8; 200];
+        data[152..160].copy_from_slice(&1_000_000i64.to_le_bytes());
+        let data: String = data.iter().map(|b| format!("\\x{b:02x}")).collect();
+        // This thread's thread-local: its block, or the root block while its `vcpu.tls` is 0.
+        let mine = "  w = vcpu.tls.get\n  root = data.sym \"__tls_root\" 0\n  z = i64.eqz w\n  \
+                    blk = select z root w\n  off = data.self tls 0\n  mine = i64.add blk off\n";
+        // `syscall(202, va)` with `va` = [uaddr, op, val, timeout], into `r`.
+        let futex = |va: &str, uaddr: &str, op: i64, val: i64, ts: &str| {
+            format!(
+                "  i64.store {va} {uaddr}\n  fo = i64.const {op}\n  i64.store {va} fo offset=8\n  \
+                 fv = i64.const {val}\n  i64.store {va} fv offset=16\n  i64.store {va} {ts} offset=24\n  \
+                 nr = i64.const 202\n  r = call.import 5 (nr, {va})\n"
+            )
+        };
+        let mut s = format!(
+            "import 0 \"pthread_attr_init\" (i64) -> (i32)\n\
+             import 1 \"pthread_attr_setstacksize\" (i64, i64) -> (i32)\n\
+             import 2 \"pthread_create\" (i64, i64, i32, i64) -> (i32)\n\
+             import 3 \"pthread_attr_destroy\" (i64) -> (i32)\n\
+             import 4 \"pthread_join\" (i64, i64) -> (i32)\n\
+             import 5 \"syscall\" (i64, i64) -> (i64)\n\
+             import 6 \"errnoLocation\" () -> (i64)\n\
+             data {c} \"{data}\"\n\
+             data tls 0 \"\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\
+             func () -> (i64) {{\nblock 0 () {{\n{mine}  seven = i64.const 7\n  i64.store mine seven\n  \
+             attr = i64.const {attr}\n  p0 = call.import 0 (attr)\n  stk = i64.const 65536\n  \
+             p1 = call.import 1 (attr, stk)\n  f = ref.func 1\n",
+            attr = c + 16,
+        );
+        for k in 0..4 {
+            let _ = write!(
+                s,
+                "  t{k} = i64.const {}\n  k{k} = i64.const {k}\n  \
+                 q{k} = call.import 2 (t{k}, attr, f, k{k})\n",
+                c + 80 + 8 * k
+            );
+        }
+        s.push_str("  p2 = call.import 3 (attr)\n");
+        for k in 0..4 {
+            let _ = write!(
+                s,
+                "  h{k} = i64.load t{k}\n  o{k} = i64.const {}\n  j{k} = call.import 4 (h{k}, o{k})\n",
+                c + 112 + 8 * k
+            );
+        }
+        // Bit 6: any pthread call that did not return 0.
+        s.push_str(
+            "  e0 = i32.or p0 p1\n  e1 = i32.or e0 p2\n  e2 = i32.or e1 q0\n  e3 = i32.or e2 q1\n  \
+             e4 = i32.or e3 q2\n  e5 = i32.or e4 q3\n  e6 = i32.or e5 j0\n  e7 = i32.or e6 j1\n  \
+             e8 = i32.or e7 j2\n  e9 = i32.or e8 j3\n  ez = i32.const 0\n  ef = i32.ne e9 ez\n  \
+             eb = i64.extend_i32_u ef\n  es = i64.const 6\n  m0 = i64.shl eb es\n",
+        );
+        // Bits 0–5: the counter, each thread's thread-local, the root's.
+        let checks: Vec<(String, i64)> = std::iter::once((format!("i64.const {}", c + 8), 4 * n))
+            .chain(
+                (0..4u64).map(|k| (format!("i64.const {}", c + 112 + 8 * k), n * (k as i64 + 1))),
+            )
+            .collect();
+        for (bit, (addr, want)) in checks.iter().enumerate() {
+            let _ = write!(
+                s,
+                "  a{bit} = {addr}\n  x{bit} = i64.load a{bit}\n  w{bit} = i64.const {want}\n  \
+                 d{bit} = i64.ne x{bit} w{bit}\n  b{bit} = i64.extend_i32_u d{bit}\n  \
+                 n{bit} = i64.const {bit}\n  s{bit} = i64.shl b{bit} n{bit}\n  \
+                 m{} = i64.or m{bit} s{bit}\n",
+                bit + 1
+            );
+        }
+        s.push_str(
+            "  rl = i64.load mine\n  rw = i64.const 7\n  rd = i64.ne rl rw\n  rb = i64.extend_i32_u rd\n  \
+             rs = i64.const 5\n  rsh = i64.shl rb rs\n  m6 = i64.or m5 rsh\n  br 1(m6)\n  }\n",
+        );
+        // Bits 7–9: each failing call returns -1 and leaves its errno.
+        let fails = [
+            ("i32.atomic.wait times out", 128, 0, c + 144, 110),
+            ("the word no longer holds 1", 128, 1, 0, 11),
+            ("syscall 39 is not served", -1, 0, 0, 38),
+        ];
+        for (i, (_, op, val, ts, errno)) in fails.iter().enumerate() {
+            let call = if *op < 0 {
+                "  nr = i64.const 39\n  r = call.import 5 (nr, va)\n".to_string()
+            } else {
+                format!(
+                    "  tsp = i64.const {ts}\n{}",
+                    futex("va", "ua", *op, *val, "tsp")
+                )
+            };
+            let _ = write!(
+                s,
+                "block {b} (m: i64) {{\n  va = i64.const {va}\n  ua = i64.const {ua}\n{call}  \
+                 neg = i64.const -1\n  bad = i64.ne r neg\n  el = call.import 6 ()\n  \
+                 ev = i32.load el\n  ew = i32.const {errno}\n  ed = i32.ne ev ew\n  \
+                 either = i32.or bad ed\n  fb = i64.extend_i32_u either\n  fs = i64.const {bit}\n  \
+                 fsh = i64.shl fb fs\n  mm = i64.or m fsh\n  br {next}(mm)\n  }}\n",
+                b = i + 1,
+                va = c + 160,
+                ua = c + 192,
+                bit = 7 + i,
+                next = i + 2,
+            );
+        }
+        s.push_str("block 4 (m: i64) {\n  return m\n  }\n}\n");
+        // Each thread's turns, its own data stack holding its syscall arguments.
+        let _ = write!(
+            s,
+            "func (i64, i64) -> (i64) {{\nblock 0 (sp: i64, k: i64) {{\n{mine}  one = i64.const 1\n  \
+             inc = i64.add k one\n  i = i64.const 0\n  br 1(sp, mine, inc, i)\n  }}\n\
+             block 1 (sp: i64, mine: i64, inc: i64, i: i64) {{\n  n = i64.const {n}\n  \
+             done = i64.ge_s i n\n  br_if done 5(mine) 2(sp, mine, inc, i)\n  }}\n\
+             block 2 (sp: i64, mine: i64, inc: i64, i: i64) {{\n  x = i64.load mine\n  \
+             y = i64.add x inc\n  i64.store mine y\n  br 3(sp, mine, inc, i)\n  }}\n\
+             block 3 (sp: i64, mine: i64, inc: i64, i: i64) {{\n  lk = i64.const {c}\n  \
+             held = i32.const 1\n  old = i32.atomic.rmw.xchg lk held\n  free = i32.eqz old\n  \
+             br_if free 4(sp, mine, inc, i) 6(sp, mine, inc, i)\n  }}\n\
+             block 4 (sp: i64, mine: i64, inc: i64, i: i64) {{\n  cp = i64.const {cnt}\n  \
+             cv = i64.load cp\n  one = i64.const 1\n  cv2 = i64.add cv one\n  i64.store cp cv2\n  \
+             lk = i64.const {c}\n  open = i32.const 0\n  i32.atomic.store lk open\n  \
+             nots = i64.const 0\n{wake}  i2 = i64.add i one\n  br 1(sp, mine, inc, i2)\n  }}\n\
+             block 5 (mine: i64) {{\n  v = i64.load mine\n  return v\n  }}\n\
+             block 6 (sp: i64, mine: i64, inc: i64, i: i64) {{\n  lk = i64.const {c}\n  \
+             nots = i64.const 0\n{wait}  br 3(sp, mine, inc, i)\n  }}\n}}\n",
+            cnt = c + 8,
+            wake = futex("sp", "lk", 129, 1, "nots"),
+            wait = futex("sp", "lk", 128, 1, "nots"),
+        );
+        s
+    }
+
+    /// #2202: threads start, join and lock through the shim on every engine, each with a
+    /// thread-local block of its own. Each bit of a failure's mask is a check of
+    /// [`threads_driver`].
+    #[test]
+    #[cfg(unix)]
+    fn threads_start_join_and_lock_through_the_shim() {
+        use temen_interp::Value;
+        use temen_run::{Backend, Outcome, RunConfig};
+        let m = link_over_shim(&threads_driver(500));
+        for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+            let run = temen_run::instantiate(m.clone())
+                .expect("instantiates")
+                .run(backend, &RunConfig::default())
+                .map(|r| r.outcome);
+            assert!(
+                matches!(&run, Ok(Outcome::Returned(v)) if v[..] == [Value::I64(0)]),
+                "{backend:?}: {run:?}"
+            );
+        }
+        let run = temen_run::instantiate(link_over_shim(&threads_driver(20_000)))
+            .expect("instantiates")
+            .run_with_caps_parallel(&RunConfig::default(), &[])
+            .map(|r| r.outcome);
+        assert!(
+            matches!(&run, Ok(Outcome::Returned(v)) if v[..] == [Value::I64(0)]),
+            "parallel: {run:?}"
+        );
     }
 
     /// #2202: threads that run at the same time lose no atomic update, on any engine. The

@@ -5135,6 +5135,21 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// host parallelism. Workers are spawned **lazily** — a single-threaded guest never creates any.
 const MAX_WORKERS: usize = 32;
 
+/// How many ops a vCPU in an unbounded lane runs on a worker before it yields it to the next
+/// runnable vCPU: the real pool's preemption quantum. Without it a vCPU kept its worker until it
+/// parked, so guest threads that spin on each other livelocked once they outnumbered the workers:
+/// the spinners held every worker, and the thread they waited for never ran (#2202, nimony's
+/// `tallocpool` on four workers). A vCPU in a bounded lane is not preempted (see [`dispatch`]).
+///
+/// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
+/// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
+/// before that thread runs again. Measured on nimony's thread pool, five vCPUs on two workers:
+/// `1 << 20` ran it in 0.16 s or 35 s depending on where preemptions landed, `1 << 16` in 3.3 s
+/// every time. A vCPU running alone yields too, and the round trip costs nothing measurable: a
+/// 20M-iteration loop took ~1 s at `u64::MAX`, `1 << 20` and `1 << 16` alike. The bytecode
+/// engine's cooperative quantum is a separate knob, sized for its deterministic interleaving.
+const POOL_QUANTUM: u64 = 1 << 16;
+
 /// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
 /// spawner's child table); the executor keys results/waiters by `TaskId`.
 type TaskId = u64;
@@ -5412,8 +5427,8 @@ enum Pending {
 enum Step {
     Done(Result<Vec<Value>, Trap>),
     Park(Blocked),
-    /// Ran out its scheduling quantum mid-execution (deterministic-explorer preemption); re-enqueue
-    /// and continue later. The real executor uses an unbounded quantum and never yields.
+    /// Ran out its scheduling quantum mid-execution; re-enqueue and continue later. The real pool's
+    /// quantum is [`POOL_QUANTUM`], the deterministic explorer's a small seeded one.
     Yield,
     /// **Debug pause** (DEBUGGING.md W2/S4): a breakpoint/step hit, before the op at this [`IrPc`].
     /// Only produced when an [`Inspector`] drives the vCPU; the [`VCpu`] continuation is intact, so
@@ -7985,9 +8000,9 @@ fn pipe_park_check(host: &Arc<Mutex<Host>>, pipe: u32, write: bool) -> (bool, u3
 /// The **park gate** (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24): a vCPU
 /// reaching a park safepoint after its domain — or the whole run — was torn down is reaped here
 /// instead of parking into the dead world (teardown is non-preemptive, so the sweep could not
-/// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
-/// lock as the park insert, so a teardown can never slip between the check and the park. Returns
-/// the vCPU back when its world is still alive.
+/// touch it while it ran; the park arms and the quantum's `Yield` are exactly the "next safepoint").
+/// Checked under the same lock as the park insert, so a teardown can never slip between the check
+/// and the park. Returns the vCPU back when its world is still alive.
 /// The pipe and `waitpid` park arms' half of [`Host::park_must_wake`]: a kill or a deliverable
 /// signal that landed before this park was filed wakes it here exactly as the sweep would have —
 /// the host's EINTR flag, and a re-admit whose rewound op re-executes (and the per-op poll traps a
@@ -8669,7 +8684,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 m.durable_set_sp(root_word, v.root_shadow_sp);
             }
         }
-        let step = v.run(u64::MAX);
+        // Only an unbounded vCPU is preempted: the pool's size is a cap the guest never asked for,
+        // and the quantum keeps it invisible, as the OS keeps the core count invisible to the JIT's
+        // threads. Inside a bounded lane a vCPU runs to its next park, as on the JIT, where a lane is
+        // held from resume to park; a yield would hand its lane to a sibling mid-body.
+        let step = v.run(if bounded { u64::MAX } else { POOL_QUANTUM });
         // D66 — the lanes are held exactly while the vCPU is on the worker: release them before any
         // routing below (a parked or finished task holds none), and re-admit everything that was
         // waiting on a lane — each re-checks at its own dispatch.
@@ -9665,8 +9684,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
             }
             Step::Yield => {
-                // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
+                // It spent its quantum: to the back of the queue, so every runnable vCPU gets a
+                // worker in turn. The quantum's end is a safepoint (DESIGN.md §12), so it goes
+                // through the park gate: a vCPU whose run or domain ended while it ran stops here.
+                // Without the gate, a sibling spinning when the root returned was re-queued forever.
                 let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
                 s.runnable.push_back(v);
                 sched.work.notify_one();
             }
@@ -12528,9 +12554,9 @@ impl VCpu {
         }
     }
 
-    /// Run for up to `quantum` instructions, then finish / park / yield. The real executor passes
-    /// `u64::MAX` (run to completion or park); the deterministic explorer passes a small seeded
-    /// quantum to interleave vCPUs finely. Folds a trap into `Step::Done(Err)`.
+    /// Run for up to `quantum` instructions, then finish / park / yield. The real pool passes
+    /// [`POOL_QUANTUM`]; the deterministic explorer passes a small seeded quantum to interleave vCPUs
+    /// finely, and a debugger `u64::MAX`. Folds a trap into `Step::Done(Err)`.
     fn run(&mut self, quantum: u64) -> Step {
         match run_inner(self, quantum) {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
@@ -13121,7 +13147,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
     let arena = v.arena();
-    let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
+    let mut budget = quantum; // instructions left before a forced `Yield`
                               // A timed `svc.wait`'s deadline fired (I38): consumed by the rewound serve arm below, which
                               // returns its count instead of re-parking. Only ever set in the same `run_inner` call that
                               // re-executes the arm (the pending is taken at resume, the rewound op runs first).
@@ -13861,9 +13887,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // `memop` mode (so thread-local computation runs to the next memory op before a yield is
             // possible — the partial-order reduction that keeps exhaustive exploration tractable).
             let visible = !memop || is_visible(&block.insts[frames[top].inst]);
-            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
-            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`, so
-            // it never yields. **This precedes the debug seam below**: a debug stop (breakpoint /
+            // Preemption: yield at an instruction boundary (state consistent; `inst` not yet
+            // advanced) when the quantum is spent. **This precedes the debug seam below**: a debug stop (breakpoint /
             // watch / step) at a budget-exhausted visible op must fire at the *start of its own turn*
             // (budget fresh, on the next pick), not inside the previous turn — otherwise a stop would
             // run the op in the prior turn, collapsing two one-visible-op turns into one and desyncing
@@ -15186,6 +15211,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top]
                                 .vals
                                 .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
+                        }
+                        // #2220 — `grant(child_handle, handle) -> child's handle | -errno`: grant
+                        // `handle` into a child that is running or parked
+                        // ([`Host::grant_running_child`]). A child whose outcome is in — it
+                        // returned, trapped, or unwound for a freeze: what `poll` reports — has
+                        // ended, and a `thread.spawn` handle names no powerbox of its own; both are
+                        // the `-EINVAL` `child_offer` answers for a child it cannot reach.
+                        19 => {
+                            let ch =
+                                get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
+                            let gh =
+                                get_i32(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?;
+                            let callee = resolve_thread(threads, ch)
+                                .ok()
+                                .filter(|&slot| threads[slot].is_some_and(|c| !sched.has_result(c)))
+                                .and_then(|slot| child_hosts.get(&slot));
+                            let r = grant_into_running(host, callee, gh)?;
+                            frames[top].vals.push(Reg::from_i32(r as i32));
                         }
                         // PROCESS.md §5 — `instantiate_detached(budget, module, grants_ptr,
                         // grants_n, entry, size_log2, quota) -> child | -EINVAL`: spawn a
@@ -22387,6 +22430,24 @@ fn lock_host_pair<'a>(
     }
 }
 
+/// #2220 — [`Host::grant_running_child`] from the powerbox in cell `parent` into the one in cell
+/// `child` (`None`: the spawner has no live child there), both locked for the grant in
+/// [`lock_host_pair`]'s order, as every scope that holds two powerboxes takes them: the
+/// tree-walker's and the bytecode drivers' grant. A live self-serve grant calls back through
+/// `parent`, as at their spawns.
+pub(crate) fn grant_into_running(
+    parent: &Arc<Mutex<Host>>,
+    child: Option<&Arc<Mutex<Host>>>,
+    handle: i32,
+) -> Result<i64, Trap> {
+    match child.and_then(|c| lock_host_pair(parent, c)) {
+        Some((mut p, mut c)) => p.grant_running_child(Some(parent), handle, Some(&mut *c)),
+        None => parent
+            .lock_unpoisoned()
+            .grant_running_child(Some(parent), handle, None),
+    }
+}
+
 fn translate_cap_slots(
     src: &mut Host,
     dst: &mut Host,
@@ -22924,6 +22985,12 @@ pub struct Host {
     /// activation opens ([`Host::begin_activation`]) and handed back with the window. A detached
     /// child's first vCPU rides its admission lease instead.
     main_vcpu: bool,
+    /// #2220 — this domain has ended: its memory went back ([`Host::release_memory`]), so nothing
+    /// more is granted into it ([`Host::grant_running_child`]) — a pipe end granted after its ends
+    /// were released would hold its count forever. Set under the domain's lock, so a grant either
+    /// lands before the end, which then releases it with the rest, or is refused. A reactor's next
+    /// activation reopens the domain ([`Host::begin_activation`]).
+    ended: bool,
     /// §4 / S4 **host-served pipe** FIFO backings, indexed by the id a [`Binding::PipeEnd`] carries.
     /// Each is a shared byte queue a `write` end appends to and a `read` end drains. The backing is
     /// `Arc`-shared ([`PipeBacking`]) so an end can be **re-granted into a §14 child** (the child's
@@ -23879,6 +23946,7 @@ impl Host {
             grown: 0,
             own_window: 0,
             main_vcpu: false,
+            ended: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
@@ -27116,8 +27184,10 @@ impl Host {
     /// ([`ChargedRegion`]). Never on a freeze: a captured window stays charged, and the thaw takes the
     /// charge over ([`Host::prepare_detached_relaunch`]). A domain on the run's own node (a run's
     /// root, and its processes) keeps its regions for the embedder: it reads them after the run, and
-    /// a reactor's next call finds them where they were.
+    /// a reactor's next call finds them where they were. Every engine calls this where a domain ends,
+    /// under its lock, so it is also where the domain is marked [`Self::ended`] (#2220).
     pub fn release_memory(&mut self) {
+        self.ended = true;
         let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
         if held > 0 {
             self.budgets.refund(self.own_budget, BUDGET_MEM, held);
@@ -27136,8 +27206,10 @@ impl Host {
     /// a thaw starts with the limit its embedder passes. The root's window and its main vCPU are its
     /// own node's, as a child's are its budget's: charged past any ceiling, since they are what its
     /// embedder chose to run, so a grant they exceed leaves the run room for nothing more. What an
-    /// earlier activation's window held goes back first. Returns the node its vCPUs draw from.
+    /// earlier activation's window held goes back first, and the domain the last one ended is live
+    /// again ([`Self::ended`]). Returns the node its vCPUs draw from.
     pub fn begin_activation(&mut self, fuel: u64, window: RootWindow) -> NodeRef {
+        self.ended = false;
         self.budgets.set_fuel_room(self.own_budget, fuel);
         let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
         if held > 0 {
@@ -28124,7 +28196,7 @@ impl Host {
 
     /// #744 — the shared cell this host sits in ([`Host::into_cell`]), which a live self-serve grant
     /// calls back through; `None` when it sits in none.
-    pub(crate) fn own_cell(&self) -> Option<Arc<Mutex<Host>>> {
+    pub fn own_cell(&self) -> Option<Arc<Mutex<Host>>> {
         self.self_cell.as_ref().and_then(Weak::upgrade)
     }
 
@@ -30109,6 +30181,48 @@ impl Host {
         }
     }
 
+    /// #2220 — `Instantiator.grant` (op 19): grant `handle` from this (the parent's) powerbox into
+    /// `child`, the powerbox of a detached child that is running or parked, as a spawn grants it
+    /// ([`Self::grant_into_child`]: an offer adopted one depth deeper, a pipe end aliasing its
+    /// backing, a coordinate-free cap copied), and answer the child's index of it. The parent tells
+    /// the child the index itself; the child gains no operation. INVARIANTS #3: the granter holds
+    /// both ends. `child` is `None` when the spawner has no live child there. An engine holds both
+    /// powerboxes' locks for the call, so the grant is atomic with the child's end ([`Self::ended`]).
+    /// `cell` is the cell this host sits in, which a live self-serve grant calls back through, as at
+    /// a spawn.
+    ///
+    /// - `CapFault`: `handle` is one no spawn could grant ([`Self::can_grant`]). Checked first, so a
+    ///   forgery traps whatever became of the child.
+    /// - `-EINVAL`: no live child: it has ended, or it is a carve child — a carve charges no node, so
+    ///   its own is the run node — whose path is retired (INVARIANTS #13, #1867).
+    /// - `-EINVAL`: a `Jit` table, whose install slots size the child's dispatch table, or a forkable
+    ///   host proc, which wires the child's signal doors. Both are fixed when the child starts, so
+    ///   only a spawn grants them.
+    /// - `-EMFILE`: the child's table is full. Each re-grant installs one entry with the infallible
+    ///   grant, so the room is checked first.
+    pub fn grant_running_child(
+        &mut self,
+        cell: Option<&Arc<Mutex<Host>>>,
+        handle: i32,
+        child: Option<&mut Host>,
+    ) -> Result<i64, Trap> {
+        if !self.can_grant(handle, cell.is_some()) {
+            return Err(Trap::CapFault);
+        }
+        let Some(child) = child.filter(|c| !c.ended && c.own_budget != BudgetTree::RUN_NODE) else {
+            return Ok(EINVAL);
+        };
+        if self.jit_table(handle) || self.forkable_host_proc(handle) {
+            return Ok(EINVAL);
+        }
+        if child.table.iter().all(|s| s.entry.is_some()) {
+            return Ok(EMFILE);
+        }
+        Ok(self
+            .grant_into_child(cell, handle, child)
+            .map_or(EINVAL, i64::from))
+    }
+
     /// Whether `handle` names a capability this host may **re-grant into a §14 child** — a coordinate-free
     /// cap ([`Self::resolve_copyable`]) or a pipe end ([`Self::resolve_pipe_end`]). Used to fail a grant
     /// closed *before* any child state is built.
@@ -30133,8 +30247,14 @@ impl Host {
             })
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
-            || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
+            || self.jit_table(handle)
             || self.progeny_authority(handle).is_some()
+    }
+
+    /// #1296 — whether `handle` names a `Jit` table, which a spawn re-grants as a fresh table of the
+    /// child's own ([`Self::regrant_into_child`]).
+    fn jit_table(&self, handle: i32) -> bool {
+        matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
     }
 
     /// #2018 — the freeze authority over **detached progeny** `handle` names, the one form a spawn

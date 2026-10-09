@@ -1,15 +1,18 @@
-//! Thread-var (`tvar`) lowering — the single-threaded TLS model (NIM.md §3d).
+//! Thread-var (`tvar`) lowering (NIM.md §3d).
 //!
 //! Leng marks a thread-local `tvar` (nimony's `__thread`; the allocator and exception state in the
-//! real `system` module are thread-vars). temen-leng lowers a `tvar` **identically to a `gvar`**: one
-//! plain, zero-initialized global at a fixed window offset. This is sound because every guest we
-//! target — each nimony compiler phase, each temen domain — runs single-threaded, so a thread-local has
-//! exactly one instance and a plain global *is* that instance. It mirrors the retired C on-ramp path,
-//! which stripped `__thread` before clang (NIM.md §3d). These tests pin that model: a `tvar`
-//! must behave as a persistent global — writes survive across calls, non-zero initializers seed it,
-//! and it links across modules the same as a `gvar` — on both engines. The real multi-threaded
-//! `__thread` lowering over `vcpu.tls` (NIM.md §3d Tier 2) is implemented behind `tls_mode` and
-//! covered by the Tier-2 tests at the bottom of this file.
+//! real `system` module are thread-vars). How temen-leng lowers one depends on whether the program
+//! can start a thread, which it can only through the compute shim's `pthread_create`:
+//!
+//! - **It cannot:** a `tvar` lowers **identically to a `gvar`**, one plain global at a fixed window
+//!   offset. The program has one thread, so a thread-local has exactly one instance and a plain global
+//!   *is* that instance. The first tests pin this: writes survive across calls, non-zero initializers
+//!   seed it, and it links across modules the same as a `gvar`.
+//! - **It can:** a `tvar` is a thread-local in the IR's sense (#1715), read at this thread's block
+//!   plus its offset. The tests at the bottom pin that each thread reads its own copy, and that a
+//!   sibling unit's reference reaches the same one.
+//!
+//! Every test runs on the tree-walker and the JIT.
 
 use temen_interp::Value;
 use temen_ir::LinkUnit;
@@ -126,62 +129,98 @@ fn thread_var_links_cross_module_like_a_global() {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 2 (NIM.md §3d): the real multi-threaded `__thread` lowering over `vcpu.tls`.
+// A program that can start a thread (NIM.md §3d): its `tvar`s are thread-locals (#1715).
 //
-// In `translate_tls`, a `tvar` no longer collapses to one plain global — it gets an offset in the
-// per-vCPU TLS block, and each access lowers to `vcpu.tls.get() + off` (the fs/gs-base recipe). temen
-// supplies the per-vCPU base register (§12, seeded to the vCPU id, guest-overwritable); the runtime
-// establishes each thread's block base with `vcpu.tls.set` at thread entry. These tests exercise
-// temen-leng's half — the access lowering — with a hand-written driver standing in for that runtime.
+// Once a unit declares `pthread_create`, the import the compute shim starts a thread with, the link
+// puts each `tvar` in its unit's thread-local template and reads it at this thread's block plus its
+// offset. The block is the vCPU's `vcpu.tls` word, or the root block while that word is 0. These tests
+// let a driver set the word, standing in for the shim's thread start.
 
-/// A tvar module for Tier-2 lowering: `bump(n)` adds to the thread-var `counter`, `get()` reads it.
-/// `bump` is func 0, `get` is func 1.
-const TVAR_ACCESSORS: &str = "\
+/// The declaration that makes a program threaded: nimony's `std/rawthreads` spelling, uncalled.
+const PTHREAD_CREATE: &str = " (proc :pthread_create.0. (params (param :t.0 . (i +64)) (param :a.0 . (i +64)) \
+(param :f.0 . (i +64)) (param :x.0 . (i +64))) (i +32) (pragmas (importc \"pthread_create\")) (stmts .))";
+
+/// `counter` and its accessors, `bump.0.mods` and `get.0.mods`, in a program that can start a thread.
+fn tvar_accessors() -> String {
+    format!(
+        "\
 (stmts
+{PTHREAD_CREATE}
  (tvar :counter.0. . (i +64) .)
  (proc :bump.0. (params (param :n.0 . (i +64))) (void) .
   (stmts .
    (asgn counter.0. (add (i +64) counter.0. n.0))))
- (proc :get.0. . (i +64) . (stmts . (ret counter.0.))))";
+ (proc :get.0. . (i +64) . (stmts . (ret counter.0.))))"
+    )
+}
+
+/// Link nimony-shaped units with a hand-written `driver`, which becomes the last unit.
+fn link_with_driver(units: &[(&str, &str)], driver: &str) -> temen_ir::Module {
+    let units: Vec<temen_leng::WholeModule> = units
+        .iter()
+        .map(|&(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let driver = temen_text::parse_module(driver).expect("driver parses");
+    temen_leng::link_whole_with_runtime(
+        &units,
+        vec![LinkUnit {
+            module: driver,
+            exports: vec![("_start".into(), 0)],
+            ..Default::default()
+        }],
+    )
+    .unwrap_or_else(|e| panic!("link: {e}"))
+}
+
+/// The `_start` the driver exports, as a function index of the linked module.
+fn start(m: &temen_ir::Module) -> u32 {
+    m.exports
+        .iter()
+        .find(|e| e.name == "_start")
+        .expect("_start")
+        .func
+}
 
 #[test]
-fn tls_mode_lowers_a_tvar_through_vcpu_tls() {
-    // Tier 2 reads/writes the tvar via the per-vCPU register; Tier 1 (the default) keeps it a plain
-    // global. The presence/absence of `vcpu.tls` in the emitted text is the switch.
-    let tls = temen_leng::translate_tls_to_text(TVAR_ACCESSORS).unwrap();
+fn a_tvar_is_a_thread_local_only_once_the_program_can_start_a_thread() {
+    // The switch is the `pthread_create` declaration: with it the counter is read through
+    // `vcpu.tls`; without it the program has one thread and the counter is a plain global.
+    let threaded = tvar_accessors();
+    let single = threaded.replace(PTHREAD_CREATE, "");
+    let text = |src: &str| {
+        let m = temen_leng::link_whole_with_runtime(
+            &[temen_leng::WholeModule { stem: "mods", src }],
+            Vec::new(),
+        )
+        .unwrap_or_else(|e| panic!("link: {e}"));
+        temen_text::print_module(&m)
+    };
     assert!(
-        tls.contains("vcpu.tls.get"),
-        "TLS mode reaches the tvar through the per-vCPU base:\n{tls}"
+        text(&threaded).contains("vcpu.tls.get"),
+        "a program that can start a thread reads its tvar through vcpu.tls"
     );
-    let plain = temen_leng::translate_to_text(TVAR_ACCESSORS).unwrap();
     assert!(
-        !plain.contains("vcpu.tls"),
-        "Tier 1 keeps the tvar a plain global (no vcpu.tls):\n{plain}"
+        !text(&single).contains("vcpu.tls"),
+        "a program with one thread keeps its tvar a plain global"
     );
 }
 
 #[test]
-fn tvar_is_isolated_per_tls_base() {
-    // The core Tier-2 property: the tvar follows `vcpu.tls`, so two different bases are two
-    // independent instances — exactly the per-thread isolation a spawned thread gets when the
-    // runtime hands it its own block. A single vCPU proves the mechanism deterministically by
-    // switching the base (what a real per-thread `vcpu.tls.set` does): set base B0, bump +3; set
-    // base B1, bump +5; read B0 back (3) and B1 back (5) → 3*100 + 5 = 305. If the tvar were a
-    // shared global, both reads would see 8.
-    let user =
-        temen_leng::translate_tls(TVAR_ACCESSORS).unwrap_or_else(|e| panic!("translate_tls: {e}"));
-
-    // The driver stands in for the thread runtime: it owns the `vcpu.tls.set`s and calls the
-    // translated accessors (imported by name, bound to the user unit's exports by the linker).
-    // B0 = 18432, B1 = 20480 — two zeroed 8-byte blocks, each raised +16384 above the unconditional
-    // NULL guard (#1094) into the mapped scratch above it.
-    let driver = temen_text::parse_module(
+fn each_thread_reads_its_own_copy_of_a_tvar() {
+    // The root thread (word 0) bumps its copy by 1, block B0's by 3 and B1's by 5; each reads back
+    // only its own: 1, 3 and 5 → 10305. One shared global would read 9 three times.
+    // B0 = 18432 and B1 = 20480 are zeroed scratch above the NULL guard (#1094), below the globals.
+    let src = tvar_accessors();
+    let m = link_with_driver(
+        &[("mods", &src)],
         "\
 memory 16
-import 0 \"bump\" (i64) -> ()
-import 1 \"get\" () -> (i64)
+import 0 \"bump.0.mods\" (i64) -> ()
+import 1 \"get.0.mods\" () -> (i64)
 func 0 () -> (i64) {
 block 0 () {
+  one = i64.const 1
+  call.import 0 (one)
   b0 = i64.const 18432
   vcpu.tls.set b0
   three = i64.const 3
@@ -190,134 +229,94 @@ block 0 () {
   vcpu.tls.set b1
   five = i64.const 5
   call.import 0 (five)
+  zero = i64.const 0
+  vcpu.tls.set zero
+  g = call.import 1 ()
   vcpu.tls.set b0
   g0 = call.import 1 ()
   vcpu.tls.set b1
   g1 = call.import 1 ()
-  hund = i64.const 100
-  m = i64.mul g0 hund
-  r = i64.add m g1
+  k = i64.const 100
+  hi = i64.mul g k
+  hi2 = i64.mul hi k
+  mid = i64.mul g0 k
+  s = i64.add hi2 mid
+  r = i64.add s g1
   return r
   }
 }
-export 0 func \"_start\" 0
 ",
-    )
-    .expect("driver parses");
-
-    let linked = temen_ir::link(&[
-        LinkUnit {
-            module: driver,
-            exports: vec![],
-            ..Default::default()
-        },
-        LinkUnit {
-            module: user,
-            exports: vec![("bump".into(), 0), ("get".into(), 1)],
-            ..Default::default()
-        },
-    ])
-    .unwrap_or_else(|e| panic!("link: {e:?}"));
-    // _start is the driver's func 0 → func 0 of the linked module.
-    assert_eq!(
-        run(&linked, 0, &[]),
-        305,
-        "B0's counter is 3 and B1's is 5 — the tvar is per-tls-base, not shared"
     );
+    assert_eq!(run(&m, start(&m), &[]), 10305);
 }
 
 #[test]
-fn non_zero_tvar_initializer_fails_closed_in_tls_mode() {
-    // Tier 2 zeroes each per-thread block; a non-zero initializer would need per-thread seeding by
-    // the runtime (a bounded follow-up), so it's a clean error rather than a silently-wrong global.
-    let leng = "\
+fn a_sibling_units_tvar_is_the_same_thread_local() {
+    // `mods` defines `g` behind a filler `aa`, so `g` is not at offset 0, and reads it by its local
+    // name; `modw` writes and reads it by its cross-module name `g.0.mods`. In block B0, `rw(42)`
+    // and `peek()` must meet in one slot (42); in block B1 `g` is still 0. → 42*100 + 0 = 4200.
+    let mod_s = format!(
+        "\
 (stmts
- (tvar :g.0. . (i +64) 5)
- (proc :get.0. . (i +64) . (stmts . (ret g.0.))))";
-    let err =
-        temen_leng::translate_tls_to_text(leng).expect_err("non-zero tvar init must fail-closed");
-    assert!(
-        format!("{err:?}").contains("TLS mode"),
-        "clean, specific error: {err:?}"
-    );
-}
-
-#[test]
-fn tvar_block_offset_agrees_across_modules() {
-    // The cross-module Tier-2 property (NIM.md §3d): a `tvar` defined in one unit and referenced from
-    // another must resolve to the *same* per-vCPU block offset — the TLS analog of a relocated
-    // cross-module global. The linker pools every unit's tvars into one shared layout and hands it to
-    // all, so both sides bake the same `vcpu.tls.get()+off`.
-    //
-    // `mods` defines thread-var `g` and a `peek()` that reads it by its *local* name. `modw`'s `rw(v)`
-    // writes and reads `g` by its *cross-module* name `g.0.mods`. A driver sets a TLS base, then
-    // `rw(42)` writes 42 through modw's offset and `peek()` reads through mods's offset: if the two
-    // offsets agree, `peek` sees 42 (a disagreement would read a different, zeroed slot → 0).
-    // Result = rw*100 + peek = 42*100 + 42 = 4242.
-    //
-    // The filler thread-var `aa` (sorted before `g`) pushes `g`'s shared offset to 8, so the test
-    // proves the *accumulated* layout propagates cross-module — not a coincidental offset-0 match.
-    let mod_s = "\
-(stmts
+{PTHREAD_CREATE}
  (tvar :aa.0. . (i +64) .)
  (tvar :g.0. . (i +64) .)
- (proc :peek.0. . (i +64) . (stmts . (ret g.0.))))";
+ (proc :peek.0. . (i +64) . (stmts . (ret g.0.))))"
+    );
     let mod_w = "\
 (stmts
  (proc :rw.0. (params (param :v.0 . (i +64))) (i +64) .
   (stmts .
    (asgn g.0.mods v.0)
    (ret g.0.mods))))";
-
-    // The driver stands in for the thread runtime: `vcpu.tls.set` a block base, then call the
-    // translated procs (imported under their stem-suffixed export names).
-    let driver = temen_text::parse_module(
+    let m = link_with_driver(
+        &[("modw", mod_w), ("mods", &mod_s)],
         "\
 memory 16
 import 0 \"rw.0.modw\" (i64) -> (i64)
 import 1 \"peek.0.mods\" () -> (i64)
 func 0 () -> (i64) {
 block 0 () {
-  b = i64.const 18432
-  vcpu.tls.set b
+  b0 = i64.const 18432
+  vcpu.tls.set b0
   fortytwo = i64.const 42
-  r1 = call.import 0 (fortytwo)
-  r2 = call.import 1 ()
-  hund = i64.const 100
-  m = i64.mul r1 hund
-  res = i64.add m r2
-  return res
+  w = call.import 0 (fortytwo)
+  p0 = call.import 1 ()
+  b1 = i64.const 20480
+  vcpu.tls.set b1
+  p1 = call.import 1 ()
+  k = i64.const 100
+  hi = i64.mul p0 k
+  r = i64.add hi p1
+  return r
   }
 }
-export 0 func \"_start\" 0
 ",
-    )
-    .expect("driver parses");
+    );
+    assert_eq!(run(&m, start(&m), &[]), 4200);
+}
 
-    let linked = temen_leng::link_units_tls_with_runtime(
-        &[
-            LengModule {
-                stem: "modw",
-                src: mod_w,
-                names: &["rw.0."],
-            },
-            LengModule {
-                stem: "mods",
-                src: mod_s,
-                names: &["peek.0."],
-            },
-        ],
-        vec![LinkUnit {
-            module: driver,
-            exports: vec![],
-            ..Default::default()
+#[test]
+fn a_thread_local_with_an_initial_value_fails_closed() {
+    // nimony rejects a `threadvar` with an initial value, and the template is zeros, so one that
+    // reaches leng is malformed: a link error, not a thread that starts with the wrong value.
+    let src = format!(
+        "\
+(stmts
+{PTHREAD_CREATE}
+ (tvar :g.0. . (i +64) 5)
+ (proc :get.0. . (i +64) . (stmts . (ret g.0.))))"
+    );
+    let err = temen_leng::link_whole_with_runtime(
+        &[temen_leng::WholeModule {
+            stem: "mods",
+            src: &src,
         }],
+        Vec::new(),
     )
-    .unwrap_or_else(|e| panic!("link_units_tls: {e:?}"));
-    // Funcs: modw.rw=0, mods.peek=1, driver._start=2.
-    assert_eq!(
-        run(&linked, 2, &[]),
-        4242,
-        "cross-module write (modw) and local read (mods) hit the same tvar slot"
+    .expect_err("a thread-local with an initial value must fail closed");
+    assert!(
+        err.to_string().contains("initial value"),
+        "a specific error: {err}"
     );
 }

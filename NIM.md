@@ -784,7 +784,7 @@ and is deleted. The syscalls stay on the POSIX seam, and the heap grows through 
 
 Recommendation: **Path B first** — mirror Phase 1 (shim → real) to hit "runs a real Nim program
 end-to-end", then do W2 + Path A for fidelity. Remaining unknowns are small and known: nimony's TLS
-model onto temen (now settled — §3d: single-threaded `tvar → plain global`), and confirming the ARC
+model onto temen (now settled — §3d: a `tvar` is a plain global unless the program starts threads), and confirming the ARC
 destructor protocol runs correctly against a real allocator.
 
 **✅ Path B — DONE 2026-07-29: the near-term milestone is met.** A real nimony seq program **runs
@@ -887,7 +887,7 @@ phase (`nifler`/`nimony`/`hexer`/`lengc`) to an temen module — Phase 1's C on-
 for one binary, so it is four applications of a proven step; (ii) write the driver module that
 registers them and chains them with a shared memfs; (iii) confirming each phase's allocator/`system`
 runtime boots cleanly as an isolated child. (The **TLS model** that Phase 1's on-ramp surfaced is now
-settled — see §3d: single-threaded `tvar → plain global`, done and tested.)
+settled — see §3d: a `tvar` is a plain global unless the program starts threads.)
 
 **First slice — ✅ the mechanism, proven with stand-in phases.** Mirroring how Path B's shim proved
 the runtime edge before the real `system` module: a driver module runs stand-in "phase" child
@@ -940,79 +940,72 @@ mechanism**: driver shape, real compiled child, and the file hand-off all run on
 compiling the four actual phase binaries (four applications of the on-ramp) and, for a heap phase, the
 self-seeding brk — no open architecture question.
 
-## 3d. TLS model — nimony's thread-vars onto temen (single-threaded now, `vcpu.tls` later)
+## 3d. Threads and thread-locals
 
 nimony marks its allocator and exception state `__thread` (thread-local); `hexer` emits these as Leng
-**`tvar`** (thread-var, the sibling of `gvar`). Phase 1's C on-ramp had no `llvm.threadlocal.address`
-lowering, so its build (`demos/nimony/build_nimony.sh`, retired with it) **stripped `__thread`** before
-clang (a `sed` pass with a `grep` guard that failed the build if any survived) — valid because the guest
-is single-threaded. This
-section commits the Phase-2 backend's model. It is a **two-tier** answer, and Tier 1 is done.
+**`tvar`**s, the siblings of `gvar`. Phase 1's C on-ramp stripped `__thread` before clang, which was
+valid only because every guest then was single-threaded. That is no longer assumed: a Nim program can
+start threads (#2202). How temen-leng lowers a `tvar` turns on one link-time fact, **can the program
+start a thread?** A nim program gets a second vCPU in its window only through the compute shim's
+`pthread_create`, so the link answers by looking for that import (`starts_threads` in
+`crates/temen-leng/src/lib.rs`).
 
-**What temen actually offers (measured).** temen has exactly **one** thread-local primitive: a single
-per-vCPU `i64` register, the IR ops `vcpu.tls.get` / `vcpu.tls.set` (§12,
-`crates/temen-ir/src/lib.rs:1935-1959`), seeded to the dense vCPU id (root 0, children distinct;
-`crates/temen-interp/src/lib.rs:7810`) and read *at the execution point* so it tracks the current vCPU
-across fiber migration (D57). It is **not** per-thread global storage — it is one word, meant to hold
-a *thread pointer*. Globals are process-global: a global is just a `Data { offset, readonly, bytes }`
-segment (`crates/temen-ir/src/lib.rs:4338`) in the **one shared window** every thread sees
-(`crates/temen-interp/src/bytecode.rs:8880` — "a thread shares its spawner's window/powerbox"); there
-is **no thread-local storage class** in temen-ir. A real `__thread` is therefore the guest's job:
-allocate a per-CPU block, put its base in `vcpu.tls`, and index thread-locals off it — the native
-fs/gs-base recipe. `DESIGN.md:949` lists `_Thread_local` (with threads) as deferred.
+**It cannot: a `tvar` is a plain global.** A program with one thread has one instance of each
+thread-local, so a global *is* it. This is every program that does not import `std/rawthreads`,
+directly or through `std/threadpool` or `std/parfor`: nimony's own tools and the nim card's programs
+among them. They pay nothing for threads.
 
-**Tier 1 — `tvar` → plain global (committed, done).** For a single-threaded guest a thread-local has
-exactly one instance, so a plain global *is* that instance. temen-leng lowers `tvar` **identically to
-`gvar`**: one zero-initialized global at a fixed window offset, exported/linked as an ordinary data
-symbol (`translate.rs` `collect_globals`, the `gvar | tvar` arms). This mirrors the on-ramp's
-`__thread`-stripping and needs no new IR. It rests on one **invariant**, stated so it can't rot:
-*every guest we target runs single-threaded* — each nimony compiler phase is a batch process (W4 runs
-them as separate single-threaded domains, §3c), each temen domain is single-threaded, and nimony's own
-concurrency is **CPS/`.passive` → state machines** over a minimal `system.nim` (§1), not OS threads.
-Under that invariant the collapse is exact. Pinned by `crates/temen-leng/tests/thread_var.rs`: a `tvar`
-persists across calls (write-then-read-back), a non-zero `tvar` initializer seeds the window, and a
-`tvar` **links cross-module** like a global (the shape of the real allocator's thread-vars in
-`system`, referenced from user code) — all on both engines. This is also already exercised
-end-to-end: the heap programs of W3/Path A run against the compiled `system` module, whose allocator
-state is thread-vars, and they get the right answer.
+**It can: a `tvar` is a thread-local in the IR's sense** (#1715), the class C's `_Thread_local`
+uses:
+- Each unit's `tvar`s form its thread-local template (`data tls`), exported as thread-local symbols.
+  The linker stacks the templates into one per-thread block, and places a pristine image
+  (`__tls_image` to `__tls_end`) and the root thread's block (`__tls_root`).
+- An access is the vCPU's `vcpu.tls` word plus the variable's offset, `data.self tls` for the unit's
+  own and `data.sym tls` for a sibling's. While the word is 0 it reads the root block instead, so the
+  main thread needs no setup.
+- The template is zeros: nimony rejects a `threadvar` with an initial value.
 
-**Tier 2 — real per-thread `__thread` over `vcpu.tls` (implemented).** For a genuinely multi-threaded
-guest (spawns temen threads *and* relies on per-thread `tvar` state), Tier 1's plain global is wrong —
-all vCPUs would share one copy. The faithful lowering: (i) each `tvar` gets a fixed offset in a
-per-CPU **TLS block** instead of a window offset; (ii) at thread entry the runtime allocates a block
-and `vcpu.tls.set`s its base (the root vCPU too); (iii) every `tvar` access lowers to
-`vcpu.tls.get()` + the tvar's block offset, exactly as native code adds to the fs/gs base. temen
-supplies the base register; the block layout and per-thread allocation are the backend/runtime's
-work — no new substrate.
+**Starting a thread** (`std/rawthreads`, served by the compute shim's rows 50–54):
+- `pthread_create` maps one region from the shim's `mmap`, which is locked (#1884). It holds a start
+  record, the thread's block (a copy of the image) and a data stack: 1 MiB, the main thread's
+  reserve, unless `pthread_attr_setstacksize` asked for another size.
+- It `thread.spawn`s an entry that installs the block (`vcpu.tls.set`) and calls nim's start routine
+  through `call.dyn`, with the leading `$sp` the funcref ABI gives every target. When the routine
+  returns, the entry unmaps the region; nim's thread wrapper has already handed its heap on.
+- `pthread_join` is `thread.join`, and the `pthread_t` is the thread handle.
 
-temen-leng implements (i) and (iii) — the backend's half — behind an opt-in `tls_mode`
-(`translate_tls` / `Translator::with_tls`; the `tvar` arm of `collect_globals` assigns block offsets,
-`lvalue_addr` emits `vcpu.tls.get() + off`). This holds **across modules**: `link_units_tls_with_runtime`
-runs a linker pre-pass (`export_tls_vars`) that pools every unit's thread-vars into one **shared block
-layout** and hands it to all (`import_tls_layout`), so a `tvar` defined in `system` and referenced from
-user code bakes the same offset on both sides — the TLS analog of the `data.sym` relocation a
-cross-module global gets, except the offset is fixed at translate time (a `vcpu.tls`-relative constant
-the linker can't relocate later). Step (ii) is the runtime's job — the `vcpu.tls.set` at thread entry,
-the same division as the C runtime's fs/gs-base setup — so it stays outside the translator (a threaded
-guest's thread-start shim, the analog of Path B's allocator shim; `link_units_tls_with_runtime` takes
-it as an extra link unit). Proven in `crates/temen-leng/tests/thread_var.rs`, both engines: the lowering
-routes a `tvar` through `vcpu.tls`; the `tvar` is **isolated per `vcpu.tls` base** (a driver sets base
-B0 and bumps +3, base B1 and bumps +5, reads each back as 3 and 5 — a shared global would read 8); and
-a `tvar` **defined in one unit, written cross-module and read via the defining unit's local name, hits
-one slot** (offset agreement, at a non-zero offset). Remaining bounded follow-ups, all additive:
-non-zero `tvar` initializers (fail-closed now — the per-thread block is zeroed, so non-zero state needs
-per-thread seeding by the runtime); cross-module `tvar`s wider than an `i64` scalar (a cross-module
-reference is assumed scalar-`i64`, as a cross-module data symbol is); and wiring the actual
-thread-start block-alloc/`vcpu.tls.set` shim for a real threaded guest. Tier 1's tests remain the
-differential oracle Tier 2 must satisfy when a `tls_mode` program runs single-threaded with its base
-set once.
+**Locks.** nimony's default build (`nimNativeIo`) makes `std/locks` and `std/rlocks` a futex mutex and
+condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58) serves `FUTEX_WAIT` as
+`i32.atomic.wait` and `FUTEX_WAKE` as `atomic.notify`, and fails any other number with `ENOSYS`.
+`std/threadpool` itself takes ticket spinlocks and atomics (#2202 part 1 made those the IR's).
 
-**Status:** the "TLS follow-up" flagged throughout this doc (the Phase-1 on-ramp gap) is **resolved**.
-Tier 1 (single-threaded `tvar → global`) is the operative model for the self-host goal — nimony's
-compiler is single-threaded — and both tiers are implemented and tested: Tier 1 is the default, Tier 2
-(`tls_mode`, single- and cross-module) is ready for when a threaded Nim guest appears, needing only the
-additive follow-ups
-above.
+**What is not served.**
+- CPU affinity is a no-op.
+- There is no CPU count: `sched_getaffinity` and `sysconf` report none, so `initPool()` starts one
+  worker and `initPool(n)` asks for `n`.
+- The shim's `nanosleep` returns at once, so an idle pool worker spins rather than naps. Under the
+  POSIX personality it parks, and the bytecode engine does not time a wait out while another thread
+  is runnable (#2224), so a thread that spins on a napping one hangs there.
+- `std/ioring` needs io_uring or epoll.
+- The browser's wasm tier does not compile `vcpu.tls.get`, so in a threaded program a function that
+  touches a thread-local stays on the interpreter there.
+
+The shim's thread functions reach a program only if it imports them. The linked shim keeps the
+bodies of the leaves a program references and stubs the rest (#1407), because every engine treats a
+module with a thread or futex op anywhere as threaded.
+
+**Tests.**
+- `crates/temen-leng/tests/thread_var.rs`, on the tree-walker and the JIT:
+  - a `tvar` is a plain global until the program declares `pthread_create`;
+  - each thread reads its own copy, by name or through a sibling unit;
+  - an initial value fails closed.
+- `threads_start_join_and_lock_through_the_shim` (`crates/temen-leng/src/lib.rs`): four threads start,
+  join and lock through the shim on the tree-walker, the bytecode engine, the JIT and the parallel
+  driver.
+- `nimonys_thread_tests_run_on_every_engine` (`nim_e2e`): nimony's own `tests/nimony/threads/`
+  programs on all three engines, against the output each records, and a pool of four workers. They
+  cover thread-locals, the allocator's hand-off and cross-thread frees, ARC, `std/threadpool` and
+  `std/parfor`.
 
 ## 3e. W5 scope — bootstrap + browser (self-hosting the toolchain on temen)
 

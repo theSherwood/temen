@@ -424,3 +424,78 @@ fn jit_fuel_bounds_a_busy_resume_poll_that_never_wakes_its_fiber() {
     assert_eq!(ended, Ended::OutOfFuel);
     assert_eq!(spent, 20_000, "an exhausted budget is drained to zero");
 }
+
+/// **Threads that share a domain's fuel cell run to completion** (#2202). A domain's vCPUs charge
+/// one cell with plain loads and stores, so a thread that loaded `1` before a sibling's refill can
+/// store its `0` just after it. The check used to reload the cell after a refill and trap `OutOfFuel`
+/// on that `0`: five threads looping here trapped within milliseconds with almost all of a budget 50
+/// times their work unspent. It now charges from what the refill granted. A small budget still binds
+/// them: their charge is approximate, a sibling's store can drop another's, but not by a factor of
+/// the budget over the work.
+#[test]
+fn jit_threads_sharing_fuel_run_to_completion() {
+    use temen_run::{instantiate, Backend, Outcome, RunConfig};
+    const ITERS: u64 = 20_000_000;
+    let src = format!(
+        "\
+memory 16
+func () -> (i64) {{
+block 0 () {{
+  sp = i64.const 0
+  a = i64.const 0
+  h0 = thread.spawn 1 sp a
+  h1 = thread.spawn 1 sp a
+  h2 = thread.spawn 1 sp a
+  h3 = thread.spawn 1 sp a
+  h4 = thread.spawn 1 sp a
+  j0 = thread.join h0
+  j1 = thread.join h1
+  j2 = thread.join h2
+  j3 = thread.join h3
+  j4 = thread.join h4
+  s0 = i64.add j0 j1
+  s1 = i64.add s0 j2
+  s2 = i64.add s1 j3
+  s3 = i64.add s2 j4
+  return s3
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (sp: i64, x: i64) {{
+  z = i64.const 0
+  br 1(z)
+}}
+block 1 (i: i64) {{
+  one = i64.const 1
+  i2 = i64.add i one
+  lim = i64.const {ITERS}
+  more = i64.lt_u i2 lim
+  br_if more 1(i2) 2(i2)
+}}
+block 2 (i: i64) {{
+  return i
+}}
+}}
+"
+    );
+    let m = parse_module(&src).expect("parses");
+    verify_module(&m).expect("verifies");
+    let run = |fuel: u64| {
+        let mut cfg = RunConfig::default();
+        cfg.limits.fuel = Some(fuel);
+        instantiate(m.clone())
+            .expect("instantiates")
+            .run(Backend::Jit, &cfg)
+            .map(|r| r.outcome)
+    };
+    let done = run(50 * 5 * ITERS);
+    assert!(
+        matches!(&done, Ok(Outcome::Returned(v)) if v[..] == [Value::I64(5 * ITERS as i64)]),
+        "a budget 50 times the work: {done:?}"
+    );
+    let short = run(1 << 20);
+    assert!(
+        matches!(&short, Err(e) if e.contains("OutOfFuel")),
+        "a budget far below the work: {short:?}"
+    );
+}

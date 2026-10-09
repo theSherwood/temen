@@ -11,7 +11,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 - 🚧 **Not yet (parity not achieved)** — a real gap this backend could close but hasn't.
 - 🔶 **Conditional** — Full where a build/target cfg holds, Declines elsewhere (the note names the condition).
 
-**464 ops.** Across the two JIT columns: 860 ✅ Full · 54 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
+**465 ops.** Across the two JIT columns: 861 ✅ Full · 55 ⛔ Declines · 3 🚧 Not-yet · 11 🔶 Conditional.
 
 ## scalar integer
 
@@ -499,6 +499,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `instantiate_module` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `instantiate_detached` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `child_offer` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `grant` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.poll` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.wait` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |

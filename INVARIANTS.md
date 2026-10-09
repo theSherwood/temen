@@ -39,8 +39,9 @@ description of it was simply stale, on the one page a reader is told to read fir
 
 ## 3. Authority moves only down the grant graph
 
-Every capability transfer is mediated by an authority holding both ends: spawn grants and
-`child_offer` re-grants. No peer discovery, no self-mint transfer channels, no registries,
+Every capability transfer is mediated by an authority holding both ends: spawn grants,
+`child_offer` re-grants, and a parent's grant into its running child (`Instantiator.grant`, op 19,
+#2220). No peer discovery, no self-mint transfer channels, no registries,
 no ambient names. The one sanctioned residue: a domain offering its *own* export down its
 own grant graph. *Violated by:* any path where a domain reaches a capability its ancestors
 never granted. (Owner decision 2026-07-23; IMPORTS.md §3.3/§3.6, PROCESS.md §4.)
