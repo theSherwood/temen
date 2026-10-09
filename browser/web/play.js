@@ -322,29 +322,35 @@ block 0 (vsp: i64, vp: i64) {
   },
   inst: {
     mode: 'inst',
-    desc: '§14 sandboxing: the root spawns 8 **detached** children of its own func 1 — each on its OWN ' +
-      'Web Worker, in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the ' +
-      'root was granted — joins them and sums 8 × 5 = 40. One op-17 v1 spawn record serves all eight.',
+    desc: '§14 sandboxing: the root spawns 8 **detached** copies of itself — each on its OWN Web Worker, ' +
+      'in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the root was ' +
+      'granted — joins them and sums 8 × 5 = 40. A copy starts at the program’s `_child` export: the ' +
+      'host grants the program its **child image** as `child`, and one op-17 v1 spawn record serves all eight.',
     src: `memory 16
+data 16384 "child"
+export 0 func "_child" 1   ; where a copy of this program starts: the host grants its image as "child"
 ; the root: (instantiator, budget) -> sum
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32) {
+  vcn = i64.const 16384
+  vcl = i64.const 5
+  vchild = self.resolve vcn vcl         ; this program's child image, by name
   ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 1, size_log2 0 (the declared window) | pager none, module -1 (self) | budget, region -1 (none).
+  ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
   ; Everything else — offset, quota, grants, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967297            ; version 1, entry 1
+  vf0 = i64.const 1                     ; version 1, entry 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vself = i32.const -1
-  i32.store vr3 vself                   ; module -1 (self)
+  i32.store vr3 vchild                  ; module: the child image
   vr3b = i64.const 17436
   i32.store vr3b vbud                   ; budget
   vr9 = i64.const 17480
-  i32.store vr9 vself                   ; region -1 (none)
+  vnone = i32.const -1
+  i32.store vr9 vnone                   ; region -1 (none)
   vi0 = i64.const 0
   br 1(vi0, v0)
 }
@@ -391,7 +397,7 @@ block 6 (vs3: i64) {
   return vs3
   }
 }
-; a child: its own window, its own Worker
+; a copy: its own window, its own Worker
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 5
@@ -406,11 +412,12 @@ block 0 (v0: i64) {
     editable: true,
     lang: 'temen',
     mode: 'io',
-    desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
+    desc: 'A parent spawns the **same child twice** with **different grant lists** — that is ' +
       'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
       'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
-      '`instantiator`, `budget` and `stdout` by name, fills the op-17 spawn record (entry = the child ' +
-      'function, a detached window of its own paid from the budget, no fuel cap) and a 16-byte grant ' +
+      '`instantiator`, `budget`, `stdout` and `child` (its child image, which starts at its `_child` ' +
+      'export) by name, fills the op-17 spawn record (a detached window of its own paid from the budget, ' +
+      'no fuel cap) and a 16-byte grant ' +
       'record, and spawns child A with `{"stdout" → its stdout}` and child B with an empty list. Each ' +
       'child `self.resolve`s `"stdout"`: A finds a re-grant of the parent\'s stream and prints through ' +
       'it; B finds nothing and returns 0. Result 10 (= A·10 + B), stdout "granted" once. Edit the grant ' +
@@ -421,9 +428,12 @@ data 16384 "instantiator"
 data 16400 "stdout"
 data 16408 "granted\\n"
 data 16424 "budget"
+data 16432 "child"
 export 0 func "_start" 0    ; the powerbox entry shape: both reference hosts grant the named powerbox
+export 1 func "_child" 1    ; where a child starts: the host grants this program's child image as "child"
 
-; parent: spawn the child (func 1) twice — A with {"stdout"}, B with nothing — return A*10 + B
+; parent: spawn the child (func 1, through the child image) twice — A with {"stdout"}, B with nothing —
+; return A*10 + B
 func () -> (i64) {
 block 0 () {
   vnp = i64.const 16384
@@ -434,6 +444,9 @@ block 0 () {
   vout = self.resolve vop vol           ; this domain's stdout, by name
   vbp = i64.const 16424
   vbud = self.resolve vbp vol           ; the Budget each child's window is paid from
+  vcp = i64.const 16432
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl         ; this program's child image
   ; the grant record at 17536: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
   vg0 = i64.const 17536
   vopn = i32.const 16400
@@ -444,23 +457,23 @@ block 0 () {
   vg2 = i64.const 17544
   i32.store vg2 vout
   ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
-  ; 1, size_log2 20 (the declared window) | pager none, module -1 (self) | budget, grants_ptr,
+  ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
   ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967297            ; version 1, entry 1
+  vf0 = i64.const 1                     ; version 1, entry 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vself = i32.const -1
-  i32.store vr3 vself                   ; module -1 (self)
+  i32.store vr3 vchild                  ; module: the child image
   vr3b = i64.const 17436
   i32.store vr3b vbud                   ; budget
   vr5 = i64.const 17448
   i64.store vr5 vg0                     ; grants_ptr
   vr9 = i64.const 17480
-  i32.store vr9 vself                   ; region -1 (none)
+  vnone = i32.const -1
+  i32.store vr9 vnone                   ; region -1 (none)
   ; child A: one grant
   vr6 = i64.const 17456
   vn1 = i64.const 1
@@ -479,8 +492,8 @@ block 0 () {
   }
 }
 
-; child: its own window starts with this module's data segments, so the strings are already there;
-; it resolves "stdout" — a re-grant if the parent listed it — and prints through it, else returns 0
+; child (_child): its own window starts with this module's data segments, so the strings are already
+; there; it resolves "stdout" — a re-grant if the parent listed it — and prints through it, else returns 0
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vop = i64.const 16400
@@ -508,22 +521,24 @@ block 2 (vh2: i32) {
   detached: {
     mode: 'onramp',
     debug: true, // steppable: the debug scheduler services op 15 (#1528), under the on-ramp powerbox
-    bp: 37, // a breakpoint just past the join, where `vj` holds what the detached child returned
+    bp: 38, // a breakpoint just past the join, where `vj` holds what the detached child returned
     desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
-      '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **its own func 1** ' +
-      'as a DETACHED child — a fresh 128 KiB window of its own, nothing of the parent addressable — with ' +
+      '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **a copy of itself** ' +
+      '(its child image, which starts at its `_child` export) as a DETACHED child — a fresh 128 KiB window ' +
+      'of its own, nothing of the parent addressable — with ' +
       'the region pre-mapped at 65536 of the child’s window before it starts. The child needs no ' +
       'handle, no `map`, no page-size query: it reads 41 at 65536, stores 82 at 65544, returns 42. After ' +
       '`join` the parent reads 82 back through its own mapping and returns 1000 × 42 + 82 = **42082**. ' +
       'The parent finds its `instantiator`, `addrspace`, `budget` (the detached-window allowance) and ' +
-      '`module` (itself, spawnable) by name through `self.resolve` — the on-ramp powerbox, one thread, ' +
+      '`child` (its child image) by name through `self.resolve` — the on-ramp powerbox, one thread, ' +
       'the bulk data plane between a parent and a child whose memory it cannot otherwise address.',
     src: `memory 17
 data 20480 "instantiator"
 data 20496 "addrspace"
 data 20512 "budget"
-data 20528 "module"
+data 20528 "child"
 export 0 func "_start" 0
+export 1 func "_child" 1
 func () -> (i64) {
 block 0 () {
   vp0 = i64.const 20480
@@ -536,8 +551,8 @@ block 0 () {
   vl2 = i64.const 6
   vbud = self.resolve vp2 vl2
   vp3 = i64.const 20528
-  vl3 = i64.const 6
-  vmod = self.resolve vp3 vl3
+  vl3 = i64.const 5
+  vchild = self.resolve vp3 vl3
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -548,9 +563,9 @@ block 0 () {
   vin = i64.const 41
   i64.store vwo vin
   vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vmod
+  vmh = i64.extend_i32_u vchild
   vz = i64.const 0
-  vent = i64.const 1
+  vent = i64.const 0
   vlog = i64.const 17
   vreg = i64.extend_i32_u vrh
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
@@ -1178,7 +1193,9 @@ print("squares:", table.concat(sq, " "))
       'formatting (correctly rounded to the requested precision — not a bignum shortest-round-trip, so a few ' +
       'exact-tie roundings can differ from glibc). Split the editor into a multi-file project with `//// file: name` ' +
       'marker lines — the code above the first marker is /in.c, and it can #include "name" the sibling files ' +
-      '(headers or extra .c, unity-build style). Compile a program and run it, entirely in the browser, on the Temen.',
+      '(headers or extra .c, unity-build style). A `//// child: name.c` line starts a separate program ' +
+      'instead: the page compiles it on its own and grants it to yours as `name`, a module it can spawn as ' +
+      'a §14 child (the §14 C cards below do). Compile a program and run it, entirely in the browser, on the Temen.',
     src: `// Write C here, then click Run. printf output shows in the pane on the
 // right; the emitted Temen IR appears below it, and main()'s return is the result.
 #include <stdio.h>
@@ -1207,50 +1224,48 @@ int main(void) {
     mode: 'io',
     desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
       '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
-      'record into one call — `vm_spawn(module, entry, size_log2, grants, n, args, args_len, ' +
-      'scratch)` — so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns ' +
-      '`child` (a function of this same program, by funcref) twice, each into a **window of its own** ' +
-      '(the program\'s size, paid from the `budget` grant and returned when the child ends): A with ' +
-      '`{"stdout"}`, B with none. A resolves the re-granted stream and prints "granted"; B finds nothing. ' +
-      'main() prints both results and returns A·10 + B = 10. A child entry receives its starter handles ' +
-      'where a C function expects its data-stack pointer, so `child` is written **stackless** (no ' +
-      'address-taken locals, VM builtins only).',
+      'record into one call — `vm_spawn(module, size_log2, grants, n, args, args_len, scratch)` — so ' +
+      'per-child attenuation is just **which `vm_grant`s you list**. The child is a program of its own: ' +
+      'the `//// child: worker.c` line starts it, and the page compiles it separately, links it to run as a ' +
+      'child and grants it to `main` as `worker`. The parent spawns it twice, each into a **window of its ' +
+      'own** (paid from the `budget` grant and returned when the child ends): A with `{"stdout"}`, B with ' +
+      'none. A resolves the re-granted stream and prints "granted"; B finds nothing. main() prints both ' +
+      'results and returns A·10 + B = 10.',
     src: `// Two children, two powerboxes — attenuation is the grant list (#1509).
 #include <stdio.h>
 #include <temen.h>
 #include <temen/spawn.h>
 
-long __vm_resolve(const char *name, long len);
-long __vm_write(int h, void *buf, long len);
-
-/* The child entry, spawned into a window of its own (this program's size and data image, none of
-   the parent's memory). Stackless on purpose: a child entry gets its two starter handles where a C
-   function expects its data-stack pointer, so no address-taken locals and no calls into C here —
-   only VM builtins over two strings it writes itself, just above the NULL guard. */
-long child(long addrspace) {
-  *(long *)16384 = 128047728850035L;            /* "stdout" packed little-endian */
-  *(long *)16400 = 748834988792836711L;         /* "granted\\n" */
-  long h = __vm_resolve((char *)16384, 6);      /* re-granted, or not */
-  if (h < 0) return 0;
-  __vm_write((int)h, (char *)16400, 8);         /* through the re-grant */
-  return 1;
-}
-
 static long scratch[16];     /* the spawn record + one grant record (8-byte aligned) */
 
 int main(void) {
-  int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
+  int out = (int)__vm_resolve("stdout", 6);    /* this program's own stdout handle */
+  long worker = __vm_resolve("worker", 6);     /* worker.c below, granted by the page */
   /* size 0: each child's window is its module's declared memory, paid from the "budget" grant. */
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
-  long a = vm_spawn(-1, (long)child, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
+  long a = vm_spawn(worker, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
   long ra = vm_join(a);
-  long b = vm_spawn(-1, (long)child, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
+  long b = vm_spawn(worker, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
   long rb = vm_join(b);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);
   return (int)(ra * 10 + rb);
+}
+
+//// child: worker.c
+// The child: a program of its own, in a window of its own (its own data image, none of the parent's
+// memory). Its powerbox is what the parent listed: it resolves "stdout", a re-grant or nothing.
+#include <temen.h>
+
+long __vm_write(int h, void *buf, long len);
+
+int main(void) {
+  long h = __vm_resolve("stdout", 6);
+  if (h < 0) return 0;
+  __vm_write((int)h, "granted\\n", 8);    /* through the re-grant */
+  return 1;
 }
 `,
   },
@@ -1263,55 +1278,42 @@ int main(void) {
     url: './assets/chibicc.temen',
     mode: 'io',
     desc: 'The **IR card above, in C**: `main` mints a SharedRegion, maps it into its own window, fills it ' +
-      'with 1…8, and spawns `child` — a function of this very program — as a **detached** child ' +
-      '(`Instantiator` op 15, the 11-arg form) with the region **pre-mapped** into the child’s fresh ' +
-      'window at the same offset. The child squares the numbers in place through plain pointer access — ' +
-      'it holds no handle and calls no capability — and after `join` the parent prints the results it ' +
-      'reads back through its own mapping. Everything the parent needs comes by name from the ' +
-      'powerbox (`__vm_resolve`: `instantiator`, `budget`, `module`) plus the `<temen.h>` builtins — ' +
-      'the region ops, `__vm_budget_read`, and the spawn/join themselves, each a static `call.cap` on the ' +
-      'handle it names. Compiled by chibicc in your browser, linked against the prebuilt libc, run on ' +
-      'the bytecode engine.',
+      'with 1…8, and spawns `square.c` — a program of its own, below the `//// child:` line, which the page ' +
+      'compiles separately and grants as `square` — as a **detached** child (`Instantiator` op 15, the ' +
+      '11-arg form) with the region **pre-mapped** into the child’s fresh window. The child squares the ' +
+      'numbers in place through plain pointer access — it holds no handle and calls no capability — and ' +
+      'after `join` the parent prints the results it reads back through its own mapping. Everything the ' +
+      'parent needs comes by name from the powerbox (`__vm_resolve`: `instantiator`, `budget`, `square`) ' +
+      'plus the `<temen.h>` builtins — the region ops, `__vm_budget_read`, and the spawn/join themselves, ' +
+      'each a static `call.cap` on the handle it names. Compiled by chibicc in your browser, linked against ' +
+      'the prebuilt libc, run on the bytecode engine.',
     src: `// A detached child that shares memory with its parent: the op-15 pre-mapped SharedRegion.
 //
 // The parent mints a SharedRegion, maps it into its own window, fills it with numbers, and spawns
-// \`child\` (a function of THIS program) as a DETACHED child: a fresh window of its own, with nothing
-// of the parent's memory addressable — except the region, which the runtime pre-maps into the
-// child's window at CHILD_OFF before it starts. The child squares the numbers in place; after join
-// the parent reads the results back through its own mapping. No copying, nothing for the child to
-// resolve or map: the shared pages are just memory at a fixed offset.
+// square.c (below, a program of its own) as a DETACHED child: a fresh window of its own, with nothing
+// of the parent's memory addressable — except the region, which the runtime pre-maps into the child's
+// window at CHILD_OFF before it starts. The child squares the numbers in place; after join the parent
+// reads the results back through its own mapping. No copying, nothing for the child to resolve or map:
+// the shared pages are just memory at a fixed offset.
 #include <stdio.h>
 #include <temen.h>
 
 #define N 8
-#define REGION_LEN 65536 // one 64 KiB region (the map granule)
-// The child's view of the region: the 64 KiB page its data would occupy. It runs only \`child\` —
-// never \`_start\` or the libc — so that page is free, whatever window chibicc sized.
-#define CHILD_OFF 65536
-
-// The child entry. A detached child receives capability handles, not a data stack, so it keeps to
-// register locals and the pre-mapped pages.
-long child(long unused) {
-  long *p = (long *)CHILD_OFF;
-  for (int i = 0; i < N; i++) p[i] = p[i] * p[i];
-  return N;
-}
+#define REGION_LEN 65536  // one 64 KiB region (the map granule)
+#define CHILD_OFF 1048576 // where square.c sees it: 1 MiB into its window, clear of its data and stack
 
 int main(void) {
   int inst = (int)__vm_resolve("instantiator", 12); // spawn authority
   int budget = (int)__vm_resolve("budget", 6);       // the detached-window allowance
-  int module = (int)__vm_resolve("module", 6);       // this program, as a spawnable Module
-  // The allowance is one window's worth of detached memory — this program's own size — and a
-  // child's window must equal the program's declared memory, so the budget says how big both are.
+  int square = (int)__vm_resolve("square", 6);       // square.c, granted by the page
+  // The allowance is one window's worth of detached memory: this program's own size.
   long win = __vm_budget_read(budget, 1); // field 1 = memory, in bytes
-  int lg = 0;
-  while ((1L << lg) < win) lg++;
   int region = (int)__vm_region_create(REGION_LEN);
   long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
   __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
   for (int i = 0; i < N; i++) p[i] = i + 1;
-  long h = __vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, region,
-                                     CHILD_OFF);
+  // Entry 0 (square.c's own start), size 0 (its declared window), the region at CHILD_OFF.
+  long h = __vm_instantiate_detached(inst, budget, square, 0, 0, 0, 0, 0, 0, region, CHILD_OFF);
   if (h < 0) {
     printf("spawn refused: %ld\\n", h);
     return 1;
@@ -1321,6 +1323,18 @@ int main(void) {
   for (int i = 0; i < N; i++) printf(" %ld", p[i]);
   printf("\\n");
   return 0;
+}
+
+//// child: square.c
+// The child: squares the numbers its parent left in the region, which the runtime mapped at CHILD_OFF
+// before it started. It holds no handle and calls no capability: the shared pages are just memory.
+#define N 8
+#define CHILD_OFF 1048576
+
+int main(void) {
+  long *p = (long *)CHILD_OFF;
+  for (int i = 0; i < N; i++) p[i] = p[i] * p[i];
+  return N;
 }
 `,
   },
@@ -2157,6 +2171,14 @@ const readModuleStdoutBytes = () =>
 const readModuleStderr = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.temen_stderr_ptr(), eng.ex.temen_stderr_ptr() + eng.ex.temen_stderr_len()));
+// What the host noted about the last run (#2219), one per line: a spawn refused for the import nothing
+// satisfied. `temen_notes_len` stashes them for `temen_notes_ptr`, so it goes first.
+const readRunNotes = () => {
+  if (!eng.ex.temen_notes_len) return '';
+  const len = eng.ex.temen_notes_len();
+  const p = eng.ex.temen_notes_ptr();
+  return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + len));
+};
 
 // Inflate a gzip'd asset to a Uint8Array via the browser's built-in DecompressionStream (no library).
 // Used by the nim card, whose toolchain ships gzipped (`nimony.blob.gz`).
@@ -2869,6 +2891,89 @@ function linkPgProgram(link, handles, unit) {
   return r;
 }
 
+// A `//// child: NAME.c` line (#2219) starts a program of its own: everything below it, up to the next
+// such line, is NAME.c, with its own `//// file:` siblings. The page compiles each child as its own
+// program and grants it to the card's run as a `Module` named NAME (without the `.c`), which the program
+// above the first marker spawns. Returns that program's text and the children.
+function splitChildren(text) {
+  const parts = text.split(/^[ \t]*\/\/\/\/[ \t]*child:[ \t]*(\S+?)[ \t]*$/im);
+  const children = [];
+  for (let i = 1; i < parts.length; i += 2) {
+    children.push({ name: parts[i].replace(/\.c$/i, ''), src: parts[i + 1].replace(/^\r?\n/, '') });
+  }
+  return { parent: parts[0], children };
+}
+
+// Pass 1 for one program: run chibicc over `srcBytes` — on the wasm-JIT when `useJit` (`runJitCompiler`:
+// the cdylib seeds the memfs + argv and emits `_start`), else, or when that emit is unavailable, on the
+// bytecode interpreter. Both leave the emitted IR text on the stdout stash, read here. `flags` selects
+// `-g` and the program-unit mode.
+async function compileC(c, rec, compiler, srcBytes, flags, useJit) {
+  let status, tier = 'interpreter';
+  if (useJit) {
+    try {
+      // chibicc's emitted `_start` is independent of the source and the flags (both are fed via the memfs
+      // and argv, not baked into the code), so cache it under a stable key — every compile reuses it.
+      status = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, flags, 'chibicc-compiler');
+      tier = 'wasm-JIT';
+    } catch (e) {
+      logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
+      runNote(rec, { compileJitFallbackReason: e.message });
+    }
+  }
+  if (status === undefined) {
+    // Alloc both buffers before writing (temen_alloc may detach linear memory), pass an empty header
+    // image (0,0), and run chibicc on the interpreter.
+    const p = eng.ex.temen_alloc(compiler.length);
+    const sp = eng.ex.temen_alloc(srcBytes.length);
+    const view = new Uint8Array(eng.memory.buffer);
+    view.set(compiler, p);
+    view.set(srcBytes, sp);
+    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, flags);
+    status = eng.ex.temen_status();
+    eng.ex.temen_dealloc(p, compiler.length);
+    eng.ex.temen_dealloc(sp, srcBytes.length);
+  }
+  return { status, tier, ir: readModuleStdout(), stderr: readModuleStderr() };
+}
+
+// A child's compiled IR by its flags and source, for the page: a Run recompiles only the children that
+// changed. A few entries are plenty for the cards; the oldest goes first.
+const childIrCache = new Map();
+const CHILD_IR_CACHE_MAX = 16;
+
+// Link a child program unit against the resident C units as a §14 child and stage it under `name` for
+// the next run (`temen_link_child_libs`). Returns 0, else a negative status.
+function linkPgChild(handles, name, unit) {
+  const nameBytes = new TextEncoder().encode(name);
+  const hp = eng.ex.temen_alloc(4 * handles.length);
+  const up = eng.ex.temen_alloc(unit.length);
+  const np = eng.ex.temen_alloc(nameBytes.length);
+  const dv = new DataView(eng.memory.buffer);
+  handles.forEach((h, i) => dv.setInt32(hp + 4 * i, h, true));
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(unit, up);
+  view.set(nameBytes, np);
+  const r = eng.ex.temen_link_child_libs(hp, handles.length, up, unit.length, np, nameBytes.length);
+  eng.ex.temen_dealloc(hp, 4 * handles.length);
+  eng.ex.temen_dealloc(up, unit.length);
+  eng.ex.temen_dealloc(np, nameBytes.length);
+  return r;
+}
+
+// Stage every child for the run about to start, which takes them (`grant_onramp_caps`), so each run
+// attempt stages them again. Returns an error message, or null.
+function stageChildren(handles, kids) {
+  eng.ex.temen_child_programs_clear();
+  for (const k of kids) {
+    if (linkPgChild(handles, k.name, k.unit) !== 0) {
+      eng.ex.temen_child_programs_clear();
+      return `link of child ${k.name}.c failed: status ${eng.ex.temen_status()}`;
+    }
+  }
+  return null;
+}
+
 // The in-browser C compiler (SELFHOST_C.md §7 step 5) — two Temen passes in the sandbox:
 //   1. compile: run `chibicc.temen` over the editor's C, seeded on an `fs` cap at `/in.c`
 //      (`temen_run_onramp_fs`), and capture the emitted TEMEN-IR *text* on stdout;
@@ -2899,12 +3004,13 @@ async function runChibicc(c) {
     runEnd(rec, { ok: false });
     return;
   }
-  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  // `//// child: NAME.c` markers (#2219) split off the programs the card's program spawns.
+  const { parent, children } = splitChildren(c.editor.getValue());
+  const srcBytes = new TextEncoder().encode(parent);
   if (srcBytes.length === 0) { setState(c, 'error', 'empty source'); runEnd(rec, { ok: false }); return; }
 
-  // Pass 1 — compile. On the wasm-JIT, hand the compiler + source to `runJitCompiler` (the cdylib seeds
-  // the memfs + argv and emits `_start`); otherwise run chibicc on the bytecode interpreter. Both leave
-  // the emitted IR text on the stdout stash. Alloc happens inside the JIT driver / just below.
+  // Pass 1 — compile (`compileC`): on the wasm-JIT when its toggle is on, else on the bytecode
+  // interpreter. Both leave the emitted IR text on the stdout stash.
   setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
   // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `temen_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
@@ -2922,40 +3028,13 @@ async function runChibicc(c) {
   const flags = gOn | 2 /* CHIBICC_PROGRAM_UNIT */;
   runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn });
   const tCompile = performance.now();
-  let cstatus, compileTier = 'interpreter';
-  if (useJit) {
-    try {
-      // The cdylib seeds the memfs + argv and emits `_start`; `flags` selects `-g` and the program-unit
-      // mode. chibicc's emitted `_start` is independent of both (the source and argv are fed via memfs,
-      // not baked into the code), so cache it under a stable key — every compile reuses the Module.
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, flags, 'chibicc-compiler');
-      compileTier = 'wasm-JIT';
-    } catch (e) {
-      logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
-      runNote(rec, { compileJitFallbackReason: e.message });
-      cstatus = undefined;
-    }
-  }
-  if (cstatus === undefined) {
-    // Alloc both buffers before writing (temen_alloc may detach linear memory), pass an empty header
-    // image (0,0), and run chibicc on the interpreter.
-    const p = eng.ex.temen_alloc(compiler.length);
-    const sp = eng.ex.temen_alloc(srcBytes.length);
-    const view = new Uint8Array(eng.memory.buffer);
-    view.set(compiler, p);
-    view.set(srcBytes, sp);
-    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, flags);
-    cstatus = eng.ex.temen_status();
-    eng.ex.temen_dealloc(p, compiler.length);
-    eng.ex.temen_dealloc(sp, srcBytes.length);
-  }
+  const compiled = await compileC(c, rec, compiler, srcBytes, flags, useJit);
+  const { status: cstatus, tier: compileTier, ir, stderr: cstderr } = compiled;
   const compileMs = runStage(rec, `compile:${compileTier}`, performance.now() - tCompile);
   // The headline tier is where the *compiler* ran (the wasm-JIT showcase); a wasm-JIT→interpreter note
   // here means the compile emit was unavailable. The compiled program always runs on the interpreter
   // oracle (pass 3), shown separately in the stage split.
   runTier(rec, compileTier);
-  const ir = readModuleStdout();
-  const cstderr = readModuleStderr();
   c.el.stdout.textContent = ir; // show the emitted Temen IR
   runNote(rec, { compileTier, irBytes: ir.length });
   logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B Temen IR` +
@@ -2965,6 +3044,39 @@ async function runChibicc(c) {
     runEnd(rec, { ok: false, status: cstatus });
     return;
   }
+  // The children: each its own program, compiled once per page while its source is unchanged.
+  const kids = [];
+  for (const ch of children) {
+    const key = `${flags}\0${ch.src}`;
+    let kir = childIrCache.get(key);
+    if (kir === undefined) {
+      const tChild = performance.now();
+      const k = await compileC(c, rec, compiler, new TextEncoder().encode(ch.src), flags, useJit);
+      if ((k.status !== 0 && k.status !== 5) || k.ir.length === 0) {
+        setState(c, 'error', `compile of child ${ch.name}.c failed: status ${k.status}` +
+          `${k.stderr ? ` — ${k.stderr.trim()}` : ''}`);
+        runEnd(rec, { ok: false, status: k.status });
+        return;
+      }
+      kir = k.ir;
+      childIrCache.set(key, kir);
+      if (childIrCache.size > CHILD_IR_CACHE_MAX) childIrCache.delete(childIrCache.keys().next().value);
+      const ms = runStage(rec, `compile-child:${k.tier}`, performance.now() - tChild);
+      logTo(c, `compiled child ${ch.name}.c (${k.tier}): ${kir.length}B Temen IR in ${ms.toFixed(0)}ms`);
+    } else {
+      logTo(c, `child ${ch.name}.c is unchanged: its compile is reused`);
+    }
+    kids.push({ name: ch.name, unit: new TextEncoder().encode(kir) });
+  }
+  // The run about to start takes the children, so each attempt stages them.
+  const stage = () => {
+    const err = stageChildren(units, kids);
+    if (err) {
+      setState(c, 'error', err);
+      runEnd(rec, { ok: false });
+    }
+    return !err;
+  };
 
   // Pass 2 — for the wasm-JIT, **link** the emitted program unit against the resident units into a
   // runnable module (`temen_link_encode_libs`: `_start` synthesized, verified, encoded). It stays binary
@@ -2992,6 +3104,7 @@ async function runChibicc(c) {
   const tRun = performance.now();
   let r, runTierName = 'interpreter';
   if (parsed) {
+    if (!stage()) return;
     try {
       const status = await runJitModule(eng.ex, eng.memory, parsed, null);
       r = { rv: Number(eng.ex.temen_run_value()), status, stdout: readModuleStdout() };
@@ -3002,9 +3115,14 @@ async function runChibicc(c) {
     }
   }
   if (!r) {
+    if (!stage()) return;
     const rv = linkPgProgram(eng.ex.temen_link_run_libs, units, unit);
     r = { rv, status: eng.ex.temen_status(), stdout: readModuleStdout() };
   }
+  eng.ex.temen_child_programs_clear(); // what a run that never started left staged
+  // What the host noted about the run (#2219): a spawn refused for the import nothing satisfied.
+  const notes = readRunNotes();
+  if (notes) logTo(c, `host notes:\n${notes}`);
   const runMs = runStage(rec, `run:${runTierName}`, performance.now() - tRun);
   runNote(rec, { runTier: runTierName, compileMs: +compileMs.toFixed(1), runMs: +runMs.toFixed(1), progStdoutBytes: (r.stdout || '').length });
   c.el.result.textContent = `${r.rv}`;
@@ -3014,7 +3132,8 @@ async function runChibicc(c) {
   const progOut = r.stdout || '';
   const irLabel = `compiled to ${ir.length} B of Temen IR (a program unit — the libc and heap are prebuilt and linked)`;
   const irSection = `${'─'.repeat(18)} ${irLabel} ${'─'.repeat(18)}\n${ir}`;
-  c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
+  const notesSection = notes ? `${'─'.repeat(18)} host notes ${'─'.repeat(18)}\n${notes}\n` : '';
+  c.el.stdout.textContent = (progOut ? `${progOut}\n` : '') + notesSection + irSection;
   // Status line now shows the compile/run split by tier, so "where the time went" is visible on-page.
   const split = `compile ${compileMs.toFixed(0)}ms (${compileTier}) · run ${runMs.toFixed(0)}ms (${runTierName})`;
   if (r.status === 0 || r.status === 5) {
@@ -4300,7 +4419,8 @@ async function proveChibiccParity(c) {
     c.el.prove.disabled = false;
     return;
   }
-  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  // The card's own program: a `//// child:` program below it compiles on its own (#2219).
+  const srcBytes = new TextEncoder().encode(splitChildren(c.editor.getValue()).parent);
   if (srcBytes.length === 0) {
     setState(c, 'error', 'empty source');
     c.el.run.disabled = broken;
@@ -4561,7 +4681,8 @@ function dapHandle(c, reply) {
 // own file.
 async function chibiccCompileIR(c) {
   const compiler = await fetchModule(c.ex.url, onFetchProgress(c, baseName(c.ex.url)));
-  const srcBytes = new TextEncoder().encode(c.editor.getValue());
+  // The card's own program: a `//// child:` program below it compiles on its own (#2219).
+  const srcBytes = new TextEncoder().encode(splitChildren(c.editor.getValue()).parent);
   if (srcBytes.length === 0) return { ir: '', status: -1, stderr: 'empty source' };
   let units;
   try {

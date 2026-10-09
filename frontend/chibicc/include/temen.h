@@ -30,20 +30,23 @@
 int __vm_cap(int i);
 // `__vm_resolve(name, len)` returns the handle registered under `name` in this domain's §7 name
 // directory (`self.resolve`) — the by-name twin of `__vm_cap`, for capabilities outside the fixed
-// indexed set: `"instantiator"`, `"module"`, `"budget"`, `"stderr"`, a parent's re-grant …
+// indexed set: `"instantiator"`, `"budget"`, `"stderr"`, a module the host granted, a parent's
+// re-grant …
 long __vm_resolve(const char *name, long len);
 //
-// **Spawning a §5 detached child** (`Instantiator` op 15, the 11-arg pre-mapped form): a function
-// `entry` of `module` runs in a fresh window of `1 << size_log2` bytes minted from `budget` (which
-// also bounds the child's fuel), with
+// **Spawning a §5 detached child** (`Instantiator` op 15, the 11-arg pre-mapped form): `module`, a
+// `Module` the host granted you — another program, built to run as a child — runs from its function 0
+// (`entry` must be 0, #2219) in a fresh window of `1 << size_log2` bytes (0: its declared memory)
+// minted from `budget` (which also bounds the child's fuel), with
 // `region` (a SharedRegion of yours) aliased whole into its window at `child_off` before it starts
 // — the bulk data plane with a child whose memory you cannot address. `grants_ptr`/`grants_n` is
 // the op-11 grant-record list (0, 0 for none), `args_ptr`/`args_len` a spawn-time payload (0, 0
 // for none). Returns the child handle (join it with `__vm_instantiate_join`) or -errno. The
-// powerbox names `"instantiator"`, `"module"` (this program, spawnable) and `"budget"` for a
-// program that spawns detached: `int inst = (int)__vm_resolve("instantiator", 12);` etc. A program
-// that exports a `_child` entry is also granted `"child"`, its child image: this program with a
-// bootstrap at function 0 that runs `_child`, so a copy of it spawned at entry 0 starts there (#2219).
+// powerbox names `"instantiator"` and `"budget"` for a program that spawns detached:
+// `int inst = (int)__vm_resolve("instantiator", 12);` etc. The playground grants a card's
+// `//// child: NAME.c` program, compiled and linked to run as a child, as `"NAME"`. A program that
+// exports a `_child` entry is also granted `"child"`, its child image: this program with a bootstrap
+// at function 0 that runs `_child`, so a copy of it spawned at entry 0 starts there (#2219).
 long __vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
                                long entry, long size_log2, long args_ptr, long args_len, long region,
                                long child_off);

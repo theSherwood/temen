@@ -9,11 +9,14 @@
 //! - the **C** card: compiled by the committed `chibicc.temen` (the in-browser compiler — this is also
 //!   the code-coupled gate for its `__vm_instantiate_rec`/`__vm_instantiate_join` builtins) against
 //!   the seeded playground headers, `<temen/spawn.h>` included, linked against the heap unit, then
-//!   run. Fail-soft: SKIPs if the asset isn't built.
+//!   run. Its `//// child: worker.c` program is compiled and linked to run as a child, and staged for
+//!   the run as the page stages it (#2219). Fail-soft: SKIPs if the asset isn't built.
 use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
 };
 
+#[path = "support/card_children.rs"]
+mod card_children;
 #[path = "support/pg_heap.rs"]
 mod pg_heap;
 
@@ -58,35 +61,45 @@ fn c_card_grants_stdout_to_one_child_only() {
     };
     let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
     let src = card_src("'§14 attenuation from C (chibicc + <temen/spawn.h>)'");
-    let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
-    files.push(("in.c".to_string(), src.into_bytes()));
-    let dirs = vec!["include".to_string(), "include/temen".to_string()];
-    let image = temen_fs::encode_image(&files, &dirs);
-    let compiled = onramp_fs_exec(
-        &chibicc,
-        &image,
-        &[
-            b"chibicc",
-            b"--data-page",
-            b"65536",
-            b"--emit-object",
-            b"/in.c",
-        ],
-        b"",
-    );
-    assert!(
-        compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
-        "compile status {} — stderr: {}",
-        compiled.status,
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
+    let compile = |src: String| -> (String, temen_ir::Module) {
+        let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
+        files.push(("in.c".to_string(), src.into_bytes()));
+        let dirs = vec!["include".to_string(), "include/temen".to_string()];
+        let image = temen_fs::encode_image(&files, &dirs);
+        let compiled = onramp_fs_exec(
+            &chibicc,
+            &image,
+            &[
+                b"chibicc",
+                b"--data-page",
+                b"65536",
+                b"--emit-object",
+                b"/in.c",
+            ],
+            b"",
+        );
+        assert!(
+            compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
+            "compile status {} — stderr: {}",
+            compiled.status,
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
+        let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+        (ir, m)
+    };
+    let (parent, children) = card_children::split(&src);
+    let (ir, m) = compile(parent);
     // The helper's spawn/join are static `call.cap`s on the Instantiator (interface 6).
     assert!(
         ir.contains("call.cap 6 17") && ir.contains("call.cap 6 1 "),
         "{ir:.300}"
     );
-    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    assert_eq!(children.len(), 1, "the card's worker.c");
+    for (name, child) in children {
+        let (_, child) = compile(child);
+        temen_browser::stage_child_program(&name, pg_heap::link_child(&[], &child));
+    }
     let run = onramp_exec(&pg_heap::link(&[], &m), b"");
     assert_eq!(
         run.status,
@@ -102,9 +115,9 @@ fn c_card_grants_stdout_to_one_child_only() {
 }
 
 /// The `detached` card (§5 op 15 over a pre-mapped SharedRegion) through the same `onramp_exec` the
-/// page's on-ramp recipe calls: the parent finds `module` and `budget` by name and spawns its own
-/// func 1 detached — 1000 × 42 + 82. `budget` cannot cross into a §14 child yet, so a card that spawns
-/// detached runs at the root (#1720); this pins that it still runs at all.
+/// page's on-ramp recipe calls: the parent finds `child` (its child image, #2219) and `budget` by name
+/// and spawns the image detached — 1000 × 42 + 82. `budget` cannot cross into a §14 child yet, so a
+/// card that spawns detached runs at the root (#1720); this pins that it still runs at all.
 #[test]
 fn detached_card_spawns_over_a_premapped_region() {
     let src = card_src("\n  detached: {");
@@ -112,4 +125,26 @@ fn detached_card_spawns_over_a_premapped_region() {
     let run = onramp_exec(&m, b"");
     assert_eq!(run.status, STATUS_OK, "trap: {:?}", run.trap);
     assert_eq!(run.value, 42082);
+}
+
+/// The `inst` card under the grants of the parallel §14 recipe it runs on (`temen_par_root`): an
+/// `Instantiator` over its window, the `budget` its children's windows spend, and its child image as
+/// `"child"` (#2219). The page runs each child on a Worker of its own; here they share the bytecode
+/// engine's cooperative driver, which admits them the same way. Eight copies return 5 each.
+#[test]
+fn inst_card_sums_eight_copies_of_itself() {
+    let src = card_src("\n  inst: {");
+    let m = std::sync::Arc::new(
+        temen_text::parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}")),
+    );
+    let mut host = temen_interp::Host::new();
+    host.set_self_module(&m);
+    let inst = host.grant_instantiator(0, 1 << 16);
+    let budget = host.grant_budget(-1, 1 << 20, -1); // the page's `minter`
+    host.grant_child_image();
+    let mut fuel = 50_000_000u64;
+    let args = [inst, budget].map(temen_interp::Value::I32);
+    let r = temen_interp::bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
+        .expect("the bytecode engine runs the card");
+    assert_eq!(r, Ok(vec![temen_interp::Value::I64(40)]));
 }

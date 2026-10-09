@@ -28834,17 +28834,27 @@ impl Host {
             let budget = self.grant_budget(-1, win as i64, -1);
             self.register_cap_name("budget", budget);
         }
-        // #2219: a program that spawns copies of itself declares where they start (`_child`), and
-        // spawns its child image. Non-durable, as the `"module"` grant is: a durable domain refuses it.
-        if self.resolve_cap_name("child").is_none() {
-            match temen_ir::child_image(&m) {
-                Some(Ok(image)) => {
-                    let child = self.grant_module_shared(Arc::new(image), false);
-                    self.register_cap_name("child", child);
-                }
-                Some(Err(e)) => self.note(format!("no \"child\" grant: {e}")),
-                None => {}
+        self.grant_child_image();
+    }
+
+    /// #2219: grant the running program's [`temen_ir::child_image`] as `"child"`, when it exports a
+    /// `_child` entry and nothing holds the name yet. A program that spawns copies of itself declares
+    /// where they start, and spawns this image. Non-durable, as the `"module"` grant is: a durable
+    /// domain refuses it. A `_child` the image refuses is noted instead.
+    pub fn grant_child_image(&mut self) {
+        let Some(m) = self.self_module.clone() else {
+            return;
+        };
+        if self.resolve_cap_name("child").is_some() {
+            return;
+        }
+        match temen_ir::child_image(&m) {
+            Some(Ok(image)) => {
+                let child = self.grant_module_shared(Arc::new(image), false);
+                self.register_cap_name("child", child);
             }
+            Some(Err(e)) => self.note(format!("no \"child\" grant: {e}")),
+            None => {}
         }
     }
 

@@ -214,36 +214,34 @@ pub extern "C" fn run_threads() -> i64 {
 /// runs every multi-domain guest on), over primitives already exercised on wasm32 — the wasm-JIT
 /// tier-up is orthogonal (a per-Worker compute accelerator; cap/serve/fork ops leaf-fold to the
 /// interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
-/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The manager spawns both
-/// domains through op-17 v1 records (#1864): each is this module in a **detached 2^18 window of its
-/// own** paid from the `Budget` arg, so each starts with the module's data segments — the guest reads
-/// its "svc"/"o" names there, and every scratch cell sits above the #1094 NULL guard.
-const FORK_TWIN: &str = r#"
+/// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The three are three
+/// programs (#2219): the manager spawns the server and the guest — modules the host grants it — through
+/// op-17 v1 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
+/// the `Budget` arg, so each starts with its own data segments — the guest reads its "svc"/"o" names
+/// there, and every scratch cell sits above the #1094 NULL guard.
+const FORK_MANAGER: &str = r#"
 memory 18
-type 0 func (i64) -> (i64)
-type 1 interface { fork: 0, wait: 0 }
-export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-; manager (inst, stdout, budget): spawn the server (func 1), offer its "svc" to the guest (func 4)
-; with our stdout as "o", and return the guest's status
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
-  ; the op-17 v1 record for the server at 17600: version 1 | entry 1, size_log2 18 | no pager,
-  ; module -1 (self) | budget, no grants, no args, region -1 (none); the rest is zero
+; manager (inst, stdout, budget, server, guest): spawn the server, offer its "svc" to the guest with
+; our stdout as "o", and return the guest's status
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
+  ; the op-17 v1 record for the server at 17600: version 1 | entry 0, size_log2 18 | no pager,
+  ; the server module | budget, no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
-  q1v0 = i64.const 4294967297
+  q1v0 = i64.const 1
   i64.store q1a0 q1v0
   q1a2 = i64.const 17616
   q1v2 = i64.const -4294967278
   i64.store q1a2 q1v2
   q1a3 = i64.const 17624
-  vself = i32.const -1
-  i32.store q1a3 vself
+  i32.store q1a3 vsrv
   q1a3b = i64.const 17628
   i32.store q1a3b vbud
   q1a9 = i64.const 17672
-  i32.store q1a9 vself
+  vnone = i32.const -1
+  i32.store q1a9 vnone
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -263,14 +261,14 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; the guest's record at 17696: version 1 | entry 4, the two grants above, otherwise as the server's
+  ; the guest's record at 17696: version 1 | entry 0, the guest module, the two grants above,
+  ; otherwise as the server's
   q2a0 = i64.const 17696
-  q2v0 = i64.const 17179869185
-  i64.store q2a0 q2v0
+  i64.store q2a0 q1v0
   q2a2 = i64.const 17712
   i64.store q2a2 q1v2
   q2a3 = i64.const 17720
-  i32.store q2a3 vself
+  i32.store q2a3 vgst
   q2a3b = i64.const 17724
   i32.store q2a3b vbud
   q2a5 = i64.const 17736
@@ -280,12 +278,20 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   q2v6 = i64.const 2
   i64.store q2a6 q2v6
   q2a9 = i64.const 17768
-  i32.store q2a9 vself
+  i32.store q2a9 vnone
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
 }
+"#;
+
+/// [`FORK_MANAGER`]'s server: serves `"svc"` — `fork` clones its caller, `wait` reaps the twin.
+const FORK_SERVER: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { fork: 0, wait: 0 }
+export 0 interface "svc" 1 { fork: 1, wait: 2 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   br 1()
@@ -312,6 +318,13 @@ block 0 (vpid: i64) {
   return vt
   }
 }
+"#;
+
+/// [`FORK_MANAGER`]'s guest: forks through `"svc"`, and each copy writes its reply to `"o"`.
+const FORK_GUEST: &str = r#"
+memory 18
+data 16684 "svc"
+data 16694 "o"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vp0 = i64.const 16684
@@ -356,25 +369,23 @@ block 4 (vr: i64, vho: i32) {
 /// run_fork` exercises the fork substrate on wasm.
 #[no_mangle]
 pub extern "C" fn run_fork() -> i64 {
-    let Ok(m) = temen_text::parse_module(FORK_TWIN) else {
+    let parse = |src| temen_text::parse_module(src).ok();
+    let (Some(m), Some(server), Some(guest)) =
+        (parse(FORK_MANAGER), parse(FORK_SERVER), parse(FORK_GUEST))
+    else {
         return i64::MIN;
     };
-    let m = std::sync::Arc::new(m);
     let mut host = Host::new();
-    host.set_self_module(&m);
     let inst = host.grant_instantiator(0, 1u64 << 18);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     // The server's and the guest's windows, and the twin's copy of the guest's (#2106).
     let budget = host.grant_budget(-1, 3 << 18, -1);
+    let server = host.grant_module(&server);
+    let guest = host.grant_module(&guest);
     let mut fuel = 40_000_000u64;
-    let r = match bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(inst), Value::I32(out_h), Value::I32(budget)],
-        &mut fuel,
-        &mut host,
-    ) {
+    let args = [inst, out_h, budget, server, guest].map(Value::I32);
+    let r = match bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host) {
         Some(Ok(vals)) => match vals.first() {
             Some(Value::I64(x)) => *x,
             _ => return i64::MIN,
@@ -2090,7 +2101,7 @@ pub extern "C" fn temen_par_root(
     if let Some(cfg) = par_inst() {
         let mut host = Host::new();
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        host.set_self_module(unsafe { prog_ref(prog) }.module()); // a record's `module = -1`
+        host.set_self_module(unsafe { prog_ref(prog) }.module()); // a record's `module = -1`, its image
         let inst = host.grant_instantiator(0, cfg.win_size);
         let mut args = vec![Value::I32(inst)];
         if let Some(m) = &cfg.module {
@@ -2103,6 +2114,9 @@ pub extern "C" fn temen_par_root(
                 -1,
             )));
         }
+        // #2219: a root that spawns copies of itself finds its child image as `"child"`, as under
+        // the reference powerboxes. Granted after the positional handles, so they keep their values.
+        host.grant_child_image();
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
             unsafe { prog_ref(prog) },
@@ -3678,6 +3692,14 @@ fn grant_onramp_caps(
     let declared = declared
         .map(|(names, requests)| host.grant_declared_host_caps(&m.imports, names, requests))
         .unwrap_or_default();
+    // #2219: a card's `//// child: NAME.c` programs, each a `Module` under its name — what its parent
+    // spawns. This run takes them, and they come after every grant above, whose handles keep their
+    // values.
+    let children = CHILD_PROGRAMS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for (name, child) in &children {
+        let h = host.grant_module(child);
+        host.register_cap_name(name, h);
+    }
     let mut seams: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
     seams.extend(declared.iter().map(|(n, h)| (n.as_str(), *h)));
     host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
@@ -3848,6 +3870,7 @@ fn onramp_run(
         stderr: Vec::new(),
         framebuffer: None,
     };
+    set_last_notes(Vec::new());
     if onramp_check(m).is_err() {
         return unsupported();
     }
@@ -3903,6 +3926,7 @@ fn onramp_run(
         },
     };
     let framebuffer = frame.lock().unwrap().take();
+    set_last_notes(host.take_notes());
     PbOutcome {
         trap,
         fault_addr: match trap {
@@ -9090,6 +9114,103 @@ pub extern "C" fn temen_link_encode_libs(
     )
 }
 
+thread_local! {
+    /// #2219 — the `//// child: NAME.c` programs a playground card's page linked for its next run
+    /// ([`temen_link_child_libs`]), each under the name its parent finds it by. The next on-ramp run
+    /// on this thread grants and takes them ([`grant_onramp_caps`]), so they serve that run alone.
+    static CHILD_PROGRAMS: std::cell::RefCell<Vec<(String, temen_ir::Module)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Hold `module` for the next on-ramp run on this thread, which grants it as a `Module` named `name`
+/// (#2219): how a card's `//// child: NAME.c` program reaches its parent. Public so a native test
+/// stages a card's child as the page does.
+pub fn stage_child_program(name: &str, module: temen_ir::Module) {
+    CHILD_PROGRAMS.with(|c| c.borrow_mut().push((name.to_string(), module)));
+}
+
+thread_local! {
+    /// #2219 — the host notes the last on-ramp run on this thread finished with
+    /// ([`Host::take_notes`]): a spawn refused for the import nothing satisfied, or a `_child` its host
+    /// could not image. The page shows them with the card's output ([`temen_notes_len`]).
+    static LAST_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The notes the last on-ramp run on this thread finished with, one per refusal.
+pub fn last_notes() -> Vec<String> {
+    LAST_NOTES.with(|n| n.borrow().clone())
+}
+
+fn set_last_notes(notes: Vec<String>) {
+    LAST_NOTES.with(|n| *n.borrow_mut() = notes);
+}
+
+/// Length of the last run's notes, one per line. Call it first: it stashes them for
+/// [`temen_notes_ptr`].
+#[no_mangle]
+pub extern "C" fn temen_notes_len() -> usize {
+    let bytes = last_notes().join("\n").into_bytes();
+    // SAFETY: single-threaded wasm; the slot is read back only via the accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(NOTES), bytes);
+        (*core::ptr::addr_of!(NOTES)).1
+    }
+}
+
+/// Pointer to the notes [`temen_notes_len`] stashed (cdylib-managed; do not `temen_dealloc` it).
+#[no_mangle]
+pub extern "C" fn temen_notes_ptr() -> *const u8 {
+    // SAFETY: as [`temen_notes_len`].
+    unsafe { (*core::ptr::addr_of!(NOTES)).0 }
+}
+
+static mut NOTES: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
+/// Drop the staged child programs, for a card run that stops before its parent runs.
+#[no_mangle]
+pub extern "C" fn temen_child_programs_clear() {
+    CHILD_PROGRAMS.with(|c| c.borrow_mut().clear());
+}
+
+/// Link a card's `//// child: NAME.c` program unit against the resident libraries (see
+/// [`temen_link_run_libs`] for the handle list) as a §14 child ([`link_child_program_multi`],
+/// entering at `main`), and stage it under `[name_ptr, name_len)` for the next run
+/// ([`stage_child_program`]). Returns 0, else a negative `STATUS_*`.
+#[no_mangle]
+pub extern "C" fn temen_link_child_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let fail = |s: i32| {
+        set(s);
+        -s
+    };
+    let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    match resident_link(
+        handle_slice(handles_ptr, handles_len),
+        &program,
+        "main",
+        true,
+    ) {
+        Ok((m, _)) => {
+            stage_child_program(name, m);
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => fail(status),
+    }
+}
+
 /// Report what a module **declares as host capabilities**, and which of them the on-ramp powerbox can
 /// serve. `[ptr, len)` is a module in either form [`link_load_unit`] accepts — an encoded blob or
 /// Temen text — so a host can ask this of a program it has just linked without re-encoding it.
@@ -9200,7 +9321,7 @@ fn link_lib_stash(
     let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
         return fail(STATUS_DECODE_ERR);
     };
-    match resident_link(handles, &program, entry) {
+    match resident_link(handles, &program, entry, false) {
         Ok((m, _)) => {
             let bytes = render(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
@@ -9273,6 +9394,29 @@ pub fn link_program_multi(
     program: &temen_ir::Module,
     entry: &str,
 ) -> Result<temen_ir::Module, i32> {
+    link_program_as(libs, program, entry, false)
+}
+
+/// [`link_program_multi`] for a program that runs as a §14 **child** (#2219): the same link, wrapped
+/// in the child-entry bootstrap ([`temen_ir::synth_manifest_child_start`]) — it takes the starter
+/// capability, seeds the heap words, runs the program's own `_start`, and returns `main`'s value as
+/// the status its parent `join`s. A playground card's `//// child: NAME.c` program is linked so.
+pub fn link_child_program_multi(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    program: &temen_ir::Module,
+    entry: &str,
+) -> Result<temen_ir::Module, i32> {
+    link_program_as(libs, program, entry, true)
+}
+
+/// The link behind [`link_program_multi`] and [`link_child_program_multi`]: `child` picks the
+/// bootstrap.
+fn link_program_as(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    program: &temen_ir::Module,
+    entry: &str,
+    child: bool,
+) -> Result<temen_ir::Module, i32> {
     let mut prog_exports = link_lib_exports(program);
     // **Enter at the program unit's own `_start`, not at `main`** (#1536). The frontend's bootstrap is
     // the only thing that knows how to call *this* `main`: chibicc threads a data-stack pointer as an
@@ -9338,8 +9482,12 @@ pub fn link_program_multi(
     // dead body still names its imports until it is emptied) and before `synth_manifest_start`,
     // which reads the table this reports.
     let _ = temen_ir::prune_unused_imports(&mut linked);
-    let module =
-        temen_ir::synth_manifest_start(linked, entry_idx, true).map_err(|_| STATUS_UNSUPPORTED)?;
+    let module = if child {
+        temen_ir::synth_manifest_child_start(linked, entry_idx, true)
+    } else {
+        temen_ir::synth_manifest_start(linked, entry_idx, true)
+    }
+    .map_err(|_| STATUS_UNSUPPORTED)?;
     // Verify before handing it on: a program that references an undefined proc links to an
     // unresolvable manifest import / out-of-range target, which would otherwise fault deep in the
     // engine. Reject it cleanly so a typo can't take down the playground's wasm instance.
@@ -9452,7 +9600,7 @@ fn link_run_handles(
         stdin_ptr,
         stdin_len,
         |program, entry| {
-            resident_link(handles, program, entry)
+            resident_link(handles, program, entry, false)
                 .map(|(m, set)| (m, Some(std::sync::Arc::clone(&set.memo))))
         },
     )
@@ -9492,6 +9640,7 @@ fn resident_link(
     handles: &[i32],
     program: &temen_ir::Module,
     entry: &str,
+    child: bool,
 ) -> Result<(temen_ir::Module, &'static LinkSet), i32> {
     let set = link_set(handles).ok_or(STATUS_UNSUPPORTED)?;
     let linked = match &set.base {
@@ -9503,11 +9652,11 @@ fn resident_link(
                 data_exports: &base.data_exports,
                 live: Some(&live),
             };
-            link_program_multi(&[unit], program, entry)
+            link_program_as(&[unit], program, entry, child)
         }
         None => {
             let units = resident_units(handles).ok_or(STATUS_UNSUPPORTED)?;
-            link_program_multi(&units, program, entry)
+            link_program_as(&units, program, entry, child)
         }
     };
     linked.map(|m| (m, set))
@@ -14283,6 +14432,7 @@ fn coop_pump(budget: Option<u64>) -> i32 {
     }
     // The files the run ended with, for an embedder's file view after it closes the session.
     let fs = temen_fs::vm_fs_image(&s.run.host_mut());
+    set_last_notes(s.run.host_mut().take_notes());
     // #1896: a nimony build's output is its personality's, and its memfs outlives the run for
     // `temen_nim_file` to read.
     let (stdout, stderr) = match s.nim.take() {

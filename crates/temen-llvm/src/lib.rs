@@ -13267,8 +13267,9 @@ fn lower_vm_builtin(
         }
         // §14 spawn: `long __vm_instantiate_rec(int inst, long rec)` → `call.cap INSTANTIATOR 17 inst
         // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 **v1** record
-        // (`temen_ir::SpawnRec`, 88 bytes) in the guest window naming the module (`-1` = this
-        // program), the `Budget` that pays for the child's window of its own, the by-name grant list,
+        // (`temen_ir::SpawnRec`, 88 bytes) in the guest window naming the module (a `Module` handle
+        // the host granted, started at its function 0, #2219), the `Budget` that pays for the child's
+        // window of its own, the by-name grant list,
         // the spawn-time args payload and an optional pre-mapped region. The same builtin chibicc
         // lowers. `inst` is the reflection-discovered `Instantiator` handle (`__vm_cap_at`, interface
         // id 6). Returns the child handle (`-EINVAL` on a refused spawn), joined with `__vm_join`.
