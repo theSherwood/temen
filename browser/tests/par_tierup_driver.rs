@@ -2,7 +2,7 @@
 //! wasmi, over the real exports, so the parallel driver's event plumbing runs in `cargo test` and not
 //! only in real Chromium. It pins the Worker's B2 table mirror: a runtime unit's `call.dyn` into the
 //! program's natural prefix (#1347), and an installed unit surviving the release of its code handle
-//! (#1339).
+//! (#1339) but not its run (#2259).
 
 use temen_browser::{
     temen_par_enable_jit, temen_par_ev_a, temen_par_ev_b, temen_par_free, temen_par_root,
@@ -419,7 +419,7 @@ fn par_linked_unit_dispatches_program_functions_through_the_b2_mirror() {
     }
 }
 
-// ---- #1339: the slot mirror survives the guest's `Jit.release` -----------------------------------
+// ---- #1339, #2259: the slot mirror survives the guest's `Jit.release`, not its run -----------------
 
 /// #1339 — **the parallel driver's slot mirror is keyed on the unit, not the code handle.**
 ///
@@ -434,16 +434,20 @@ fn par_linked_unit_dispatches_program_functions_through_the_b2_mirror() {
 /// The guest compiles `f(x) = x + K` from the host-staged blob, installs it (taking slot 1 — the
 /// first padding slot past its own single function), releases the handle, then `call.dyn`s the slot.
 /// Asserts the dispatch still computes, and then — the regression proper — that **after the release**
-/// the mirror still names the unit and the driver can still fetch its emitted wasm by slot: the two
-/// reads `worker.js::jitSyncTable` makes to fill that slot.
+/// the mirror still names the unit and the driver can still fetch its emitted wasm by that name: the
+/// two reads `worker.js::jitSyncTable` makes to fill that slot.
+///
+/// #2259 — and that the **next run's publish empties the mirror**. Its host numbers units afresh, so
+/// an entry left from this run named another unit of it: a Worker of the next run fetched that
+/// unit's wasm into the slot.
 #[test]
-fn par_installed_unit_survives_the_release_of_its_code_handle() {
+fn par_installed_unit_outlives_its_handle_but_not_its_run() {
     // The par §22 statics (the powerbox, the slot mirror, the prefix shims) are process-global, so
     // this shares `JIT_STATE_LOCK` with the other single-run test in this binary (#1182).
     let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use temen_browser::{
         temen_par_compile_jit, temen_par_ev_a, temen_par_jit_slot_unit, temen_par_jit_table_gen,
-        temen_par_jit_unit_wasm_by_slot_len, temen_par_powerbox_jit_runtime, temen_par_root,
+        temen_par_jit_unit_wasm_by_id_len, temen_par_powerbox_jit_runtime, temen_par_root,
         temen_par_run, PAR_DONE,
     };
 
@@ -512,12 +516,23 @@ block 0 (v0: i32) {{
         "the slot mirror must still name the installed unit after `release`"
     );
     assert!(
-        temen_par_jit_unit_wasm_by_slot_len(1) > 0,
+        temen_par_jit_unit_wasm_by_id_len(temen_par_jit_slot_unit(1)) > 0,
         "the driver must still fetch the installed unit's emitted wasm after `release`"
     );
     assert_ne!(
         temen_par_jit_table_gen(),
         gen0,
         "the install must advance the mirror generation so a Worker rebuilds"
+    );
+
+    assert_eq!(
+        temen_par_powerbox_jit_runtime(guest_bytes.as_ptr(), guest_bytes.len()),
+        1,
+        "the next run's powerbox"
+    );
+    assert_eq!(
+        temen_par_jit_slot_unit(1),
+        -1,
+        "the next run starts with nothing installed"
     );
 }

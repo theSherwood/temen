@@ -896,8 +896,16 @@ static PAR_RUN_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 static CODEGEN_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Bump the run generation. Call once, page-side, at the start of every powerbox publisher.
+///
+/// The §22 slot mirror ([`PAR_JIT_SLOT_UNIT`]) belongs to the run, so it starts empty here
+/// (#2259): the next run's host numbers its units afresh, and an entry the last run left would
+/// name another of them.
 fn par_run_gen_bump() {
     PAR_RUN_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    PAR_JIT_SLOT_UNIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// RAII spin-lock over the codegen stashes: `Acquire` on lock, `Release` on unlock, so a stash the
@@ -1850,8 +1858,9 @@ fn par_resolve_unit_rt(
 /// `None` empty), shared across every Worker (one arena / one set of statics behind the shared
 /// memory). The shared interpreter `Domain` dispatch table is atomics-in-memory but has no
 /// slot→emitted-wasm link; this records it wherever an `install`/`uninstall` is serviced so a Worker
-/// can rebuild its own `WebAssembly.Table` from `(slot → unit → temen_par_jit_unit_wasm_by_slot)`.
-/// Sized lazily to the grant reservation `1 << PAR_JIT_TABLE_LOG2`.
+/// can rebuild its own `WebAssembly.Table` from `(slot → unit → temen_par_jit_unit_wasm_by_id)`.
+/// Sized lazily to the grant reservation `1 << PAR_JIT_TABLE_LOG2`, and emptied when a run is
+/// published ([`par_run_gen_bump`]): its units are its host's.
 ///
 /// #1339: the key is the **unit index, not the code handle** — the coop driver's
 /// `CoopSched::slot_units` twin, and for the same reason: a handle is guest-revocable and
@@ -1929,7 +1938,7 @@ pub extern "C" fn temen_par_jit_table_log2() -> u32 {
 /// #1339 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
 /// `domain << 32 | unit` (`-1` empty): the mirror map a Worker reads to rebuild its per-Worker
 /// `WebAssembly.Table` (§22 B2 cross-Worker), and the key it fetches the slot's emitted wasm by
-/// ([`temen_par_jit_unit_wasm_by_slot_len`]). The `temen_coop_slot_unit` twin: keyed on the unit
+/// ([`temen_par_jit_unit_wasm_by_id_len`]). The `temen_coop_slot_unit` twin: keyed on the unit
 /// index rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
 #[no_mangle]
 pub extern "C" fn temen_par_jit_slot_unit(slot: u32) -> i64 {
@@ -2005,34 +2014,33 @@ pub extern "C" fn temen_par_shim_wasm_ptr(slot: u32) -> *const u8 {
         .map_or(core::ptr::null(), |w| w.as_ptr())
 }
 
-/// #1339 — emitted-wasm for the unit installed at dispatch-table `slot`, so a Worker can instantiate
-/// a slot's unit it hasn't itself invoked. `0` if the slot is empty or the unit is interpreter-only.
-/// The bytes (via [`temen_par_jit_unit_wasm_by_slot_ptr`]) live in the shared host's heap = shared
-/// linear memory, held for the process, so the returned pointer stays valid.
+/// #1339 — emitted-wasm for the unit `id` ([`temen_par_jit_slot_unit`]'s packed `(domain, unit)`),
+/// so a Worker can instantiate a slot's unit it hasn't itself invoked. `0` if there is no such unit
+/// or it is interpreter-only. The bytes (via [`temen_par_jit_unit_wasm_by_id_ptr`]) live in the
+/// shared host's heap = shared linear memory, held for the process, so the returned pointer stays
+/// valid.
 ///
-/// Resolved through the engine's own slot mirror rather than the guest's (revocable) code handle: the
-/// ordinary `compile → install → release` leaves the unit installed with no live handle, and a
-/// by-handle fetch then came back empty and nulled the slot (`IndirectCallToNull`). The
-/// `temen_coop_jit_wasm_by_slot_len` twin.
+/// Keyed by the unit rather than the guest's (revocable) code handle: the ordinary
+/// `compile → install → release` leaves the unit installed with no live handle, and a by-handle
+/// fetch then came back empty and nulled the slot (`IndirectCallToNull`). And by the unit rather
+/// than its slot (#2259): another Worker can install into the slot between the Worker's reads, and
+/// a by-slot length and pointer then named two units. The `temen_coop_jit_wasm_by_slot_len` twin,
+/// which needs no such guard on its one thread.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_slot_len(slot: u32) -> usize {
-    par_jit_unit_wasm_by_slot(slot).map_or(0, |w| w.len())
+pub extern "C" fn temen_par_jit_unit_wasm_by_id_len(id: i64) -> usize {
+    par_jit_unit_wasm_by_id(id).map_or(0, |w| w.len())
 }
 
-/// Pointer to the emitted-wasm for `slot` (see [`temen_par_jit_unit_wasm_by_slot_len`]).
+/// Pointer to the emitted-wasm for unit `id` (see [`temen_par_jit_unit_wasm_by_id_len`]).
 #[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_slot_ptr(slot: u32) -> *const u8 {
-    par_jit_unit_wasm_by_slot(slot).map_or(core::ptr::null(), |w| w.as_ptr())
+pub extern "C" fn temen_par_jit_unit_wasm_by_id_ptr(id: i64) -> *const u8 {
+    par_jit_unit_wasm_by_id(id).map_or(core::ptr::null(), |w| w.as_ptr())
 }
 
-fn par_jit_unit_wasm_by_slot(slot: u32) -> Option<std::sync::Arc<[u8]>> {
-    let unit = {
-        let v = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-        v.get(slot as usize).copied().flatten()?
-    };
+fn par_jit_unit_wasm_by_id(id: i64) -> Option<std::sync::Arc<[u8]>> {
     let cfg = par_jit_rt()?;
     let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-    g.jit_unit_wasm_or_emit(unit.0, unit.1) // #1301: a thawed unit re-emits here
+    g.jit_unit_wasm_or_emit((id >> 32) as u32, id as u32) // #1301: a thawed unit re-emits here
 }
 
 /// Live-vCPU counter across Workers — the browser path's anti-bomb **backstop** (the native drivers
