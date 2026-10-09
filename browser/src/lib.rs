@@ -975,24 +975,9 @@ pub extern "C" fn temen_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i3
         // single top-level frame — vCPUs enter via `thread.spawn`), so `compile_jit` picks tier-up. `Err`
         // only if the assembler itself rejects the set — treat as "no tier-up" (fail-closed: the guest
         // keeps interpreting).
-        let Ok(temen_wasm_jit::Artifact {
-            wasm,
-            emitted: emit,
-            ..
-        }) = temen_wasm_jit::compile_jit(&m, temen_wasm_jit::Shape::Threaded, true)
-        else {
-            return 0;
-        };
-        let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-        let eligible: Vec<bool> = m
-            .funcs
-            .iter()
-            .enumerate()
-            .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-            .collect();
-        if !eligible.iter().any(|&e| e) {
+        let Some((wasm, eligible)) = threads_tierup(&m) else {
             return 0; // nothing safely tier-up-able → leave everything on the interpreter
-        }
+        };
         // SAFETY: written once per run while CODEGEN_LOCK is held (this closure runs only on the
         // first Worker of the run); Workers then read it stable for the run.
         unsafe {
@@ -1006,6 +991,23 @@ pub extern "C" fn temen_par_enable_jit(mod_ptr: *const u8, mod_len: usize) -> i3
     TIERUP_RESULT.store(result, Ordering::Relaxed);
     TIERUP_DONE_GEN.store(generation, Ordering::Relaxed);
     result
+}
+
+/// A threaded guest's tier-up emit: the module `compile_jit`'s `Threaded` shape emits for `m`, and
+/// for each function whether a direct call to it tiers up — it was emitted, with an all-i64
+/// signature (the i64-slot transport the host marshals by). `None` when no call can tier up, or
+/// the assembler refused the set (fail-closed: the guest interprets).
+fn threads_tierup(m: &temen_ir::Module) -> Option<(Vec<u8>, Vec<bool>)> {
+    let temen_wasm_jit::Artifact { wasm, emitted, .. } =
+        temen_wasm_jit::compile_jit(m, temen_wasm_jit::Shape::Threaded, true).ok()?;
+    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
+    let eligible: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| emitted[i] && all_i64(&f.params) && all_i64(&f.results))
+        .collect();
+    eligible.iter().any(|&e| e).then_some((wasm, eligible))
 }
 
 /// [`temen_par_enable_jit`], but the tier-up module is emitted **paged** (#750,
@@ -2951,20 +2953,125 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 // The native parallel driver (executor 2: a thread per task over the pump's scheduling core) runs a
 // guest whole, in-Rust, from one call, given a way to start a thread and read a clock. Here a thread
 // is a Web Worker the page starts, running a boxed closure out of the one shared memory, and the
-// clock is the page's. The page never blocks, so the run itself starts on a Worker too. Interpreted
-// runs only: a task's emitted tier is #1414 B6-3.
+// clock is the page's. The page never blocks, so the run itself starts on a Worker too. A thread
+// runs its own task's tier-ups on its Worker's instance of the run's tier-up module (#1414 B6-3).
 
-// The two imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
+// The imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
 // `///` on an extern block.)
 // - `x2_spawn(start)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. 0 when the
 //   request is posted; nonzero when this agent cannot start Workers.
 // - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
 //   alike (`performance.timeOrigin + performance.now()`).
+// - `x2_tierup(func, argv, argc, win, mapped, cell, over, out)`: run `f{func}(win, cell, ...argv)`
+//   on this Worker's instance of the run's tier-up module ([`temen_x2_wasm_ptr`]) with `"mapped"`
+//   set, and write its results at `out`. Returns how many, or `-(1 + code)` when it trapped with
+//   `code`. The emitted code's fuel checks look at the byte at `over`, and once it is set the next
+//   one ends the call ([`bytecode::TierUpCall::over`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[link(wasm_import_module = "temen_host")]
 extern "C" {
     fn x2_spawn(start: *mut core::ffi::c_void) -> i32;
     fn x2_now_ms() -> f64;
+    fn x2_tierup(
+        func: u32,
+        argv: *const i64,
+        argc: u32,
+        win: u32,
+        mapped: u64,
+        cell: u32,
+        over: u32,
+        out: *mut i64,
+    ) -> i32;
+}
+
+/// The run's tier-up module, which each Worker instantiates at its first tier-up.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static X2_WASM: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The run's tier-up module ([`X2_WASM`]): its bytes.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_wasm_ptr() -> *const u8 {
+    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).as_ptr()
+}
+
+/// The run's tier-up module ([`X2_WASM`]): its length.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_wasm_len() -> usize {
+    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// A tier-up's call back into the interpreter ([`bytecode::TierUpCall::bounce`]), its lifetime
+/// erased for as long as [`x2_tier_up`] runs the call.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+type X2Bounce = *mut bytecode::Bounce<'static>;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+thread_local! {
+    /// This thread's running tier-up's bounce, for the emitted code's `call_interp`
+    /// ([`temen_x2_call_interp`]).
+    static X2_BOUNCE: std::cell::Cell<Option<X2Bounce>> = const { std::cell::Cell::new(None) };
+    /// The trap the last bounce ended in, which the emitted code unwinds over.
+    static X2_BOUNCE_TRAP: std::cell::Cell<Option<Trap>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run one tier-up on this thread's Worker ([`bytecode::ThreadTier::run`]): `x2_tierup` calls the
+/// emitted function, and its calls back into the interpreter reach the tier-up's bounce through
+/// [`temen_x2_call_interp`]. A trap in a bounce is the call's, else the emitted code's own.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn x2_tier_up(call: &mut bytecode::TierUpCall<'_>) -> Result<(), Trap> {
+    // Enough for any result list the i64-slot transport carries.
+    let mut out = [0i64; temen_wasm_jit::XCALL_MAX_SLOTS];
+    let bounce: *mut bytecode::Bounce<'_> = call.bounce;
+    // SAFETY: only the lifetime is erased, and the pointer is taken back below, before `call`'s
+    // bounce can end.
+    let bounce: X2Bounce = unsafe { std::mem::transmute(bounce) };
+    let outer = X2_BOUNCE.with(|b| b.replace(Some(bounce)));
+    X2_BOUNCE_TRAP.with(|t| t.set(None));
+    // SAFETY: `argv` and `out` are live for the call; `win` and `cell` are this run's.
+    let n = unsafe {
+        x2_tierup(
+            call.func,
+            call.argv.as_ptr(),
+            call.argv.len() as u32,
+            call.win as usize as u32,
+            call.mapped,
+            call.cell as usize as u32,
+            call.over.as_ptr() as usize as u32,
+            out.as_mut_ptr(),
+        )
+    };
+    X2_BOUNCE.with(|b| b.set(outer));
+    if n < 0 {
+        let bounced = X2_BOUNCE_TRAP.with(|t| t.take());
+        return Err(bounced.unwrap_or_else(|| emitted_trap(-(n + 1))));
+    }
+    call.results = out[..n as usize].to_vec();
+    Ok(())
+}
+
+/// The emitted code's call back into the interpreter (`env.call_interp`): function `target`, with
+/// its arguments at `args_ptr` (the call scratch, `XCALL_MAX_SLOTS` i64s) and its results written
+/// back there, over the running tier-up's task. `0` on success; `1` when it trapped.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+    let Some(bounce) = X2_BOUNCE.with(|b| b.get()) else {
+        return 1;
+    };
+    // SAFETY: the emitted code passes its env cell's call scratch, `XCALL_MAX_SLOTS` i64s wide.
+    let io = unsafe {
+        core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
+    };
+    // SAFETY: set by `x2_tier_up` for the emitted call this bounce comes from, which is running.
+    match unsafe { (*bounce)(target, io) } {
+        Ok(_) => 0,
+        Err(t) => {
+            X2_BOUNCE_TRAP.with(|c| c.set(Some(t)));
+            1
+        }
+    }
 }
 
 /// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
@@ -2987,6 +3094,7 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
     },
     // SAFETY: a pure import.
     now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
+    tier: None,
 };
 
 /// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
@@ -2994,8 +3102,9 @@ const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
-    par_install_panic_capture(); // I22: a panic on this thread names its FILE:LINE
-                                 // SAFETY: `start` came from `X2_PLATFORM.spawn`, and the page handed it to this Worker alone.
+    // I22: a panic on this thread names its FILE:LINE.
+    par_install_panic_capture();
+    // SAFETY: `start` came from `X2_PLATFORM.spawn`, and the page handed it to this Worker alone.
     let f = unsafe { Box::from_raw(start) };
     f()
 }
@@ -3009,11 +3118,22 @@ pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
 /// runtime-compile recipe ([`temen_par_powerbox_jit_runtime`]) is refused ([`STATUS_UNSUPPORTED`]):
 /// its unit blobs are staged into a window the page allocates, and this run's is the driver's own.
 ///
+/// With `tierup` set, a module-0 task's calls to the functions the threads tier-up emit takes
+/// ([`threads_tierup`]) run on it, each on its thread's Worker. The emitted code addresses the
+/// root's window as one span, so the window is a flat one of the declared size or `win_size`,
+/// whichever is larger, and it cannot grow past that; without `tierup` it is the driver's own,
+/// which grows on demand.
+///
 /// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
 /// tell the rest, as for [`temen_run_onramp`].
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_start(guest_ptr: *const u8, guest_len: usize) -> i64 {
+pub extern "C" fn temen_x2_start(
+    guest_ptr: *const u8,
+    guest_len: usize,
+    win_size: usize,
+    tierup: i32,
+) -> i64 {
     use std::sync::atomic::Ordering;
     par_install_panic_capture();
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -3053,10 +3173,33 @@ pub extern "C" fn temen_x2_start(guest_ptr: *const u8, guest_len: usize) -> i64 
             }
         }
     };
-    host.set_thread_platform(X2_PLATFORM);
+    let tier = if tierup != 0 {
+        threads_tierup(&m)
+    } else {
+        None
+    };
+    let mut back = None;
+    let mut platform = X2_PLATFORM;
+    if let Some((wasm, eligible)) = tier {
+        let declared = m.memory.map_or(0, |mc| 1usize << mc.size_log2);
+        let page = temen_interp::host_page_size();
+        let Some(flat) = temen_interp::Region::owned_zeroed(declared.max(win_size) as u64, page)
+        else {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        };
+        back = Some(std::sync::Arc::new(flat));
+        *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = wasm;
+        platform.tier = Some(bytecode::ThreadTier {
+            eligible: eligible.into(),
+            cell_bytes: temen_wasm_jit::ENV_CELL_BYTES,
+            run: x2_tier_up,
+        });
+    }
+    host.set_thread_platform(platform);
     let mut fuel = DEFAULT_FUEL;
     let ran = bytecode::compile_and_run_capture_over_parallel_with_host(
-        &m, 0, &args, &mut fuel, &init, None, &mut host,
+        &m, 0, &args, &mut fuel, &init, back, &mut host,
     );
     if let Some(io) = io {
         *io.host.lock().unwrap_or_else(|e| e.into_inner()) = host;

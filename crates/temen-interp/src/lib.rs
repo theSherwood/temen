@@ -30920,7 +30920,7 @@ impl Host {
 
     /// How the parallel driver starts this run's threads and reads its clock.
     pub(crate) fn thread_platform(&self) -> bytecode::ThreadPlatform {
-        self.thread_platform
+        self.thread_platform.clone()
     }
 
     pub(crate) fn wire_park_door(&self) {

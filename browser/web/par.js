@@ -70,6 +70,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
       // page, which cannot block — so the page starts no thread of its own.
       x2_spawn: () => -1,
       x2_now_ms: () => performance.timeOrigin + performance.now(),
+      x2_tierup: () => -1,
     },
   };
   const { exports: ex } = await WebAssembly.instantiate(module, importObj);
@@ -97,8 +98,9 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               isn't seeded by a previous run's recipe;
 //   `x2`      ⇒ run on the **parallel driver** (executor 2, #1414 B6) instead of a `Vcpu` per Worker:
 //               the whole run is one in-Rust call on the root's Worker, each of its threads a Worker
-//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, none). It runs
-//               interpreted, so it takes none of the emitted-tier options;
+//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, none). Of the
+//               emitted-tier options it takes `tierup` (each thread runs its task's tier-ups on its
+//               own Worker, over a window of `winSize` that cannot grow) and refuses the rest;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
 //   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
@@ -109,8 +111,8 @@ export function makeRunner({ module, memory, ex }) {
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], x2 = false } = {}) {
-    if (x2 && (jitCodegen || instCodegen || tierup || jitB2 || jitRuntime || jitRuntimeCodegen)) {
-      throw new Error('the parallel driver runs interpreted: no emitted-tier options (#1414 B6-3)');
+    if (x2 && (jitCodegen || instCodegen || jitB2 || jitRuntime || jitRuntimeCodegen)) {
+      throw new Error('the parallel driver tiers up regions only, for now (#1414 B6-3b, B6-3c)');
     }
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);

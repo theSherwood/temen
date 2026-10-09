@@ -2229,6 +2229,10 @@ fn main() {
             "live_caller",
             include_str!("../../crates/temen-interp/tests/fixtures/live_caller.temt"),
         ),
+        (
+            "root_leaves_a_spinner",
+            include_str!("../../crates/temen-interp/tests/fixtures/root_leaves_a_spinner.temt"),
+        ),
     ] {
         emit(name, src);
     }

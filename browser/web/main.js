@@ -162,10 +162,16 @@ async function main() {
     }
     const dl = await runPath('/corpus/join_a_forever_waiter.temenc', x2).then(() => 'no trap', (e) => e.message);
     const sv = await runPath('/corpus/live_caller.temenc', { ...x2, inst: true, winSize: 1 << 17, minter: 1 << 20 });
+    // #1414 B6-3: each thread runs its task's tier-ups on its own Worker — the `tierup` kernel's 8
+    // workers each call the emitted leaf once. Then a root that returns while its thread counts
+    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns.
+    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true });
+    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true });
     const ms = (performance.now() - t0).toFixed(0);
     const ok = th.value === 4000n && jt.value === 1136n && io.value === 8n && out === 'tick\n'.repeat(8) &&
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
-      fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n;
+      fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
+      tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1;
     set('x2', ok ? 'pass' : 'fail',
       `x2: threads ${th.value} (want 4000) across ${th.started} Workers · jit ${jt.value} (want 1136) · ` +
       `io ${io.value} (want 8), stdout ${JSON.stringify(out)} · on-ramp exit ${r.exit} (want 7), letters ` +
@@ -173,6 +179,8 @@ async function main() {
       `${JSON.stringify(ct)} (want DivByZero) · ` +
       fibers.map((f) => `${f.name} ${f.got}${f.ok ? '' : ` (want ${f.want})`}`).join(' · ') +
       ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
+      `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
+      `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) ` +
       `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`x2 → threads ${th.value} across ${th.started} Workers in ${ms}ms`);
   } catch (e) {

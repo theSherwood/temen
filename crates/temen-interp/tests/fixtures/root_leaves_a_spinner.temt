@@ -1,0 +1,38 @@
+memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  va = i64.const 16392
+  vf = i64.atomic.load va
+  vzero = i64.const 0
+  vw = i64.eq vf vzero
+  br_if vw 1() 2()
+}
+block 2 () {
+  vr = i64.const 42
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vc = call 2 (varg)
+  return vc
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 16392
+  v1 = i64.const 1
+  i64.store va v1
+  br 1(v0)
+}
+block 1 (v2: i64) {
+  v3 = i64.const 1
+  v4 = i64.add v2 v3
+  br 1(v4)
+  }
+}

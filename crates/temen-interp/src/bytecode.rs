@@ -14379,6 +14379,15 @@ fn settle_wakes(
 }
 
 impl SchedCore {
+    /// #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
+    /// call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
+    /// gate). `thread.spawn` children inherit the bitmap in the `Spawn` rule (same-module only).
+    fn arm_tierup(&mut self, eligible: &std::sync::Arc<[bool]>, page_checked: bool) {
+        let root = &mut self.tasks[0].vm.vt.active;
+        root.jit_eligible = Some(std::sync::Arc::clone(eligible));
+        root.jit_page_checked = page_checked;
+    }
+
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge.
     /// Both executors start a run here ([`CoopSched::new`], [`drive_threads`]).
@@ -14512,12 +14521,8 @@ impl CoopSched {
             (Some(t.eligible), t.page_checked, t.leaf)
         });
         let mut core = SchedCore::new(dom, entry, args, fuel, mem.as_ref(), host)?;
-        // #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
-        // call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
-        // gate). `thread.spawn` children inherit the bitmap in `pump`'s `Spawn` arm (same-module only).
         if let Some(e) = &eligible {
-            core.tasks[0].vm.vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
-            core.tasks[0].vm.vt.active.jit_page_checked = page_checked;
+            core.arm_tierup(e, page_checked);
         }
         Ok(CoopSched {
             core,
@@ -17142,6 +17147,9 @@ struct Threads {
     live: usize,
     /// Whether one of them panicked: the run then ends, and its caller panics.
     panicked: bool,
+    /// The emitted tier's state the rules read ([`SchedCore::on_stop`]): the eligibility the
+    /// spawns hand their children, when the platform has a tier ([`ThreadTier`]).
+    emit: EmitTier,
 }
 
 impl Threads {
@@ -17168,28 +17176,78 @@ struct ThreadRun {
     start: u64,
     bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
     ended: std::sync::Condvar,
+    /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
+    /// ([`TierUpCall::over`]).
+    over: std::sync::atomic::AtomicBool,
 }
 
-/// How executor 2, the parallel driver, starts a run's threads and reads its clock (#1414 B6). A
-/// run uses the OS's ([`ThreadPlatform::OS`]) unless its host was handed another
-/// ([`Host::set_thread_platform`]): a browser starts a thread as a Web Worker, and wasm32 has no
-/// clock of its own.
-#[derive(Clone, Copy)]
+/// How executor 2, the parallel driver, starts a run's threads, reads its clock, and runs its emitted
+/// tier (#1414 B6). A run uses the OS's ([`ThreadPlatform::OS`]) unless its host was handed another
+/// ([`Host::set_thread_platform`]): a browser starts a thread as a Web Worker, wasm32 has no clock
+/// of its own, and a browser's threads can run emitted wasm.
+#[derive(Clone)]
 pub struct ThreadPlatform {
     /// Start `f` on a thread of its own, which nothing joins. An error refuses the thread.
     pub spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
     pub now_ns: fn() -> u64,
+    /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
+    pub tier: Option<ThreadTier>,
 }
 
 impl ThreadPlatform {
-    /// An OS thread per task (D56), and the process-wide monotonic clock the pump's busy-poll
-    /// deadlines use.
+    /// An OS thread per task (D56), the process-wide monotonic clock the pump's busy-poll deadlines
+    /// use, and no emitted tier.
     pub const OS: ThreadPlatform = ThreadPlatform {
         spawn: |f| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
+        tier: None,
     };
 }
+
+/// The emitted tier on the parallel driver (#1414 B6-3): which calls tier up, and how a thread runs
+/// one itself, where its task stopped.
+#[derive(Clone)]
+pub struct ThreadTier {
+    /// Per-module-0-function eligibility, as the pump's ([`TierUpConfig::eligible`]): a module-0
+    /// task's direct call to an eligible function runs on the emitted tier.
+    pub eligible: std::sync::Arc<[bool]>,
+    /// The size of a thread's env cell, the emitted code's per-thread scratch ([`TierUpCall::cell`]).
+    pub cell_bytes: usize,
+    /// Run one tier-up, on the calling thread. Once the run is over ([`TierUpCall::over`]) it
+    /// returns by the emitted code's next fuel check, whatever it returns: the run waits for its
+    /// thread.
+    pub run: fn(&mut TierUpCall<'_>) -> Result<(), Trap>,
+}
+
+/// One tier-up a thread runs ([`ThreadTier::run`]): module-0 function `func` on the emitted tier,
+/// over its task's window.
+pub struct TierUpCall<'a> {
+    pub func: u32,
+    /// The arguments, as raw i64 slots.
+    pub argv: &'a [i64],
+    /// The window's committed extent, the emitted `"mapped"` global (#717).
+    pub mapped: u64,
+    /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
+    pub win: *const u8,
+    /// This thread's env cell ([`ThreadTier::cell_bytes`]), zeroed when the thread made it.
+    pub cell: *mut u8,
+    /// Set once the run is over. Emitted code still running then stops at its next fuel check.
+    pub over: &'a std::sync::atomic::AtomicBool,
+    /// The results, as raw i64 slots: `run` fills them.
+    pub results: Vec<i64>,
+    /// A call out of the emitted code back into the interpreter ([`Bounce`]).
+    pub bounce: &'a mut Bounce<'a>,
+}
+
+/// A call out of a tier-up's emitted code back into the interpreter (`env.call_interp`): function
+/// `target` of the task's dispatch table, its arguments in `io` and its results written back over
+/// them, run over the task's live window and powerbox. Returns how many results it wrote.
+pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
+
+/// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
+/// a loop of calls that each tier up never spends a quantum.
+const TIERUP_LOOK: u32 = 1024;
 
 /// A thread's last act on executor 2, as it returns or unwinds: it counts itself out of the run
 /// ([`Threads::live`]), after every other local of its own (its fuel hand, its window view) has
@@ -17246,7 +17304,8 @@ enum ParkFor {
 /// armed external-wake bell has a watcher that settles the run on each ring ([`ThreadRun::watch`]);
 /// and the run ends when its root does, the other tasks stopping at their next look, or with the
 /// pump's deadlock verdict ([`ThreadRun::settle`]). It returns once every thread has gone
-/// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`].
+/// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`],
+/// and with the platform's emitted tier each thread runs its own task's tier-ups ([`ThreadRun::step`]).
 fn drive_threads(
     dom: Domain,
     entry: FuncIdx,
@@ -17259,7 +17318,7 @@ fn drive_threads(
     // #1944 slice 3 — an activation of `host`: every thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
     let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
-    let core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
+    let mut core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
         Ok(core) => core,
         Err(t) => {
             drop(root_fuel);
@@ -17269,6 +17328,13 @@ fn drive_threads(
     };
     let bell = host.external_wake();
     let platform = host.thread_platform();
+    let eligible = platform
+        .tier
+        .as_ref()
+        .map(|t| std::sync::Arc::clone(&t.eligible));
+    if let Some(e) = &eligible {
+        core.arm_tierup(e, false);
+    }
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
@@ -17282,11 +17348,16 @@ fn drive_threads(
             fault: None,
             live: 1, // the root's, on this thread
             panicked: false,
+            emit: EmitTier {
+                eligible,
+                ..EmitTier::default()
+            },
         }),
-        platform,
         start: (platform.now_ns)(),
+        platform,
         bell,
         ended: std::sync::Condvar::new(),
+        over: std::sync::atomic::AtomicBool::new(false),
     });
     let (view, hand) = run.state.lock_unpoisoned().hand(None);
     if let Some(bell) = run.bell.clone() {
@@ -17347,6 +17418,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     let mut look = true;
     // The task's VM while its thread steps it; the slot holds this empty one meanwhile.
     let mut vm: Box<TaskVm> = Box::default();
+    // The thread's env cell for the emitted tier ([`TierUpCall::cell`]), made at its first tier-up.
+    let mut cell = None;
     'run: loop {
         loop {
             if g.over.is_some() {
@@ -17377,15 +17450,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             durable: false,
             host: HostCell::Shared(&host),
         };
-        let stop = step_vcpu(
-            &mut vm.vt,
-            &mut FiberCell::Core(&run.state, env),
-            &run.dom,
-            &mut ctx,
-            COOP_QUANTUM,
-            true, // a blocking `cont.resume` idles the task on the fiber (I48)
-            true, // the quantum is the thread's look at the run: a kill, or the run's end
-        );
+        let stop = run.step(&mut vm, env, &mut ctx, &mut cell);
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
             _ => None,
@@ -17424,6 +17489,109 @@ fn release(mut g: std::sync::MutexGuard<'_, Threads>) {
 }
 
 impl ThreadRun {
+    /// Step task VM `vm`, of domain `env`, until a stop for the rules. A tier-up runs on this
+    /// thread, on the platform's emitted tier ([`ThreadTier`]), and the step goes on; after
+    /// [`TIERUP_LOOK`] of them in a row the thread stops to look at the run, as a preemption makes
+    /// it.
+    fn step(
+        &self,
+        vm: &mut TaskVm,
+        env: Option<usize>,
+        ctx: &mut RunCtx,
+        cell: &mut Option<Box<[u64]>>,
+    ) -> Result<VcpuStop, Trap> {
+        let mut fibers = FiberCell::Core(&self.state, env);
+        for _ in 0..TIERUP_LOOK {
+            match step_vcpu(
+                &mut vm.vt,
+                &mut fibers,
+                &self.dom,
+                ctx,
+                COOP_QUANTUM,
+                true, // a blocking `cont.resume` idles the task on the fiber (I48)
+                true, // the quantum is the thread's look at the run: a kill, or the run's end
+            ) {
+                Ok(VcpuStop::TierUp {
+                    func,
+                    argv,
+                    dst,
+                    results,
+                    mapped,
+                }) => {
+                    // Only a tier arms the eligibility a tier-up needs.
+                    let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+                    let vals = self.tier_up(tier, cell, &mut fibers, ctx, func, &argv, mapped)?;
+                    // A short reply is malformed, as the pump's `deliver_tierup` has it.
+                    if vals.len() < results.len() {
+                        return Err(Trap::Malformed);
+                    }
+                    set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                }
+                stop => return stop,
+            }
+        }
+        Ok(VcpuStop::Preempted)
+    }
+
+    /// Run one tier-up on this thread ([`ThreadTier::run`]), over the task's window and the
+    /// thread's env cell. Its calls back into the interpreter run over the task's live window,
+    /// powerbox and table, with their fibers in the run's registry, as the pump's do.
+    #[allow(clippy::too_many_arguments)]
+    fn tier_up(
+        &self,
+        tier: &ThreadTier,
+        cell: &mut Option<Box<[u64]>>,
+        fibers: &mut FiberCell,
+        ctx: &mut RunCtx,
+        func: u32,
+        argv: &[i64],
+        mapped: u64,
+    ) -> Result<Vec<i64>, Trap> {
+        // Words, so the scratch is 8-aligned.
+        let cell = cell.get_or_insert_with(|| vec![0; tier.cell_bytes.div_ceil(8)].into());
+        // A tier-up surfaces only over a window with a flat span, or none at all.
+        let win = match ctx.mem.as_ref() {
+            None => std::ptr::null(),
+            Some(m) => m.flat_win_base().ok_or(Trap::Malformed)?,
+        };
+        let RunCtx {
+            table,
+            fuel,
+            mem,
+            host,
+            ..
+        } = ctx;
+        let mut bounce = |target: u32, io: &mut [i64]| {
+            let run_level = BounceRunCtx {
+                jit_mirror: None,
+                park: None,
+            };
+            coop_bounce(
+                &self.dom.source,
+                table,
+                fuel,
+                mem,
+                host,
+                fibers,
+                Some(run_level),
+                target,
+                io,
+                None,
+            )
+        };
+        let mut call = TierUpCall {
+            func,
+            argv,
+            mapped,
+            win,
+            cell: cell.as_mut_ptr().cast(),
+            over: &self.over,
+            results: Vec::new(),
+            bounce: &mut bounce,
+        };
+        (tier.run)(&mut call).map(|()| call.results)
+    }
+
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
     fn ring(&self) {
         if let Some(bell) = &self.bell {
@@ -17438,9 +17606,18 @@ impl ThreadRun {
         (self.platform.now_ns)().saturating_sub(self.start)
     }
 
+    /// End the run with `res`, unless it is over already. Every thread stops at its next look, and
+    /// emitted code at its next fuel check ([`TierUpCall::over`]).
+    fn conclude(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
+        if g.over.is_none() {
+            g.over = Some(res);
+            self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     /// End the run with `ThreadFault` (if it is not over already) and wake every thread to see it.
     fn end(&self, g: &mut Threads) {
-        g.over.get_or_insert(Err(Trap::ThreadFault));
+        self.conclude(g, Err(Trap::ThreadFault));
         g.woken = g.parks.clone();
     }
 
@@ -17471,22 +17648,24 @@ impl ThreadRun {
         let had = g.core.tasks.len();
         g.core.clock = self.now();
         let Threads {
-            core, mem, fuel, ..
-        } = &mut *g;
-        // This executor has no emitted tier: the rules see an inert one, so none pauses for a host.
-        let step = core.on_stop(
-            &mut EmitTier::default(),
-            &self.dom,
+            core,
             mem,
-            &self.root,
             fuel,
-            ti,
-            stop,
-        );
-        debug_assert!(
-            step.is_none(),
-            "executor 2 has no emitted tier to pause for"
-        );
+            emit,
+            ..
+        } = &mut *g;
+        // A thread runs its own task's tier-ups ([`ThreadRun::step`]), so no tier-up reaches the
+        // rules. What else could pause for a host is an emitted §22 invoke, which surfaces only for
+        // a host with a unit emitter; this executor's are given none yet (#1414 B6-3b), so one that
+        // surfaces anyway fails closed.
+        if core
+            .on_stop(emit, &self.dom, mem, &self.root, fuel, ti, stop)
+            .is_some()
+        {
+            debug_assert!(false, "executor 2 cannot run an emitted §22 invoke yet");
+            emit.pending_jit = None;
+            complete(&mut core.tasks, ti, Err(Trap::CapFault));
+        }
         if self.missed_wake(&g.core, ti, exits) {
             g.core.tasks[ti].state = TaskState::Runnable;
         }
@@ -17539,8 +17718,9 @@ impl ThreadRun {
         if g.over.is_some() {
             return;
         }
-        if let TaskState::Done(res) = &core.tasks[0].state {
-            g.over = Some(res.clone());
+        let core = &g.core;
+        let over = if let TaskState::Done(res) = &core.tasks[0].state {
+            Some(res.clone())
         } else if self.idle(core) {
             let external = core.tasks.iter().any(|t| {
                 matches!(
@@ -17550,9 +17730,13 @@ impl ThreadRun {
                         | TaskState::BlockedStdin
                 )
             });
-            if !external || self.root.lock_unpoisoned().external_wake().is_none() {
-                g.over = Some(Err(Trap::ThreadFault));
-            }
+            (!external || self.root.lock_unpoisoned().external_wake().is_none())
+                .then_some(Err(Trap::ThreadFault))
+        } else {
+            None
+        };
+        if let Some(res) = over {
+            self.conclude(g, res);
         }
     }
 
@@ -18998,8 +19182,13 @@ impl Vm {
                         // #750 paged tier: the emitted code carries a per-access page check, so an
                         // unrepresentable window must NOT decline — surface with the reserved size
                         // (the bound must never under-admit a page the driver's table admits).
+                        //
+                        // #1414 B6-3: the emitted code addresses the window as one flat span
+                        // (`win + addr`), so a window backed without one (`Sparse`, `Paged`,
+                        // `Foreign`) declines whatever its page state.
                         let extent = match mem.as_ref() {
                             None => Some(0),
+                            Some(m) if m.flat_win_base().is_none() => None,
                             Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                             Some(m) => m.scalar_extent(),
                         };
