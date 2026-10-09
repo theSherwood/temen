@@ -409,11 +409,11 @@ pub(crate) fn drive_op13<'p>(
             bytecode::VcpuEvent::JitInstall { handle, code } => {
                 let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
                     .map(|(f, t, _wasm, id)| (f, t, id));
-                let _ = vcpu.deliver_jit_install(unit);
+                vcpu.deliver_jit_install(unit);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
                 let authorized = vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
-                let _ = vcpu.deliver_jit_uninstall(authorized);
+                vcpu.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
                 let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)

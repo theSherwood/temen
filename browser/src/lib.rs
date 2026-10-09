@@ -1577,10 +1577,7 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
     let io = unsafe {
         core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
     };
-    // A §14 child's installs stay in its OWN dispatch table (#1296), so it lends no mirror —
-    // publishing them into the root's `PAR_JIT_SLOT_UNIT` would put the child's units in the parent's
-    // `call.dyn` slots. The root's twin is [`temen_par_root_call_interp`].
-    match v.inner.bounce_call(func, io, None) {
+    match v.inner.bounce_call(func, io) {
         Ok(_) => {
             if temen_par_inst_paged() == 1 {
                 inst_sync_pagestate(v);
@@ -1639,37 +1636,6 @@ pub extern "C" fn temen_par_inst_join(v: *mut ParVcpu, handle: i32) -> i64 {
 pub extern "C" fn temen_par_inst_end_join(v: *mut ParVcpu) {
     // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
     unsafe { (*v).inner.end_join() }
-}
-
-/// #1339 — [`temen_par_inst_call_interp`]'s **root** twin: service one `env.call_interp(func, …)`
-/// bounce on the ROOT vCPU, lending the process-global §22 slot mirror for the duration. A guest
-/// whose *emitted* frame defines and dispatches units (Forth's outer interpreter) reaches
-/// `Jit.install`/`uninstall` inside the bounce; the engine services it (`drive_nested`, #1233) and
-/// writes the mirror through, so the Worker rebuilds an exact table before the emitted frame resumes
-/// — the coop driver's post-bounce `syncTableSync` twin. The Worker picks this entry point by role
-/// (`role === 'root'`), so a child can never reach the root mirror by accident.
-#[no_mangle]
-pub extern "C" fn temen_par_root_call_interp(v: *mut ParVcpu, func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: `v` is a live root `ParVcpu` owned by this Worker; the host passes the env scratch, at
-    // least `XCALL_MAX_SLOTS` 8-aligned i64 slots wide (`temen_wasmjit_env_bytes`).
-    let v = unsafe { &mut *v };
-    let io = unsafe {
-        core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
-    };
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    let mirror = bytecode::JitMirror {
-        units: &mut units,
-        gen: &mut gen,
-    };
-    match v.inner.bounce_call(func, io, Some(mirror)) {
-        Ok(_) => {
-            if temen_par_inst_paged() == 1 {
-                inst_sync_pagestate(v);
-            }
-            0
-        }
-        Err(_) => 1,
-    }
 }
 
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
@@ -1871,64 +1837,9 @@ fn par_resolve_unit_rt(
 > {
     // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
     let (funcs, types, (cd, cu)) = h.resolve_jit_unit(handle, code)?;
-    // #1339: `(cd, cu)` rides back for the slot mirror (the handle is revocable, the index is not).
+    // #1339: `(cd, cu)` rides back for an install, which records it in the table (the handle is
+    // revocable, the unit is not).
     Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu), (cd, cu))) // #1301: a thawed unit re-emits here
-}
-
-/// §22 **Model B2 cross-Worker** mirror registry: `slot → the `(domain, unit)` installed there` (or
-/// `None` empty), shared across every Worker (one arena / one set of statics behind the shared
-/// memory). The shared interpreter `Domain` dispatch table is atomics-in-memory but has no
-/// slot→emitted-wasm link; this records it wherever an `install`/`uninstall` is serviced so a Worker
-/// can rebuild its own `WebAssembly.Table` from `(slot → unit → temen_par_jit_unit_wasm_by_slot)`.
-/// Sized lazily to the grant reservation `1 << PAR_JIT_TABLE_LOG2`.
-///
-/// #1339: the key is the **unit index, not the code handle** — the coop driver's
-/// `CoopSched::slot_units` twin, and for the same reason: a handle is guest-revocable and
-/// `compile → install → release` is the ordinary pattern, so a handle-keyed mirror lost every
-/// released unit at the next table rebuild and nulled a live slot (`IndirectCallToNull`).
-static PAR_JIT_SLOT_UNIT: std::sync::Mutex<Vec<Option<(u32, u32)>>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// #1339: the generation of [`PAR_JIT_SLOT_UNIT`], bumped on every install/uninstall so a Worker
-/// rebuilds its table only when the mirror moved (the coop driver's `table_gen` twin). A `u32` behind
-/// the same lock as the mirror, so a Worker that reads both sees a consistent pair.
-static PAR_JIT_TABLE_GEN: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
-
-/// The locked halves of the par slot mirror, held for the lifetime of a [`bytecode::JitMirror`]
-/// borrowed from them (see [`par_jit_mirror_guards`]).
-type ParJitMirrorGuards = (
-    std::sync::MutexGuard<'static, Vec<Option<(u32, u32)>>>,
-    std::sync::MutexGuard<'static, u32>,
-);
-
-/// Lock the process-global par mirror, sized to the grant reservation, as a [`bytecode::JitMirror`]
-/// the engine can write through — the lending shape [`bytecode::Vcpu::bounce_call`] takes so a §22
-/// install reached from an *emitted* frame moves the mirror before that frame resumes (#1339).
-/// The two guards must outlive the borrow, so the caller holds them.
-fn par_jit_mirror_guards() -> ParJitMirrorGuards {
-    let mut units = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-    let need = 1usize << PAR_JIT_TABLE_LOG2;
-    if units.len() < need {
-        units.resize(need, None);
-    }
-    let gen = PAR_JIT_TABLE_GEN.lock().unwrap_or_else(|e| e.into_inner());
-    (units, gen)
-}
-
-fn par_jit_slot_record(slot: usize, unit: (u32, u32)) {
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    if let Some(e) = units.get_mut(slot) {
-        *e = Some(unit);
-    }
-    *gen = gen.wrapping_add(1);
-}
-
-fn par_jit_slot_clear(slot: usize) {
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    if let Some(e) = units.get_mut(slot) {
-        *e = None;
-    }
-    *gen = gen.wrapping_add(1);
 }
 
 /// When on, the runtime-`Jit.compile` emitter emits **Model B2** units (importing the shared reserved
@@ -1955,27 +1866,25 @@ pub extern "C" fn temen_par_jit_table_log2() -> u32 {
     PAR_JIT_TABLE_LOG2 as u32
 }
 
-/// #1339 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
-/// `domain << 32 | unit` (`-1` empty): the mirror map a Worker reads to rebuild its per-Worker
+/// #1339 — the `(domain, unit)` installed at `slot` of `v`'s dispatch table, packed
+/// `domain << 32 | unit` (`-1` empty): what a Worker reads to rebuild its per-Worker
 /// `WebAssembly.Table` (§22 B2 cross-Worker), and the key it fetches the slot's emitted wasm by
-/// ([`temen_par_jit_unit_wasm_by_slot_len`]). The `temen_coop_slot_unit` twin: keyed on the unit
-/// index rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
+/// ([`temen_par_jit_unit_wasm_by_slot_len`]). The `temen_coop_slot_unit` twin: it names the unit
+/// rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_slot_unit(slot: u32) -> i64 {
-    let v = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-    v.get(slot as usize)
-        .copied()
-        .flatten()
-        .map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
+pub extern "C" fn temen_par_jit_slot_unit(v: *mut ParVcpu, slot: u32) -> i64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.slot_unit(slot) }.map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
 }
 
-/// #1339 — the generation of the slot mirror, bumped on each §22 install/uninstall (the coop driver's
-/// `temen_coop_table_gen` twin). A Worker caches the generation it last rebuilt its `WebAssembly.Table`
-/// at and rebuilds only when this advances — including after a bounce, whose callback may have
-/// installed from an emitted frame.
+/// #1339 — the generation of `v`'s dispatch table, which moves with every §22 install and uninstall
+/// (the coop driver's `temen_coop_table_gen` twin). A Worker caches the generation it last rebuilt
+/// its `WebAssembly.Table` at and rebuilds only when this moves — including after a bounce, whose
+/// callback may have installed from an emitted frame.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_table_gen() -> u32 {
-    *PAR_JIT_TABLE_GEN.lock().unwrap_or_else(|e| e.into_inner())
+pub extern "C" fn temen_par_jit_table_gen(v: *mut ParVcpu) -> u32 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.table_gen() }
 }
 
 /// #1347: the run program's function count — the dispatch table's **natural prefix** (`slot i <
@@ -2039,26 +1948,24 @@ pub extern "C" fn temen_par_shim_wasm_ptr(slot: u32) -> *const u8 {
 /// The bytes (via [`temen_par_jit_unit_wasm_by_slot_ptr`]) live in the shared host's heap = shared
 /// linear memory, held for the process, so the returned pointer stays valid.
 ///
-/// Resolved through the engine's own slot mirror rather than the guest's (revocable) code handle: the
+/// Resolved through `v`'s dispatch table rather than the guest's (revocable) code handle: the
 /// ordinary `compile → install → release` leaves the unit installed with no live handle, and a
 /// by-handle fetch then came back empty and nulled the slot (`IndirectCallToNull`). The
 /// `temen_coop_jit_wasm_by_slot_len` twin.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_slot_len(slot: u32) -> usize {
-    par_jit_unit_wasm_by_slot(slot).map_or(0, |w| w.len())
+pub extern "C" fn temen_par_jit_unit_wasm_by_slot_len(v: *mut ParVcpu, slot: u32) -> usize {
+    par_jit_unit_wasm_by_slot(v, slot).map_or(0, |w| w.len())
 }
 
 /// Pointer to the emitted-wasm for `slot` (see [`temen_par_jit_unit_wasm_by_slot_len`]).
 #[no_mangle]
-pub extern "C" fn temen_par_jit_unit_wasm_by_slot_ptr(slot: u32) -> *const u8 {
-    par_jit_unit_wasm_by_slot(slot).map_or(core::ptr::null(), |w| w.as_ptr())
+pub extern "C" fn temen_par_jit_unit_wasm_by_slot_ptr(v: *mut ParVcpu, slot: u32) -> *const u8 {
+    par_jit_unit_wasm_by_slot(v, slot).map_or(core::ptr::null(), |w| w.as_ptr())
 }
 
-fn par_jit_unit_wasm_by_slot(slot: u32) -> Option<std::sync::Arc<[u8]>> {
-    let unit = {
-        let v = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-        v.get(slot as usize).copied().flatten()?
-    };
+fn par_jit_unit_wasm_by_slot(v: *mut ParVcpu, slot: u32) -> Option<std::sync::Arc<[u8]>> {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    let unit = unsafe { (*v).inner.slot_unit(slot) }?;
     let cfg = par_jit_rt()?;
     let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
     g.jit_unit_wasm_or_emit(unit.0, unit.1) // #1301: a thawed unit re-emits here
@@ -2585,9 +2492,9 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::JitInstall { handle, code } => {
                 // Resolve the unit via whichever powerbox this run holds — fixed-unit (`par_pb`) or
                 // runtime-compile (`par_jit_rt`). Both surface a `JitInstall` event; the runtime path
-                // was previously unwired here (it would trap). The filled slot is recorded per code
-                // handle so each Worker can mirror the shared `Domain` into its own `WebAssembly.Table`
-                // (§22 Model B2 cross-Worker — funcrefs can't cross Workers).
+                // was previously unwired here (it would trap). Each Worker mirrors the shared
+                // `Domain`'s table into its own `WebAssembly.Table` (§22 Model B2 cross-Worker —
+                // funcrefs can't cross Workers), from `temen_par_jit_slot_unit`.
                 let resolved = if let Some(pb) = par_pb() {
                     pb.host.resolve_jit_unit(handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
@@ -2596,13 +2503,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 } else {
                     return PAR_TRAP;
                 };
-                let unit_id = resolved.as_ref().ok().map(|&(_, _, id)| id);
-                if let Some(slot) = v.inner.deliver_jit_install(resolved) {
-                    // #1339: mirror the unit identity, not the (revocable) code handle.
-                    if let Some(id) = unit_id {
-                        par_jit_slot_record(slot, id);
-                    }
-                }
+                v.inner.deliver_jit_install(resolved);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
                 let authorized = if let Some(pb) = par_pb() {
@@ -2613,9 +2514,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 } else {
                     return PAR_TRAP;
                 };
-                if let Some(slot) = v.inner.deliver_jit_uninstall(authorized) {
-                    par_jit_slot_clear(slot); // keep each Worker's table mirror exact (stale call traps)
-                }
+                v.inner.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke {
                 handle,
@@ -13906,10 +13805,10 @@ struct CoopTierupRun {
     jit_param_types: Vec<u8>,
     jit_result_types: Vec<u8>,
     /// #926 slice 2f — the B2 driver-table state (the twin of `TierupRun`'s). `sigs[i]` is program
-    /// function `i`'s signature (the shim generator's source for a slot in the natural prefix); the
-    /// slot→code mirror itself lives on the engine's `CoopSched` (read via [`bytecode::CoopRun::slot_code`],
-    /// since coop `Jit.install` happens inside the pump). `shim_wasm`/`jit_wasm_by_handle` each hold the
-    /// last generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
+    /// function `i`'s signature (the shim generator's source for a slot in the natural prefix); what
+    /// each other slot holds is the run's own dispatch table (read via
+    /// [`bytecode::CoopRun::slot_unit`]). `shim_wasm`/`jit_wasm_by_handle` each hold the last
+    /// generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
     sigs: Vec<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)>,
     shim_wasm: Vec<u8>,
     jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
@@ -15002,9 +14901,8 @@ pub extern "C" fn temen_coop_pagestate_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
-/// #1009: the dispatch-table generation — bumped on each §22 install/uninstall the coop scheduler
-/// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
-/// advances (a §22 install/uninstall).
+/// #1009: the root's dispatch-table generation, which moves with every §22 install and uninstall
+/// into it. The driver rebuilds its `WebAssembly.Table` only when this moves.
 #[no_mangle]
 pub extern "C" fn temen_coop_table_gen() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
@@ -15342,8 +15240,8 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
 /// #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
 /// `domain << 32 | unit` (`-1` empty/natural): the key the host caches an installed slot's emitted
 /// unit by, and fetches its wasm through ([`temen_coop_jit_wasm_by_slot_len`]). Unlike the code
-/// handle ([`temen_coop_slot_code`]) it survives the guest's `Jit.release` of that handle — the
-/// ordinary compile → install → release pattern leaves the unit installed with no live handle.
+/// handle it survives the guest's `Jit.release` of that handle — the ordinary compile → install →
+/// release pattern leaves the unit installed with no live handle.
 #[no_mangle]
 pub extern "C" fn temen_coop_slot_unit(slot: u32) -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(-1, |s| {
@@ -15354,8 +15252,8 @@ pub extern "C" fn temen_coop_slot_unit(slot: u32) -> i64 {
 }
 
 /// Emitted-wasm length for the unit installed at dispatch-table `slot` (`0` if the slot is empty or
-/// the unit is interpreter-only) — the table rebuild's fetch, resolved through the engine's own slot
-/// mirror rather than the guest's (revocable) code handle, so a released-after-install unit still
+/// the unit is interpreter-only) — the table rebuild's fetch, resolved through the run's dispatch
+/// table rather than the guest's (revocable) code handle, so a released-after-install unit still
 /// rebuilds (#1233). Bytes via [`temen_coop_jit_wasm_by_handle_ptr`] (the shared buffer), valid
 /// until the next call of either accessor.
 #[no_mangle]
@@ -15387,7 +15285,7 @@ pub extern "C" fn temen_coop_shim_wasm(slot: u32) -> usize {
     let sig = if (slot as usize) < s.sigs.len() {
         Some(s.sigs[slot as usize].clone())
     } else {
-        // #1339: resolve the occupant through the slot mirror's `(domain, unit)`, never the §22 code
+        // #1339: resolve the occupant through the table's `(domain, unit)`, never the §22 code
         // handle — the guest's `release` right after `install` would otherwise leave an installed
         // interpreter-only unit with no shim, i.e. a null slot that traps the next emitted `call.dyn`.
         s.run.slot_unit(slot).and_then(|(cd, cu)| {

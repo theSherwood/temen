@@ -275,13 +275,13 @@ self.onmessage = async (e) => {
     return inst;
   };
   const jitUnitForSlot = (slot) => {
-    const uid = ex.temen_par_jit_slot_unit(slot);
+    const uid = ex.temen_par_jit_slot_unit(v, slot);
     if (uid < 0n) return null;
     let inst = jitInstCache.get(uid);
     if (inst) return inst;
-    const len = ex.temen_par_jit_unit_wasm_by_slot_len(slot);
+    const len = ex.temen_par_jit_unit_wasm_by_slot_len(v, slot);
     if (len === 0) return null;
-    const ptr = Number(ex.temen_par_jit_unit_wasm_by_slot_ptr(slot));
+    const ptr = Number(ex.temen_par_jit_unit_wasm_by_slot_ptr(v, slot));
     inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
     jitInstCache.set(uid, inst);
     return inst;
@@ -291,14 +291,12 @@ self.onmessage = async (e) => {
   // Worker's vCPU (`temen_par_inst_call_interp` → `bounce_call`, the live window + powerbox), the
   // coop driver's `shimFor`. Instantiated once per slot (the program never changes within a run).
   const jitShims = new Map();
-  // #1339: a shim bounce on the ROOT vCPU lends the process-global §22 slot mirror, so a guest that
-  // `Jit.install`s from its *emitted* frame (Forth's outer interpreter) moves the mirror before the
-  // frame resumes; rebuild the table right there, since no event boundary intervenes. A §14
-  // child uses `temen_par_inst_call_interp` instead — its installs stay in its own table (#1296).
-  const rootCallInterp = (t, a) => {
-    const bounce = role === 'root' ? ex.temen_par_root_call_interp : ex.temen_par_inst_call_interp;
-    if (bounce(v, t, a) !== 0) throw new Error('cross-tier trap');
-    if (role === 'root' && ex.temen_par_jit_table_gen() !== jitSyncedGen) jitSyncTable();
+  // #1339: a guest that `Jit.install`s from its *emitted* frame (Forth's outer interpreter) moves
+  // this vCPU's table inside the bounce, so rebuild the Worker's table right there, before the frame
+  // resumes: no event boundary intervenes. A §14 child's installs stay in its own table (#1296).
+  const vcpuCallInterp = (t, a) => {
+    if (ex.temen_par_inst_call_interp(v, t, a) !== 0) throw new Error('cross-tier trap');
+    if (ex.temen_par_jit_table_gen(v) !== jitSyncedGen) jitSyncTable();
   };
   const jitShimFor = (slot) => {
     let f = jitShims.get(slot);
@@ -311,7 +309,7 @@ self.onmessage = async (e) => {
       env: {
         memory,
         trap: () => {},
-        call_interp: rootCallInterp,
+        call_interp: vcpuCallInterp,
       },
     }).exports['t'];
     jitShims.set(slot, f);
@@ -322,12 +320,12 @@ self.onmessage = async (e) => {
   // the tier-up module's emitted `f{slot}` if it emitted, else a bounce shim (#1347); a slot past it
   // holds an installed unit's `f0`, or null when empty/uninstalled (so a stale `call_indirect`
   // traps). Called before each invoke.
-  // #1339: rebuild only when the shared slot mirror actually moved (`temen_par_jit_table_gen`) — a
-  // run that never installs syncs once, not per invoke. The generation also covers an install made
-  // from INSIDE a bounce (see `rootCallInterp`), which the per-event sync alone would miss.
+  // #1339: rebuild only when the vCPU's table actually moved (`temen_par_jit_table_gen`) — a run
+  // that never installs syncs once, not per invoke. The generation also covers an install made from
+  // INSIDE a bounce (see `vcpuCallInterp`), which the per-event sync alone would miss.
   let jitSyncedGen = -1;
   const jitSyncTable = () => {
-    const gen = ex.temen_par_jit_table_gen();
+    const gen = ex.temen_par_jit_table_gen(v);
     if (gen === jitSyncedGen) return;
     const size = 1 << ex.temen_par_jit_table_log2();
     const nfuncs = ex.temen_par_nfuncs();

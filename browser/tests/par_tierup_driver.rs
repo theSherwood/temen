@@ -307,7 +307,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
                             }
                         }
                     } else {
-                        assert_eq!(temen_par_jit_slot_unit(slot), -1, "nothing installed");
+                        assert_eq!(temen_par_jit_slot_unit(v, slot), -1, "nothing installed");
                         None
                     };
                     let fr = match entry {
@@ -490,7 +490,6 @@ block 0 (v0: i32) {{
         1,
         "runtime-compile powerbox"
     );
-    let gen0 = temen_par_jit_table_gen();
     let prog = temen_par_compile_jit(guest_bytes.as_ptr(), guest_bytes.len());
     assert!(!prog.is_null(), "guest compiles");
 
@@ -499,6 +498,7 @@ block 0 (v0: i32) {{
     win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
     let v = temen_par_root(prog, win.as_mut_ptr(), win.len(), 0);
     assert!(!v.is_null(), "root vCPU builds");
+    let gen0 = temen_par_jit_table_gen(v);
     assert_eq!(temen_par_run(v), PAR_DONE, "the guest runs to completion");
     // `vres` (= X + K) + `vslot` (1, the first padding slot) + `vrel` (0, release ok).
     assert_eq!(
@@ -508,16 +508,16 @@ block 0 (v0: i32) {{
     );
 
     assert!(
-        temen_par_jit_slot_unit(1) >= 0,
-        "the slot mirror must still name the installed unit after `release`"
+        temen_par_jit_slot_unit(v, 1) >= 0,
+        "the table must still name the installed unit after `release`"
     );
     assert!(
-        temen_par_jit_unit_wasm_by_slot_len(1) > 0,
+        temen_par_jit_unit_wasm_by_slot_len(v, 1) > 0,
         "the driver must still fetch the installed unit's emitted wasm after `release`"
     );
     assert_ne!(
-        temen_par_jit_table_gen(),
+        temen_par_jit_table_gen(v),
         gen0,
-        "the install must advance the mirror generation so a Worker rebuilds"
+        "the install must move the table's generation so a Worker rebuilds"
     );
 }
