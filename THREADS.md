@@ -134,6 +134,13 @@ property, so in practice:
   join-value kernel → **46**, both **byte-identical** to `compile_and_run_capture` and **stable across
   50 real-race repeats** (a wrong driver would be flaky). New public entry
   `compile_and_run_capture_over_parallel` (the `Parallel` sibling of `compile_and_run_capture_over`).
+  *Superseded (#1414 3e):* the native parallel driver is now executor 2, `drive_threads` — one OS
+  thread per task (D56) over one `SchedCore` behind one lock; a thread steps its task without the lock
+  and applies the cooperative pump's rule under it at each stop — and it runs what the pump runs but
+  the emitted tier and a durable host. `drive_parallel`, `run_vcpu_parallel`, `ThreadRegistry` and the
+  native `Futex` of 4c-futex are gone; the same public entries run it. A futex wait parks through the
+  shared rules, so a run whose tasks all park with nothing to wake one ends with the pump's deadlock
+  `ThreadFault`, not a 10 s `MAX_WAIT` timeout (#1652).
 - [x] **Step 4c-futex — the cross-thread `memory.wait`/`notify`.** The parallel driver now services the
   **full threads model**, not just spawn/join: a native `Futex` (a per-address parked-token queue under
   one bucket lock — the std-sync analogue of a kernel futex bucket, with the compare-and-park done under
@@ -232,7 +239,7 @@ property, so in practice:
     the vCPU's deny-all powerbox — a `call.cap`ing unit is out of scope, the C1 limitation.)
   - **§14 `instantiate` in parallel** *(Retiring: this design runs each child over a carve of the
     shared backing — `nested_view`, `carve_region` — and the carve path is being deleted (INVARIANTS
-    #13, 2026-09-29; #1289). The detached equivalent is op 15: `drive_parallel` and the resumable
+    #13, 2026-09-29; #1289). The detached equivalent is op 15: `drive_threads` and the resumable
     `Vcpu` (`VcpuEvent::InstantiateDetached`) run the child over its own `Mem`, and the browser runs
     it on its own Worker over a per-child `WebAssembly.Memory` through `Region::Foreign`
     (`temen_par_child_detached`; DETACHED_JIT.md §3.1, §3.3).)* — a confined executor child runs as
@@ -341,13 +348,15 @@ property, so in practice:
   created on one Worker resumes on another — the D57 claim protocol, locked per fiber transition
   only. `vcpu.tls` is the executing vCPU's word (a migrated fiber reads its new vCPU's), and each
   child is seeded with its dense id in spawn order (`PAR_SPAWN`'s `ev_d` → `temen_par_child`). The
-  native parallel driver (`drive_parallel`) shares the registry the same way. A JACL card built
+  native parallel driver (`drive_threads`) keeps that shared registry in its `SchedCore`, a fiber op
+  taking the core's lock. A JACL card built
   with 4 pool workers runs on it at ~3.7× its 1-worker build (native OS-thread harness, 4 cores). A
   member's trap or `exit` ends its **domain** on both thread-per-vCPU drivers too (DESIGN.md §12 / I37,
   the cooperative `teardown_domains` rule): a spawned thread's trap becomes the run's result instead of
-  waiting on a `thread.join` that may never come. Natively each domain (`ParDomain`) records its first
-  trap and its members die at their next safepoint (a 1M-op quantum, or a futex wait / join the kill
-  wakes); on Workers a root-domain vCPU's trap ends the run. A §14 confined child stays its own domain.
+  waiting on a `thread.join` that may never come. Natively the run's settle applies that rule itself
+  (`ParDomain` is gone, #1414 3e): a parked member is finalized there, and a running one ends at its
+  next stop (its next event or the 1M-op quantum); on Workers a root-domain vCPU's trap ends the run.
+  A §14 confined child stays its own domain.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
   interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
   editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/
@@ -414,9 +423,9 @@ cargo test -p temen --test bytecode_shared_window       # engine over a caller-o
 cargo test -p temen --test bytecode_parallel            # 4c: native parallel driver vs oracle
 cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerbox call.cap vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
-cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in drive_parallel vs oracle
+cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in the parallel driver vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
-cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in drive_parallel vs oracle
+cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in the parallel driver vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration_instantiate  # 4c-domain §14-D2: confined children via resumable Vcpu
 cargo +nightly miri test -p temen-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
 cargo +nightly miri test -p temen-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free

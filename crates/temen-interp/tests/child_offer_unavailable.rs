@@ -1,7 +1,8 @@
 //! #1732 — a driver that cannot mint a `child_offer` (op 14) answers `-EINVAL`, the value the oracle
 //! gives for a child it has nothing to offer over. Minting needs a live child's powerbox, which only
-//! the cooperative scheduler keeps; the parallel driver and the Cranelift nursery without a mint
-//! hook already answered `-EINVAL`, while the single-vCPU `Vcpu::run` trapped `ThreadFault`. An
+//! the bytecode scheduling core keeps (the cooperative and the parallel driver); the Cranelift
+//! nursery without a mint hook already answered `-EINVAL`, while the single-vCPU `Vcpu::run`
+//! trapped `ThreadFault`. An
 //! unavailable seam is a value, not a trap (INVARIANTS #5), and one op gets one answer whichever
 //! loop drives it (#9).
 //!

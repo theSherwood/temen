@@ -847,9 +847,9 @@ The slices, **all landed for the cooperative driver** (each pinned against the o
    topology spawns with grants via op-17 records under a serving module.)
 4. **Differential pin. DONE.** `clone_caller.rs::bytecode_forks_the_twin_identically_to_the_oracle`
    runs the `SRC_TWIN` topology on the bytecode engine (natively, not folded) and asserts the run
-   value + both replies on the shared sink match the oracle. **Remaining:** port the driver arms to
-   `drive_parallel` (fork currently runs on the cooperative single-threaded driver; the parallel
-   driver fails closed), and add fork shapes to the `bytecode_diff` fuzz corpus.
+   value + both replies on the shared sink match the oracle. **Remaining:** add fork shapes to the
+   `bytecode_diff` fuzz corpus. (The parallel driver, which failed closed here, now runs these arms:
+   it is executor 2, `drive_threads`, applying the pump's `SchedCore::on_stop` — #1414 3e.)
 
 ### 9.3 The Cranelift capstone (design, 2026-08-07 — grounded in a full JIT durable map)
 

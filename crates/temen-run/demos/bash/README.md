@@ -306,10 +306,11 @@ on every driver as well — cooperative, parallel, and the threaded debug engine
 
 ## bash on the parallel driver (#748 — real OS threads)
 
-The same bytecode also runs over **`drive_parallel`** (`BASH_PROBE_BACKEND=parallel`, routed through
-`Instance::run_with_caps_parallel`): every bash `fork()` twin is a real OS thread over a private
-window copy with its own powerbox, `waitpid` a real condvar block, pipes level-triggered polls, and
-`execve` an in-place host/table swap on the exec'ing thread. Builtin pipelines, command/process
+The same bytecode also runs over the **parallel driver** (`BASH_PROBE_BACKEND=parallel`, routed through
+`Instance::run_with_caps_parallel`; executor 2, `drive_threads`, since #1414 3e): every bash `fork()`
+twin is a real OS thread over a private window copy with its own powerbox, and `waitpid`, pipes and
+`execve` take the cooperative pump's rules — a parked thread waits on its condvar, a pipe park is
+polled every 50 µs, and the exec'ing thread steps the new image. Builtin pipelines, command/process
 substitution, subshells, and the exec'd-coreutil pipelines (`seq | head`, `seq 100 | wc -l`,
 `sort | uniq`, redirections) all match the cooperative tier. The bash capstone gate
 (`demo_bash_translates_and_verifies`) pins this as the **three-engine differential**: every script in
