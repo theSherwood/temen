@@ -1803,3 +1803,44 @@ fn a_refusal_notes_the_import_nothing_satisfied() {
         }
     }
 }
+
+/// The root joins a thread that waits, with no timeout, on a word nothing will write: every task is
+/// parked and nothing can wake one, so the run is deadlocked and ends with `ThreadFault` (#1638).
+const JOIN_A_FOREVER_WAITER: &str = "memory 18
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = i64.const 131072
+  vchild = thread.spawn 1 vz va
+  vst = thread.join vchild
+  return vst
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, va: i64) {
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait va vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+";
+
+/// #1652 — a deadlock ends the run with `ThreadFault`: on the oracle and the pump at their idle
+/// point, and on executor 2 (`Threads`) when its last running task parks. The parallel driver it
+/// replaces cannot tell, and times the infinite wait out after 10 s instead; the debugger stops
+/// `Blocked` there, for its user to decide.
+#[test]
+fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
+    let m = module(JOIN_A_FOREVER_WAITER);
+    let setup = || (Host::new(), Vec::new());
+    let drivers = [Driver::Oracle, Driver::Coop, Driver::Threads];
+    agree_on(
+        &drivers,
+        "a thread waiting forever, joined",
+        &m,
+        &setup,
+        &trapped(Trap::ThreadFault),
+    );
+}
