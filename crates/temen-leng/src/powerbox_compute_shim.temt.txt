@@ -381,8 +381,31 @@ block 0 (v0: i32, v1: i32) {
 }
 func (i64, i64) -> (i32) {
 block 0 (v0: i64, v1: i64) {
-  v2 = i32.const 0
-  return v2
+  v2 = i64.load v0
+  v3 = i64.load v0 offset=8
+  v4 = i64.const 0
+  v5 = i64.lt_s v2 v4
+  v6 = i64.const 1000000000
+  v7 = i64.ge_u v3 v6
+  v8 = i32.or v5 v7
+  br_if v8 2() 1(v0, v2, v3)
+  }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.const 1000000000
+  v4 = i64.mul v1 v3
+  v5 = i64.add v4 v2
+  v6 = i64.const 9223372035
+  v7 = i64.gt_s v1 v6
+  v8 = i64.const 9223372036854775807
+  v9 = select v7 v8 v5
+  v10 = i32.load v0
+  v11 = i32.atomic.wait v0 v10 v9
+  v12 = i32.const 0
+  return v12
+  }
+block 2 () {
+  v0 = i32.const -22
+  return v0
   }
 }
 func (i32) -> (i64) {
