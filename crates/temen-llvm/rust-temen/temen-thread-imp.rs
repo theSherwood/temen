@@ -45,8 +45,7 @@ unsafe extern "C" {
 /// Park the current vCPU for `timeout_ns` nanoseconds by futex-waiting on a private stack word whose
 /// value matches `expected`, so no notify can target it — it only wakes on the deadline. `timeout_ns
 /// == 0` yields exactly one scheduler turn (a park with an already-reached deadline). A spurious wake
-/// (`0`, possible only under the parallel driver's real futex) re-parks, so the vCPU sleeps at least
-/// the requested time.
+/// (`0`) re-parks, so the vCPU sleeps at least the requested time.
 fn futex_park(timeout_ns: i64) {
     // A fresh, never-notified word: value 0, expected 0 → the wait parks rather than returning early.
     let word: i32 = 0;

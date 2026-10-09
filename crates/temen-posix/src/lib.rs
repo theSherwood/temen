@@ -3022,7 +3022,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
             drop(w);
             if !wakes.is_empty() {
                 // Both guards are dropped, so no `Host`/scheduler lock is held here. On a
-                // multi-threaded driver (the tree-walker's threads, `drive_parallel`) a same-stack
+                // multi-threaded driver (the tree-walker's threads, the parallel driver) a same-stack
                 // fire could still close a host ↔ scheduler cycle *via another thread*, so we detach
                 // (cross-process signals are human-frequency — a short-lived thread is the boring,
                 // provably-unentangled choice). wasm32 has no `thread::spawn` and is always

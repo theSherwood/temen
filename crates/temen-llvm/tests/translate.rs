@@ -7532,7 +7532,7 @@ long worker(long arg) {
 
 /// #1097 — vCPUs allocating at the same time never share a block. Four threads each `malloc` 2000
 /// blocks and tag them, then check every tag survived. Before the allocation lock, two vCPUs could read
-/// the same `HEAP_BRK` and be handed the same block. The lock is dlmalloc's own spin lock now (#1603). Runs on `drive_parallel`, one OS thread per vCPU,
+/// the same `HEAP_BRK` and be handed the same block. The lock is dlmalloc's own spin lock now (#1603). Runs on the parallel driver, one OS thread per vCPU,
 /// where the race is real: the nightly std lane's parallel atomic-counter smoke trapped on it about one
 /// run in four.
 #[test]
@@ -13834,7 +13834,7 @@ fn demo_bash_translates_and_verifies() {
             .expect("run the native oracle");
         // ▶ #1146 / #748 — the **bytecode tiers match NATIVE too**. With async signal delivery
         // ported to the bytecode engine (the #796 L2 safepoint redirect on both the cooperative
-        // browser tier and `drive_parallel`), the kill-based trap scripts run their C handlers on
+        // browser tier and the parallel driver), the kill-based trap scripts run their C handlers on
         // both bytecode drivers exactly as on the tree-walker — so native is the single oracle for
         // all three engines here. (Previously async delivery was interpreter-only, so these printed
         // less on the bytecode tier and were only pinned coop==parallel; #1146 closed that gap.)
@@ -14007,7 +14007,7 @@ fn demo_bash_translates_and_verifies() {
             .current_dir(&native_cwd)
             .output()
             .expect("run the native oracle");
-        // ▶ #748 all three engines over the EXEC surface: on `drive_parallel` every stage is a real
+        // ▶ #748 all three engines over the EXEC surface: on the parallel driver every stage is a real
         // OS thread exec'ing its coreutil (the in-place host/table swap), piped through
         // level-triggered CorePipe blocks. No signal scripts in this list, so every engine must
         // match the native oracle, which implies coop ≡ parallel too.

@@ -2584,12 +2584,12 @@ pub enum Inst {
     /// The `block: true` form (`cont.resume.block`, ISSUES.md I48) is an advisory scheduling
     /// hint — returning `FIBER_PARKED (3)` is always conforming, so a guest still loops for
     /// completion; it issues this form only when it has nothing else to run, to avoid
-    /// busy-polling a lone parked fiber. After the parity commits the cooperative bytecode
-    /// driver genuinely idles the resumer (`TaskState::BlockedOnFiber`, zero fuel), the
-    /// wasm-JIT inherits that via its `DriveMode::InterpDriven` fold, and the Cranelift JIT
-    /// parks the resumer's OS thread on `Domain.futex_cv` via the `fiber_resume_block` thunk;
-    /// only the OS-thread-parallel bytecode drivers (`drive_parallel`, single-vCPU
-    /// `Vcpu::run`) take the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
+    /// busy-polling a lone parked fiber. After the parity commits the bytecode scheduling
+    /// core (the cooperative and the parallel driver) genuinely idles the resumer
+    /// (`TaskState::BlockedOnFiber`, zero fuel), the wasm-JIT inherits that via its
+    /// `DriveMode::InterpDriven` fold, and the Cranelift JIT parks the resumer's OS thread on
+    /// `Domain.futex_cv` via the `fiber_resume_block` thunk; only the single-vCPU bytecode
+    /// `Vcpu::run` takes the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
     /// Advisory only — no new semantics, invariant 9 preserved.
     ContResume {
         k: ValIdx,

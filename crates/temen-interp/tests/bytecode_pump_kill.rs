@@ -1,4 +1,4 @@
-//! The cooperative bytecode pump must not sleep through a kill that lands **during its settle**.
+//! The bytecode executors must not sleep through a kill that rings the external-wake bell (#1122).
 //!
 //! The pump's loop top finalizes every task of a killed domain (#1215), and when everything is parked
 //! on something an embedder can wake it blocks on the external-wake doorbell (#1122) until the next
@@ -7,11 +7,15 @@
 //! some unrelated ring (the next keystroke) although the domain was already dead. The source below
 //! lands the kill at exactly that point — right after the sweep reads `killed()` — so the ordering
 //! is deterministic.
+//!
+//! The parallel driver (executor 2) has no all-parked block: its parked threads sleep until a rule
+//! wakes them or their deadline comes. A watcher on the bell settles the run on each ring, so the
+//! same kill ends a run whose every task sleeps, at once rather than at the deadline.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use temen_interp::{bytecode, Host, SignalSource, StreamRole, Value};
+use temen_interp::{bytecode, Host, SignalSource, StreamRole, Trap, Value};
 
 /// Answers `killed()` truthfully, but on the `trigger`th query goes dead *after* answering and rings
 /// the kill door — a terminate arriving from another thread just after the sweep looked.
@@ -86,4 +90,55 @@ fn a_kill_that_lands_after_the_kill_sweep_is_not_slept_through() {
         r.is_err(),
         "the killed root is finalized, not returned: {r:?}"
     );
+}
+
+/// The root sleeps in a 30 s futex wait that nothing notifies.
+const SLEEP_30S: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  va = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const 30000000000
+  vst = i32.atomic.wait va vexp vto
+  vr = i64.extend_i32_u vst
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_kill_that_rings_the_bell_ends_a_parallel_run_whose_tasks_all_sleep() {
+    let m = temen_text::parse_module(SLEEP_30S).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.arm_external_wake();
+        // Query 1 is the settle after the root parked in its wait: the kill lands right after it,
+        // and nothing but the bell is left to wake the run before the deadline.
+        let source = Arc::new(KilledAfterTheSweep {
+            queries: AtomicUsize::new(0),
+            trigger: 1,
+            dead: AtomicBool::new(false),
+            ring: Mutex::new(None),
+        });
+        host.set_signal_source(source, Arc::new(AtomicBool::new(false)));
+        let mut fuel = u64::MAX;
+        let r = bytecode::compile_and_run_capture_over_parallel_with_host(
+            &m,
+            0,
+            &[],
+            &mut fuel,
+            &[],
+            None,
+            &mut host,
+        );
+        let _ = tx.send(r.map(|(r, _image)| r));
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the run slept through a kill that rang its bell");
+    let r = r.expect("the parallel driver runs this module");
+    assert_eq!(r, Err(Trap::ThreadFault), "the killed root is finalized");
 }

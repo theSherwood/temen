@@ -64,8 +64,8 @@ fn posix_cap_inner(
             p.enable_terminal(h);
             // #1122 — a terminal grant means an interactive embedder: let the cooperative
             // bytecode driver BLOCK for the feeder at its all-parked point (waiting for input
-            // is the session's normal state, not a deadlock). Inert on the other tiers — the
-            // tree-walker wires its own scheduler doors over this, the parallel driver polls.
+            // is the session's normal state, not a deadlock); the parallel driver settles on each
+            // ring. Inert on the tree-walker, which wires its own scheduler doors over this.
             h.arm_external_wake();
         }
         handle

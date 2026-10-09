@@ -7757,16 +7757,17 @@ impl Instance {
         Ok(Some(run))
     }
 
-    /// Run the powerbox entry under the **parallel** driver (THREADS.md 4c): one OS thread per vCPU
-    /// over a single shared window, with the powerbox `host` shared across them (host I/O serialized
-    /// per call). This is the opt-in parallel execution mode — real races, *not* the deterministic
-    /// oracle — so it is used for **smoke** coverage (assert the outcome, not the schedule) of the
-    /// threaded `std` programs the cooperative entries pin exactly.
+    /// Run the powerbox entry under the **parallel** driver (THREADS.md 4c): one OS thread per task
+    /// over a single shared window, on the cooperative pump's scheduling rules, with the powerbox
+    /// `host` shared across the root's threads (host I/O serialized per call). This is the opt-in
+    /// parallel execution mode — real races, *not* the deterministic oracle — so it is used for
+    /// **smoke** coverage (assert the outcome, not the schedule) of the threaded `std` programs the
+    /// cooperative entries pin exactly.
     ///
     /// The driver reserves the window itself, as the cooperative engines do, so a guest's heap and
     /// thread stacks in the reserved tail (chibicc's heap starts at 256 MiB) hold what is stored to
-    /// them (#2196). `instantiate`/JIT-install fail closed under this driver; the pure threads +
-    /// futex + atomics + host-I/O subset (what these tests use) runs.
+    /// them (#2196). It runs what the pump runs but the emitted tier; a durable powerbox is outside
+    /// it.
     pub fn run_with_caps_parallel(
         &self,
         config: &RunConfig,

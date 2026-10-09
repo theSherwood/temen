@@ -19,12 +19,9 @@ pub enum Driver {
     Oracle,
     /// The cooperative executor (`bytecode::compile_and_run_with_host`).
     Coop,
-    /// The OS-thread parallel driver (`compile_and_run_capture_over_parallel_with_host`), over a
-    /// window it reserves itself.
+    /// The OS-thread parallel driver (`compile_and_run_capture_over_parallel_with_host`): executor 2,
+    /// an OS thread per task on the pump's rules (#1414 3e), over a window it reserves itself.
     Parallel,
-    /// Executor 2 (`compile_and_run_capture_over_threads_with_host`, #1414 3e): an OS thread per
-    /// task on the pump's rules, which replaces `Parallel`.
-    Threads,
     /// The debug scheduler (`ScheduledDebugRun`), run to completion through its breakpoints.
     Debug,
     /// The resumable single vCPU (`Vcpu::run`) under a native orchestrator: the engine the browser's
@@ -32,11 +29,10 @@ pub enum Driver {
     Vcpu,
 }
 
-pub const ALL: [Driver; 6] = [
+pub const ALL: [Driver; 5] = [
     Driver::Oracle,
     Driver::Coop,
     Driver::Parallel,
-    Driver::Threads,
     Driver::Debug,
     Driver::Vcpu,
 ];
@@ -91,18 +87,6 @@ pub fn run_on_then<R>(
         }
         Driver::Parallel => {
             let (r, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
-                m,
-                0,
-                &args,
-                &mut fuel,
-                &[],
-                None,
-                &mut host,
-            )?;
-            done(r, &host)
-        }
-        Driver::Threads => {
-            let (r, _image) = bytecode::compile_and_run_capture_over_threads_with_host(
                 m,
                 0,
                 &args,
@@ -369,11 +353,10 @@ fn unorchestrated(event: &str) -> ! {
 /// The drivers that schedule a spawned child themselves. The [`Driver::Vcpu`]'s host runs its
 /// children and has no surface to answer `poll`, `detach` or `kill` yet, so each traps there when it
 /// runs (temen#2083).
-pub const SCHEDULING: [Driver; 5] = [
+pub const SCHEDULING: [Driver; 4] = [
     Driver::Oracle,
     Driver::Coop,
     Driver::Parallel,
-    Driver::Threads,
     Driver::Debug,
 ];
 

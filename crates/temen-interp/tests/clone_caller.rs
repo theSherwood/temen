@@ -491,6 +491,48 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     );
 }
 
+/// The same fork on the parallel driver (#1414 3e), which applies the pump's rules: the twin is a
+/// task on its own OS thread, and the run's value and both replies are the oracle's.
+#[test]
+fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
+    let (oracle_r, oracle_bytes) = run_src_twin_oracle();
+    let m = module(&forking(SRC_TWIN));
+    let mut host = Host::new();
+    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let hb = host.grant_budget(-1, 8 << 20, -1);
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
+    let mut fuel = 40_000_000u64;
+    let (r, _image) = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
+        &mut fuel,
+        &[],
+        None,
+        &mut host,
+    )
+    .expect("the parallel driver runs the fork module");
+    assert_eq!(r.expect("parallel run"), oracle_r, "the oracle's value");
+    let mut bytes: Vec<i64> = sink
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    bytes.sort();
+    let mut want: Vec<i64> = oracle_bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    want.sort();
+    assert_eq!(
+        bytes, want,
+        "both replies on the shared sink, as on the oracle"
+    );
+}
+
 /// FORK.md PR 5 — **pid mode**, the exact `fork()` shape: `clone_caller(0)` (one arg) replies the
 /// twin's `TaskId` to the original (parent sees pid) and `0` to the twin (child sees 0). Same
 /// topology as the two-reply test; only the `fork` handler changes. Task ids are deterministic here

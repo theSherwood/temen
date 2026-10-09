@@ -11792,8 +11792,8 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 
 /// Join child `handle`: take its entry out of `children` and retire the slot, by the
 /// [`resolve_thread`] rule: a negative handle, or one whose masked slot is spent or was never issued,
-/// is `ThreadFault`. The join rule of the child tables kept outside the tree-walker's task list — the
-/// parallel driver's and [`bytecode::Vcpu`]'s — so they answer a join as the oracle does (#1728).
+/// is `ThreadFault`. The join rule of a child table kept outside a scheduler's task list —
+/// [`bytecode::Vcpu`]'s — so it answers a join as the oracle does (#1728).
 pub(crate) fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
     let slot = resolve_thread(children, handle)?;
     Ok(children[slot]
@@ -22777,10 +22777,10 @@ pub trait SignalSource: Send + Sync {
     }
 
     /// #1215 — has this domain been **terminated** by a `SIG_DFL` terminate-action signal (SIGKILL,
-    /// SIGTERM, an uncaught SIGINT, …), i.e. is its `term_sig` bookkeeping set and actionable now? The
-    /// cooperative driver has no per-op terminate poll (the tree-walker's `term_flag` safepoint), so its
-    /// scheduler consults this at the loop top to FINALIZE every task of a killed domain — running,
-    /// stopped, or parked — before the pick, dying with the WIFSIGNALED status the exit hook then reaps.
+    /// SIGTERM, an uncaught SIGINT, …), i.e. is its `term_sig` bookkeeping set and actionable now? A
+    /// task mid-step dies at its per-op `term_flag` poll; the bytecode scheduler consults this in its
+    /// settle to FINALIZE every other task of a killed domain — runnable, stopped, or parked — dying
+    /// with the WIFSIGNALED status the exit hook then reaps.
     /// A signal HELD while stopped/masked (a plain SIGTERM to a stopped job) is not yet actionable, so it
     /// stays `false` until continued — matching the personality's own gate. Default `false` — sources
     /// without a default-action terminate story never die here.
@@ -22813,8 +22813,7 @@ pub trait SignalSource: Send + Sync {
     /// `SIG_DFL` terminate becomes actionable — NOT deferred — so the flag is set before the (deferred,
     /// order-independent) [`Self::set_kill`] wake runs, and no reorder can leave a killed domain marked
     /// live. Must be a lock-free write (an atomic store), safe while the engine holds the domain's `Host`
-    /// lock. Default no-op — the cooperative driver reads the personality's own `term_sig` directly and
-    /// keeps no mirror, so it installs nothing here.
+    /// lock. Default no-op — a source that never terminates a domain need not store it.
     fn set_kill_apply(&self, _apply: Arc<dyn Fn() + Send + Sync>) {}
 
     /// #799 — store the run's **park-request closure**: the personality fires it *during* one of

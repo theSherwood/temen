@@ -1731,7 +1731,7 @@ fn granted_program(
 /// A §14 confined or §5 detached child as every in-process bytecode driver builds it — the **one
 /// definition** of admission and of the child powerbox (INVARIANTS #15), made by
 /// [`admit_confined_child`] or [`admit_detached_child`] and shared by the cooperative executor
-/// (`drive`), the OS-thread parallel driver (`run_vcpu_parallel`) and the debug scheduler. Only *how
+/// (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the debug scheduler. Only *how
 /// the child is scheduled* differs per driver: an executor task, an OS thread, a debug task. (Until
 /// #1855 each driver admitted a confined child its own way, and two of them trapped on a budget or a
 /// grant list the cooperative driver serves.)
@@ -2301,7 +2301,7 @@ fn compile_module_with(
     // are different: they run on the scheduler like threads, not inline — so they classify as
     // scheduler-driven, not as coroutines — and they combine with `cont.*` fibers too: every driver
     // gives each confined child domain its own fiber registry (the cooperative `ChildEnv::fibers`,
-    // the debugger's `DbgEnv::fibers`, the parallel `ParDomain`), as the oracle does. Plain coroutine /
+    // which the parallel driver shares, and the debugger's `DbgEnv::fibers`), as the oracle does. Plain coroutine /
     // fiber / thread / instantiate modules are each fine, as are instantiate+thread,
     // instantiate+coroutine and instantiate+fiber.
     let s = scan_seams(funcs);
@@ -3771,23 +3771,24 @@ impl SharedProgram {
 }
 
 /// THREADS.md step 4c — the **parallel** sibling of [`compile_and_run_capture_over`]: run the guest's
-/// `thread.spawn`ed vCPUs on **separate OS threads** (the native stand-in for per-vCPU wasm Workers)
-/// over the **one** shared window, instead of cooperatively multiplexing them onto one thread. Every
-/// vCPU executes over the same backing — `thread.spawn`/`join` + hardware `atomic.*` are genuine
-/// cross-core operations, not a single-thread interleaving. This is the host-selected `Parallel` mode;
-/// the cooperative [`compile_and_run_capture_over`] is its **deterministic oracle**
-/// (differential-tested in `bytecode_parallel.rs`).
+/// tasks on **separate OS threads**, one per task (D56), over the **one** shared window, instead of
+/// cooperatively multiplexing them onto one thread. Every task executes over the same backing —
+/// `thread.spawn`/`join` + hardware `atomic.*` are genuine cross-core operations, not a single-thread
+/// interleaving. This is the host-selected `Parallel` mode, run by executor 2 ([`drive_threads`],
+/// #1414 3e) on the cooperative pump's scheduling rules; the cooperative
+/// [`compile_and_run_capture_over`] is its **deterministic oracle** (differential-tested in
+/// `bytecode_parallel.rs` and the cross-driver matrix).
 ///
 /// `back` is the window's backing. `None` reserves it here, as every other driver does, so a page the
 /// guest maps anywhere in its reservation holds what is stored to it. `Some` runs over a caller-owned
 /// backing (Miri, which cannot reserve the full window), and an access past that backing's end reads
 /// zero and drops its store (#1191) — #2196 was every caller sizing it to the declared window.
 ///
-/// Scope: the **full threads model** — `thread.spawn`/`join`, the `memory.wait`/`notify` futex
-/// (a genuine cross-thread [`Futex`], not a single-thread park queue), and atomics — plus pure compute,
-/// §14 confined children and the §22 guest JIT (installs land in the shared, interior-mutable
-/// [`Domain`] table). Returns `None` only if the module is outside the engine's subset, same as the
-/// cooperative entry.
+/// Scope: what the cooperative pump runs, but its emitted tier — the threads model, the
+/// `memory.wait`/`notify` futex, fibers (a fiber's futex wait parks the fiber, #2215), §14 children
+/// and serving, processes, and the §22 guest JIT (interpreted; installs land in the shared,
+/// interior-mutable [`Domain`] table). Returns `None` only if the module is outside the engine's
+/// subset, same as the cooperative entry.
 pub fn compile_and_run_capture_over_parallel(
     m: &Module,
     func: FuncIdx,
@@ -3796,21 +3797,18 @@ pub fn compile_and_run_capture_over_parallel(
     init_mem: &[u8],
     back: Option<std::sync::Arc<super::Region>>,
 ) -> Option<Capture> {
-    let c = compile_module_for(m, false)?;
-    if func as usize >= c.progs.len() {
-        return Some((Err(Trap::Malformed), Vec::new()));
-    }
     let mut host = Host::new();
     compile_and_run_capture_over_parallel_with_host(m, func, args, fuel, init_mem, back, &mut host)
 }
 
 /// Like [`compile_and_run_capture_over_parallel`], but runs over a **caller-prepared `host`** (the
-/// powerbox) shared by every parallel vCPU (THREADS.md 4c-host). A spawned vCPU's `call.cap` dispatches
-/// on the **same** host as the root, serialized per call by an internal lock — so host I/O from worker
-/// vCPUs works, with compute/atomics/futex still fully parallel. Determinism note: this is the **opt-in
-/// parallel** mode, so stateful-cap interleaving (e.g. `Clock.now` values, the order of distinct
-/// `stdout` writes) races as real threads do; the **cooperative** entries remain the deterministic
-/// oracle. The caller reads the host back (its `stdout`/state) after the run.
+/// powerbox) shared by every task of the root domain (THREADS.md 4c-host). A spawned thread's
+/// `call.cap` dispatches on the **same** host as the root, serialized per call by its lock — so host
+/// I/O from worker threads works, with compute/atomics/futex still fully parallel. Determinism
+/// note: this is the **opt-in parallel** mode, so stateful-cap interleaving (e.g. `Clock.now`
+/// values, the order of distinct `stdout` writes) races as real threads do; the **cooperative**
+/// entries remain the deterministic oracle. The caller reads the host back (its `stdout`/state)
+/// after the run.
 pub fn compile_and_run_capture_over_parallel_with_host(
     m: &Module,
     func: FuncIdx,
@@ -3820,43 +3818,8 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: Option<std::sync::Arc<super::Region>>,
     host: &mut Host,
 ) -> Option<Capture> {
-    // #1694 — the parallel driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a
-    // durable host is outside it: `None`, and the caller runs it where durability is kept, rather
-    // than here silently non-durable.
-    if host.is_durable() {
-        return None;
-    }
-    let c = compile_module_for(m, false)?;
-    if func as usize >= c.progs.len() {
-        return Some((Err(Trap::Malformed), Vec::new()));
-    }
-    let dom = Domain::new(c, host.jit_table_log2());
-    // #748 — the root's park-request door: a personality's `fork()`/blocking `waitpid` fires
-    // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
-    // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` arms below never surface.
-    host.wire_park_door();
-    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
-    let (r, mem) = drive_parallel(dom, func, args, fuel, mem, host);
-    let snap = mem
-        .as_ref()
-        .map(|mm| mm.snapshot(init_mem.len() as u64))
-        .unwrap_or_default();
-    Some((r, snap))
-}
-
-/// Executor 2 ([`drive_threads`], #1414 3e): the parallel driver's contract — a run over a
-/// caller-prepared `host`, its tasks on real OS threads, one per task — on the cooperative pump's
-/// rules. It runs beside [`compile_and_run_capture_over_parallel_with_host`] until it replaces it
-/// (R6). A durable host is outside it, as it is outside the parallel driver.
-pub fn compile_and_run_capture_over_threads_with_host(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-    init_mem: &[u8],
-    back: Option<std::sync::Arc<super::Region>>,
-    host: &mut Host,
-) -> Option<Capture> {
+    // #1694 — executor 2 has no freeze driver, so a durable host is outside it: `None`, and the
+    // caller runs it where durability is kept, rather than here silently non-durable.
     if host.is_durable() {
         return None;
     }
@@ -3865,6 +3828,9 @@ pub fn compile_and_run_capture_over_threads_with_host(
         return Some((Err(Trap::Malformed), Vec::new()));
     }
     let dom = Domain::new(c, host.jit_table_log2());
+    // #748 — the root's park-request door: a personality's `fork()`/blocking `waitpid` fires
+    // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
+    // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply.
     host.wire_park_door();
     let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
     let (r, mem) = drive_threads(&dom, func, args, fuel, mem, host);
@@ -3876,7 +3842,7 @@ pub fn compile_and_run_capture_over_threads_with_host(
 }
 
 // === THREADS.md step 4c-wasm — the resumable per-vCPU primitive ==================================
-// `drive_parallel` runs a guest's vCPUs on native OS threads it spawns itself. The browser can't:
+// The parallel driver runs a guest's tasks on native OS threads it spawns itself. The browser can't:
 // wasm32 has no `thread::spawn`, so a guest `thread.spawn` must bubble out to JS, which creates a
 // Worker that re-enters the engine to run that one vCPU. That needs a *resumable, single-vCPU* entry
 // the **host** orchestrates — pausing on each multi-vCPU event (`thread.spawn`/`join`,
@@ -4419,8 +4385,8 @@ enum Opens {
 
 /// One **resumable** vCPU over a shared window. The host calls [`run`](Vcpu::run) to advance it until a
 /// [`VcpuEvent`], services the event, delivers the result (`deliver_*`), and runs again — so the same
-/// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope (as
-/// for [`drive_parallel`]): `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, §22
+/// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope:
+/// `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, §22
 /// guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
 /// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
 /// serviced internally; the confined and detached spawns surfacing [`VcpuEvent::Instantiate`] and
@@ -4428,7 +4394,7 @@ enum Opens {
 /// starts on its own Worker). By default carries a deny-all `Host` (an
 /// I/O `call.cap` is an inert `CapFault`); attach the run's shared powerbox with
 /// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `call.cap` host I/O works from
-/// every vCPU sharing it, serialized per call — `drive_parallel`'s 4c-host model.
+/// every vCPU sharing it, serialized per call — the parallel driver's 4c-host model.
 pub struct Vcpu<'p> {
     prog: &'p VcpuProgram,
     vt: VTask,
@@ -4441,7 +4407,7 @@ pub struct Vcpu<'p> {
     /// The run's **shared powerbox** (THREADS.md 4d): when set (see
     /// [`with_shared_host`](Vcpu::with_shared_host)), every host access — `call.cap` dispatch, §14
     /// module/authority resolution, an invoked §22 unit's calls — goes through this `Mutex<Host>`
-    /// instead of the owned `host`, exactly [`drive_parallel`]'s 4c-host model: each `call.cap` locks
+    /// instead of the owned `host`, exactly the parallel driver's 4c-host model: each `call.cap` locks
     /// only for its own dispatch, so compute/atomics between calls stay lock-free, and host I/O
     /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
     /// host, as before.
@@ -4904,7 +4870,7 @@ impl<'p> Vcpu<'p> {
     /// Attach the run's **shared powerbox** (THREADS.md 4d — builder-style, on any constructor's
     /// result): every host access of this vCPU then goes through `host` under its lock, so `call.cap`
     /// (host I/O), §14 module/authority resolution, and invoked §22 units work from every vCPU of the
-    /// run sharing it — the resumable counterpart of [`drive_parallel`]'s 4c-host shared `Mutex<Host>`.
+    /// run sharing it — the resumable counterpart of the parallel driver's 4c-host shared `Mutex<Host>`.
     /// The embedder grants into the `Host` *before* the run (handle order is deterministic) and reads
     /// its state (e.g. `stdout`) after; per-call serialization is the documented 4c-host model.
     pub fn with_shared_host(mut self, host: &'p std::sync::Mutex<Host>) -> Vcpu<'p> {
@@ -5164,9 +5130,9 @@ impl<'p> Vcpu<'p> {
             );
             match stop {
                 // #1732 — `child_offer` mints over a live child's powerbox, which only the
-                // cooperative scheduler keeps; this driver has none. "Unavailable" is the `-EINVAL`
-                // the oracle gives a child it has nothing to offer over, as on the parallel driver
-                // and the Cranelift nursery: a value, not a trap (INVARIANTS #5, #9).
+                // scheduling core keeps (the pump, the parallel driver); this driver has none.
+                // "Unavailable" is the `-EINVAL` the oracle gives a child it has nothing to offer
+                // over, as on the Cranelift nursery: a value, not a trap (INVARIANTS #5, #9).
                 Ok(VcpuStop::ChildOffer {
                     grant: false, dst, ..
                 }) => {
@@ -5757,7 +5723,7 @@ impl<'p> Vcpu<'p> {
         // `&mut self.fuel/mem/host` fields the invoke needs, so the borrows split.
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         // The invoked unit runs over the run's powerbox — the shared one when attached (its
-        // `call.cap`s then serialize per-call like every other vCPU's, matching `drive_parallel`),
+        // `call.cap`s then serialize per-call like every other vCPU's, as on the parallel driver),
         // else this vCPU's owned (default deny-all) host.
         let mut cell = match self.shared_host {
             Some(m) => HostCell::Shared(m),
@@ -8338,7 +8304,7 @@ fn service_advance(
             Outcome::StdinPark => tasks[ti].state = TaskState::BlockedStdin,
             // Everything this engine does **not** dispatch, named rather than caught by a `_`
             // (#1414). The debugger path is the one native driver whose event match had a wildcard;
-            // `pump` and `run_vcpu_parallel` are already exhaustive, so a new `Outcome` variant fails
+            // the pump's is already exhaustive, so a new `Outcome` variant fails
             // to build there and must be handled. Here it silently joined the declined set — which is
             // the same shape as #1412, where a new answer slipped in without anything going red.
             //
@@ -10654,16 +10620,32 @@ fn fork_process(
 }
 
 /// Wire a new process's powerbox as the root's is: its own park door, which its personality's
-/// `fork()`/`waitpid()` park through (`fork_powerbox` and `spawn_powerbox` mint it with none), and its
-/// signal doors on the run's external-wake bell, so an embedder signal to it while every task is
-/// parked re-runs the settle (#1262: an interactive `^C` of a parked `cat`).
+/// `fork()`/`waitpid()` park through (`fork_powerbox` and `spawn_powerbox` mint it with none), its
+/// terminate ([`wire_kill`]), and its signal doors on the run's external-wake bell, so an embedder
+/// signal to it while every task is parked re-runs the settle (#1262: an interactive `^C` of a
+/// parked `cat`).
 fn wire_process(host: &Host, root: &DomainCell) {
     host.wire_park_door();
+    wire_kill(host);
     let bell = root.lock_unpoisoned().external_wake();
     if let Some(bell) = bell {
         if let Some((_, source)) = host.signal_poll() {
-            wire_pump_bell(&source, &bell);
+            wire_run_bell(&source, &bell);
         }
+    }
+}
+
+/// #1246/#1259 — wire a domain's default-action TERMINATE to its `term_flag`, which its tasks poll
+/// per op ([`Vm::resume`]): a killed task dies at its next op, as on the tree-walker, even when it
+/// is mid-step on another thread (executor 2). The personality fires this inline apply under its own
+/// lock, so it is one atomic store. The settle's kill sweep (#1215) finalizes the domain's tasks
+/// that are not running.
+fn wire_kill(host: &Host) {
+    if let Some((_, source)) = host.signal_poll() {
+        let term_flag = std::sync::Arc::clone(&host.term_flag);
+        source.set_kill_apply(std::sync::Arc::new(move || {
+            term_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
     }
 }
 
@@ -11277,8 +11259,8 @@ struct FiberMeta {
 /// A **run-shared** §12 fiber registry for vCPUs on separate OS threads or Web Workers (#1761): one
 /// handle namespace for the root and all its `thread.spawn` children, so a fiber created on one vCPU
 /// can be resumed on another (D57 migration) — the cooperative driver's single registry, and the
-/// tree-walker's `FiberRegistry`, made shareable. Attach with [`Vcpu::with_shared_fibers`];
-/// [`drive_parallel`] builds one per run. The lock is a leaf, held only for a fiber state transition
+/// tree-walker's `FiberRegistry`, made shareable. Attach with [`Vcpu::with_shared_fibers`]. The
+/// lock is a leaf, held only for a fiber state transition
 /// (`cont.new`, the `cont.resume` claim, `suspend`, a fiber's return) or a `gc.roots` scan, never
 /// across execution. The claim is the arbiter: `cont.resume` swaps a parked fiber for a `Running`
 /// marker under the lock, so exactly one resumer wins and any other gets `FiberFault`.
@@ -12874,14 +12856,14 @@ fn step_vcpu(
     dom: &Domain,
     ctx: &mut RunCtx,
     budget: u64,
-    // I48: only the cooperative `drive` scheduler can idle a blocking `cont.resume.block` (park the
-    // resumer's task via `VcpuStop::BlockOnFiber`). The OS-thread parallel paths pass `false` and
-    // take the advisory `FIBER_PARKED` poll instead — their idle is the follow-up slice (the same
-    // OS-thread-block problem as the Cranelift JIT).
+    // I48: only a scheduling core (the pump, the parallel driver) can idle a blocking
+    // `cont.resume.block` (park the resumer's task via `VcpuStop::BlockOnFiber`). `Vcpu::run` and
+    // the debug harness pass `false` and take the advisory `FIBER_PARKED` poll instead — their idle
+    // is the follow-up slice (the same OS-thread-block problem as the Cranelift JIT).
     cooperative: bool,
-    // #1157: when true, a `budget`-exhausted resume (the cooperative preemption quantum) yields to the
-    // pump as `VcpuStop::Preempted` instead of re-looping. Every caller but the cooperative pump passes
-    // `false` — the parallel driver and the single-step/debug harness keep the transparent re-loop.
+    // #1157: when true, a `budget`-exhausted resume (the preemption quantum) yields to the executor
+    // as `VcpuStop::Preempted` instead of re-looping. The pump and the parallel driver pass `true`;
+    // `Vcpu::run` and the single-step/debug harness keep the transparent re-loop.
     preemptible: bool,
 ) -> Result<VcpuStop, Trap> {
     loop {
@@ -12899,11 +12881,11 @@ fn step_vcpu(
                 if preemptible {
                     return Ok(VcpuStop::Preempted);
                 }
-                // #1198 — the COOPERATIVE pump only: `resume` bailed at a syscall boundary because this
+                // #1198 — a scheduling core only: `resume` bailed at a syscall boundary because this
                 // domain just STOPPED itself (a background-terminal SIGTTIN/SIGTTOU, or ^Z). Return to the
-                // pump so its round-robin pick benches the stopped domain, instead of re-looping straight
-                // into another stopped spin. The single-vCPU parallel/debug driver (`cooperative: false`)
-                // must NOT bench here: it has no pick to bench into, and its stop is a real concurrent
+                // executor so it benches the stopped domain (the pump's pick, the parallel driver's
+                // thread), instead of re-looping straight into another stopped spin. `Vcpu::run` and
+                // the debug harness (`cooperative: false`) must NOT bench here: it has no pick to bench into, and its stop is a real concurrent
                 // busy-wait — the stopped vCPU spins on its own OS thread until ANOTHER thread SIGCONTs it,
                 // exactly as before. `Preempted` on that path is `ThreadFault` (fail-closed), so gate it.
                 // Otherwise a normal `Suspended` (the sliced-harness budget boundary) re-loops as ever.
@@ -13197,8 +13179,8 @@ struct ChildEnv {
     table: std::sync::Arc<SharedSlots>,
     fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
-    /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
-    /// per-domain [`ParDomain`] registry, here. The root domain's is [`SchedCore::fibers`].
+    /// fibers from 0 and cannot reach another's, as on the tree-walk oracle. The root domain's is
+    /// [`SchedCore::fibers`].
     fibers: FiberTables,
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
@@ -14123,16 +14105,18 @@ struct CoopSched {
     freeze_on_quiesce: bool,
 }
 
-/// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
-/// bell, so an embedder signal (a terminal `^C`/`^Z`, a `kill(1)`) delivered *while the pump is
-/// all-parked* rings the bell and re-runs the settle instead of being slept through. Every door is the
-/// same ring — "something changed" — and the pump's settle does the real work (pipe poll, `reap_pending`
-/// re-admit, the `#1215` loop-top kill sweep). Two gaps this closes: (1) `set_kill` was never wired, so a
-/// default-action TERMINATE (`^C` of a job with no handler) set `term_sig` but woke nothing; (2) a fork
-/// twin's doors were never wired at all, so an embedder signal to a foreground/background *twin* (the
-/// shape of a real `cat`) could not ring the root bell. The tree-walker points these doors at
-/// `interrupt_interruptible_parks`/`wake_stopped`; the cooperative pump needs only the ring.
-fn wire_pump_bell(
+/// #1262 — wire a domain's personality signal doors to the run's `#1122` external-wake bell, so an
+/// embedder signal (a terminal `^C`/`^Z`, a `kill(1)`) delivered *while every task is parked* rings
+/// the bell and re-runs the settle instead of being slept through: the pump blocks on the bell at
+/// its all-parked point, and executor 2's watcher settles on each ring ([`ThreadRun::watch`]).
+/// Every door is the same ring — "something changed" — and the settle does the real work (pipe
+/// poll, `reap_pending` re-admit, the `#1215` kill sweep). Two gaps this closes: (1) `set_kill` was
+/// never wired, so a default-action TERMINATE (`^C` of a job with no handler) set `term_sig` but
+/// woke nothing; (2) a fork twin's doors were never wired at all, so an embedder signal to a
+/// foreground/background *twin* (the shape of a real `cat`) could not ring the root bell. The
+/// tree-walker points these doors at `interrupt_interruptible_parks`/`wake_stopped`; the bytecode
+/// executors need only the ring.
+fn wire_run_bell(
     source: &std::sync::Arc<dyn super::SignalSource + Send + Sync>,
     bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
@@ -14195,13 +14179,13 @@ fn settle_wakes(
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
-    // `term_sig` set) must DIE. The tree-walker benches every vCPU of the domain at its per-op
-    // `term_flag` safepoint and traps it; the cooperative driver has no per-op poll, so finalize
-    // each task of a killed domain HERE — running, stopped (#1198-benched), or parked — as a
-    // fatal completion. Because the driver is single-threaded round-robin, a killed task is never
-    // mid-step when its signaller ran, so finalizing at the loop top loses no work; and it runs
-    // before the exit-hook step below, so the twin retires (WIFSIGNALED via `term_sig`) and the
-    // signaller's `waitpid` reaps it in the same settle. Domain-scoped (invariant 12).
+    // `term_sig` set) must DIE. A task mid-step dies at its next op, through its domain's
+    // `term_flag` ([`wire_kill`]), as on the tree-walker; finalize HERE each task of a killed domain
+    // — runnable, stopped (#1198-benched), or parked — as a fatal completion (on executor 2 a task
+    // still mid-step on its thread is marked done too, and its thread drops the stop it brings
+    // back). It runs before the exit-hook step below, so the twin retires (WIFSIGNALED via
+    // `term_sig`) and the signaller's `waitpid` reaps it in the same settle. Domain-scoped
+    // (invariant 12).
     let killed: Vec<usize> = tasks
         .iter()
         .enumerate()
@@ -14433,6 +14417,19 @@ impl SchedCore {
         }
         let root_vt = VTask::new(&dom.source.primary(), entry as usize, args)?;
         let tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none())];
+        wire_kill(host);
+        // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
+        // ring it (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing
+        // deliverable signal; `set_chld_wake` for a child stop/continue re-scan; `set_kill` for a
+        // default-action TERMINATE), the cooperative twin of the tree-walker's scheduler doors. An
+        // embedder (another OS thread, or another wasm-thread instantiation) is the source; each
+        // ring re-runs the settle, which does the work (pipe poll, `reap_pending`, the #1215 kill
+        // sweep), so a ring only says "something changed". See [`wire_run_bell`].
+        if let Some(bell) = host.external_wake() {
+            if let Some((_, source)) = host.signal_poll() {
+                wire_run_bell(&source, &bell);
+            }
+        }
         // §14 `instantiate` children's confined environments (handle = `env` index). The root and its
         // `thread.spawn` siblings use the shared `mem`/`host`/`dom.table` instead (`env == None`).
         let extra_envs: Vec<ChildEnv> = Vec::new();
@@ -14539,24 +14536,6 @@ impl CoopSched {
             core.tasks[0].vm.vt.active.jit_eligible = Some(std::sync::Arc::clone(e));
             core.tasks[0].vm.vt.active.jit_page_checked = page_checked;
         }
-        // #1122 — an armed external-wake doorbell: wire the personality's pipe-wake door to ring
-        // it (the cooperative twin of the tree-walker's `set_pipe_wake` → scheduler wiring). The
-        // pump then BLOCKS on the bell at its would-be all-parked deadlock and re-polls pipe
-        // readiness on each ring — an embedder's `feed_terminal` (another OS thread, or another
-        // wasm-thread instantiation) is the wake source. The pipe id is unused: the pump's settle
-        // already polls every parked pipe, so the ring only needs to say "something changed".
-        // #1122/#1146/#1262 — wire the root's personality signal doors to ring the external-wake bell
-        // (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing deliverable
-        // signal; `set_chld_wake` for a child stop/continue re-scan; `set_kill` for a default-action
-        // TERMINATE), so an embedder signal delivered while the pump is all-parked re-runs the settle
-        // instead of being slept through. The pump's settle does the work (pipe poll, `reap_pending`,
-        // the #1215 kill sweep). See [`wire_pump_bell`].
-        if let Some(bell) = host.external_wake() {
-            if let Some((_, source)) = host.signal_poll() {
-                wire_pump_bell(&source, &bell);
-            }
-        }
-
         Ok(CoopSched {
             core,
             emit: EmitTier {
@@ -16996,170 +16975,6 @@ fn coop_bounce(
     Ok(cr.len())
 }
 
-/// THREADS.md step 4c — a **native futex**, the parallel driver's stand-in for wasm
-/// `memory.atomic.wait`/`notify`. A parked waiter enqueues a token (its own `woken` flag + `Condvar`)
-/// under its address key; `notify` wakes up to `count` of them FIFO. The compare-and-park runs under
-/// `buckets`, so a concurrent `notify` cannot slip between a waiter reading the futex word and parking
-/// (the std-sync analogue of the kernel's per-bucket futex lock) — no lost wakeups. In real wasm this
-/// role is played by `memory.atomic.wait`/`notify` directly; here it serves the cooperative oracle's
-/// same `wait`/`notify` semantics for genuinely parallel vCPUs.
-///
-/// #2189 — one table for the whole run, keyed as the cooperative driver keys its waits
-/// ([`super::FutexKey`]): a §13 region word that a parent and its child both map is one key in both
-/// domains, so a notify in either reaches a waiter in the other, while anonymous pages key on their
-/// backing and stay apart.
-#[derive(Default)]
-struct Futex {
-    buckets: std::sync::Mutex<
-        std::collections::HashMap<
-            super::FutexKey,
-            std::collections::VecDeque<std::sync::Arc<Waiter>>,
-        >,
-    >,
-}
-
-struct Waiter {
-    woken: std::sync::Mutex<bool>,
-    cv: std::sync::Condvar,
-    /// The waiter's domain ([`ParDomain`], by address), so a domain's death wakes only its members.
-    domain: usize,
-}
-
-impl Futex {
-    /// `memory.wait`: compare the futex word at `base` to `expected` under the bucket lock; if it
-    /// already differs, return `WAIT_NOT_EQUAL` without parking (the fast path). Otherwise enqueue a
-    /// token and park on it until `notify` wakes it (`WAIT_WOKEN`) or `timeout` ns elapse
-    /// (`WAIT_TIMED_OUT`). Mirrors the cooperative `BlockedWait` arm; the per-token flag absorbs
-    /// spurious condvar wakeups.
-    /// `timeout` is the guest's own, **unclamped** (#1641) — two waiters asking 30 s and 20 s
-    /// must not tie at a 10 s cap and wake in the wrong order.
-    ///
-    /// `None` (an infinite wait) is the one case this driver still backstops with [`MAX_WAIT`],
-    /// and it is a **known divergence** from the oracle in both directions (#1652): a satisfiable
-    /// wait longer than the cap returns a spurious `WAIT_TIMED_OUT` where the oracle waits it out,
-    /// and an unsatisfiable one returns `WAIT_TIMED_OUT` at 10 s where the oracle faults. It stays
-    /// only because this driver runs each vCPU on its own OS thread with no cross-thread park
-    /// census, so dropping the backstop outright would turn the second case into a hang.
-    fn wait(
-        &self,
-        domain: &ParDomain,
-        mem: &Mem,
-        base: u64,
-        expected: u64,
-        width: u32,
-        timeout: Option<u64>,
-    ) -> i32 {
-        let key = mem.futex_key(base);
-        let waiter = {
-            let mut buckets = self.buckets.lock().unwrap();
-            // A domain that died since this vCPU's last safepoint: its kill scanned the buckets
-            // before this waiter was in them ([`ParDomain::kill`] records the death, *then* takes
-            // this lock to wake), so ask here, under the lock, and return as its wake would have.
-            if domain.dead().is_some() {
-                return super::WAIT_WOKEN;
-            }
-            // Compare-under-lock: the futex word lives in the shared backing (`atomic_value` reads it).
-            if mem.atomic_value(base, width) != expected {
-                return super::WAIT_NOT_EQUAL;
-            }
-            let w = std::sync::Arc::new(Waiter {
-                woken: std::sync::Mutex::new(false),
-                cv: std::sync::Condvar::new(),
-                domain: domain as *const ParDomain as usize,
-            });
-            buckets
-                .entry(key)
-                .or_default()
-                .push_back(std::sync::Arc::clone(&w));
-            w
-        };
-        // Park on our own token (the bucket lock is released): woken by `notify`, or timed out.
-        let timeout = timeout.map_or(super::MAX_WAIT, std::time::Duration::from_nanos);
-        let (flag, res) = waiter
-            .cv
-            .wait_timeout_while(waiter.woken.lock().unwrap(), timeout, |w| !*w)
-            .unwrap();
-        let woken = *flag;
-        drop(flag);
-        if woken {
-            super::WAIT_WOKEN
-        } else {
-            debug_assert!(res.timed_out());
-            // Timed out: de-enqueue our (possibly still-parked) token so a later `notify` skips it.
-            let mut buckets = self.buckets.lock().unwrap();
-            if let Some(q) = buckets.get_mut(&key) {
-                q.retain(|x| !std::sync::Arc::ptr_eq(x, &waiter));
-            }
-            super::WAIT_TIMED_OUT
-        }
-    }
-
-    /// `memory.notify`: wake up to `count` waiters parked on `base` in `mem`, FIFO, and return how
-    /// many were woken (mirrors the cooperative `Notify` arm's count; the guest typically ignores it).
-    fn notify(&self, mem: Option<&Mem>, base: u64, count: i32) -> i32 {
-        let key = mem.map_or(super::FutexKey::Anon(0, base), |m| m.futex_key(base));
-        let want = count as u32;
-        let mut buckets = self.buckets.lock().unwrap();
-        let mut woken = 0u32;
-        if let Some(q) = buckets.get_mut(&key) {
-            while woken < want {
-                let Some(w) = q.pop_front() else { break };
-                *w.woken.lock().unwrap() = true;
-                w.cv.notify_one();
-                woken += 1;
-            }
-        }
-        woken as i32
-    }
-
-    /// Wake every waiter of `domain` (it died — see [`ParDomain::kill`]); each returns `WAIT_WOKEN`
-    /// and its vCPU observes the death at its next safepoint.
-    fn wake_domain(&self, domain: &ParDomain) {
-        let id = domain as *const ParDomain as usize;
-        let mut buckets = self.buckets.lock().unwrap();
-        for q in buckets.values_mut() {
-            q.retain(|w| {
-                if w.domain != id {
-                    return true;
-                }
-                *w.woken.lock().unwrap() = true;
-                w.cv.notify_one();
-                false
-            });
-        }
-    }
-}
-
-#[cfg(test)]
-mod par_futex_tests {
-    use super::*;
-
-    /// A domain that died between a member's loop-top `dead()` check and its futex enqueue: the
-    /// kill's wake scanned the buckets before the waiter was in them. The waiter must see the death
-    /// under the bucket lock, not sleep out its timeout (`MAX_WAIT`, 10 s, for an infinite wait).
-    #[test]
-    fn a_wait_in_a_domain_that_died_before_it_enqueued_returns_at_once() {
-        let mem = Mem::with_reservation(temen_ir::DEFAULT_RESERVED_LOG2, 16, None);
-        let base = mem.prepare_wait(16384, IntTy::I32).expect("in bounds");
-        let reg = ThreadRegistry::new();
-        let dom = ParDomain::default();
-        dom.kill(&Trap::ThreadFault, &reg);
-        let t0 = std::time::Instant::now();
-        let r = reg.futex.wait(&dom, &mem, base, 0, 4, None);
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(2),
-            "slept {:?} in a dead domain",
-            t0.elapsed()
-        );
-        assert_eq!(r, super::super::WAIT_WOKEN);
-    }
-}
-
-/// #2006 — a detached child its driver refuses at the run's live-vCPU cap, after the admission charged
-/// its window and first vCPU, hands both back: a spawn refused after its admission charges nothing
-/// (#1975), on every driver that schedules the child itself. A guest cannot reach the cap cheaply
-/// (`MAX_VCPUS` live vCPUs, an OS thread each on the parallel driver), so each driver's scheduling
-/// step is called directly with its live count full.
 /// #2112 — the debug scheduler ends a child domain when its last task ends, not when its root does,
 /// as the oracle ends a domain with its last vCPU: a thread still running may resume the fibers its
 /// root left, so they stay, and stay charged, until it ends too.
@@ -17235,6 +17050,11 @@ mod dbg_domain_end_tests {
     }
 }
 
+/// #2006 — a detached child its driver refuses at the run's live-vCPU cap, after the admission charged
+/// its window and first vCPU, hands both back: a spawn refused after its admission charges nothing
+/// (#1975), on every driver that schedules the child itself. A guest cannot reach the cap cheaply
+/// (`MAX_VCPUS` live vCPUs, an OS thread each on the parallel driver), so each driver's scheduling
+/// step is called directly with its live count full.
 #[cfg(test)]
 mod live_cap_tests {
     use super::*;
@@ -17316,317 +17136,8 @@ mod live_cap_tests {
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(held(&host), (0, 0), "nothing stays charged");
     }
-
-    #[test]
-    fn the_parallel_driver_hands_a_refused_childs_window_back() {
-        let (host, child) = admitted();
-        let host = std::sync::Arc::new(std::sync::Mutex::new(host));
-        let dom = Domain::new(unit(), 0);
-        let reg = ThreadRegistry::new();
-        reg.live
-            .store(crate::MAX_VCPUS, std::sync::atomic::Ordering::Relaxed);
-        let mut threads = Vec::new();
-        let r = std::thread::scope(|scope| {
-            par_start_child(
-                scope,
-                &dom,
-                &reg,
-                &host,
-                &ParDomain::default(),
-                &mut threads,
-                child,
-                0,
-            )
-        });
-        assert_eq!(r, Err(Trap::ThreadFault));
-        assert!(threads.is_empty(), "nothing was started");
-        assert_eq!(
-            reg.live.load(std::sync::atomic::Ordering::Relaxed),
-            crate::MAX_VCPUS,
-            "the refusal took no live slot"
-        );
-        assert_eq!(
-            held(&host.lock_unpoisoned()),
-            (0, 0),
-            "nothing stays charged"
-        );
-    }
 }
 
-/// One **domain** of the parallel driver (DESIGN.md §12): the root and its `thread.spawn` threads,
-/// or a §14 confined child or fork twin and its threads — the world that shares one window and
-/// powerbox. It holds the domain's fiber registry (#1761) and its death: a member's trap is
-/// terminal for the whole domain (I37, the cooperative `teardown_domains` rule), so the first trap
-/// is recorded here and every other member dies with it at its next safepoint — the per-quantum
-/// check, or a futex wait / join this kill wakes. A sibling's trap thereby becomes the root's result.
-#[derive(Default)]
-struct ParDomain {
-    fibers: SharedFibers,
-    dead: std::sync::Mutex<Option<Trap>>,
-    /// #2074 — the §14 children this domain's vCPUs spawned, by their id in its registry: the domain
-    /// each runs in, the registry its own vCPUs join through and its powerbox. A kill reaches them
-    /// through it, and so does a grant (#2220).
-    kids: std::sync::Mutex<std::collections::BTreeMap<u64, ParChild>>,
-}
-
-/// A §14 child of a [`ParDomain`]: its own domain, the registry its vCPUs join through, and its
-/// powerbox, which its OS thread runs over.
-type ParChild = (
-    std::sync::Arc<ParDomain>,
-    std::sync::Arc<ThreadRegistry>,
-    DomainCell,
-);
-
-impl ParDomain {
-    /// This domain's trap, once a member has died.
-    fn dead(&self) -> Option<Trap> {
-        *self.dead.lock_unpoisoned()
-    }
-
-    /// A member trapped with `t`: record it (the first trap wins) and wake every member blocked in a
-    /// futex wait or a join, so each observes the death.
-    fn kill(&self, t: &Trap, reg: &ThreadRegistry) {
-        {
-            let mut d = self.dead.lock_unpoisoned();
-            if d.is_some() {
-                return;
-            }
-            *d = Some(*t);
-        }
-        reg.futex.wake_domain(self);
-        {
-            let _g = reg.done.lock().unwrap_or_else(|e| e.into_inner());
-            reg.woken.notify_all();
-        }
-        reg.wake_fork_waiters();
-    }
-
-    /// `Instantiator.kill` (#2074): end this child domain, whose vCPUs join through `reg`, and every
-    /// child domain under it, with `ThreadFault` ([`ParDomain::kill`] wakes its parked members; a
-    /// running one stops at its next safepoint). The parallel driver's child scope joins its
-    /// children before it ends, so a domain that has ended has none left alive.
-    fn kill_tree(&self, reg: &ThreadRegistry) {
-        self.kill(&Trap::ThreadFault, reg);
-        let kids: Vec<ParChild> = self.kids.lock_unpoisoned().values().cloned().collect();
-        for (d, r, _) in kids {
-            d.kill_tree(&r);
-        }
-    }
-}
-
-/// THREADS.md step 4c — the cross-thread `thread.spawn`/`join` rendezvous for the parallel driver.
-/// The cooperative `drive` keeps its child vCPUs in one `tasks` vec and wakes joiners inline; the
-/// parallel driver runs each vCPU on its **own OS thread**, so a joiner blocks here on a `Condvar`
-/// until the child it named publishes its result. One `id` namespace across the whole run (handed out
-/// by `next_id`); a child's result (value-or-trap) is delivered to the lowest-index waiter via the
-/// `done` map. `futex` serves the guest's `memory.wait`/`notify` across threads.
-struct ThreadRegistry {
-    done: std::sync::Mutex<std::collections::HashMap<u64, Result<Vec<Value>, Trap>>>,
-    woken: std::sync::Condvar,
-    next_id: std::sync::atomic::AtomicU64,
-    /// The run's live vCPUs, the root among them, shared by every domain's registry: what the
-    /// `MAX_VCPUS` anti-bomb gate counts, as the cooperative driver counts its tasks (#2006). Taken by
-    /// [`Self::try_start`], given back by [`Self::end`].
-    live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// The run's futex, shared by every domain's registry like `live` (#2189).
-    futex: std::sync::Arc<Futex>,
-    /// #748 — the personality **fork-twin table** for the parallel driver's `ForkSelf`/`ReapWait`
-    /// arms: `(exited pids, generation)`. Exited pids are permanent (never removed — pids are
-    /// per-run unique), so a `waitpid(pid)` waiter can never miss its wake. The generation bumps
-    /// once per twin exit so an **any-child** waiter waits for "an exit newer than the ones my
-    /// re-issued waitpid already consumed" — the condvar analogue of the cooperative driver's
-    /// consumed-Done-twin prune: a stale exit can neither re-wake forever nor be lost (an exit
-    /// before the op's table check left a zombie the re-issue reaps; one after bumps past the
-    /// waiter's recorded generation).
-    fork_exits: std::sync::Mutex<(std::collections::HashSet<i64>, u64)>,
-    fork_woken: std::sync::Condvar,
-    /// The next personality twin pid. Starts at 2: the root personality is pid 1 (the same
-    /// no-collision shape as the cooperative driver's `task index + 1`).
-    next_fork_pid: std::sync::atomic::AtomicI64,
-    /// This registry, for the personality doors [`wire_parallel_doors`] installs: they outlive the
-    /// run on the host's signal source, so they hold it weakly.
-    me: std::sync::Weak<ThreadRegistry>,
-}
-
-impl ThreadRegistry {
-    /// A run's root registry: its live count starts at one, the root vCPU.
-    fn new() -> std::sync::Arc<ThreadRegistry> {
-        Self::counting(
-            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            std::sync::Arc::default(),
-        )
-    }
-
-    /// A child domain's registry: its own join table and fork table, counted in the run's live
-    /// vCPUs, waiting in the run's futex.
-    fn child(&self) -> std::sync::Arc<ThreadRegistry> {
-        Self::counting(
-            std::sync::Arc::clone(&self.live),
-            std::sync::Arc::clone(&self.futex),
-        )
-    }
-
-    fn counting(
-        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        futex: std::sync::Arc<Futex>,
-    ) -> std::sync::Arc<Self> {
-        std::sync::Arc::new_cyclic(|me| ThreadRegistry {
-            done: std::sync::Mutex::new(std::collections::HashMap::new()),
-            woken: std::sync::Condvar::new(),
-            next_id: std::sync::atomic::AtomicU64::new(0),
-            live,
-            futex,
-            fork_exits: std::sync::Mutex::new((std::collections::HashSet::new(), 0)),
-            fork_woken: std::sync::Condvar::new(),
-            next_fork_pid: std::sync::atomic::AtomicI64::new(2),
-            me: me.clone(),
-        })
-    }
-
-    /// #748 — a fork twin's OS thread finished (its exit hooks have already fired, so the
-    /// personality table shows the zombie): record the exit and wake every reap waiter.
-    fn publish_fork_exit(&self, pid: i64) {
-        let mut g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
-        g.0.insert(pid);
-        g.1 += 1;
-        self.fork_woken.notify_all();
-    }
-
-    /// Something other than an exit a reap waiter must re-check (a kill, a raise, a child
-    /// stop/continue): wake them all under the table lock, so a waiter between its check and its
-    /// wait cannot miss it.
-    fn wake_fork_waiters(&self) {
-        let _g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
-        self.fork_woken.notify_all();
-    }
-
-    /// #748 — block this vCPU's OS thread until `child` (`Some(pid)`) has published its exit, or
-    /// (`None`, the any-child wait) until the exit generation exceeds `last_gen`. Returns the
-    /// current generation for the caller to carry into its next wait; either way the caller's
-    /// rewound `waitpid` re-executes against the updated personality table.
-    ///
-    /// `interrupted` asks, under the table lock, whether anything else this park must not sleep
-    /// through has happened (see the `ReapWait` arm); each such event rings
-    /// [`Self::wake_fork_waiters`] after raising its fact, so the pair cannot lose it.
-    fn wait_fork_exit(
-        &self,
-        child: Option<i64>,
-        last_gen: u64,
-        interrupted: impl Fn() -> bool,
-    ) -> u64 {
-        let mut g = self.fork_exits.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            let ready = match child {
-                Some(pid) => g.0.contains(&pid),
-                None => g.1 > last_gen,
-            };
-            if ready || interrupted() {
-                return g.1;
-            }
-
-            g = self.fork_woken.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
-    }
-
-    /// Take one of the run's live-vCPU slots for a vCPU about to be made, the cooperative
-    /// `live >= MAX_VCPUS` gate across threads: `false`, with nothing taken, when the run is full.
-    fn try_start(&self) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        if self.live.fetch_add(1, Relaxed) < super::MAX_VCPUS {
-            return true;
-        }
-        self.live.fetch_sub(1, Relaxed);
-        false
-    }
-
-    /// Give back a slot [`Self::try_start`] took: its vCPU ended, or was never made.
-    fn end(&self) {
-        self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// A spawned vCPU finished: publish its result and wake any joiner parked on it.
-    fn publish(&self, id: u64, res: Result<Vec<Value>, Trap>) {
-        self.done.lock().unwrap().insert(id, res);
-        self.end();
-        self.woken.notify_all();
-    }
-
-    /// Block until vCPU `id` has published, then deliver its result by [`super::join_delivery`] —
-    /// consumed unless a `wait` leaves it for a `join` — the parallel analogue of the cooperative
-    /// `BlockedJoin` wakeup. A child trap is returned to propagate to the joiner. A joiner whose own
-    /// `domain` dies while it waits completes with the domain's trap.
-    fn join(&self, id: u64, domain: &ParDomain, wait: bool) -> (Result<Reg, Trap>, bool) {
-        let mut g = self.done.lock().unwrap();
-        loop {
-            if let Some(r) = g.get(&id) {
-                let (out, keep) = super::join_delivery(r, wait);
-                if !keep {
-                    g.remove(&id);
-                }
-                return (out, keep);
-            }
-            if let Some(t) = domain.dead() {
-                return (Err(t), false);
-            }
-            g = self.woken.wait(g).unwrap();
-        }
-    }
-}
-
-/// #1246 — wire a parallel domain's default-action TERMINATE door: the personality's `set_kill`
-/// closure stores into this host's `term_flag`, the atomic every vCPU of the domain polls per op in
-/// [`Vm::resume`] and traps on. Called on the root host and on each fork twin's freshly-minted host;
-/// a host with no signal personality is a no-op.
-///
-/// A running vCPU needs nothing more, but a **blocked** one polls nothing: one parked in a futex
-/// `wait` slept out its timeout (10 s for an infinite wait), and one parked in a blocking `waitpid`
-/// until a child exited — forever, if that child was parked too. So the deferred doors wake them:
-/// a terminate is this domain's death, the same `ThreadFault` the per-op poll raises
-/// ([`ParDomain::kill`] wakes its futex waiters, joiners and reap waiters), and a deliverable raise
-/// or a child's stop/continue re-checks every reap waiter (the `ReapWait` arm's predicate).
-fn wire_parallel_doors(
-    host: &std::sync::Arc<std::sync::Mutex<Host>>,
-    reg: &ThreadRegistry,
-    domain: &std::sync::Arc<ParDomain>,
-) {
-    let (term_flag, source) = {
-        let hg = host.lock_unpoisoned();
-        (hg.term_flag.clone(), hg.signal_poll().map(|(_, s)| s))
-    };
-    if let Some(source) = source {
-        // #1259 — the `term_flag` write is the INLINE apply (fired synchronously by the personality),
-        // not a deferred wake: a per-op-polling parallel vCPU needs no scheduler notify, and applying it
-        // in program order keeps it reorder-free by construction.
-        source.set_kill_apply(std::sync::Arc::new(move || {
-            term_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }));
-        let (r, d) = (reg.me.clone(), std::sync::Arc::downgrade(domain));
-        source.set_kill(std::sync::Arc::new(move || {
-            if let (Some(r), Some(d)) = (r.upgrade(), d.upgrade()) {
-                d.kill(&Trap::ThreadFault, &r);
-            }
-        }));
-        let ring = |r: std::sync::Weak<ThreadRegistry>| -> std::sync::Arc<dyn Fn() + Send + Sync> {
-            std::sync::Arc::new(move || {
-                if let Some(r) = r.upgrade() {
-                    r.wake_fork_waiters();
-                }
-            })
-        };
-        source.set_wake(ring(reg.me.clone()));
-        source.set_chld_wake(ring(reg.me.clone()));
-    }
-}
-
-/// THREADS.md step 4c — the **parallel** driver (the host-selected `Parallel` mode). One guest's vCPUs
-/// run on **separate OS threads** sharing **one** `Region::shared` window, instead of the cooperative
-/// `drive`'s single-thread `tasks` loop. `std::thread::scope` borrows the `&Domain` (which is `Sync`)
-/// and the `&ThreadRegistry` into each child and joins every still-running thread before returning, so
-/// the window is quiescent for the snapshot. The root runs on the calling thread (it never
-/// `atomic.wait`s — `join` blocks on a `Condvar`, sidestepping the browser main-thread-wait wrinkle).
-/// Returns the root's result and its (now-quiescent) `Mem` for capture. Scope: the pure-threads subset
-/// (`thread.spawn`/`join` + atomics); other multi-vCPU events fail closed (see
-/// [`compile_and_run_capture_over_parallel`]).
 /// Whether a run's entry is a durable **thaw** continuing an already-charged run (its root re-enters
 /// under `REWINDING`), which takes no entry charge: the gate the tree-walker's `drive` applies to its
 /// own.
@@ -17634,67 +17145,10 @@ fn thaws(host: &Host, mem: Option<&Mem>) -> bool {
     host.is_durable() && mem.is_some_and(|m| m.durable_thaw_state(0) == super::STATE_REWINDING)
 }
 
-fn drive_parallel(
-    dom: Domain,
-    entry: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-    mem: Option<Mem>,
-    host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let root_vt = match VTask::new(&dom.source.primary(), entry as usize, args) {
-        Ok(v) => v,
-        Err(t) => return (Err(t), mem),
-    };
-    // #1944 slice 3 — an activation of `host`: every vCPU thread draws from the host's own node, and
-    // `fuel` reads back the room left once each has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
-    // Fuel unification: entering the top-level entry costs one fuel, as `CoopSched::new` and the
-    // tree-walker charge it (#2113 found this driver skipping it).
-    if !thaws(host, mem.as_ref()) {
-        if let Err(t) = root_fuel.burn() {
-            drop(root_fuel);
-            *fuel = host.fuel_left();
-            return (Err(t), mem);
-        }
-    }
-    let reg = ThreadRegistry::new();
-    // Share the caller's powerbox across every vCPU thread, then hand it back (so the caller reads its
-    // stdout / final state). `Arc` (not a scope-borrowed `&Mutex`) because a personality fork twin
-    // (#748) carries its OWN host cell minted at runtime — per-process powerboxes, the parallel twin
-    // of the cooperative driver's `extra_envs`. `scope` joins all vCPUs before returning, so every
-    // clone is dropped and the unwrap below is the sole owner.
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(host)));
-    // #1246 — wire the root domain's terminate door (a guest that kills its own group, or is killed
-    // by an embedder, dies at its next per-op poll). Fork twins get theirs at mint (the `ForkSelf` arm).
-    let root_domain = std::sync::Arc::new(ParDomain::default());
-    wire_parallel_doors(&shared, &reg, &root_domain);
-    let out = std::thread::scope(|scope| {
-        run_vcpu_parallel(
-            scope,
-            &dom,
-            &reg,
-            std::sync::Arc::clone(&shared),
-            root_domain,
-            None,
-            root_vt,
-            mem,
-            root_fuel,
-        )
-    });
-    *host = match std::sync::Arc::try_unwrap(shared) {
-        Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-        // Unreachable in practice (the scope joined every holder), but never lose the powerbox.
-        Err(a) => std::mem::take(&mut *a.lock().unwrap_or_else(|e| e.into_inner())),
-    };
-    *fuel = host.fuel_left();
-    out
-}
-
 // === #1414 3e — executor 2: one OS thread per task over the run's scheduling core ===============
 
 /// How long the thread of a task parked on what no rule wakes (a pipe, stdin, a fiber parked on the
-/// host or on a punted call) sleeps before it looks again: the parallel driver's pipe poll.
+/// host or on a punted call) sleeps before it looks again.
 const THREADS_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 
 /// Executor 2's shared state (#1414 3e): the run's scheduling core and what its threads keep beside
@@ -17729,13 +17183,30 @@ impl Threads {
     }
 }
 
-/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, and
-/// the instant the run's wall clock counts from.
+/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, the
+/// instant the run's wall clock counts from, and the external-wake bell an embedder armed (#1122).
 struct ThreadRun<'a> {
     dom: &'a Domain,
     root: DomainCell,
     state: std::sync::Mutex<Threads>,
     start: std::time::Instant,
+    bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
+}
+
+/// Ends the run if its thread unwinds. A panic in a step or a rule is a bug; without this the other
+/// threads stay parked, the scope never joins them, and the run hangs instead of failing.
+struct EndOnPanic<'a, 'r>(&'a ThreadRun<'r>);
+
+impl Drop for EndOnPanic<'_, '_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut g = self.0.state.lock_unpoisoned();
+            g.over.get_or_insert(Err(Trap::ThreadFault));
+            g.woken = g.parks.clone();
+            release(g);
+            self.0.ring();
+        }
+    }
 }
 
 /// Whether task `t` needs nothing from a rule to go on: it can run, or it has ended.
@@ -17754,18 +17225,19 @@ enum ParkFor {
     Poll { pending: bool },
 }
 
-/// Executor 2 (#1414 3e): a run's tasks, each on its own OS thread (D56), over one [`SchedCore`]
-/// under one lock. A thread steps its own task without the lock, over its own view of its domain's
-/// window and its own hand of the domain's fuel, as the parallel driver's vCPUs do. At each stop it
+/// Executor 2, the parallel driver (#1414 3e): a run's tasks, each on its own OS thread (D56), over
+/// one [`SchedCore`] under one lock. A thread steps its own task without the lock, over its own view
+/// of its domain's window and its own hand of the domain's fuel. At each stop it
 /// takes the lock and applies the stop's rule ([`SchedCore::on_stop`]) and the wake scans, as the
 /// pump does between steps. While a task steps, its VM is out of the table: the rules write only a
 /// parked task's VM, and a parked task's VM is in the table.
 ///
 /// What is the executor's own: a parked task's thread waits on its own condvar; a wait times out
 /// on the wall clock (the core's `clock` reads nanoseconds since the run started, so the rules'
-/// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); and
-/// the run ends when its root does, the other tasks stopping at their next look, or with the pump's
-/// deadlock verdict ([`ThreadRun::park`]).
+/// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); an
+/// armed external-wake bell has a watcher that settles the run on each ring ([`ThreadRun::watch`]);
+/// and the run ends when its root does, the other tasks stopping at their next look, or with the
+/// pump's deadlock verdict ([`ThreadRun::settle`]).
 fn drive_threads(
     dom: &Domain,
     entry: FuncIdx,
@@ -17786,6 +17258,7 @@ fn drive_threads(
             return (Err(t), mem);
         }
     };
+    let bell = host.external_wake();
     let run = ThreadRun {
         dom,
         root: std::mem::take(host).into_cell(),
@@ -17799,9 +17272,20 @@ fn drive_threads(
             fault: None,
         }),
         start: std::time::Instant::now(),
+        bell,
     };
     let (view, hand) = run.state.lock_unpoisoned().hand(None);
-    std::thread::scope(|scope| run_task_thread(scope, &run, 0, view, hand));
+    std::thread::scope(|scope| {
+        let run = &run;
+        if let Some(bell) = &run.bell {
+            // The ring count before the run starts, so the watcher misses no ring the run makes.
+            let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
+            scope.spawn(move || run.watch(bell, seen));
+        }
+        run_task_thread(scope, run, 0, view, hand);
+        // The run is over: one more ring, and the watcher sees it and ends.
+        run.ring();
+    });
     let ThreadRun { root, state, .. } = run;
     let Threads {
         mut core,
@@ -17840,6 +17324,7 @@ fn run_task_thread<'scope, 'env>(
     mut mem: Option<Mem>,
     mut fuel: Fuel,
 ) {
+    let _end = EndOnPanic(run);
     let mut g = run.state.lock_unpoisoned();
     let park = std::sync::Arc::clone(&g.parks[ti]);
     let mut env = g.core.tasks[ti].env;
@@ -17927,6 +17412,14 @@ fn release(mut g: std::sync::MutexGuard<'_, Threads>) {
 }
 
 impl ThreadRun<'_> {
+    /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
+    fn ring(&self) {
+        if let Some(bell) = &self.bell {
+            *bell.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            bell.1.notify_all();
+        }
+    }
+
     /// The core's clock on this executor: nanoseconds since the run started, so a wait's deadline
     /// (`clock + timeout`, as the rules compute it) is a wall-clock one.
     fn now(&self) -> u64 {
@@ -17974,7 +17467,7 @@ impl ThreadRun<'_> {
             let (mem, fuel) = g.hand(g.core.tasks[j].env);
             made.push((j, mem, fuel));
         }
-        self.wake(g, &was_awake, ti);
+        self.wake(g, &was_awake, Some(ti));
         made
     }
 
@@ -18031,13 +17524,13 @@ impl ThreadRun<'_> {
         }
     }
 
-    /// Queue the thread of every task `was_awake` shows parked that is now awake, but `ti`'s (the
-    /// caller's own), to be signalled when the lock is let go ([`release`]); every thread once the
-    /// run is over.
-    fn wake(&self, g: &mut Threads, was_awake: &[bool], ti: usize) {
+    /// Queue the thread of every task `was_awake` shows parked that is now awake, but `own`'s (the
+    /// caller's, if it is a task's thread), to be signalled when the lock is let go ([`release`]);
+    /// every thread once the run is over.
+    fn wake(&self, g: &mut Threads, was_awake: &[bool], own: Option<usize>) {
         for (j, park) in g.parks.iter().enumerate() {
             let woke = !was_awake.get(j).copied().unwrap_or(true) && awake(&g.core.tasks[j]);
-            if j != ti && (woke || g.over.is_some()) {
+            if Some(j) != own && (woke || g.over.is_some()) {
                 g.woken.push(std::sync::Arc::clone(park));
             }
         }
@@ -18149,874 +17642,35 @@ impl ThreadRun<'_> {
         };
         let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
         self.settle(&mut g);
-        self.wake(&mut g, &was_awake, ti);
+        self.wake(&mut g, &was_awake, Some(ti));
         g
     }
-}
 
-/// Run process `pid` of a parallel run on its own OS thread, over its own powerbox cell, window and
-/// table — a fork twin continuing its parent's image, or a spawned process starting a new one — and
-/// retire it when it ends: its pipe ends released (EOF/`-EPIPE` for peers) and its exit hooks fired
-/// once with the reap-encoded status (Live → Zombie in the personality table), THEN its exit
-/// published, so a woken waiter's re-issued `waitpid` finds the zombie already there.
-#[allow(clippy::too_many_arguments)]
-fn start_process<'scope, 'env>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    dom: &'env Domain,
-    reg: &'env ThreadRegistry,
-    host: std::sync::Arc<std::sync::Mutex<Host>>,
-    tbl: Option<std::sync::Arc<SharedSlots>>,
-    vt: VTask,
-    mem: Option<Mem>,
-    fuel: Fuel,
-    pid: i64,
-    live: LiveVcpu,
-) {
-    // #1246 — the process's own terminate door, so a SIGKILL/SIGTERM to it sets its `term_flag` and its
-    // resume loop traps at the next op (its parent's `waitpid` then reaps the WIFSIGNALED death).
-    let domain = std::sync::Arc::new(ParDomain::default());
-    wire_parallel_doors(&host, reg, &domain);
-    let hooks_host = std::sync::Arc::clone(&host);
-    scope.spawn(move || {
-        let (r, _m) = run_vcpu_parallel(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
-        let status = super::reap_status(&r);
-        let hooks = {
-            let mut g = hooks_host.lock_unpoisoned();
-            g.release_memory(); // #1909, #2106
-            g.release_pipe_ends();
-            g.exit_hooks.clone()
-        };
-        for h in hooks {
-            h(status);
-        }
-        drop(live); // #2001: its `spawn` goes back before a reaper can see it ended
-        reg.end();
-        reg.publish_fork_exit(pid);
-    });
-}
-
-/// Run one vCPU of the parallel driver to completion on **this** OS thread, fanning each
-/// `thread.spawn` onto a fresh scoped thread (over a `fork_for_thread` view of the shared window) and
-/// blocking each `thread.join` on the [`ThreadRegistry`]. Mirrors the cooperative `drive`'s `Spawn` /
-/// `Join` / `Done` arms, one vCPU at a time. Returns this vCPU's result and the `Mem` it owned (the
-/// root's is the one captured; a child's is dropped, its bytes already live in the shared backing).
-#[allow(clippy::too_many_arguments)] // an internal driver entry: the args ARE the vCPU's identity
-fn run_vcpu_parallel<'scope, 'env>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    dom: &'env Domain,
-    reg: &'env ThreadRegistry,
-    host: std::sync::Arc<std::sync::Mutex<Host>>,
-    domain: std::sync::Arc<ParDomain>,
-    tbl: Option<std::sync::Arc<SharedSlots>>,
-    vt: VTask,
-    mem: Option<Mem>,
-    fuel: Fuel,
-) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    let d = std::sync::Arc::clone(&domain);
-    let out = run_vcpu_parallel_body(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
-    // A member's trap is terminal for its domain (I37): the others die with it, so the scope that
-    // joins them — and the run — ends instead of waiting on vCPUs that would never finish.
-    if let Err(t) = &out.0 {
-        d.kill(t, reg);
-    }
-    out
-}
-
-/// [`run_vcpu_parallel`]'s loop, without the domain kill on a trap.
-#[allow(clippy::too_many_arguments)] // an internal driver entry: the args ARE the vCPU's identity
-fn run_vcpu_parallel_body<'scope, 'env>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    dom: &'env Domain,
-    reg: &'env ThreadRegistry,
-    // This vCPU's powerbox cell: the run's shared host for the root and its `thread.spawn` siblings
-    // (4c-host), or a fork twin's OWN forked powerbox (#748) — its own spawned threads then share
-    // *that*. Owned `Arc` so a twin's runtime-minted cell moves into its scoped thread cleanly.
-    host: std::sync::Arc<std::sync::Mutex<Host>>,
-    // This vCPU's domain (its fiber registry, #1761, and its death), shared like the powerbox: by
-    // the root and its `thread.spawn` siblings. A fork twin or a §14 confined child is its own
-    // process and starts a fresh one.
-    domain: std::sync::Arc<ParDomain>,
-    // This vCPU's dispatch table when it is not the domain's shared `dom.table`: an `exec_module`
-    // image-replace (#748 rung 2) installs the command's natural table here, and a fork twin (same
-    // image as its parent) or `thread.spawn` child (same image as its spawner) inherits its
-    // parent's. `Arc` so inheritance is a clone, not a rebuild.
-    mut tbl: Option<std::sync::Arc<SharedSlots>>,
-    mut vt: VTask,
-    mut mem: Option<Mem>,
-    mut fuel: Fuel,
-) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
-    // handle (index) → global vCPU id of a `thread.spawn` child (shares the cooperative handle scheme).
-    let mut threads: Vec<Option<u64>> = Vec::new();
-    // #748 — the exit generation this vCPU's any-child `waitpid` has consumed up to (see
-    // [`ThreadRegistry::wait_fork_exit`]).
-    let mut fork_gen: u64 = 0;
-    loop {
-        // A sibling's trap killed this domain (I37): die with it.
-        if let Some(t) = domain.dead() {
-            return (Err(t), mem);
-        }
-        let mut ctx = RunCtx {
-            table: tbl.as_deref().unwrap_or(&dom.table),
-            fuel: &mut fuel,
-            mem: &mut mem,
-            durable: false,
-            // The powerbox is **shared** by every vCPU of the run (4c-host): `call.cap` takes the lock
-            // only for its own dispatch, so compute/atomics/futex between calls stay lock-free.
-            host: HostCell::Shared(&host),
-        };
-        // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
-        let stop = step_vcpu(
-            &mut vt,
-            &mut FiberCell::Shared(&domain.fibers),
-            dom,
-            &mut ctx,
-            COOP_QUANTUM,
-            false, // OS-thread parallel driver: blocking `cont.resume.block` idle is a follow-up (I48)
-            // The OS preempts real threads; the quantum is only this vCPU's safepoint for observing a
-            // sibling's trap (the loop-top check) when it never blocks.
-            true,
-        );
-        match stop {
-            // §3.6 (I36 slice 2): the serve/call pair runs only on the cooperative driver
-            // (`drive`); a serving module never reaches the parallel driver (the qualification veto
-            // refuses svc + threads together) — fail closed if it somehow does, rather than park
-            // unwakeably. (`child_offer` was grouped here until #1566; see the arm above.) I48 `BlockOnFiber` is likewise cooperative-only
-            // (this path passes `cooperative: false`), so it never arises here — grouped in.
-            // §3.6 `child_offer` (op 14) — #1566. Unlike its neighbours below, this one **is**
-            // reachable here: the qualification veto that keeps a serving module off this driver
-            // covers the svc ops, and `child_offer` is an `Instantiator` op, so a single-vCPU guest
-            // that never spawns a thread reaches it with nothing refusing first. The capability
-            // itself is genuinely unavailable — a live offer is served through the cooperative
-            // driver's call transport, so a call through one fails closed here (`LiveCall`, below),
-            // though this driver keeps each child's powerbox, for a grant (#2220).
-            //
-            // But "unavailable" is a value, not a trap. The cooperative driver answers `-EINVAL`
-            // for a child it cannot resolve, so this answers the same: one op, one answer, whichever
-            // loop is driving (INVARIANTS #9), and a guest probing a stale child handle is not
-            // killed for the driver it happened to land on (#5 — errors are values, traps are for
-            // forgery). It used to be grouped into the fail-closed trap below on the premise that it
-            // could not arrive.
-            Ok(VcpuStop::ChildOffer {
-                grant: false, dst, ..
-            }) => {
-                vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-            }
-            // #2220 — grant into a running child, through the powerbox the spawner's domain keeps
-            // for it. A `thread.spawn` handle names no child domain. The child's thread marks it
-            // ended before it publishes, so a child a `wait` or `poll` saw end is refused.
-            Ok(VcpuStop::ChildOffer {
-                grant: true,
-                child,
-                arg,
-                dst,
-            }) => {
-                let callee = super::resolve_thread(&threads, child)
-                    .ok()
-                    .and_then(|slot| threads[slot])
-                    .and_then(|id| domain.kids.lock_unpoisoned().get(&id).map(|k| k.2.clone()));
-                match super::grant_into_running(&host, callee.as_ref(), arg as i32) {
-                    Ok(h) => vt.active.set(dst, Reg::from_i32(h as i32)),
-                    Err(t) => return (Err(t), mem),
+    /// #1122/#1262 — settle the run on each ring of its external-wake `bell` after the `seen`th,
+    /// until the run is over. An embedder's input or signal rings it (a terminal `^C` while every
+    /// task waits on a rule or a deadline), and the parks it ends wake now, not at the next stop.
+    /// The bell's lock is let go before the run's is taken, so a ring from under the run's lock
+    /// cannot deadlock with it.
+    fn watch(&self, bell: &(std::sync::Mutex<u64>, std::sync::Condvar), mut seen: u64) {
+        let _end = EndOnPanic(self);
+        loop {
+            {
+                let mut gen = bell.0.lock().unwrap_or_else(|e| e.into_inner());
+                while *gen == seen {
+                    gen = bell.1.wait(gen).unwrap_or_else(|e| e.into_inner());
                 }
+                seen = *gen;
             }
-            // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and this
-            // vCPU's resumer runs on (the driver cannot idle a blocking resume: the `FIBER_PARKED`
-            // poll). A vanished pipe's op just re-runs, and fails closed.
-            Ok(
-                stop @ (VcpuStop::PipeRead { .. }
-                | VcpuStop::PipeWrite { .. }
-                | VcpuStop::StdinPark),
-            ) if vt.active_id != ROOT_FIBER => {
-                let parked = {
-                    let g = host.lock_unpoisoned();
-                    HostWait::of(&stop, &g).map(|on| {
-                        let ready = on.ready(&g);
-                        (on, ready)
-                    })
-                };
-                if let Some((on, ready)) = parked {
-                    FiberCell::Shared(&domain.fibers).with(|f, sp, _| {
-                        park_fiber_on_host(&mut vt, f, sp, &mut mem, false, false, on, ready)
-                    });
-                }
+            let mut g = self.state.lock_unpoisoned();
+            if g.over.is_some() {
+                return;
             }
-            Ok(VcpuStop::LiveCall { .. })
-            | Ok(VcpuStop::SvcWait)
-            | Ok(VcpuStop::CloneCaller { .. })
-            | Ok(VcpuStop::Reap { .. })
-            | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
-            // The safepoint quantum elapsed: back to the loop top's domain check, then resume.
-            Ok(VcpuStop::Preempted) => {}
-            Err(trap) => return (Err(trap), mem),
-            Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
-            // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
-            Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
-            // #1146 (deeper) — blocking `Stream{In}` read on an exhausted stdin (the op was rewound):
-            // block this OS thread until bytes arrive, a default-action TERMINATE flips `term_flag`
-            // (the re-run then dies at its per-op safepoint — invariant 14's terminate axis), or a
-            // deliverable non-`SA_RESTART` signal interrupts it (latch `set_sig_interrupt` and break so
-            // the re-run completes `-EINTR` at the stdin park site in `resume`). The stdin twin of the
-            // pipe poll below — each blocked OS thread observes its own interrupt, no central sweep.
-            Ok(VcpuStop::StdinPark) => {
-                let term_flag = host.lock_unpoisoned().term_flag.clone();
-                while !host.lock_unpoisoned().stdin_ready() {
-                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
-                    // rewound op re-runs into the safepoint that ends this vCPU.
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        || domain.dead().is_some()
-                    {
-                        break;
-                    }
-                    if host.lock_unpoisoned().park_interrupted() {
-                        host.lock_unpoisoned().set_sig_interrupt();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            }
-            Ok(VcpuStop::Spawn {
-                func,
-                sp,
-                arg,
-                dst,
-                module,
-            }) => {
-                let mut child_vt = match thread_task(&dom.source, module as usize, func, sp, arg) {
-                    Ok(vt) => vt,
-                    Err(t) => return (Err(t), mem),
-                };
-                // #2001 — the thread is one `spawn` of its domain's node while it lives, handed back
-                // before its result is published, so its joiner can spawn in its place.
-                let node = host.lock_unpoisoned().own_node();
-                let Some(live) = LiveVcpu::charge(node) else {
-                    return (Err(Trap::ThreadFault), mem);
-                };
-                // Cross-thread anti-bomb gate (mirrors the cooperative `live >= MAX_VCPUS`), taken
-                // once nothing can fail before the thread holds it (#2006).
-                if !reg.try_start() {
-                    return (Err(Trap::ThreadFault), mem);
-                }
-                let id = reg
-                    .next_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // §12: its `vcpu.tls` starts at its id in its domain (#1775).
-                child_vt.active.tls = host.lock_unpoisoned().next_vcpu_id();
-                // The child runs over its own `Mem` view of the **same** shared backing (real atomics)
-                // and SHARES this vCPU's powerbox cell (a thread, not a process — cf. `ForkSelf`).
-                let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
-                let child_host = std::sync::Arc::clone(&host);
-                let child_tbl = tbl.clone();
-                let child_domain = std::sync::Arc::clone(&domain);
-                // #1944 slice 3 — the domain's one fuel budget (INVARIANTS #6): the thread draws from
-                // the node its siblings do.
-                let child_fuel = fuel.for_thread();
-                scope.spawn(move || {
-                    let (r, _m) = run_vcpu_parallel(
-                        scope,
-                        dom,
-                        reg,
-                        child_host,
-                        child_domain,
-                        child_tbl,
-                        child_vt,
-                        child_mem,
-                        child_fuel,
-                    );
-                    drop(live);
-                    reg.publish(id, r);
-                });
-                let handle = threads.len() as i32;
-                threads.push(Some(id));
-                vt.active.set(dst, Reg::from_i32(handle));
-            }
-            // PROCESS.md S3 — `poll`/`detach`/`kill`, as the cooperative driver's arm.
-            Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
-                let slot = match super::resolve_thread(&threads, child) {
-                    Ok(s) => s,
-                    Err(t) => return (Err(t), mem),
-                };
-                let id = threads[slot].expect("resolve_thread checked liveness");
-                let answer = match ctl {
-                    ChildCtl::Poll => match reg.done.lock_unpoisoned().get(&id) {
-                        None => 0,
-                        Some(Ok(_)) => 1,
-                        Some(Err(_)) => 2,
-                    },
-                    // A result published later stays in `done` until the run ends, as the oracle
-                    // discards a detached child's at teardown.
-                    ChildCtl::Detach => {
-                        threads[slot] = None;
-                        reg.done.lock_unpoisoned().remove(&id);
-                        0
-                    }
-                    // A `thread.spawn` handle names no child domain: nothing to kill.
-                    ChildCtl::Kill => {
-                        let kid = domain.kids.lock_unpoisoned().get(&id).cloned();
-                        if let Some((d, r, _)) = kid {
-                            d.kill_tree(&r);
-                        }
-                        0
-                    }
-                };
-                vt.active.set(dst, Reg::from_i32(answer));
-            }
-            Ok(VcpuStop::Join { handle, dst, wait }) => {
-                let slot = match super::resolve_thread(&threads, handle) {
-                    Ok(s) => s,
-                    Err(t) => return (Err(t), mem),
-                };
-                let id = threads[slot].expect("resolve_thread checked liveness");
-                let (out, keep) = reg.join(id, &domain, wait);
-                if !keep {
-                    threads[slot] = None; // a single join: the handle is now spent
-                }
-                match out {
-                    // A joined child's first result value lands in the joiner's `dst`.
-                    Ok(r) => vt.active.set(dst, r),
-                    // A child trap propagates: the joiner completes with the same trap.
-                    Err(t) => return (Err(t), mem),
-                }
-            }
-            Ok(VcpuStop::ForkSelf { dst }) => {
-                // #748 rung 0 — personality `fork()` on the parallel driver: duplicate THIS vCPU
-                // into a twin **OS thread** over a PRIVATE window copy with its OWN forked powerbox
-                // — a process, not a 4c thread (cf. `Spawn`'s `fork_for_thread` shared view). The
-                // parent keeps running with the twin's pid; the twin resumes at the same op (pc
-                // already advanced) with the return-twice `0`. Bare gate + `-EAGAIN` refusal mirror
-                // the cooperative arm (invariant 5: a value, never a hang).
-                // Cross-thread anti-bomb gate (the `Spawn` arm's), released on any refusal.
-                let admitted = fork_bare(&threads, &vt) && reg.try_start();
-                let forked = if admitted {
-                    let twin_pid = reg
-                        .next_fork_pid
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let built = fork_process(&host, mem.as_ref(), twin_pid as u64);
-                    if built.is_none() {
-                        reg.end();
-                    }
-                    built.map(|(m, h, live)| (m, h, twin_pid, live))
-                } else {
-                    None
-                };
-                match forked {
-                    None => vt.active.set(dst, Reg::from_i64(super::EAGAIN)),
-                    Some((twin_mem, twin_host, twin_pid, live)) => {
-                        // The twin's OWN park door (the #1112 lesson): `fork_powerbox` mints its
-                        // personality with no park delegate, and without one the twin's own
-                        // `fork()`/`waitpid()` cannot park (`-ENOSYS`/the ECHILD poll).
-                        twin_host.wire_park_door();
-                        let twin_vt = twin_task(&vt.active, dst, 0);
-                        let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
-                        // The twin continues the SAME image as its parent, so it dispatches over the
-                        // same table (post-exec parents included — cf. the coop arm's fresh primary
-                        // table, which a bare pre-exec caller also resolves to).
-                        let twin_tbl = tbl.clone();
-                        start_process(
-                            scope,
-                            dom,
-                            reg,
-                            twin_host,
-                            twin_tbl,
-                            twin_vt,
-                            twin_mem,
-                            fuel.for_thread(), // the twin shares the budget node
-                            twin_pid,
-                            live,
-                        );
-                        vt.active.set(dst, Reg::from_i64(twin_pid));
-                    }
-                }
-            }
-            Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
-                // A personality `posix_spawn` on the parallel driver: mint a process as the fork
-                // arm does (its pid from the run's counter, its own OS thread, retired through its
-                // exit hooks) and build its image as the exec arm does, with nothing of the caller
-                // copied. The caller runs on with the pid, `-EAGAIN` when none could be minted; a
-                // process whose image cannot be built exits as it is born. The tree-walker's gate
-                // first: a request from a fiber keeps its placeholder, and a serve handler is not a
-                // clean root.
-                if vt.active_id != ROOT_FIBER {
-                    vt.active.set(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
-                    continue;
-                }
-                if vt.active.serve_ticket.is_some() {
-                    vt.active.set(dst, Reg::from_i64(super::EINVAL));
-                    continue;
-                }
-                // #2001 — the process is one `spawn` of the node it shares with its spawner while
-                // it lives: a full ceiling refuses it as the live cap does.
-                let node = host.lock_unpoisoned().own_node();
-                let twin = if reg.try_start() {
-                    let twin = LiveVcpu::charge(node).and_then(|live| {
-                        let pid = reg
-                            .next_fork_pid
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let window = mem.as_ref().map_or(0, Mem::mapped_size);
-                        let twin = host
-                            .lock_unpoisoned()
-                            .spawn_powerbox(pid as u64, plan, window);
-                        twin.map(|t| (pid, t, live))
-                    });
-                    if twin.is_none() {
-                        reg.end();
-                    }
-                    twin
-                } else {
-                    None
-                };
-                match twin {
-                    None => {
-                        vt.active.set(dst, Reg::from_i64(super::EAGAIN));
-                    }
-                    Some((pid, mut twin, live)) => {
-                        let built = exec_image_build(
-                            &mut twin,
-                            mem.as_ref(),
-                            dom,
-                            cmd,
-                            0,
-                            0,
-                            0,
-                            0,
-                            true,
-                            None,
-                        );
-                        match built {
-                            Ok(built) => {
-                                built.host.wire_park_door();
-                                let child_host =
-                                    std::sync::Arc::new(std::sync::Mutex::new(built.host));
-                                let table = Some(std::sync::Arc::new(built.table));
-                                let child_mem = Some(built.mem);
-                                start_process(
-                                    scope,
-                                    dom,
-                                    reg,
-                                    child_host,
-                                    table,
-                                    built.vt,
-                                    child_mem,
-                                    fuel.for_thread(), // a spawned process shares the budget node
-                                    pid,
-                                    live,
-                                );
-                            }
-                            Err(_) => {
-                                let _ = twin.spawn_failed(super::SPAWN_EXEC_FAILED);
-                                drop(live);
-                                reg.end();
-                                reg.publish_fork_exit(pid);
-                            }
-                        }
-                        vt.active.set(dst, Reg::from_i64(pid));
-                    }
-                }
-            }
-            Ok(VcpuStop::ReapWait { child }) => {
-                // #748 rung 1 — blocking personality `waitpid` on the parallel driver: the op was
-                // REWOUND, so after this (real, condvar) block the loop re-executes it against the
-                // now-updated personality table. `Some(pid)` waits on that twin's permanent exit
-                // record; `None` (any-child) waits for an exit generation newer than the last one
-                // this vCPU consumed — see [`ThreadRegistry::wait_fork_exit`] for why neither can
-                // livelock on a stale exit nor lose a wake.
-                //
-                // Not only an exit ends the wait: a kill of this domain (its `term_flag`, or a
-                // sibling's trap), a deliverable signal (`-EINTR`, as the stdin park does), or a
-                // child's stop/continue (the personality's one-shot `reap_pending` edge — what the
-                // other two drivers wake a `WUNTRACED` wait on). Each is raised before its door
-                // rings the table (`wire_parallel_doors`), so asking under the table lock cannot miss
-                // one. The rewound `waitpid` then re-runs into the right outcome.
-                let term_flag = host.lock_unpoisoned().term_flag.clone();
-                fork_gen = reg.wait_fork_exit(child.map(|p| p as i64), fork_gen, || {
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        || domain.dead().is_some()
-                    {
-                        return true;
-                    }
-                    let mut h = host.lock_unpoisoned();
-                    if h.park_interrupted() {
-                        h.set_sig_interrupt();
-                        return true;
-                    }
-                    h.signal_poll().is_some_and(|(_, s)| s.reap_pending())
-                });
-            }
-            Ok(VcpuStop::Exec {
-                cmd,
-                grants_ptr,
-                grants_n,
-                entry,
-                size_log2,
-                dst,
-                personality,
-            }) => {
-                // #748 rung 2 — FORK.md §8.6 `execve` image-replace on the parallel driver. Every
-                // refusal writes a probeable errno to `dst` and lets the caller run on (POSIX:
-                // `execve` returns only on failure). Admissible from a clean root computation only
-                // (no serve handler, root fiber, a non-durable domain) — the cooperative arm's
-                // gate. Root and fork-twin execs take the SAME path here: each vCPU already owns
-                // its window/host cell, so the cooperative arm's env split does not arise.
-                let clean = vt.active.serve_ticket.is_none()
-                    && vt.active_id == ROOT_FIBER
-                    && !host.lock_unpoisoned().is_durable();
-                let built = if clean {
-                    let mut g = host.lock_unpoisoned();
-                    exec_image_build(
-                        &mut g,
-                        mem.as_ref(),
-                        dom,
-                        cmd,
-                        grants_ptr,
-                        grants_n,
-                        entry,
-                        size_log2,
-                        personality,
-                        None,
-                    )
-                } else {
-                    Err(super::EINVAL)
-                };
-                match built {
-                    Err(e) => vt.active.set(dst, Reg::from_i32(e as i32)),
-                    Ok(ExecBuilt {
-                        host: child_host,
-                        table: child_table,
-                        vt: new_vt,
-                        mem: win,
-                        leaf: _,
-                    }) => {
-                        // Replace the powerbox INSIDE this vCPU's cell, not the `Arc` itself: a
-                        // fork twin's exit-hook holder kept a clone of the cell at spawn, so the
-                        // post-exec exit must find the CARRIED hooks (`exec_carry`) behind the
-                        // same cell — the parallel analogue of the cooperative arm overwriting
-                        // `extra_envs[k].host`. The image's window and the command's natural table
-                        // replace this vCPU's.
-                        *host.lock_unpoisoned() = child_host;
-                        mem = Some(win);
-                        tbl = Some(std::sync::Arc::new(child_table));
-                        vt = new_vt;
-                    }
-                }
-            }
-            Ok(VcpuStop::PipeRead { pipe }) => {
-                // #748 rung 3 (#1080 rung 4) — blocking CorePipe read: the op was rewound, so
-                // block this OS thread until level-triggered readiness (bytes buffered, or every
-                // writer closed) and let the loop re-execute it (a read, or EOF). A short-sleep
-                // poll rather than a condvar door: the peer end lives on another powerbox (a fork
-                // twin's, or even another driver's engine) with no cross-thread doorbell into this
-                // cell yet, and a level-triggered poll cannot lose a wake. Condvar doors on the
-                // shared pipe backing are the follow-up.
-                // #1262 (parallel) — a default-action TERMINATE (this domain's `term_flag`, set by a
-                // group `^C`/SIGKILL) must break a twin blocked here even with NO caught handler: the
-                // re-run then hits the per-op `term_flag` safepoint in `resume` and the vCPU dies
-                // (WIFSIGNALED). Without this a pipeline stage parked on an empty pipe when its group is
-                // `^C`'d slept forever and the shell's reap never woke. Cheap to clone the flag once.
-                let term_flag = host.lock_unpoisoned().term_flag.clone();
-                while !host.lock_unpoisoned().pipe_read_ready(pipe) {
-                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
-                    // rewound op re-runs into the safepoint that ends this vCPU.
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        || domain.dead().is_some()
-                    {
-                        break;
-                    }
-                    // #1146 slice 2 (parallel) — a signal reaching this OS thread while it blocks on
-                    // the pipe interrupts the read: when a deliverable, non-`SA_RESTART` signal is
-                    // pending, set this host's EINTR flag and break, so the re-run completes `-EINTR`
-                    // at the slice-2a park site (the caught handler is delivered at the vCPU's next
-                    // safepoint). Unlike the cooperative pump there is no central sweep — each blocked
-                    // OS thread observes the interrupt itself. Setting the flag latches the interrupt
-                    // across the break so the re-run surfaces EINTR even if that safepoint delivery
-                    // consumes the pending signal first. `SA_RESTART` leaves `park_interrupted` false,
-                    // so the poll keeps waiting for data (the restarted read).
-                    if host.lock_unpoisoned().park_interrupted() {
-                        host.lock_unpoisoned().set_sig_interrupt();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            }
-            Ok(VcpuStop::PipeWrite { pipe }) => {
-                // The write twin: ready when the FIFO has room under `PIPE_CAP` (backpressure
-                // drained) or every reader closed (the re-run completes `-EPIPE`).
-                // #1262 (parallel) — same terminate break as the read poll below.
-                let term_flag = host.lock_unpoisoned().term_flag.clone();
-                while !host.lock_unpoisoned().pipe_write_ready(pipe) {
-                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
-                    // rewound op re-runs into the safepoint that ends this vCPU.
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
-                        || domain.dead().is_some()
-                    {
-                        break;
-                    }
-                    // #1146 slice 2 (parallel) — same interruptible break as the read poll above.
-                    if host.lock_unpoisoned().park_interrupted() {
-                        host.lock_unpoisoned().set_sig_interrupt();
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
-                }
-            }
-            Ok(VcpuStop::CapPending { id, dst }) => {
-                // F2: the parallel driver keeps the inline completion wait — it blocks only
-                // this OS thread while the pool works (the §5b overlap across sibling vCPUs
-                // is the lock-release, already landed); fiber-waiter delivery through the
-                // real cross-thread futex is the I45/I73 residue, its own slice.
-                let comps = host.lock_unpoisoned().completions();
-                // #1366: a host-completed punt has no completer on this driver — decline.
-                match comps.wait_unless_host_owned(id) {
-                    Some(r) => vt.active.set(dst, Reg::from_i64(r)),
-                    None => return (Err(Trap::CapFault), mem),
-                }
-            }
-            Ok(VcpuStop::Wait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            }) => {
-                // Genuine cross-thread futex: park on the shared address until another vCPU `notify`s
-                // (or the timeout fires). No memory ⇒ can't park ⇒ vacuously not-equal.
-                let r = match mem.as_ref() {
-                    Some(m) => reg.futex.wait(&domain, m, base, expected, width, timeout),
-                    None => super::WAIT_NOT_EQUAL,
-                };
-                vt.active.set(dst, Reg::from_i32(r));
-            }
-            Ok(VcpuStop::Notify { base, count, dst }) => {
-                let woken = reg.futex.notify(mem.as_ref(), base, count);
-                vt.active.set(dst, Reg::from_i32(woken));
-            }
-            // §22 guest-JIT (THREADS.md 4c-domain): install/uninstall/invoke against the **shared**
-            // [`Domain`] — `install`/`uninstall`/`push` are interior-mutable (Release/Acquire-paired
-            // with the dispatch reads), so a worker vCPU drives them on `&Domain` while compute/atomics
-            // on the other vCPUs stay lock-free. The result (slot / `-ENOSPC` / value) is
-            // schedule-independent for the disciplined guest the oracle is differentially run against.
-            Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
-                if let Err(t) =
-                    jit_install(unit, &dom.source, &dom.table, None, &mut vt.active, dst)
-                {
-                    return (Err(t), mem);
-                }
-            }
-            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                let authority = host.lock_unpoisoned().resolve_jit_domain(h).map(drop);
-                let active = &mut vt.active;
-                if let Err(t) =
-                    jit_uninstall(authority, &dom.source, &dom.table, slot, None, active, dst)
-                {
-                    return (Err(t), mem);
-                }
-            }
-            Ok(VcpuStop::JitInvoke {
-                h,
-                code,
-                argv,
-                dst,
-                params,
-                results,
-            }) => {
-                // The unit runs over the **shared** powerbox (its `call.cap`s serialize per-call, like
-                // every other vCPU's), and its `gc.roots` sees the run's parked fibers beneath it
-                // (#1660) — the shared registry, locked only while such a scan reads it.
-                let unit = host.lock_unpoisoned().resolve_jit_unit(h, code);
-                let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
-                    |(umod, args)| {
-                        run_invoke(
-                            &dom.source,
-                            &dom.table,
-                            umod,
-                            &args,
-                            &mut fuel,
-                            &mut mem,
-                            &mut HostCell::Shared(&host),
-                            Some(&Beneath::task(&vt, FiberRegRef::Shared(&domain.fibers))),
-                        )
-                    },
-                );
-                match ran {
-                    Ok(vals) => {
-                        let slots = vals.into_iter().map(val_to_slot);
-                        set_slot_results(&mut vt.active, dst, &results, slots);
-                    }
-                    Err(t) => return (Err(t), mem),
-                }
-            }
-            // §14 `Instantiator.instantiate` (THREADS.md 4c-domain) — a **same-module** confined
-            // executor child: its own power-of-two sub-window (`nested_view` of the shared backing,
-            // own page-prot map), its own attenuated powerbox (`Instantiator` + `AddressSpace` over
-            // `[0, child_size)`), its own natural dispatch table (no parent install slots), and a
-            // quota sub-allocated from the parent's fuel. The child is a **nested confined parallel
-            // run** on its own scoped thread — joinable through the parent's registry exactly like a
-            // `thread.spawn` child. Unlike a `thread.spawn` child (which shares this vCPU's `Mem`
-            // view + the shared powerbox), it owns all of these — the §14 confinement.
-            // §14 confined children (ops 0, 5, 13, 17): the executor's admission, under the host lock —
-            // so a budget or a grant list is served here as there (#1855) — then a scoped OS thread
-            // over the carve. This vCPU's own `mem`/`fuel` *are* its environment: a confined parent
-            // already runs on its own thread with its own confined view.
-            Ok(VcpuStop::Instantiate { spawn, dst }) => {
-                let admitted = {
-                    let mut hg = host.lock_unpoisoned();
-                    admit_confined_child(
-                        &mut hg,
-                        mem.as_ref(),
-                        fuel.can_burn(),
-                        &dom.source,
-                        &vt.active,
-                        spawn,
-                    )
-                };
-                let child = match admitted {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                    Err(t) => return (Err(t), mem),
-                };
-                match par_start_child(
-                    scope,
-                    dom,
-                    reg,
-                    &host,
-                    &domain,
-                    &mut threads,
-                    child,
-                    spawn.entry,
-                ) {
-                    Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
-                    Err(t) => return (Err(t), mem),
-                }
-            }
-            // §5 `instantiate_detached` (op 15): a fresh window of its own on its own OS thread — the
-            // cooperative executor's spawn (`admit_detached_child`, the same admission and child
-            // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
-            // confined child, its result published to the parent's `reg` for `join`.
-            Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
-                let admitted = admit_detached_in_process(
-                    &mut host.lock_unpoisoned(),
-                    mem.as_ref(),
-                    spawn,
-                    &dom.source,
-                    spawner_module(&dom.source, &vt.active),
-                    dom.table.jit_unit(vt.active.module),
-                );
-                let child = match admitted {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                    Err(t) => return (Err(t), mem),
-                };
-                match par_start_child(
-                    scope,
-                    dom,
-                    reg,
-                    &host,
-                    &domain,
-                    &mut threads,
-                    child,
-                    spawn.entry,
-                ) {
-                    Ok(handle) => vt.active.set(dst, Reg::from_i32(handle)),
-                    Err(t) => return (Err(t), mem),
-                }
-            }
+            let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
+            self.settle(&mut g);
+            self.wake(&mut g, &was_awake, None);
+            release(g);
         }
     }
-}
-
-/// Start an admitted §14/§5 child on its own scoped OS thread — its own domain (a natural table over
-/// the shared source), attenuated powerbox, window, fuel and thread registry (for the threads and
-/// children *it* spawns) — publishing its result to this vCPU's `reg`, where `join` finds it. Returns
-/// the join handle; `Err(ThreadFault)` on the cross-thread vCPU-count bomb (the cooperative driver's
-/// `live >= MAX_VCPUS`). A child refused here hands its window lease back to `parent_host`, so a spawn
-/// refused after its admission charges nothing ([`coop_start_child`], #2006).
-#[allow(clippy::too_many_arguments)] // the spawn's context, as `coop_start_child`'s
-fn par_start_child<'scope, 'env>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    dom: &'env Domain,
-    reg: &'env ThreadRegistry,
-    parent_host: &std::sync::Arc<std::sync::Mutex<Host>>,
-    // The spawner's domain, which records the child for a kill (#2074).
-    parent_domain: &ParDomain,
-    threads: &mut Vec<Option<u64>>,
-    child: AdmittedChild,
-    entry: i64,
-) -> Result<i32, Trap> {
-    let room = reg.try_start(); // the cross-thread vCPU ceiling, released below on a refusal
-    let built = child.build(entry, room, |budget, bytes| {
-        parent_host
-            .lock_unpoisoned()
-            .release_detached(budget, bytes)
-    });
-    if room && built.is_err() {
-        reg.end();
-    }
-    let BuiltChild {
-        vt,
-        table,
-        mem,
-        host,
-        fuel,
-        lease,
-        ..
-    } = built?;
-    let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), table);
-    let lease = lease.map(|(budget, bytes)| (std::sync::Arc::clone(parent_host), budget, bytes));
-    let id = reg
-        .next_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let child_reg = reg.child();
-    let child_par = std::sync::Arc::new(ParDomain::default());
-    let child_host = std::sync::Arc::new(std::sync::Mutex::new(host));
-    parent_domain.kids.lock_unpoisoned().insert(
-        id,
-        (
-            std::sync::Arc::clone(&child_par),
-            std::sync::Arc::clone(&child_reg),
-            std::sync::Arc::clone(&child_host),
-        ),
-    );
-    // A kill that reached the spawner while this child was being filed missed it: it dies too.
-    if parent_domain.dead().is_some() {
-        child_par.kill_tree(&child_reg);
-    }
-    scope.spawn(move || {
-        let (r, _m) = std::thread::scope(|cscope| {
-            run_vcpu_parallel(
-                cscope,
-                &child_dom,
-                &child_reg,
-                std::sync::Arc::clone(&child_host),
-                std::sync::Arc::clone(&child_par),
-                None,
-                vt,
-                mem,
-                fuel,
-            )
-        });
-        // FORK.md §8.6 / #1807 — the child's domain finished: release its pipe ends, and (#1909) what
-        // its window held, and (#2112) its fibers, whose registry the spawner's domain keeps for a kill.
-        {
-            let mut h = child_host.lock_unpoisoned();
-            h.release_memory();
-            h.release_pipe_ends();
-        }
-        *child_par.fibers.0.lock_unpoisoned() = FiberTables::default();
-        // A detached child's window goes back to the budget that paid for it (INVARIANTS #3), before
-        // the result is published, so a joiner sees the refund.
-        if let Some((parent, budget, bytes)) = lease {
-            parent.lock_unpoisoned().release_detached(budget, bytes);
-        }
-        reg.publish(id, r);
-    });
-    let handle = threads.len() as i32;
-    threads.push(Some(id));
-    Ok(handle)
 }
 
 /// Mark task `ti` finished with `res`, then wake any vCPU parked on `thread.join` of it: an `Ok`
@@ -19822,11 +18476,10 @@ impl Vm {
         let signal_poll = host.with(|h| h.signal_poll());
         // #1246 — the per-op default-action TERMINATE poll (the bytecode twin of the tree-walker's
         // `term_flag` safepoint). Fetched once per resume, and only when a signal personality is present
-        // (`None` on a pure-compute / JIT-bench run, so the per-op check is skipped entirely). This is
-        // the GENUINELY-PARALLEL driver's kill mechanism: its OS-thread vCPUs run concurrently, so a
-        // killed thread must observe the kill mid-execution (it can't wait for a scheduler sweep). The
-        // cooperative driver never sets this flag — it finalizes a killed domain at its loop top (#1215)
-        // — so the load is dead (always `false`) there.
+        // (`None` on a pure-compute / JIT-bench run, so the per-op check is skipped entirely). A killed
+        // task observes the kill mid-step and dies at its next op ([`wire_kill`]): on executor 2 it may
+        // be running on its own thread when another kills it; a task that is not running is finalized
+        // by the settle's kill sweep (#1215).
         let term_flag = signal_poll
             .as_ref()
             .map(|_| host.with(|h| h.term_flag.clone()));
@@ -19886,11 +18539,10 @@ impl Vm {
             }
             budget -= 1;
             // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
-            // domain set its `term_flag` (via the personality's `set_kill` closure, wired on the
-            // parallel driver by `wire_parallel_doors`). Die at this op — the vCPU's thread returns the trap,
-            // and the driver's exit hook reports term-by-signal from the personality's `term_sig`
-            // bookkeeping (WIFSIGNALED), exactly like the tree-walker. Checked before the async-signal
-            // redirect (death beats a caught delivery).
+            // domain set its `term_flag` (the personality's inline kill apply, [`wire_kill`]). Die at
+            // this op — the step returns the trap, and the exit hook reports term-by-signal from the
+            // personality's `term_sig` bookkeeping (WIFSIGNALED), exactly like the tree-walker.
+            // Checked before the async-signal redirect (death beats a caught delivery).
             if let Some(tf) = &term_flag {
                 if tf.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(Trap::ThreadFault);
@@ -20681,7 +19333,8 @@ impl Vm {
                     };
                     if eff_tid == super::cap_id::STREAM && eff_op == 0 && parks.stdin {
                         // #1146 (deeper) — the stdin park's EINTR leg. The scheduler drivers' interrupt
-                        // paths (the cooperative all-parked sweep / the parallel poll break) latch
+                        // paths ([`interrupt_parks`], at the pump's all-parked point and every parallel
+                        // driver settle) latch
                         // `set_sig_interrupt` and re-admit this task; the rewound read re-executes and
                         // lands HERE. Without this leg the re-run would re-park unconditionally and the
                         // latched interrupt would be silently dropped (a livelock, not a visible hang) —
