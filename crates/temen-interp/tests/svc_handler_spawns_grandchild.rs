@@ -115,7 +115,8 @@ fn module(src: &str) -> Arc<temen_ir::Module> {
 ///   answering C's cap call by nesting a §14 spawn. The reply wakes C.
 ///
 /// The conductor spawns S and C detached by the records [`sibling_driven`] appends, paid from the
-/// `Budget` `v1`.
+/// `Budget` `v1`. Each child is a child image (#2219): S of func 1 (the `Module` `v2`), C of func 2
+/// (`v3`), and the grandchild of func 4 (`v4`), which the conductor grants S as `"g4"`.
 ///
 /// Composite return: `join(C) * 1000 + join(S)` = 99*1000 + 1 (S served exactly one) = 99001. This is
 /// the full guest-serves-via-grandchild shape (toy grandchild): nimsem(C) calls exec(the re-granted
@@ -127,9 +128,20 @@ type 1 interface { go: 0 }
 export 0 interface "svc" 1 { go: 3 }
 data 16584 "svc"
 data 16600 "budget"
+data 16608 "g4"
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+  sm = i64.const 17688
+  i32.store sm v2
+  h0 = i64.const 16656
+  hn = i32.const 16608
+  i32.store h0 hn
+  h1 = i64.const 16660
+  hl = i32.const 2
+  i32.store h1 hl
+  h2 = i64.const 16664
+  i32.store h2 v4
   sb = i64.const 17692
   i32.store sb v1
   sp = i64.const 17664
@@ -144,6 +156,8 @@ block 0 (v0: i32, v1: i32) {
   i32.store g1 gl
   g2 = i64.const 16648
   i32.store g2 vcap
+  cm = i64.const 17784
+  i32.store cm v3
   cb = i64.const 17788
   i32.store cb v1
   cp = i64.const 17760
@@ -188,6 +202,11 @@ block 0 (vx: i64) {
   vb = self.resolve np nl
   fb = i64.const 18460
   i32.store fb vb
+  gp = i64.const 16608
+  gl = i64.const 2
+  vg = self.resolve gp gl
+  fm = i64.const 18456
+  i32.store fm vg
   fp = i64.const 18432
   vG = call.cap 6 17 (i64) -> (i32) vi (fp)
   vr = call.cap 6 1 (i32) -> (i64) vi (vG)
@@ -203,19 +222,24 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// [`SIBLING_DRIVEN`] with its spawn records: S (func 1) at 17664, C (func 2, granted the list at
-/// 16640) at 17760, and the grandchild (func 4) at 18432, which S's handler fills in.
+/// [`SIBLING_DRIVEN`] with its spawn records: S's at 17664 (granted the list at 16656), C's at 17760
+/// (granted the list at 16640), and the grandchild's at 18432, which S's handler fills in.
 fn sibling_driven() -> String {
+    let s = SpawnRec {
+        grants_ptr: 16656,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(2)
+        ..SpawnRec::v1(0)
     };
     format!(
         "{SIBLING_DRIVEN}{}{}{}",
-        rec::segment(17664, &SpawnRec::v1(1)),
+        rec::segment(17664, &s),
         rec::segment(17760, &c),
-        rec::segment(18432, &SpawnRec::v1(4))
+        rec::segment(18432, &SpawnRec::v1(0))
     )
 }
 
@@ -228,18 +252,13 @@ fn a_child_cap_call_is_serviced_by_a_handler_that_nests_a_grandchild_spawn() {
         "serve+instantiate folds to the oracle"
     );
     let mut host = Host::new();
-    host.set_self_module(&m);
     let hi = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 4 << 20, -1);
+    let [s, c, g] = [1, 2, 4]
+        .map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));
     let mut fuel = 50_000_000u64;
-    let r = run_with_host(
-        &m,
-        0,
-        &[Value::I32(hi), Value::I32(hb)],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
+    let args = [hi, hb, s, c, g].map(Value::I32);
+    let r = run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(99001)],

@@ -124,23 +124,25 @@ block 0 (v0: i64) {{
     )
 }
 
-/// A same-module op-17 parent `(i32 inst, i32 out, i32 err, i32 budget) -> i64` that re-grants
-/// `stdout` and `stderr` by name to func 1, spawned detached by the v1 record at 17408 and paid from
-/// `budget`. Func 1 resolves the two names from the module's data, writes `O` and `E` through them and
-/// returns 7.
-fn op17_same_module_granted() -> String {
+/// An op-17 parent `(i32 inst, i32 out, i32 err, i32 budget, i32 child) -> i64` that re-grants
+/// `stdout` and `stderr` by name to `child` (func 1's child image, #2219), spawned detached by the v1
+/// record at 17408 and paid from `budget`. Func 1 resolves the two names from the module's data,
+/// writes `O` and `E` through them and returns 7.
+fn op17_granted() -> String {
     let child = SpawnRec {
         grants_ptr: 17600,
         grants_n: 2,
-        ..SpawnRec::v1(1)
+        ..SpawnRec::v1(0)
     };
     format!(
         "memory 17
 data 17700 \"stdout\"
 data 17710 \"stderr\"
-func (i32, i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vout: i32, verr: i32, vbud: i32) {{
-{g0}{g1}  vbf = i64.const 17436
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vout: i32, verr: i32, vbud: i32, vmod: i32) {{
+{g0}{g1}  vmf = i64.const 17432
+  i32.store vmf vmod
+  vbf = i64.const 17436
   i32.store vbf vbud
   vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -324,19 +326,16 @@ fn a_budget_funded_same_module_record_spawn() {
 }
 
 #[test]
-fn a_grant_carrying_same_module_record_spawn() {
-    let m = module(&op17_same_module_granted());
+fn a_grant_carrying_record_spawn() {
+    let m = module(&op17_granted());
     let setup = || {
         let mut h = Host::new();
-        h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 17);
         let o = h.grant_stream(StreamRole::Out);
         let e = h.grant_stream(StreamRole::Err);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        (
-            h,
-            vec![Value::I32(i), Value::I32(o), Value::I32(e), Value::I32(b)],
-        )
+        let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+        (h, [i, o, e, b, c].map(Value::I32).to_vec())
     };
     let want = Ran {
         result: Ok(vec![Value::I64(7)]),
@@ -812,20 +811,20 @@ fn a_detached_spawn_with_a_fuel_quota_traps() {
         &op15_setup(&child, 1 << 20),
         &trapped(Trap::CapFault),
     );
-    let mut rec = SpawnRec::v1(1);
+    let mut rec = SpawnRec::v1(0);
     rec.quota = 5;
     let m = module(&record_spawn(&rec));
     agree_on_every_driver(
         "op 17, a v1 record with a nonzero quota",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1]),
         &trapped(Trap::CapFault),
     );
-    let m = module(&record_spawn(&SpawnRec::v1(1)));
+    let m = module(&record_spawn(&SpawnRec::v1(0)));
     agree_on_every_driver(
         "op 17, a v1 record with no quota",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1]),
         &ok(3),
     );
 }
@@ -946,18 +945,25 @@ fn a_handle_masks_onto_the_table() {
 
 // ---- #1944: a detached child pays for its own detached child ------------------------------------
 
-/// Three generations of one `memory 16` module, each window 64 KiB. The root resolves its `"budget"`,
-/// splits a node with a `mem` ceiling of `mem` and a `spawn` ceiling of `spawn` (`-1` = unbounded),
-/// and spawns func 1 detached, paid from it.
-/// Func 1 resolves its own `"budget"` — the node that paid for it — and spawns func 2 from it: a
+/// Three generations of one `memory 16` module, each window 64 KiB, each a child image (#2219). The
+/// root `(i32 inst, i32 c1, i32 c2) -> i64` resolves its `"budget"`, splits a node with a `mem` ceiling
+/// of `mem` and a `spawn` ceiling of `spawn` (`-1` = unbounded), and spawns `c1` (func 1's image)
+/// detached, paid from it and granted `c2` (func 2's image) as `"g2"`.
+/// Func 1 resolves its own `"budget"` — the node that paid for it — and spawns `"g2"` from it: a
 /// refused spawn returns its `-errno`, an admitted one `join + 20`. Func 2 returns 3. The root returns
 /// what its child did plus 100.
 fn three_generations(mem: i64, spawn: i64) -> String {
+    let r1 = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     format!(
         "memory 16
 data 16384 \"budget\"
-{r1}{r2}func (i32) -> (i64) {{
-block 0 (vinst: i32) {{
+data 16400 \"g2\"
+{r1}{r2}func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vc1: i32, vc2: i32) {{
   np = i64.const 16384
   nl = i64.const 6
   vroot = self.resolve np nl
@@ -967,7 +973,9 @@ block 0 (vinst: i32) {{
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, sp)
   bf = i64.const 17436
   i32.store bf vsub
-  rp = i64.const 17408
+  mf = i64.const 17432
+  i32.store mf vc1
+{g2}  rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
   k = i64.const 100
@@ -983,6 +991,11 @@ block 0 (va: i64) {{
   vb = self.resolve np nl
   bf = i64.const 17532
   i32.store bf vb
+  gp = i64.const 16400
+  gl = i64.const 2
+  vg = self.resolve gp gl
+  mf = i64.const 17528
+  i32.store mf vg
   rp = i64.const 17504
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vz = i32.const 0
@@ -1007,36 +1020,47 @@ block 0 (va: i64) {{
   }}
 }}
 ",
-        r1 = rec::segment(17408, &SpawnRec::v1(1)),
-        r2 = rec::segment(17504, &SpawnRec::v1(2)),
+        r1 = rec::segment(17408, &r1),
+        r2 = rec::segment(17504, &SpawnRec::v1(0)),
+        g2 = store_grant("g", 17600, 16400, "g2", "vc2"),
     )
 }
 
-/// The root's powerbox: its `Instantiator`, its running module, and a 1 MiB `"budget"`.
-fn generations_setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+/// The root's powerbox: its `Instantiator`, a 1 MiB `"budget"`, and the child images (#2219) of the
+/// functions `children`, one argument each after the `Instantiator`.
+fn generations_setup<'a>(
+    m: &'a Module,
+    children: &'a [u32],
+) -> impl Fn() -> (Host, Vec<Value>) + 'a {
     move || {
         let mut h = Host::new();
-        h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 16);
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", b);
-        (h, vec![Value::I32(i)])
+        let mut args = vec![Value::I32(i)];
+        for &f in children {
+            let image = temen_ir::child_image_at(m, f).expect("child image");
+            args.push(Value::I32(h.grant_module(&image)));
+        }
+        (h, args)
     }
 }
 
-/// A `memory 16` root that spawns its func 1 by the v1 record `rec`, paid from its `"budget"`, and
-/// returns the join. Func 1 returns 3.
+/// A `memory 16` root `(i32 inst, i32 child) -> i64` that spawns `child` (func 1's child image) by the
+/// v1 record `rec`, paid from its `"budget"`, and returns the join. Func 1 returns 3.
 fn record_spawn(rec: &SpawnRec) -> String {
     format!(
         "memory 16
 data 16384 \"budget\"
-{r}func (i32) -> (i64) {{
-block 0 (vinst: i32) {{
+{r}func (i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32) {{
   np = i64.const 16384
   nl = i64.const 6
   vb = self.resolve np nl
   bf = i64.const 17436
   i32.store bf vb
+  mf = i64.const 17432
+  i32.store mf vmod
   rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
@@ -1060,7 +1084,7 @@ fn a_detached_child_spawns_a_grandchild_from_its_own_budget() {
     agree_on_every_driver(
         "a child whose 128 KiB ceiling holds its window and its child's",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1, 2]),
         &ok(3 + 20 + 100),
     );
 }
@@ -1071,7 +1095,7 @@ fn a_childs_ceiling_caps_its_subtree_while_its_parent_has_room() {
     agree_on_every_driver(
         "a child whose 64 KiB ceiling its own window fills",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1, 2]),
         &ok(-22 + 100),
     );
 }
@@ -1162,14 +1186,14 @@ fn a_childs_spawn_ceiling_counts_itself_and_its_children() {
     agree_on_every_driver(
         "a child whose one-vCPU ceiling it fills",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1, 2]),
         &ok(-22 + 100),
     );
     let m = module(&three_generations(1 << 17, 2));
     agree_on_every_driver(
         "a child whose two-vCPU ceiling holds its child",
         &m,
-        &generations_setup(&m),
+        &generations_setup(&m, &[1, 2]),
         &ok(3 + 20 + 100),
     );
 }

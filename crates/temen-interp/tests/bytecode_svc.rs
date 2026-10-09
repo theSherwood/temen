@@ -487,7 +487,8 @@ fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
     )));
 }
 
-/// A detached child (func 1, its `Instantiator` its entry argument) spawns a thread and asks for a
+/// A detached child (func 1's child image, #2219, its `Instantiator` its entry argument) spawns a
+/// thread and asks for a
 /// live offer over it (op 14). A thread runs the caller's own domain, not a child's, so the mint is
 /// refused `-EINVAL` — on the oracle, and on the cooperative driver, where an offer into the caller's
 /// own domain would have a call lock the cell its step already holds.
@@ -497,8 +498,10 @@ type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "svc" 1 { op: 3 }
 
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17432
+  i32.store vrm v2
   vrb = i64.const 17436
   i32.store vrb v1
   vrp = i64.const 17408
@@ -537,18 +540,18 @@ block 0 (vx: i64) {
 fn a_live_offer_over_a_thread_is_refused() {
     let m = module(&format!(
         "{OFFER_OVER_A_THREAD}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(1))
+        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
     ));
     let run = |entry: Entry| {
         let mut host = Host::new();
-        host.set_self_module(&m);
         let hi = host.grant_instantiator(0, 1u64 << 17);
         let hb = host.grant_budget(-1, 1 << 20, -1);
+        let hm = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 5_000_000u64;
         entry(
             &m,
             0,
-            &[Value::I32(hi), Value::I32(hb)],
+            &[Value::I32(hi), Value::I32(hb), Value::I32(hm)],
             &mut fuel,
             &mut host,
         )

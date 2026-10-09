@@ -97,14 +97,17 @@ fn rec_with_impl_export() -> String {
     )
 }
 
-/// A detached-record parent (`(i32 inst, i64 budget) -> (i64)`): the budget handle arrives at run
-/// time and is stored into the v1 record appended at 17536 (func 1, its declared window). Spawn,
-/// join, return the child's 42 — or the spawn's refusal.
+/// A detached-record parent (`(i32 inst, i64 budget, i32 child) -> (i64)`): the budget and module
+/// handles arrive at run time and are stored into the v1 record appended at 17536 (`child`, func 1's
+/// child image, #2219, in its declared window). Spawn, join, return the child's 42 — or the spawn's
+/// refusal.
 fn budget_rec_v1_src() -> String {
     format!(
         "memory 17
-func (i32, i64) -> (i64) {{
-block 0 (v0: i32, v1: i64) {{
+func (i32, i64, i32) -> (i64) {{
+block 0 (v0: i32, v1: i64, v2: i32) {{
+  qma = i64.const 17560
+  i32.store qma v2
   qb = i32.wrap_i64 v1
   qba = i64.const 17564
   i32.store qba qb
@@ -130,7 +133,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17536, &SpawnRec::v1(1))
+        rec = rec::segment(17536, &SpawnRec::v1(0))
     )
 }
 
@@ -300,19 +303,29 @@ fn budget_mem_refusal_is_einval_on_both_engines() {
     assert_eq!(r_bc, r_tw, "mem refusal: bytecode != tree-walker");
 }
 
-/// A dangling budget handle fails the detached spawn closed (`CapFault`) on both engines, natively —
-/// the bytecode exec arm's check is the twin of the tree-walker's record-parse check.
+/// A dangling budget handle refuses the detached spawn probeably (`-EINVAL`) on both engines,
+/// natively: op 15's rule, which a v1 record follows (a non-`Budget` arg refuses). This test pinned
+/// `CapFault` while its record spawned `module = -1` from a host that registered no program: the
+/// module failed to resolve before the budget was looked at (#2219).
 #[test]
-fn dangling_budget_handle_capfaults_on_both_engines() {
+fn dangling_budget_handle_refuses_the_detached_spawn_on_both_engines() {
     let src = budget_rec_v1_src();
+    let image = temen_ir::child_image_at(&parse_module(&src).expect("parse"), 1).expect("image");
     let mut h_tw = Host::new();
     let i_tw = h_tw.grant_instantiator(0, 1 << 17);
-    let r_tw = tw(&src, &[Value::I32(i_tw), Value::I64(99)], &mut h_tw);
-    assert_eq!(r_tw, Err(Trap::CapFault), "oracle");
+    let c_tw = h_tw.grant_module(&image);
+    let args_tw = [Value::I32(i_tw), Value::I64(99), Value::I32(c_tw)];
+    let r_tw = tw(&src, &args_tw, &mut h_tw);
+    assert_eq!(r_tw, Ok(vec![Value::I64(EINVAL)]), "oracle");
 
     let mut h_bc = Host::new();
     let i_bc = h_bc.grant_instantiator(0, 1 << 17);
-    let r_bc = bc(&src, &[Value::I32(i_bc), Value::I64(99)], &mut h_bc);
+    let c_bc = h_bc.grant_module(&image);
+    let r_bc = bc(
+        &src,
+        &[Value::I32(i_bc), Value::I64(99), Value::I32(c_bc)],
+        &mut h_bc,
+    );
     assert_eq!(r_bc, r_tw, "dangling budget: bytecode != tree-walker");
 }
 

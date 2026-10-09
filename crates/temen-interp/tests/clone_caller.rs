@@ -16,21 +16,31 @@ use std::sync::Arc;
 use temen_interp::{run_with_host, Host, StreamRole, Value};
 use temen_ir::SpawnRec;
 
-/// The server's spawn record: S (func 1) at 17536, its window the module's own.
+/// The server's spawn record at 17536: S, func 1's child image (#2219), in the window the module
+/// declares.
 fn server() -> String {
-    rec::segment(17536, &SpawnRec::v1(1))
+    rec::segment(17536, &SpawnRec::v1(0))
 }
 
-/// `src` with its spawn records: the server S (func 1) at 17536, and the caller C (func 4) at 17664,
-/// granted `"svc"` and `"o"` by the list at 16640. Both are detached, paid from the root's last
-/// argument, a `Budget`.
+/// `src` with its spawn records: the server S at 17536, and the caller C at 17664, granted `"svc"`
+/// and `"o"` by the list at 16640. Both are detached, paid from the root's `Budget` argument, and
+/// child images (#2219): S of func 1, C of func 4, the root's last two arguments.
 fn forking(src: &str) -> String {
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(4)
+        ..SpawnRec::v1(0)
     };
     format!("{src}{}{}", server(), rec::segment(17664, &c))
+}
+
+/// `m`'s child images (#2219) of the functions `funcs`, granted in order: the server S is func 1 and
+/// the caller C func 4.
+fn images<const N: usize>(host: &mut Host, m: &temen_ir::Module, funcs: [u32; N]) -> [Value; N] {
+    funcs.map(|f| {
+        let image = temen_ir::child_image_at(m, f).expect("child image");
+        Value::I32(host.grant_module(&image))
+    })
 }
 
 fn module(text: &str) -> Arc<temen_ir::Module> {
@@ -114,8 +124,10 @@ memory 17
 type 0 func (i64) -> (i64)
 type 1 interface { op: 0 }
 export 0 interface "svc" 1 { op: 2 }
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vbud: i32, vsm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q0b = i64.const 17564
   i32.store q0b vbud
   q0p = i64.const 17536
@@ -204,14 +216,14 @@ fn clone_caller_outside_a_handler_is_probeable_einval() {
 fn clone_caller_injects_the_callers_reply_out_of_band() {
     let m = module(&format!("{SRC}{}", server()));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
+    let [sm] = images(&mut host, &m, [1]);
     let mut fuel = 20_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(hb), sm],
         &mut fuel,
         &mut host,
     )
@@ -261,8 +273,10 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q1b = i64.const 17564
   i32.store q1b vbud
   q1p = i64.const 17536
@@ -285,6 +299,8 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
+  qcm = i64.const 17688
+  i32.store qcm vcm
   q2b = i64.const 17692
   i32.store q2b vbud
   q2p = i64.const 17664
@@ -362,16 +378,16 @@ block 4 (vr: i64, vho: i32) {
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -409,16 +425,16 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -434,16 +450,16 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 40_000_000u64;
     let bc_r = temen_interp::bytecode::compile_and_run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -495,8 +511,10 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q3b = i64.const 17564
   i32.store q3b vbud
   q3p = i64.const 17536
@@ -519,6 +537,8 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
+  qcm = i64.const 17688
+  i32.store qcm vcm
   q4b = i64.const 17692
   i32.store q4b vbud
   q4p = i64.const 17664
@@ -597,16 +617,16 @@ block 5 (vpid: i64) {
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
     let m = module(&forking(SRC_FORK_PID));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 40_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -656,8 +676,10 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q5b = i64.const 17564
   i32.store q5b vbud
   q5p = i64.const 17536
@@ -680,6 +702,8 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
+  qcm = i64.const 17688
+  i32.store qcm vcm
   q6b = i64.const 17692
   i32.store q6b vbud
   q6p = i64.const 17664
@@ -762,16 +786,16 @@ block 5 () {
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
     let m = module(&forking(SRC_FORK_WAIT));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 60_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -809,8 +833,10 @@ type 2 func (i64, i64) -> (i64)
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
+  qsm = i64.const 17560
+  i32.store qsm vsm
   q5b = i64.const 17564
   i32.store q5b vbud
   q5p = i64.const 17536
@@ -833,6 +859,8 @@ block 0 (v0: i32, vout: i32, vbud: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
+  qcm = i64.const 17688
+  i32.store qcm vcm
   q6b = i64.const 17692
   i32.store q6b vbud
   q6p = i64.const 17664
@@ -922,16 +950,16 @@ block 5 () {
 fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
     let m = module(&forking(SRC_FORK_WAITPID));
     let mut host = Host::new();
-    host.set_self_module(&m);
     let ih = host.grant_instantiator(0, 1u64 << 18);
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
+    let [sm, cm] = images(&mut host, &m, [1, 4]);
     let mut fuel = 60_000_000u64;
     let r = run_with_host(
         &m,
         0,
-        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+        &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
         &mut fuel,
         &mut host,
     )
@@ -1015,15 +1043,15 @@ block 2 (vs: i64) {
     std::thread::spawn(move || {
         let m = module(&forking(&src));
         let mut host = Host::new();
-        host.set_self_module(&m);
         let ih = host.grant_instantiator(0, 1u64 << 18);
         let hb = host.grant_budget(-1, 8 << 20, -1);
         let out_h = host.grant_stream(StreamRole::Out);
+        let [sm, cm] = images(&mut host, &m, [1, 4]);
         let mut fuel = 60_000_000u64;
         let _ = tx.send(run_with_host(
             &m,
             0,
-            &[Value::I32(ih), Value::I32(out_h), Value::I32(hb)],
+            &[Value::I32(ih), Value::I32(out_h), Value::I32(hb), sm, cm],
             &mut fuel,
             &mut host,
         ));

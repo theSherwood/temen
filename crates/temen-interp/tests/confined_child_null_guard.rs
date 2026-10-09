@@ -20,13 +20,16 @@ use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
-/// Root `(inst, budget) -> child`: spawns func 1 detached through the v1 record at 17408, paid from
-/// `budget`, and `join`s it. The child stores 7 at `addr` in its own window and loads it back.
+/// Root `(inst, budget, child) -> child`: spawns `child` (func 1's child image, #2219) detached through
+/// the v1 record at 17408, paid from `budget`, and `join`s it. The child stores 7 at `addr` in its own
+/// window and loads it back.
 fn child_src(addr: u64) -> String {
     format!(
         r#"memory 17
-func (i32, i32) -> (i64) {{
-block 0 (vinst: i32, vbud: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32, vmod: i32) {{
+  vm = i64.const 17432
+  i32.store vm vmod
   vb = i64.const 17436
   i32.store vb vbud
   vrec = i64.const 17408
@@ -45,7 +48,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {}"#,
-        rec::segment(17408, &SpawnRec::v1(1))
+        rec::segment(17408, &SpawnRec::v1(0))
     )
 }
 
@@ -75,13 +78,13 @@ block 0 (vsp: i64, varg: i64) {{
     )
 }
 
-/// A self-spawning root's powerbox: its program registered, an instantiator, and a budget.
+/// The spawning root's powerbox: an instantiator, a budget, and the child image of its func 1.
 fn spawn_host(m: &temen_ir::Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let inst = host.grant_instantiator(0, 1 << 17);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    (host, vec![Value::I32(inst), Value::I32(budget)])
+    let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    (host, [inst, budget, child].map(Value::I32).to_vec())
 }
 
 /// The cooperative multiplex.

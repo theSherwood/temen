@@ -29,8 +29,9 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
 /// `(i64)` starter arg the spawn-ABI enforces; C1 uses `i32.wrap_i64` on it (no durable transform
 /// here, so conversions are fine) to get the `i32` instantiator handle for spawning C2.
 ///
-/// Both spawns are detached, by the records [`chain`] appends: root pays for C1 from the `Budget`
-/// `v1`, and C1 pays for C2 from its own `"budget"`.
+/// Both spawns are detached, by the records [`chain`] appends, and each child is a child image
+/// (#2219): C1 of func 2, the `Module` `v2`, and C2 of func 4, `v3`, which root grants C1 as `"c2"`.
+/// Root pays for C1 from the `Budget` `v1`, and C1 pays for C2 from its own `"budget"`.
 const CHAIN: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
@@ -38,8 +39,19 @@ type 1 interface { call: 0 }
 export 0 interface "leaf" 1 { call: 1 }
 export 1 interface "fwd" 1 { call: 3 }
 data 17408 "budget"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+data 17416 "c2"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+  vrm = i64.const 17560
+  i32.store vrm v2
+  vga = i64.const 17760
+  vgn = i32.const 17416
+  i32.store vga vgn
+  vgb = i64.const 17764
+  vgl = i32.const 2
+  i32.store vgb vgl
+  vgc = i64.const 17768
+  i32.store vgc v3
   vrb = i64.const 17564
   i32.store vrb v1
   vrp = i64.const 17536
@@ -66,6 +78,11 @@ block 0 (v0: i64) {
   vb = self.resolve vnp vnl
   vrb = i64.const 17692
   i32.store vrb vb
+  vmp = i64.const 17416
+  vml = i64.const 2
+  vm2 = self.resolve vmp vml
+  vrm = i64.const 17688
+  i32.store vrm vm2
   vrp = i64.const 17664
   vc2 = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vexp = i64.const 0
@@ -96,12 +113,17 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// [`CHAIN`] with its spawn records: C1 (func 2) at 17536 and C2 (func 4) at 17664.
+/// [`CHAIN`] with its spawn records: C1's at 17536, granted the list at 17760, and C2's at 17664.
 fn chain() -> String {
+    let c1 = SpawnRec {
+        grants_ptr: 17760,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     format!(
         "{CHAIN}{}{}",
-        rec::segment(17536, &SpawnRec::v1(2)),
-        rec::segment(17664, &SpawnRec::v1(4))
+        rec::segment(17536, &c1),
+        rec::segment(17664, &SpawnRec::v1(0))
     )
 }
 
@@ -126,17 +148,13 @@ fn run_chain_with_watchdog() -> Result<Vec<Value>, Trap> {
     std::thread::spawn(move || {
         let m = module(&chain());
         let mut host = Host::new();
-        host.set_self_module(&m);
         let ih = host.grant_instantiator(0, 1u64 << 19);
         let hb = host.grant_budget(-1, 4 << 20, -1);
+        let c1 = host.grant_module(&temen_ir::child_image_at(&m, 2).expect("C1's image"));
+        let c2 = host.grant_module(&temen_ir::child_image_at(&m, 4).expect("C2's image"));
         let mut fuel = 20_000_000u64;
-        let r = run_with_host(
-            &m,
-            0,
-            &[Value::I32(ih), Value::I32(hb)],
-            &mut fuel,
-            &mut host,
-        );
+        let args = [ih, hb, c1, c2].map(Value::I32);
+        let r = run_with_host(&m, 0, &args, &mut fuel, &mut host);
         // The receiver is gone if the watchdog already fired; the send error is expected there.
         let _ = tx.send(r);
     });
