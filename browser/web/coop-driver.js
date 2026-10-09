@@ -42,10 +42,10 @@ export function moduleCacheClear() {
 // i64 slot — worker.js's `jitArg`/`jitRes` twins for the single-shot pump (#835). Type codes:
 // 0 = i32 (JS Number), 1 = i64 (BigInt), 2 = f32, 3 = f64 (Numbers via the slot's float bits).
 const f64buf = new DataView(new ArrayBuffer(8));
-const tierupJitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot))
+export const tierupJitArg = (slot, tc) => tc === 0 ? Number(BigInt.asIntN(32, slot))
   : tc === 1 ? slot
   : (f64buf.setBigInt64(0, slot, true), tc === 2 ? f64buf.getFloat32(0, true) : f64buf.getFloat64(0, true));
-const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
+export const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
   : (tc === 2 ? f64buf.setFloat32(0, ret, true) : f64buf.setFloat64(0, ret, true), f64buf.getBigInt64(0, true));
 
 // The **cooperative tier-up driver** (#926 slice 2; since #1026 the ONE fallback tier when the
@@ -76,7 +76,8 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 // that code calls through (Model B2, #880), what fills it — the run's region emit, installed §22 units,
 // and bounce shims for slots whose function stays on the interpreter — the globals every live
 // instance shares, the env cell, the bounce back into the interpreter, and how a trap in emitted code
-// is named. The coop driver keeps one for its run. `x` reads the run it serves:
+// is named. The coop driver keeps one for its run, and each thread of the parallel driver one on its
+// Worker. `x` reads the run it serves:
 // - `tableLog2()`, `nfuncs()`: the table's size, and its natural prefix (the program's functions);
 // - `tableGen()`, `slotUnit(slot)`: the table's generation, and the `(domain, unit)` installed at a
 //   slot (a BigInt; negative for none);
@@ -88,9 +89,11 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 //   sees it — whether it is page-checked, the event's extent (a paged run's table coverage), the
 //   extent now, the page-state table, and the base;
 // - `deliverFaultAddr(addr)`: where a memory fault in emitted code faulted;
-// - `spillBytes()`, `spillPtr()`: the spill stack a collecting guest's frames push to (#1627).
+// - `spillBytes()`, `spillPtr()`: the spill stack a collecting guest's frames push to (#1627);
+// - `fuelOut()` (optional): emitted code spent its fuel. Return more for every instance to run on
+//   with, or nothing to let the code trap `OutOfFuel`; without it, it traps.
 // Everything here is synchronous but `syncTable` and `unitFor`, which the coop driver awaits at its
-// event boundaries.
+// event boundaries; a host that cannot await uses `syncTableSync` and `unitForSync`.
 export function emittedTier(ex, memory, x) {
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
@@ -129,6 +132,15 @@ export function emittedTier(ex, memory, x) {
   // event's entry resets it (`armEnv`); `0` — no `env.trap` — is a native wasm trap (`nativeTrap`).
   let lastTrap = 0;
   const recordTrap = (code) => { lastTrap = code; };
+  // The `env.trap` every instance made here imports. Emitted code calls it with `OUT_OF_FUEL` when
+  // its fuel runs out, and runs on if the counter was refilled.
+  const trap = x.fuelOut
+    ? (code) => {
+      const more = code === 11 /* temen_ir::trap_code::OUT_OF_FUEL */ ? x.fuelOut() : undefined;
+      if (more === undefined) return recordTrap(code);
+      for (const g of fuelGlobals) g.value = more;
+    }
+    : recordTrap;
   const armEnv = () => {
     lastTrap = 0;
     const dv = new DataView(memory.buffer);
@@ -182,10 +194,10 @@ export function emittedTier(ex, memory, x) {
     afterBounce(rc);
     if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
   };
-  const imports = (call_interp = callInterp, trap = recordTrap) => ({ env: {
+  const imports = (call_interp = callInterp, onTrap = trap) => ({ env: {
     memory,
     __indirect_function_table: table,
-    trap,
+    trap: onTrap,
     call_interp,
   } });
   // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
@@ -287,6 +299,15 @@ export function emittedTier(ex, memory, x) {
     }
     return unit;
   };
+  // `unitFor` for a host that cannot await: a Worker, which may compile a module of any size.
+  const unitForSync = (key, bytes) => {
+    let unit = jitUnits.get(key);
+    if (unit === undefined) {
+      unit = instantiateUnitSync(bytes);
+      jitUnits.set(key, unit);
+    }
+    return unit;
+  };
   // Rebuild the shared table from the run's dispatch table whenever its generation moved: at each
   // event boundary (`syncTable`) and — #1233 — inside `env.call_interp` after a bounce that installed
   // or uninstalled (`syncTableSync`). A slot in the natural prefix holds the emitted program `f{slot}`
@@ -344,8 +365,9 @@ export function emittedTier(ex, memory, x) {
   };
   return {
     imports, register, mappedGlobals, fuelGlobals, pagestateGlobals, envCell, armEnv, bounce,
-    afterBounce, callInterp, recordTrap, trapOf, unitFor, syncTable,
+    afterBounce, callInterp, recordTrap, trapOf, unitFor, unitForSync, syncTable, syncTableSync,
     // The region emit's exports, whose `f{i}` fill the table's natural prefix.
+    program: () => program,
     setProgram: (exports) => {
       program = exports;
       register(exports);
