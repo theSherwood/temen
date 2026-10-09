@@ -13,19 +13,19 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
-/// A host for `m` with an `Instantiator` over the low 128 KiB and a `"budget"` that a detached spawn
-/// of `m`'s own code pays from.
+/// A host for `m` with an `Instantiator` over the low 128 KiB, and the `"budget"` and `"child"` (`m`'s
+/// child image of func 1, #2219) of a detached spawn. The carve fixtures use neither.
 fn host(m: &Module) -> (Host, i32) {
     let mut h = Host::new();
-    h.set_self_module(&Arc::new(m.clone()));
     let budget = h.grant_budget(-1, 1 << 20, -1);
     h.register_cap_name("budget", budget);
     let inst = h.grant_instantiator(0, 128 << 10);
+    let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    h.register_cap_name("child", child);
     (h, inst)
 }
 
@@ -190,10 +190,11 @@ fn nesting_composes_to_depth_two() {
 /// A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
 /// `AddressSpace` (iface 5, op 1 = `unmap`) to decommit the second 16 KiB of its **own** window (the
 /// first 16 KiB is its NULL guard, #1206 — a page op there is refused as at the root) and returns the
-/// unmap result (0). The parent spawns it detached through a v1 record at 17728, paid from the
-/// `"budget"` it resolves, and returns what it returns.
+/// unmap result (0). The parent spawns it (its `"child"`, func 1's child image) detached through a v1
+/// record at 17728, paid from the `"budget"` it resolves, and returns what it returns.
 const ADDRESS_SPACE: &str = r#"memory 18
 data 16640 "budget"
+data 16656 "child"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vnp = i64.const 16640
@@ -201,6 +202,11 @@ block 0 (v0: i32) {
   vb = self.resolve vnp vnl
   q3b = i64.const 17756
   i32.store q3b vb
+  vcp = i64.const 16656
+  vcl = i64.const 5
+  vc = self.resolve vcp vcl
+  q3m = i64.const 17752
+  i32.store q3m vc
   q3a0 = i64.const 17728
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
@@ -220,7 +226,7 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(1)));
+    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(0)));
     check(&src, Ok(vec![Value::I64(0)]));
 }
 

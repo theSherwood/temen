@@ -20,8 +20,8 @@ use temen_verify::verify_module;
 /// A handle the guest was never granted.
 const FORGED: i32 = 9999;
 
-/// Spawn func 1 detached through the real `Instantiator`, paid from the root's `Budget` (a v1 record
-/// at 17408), then apply `op` to the live child through `FORGED`.
+/// Spawn the child (func 1's child image, #2219) detached through the real `Instantiator`, paid from
+/// the root's `Budget` (a v1 record at 17408), then apply `op` to the live child through `FORGED`.
 fn guest(op: u32) -> temen_ir::Module {
     let call = match op {
         1 => "  vr = call.cap 6 1 (i32) -> (i64) vf (vh)".to_string(),
@@ -30,8 +30,10 @@ fn guest(op: u32) -> temen_ir::Module {
     };
     let src = format!(
         r#"memory 17
-func (i32, i32) -> (i64) {{
-block 0 (vi: i32, vb: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vb: i32, vm: i32) {{
+  vam = i64.const 17432
+  i32.store vam vm
   vab = i64.const 17436
   i32.store vab vb
   vp = i64.const 17408
@@ -48,36 +50,37 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}"#,
-        rec = rec::segment(17408, &SpawnRec::v1(1))
+        rec = rec::segment(17408, &SpawnRec::v1(0))
     );
     let m = parse_module(&src).expect("parse guest");
     verify_module(&m).expect("verify guest");
     m
 }
 
-/// The entry's arguments: the `Instantiator` and the `Budget` that pays for the child.
-fn host() -> (Host, [i32; 2]) {
+/// The entry's arguments: the `Instantiator`, the `Budget` that pays for the child, and the child.
+fn host(m: &temen_ir::Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 128 << 10);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    (host, [inst, budget])
+    let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    (host, [inst, budget, child])
 }
 
 fn oracle(m: &temen_ir::Module) -> Result<Vec<Value>, Trap> {
-    let (mut host, args) = host();
+    let (mut host, args) = host(m);
     let mut fuel = 10_000_000u64;
     temen_interp::run_with_host(m, 0, &args.map(Value::I32), &mut fuel, &mut host)
 }
 
 /// `None` when the bytecode engine declines the module (it has no lowering for ops 9/10/12).
 fn bytecode_engine(m: &temen_ir::Module) -> Option<Result<Vec<Value>, Trap>> {
-    let (mut host, args) = host();
+    let (mut host, args) = host(m);
     let mut fuel = 10_000_000u64;
     bytecode::compile_and_run_with_host(m, 0, &args.map(Value::I32), &mut fuel, &mut host)
 }
 
 fn cranelift(m: &temen_ir::Module) -> JitOutcome {
-    let (mut host, args) = host();
+    let (mut host, args) = host(m);
     jit_cap_run(
         m,
         0,

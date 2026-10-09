@@ -46,8 +46,9 @@ const PAGE_BYTE: i64 = 7;
 const FAULT_MARK: i64 = 1000;
 
 /// CONSOLIDATION.md §2.2 — the **offer-transport twin**: the same S x P shape, driven the
-/// collapsed way. The parent spawns its own func 1 as a **detached demand child**, through a v1
-/// record paid from its `"budget"` that names its own impl export 0 as the pager; the child walks
+/// collapsed way. The parent spawns its `"child"`, func 1's child image (#2219), as a **detached
+/// demand child**, through a v1 record paid from its `"budget"` that names its own impl export 0 as
+/// the pager and leaves the child's `exit` import empty; the child walks
 /// the strides of its own window concurrently, each first touch faulting into a `page(addr)` call
 /// the parent serves from `svc.wait` (direct handoff runs the handler inline on the child's thread);
 /// the parent counts serves (`FAULT_MARK` each), joins the child (its stride sum), and repeats. The
@@ -60,7 +61,8 @@ fn offer_paging_program(s: u64, p: u64) -> String {
 memory 24
 data 16384 \"vm\"
 data 16400 \"budget\"
-{rec}type 0 func (i64) -> (i64)
+data 16416 \"child\"
+{rec}{exit}type 0 func (i64) -> (i64)
 type 1 interface {{ page: 0 }}
 export 0 interface \"pager\" 1 {{ page: 2 }}
 import 0 \"exit\" (i32) -> ()
@@ -75,6 +77,11 @@ block 0 () {{
   vb = self.resolve vbp vbl
   vrb = i64.const 17564
   i32.store vrb vb
+  vcp = i64.const 16416
+  vcl = i64.const 5
+  vcm = self.resolve vcp vcl
+  vrm = i64.const 17560
+  i32.store vrm vcm
   vs0 = i64.const 0
   vacc0 = i64.const 0
   br 1(vh, vs0, vacc0)
@@ -151,9 +158,12 @@ block 0 (vaddr: i64) {{
             17536,
             &SpawnRec {
                 pager: 0,
-                ..SpawnRec::v1(1)
+                grants_ptr: 16448,
+                grants_n: 1,
+                ..SpawnRec::v1(0)
             }
         ),
+        exit = rec::empty_grant(16448, 16432, "exit"),
         off = BUFFER_OFF,
         byte = PAGE_BYTE,
         mark = FAULT_MARK,
@@ -174,6 +184,7 @@ fn expected_exit(s: u64, p: u64) -> i32 {
 fn run(backend: Backend, src: &str) -> i32 {
     let m = parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
+    let child = temen_ir::child_image_at(&m, 1).expect("child image");
     let registry = Imports::new().provide("exit", HostCap::exit());
     let inst = instantiate_with_imports(m, registry).expect("instantiate");
     let r = inst
@@ -187,6 +198,12 @@ fn run(backend: Backend, src: &str) -> i32 {
                 ),
                 // One live child at a time, each a 2^24 window.
                 ("budget", HostCap::detached_budget(1 << 25)),
+                (
+                    "child",
+                    HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                        h.grant_module(&child)
+                    }),
+                ),
             ],
         )
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"));

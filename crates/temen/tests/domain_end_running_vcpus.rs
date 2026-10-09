@@ -15,7 +15,7 @@
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::Duration;
 use temen_interp::{Host, MemLayout, Trap, Value};
 use temen_ir::{SpawnRec, DEFAULT_RESERVED_LOG2};
@@ -64,16 +64,16 @@ const UP: u64 = 20480;
 /// these cases are about.
 fn thread_guest(body: &str, tail: &str) -> String {
     format!(
-        "memory 17\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vh = thread.spawn 1 v0 v0\n  br 1()\n  }}\nblock 1 () {{\n  vu = i64.const {UP}\n  vup = i32.atomic.load vu\n  br_if vup 2() 1()\n  }}\nblock 2 () {{\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  vu = i64.const {UP}\n  vone = i32.const 1\n  i32.atomic.store vu vone\n{body}"
+        "memory 17\nfunc (i64, i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64, vm: i64) {{\n  vh = thread.spawn 1 v0 v0\n  br 1()\n  }}\nblock 1 () {{\n  vu = i64.const {UP}\n  vup = i32.atomic.load vu\n  br_if vup 2() 1()\n  }}\nblock 2 () {{\n{tail}\n  }}\n}}\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, v9: i64) {{\n  vu = i64.const {UP}\n  vone = i32.const 1\n  i32.atomic.store vu vone\n{body}"
     )
 }
 
-/// The root spawns a §14 child that spins, detached and paid from its `Budget` (a v1 record at
-/// 17408), then runs `tail`.
+/// The root spawns a §14 child that spins (its func 1's child image, #2219), detached and paid from
+/// its `Budget` (a v1 record at 17408), then runs `tail`.
 fn child_guest(tail: &str) -> String {
     format!(
-        "memory 19\nfunc (i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
-        rec::segment(17408, &SpawnRec::v1(1))
+        "memory 19\nfunc (i64, i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64, vm: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vmm = i32.wrap_i64 vm\n  vam = i64.const 17432\n  i32.store vam vmm\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
+        rec::segment(17408, &SpawnRec::v1(0))
     )
 }
 
@@ -86,15 +86,14 @@ fn module(src: &str) -> temen_ir::Module {
     m
 }
 
-/// The root's arguments: an `Instantiator` over the whole window and the `Budget` that pays for a
-/// child (both unused by the thread guests). The host knows the root's module, which a child spawned
-/// detached from it runs.
-fn host(m: &temen_ir::Module) -> (Host, [i64; 2]) {
+/// The root's arguments: an `Instantiator` over the whole window, the `Budget` that pays for a child,
+/// and the child, func 1's child image (all three unused by the thread guests).
+fn host(m: &temen_ir::Module) -> (Host, [i64; 3]) {
     let mut host = Host::new();
-    host.set_self_module(&Arc::new(m.clone()));
     let ih = host.grant_instantiator(0, 1 << 19);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    (host, [ih, budget].map(i64::from))
+    let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
+    (host, [ih, budget, child].map(i64::from))
 }
 
 /// `run`'s answer, or `None` if it is still going after `DEADLINE` — a hang. It runs on its own
