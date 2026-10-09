@@ -3615,26 +3615,29 @@ fn nimonys_thread_tests_run_on_every_engine() {
     ]
     .map(|name| {
         let file = |ext: &str| std::fs::read_to_string(dir.join(format!("{name}.{ext}")));
+        let output = file("output").expect("its output");
         (
             name,
             file("nim").expect("test source"),
-            file("output").expect("its output"),
+            [output.clone(), output.clone(), output],
         )
     });
     // Theirs size the pool from the CPU count, the run's `self.parallelism` through the shim's
-    // `sysconf`: here the host's worker count, since the run sets no lane cap. This one asks for four,
-    // and the last prints the count.
+    // `sysconf`. This one asks for four, and the last prints the count: the bytecode engine runs
+    // every vCPU on one thread, the tree-walker's pool and the JIT the host's workers (#2254).
+    let pool4_out = "workers: 4 sum: 499500\n".to_string();
     let pool4 = (
         "pool4",
         POOL4.to_string(),
-        "workers: 4 sum: 499500\n".to_string(),
+        [pool4_out.clone(), pool4_out.clone(), pool4_out],
     );
+    let workers = format!("{}\n", temen_interp::pool_workers());
     let cpus = (
         "cpus",
         "import std / [cpuinfo, syncio]\necho countProcessors()\n".to_string(),
-        format!("{}\n", temen_interp::pool_workers()),
+        [workers.clone(), "1\n".to_string(), workers],
     );
-    for (name, src, want) in nimonys.into_iter().chain([pool4, cpus]) {
+    for (name, src, wants) in nimonys.into_iter().chain([pool4, cpus]) {
         let mods = compile_to_leng(&path, &src);
         let units: Vec<temen_leng::WholeModule> = mods
             .iter()
@@ -3643,11 +3646,12 @@ fn nimonys_thread_tests_run_on_every_engine() {
         let m = temen_leng::link_nim_powerbox(&units, Some(&libc))
             .unwrap_or_else(|e| panic!("{name}: link: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
-        for backend in [
+        let backends = [
             temen_run::Backend::TreeWalk,
             temen_run::Backend::Bytecode,
             temen_run::Backend::Jit,
-        ] {
+        ];
+        for (backend, want) in backends.into_iter().zip(wants) {
             let started = std::time::Instant::now();
             let run = temen_run::instantiate(m.clone())
                 .expect("instantiates")

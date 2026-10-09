@@ -7604,15 +7604,8 @@ impl Instance {
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let init_mem = config.init_mem()?;
-        let mut host = Host::new();
-        host.stdin = config.stdin.clone();
-        config.limits.grant(&mut host);
-        host.set_handoff(config.handoff);
-        self.grant_caps(&mut host, win);
-        for (name, cap) in extra_caps {
-            let handle = (cap.grant)(&mut host, win);
-            host.register_cap_name(name, handle);
-        }
+        let mut host = self.powerbox_host(config, win, extra_caps);
+        host.set_workers(1); // #2254: the cooperative driver runs every vCPU on one thread
         let fuel = config.limits.fuel();
         let mut run = temen_interp::bytecode::CoopRun::new_reserved(
             m,
@@ -7658,19 +7651,6 @@ impl Instance {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let init_mem = config.init_mem()?;
 
-        let mut host = Host::new();
-        host.stdin = config.stdin.clone();
-        config.limits.grant(&mut host);
-        host.set_handoff(config.handoff);
-        self.grant_caps(&mut host, win);
-        for (name, cap) in extra_caps {
-            let handle = (cap.grant)(&mut host, win);
-            host.register_cap_name(name, handle);
-        }
-        if let Some(setup) = host_setup {
-            setup(&mut host);
-        }
-
         // §3.6 behavioral parity (narrowed by I36 slice 3): a **serve-qualified** module (service
         // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
         // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
@@ -7682,6 +7662,16 @@ impl Instance {
         } else {
             backend
         };
+        let mut host = self.powerbox_host(config, win, extra_caps);
+        // #2254: the bytecode engine runs every vCPU of a run on one thread. A module it declines
+        // runs on the tree-walker's pool and still reports 1, which costs parallelism, not
+        // correctness. Before `host_setup`, so an embedder's hook can say otherwise.
+        if matches!(backend, Backend::Bytecode) {
+            host.set_workers(1);
+        }
+        if let Some(setup) = host_setup {
+            setup(&mut host);
+        }
         let mut trap_bt: Vec<temen_interp::IrPc> = Vec::new();
         let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
@@ -7754,16 +7744,8 @@ impl Instance {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let init_mem = config.init_mem()?;
 
-        let mut host = Host::new();
-        host.stdin = config.stdin.clone();
-        config.limits.grant(&mut host);
-        host.set_handoff(config.handoff);
-        self.grant_caps(&mut host, win);
-        for (name, cap) in extra_caps {
-            let handle = (cap.grant)(&mut host, win);
-            host.register_cap_name(name, handle);
-        }
-
+        let mut host = self.powerbox_host(config, win, extra_caps);
+        host.set_workers(1); // #2254: the debug engine schedules every vCPU on one thread
         let Some(mut run) =
             temen_interp::bytecode::ScheduledDebugRun::new_with_host(m, 0, &[], host)
         else {
@@ -7795,16 +7777,7 @@ impl Instance {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let init_mem = config.init_mem()?;
 
-        let mut host = Host::new();
-        host.stdin = config.stdin.clone();
-        config.limits.grant(&mut host);
-        host.set_handoff(config.handoff);
-        self.grant_caps(&mut host, win);
-        for (name, cap) in extra_caps {
-            let handle = (cap.grant)(&mut host, win);
-            host.register_cap_name(name, handle);
-        }
-
+        let mut host = self.powerbox_host(config, win, extra_caps);
         let mut fuel = config.limits.fuel();
         let cap = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
             m,
@@ -7919,7 +7892,25 @@ impl Instance {
         let mut host = Host::new();
         host.stdin = stdin;
         self.grant_caps(&mut host, win);
+        host.set_workers(1); // #2254: the debug engine schedules every vCPU on one thread
         temen_interp::Inspector::attach_with_host(&self.module, 0, &[], fuel, host)
+    }
+
+    /// The powerbox host every run of this instance starts from: stdin, the limits, the handoff,
+    /// the module's grants, and each of `extra_caps` under its name. One build for every driver, so
+    /// no driver answers differently what a guest may do (INVARIANTS #15). A caller whose driver
+    /// runs every vCPU on one thread sets its worker count to 1 ([`Host::set_workers`], #2254).
+    fn powerbox_host(&self, config: &RunConfig, win: u64, extra_caps: &[(&str, HostCap)]) -> Host {
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        config.limits.grant(&mut host);
+        host.set_handoff(config.handoff);
+        self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
+        host
     }
 
     fn grant_caps(&self, h: &mut Host, win: u64) {
