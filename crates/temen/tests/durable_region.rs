@@ -571,12 +571,13 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
     );
 }
 
-/// #2233 — **a thawed child that spins on its parent lets the parent run.** [`SHARING_PARENT`] sets
-/// the region's first word once it has mapped the region, after the cut, and [`SHARING_CHILD`] spins
-/// on that word before its tail. A thaw runs on one worker (DURABILITY.md §12.8), and the
-/// tree-walker's pool ran a vCPU until it parked, so the re-launched child's spin kept that worker
-/// and the thaw ran out of fuel. A vCPU in an unbounded lane now yields at its quantum (#2228); in a
-/// bounded one it still runs to its park (#2237).
+/// #2233 — **a thawed child that spins on its parent lets the parent run**, with the run's lane
+/// unbounded and capped at 2. [`SHARING_PARENT`] sets the region's first word once it has mapped the
+/// region, after the cut, and [`SHARING_CHILD`] spins on that word before its tail. A thaw runs on one
+/// worker (DURABILITY.md §12.8), and the tree-walker's pool ran a vCPU until it parked, so the
+/// re-launched child's spin kept that worker and the thaw ran out of fuel. A vCPU now yields at its
+/// quantum (#2228), and in a bounded lane it keeps its lane across the yield, so the worker
+/// time-slices between the two vCPUs the lane admits (#2237).
 #[test]
 fn a_thawed_child_spinning_on_its_parent_lets_the_parent_run() {
     let map = "  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)\n";
@@ -594,26 +595,32 @@ block 4 (vd: i64) {
     assert!(SHARING_PARENT.contains(map) && SHARING_CHILD.contains(tail));
     let parent = confined(&SHARING_PARENT.replace(map, &signal));
     let child = confined(&SHARING_CHILD.replace(tail, spin));
-    let (mut host, args) = sharing_host(&child, heap_region());
-    let win = init_durable_window(WINDOW, TEST_ARENA);
-    let (base, ..) = run(&parent, 0, &mut host, &args, &win, None);
-    assert_eq!(base, Ok(vec![Value::I64(SHARED_WANT)]), "uninterrupted run");
+    let want = Ok(vec![Value::I64(SHARED_WANT)]);
+    for cap in [-1, 2] {
+        let (mut host, args) = sharing_host(&child, heap_region());
+        host.set_lane_cap(cap);
+        let win = init_durable_window(WINDOW, TEST_ARENA);
+        let (base, ..) = run(&parent, 0, &mut host, &args, &win, None);
+        assert_eq!(base, want, "uninterrupted run, lane cap {cap}");
 
-    let (mut fhost, args) = sharing_host(&child, heap_region());
-    let mut fwin = win.clone();
-    temen_durable::write_state(&mut fwin, STATE_UNWINDING);
-    let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
-    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
-    assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
-    let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
-    let mut thost = Host::new();
-    thost.set_durable(true);
-    thost.grant_durable_module(&child);
-    let (mut twin, rprots, _) =
-        restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
-    begin_thaw(&mut twin, TEST_ARENA, 0);
-    let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
-    assert_eq!(thawed, Ok(vec![Value::I64(SHARED_WANT)]), "the thaw");
+        let (mut fhost, args) = sharing_host(&child, heap_region());
+        fhost.set_lane_cap(cap);
+        let mut fwin = win.clone();
+        temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+        let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
+        assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+        assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
+        let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.grant_durable_module(&child);
+        thost.set_lane_cap(cap);
+        let (mut twin, rprots, _) =
+            restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+        begin_thaw(&mut twin, TEST_ARENA, 0);
+        let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
+        assert_eq!(thawed, want, "the thaw, lane cap {cap}");
+    }
 }
 
 /// **Step 3 — a region a JIT parent shares with its detached child rides the cut.** The JIT freeze

@@ -4051,8 +4051,9 @@ pub mod lanes {
         true
     }
 
-    /// Release every lane in `chain` (the task parked, yielded or finished). Exact inverse of
-    /// [`enter`]; a zero entry is removed so the map stays the size of the live domain set.
+    /// Release every lane in `chain` (the task parked or finished; a preempted task keeps them).
+    /// Exact inverse of [`enter`]; a zero entry is removed so the map stays the size of the live
+    /// domain set.
     pub fn leave(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) {
         for &(d, _) in chain {
             if let Some(n) = running.get_mut(&d) {

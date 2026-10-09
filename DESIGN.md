@@ -3527,7 +3527,8 @@ was `MAX_WORKERS`, global.
    D22's double-scheduler objection is real *for those*. D56 is unchanged for them.
 3. **Parallelism is a granted resource, bounded at dispatch.** A domain holds a **lane cap**: how
    many tasks of its subtree may be *running* at once. Checked when a worker picks a task, released
-   on park/yield/finish. Distinct from the task-count bound (the budget's `spawn`), which stays.
+   on park/finish; a task preempted at its quantum keeps its lane (#2237). Distinct from the
+   task-count bound (the budget's `spawn`), which stays.
 4. **Ceiling with per-child lanes.** A grants B a lane of 2: B's subtree runs ≤ 2 at once; A's own
    tasks may fill any lane A holds. Σ of a parent's granted lanes ≤ its own cap, enforced at grant
    time; a task counts against its own lane and every enclosing one (the nested-`cpu.max` shape).

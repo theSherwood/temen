@@ -5135,11 +5135,11 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// host parallelism. Workers are spawned **lazily** — a single-threaded guest never creates any.
 const MAX_WORKERS: usize = 32;
 
-/// How many ops a vCPU in an unbounded lane runs on a worker before it yields it to the next
-/// runnable vCPU: the real pool's preemption quantum. Without it a vCPU kept its worker until it
-/// parked, so guest threads that spin on each other livelocked once they outnumbered the workers:
-/// the spinners held every worker, and the thread they waited for never ran (#2202, nimony's
-/// `tallocpool` on four workers). A vCPU in a bounded lane is not preempted (see [`dispatch`]).
+/// How many ops a vCPU runs on a worker before it yields it to the next runnable vCPU: the real
+/// pool's preemption quantum. Without it a vCPU kept its worker until it parked, so guest threads
+/// that spin on each other livelocked once they outnumbered the workers: the spinners held every
+/// worker, and the thread they waited for never ran (#2202, nimony's `tallocpool` on four workers).
+/// A vCPU in a bounded lane keeps its lanes across the yield (#2237, see [`dispatch`]).
 ///
 /// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
 /// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
@@ -6369,9 +6369,10 @@ struct Sched {
     handles: Vec<std::thread::JoinHandle<()>>,
     /// vCPUs not yet finished (running + queued + parked). The run ends when this hits 0.
     live: usize,
-    /// D66 — tasks currently **on a worker**, per domain (every domain a running task's lane chain
-    /// names, so a child's task counts here under its own domain *and* each ancestor's). Checked
-    /// against each chain entry's cap at dispatch ([`lane_enter`]); never counts a parked task.
+    /// D66 — tasks **holding a lane**, per domain: on a worker, or preempted at their quantum's end
+    /// and queued to resume (#2237). Every domain a holder's lane chain names counts it, so a child's
+    /// task counts here under its own domain *and* each ancestor's. Checked against each chain entry's
+    /// cap at dispatch ([`lane_enter`]); never counts a parked task.
     lane_running: BTreeMap<usize, usize>,
     /// D66 — vCPUs that were runnable but found a lane in their chain full. Re-admitted wholesale on
     /// any lane release (wake-all, the same obviously-correct form `svc_waiters` uses: each re-checks
@@ -7776,6 +7777,13 @@ fn kill_child_locked(s: &mut Sched, flag: &AtomicBool, host: Option<&Arc<Mutex<H
 /// the owner's death propagates as the S3 kill, [`kill_child_locked`]). Returns the dispatch tickets the vCPU had admitted but not replied
 /// (`handler_parks` / `serve_run`) so the caller can errno-wake their cross-domain callers (D37).
 fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
+    // D66 — a vCPU its quantum preempted still holds its lanes (#2237): give them back, and re-admit
+    // what waited on them, as its next dispatch would have.
+    if v.holds_lanes {
+        lane_leave(&mut s.lane_running, &v.lane_chain);
+        let woken: Vec<Box<VCpu>> = s.lane_waiters.drain(..).collect();
+        s.runnable.extend(woken);
+    }
     let tickets: Vec<u64> = v
         .handler_parks
         .values()
@@ -8646,9 +8654,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     loop {
         // D66 — lane admission: a bounded chain must have room in every lane before this vCPU takes
         // the worker; a blocked one waits in `lane_waiters` (re-admitted on any release) and the worker
-        // moves on. Unbounded chains — every run that sets no cap — skip the lock entirely.
+        // moves on. One that its quantum preempted still holds its lanes. Unbounded chains — every run
+        // that sets no cap — skip the lock entirely.
         let bounded = lane_bounded(&v.lane_chain);
-        if bounded {
+        if bounded && !v.holds_lanes {
             let mut s = sched.lock();
             if !lane_enter(&mut s.lane_running, &v.lane_chain) {
                 s.lane_waiters.push_back(v);
@@ -8684,15 +8693,16 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 m.durable_set_sp(root_word, v.root_shadow_sp);
             }
         }
-        // Only an unbounded vCPU is preempted: the pool's size is a cap the guest never asked for,
-        // and the quantum keeps it invisible, as the OS keeps the core count invisible to the JIT's
-        // threads. Inside a bounded lane a vCPU runs to its next park, as on the JIT, where a lane is
-        // held from resume to park; a yield would hand its lane to a sibling mid-body.
-        let step = v.run(if bounded { u64::MAX } else { POOL_QUANTUM });
-        // D66 — the lanes are held exactly while the vCPU is on the worker: release them before any
-        // routing below (a parked or finished task holds none), and re-admit everything that was
+        // The pool's size is a cap the guest never asked for, and the quantum keeps it invisible, as
+        // the OS keeps the core count invisible to the JIT's threads.
+        let step = v.run(POOL_QUANTUM);
+        // D66 — the lanes are held until the vCPU parks or finishes, as a JIT thread holds its lane
+        // from resume to park: a quantum's end keeps them, so no sibling takes a full lane from a
+        // holder mid-body, and a lane wider than the pool time-slices among the vCPUs it admits
+        // (#2237). Otherwise release them before any routing below, and re-admit everything that was
         // waiting on a lane — each re-checks at its own dispatch.
-        if bounded {
+        v.holds_lanes = bounded && matches!(step, Step::Yield);
+        if bounded && !v.holds_lanes {
             let mut s = sched.lock();
             lane_leave(&mut s.lane_running, &v.lane_chain);
             if !s.lane_waiters.is_empty() {
@@ -10041,6 +10051,12 @@ impl DetState {
 /// wake any cross-domain joiner. The explorer's single-threaded, so unlike the executor's
 /// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
+    // D66 — as [`reap`]: a vCPU whose turn ended holding its lanes gives them back.
+    if v.holds_lanes {
+        lane_leave(&mut s.lane_running, &v.lane_chain);
+        let woken = std::mem::take(&mut s.lane_waiters);
+        s.runnable.extend(woken);
+    }
     let outcome = Outcome {
         result: Err(*reason),
         mem: v.mem.take(),
@@ -10326,6 +10342,7 @@ impl SchedDriver {
                         // release re-admits it) and the driver picks again. A deferred planned pick
                         // is fine: the plan named a runnable tid, and the tid is still live.
                         if lane_bounded(&v.lane_chain)
+                            && !v.holds_lanes
                             && !lane_enter(&mut s.lane_running, &v.lane_chain)
                         {
                             s.lane_waiters.push(v);
@@ -10348,9 +10365,13 @@ impl SchedDriver {
             };
 
             let step = v.run(quantum);
-            // D66 — release the lanes the turn held and re-admit any lane-deferred pick (see
-            // `dispatch`; the exploration driver must gate identically to stay the oracle's oracle).
-            if lane_bounded(&v.lane_chain) {
+            // D66 — release the lanes once the vCPU parks or finishes, keep them across a turn's end
+            // or a debug stop (the held turn resumes without admission), and re-admit any
+            // lane-deferred pick (see `dispatch`; the exploration driver must gate identically to stay
+            // the oracle's oracle).
+            v.holds_lanes =
+                lane_bounded(&v.lane_chain) && matches!(step, Step::Yield | Step::Pause(..));
+            if lane_bounded(&v.lane_chain) && !v.holds_lanes {
                 let mut s = det.lock();
                 lane_leave(&mut s.lane_running, &v.lane_chain);
                 let woken = std::mem::take(&mut s.lane_waiters);
@@ -12084,12 +12105,17 @@ struct VCpu {
     delivered_detached: Vec<(usize, TaskId)>,
     /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
     /// innermost first. A worker may run it only while every bounded cap in the chain has room
-    /// ([`lane_enter`]); it holds those lanes exactly while it is on a worker and releases them the
-    /// moment it parks, yields or finishes ([`lane_leave`]). Copied from the spawner at spawn (a
-    /// `thread.spawn` sibling shares its domain's chain; a §14 child prepends its own domain), so it
-    /// never changes for the vCPU's life and needs no lock to read. Empty ⇒ nothing bounded: the hot
-    /// path skips both scheduler locks entirely, which is every run that sets no lane cap.
+    /// ([`lane_enter`]); it holds those lanes from that dispatch until it parks or finishes
+    /// ([`lane_leave`]), as a JIT thread holds its lane from resume to park. Copied from the spawner
+    /// at spawn (a `thread.spawn` sibling shares its domain's chain; a §14 child prepends its own
+    /// domain), so it never changes for the vCPU's life and needs no lock to read. Empty ⇒ nothing
+    /// bounded: the hot path skips both scheduler locks entirely, which is every run that sets no
+    /// lane cap.
     lane_chain: Vec<(usize, i64)>,
+    /// D66 — whether this vCPU holds its chain's lanes off a worker: its quantum ended, or the
+    /// explorer holds its turn at a debug stop, and neither releases them (#2237). Its next dispatch
+    /// skips admission, and [`reap`] gives them back if it never runs again.
+    holds_lanes: bool,
     /// D66 — a parent's map from a **detached** child's join slot to the lane it was granted, so the
     /// reap ([`credit_child_lane`]) returns it to `granted_lanes`. Only op-15 children have one.
     child_lane: BTreeMap<usize, i64>,
@@ -12240,6 +12266,7 @@ impl VCpu {
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
+            holds_lanes: false,
             child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -12321,6 +12348,7 @@ impl VCpu {
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
+            holds_lanes: false,
             child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -12424,6 +12452,7 @@ impl VCpu {
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
             lane_chain: Vec::new(),
+            holds_lanes: false,
             child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
@@ -13291,6 +13320,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         child_kill,
         child_freeze,
         lane_chain,
+        holds_lanes: _, // #2237: set at the dispatch boundary, after the run
         child_lane,
         serve_run,
         handler_parks,
