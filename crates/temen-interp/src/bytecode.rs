@@ -2165,6 +2165,9 @@ fn admit_detached_child(
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
     child_host.set_attestation(host.detached_child_attestation());
+    // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
+    // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
+    child_host.set_lane_cap(lane);
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
     // #1944 — the budget that paid for the window is the child's own.
@@ -10492,13 +10495,13 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         } => false,
         // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
         // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`, `attest`,
-        // `provenance`, `fuel.remaining` and the `pipe` mint. Its serve, fork, reap and exec ops
-        // park or need the caller's frames.
+        // `provenance`, `fuel.remaining`, the `pipe` mint and `parallelism`. Its serve, fork, reap
+        // and exec ops park or need the caller's frames.
         Inst::CapCall {
             type_id: temen_ir::CAP_SELF_TYPE_ID,
             op,
             ..
-        } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=18),
+        } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=19),
         Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
         _ => false,
     };

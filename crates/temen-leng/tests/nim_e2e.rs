@@ -3621,14 +3621,20 @@ fn nimonys_thread_tests_run_on_every_engine() {
             file("output").expect("its output"),
         )
     });
-    // Theirs size the pool from the CPU count, which the sandbox does not report, so they get one
-    // worker; this one asks for four.
+    // Theirs size the pool from the CPU count, the run's `self.parallelism` through the shim's
+    // `sysconf`: here the host's worker count, since the run sets no lane cap. This one asks for four,
+    // and the last prints the count.
     let pool4 = (
         "pool4",
         POOL4.to_string(),
         "workers: 4 sum: 499500\n".to_string(),
     );
-    for (name, src, want) in nimonys.into_iter().chain([pool4]) {
+    let cpus = (
+        "cpus",
+        "import std / [cpuinfo, syncio]\necho countProcessors()\n".to_string(),
+        format!("{}\n", temen_interp::pool_workers()),
+    );
+    for (name, src, want) in nimonys.into_iter().chain([pool4, cpus]) {
         let mods = compile_to_leng(&path, &src);
         let units: Vec<temen_leng::WholeModule> = mods
             .iter()

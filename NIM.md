@@ -979,10 +979,13 @@ condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58)
 `i32.atomic.wait` and `FUTEX_WAKE` as `atomic.notify`, and fails any other number with `ENOSYS`.
 `std/threadpool` itself takes ticket spinlocks and atomics (#2202 part 1 made those the IR's).
 
+**The CPU count.** `sysconf(_SC_NPROCESSORS_ONLN)` (and `_CONF`) answers `self.parallelism`: the
+domain's lane cap when it has one (D66), else the host's worker count. `std/cpuinfo` asks
+`sched_getaffinity` first, which reports nothing here, and falls back to it, so `initPool()` starts
+`max(1, n - 1)` workers.
+
 **What is not served.**
 - CPU affinity is a no-op.
-- There is no CPU count: `sched_getaffinity` and `sysconf` report none, so `initPool()` starts one
-  worker and `initPool(n)` asks for `n`.
 - The shim's `nanosleep` returns at once, so an idle pool worker spins rather than naps. Under the
   POSIX personality it parks, and the bytecode engine does not time a wait out while another thread
   is runnable (#2224), so a thread that spins on a napping one hangs there.
