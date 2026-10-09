@@ -340,6 +340,15 @@ compiler bug is a clean error, never an escape.
    and a nested-dir include, compiled + run to exact output) and a `browser-play-editor-test.mjs`
    Chromium assertion.
 
+   **→ Child programs, 2026-10-09 (#2219).** A `//// child: NAME.c` line starts a separate program: the
+   page splits it off (`splitChildren` in `play.js`), compiles it on its own (cached per page by source),
+   links it against the resident libc and heap with the §14 child bootstrap (`temen_link_child_libs`,
+   which seeds its heap words), and stages it; the next run grants it to the card's program as a
+   `Module` named NAME, which that program spawns at entry 0. A child binds its imports strictly, so one
+   that uses stdio needs its parent to grant `vm_fs` (and leave `stderr` empty, or grant it); a refused
+   spawn's note, naming the import, shows with the card's output. Gated by `attenuation_cards.rs` and
+   `pg_libc_asset.rs`.
+
    **→ Self-host libc + per-TU self-compile DONE 2026-07-28 — chibicc compiles its own source in the
    sandbox.** The remaining libc-surface lift landed: the playground `<stdio.h>` gained a **real
    buffered `FILE*`** — fd-backed *or* memory-backed — with `open_memstream`/`fopen`/`fread`/`fclose`/

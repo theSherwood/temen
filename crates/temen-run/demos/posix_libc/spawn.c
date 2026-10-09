@@ -14,8 +14,8 @@
  *
  * Record contract (little-endian, window-relative pointers; fails closed on any other layout) — the
  * v1 **detached** record (#1863): the child gets a window of its own, funded by a `Budget`:
- *   { version: u32 = 1, entry: u32, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
- *     module: i32 (-1 = self), budget: i32 (Budget handle), quota: i64,
+ *   { version: u32 = 1, entry: u32 = 0, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
+ *     module: i32 (a granted Module), budget: i32 (Budget handle), quota: i64,
  *     grants_ptr: u64, grants_n: u64, args_ptr: u64, args_len: u64,
  *     region: i32 = -1 (none), reserved: u32 = 0, child_off: u64 = 0 }
  * followed here by `n` × 16-byte grant records. `scratch` must be 8-byte aligned and hold
@@ -38,7 +38,8 @@ int __vm_cap_at(int i, int *type_id_out);
  * The child binds its imports strictly, so one no grant satisfies refuses the spawn. `VM_EMPTY` as
  * the handle grants nothing: the child's import `name` binds empty and faults if called, a part the
  * parent leaves out on purpose. `name` may also be `*` (every import nothing else satisfies) or a
- * prefix ending in `*`, and only an empty grant may use one (#2219). */
+ * prefix ending in `*`, and only an empty grant may use one (#2219). A child built against the
+ * playground libc that uses stdio imports `vm_fs` and `stderr`: grant them, or leave them empty. */
 #ifndef VM_EMPTY
 #define VM_EMPTY (-0x40000000) /* 0xC000_0000, temen_interp::GRANT_EMPTY */
 #endif
@@ -77,20 +78,21 @@ static inline int vm_budget_of_(void) {
   return vm_budget_;
 }
 
-/* vm_spawn(module, entry, size_log2, grants, n, args, args_len, scratch) -> child | -errno.
- * `module`: a granted `Module` handle, or -1 for this program. The child runs in a window of its
- * own — its module's declared memory, spent from this domain's `Budget`. `size_log2` 0 asks for
- * exactly that; any other value must equal it (else the spawn refuses, -EINVAL).
+/* vm_spawn(module, size_log2, grants, n, args, args_len, scratch) -> child | -errno.
+ * `module`: a `Module` handle the host granted you — another program, built to run as a child — and
+ * the child starts at its function 0 (#2219). It runs in a window of its own — its module's declared
+ * memory, spent from this domain's `Budget`. `size_log2` 0 asks for exactly that; any other value
+ * must equal it (else the spawn refuses, -EINVAL).
  * `args`/`args_len`: the spawn-time args payload, copied to the child's args buffer before it starts
  * (the §3e `{argc, envc}` + packed strings a `main(argc, argv)` reads); `args_len` 0 = none.
  * The child's fuel comes from the same `Budget` (the record's per-spawn `quota` is retired, #1944).
  * The child starts immediately; `vm_join` collects it. */
-static inline long vm_spawn(long module, long entry, long size_log2, vm_grant *grants, long n,
-                            void *args, long args_len, void *scratch) {
+static inline long vm_spawn(long module, long size_log2, vm_grant *grants, long n, void *args,
+                            long args_len, void *scratch) {
   int *w = (int *)scratch;
   long *q = (long *)scratch;
   w[0] = 1;                /* version: the detached record */
-  w[1] = (int)entry;       /* @4 */
+  w[1] = 0;                /* @4 entry: the child's function 0 */
   q[1] = 0;                /* @8 off: reserved */
   w[4] = (int)size_log2;   /* @16 */
   w[5] = -1;               /* @20 pager: u32::MAX = none */

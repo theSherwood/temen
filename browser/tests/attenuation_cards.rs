@@ -9,11 +9,14 @@
 //! - the **C** card: compiled by the committed `chibicc.temen` (the in-browser compiler — this is also
 //!   the code-coupled gate for its `__vm_instantiate_rec`/`__vm_instantiate_join` builtins) against
 //!   the seeded playground headers, `<temen/spawn.h>` included, linked against the heap unit, then
-//!   run. Fail-soft: SKIPs if the asset isn't built.
+//!   run. Its `//// child: worker.c` program is compiled and linked to run as a child, and staged for
+//!   the run as the page stages it (#2219). Fail-soft: SKIPs if the asset isn't built.
 use temen_browser::{
     onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK,
 };
 
+#[path = "support/card_children.rs"]
+mod card_children;
 #[path = "support/pg_heap.rs"]
 mod pg_heap;
 
@@ -58,35 +61,45 @@ fn c_card_grants_stdout_to_one_child_only() {
     };
     let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
     let src = card_src("'§14 attenuation from C (chibicc + <temen/spawn.h>)'");
-    let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
-    files.push(("in.c".to_string(), src.into_bytes()));
-    let dirs = vec!["include".to_string(), "include/temen".to_string()];
-    let image = temen_fs::encode_image(&files, &dirs);
-    let compiled = onramp_fs_exec(
-        &chibicc,
-        &image,
-        &[
-            b"chibicc",
-            b"--data-page",
-            b"65536",
-            b"--emit-object",
-            b"/in.c",
-        ],
-        b"",
-    );
-    assert!(
-        compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
-        "compile status {} — stderr: {}",
-        compiled.status,
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
+    let compile = |src: String| -> (String, temen_ir::Module) {
+        let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
+        files.push(("in.c".to_string(), src.into_bytes()));
+        let dirs = vec!["include".to_string(), "include/temen".to_string()];
+        let image = temen_fs::encode_image(&files, &dirs);
+        let compiled = onramp_fs_exec(
+            &chibicc,
+            &image,
+            &[
+                b"chibicc",
+                b"--data-page",
+                b"65536",
+                b"--emit-object",
+                b"/in.c",
+            ],
+            b"",
+        );
+        assert!(
+            compiled.status == STATUS_OK || compiled.status == STATUS_EXIT,
+            "compile status {} — stderr: {}",
+            compiled.status,
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
+        let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+        (ir, m)
+    };
+    let (parent, children) = card_children::split(&src);
+    let (ir, m) = compile(parent);
     // The helper's spawn/join are static `call.cap`s on the Instantiator (interface 6).
     assert!(
         ir.contains("call.cap 6 17") && ir.contains("call.cap 6 1 "),
         "{ir:.300}"
     );
-    let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
+    assert_eq!(children.len(), 1, "the card's worker.c");
+    for (name, child) in children {
+        let (_, child) = compile(child);
+        temen_browser::stage_child_program(&name, pg_heap::link_child(&[], &child));
+    }
     let run = onramp_exec(&pg_heap::link(&[], &m), b"");
     assert_eq!(
         run.status,

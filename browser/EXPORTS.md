@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**360 exports** in 36 families — 311 referenced from JS, 49 referenced by nothing, 10 behind a `cfg`.
+**364 exports** in 38 families — 315 referenced from JS, 49 referenced by nothing, 10 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -11,6 +11,7 @@
 | `alloc` | 1 | 1 | 0 |
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
+| `child` | 1 | 1 | 0 |
 | `coop` | 59 | 49 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
@@ -21,10 +22,11 @@
 | `foreign` | 3 | 3 | 3 |
 | `framebuffer` | 4 | 4 | 0 |
 | `jspb` | 7 | 7 | 0 |
-| `link` | 10 | 7 | 0 |
+| `link` | 11 | 8 | 0 |
 | `mem` | 3 | 0 | 0 |
 | `module` | 3 | 0 | 0 |
 | `nim` | 5 | 5 | 0 |
+| `notes` | 2 | 2 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
 | `par` | 74 | 74 | 2 |
@@ -94,6 +96,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_callprof_len` — `cfg(feature = "callprof")`
 - `temen_callprof_ptr` — `cfg(feature = "callprof")`
 - `temen_callprof_reset` — `cfg(feature = "callprof")`
+
+### `child`
+
+- `temen_child_programs_clear`
 
 ### `coop`
 
@@ -216,6 +222,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `link`
 
+- `temen_link_child_libs`
 - `temen_link_encode_lib` — *unreferenced*
 - `temen_link_encode_libs`
 - `temen_link_lib_close`
@@ -246,6 +253,11 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_nim_module_suffix`
 - `temen_nim_open`
 - `temen_nim_remove`
+
+### `notes`
+
+- `temen_notes_len`
+- `temen_notes_ptr`
 
 ### `onramp`
 

@@ -16,6 +16,16 @@ fn heap() -> temen_ir::Module {
 /// program. `libs` is empty for a unit with the headers' bodies compiled in, and the libc unit for one
 /// compiled against their declarations (the card's order: libc, heap, program).
 pub fn link(libs: &[&temen_ir::Module], prog: &temen_ir::Module) -> temen_ir::Module {
+    link_as(libs, prog, false)
+}
+
+/// [`link`] for a program that runs as a §14 child: a card's `//// child: NAME.c` program (#2219).
+#[allow(dead_code)] // not every test that links C has children
+pub fn link_child(libs: &[&temen_ir::Module], prog: &temen_ir::Module) -> temen_ir::Module {
+    link_as(libs, prog, true)
+}
+
+fn link_as(libs: &[&temen_ir::Module], prog: &temen_ir::Module, child: bool) -> temen_ir::Module {
     let heap = heap();
     let mut mods = libs.to_vec();
     mods.push(&heap);
@@ -33,5 +43,10 @@ pub fn link(libs: &[&temen_ir::Module], prog: &temen_ir::Module) -> temen_ir::Mo
             live: None,
         })
         .collect();
-    temen_browser::link_program_multi(&units, prog, "main").expect("link the program and the heap")
+    let link = if child {
+        temen_browser::link_child_program_multi
+    } else {
+        temen_browser::link_program_multi
+    };
+    link(&units, prog, "main").expect("link the program and the heap")
 }

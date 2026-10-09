@@ -14,6 +14,8 @@
 
 use temen_browser::{onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK};
 
+#[path = "support/card_children.rs"]
+mod card_children;
 #[path = "support/ffi.rs"]
 mod ffi;
 #[path = "support/pg_heap.rs"]
@@ -773,8 +775,10 @@ fn a_closed_library_takes_its_laid_out_base_with_it() {
 }
 
 /// The playground's C `detached` card, down the page's own path: compiled as a program unit, linked
-/// against the committed libc and heap, run by `onramp_exec`. It spawns detached, whose
-/// `"budget"` allowance cannot cross into a §14 child yet, so the on-ramp runs it at the root (#1720).
+/// against the committed libc and heap, run by `onramp_exec`. Its `//// child: square.c` program is
+/// compiled and linked to run as a child, and staged for the run as the page stages it (#2219). It
+/// spawns detached, whose `"budget"` allowance cannot cross into a §14 child yet, so the on-ramp runs it
+/// at the root (#1720).
 #[test]
 fn the_c_detached_card_links_and_squares_through_its_region() {
     const PLAY_JS: &str = include_str!("../web/play.js");
@@ -783,10 +787,16 @@ fn the_c_detached_card_links_and_squares_through_its_region() {
     let j = PLAY_JS[i..].find("src: `").expect("card src") + i + 6;
     let k = PLAY_JS[j..].find("`,\n  },").expect("card src end") + j;
     let src = PLAY_JS[j..k].replace("\\\\", "\\");
-    let (Some(lib), Some(prog)) = (pg_libc(), program_unit(&src)) else {
+    let (parent, children) = card_children::split(&src);
+    let (Some(lib), Some(prog)) = (pg_libc(), program_unit(&parent)) else {
         eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
         return;
     };
+    assert_eq!(children.len(), 1, "the card's square.c");
+    for (name, child) in children {
+        let child = program_unit(&child).expect("compile square.c");
+        temen_browser::stage_child_program(&name, pg_heap::link_child(&[&lib], &child));
+    }
     let out = temen_browser::onramp_exec(&pg_heap::link(&[&lib], &prog), b"");
     assert_eq!(out.status, STATUS_OK, "trap: {:?}", out.trap);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -794,4 +804,107 @@ fn the_c_detached_card_links_and_squares_through_its_region() {
         stdout.contains("child returned 8; the region now holds: 1 4 9 16 25 36 49 64"),
         "{stdout}"
     );
+}
+
+/// A child that prints: what a `//// child: talker.c` program is (#2219).
+const TALKER: &str = r#"#include <stdio.h>
+int main(void) {
+  printf("talker\n");
+  return 7;
+}
+"#;
+
+/// Spawns `talker` with what its `printf` needs — its parent's stdout and the libc's `vm_fs` — and the
+/// rest of its imports left empty on purpose (`*`), then with nothing, and prints both results.
+const SPAWNS_TALKER: &str = r#"#include <stdio.h>
+#include <temen.h>
+#include <temen/spawn.h>
+
+static long scratch[24];
+
+int main(void) {
+  long talker = __vm_resolve("talker", 6);
+  if (talker < 0) {
+    printf("no talker\n");
+    return 1;
+  }
+  vm_grant g[3];
+  g[0].name = "stdout";
+  g[0].handle = (int)__vm_resolve("stdout", 6);
+  g[1].name = "vm_fs";
+  g[1].handle = (int)__vm_resolve("vm_fs", 5);
+  g[2].name = "*";
+  g[2].handle = VM_EMPTY;
+  long a = vm_spawn(talker, 0, g, 3, 0, 0, scratch);
+  long ra = a < 0 ? a : vm_join(a);
+  long b = vm_spawn(talker, 0, g, 0, 0, 0, scratch);
+  printf("granted: %ld, refused: %ld\n", ra, b);
+  return 0;
+}
+"#;
+
+/// The last run's notes, through the exports the page reads them by.
+fn read_notes() -> String {
+    let len = temen_browser::temen_notes_len();
+    // SAFETY: the stash holds `len` bytes until the next `temen_notes_len`.
+    let bytes = unsafe { core::slice::from_raw_parts(temen_browser::temen_notes_ptr(), len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// #2219 — a card's child program through the exports the page calls: `temen_link_child_libs` links it
+/// against the resident libraries to run as a child and stages it, and the next `temen_link_run_libs`
+/// grants it by name. Granted what its `printf` imports, the child prints; granted nothing, it is
+/// refused, because it binds what it imports strictly, and the run's notes name the import.
+/// The run takes what was staged: a second run without staging has no `talker` to spawn.
+#[test]
+fn a_card_child_links_through_the_exports_and_a_refusal_is_noted() {
+    let _exports = ffi::lock();
+    let (Some(libc), Some(heap), Some(parent), Some(child)) = (
+        asset("pg_libc.temeno"),
+        asset("pg_heap.temeno"),
+        program_unit_text(SPAWNS_TALKER),
+        program_unit_text(TALKER),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno / pg_heap.temeno not built");
+        return;
+    };
+    let handles = open_pg_units(&libc, &heap);
+    let name = "talker";
+    let rc = temen_browser::temen_link_child_libs(
+        handles.as_ptr(),
+        handles.len(),
+        child.as_ptr(),
+        child.len(),
+        name.as_ptr(),
+        name.len(),
+    );
+    assert_eq!(
+        rc,
+        0,
+        "link the child: status {}",
+        temen_browser::temen_status()
+    );
+    let first = link_run_libs(&handles, &parent);
+    let notes = read_notes();
+    assert_eq!(
+        first,
+        (
+            0,
+            STATUS_OK,
+            "talker\ngranted: 7, refused: -22\n".to_string()
+        ),
+        "notes: {notes}"
+    );
+    assert!(
+        notes.starts_with("refused a child: no grant satisfies its import `vm_fs`"),
+        "{notes}"
+    );
+    assert_eq!(
+        link_run_libs(&handles, &parent),
+        (1, STATUS_OK, "no talker\n".to_string()),
+        "the first run took the staged child"
+    );
+    for h in handles {
+        temen_browser::temen_link_lib_close(h);
+    }
 }
