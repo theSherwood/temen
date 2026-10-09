@@ -839,13 +839,14 @@ struct ModuleSource {
     mods: std::sync::Mutex<Units>,
 }
 
-/// A [`ModuleSource`]'s units, and which of them are `execve`'d commands.
+/// A [`ModuleSource`]'s units, and the module each one was compiled from.
 struct Units {
     code: Vec<std::sync::Arc<Compiled>>,
-    /// Each unit an `execve` compiled, by its module's content digest ([`super::module_digest`]) —
-    /// `(digest, index)`. A command is compiled once per run, however many processes exec it, as a
-    /// JIT tree compiles it once per digest (#1825).
-    commands: Vec<([u8; 32], usize)>,
+    /// Each unit compiled from a module (an `execve`'d command, or a granted module a §14 child runs),
+    /// by the module's content digest ([`super::module_digest`]): `(digest, index)`. A run compiles
+    /// each module once, however many processes exec it or children run it, as a JIT tree compiles a
+    /// command once per digest (#1825, #2219).
+    by_digest: Vec<([u8; 32], usize)>,
 }
 
 impl ModuleSource {
@@ -859,7 +860,7 @@ impl ModuleSource {
         ModuleSource {
             mods: std::sync::Mutex::new(Units {
                 code: vec![primary],
-                commands: Vec::new(),
+                by_digest: Vec::new(),
             }),
         }
     }
@@ -880,25 +881,26 @@ impl ModuleSource {
         self.mods.lock_unpoisoned().code.get(i).cloned()
     }
 
-    /// Append a module (a §14 `instantiate_module` child's program, or a §22 `Jit.invoke`d unit) and
-    /// return its index. (§22 `Jit.install` instead goes through [`jit_install_into`], which also
-    /// fills a dispatch slot.)
+    /// Append a §22 `Jit.invoke`d unit and return its index. (§22 `Jit.install` instead goes through
+    /// [`jit_install_into`], which also fills a dispatch slot; a module an exec or a §14 child runs,
+    /// through [`unit_of`](Self::unit_of).)
     fn push(&self, unit: Compiled) -> usize {
         let mut mods = self.mods.lock_unpoisoned();
         mods.code.push(std::sync::Arc::new(unit));
         mods.code.len() - 1
     }
 
-    /// The unit of the `execve`'d command whose module has content digest `digest`: the one this
-    /// run already compiled, or `compile()`'s, appended. `None` when `compile` refuses. The compile
-    /// runs outside the lock; a racing exec of the same command keeps the unit that landed first.
-    fn command(
+    /// The unit of the module with content digest `digest` (an `execve`'d command, or a granted
+    /// module a child runs): the one this run already compiled, or `compile()`'s, appended. `None` when
+    /// `compile` refuses. The compile runs outside the lock; a racing compile of the same module keeps
+    /// the unit that landed first.
+    fn unit_of(
         &self,
         digest: &[u8; 32],
         compile: impl FnOnce() -> Option<Compiled>,
     ) -> Option<usize> {
         let find = |u: &Units| {
-            u.commands
+            u.by_digest
                 .iter()
                 .find(|(d, _)| d == digest)
                 .map(|&(_, i)| i)
@@ -913,7 +915,7 @@ impl ModuleSource {
         }
         mods.code.push(std::sync::Arc::new(unit));
         let i = mods.code.len() - 1;
-        mods.commands.push((*digest, i));
+        mods.by_digest.push((*digest, i));
         Some(i)
     }
 
@@ -925,14 +927,14 @@ impl ModuleSource {
     }
 
     /// Reset the pushed units to exactly `units` (keeping the primary at index 0) — the restore inverse
-    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe. The command index
-    /// is dropped with them: a later exec compiles its command again rather than trust an index into
-    /// units it did not see pushed.
+    /// of [`extra_units`]. Idempotent, so restoring twice into the same run is safe. The digest index
+    /// is dropped with them: a later exec or spawn compiles its module again rather than trust an index
+    /// into units it did not see pushed.
     fn reset_extra(&self, units: &[std::sync::Arc<Compiled>]) {
         let mut mods = self.mods.lock_unpoisoned();
         mods.code.truncate(1);
         mods.code.extend(units.iter().cloned());
-        mods.commands.clear();
+        mods.by_digest.clear();
     }
 }
 
@@ -1000,11 +1002,11 @@ mod module_source_tests {
     }
 
     #[test]
-    fn an_execd_command_compiles_once_per_run() {
+    fn a_module_compiles_once_per_run() {
         let src = ModuleSource::new(unit());
         let mut compiles = 0;
         let mut exec = |digest: [u8; 32]| {
-            src.command(&digest, || {
+            src.unit_of(&digest, || {
                 compiles += 1;
                 Some(unit())
             })
@@ -1014,31 +1016,27 @@ mod module_source_tests {
         assert_eq!(
             exec([1; 32]),
             a,
-            "an exec of the same command runs its unit"
+            "an exec or a child of the same module runs its unit"
         );
         let b = exec([2; 32]);
-        assert_ne!(a, b, "another command has its own unit");
-        assert_eq!(compiles, 2, "each command compiled once");
-        assert_eq!(
-            src.snapshot().len(),
-            3,
-            "the primary and a unit per command"
-        );
+        assert_ne!(a, b, "another module has its own unit");
+        assert_eq!(compiles, 2, "each module compiled once");
+        assert_eq!(src.snapshot().len(), 3, "the primary and a unit per module");
     }
 
     #[test]
-    fn a_restore_forgets_which_units_are_commands() {
+    fn a_restore_forgets_which_module_each_unit_compiled() {
         let src = ModuleSource::new(unit());
-        let a = src.command(&[1; 32], || Some(unit())).expect("compiles");
+        let a = src.unit_of(&[1; 32], || Some(unit())).expect("compiles");
         src.reset_extra(&[]);
         let mut compiled = false;
         let b = src
-            .command(&[1; 32], || {
+            .unit_of(&[1; 32], || {
                 compiled = true;
                 Some(unit())
             })
             .expect("compiles");
-        assert!(compiled, "the command is compiled again after a restore");
+        assert!(compiled, "the module is compiled again after a restore");
         assert_eq!((a, b), (1, 1), "into the restored units");
     }
 }
@@ -1695,22 +1693,36 @@ impl DetachedSpawn {
 enum ChildProgram {
     /// The spawning frame's own module (#1726): a same-module child (op 0, a module-less op 17).
     Spawner(u32, std::sync::Arc<Compiled>),
-    /// A granted separate module, compiled; [`land`](ChildProgram::land) pushes it to the source.
-    Granted(Compiled),
+    /// A granted separate module, as the run compiled it once ([`granted_program`]).
+    Granted(u32, std::sync::Arc<Compiled>),
 }
 
 impl ChildProgram {
-    /// Land the program in `source` (a granted module is pushed and gets its own index): the module
-    /// index the child runs, and its compiled unit.
-    fn land(self, source: &ModuleSource) -> Result<(u32, std::sync::Arc<Compiled>), Trap> {
+    /// The module index the child runs in the run's source, and its compiled unit.
+    fn unit(self) -> (u32, std::sync::Arc<Compiled>) {
         match self {
-            ChildProgram::Spawner(m, p) => Ok((m, p)),
-            ChildProgram::Granted(c) => {
-                let m = source.push(c);
-                Ok((m as u32, source.get(m).ok_or(Trap::Malformed)?))
-            }
+            ChildProgram::Spawner(m, p) | ChildProgram::Granted(m, p) => (m, p),
         }
     }
+}
+
+/// The program a child of granted module `g` runs: the unit this run compiled from the same module
+/// (by content digest), or a fresh compile, added to `source` (#2219). Every child is a granted module,
+/// so a run that spawns one N times would otherwise compile it N times and keep every copy. A module
+/// this engine cannot lower is the one place a guest-provided program outruns coverage (no tree-walker
+/// fallback mid-run): a `Malformed` trap, as for `Jit.install`.
+fn granted_program(
+    host: &Host,
+    source: &ModuleSource,
+    g: &super::ModuleGrant,
+) -> Result<ChildProgram, Trap> {
+    let i = source
+        .unit_of(&g.digest, || {
+            compile_granted(host, &g.funcs, &g.types, g.shadow)
+        })
+        .ok_or(Trap::Malformed)?;
+    let p = source.get(i).ok_or(Trap::Malformed)?;
+    Ok(ChildProgram::Granted(i as u32, p))
 }
 
 /// A §14 confined or §5 detached child as every in-process bytecode driver builds it — the **one
@@ -1753,14 +1765,13 @@ struct BuiltChild {
 }
 
 impl AdmittedChild {
-    /// Land the child's program in `source` and build its task at `entry` ([`child_task`]), for the
-    /// driver to schedule — or refuse it: with no `room` under the driver's vCPU ceiling (the
-    /// instantiate bomb, `ThreadFault`), or a program that does not land. A refused child hands its
-    /// window lease to `refund`, its spawner's budget, so a spawn refused after its admission charges
-    /// nothing (#1975, #2006), as the oracle's undo does.
+    /// Build the child's task at `entry` ([`child_task`]), for the driver to schedule — or refuse
+    /// it: with no `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`), or an
+    /// entry its program cannot start at. A refused child hands its window lease to `refund`, its
+    /// spawner's budget, so a spawn refused after its admission charges nothing (#1975, #2006), as the
+    /// oracle's undo does.
     fn build(
         self,
-        source: &ModuleSource,
         entry: i64,
         room: bool,
         refund: impl FnOnce(i32, u64),
@@ -1775,10 +1786,11 @@ impl AdmittedChild {
         } = self;
         let built = match room {
             false => Err(Trap::ThreadFault), // instantiate bomb
-            true => program.land(source).and_then(|(module, prog)| {
-                let (vt, table) = child_task(module, &prog, entry, &args, host.jit_table_log2())?;
-                Ok((module, vt, table))
-            }),
+            true => {
+                let (module, prog) = program.unit();
+                child_task(module, &prog, entry, &args, host.jit_table_log2())
+                    .map(|(vt, table)| (module, vt, table))
+            }
         };
         match built {
             Ok((module, vt, table)) => Ok(BuiltChild {
@@ -1826,20 +1838,17 @@ fn admit_confined_child(
         }
         Some(mh) => {
             let g = host.resolve_module(mh)?;
-            // A module this engine cannot lower is the one place a guest-provided program outruns
-            // coverage (no tree-walker fallback mid-run) — a `Malformed` trap, as for `Jit.install`.
-            let c = compile_granted(host, &g.funcs, &g.types, g.shadow).ok_or(Trap::Malformed)?;
+            let program = granted_program(host, source, g)?;
             let granted = (
                 g.memory_log2,
                 g.data.clone(),
                 std::sync::Arc::clone(&g.module),
             );
-            (ChildProgram::Granted(c), Some(granted))
+            (program, Some(granted))
         }
     };
     let sig = match &program {
-        ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
-        ChildProgram::Granted(c) => c.sigs.get(s.entry as usize),
+        ChildProgram::Spawner(_, p) | ChildProgram::Granted(_, p) => p.sigs.get(s.entry as usize),
     };
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
@@ -2059,16 +2068,18 @@ impl FreshWindow {
 /// `Vcpu` leaves the capture to its embedder, but the in-process drivers' freeze cannot, so there a
 /// durable domain's detached spawn refuses (#1893).
 ///
-/// `spawner`: the spawning frame's module in the run's source ([`spawner_module`]), and `unit`, the
-/// `Jit` unit that module is when the spawning domain installed it ([`SharedSlots::jit_unit`]):
-/// `module = -1` then names the unit's program (#2143). A child of the frame's module runs it, with
-/// no second compile; `None` (an emitted frame's spawn, whose code is never a unit's) compiles the
-/// child's program again, as any granted module is.
+/// `source`: the run's compiled modules, where a granted module's program is found or added
+/// ([`granted_program`]). `spawner`: the spawning frame's module in it ([`spawner_module`]), and
+/// `unit`, the `Jit` unit that module is when the spawning domain installed it
+/// ([`SharedSlots::jit_unit`]): `module = -1` then names the unit's program (#2143). A child of the
+/// frame's module runs it, with no second compile; `None` (an emitted frame's spawn, whose code is
+/// never a unit's) runs the child's program as a granted module's.
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
+    source: &ModuleSource,
     spawner: Option<(u32, std::sync::Arc<Compiled>)>,
     unit: Option<(u32, u32)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
@@ -2077,33 +2088,29 @@ fn admit_detached_child(
     if s.quota != 0 {
         return Err(Trap::CapFault);
     }
-    let (cfuncs, cmem_log2, cdata, ctypes, cmodule, cshadow, cdurable) = {
-        let g = host.resolve_spawn_module(s.module, unit)?;
-        (
-            g.funcs.clone(),
-            g.memory_log2,
-            g.data.clone(),
-            g.types.clone(),
-            std::sync::Arc::clone(&g.module),
-            g.shadow,
-            g.durable,
-        )
-    };
     // A child of the spawning frame's own module runs it, as a same-module confined child does
     // (#1726): no second compile, and the child's code keeps the identity the debugger keys
     // breakpoints and §6 debug info on (#2076). `-1` always names that module; a grant of the
     // domain's program does too when the frame runs the program rather than a unit.
     let runs_spawner =
         s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
-    let program = match spawner {
-        Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
-        _ => ChildProgram::Granted(
-            compile_granted(host, &cfuncs, &ctypes, cshadow).ok_or(Trap::Malformed)?,
-        ),
+    let (program, cmem_log2, cdata, cmodule, cshadow, cdurable) = {
+        let g = host.resolve_spawn_module(s.module, unit)?;
+        let program = match spawner {
+            Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
+            _ => granted_program(host, source, g)?,
+        };
+        (
+            program,
+            g.memory_log2,
+            g.data.clone(),
+            std::sync::Arc::clone(&g.module),
+            g.shadow,
+            g.durable,
+        )
     };
     let sig = match &program {
-        ChildProgram::Spawner(_, p) => p.sigs.get(s.entry as usize),
-        ChildProgram::Granted(c) => c.sigs.get(s.entry as usize),
+        ChildProgram::Spawner(_, p) | ChildProgram::Granted(_, p) => p.sigs.get(s.entry as usize),
     };
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
@@ -2211,10 +2218,13 @@ fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
+    source: &ModuleSource,
     spawner: Option<(u32, std::sync::Arc<Compiled>)>,
     unit: Option<(u32, u32)>,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, spawner, unit)? else {
+    let Some((mut child, window)) =
+        admit_detached_child(host, pm, s, false, source, spawner, unit)?
+    else {
         return Ok(None);
     };
     child.mem = Some(window.build(None, &mut child.host)?);
@@ -5375,6 +5385,7 @@ impl<'p> Vcpu<'p> {
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            &dom.source,
                             spawner,
                             unit,
                         ),
@@ -5383,6 +5394,7 @@ impl<'p> Vcpu<'p> {
                             self.mem.as_ref(),
                             spawn,
                             true,
+                            &dom.source,
                             spawner,
                             unit,
                         ),
@@ -5414,15 +5426,14 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// An admitted child as a host takes it: its program lands in the run's shared source.
+    /// An admitted child as a host takes it: its program, already in the run's shared source.
     fn pending_child(
         &self,
         child: AdmittedChild,
         entry: u32,
         window: ChildWindow,
     ) -> Result<PendingChild, Trap> {
-        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
-        let (module, _) = child.program.land(source)?;
+        let (module, _) = child.program.unit();
         Ok(PendingChild {
             host: child.host,
             module,
@@ -5539,18 +5550,26 @@ impl<'p> Vcpu<'p> {
             return Err(Trap::CapFault);
         }
         let spawn = DetachedSpawn::of(&sr);
+        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
         let admitted = match self.shared_host {
             Some(m) => admit_detached_child(
                 &mut m.lock_unpoisoned(),
                 self.mem.as_ref(),
                 spawn,
                 true,
+                source,
                 None,
                 None,
             ),
-            None => {
-                admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, None, None)
-            }
+            None => admit_detached_child(
+                &mut self.host,
+                self.mem.as_ref(),
+                spawn,
+                true,
+                source,
+                None,
+                None,
+            ),
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
@@ -8375,7 +8394,6 @@ fn dbg_instantiate_confined(
         ti,
         extra_envs,
         host,
-        source,
         child,
         spawn.entry,
         dst,
@@ -8394,7 +8412,6 @@ fn dbg_start_child(
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     host: &mut Host,
-    source: &ModuleSource,
     child: AdmittedChild,
     entry: i64,
     dst: u32,
@@ -8410,7 +8427,7 @@ fn dbg_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(source, entry, room, |budget, bytes| match spawner {
+    } = child.build(entry, room, |budget, bytes| match spawner {
         None => host.release_detached(budget, bytes),
         Some(k) => extra_envs[k].host.release_detached(budget, bytes),
     })?;
@@ -8466,24 +8483,14 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn, spawner, unit)? else {
+    let Some(child) = admit_detached_in_process(owner, pm, spawn, source, spawner, unit)? else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
     let place = EnvPlace::Detached {
         spawner: tasks[ti].env,
     };
-    dbg_start_child(
-        tasks,
-        ti,
-        extra_envs,
-        host,
-        source,
-        child,
-        spawn.entry,
-        dst,
-        place,
-    )
+    dbg_start_child(tasks, ti, extra_envs, host, child, spawn.entry, dst, place)
 }
 
 /// §22 `Jit.invoke` (op 1) **as a step-into** (both debug engines): arm [`VTask::active_invoke`] over
@@ -10602,7 +10609,7 @@ fn exec_image_build(
     let command = cur_host.exec_module(cmd)?;
     let cm = dom
         .source
-        .command(&command.0.digest, || {
+        .unit_of(&command.0.digest, || {
             compile_module(&command.0.funcs, &command.0.types, command.0.shadow)
         })
         .ok_or(super::EINVAL)?;
@@ -13117,7 +13124,6 @@ fn coop_start_child(
     extra_envs: &mut Vec<ChildEnv>,
     root: &DomainCell,
     ti: usize,
-    source: &ModuleSource,
     child: AdmittedChild,
     entry: i64,
     dst: u32,
@@ -13133,7 +13139,7 @@ fn coop_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(source, entry, room, |budget, bytes| {
+    } = child.build(entry, room, |budget, bytes| {
         task_host(root, extra_envs, spawner)
             .lock_unpoisoned()
             .release_detached(budget, bytes)
@@ -15739,17 +15745,8 @@ impl SchedCore {
                     }
                     _ => None,
                 };
-                let started = coop_start_child(
-                    tasks,
-                    extra_envs,
-                    root,
-                    ti,
-                    &dom.source,
-                    child,
-                    spawn.entry,
-                    dst,
-                    tierup,
-                );
+                let started =
+                    coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
                 if let Err(t) = started {
                     complete(tasks, ti, Err(t));
                 }
@@ -15778,6 +15775,7 @@ impl SchedCore {
                     &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
                     pm,
                     spawn,
+                    &dom.source,
                     spawner,
                     unit,
                 );
@@ -15803,17 +15801,8 @@ impl SchedCore {
                     }
                     _ => None,
                 };
-                let started = coop_start_child(
-                    tasks,
-                    extra_envs,
-                    root,
-                    ti,
-                    &dom.source,
-                    child,
-                    spawn.entry,
-                    dst,
-                    tierup,
-                );
+                let started =
+                    coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
                 if let Err(t) = started {
                     complete(tasks, ti, Err(t));
                 }
@@ -17141,18 +17130,7 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let source = ModuleSource::new(unit());
-        let r = coop_start_child(
-            &mut tasks,
-            &mut Vec::new(),
-            &root,
-            0,
-            &source,
-            child,
-            0,
-            0,
-            None,
-        );
+        let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, 0, None);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(
@@ -17168,14 +17146,12 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let source = ModuleSource::new(unit());
         let place = EnvPlace::Detached { spawner: None };
         let r = dbg_start_child(
             &mut tasks,
             0,
             &mut Vec::new(),
             &mut host,
-            &source,
             child,
             0,
             0,
@@ -18281,6 +18257,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     &mut host.lock_unpoisoned(),
                     mem.as_ref(),
                     spawn,
+                    &dom.source,
                     spawner_module(&dom.source, &vt.active),
                     dom.table.jit_unit(vt.active.module),
                 );
@@ -18329,7 +18306,7 @@ fn par_start_child<'scope, 'env>(
     entry: i64,
 ) -> Result<i32, Trap> {
     let room = reg.try_start(); // the cross-thread vCPU ceiling, released below on a refusal
-    let built = child.build(&dom.source, entry, room, |budget, bytes| {
+    let built = child.build(entry, room, |budget, bytes| {
         parent_host
             .lock_unpoisoned()
             .release_detached(budget, bytes)

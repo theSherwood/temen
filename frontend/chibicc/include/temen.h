@@ -41,7 +41,9 @@ long __vm_resolve(const char *name, long len);
 // the op-11 grant-record list (0, 0 for none), `args_ptr`/`args_len` a spawn-time payload (0, 0
 // for none). Returns the child handle (join it with `__vm_instantiate_join`) or -errno. The
 // powerbox names `"instantiator"`, `"module"` (this program, spawnable) and `"budget"` for a
-// program that spawns detached: `int inst = (int)__vm_resolve("instantiator", 12);` etc.
+// program that spawns detached: `int inst = (int)__vm_resolve("instantiator", 12);` etc. A program
+// that exports a `_child` entry is also granted `"child"`, its child image: this program with a
+// bootstrap at function 0 that runs `_child`, so a copy of it spawned at entry 0 starts there (#2219).
 long __vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
                                long entry, long size_log2, long args_ptr, long args_len, long region,
                                long child_off);

@@ -28745,7 +28745,8 @@ impl Host {
 
     /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
     /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
-    /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), and `"budget"`
+    /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), `"child"` (this
+    /// program's [`temen_ir::child_image`]) for a guest that exports a `_child` entry, and `"budget"`
     /// (one `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909). The
     /// one-window ceiling is a grant tighter than the root's, which a guest sizes its child from
     /// (owner, 2026-10-06, #2113).
@@ -28754,12 +28755,24 @@ impl Host {
             return;
         };
         if by_module_handle && self.resolve_cap_name("module").is_none() {
-            let module = self.grant_module_shared(m, false);
+            let module = self.grant_module_shared(Arc::clone(&m), false);
             self.register_cap_name("module", module);
         }
         if self.resolve_cap_name("budget").is_none() {
             let budget = self.grant_budget(-1, win as i64, -1);
             self.register_cap_name("budget", budget);
+        }
+        // #2219: a program that spawns copies of itself declares where they start (`_child`), and
+        // spawns its child image. Non-durable, as the `"module"` grant is: a durable domain refuses it.
+        if self.resolve_cap_name("child").is_none() {
+            match temen_ir::child_image(&m) {
+                Some(Ok(image)) => {
+                    let child = self.grant_module_shared(Arc::new(image), false);
+                    self.register_cap_name("child", child);
+                }
+                Some(Err(e)) => self.note(format!("no \"child\" grant: {e}")),
+                None => {}
+            }
         }
     }
 
