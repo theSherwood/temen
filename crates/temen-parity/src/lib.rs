@@ -183,6 +183,7 @@ pub mod capcall {
     pub const REAP: u32 = 12;
     pub const FUEL_REMAINING: u32 = 13;
     pub const EXEC: u32 = 14;
+    pub const PARALLELISM: u32 = 19;
 }
 
 /// Classify a `call.cap` sub-op `(type_id, op)` across the four backends. The generic host-cap case

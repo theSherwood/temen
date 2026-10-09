@@ -387,8 +387,20 @@ block 0 (v0: i64, v1: i64) {
 }
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const -1
+  v1 = i32.const 83
+  v2 = i32.sub v0 v1
+  v3 = i32.const 2
+  v4 = i32.lt_u v2 v3
+  br_if v4 1() 2()
+  }
+block 1 () {
+  v0 = i32.const 0
+  v1 = call.cap 4294967295 19 () -> (i64) v0 ()
   return v1
+  }
+block 2 () {
+  v0 = i64.const -1
+  return v0
   }
 }
 
