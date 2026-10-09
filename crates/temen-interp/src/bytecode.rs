@@ -3833,7 +3833,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply.
     host.wire_park_door();
     let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
-    let (r, mem) = drive_threads(&dom, func, args, fuel, mem, host);
+    let (r, mem) = drive_threads(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
         .map(|mm| mm.snapshot(init_mem.len() as u64))
@@ -13974,6 +13974,7 @@ fn park_task(
 /// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
 /// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
 /// child environments, the fork/teardown bookkeeping, and the logical clock.
+#[derive(Default)]
 struct SchedCore {
     /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
     tasks: Vec<TaskSlot>,
@@ -17136,6 +17137,11 @@ struct Threads {
     over: Option<Result<Vec<Value>, Trap>>,
     /// The first faulting address a step recorded (#1720), for the run's caller.
     fault: Option<u64>,
+    /// The run's threads still running: its tasks' and its bell watcher's. The run returns once it
+    /// is zero ([`ThreadRun::ended`]), so no thread outlives it holding a hand of its fuel.
+    live: usize,
+    /// Whether one of them panicked: the run then ends, and its caller panics.
+    panicked: bool,
 }
 
 impl Threads {
@@ -17150,27 +17156,50 @@ impl Threads {
     }
 }
 
-/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, the
-/// instant the run's wall clock counts from, and the external-wake bell an embedder armed (#1122).
-struct ThreadRun<'a> {
-    dom: &'a Domain,
+/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, when
+/// the run started on [`threads_now_ns`], the external-wake bell an embedder armed (#1122), and
+/// where the run waits for its threads to end. Every thread holds it (`Arc`), so a thread is
+/// started with a closure of its own ([`spawn_thread`]) rather than a borrow.
+struct ThreadRun {
+    dom: std::sync::Arc<Domain>,
     root: DomainCell,
     state: std::sync::Mutex<Threads>,
-    start: std::time::Instant,
+    start: u64,
     bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
+    ended: std::sync::Condvar,
 }
 
-/// Ends the run if its thread unwinds. A panic in a step or a rule is a bug; without this the other
-/// threads stay parked, the scope never joins them, and the run hangs instead of failing.
-struct EndOnPanic<'a, 'r>(&'a ThreadRun<'r>);
+/// Executor 2's clock (B6): nanoseconds on a monotonic clock every thread of the run reads.
+fn threads_now_ns() -> u64 {
+    sched_wall_now()
+}
 
-impl Drop for EndOnPanic<'_, '_> {
+/// Executor 2's one way to start a thread (B6): an OS thread of its own (D56).
+fn spawn_thread(f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(f).map(drop)
+}
+
+/// A thread's last act on executor 2, as it returns or unwinds: it counts itself out of the run
+/// ([`Threads::live`]), after every other local of its own (its fuel hand, its window view) has
+/// gone. A panic in a step or a rule is a bug: the run ends with it, rather than leaving the
+/// other threads parked and the run's caller waiting for them.
+struct ThreadExit<'a>(&'a ThreadRun);
+
+impl Drop for ThreadExit<'_> {
     fn drop(&mut self) {
+        let mut g = self.0.state.lock_unpoisoned();
         if std::thread::panicking() {
-            let mut g = self.0.state.lock_unpoisoned();
-            g.over.get_or_insert(Err(Trap::ThreadFault));
-            g.woken = g.parks.clone();
-            release(g);
+            g.panicked = true;
+            self.0.end(&mut g);
+        }
+        g.live -= 1;
+        if g.live == 0 {
+            self.0.ended.notify_all();
+        }
+        let over = g.over.is_some();
+        release(g);
+        // Once the run is over, its bell's watcher has to look in order to leave.
+        if over {
             self.0.ring();
         }
     }
@@ -17185,8 +17214,8 @@ fn awake(t: &TaskSlot) -> bool {
 enum ParkFor {
     /// Nothing else: only a rule wakes it.
     Wake,
-    /// Its wait's deadline, on the wall clock.
-    Until(std::time::Instant),
+    /// Its wait's deadline, on the run's clock ([`ThreadRun::now`]).
+    Until(u64),
     /// The next poll, for what no rule wakes: a punted call's completion (`pending`), or a pipe,
     /// stdin or the host, which another task or an embedder fills.
     Poll { pending: bool },
@@ -17204,9 +17233,11 @@ enum ParkFor {
 /// deadline arithmetic is the pump's); a fiber op takes the core's lock ([`FiberCell::Core`]); an
 /// armed external-wake bell has a watcher that settles the run on each ring ([`ThreadRun::watch`]);
 /// and the run ends when its root does, the other tasks stopping at their next look, or with the
-/// pump's deadlock verdict ([`ThreadRun::settle`]).
+/// pump's deadlock verdict ([`ThreadRun::settle`]). It returns once every thread has gone
+/// ([`ThreadExit`]). A thread starts and the clock is read in one place each ([`spawn_thread`],
+/// [`threads_now_ns`]), where the browser supplies its own (#1414 B6).
 fn drive_threads(
-    dom: &Domain,
+    dom: Domain,
     entry: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
@@ -17217,7 +17248,7 @@ fn drive_threads(
     // #1944 slice 3 — an activation of `host`: every thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
     let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
-    let core = match SchedCore::new(dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
+    let core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
         Ok(core) => core,
         Err(t) => {
             drop(root_fuel);
@@ -17226,8 +17257,8 @@ fn drive_threads(
         }
     };
     let bell = host.external_wake();
-    let run = ThreadRun {
-        dom,
+    let run = std::sync::Arc::new(ThreadRun {
+        dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
         state: std::sync::Mutex::new(Threads {
             core,
@@ -17237,40 +17268,44 @@ fn drive_threads(
             woken: Vec::new(),
             over: None,
             fault: None,
+            live: 1, // the root's, on this thread
+            panicked: false,
         }),
-        start: std::time::Instant::now(),
+        start: threads_now_ns(),
         bell,
-    };
-    let (view, hand) = run.state.lock_unpoisoned().hand(None);
-    std::thread::scope(|scope| {
-        let run = &run;
-        if let Some(bell) = &run.bell {
-            // The ring count before the run starts, so the watcher misses no ring the run makes.
-            let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
-            scope.spawn(move || run.watch(bell, seen));
-        }
-        run_task_thread(scope, run, 0, view, hand);
-        // The run is over: one more ring, and the watcher sees it and ends.
-        run.ring();
+        ended: std::sync::Condvar::new(),
     });
-    let ThreadRun { root, state, .. } = run;
-    let Threads {
-        mut core,
-        mem,
-        fuel: root_fuel,
-        over,
-        fault,
-        ..
-    } = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    let (view, hand) = run.state.lock_unpoisoned().hand(None);
+    if let Some(bell) = run.bell.clone() {
+        // The ring count before the run starts, so the watcher misses no ring the run makes.
+        let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
+        run.state.lock_unpoisoned().live += 1;
+        let r = std::sync::Arc::clone(&run);
+        run.start_or_end(spawn_thread(move || r.watch(&bell, seen)));
+    }
+    run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
+    // The run is over, and every thread leaves at its next look: wait for them all to go.
+    let mut g = run.state.lock_unpoisoned();
+    while g.live > 0 {
+        g = run.ended.wait(g).unwrap_or_else(|e| e.into_inner());
+    }
+    if g.panicked {
+        drop(g);
+        panic!("a thread of the parallel driver panicked");
+    }
+    let mut core = std::mem::take(&mut g.core);
+    let mem = g.mem.take();
+    let root_fuel = std::mem::replace(&mut g.fuel, Fuel::fixed(0));
+    let (over, fault) = (g.over.take(), g.fault);
+    drop(g);
+    let root = std::sync::Arc::clone(&run.root);
+    drop(run);
     // The run ended: every domain still live in it ends with it, as the pump's does.
     refund_ended_windows(&mut core.tasks, &root, &mut core.extra_envs, true);
     drop(core);
     drop(root_fuel);
-    *host = match std::sync::Arc::try_unwrap(root) {
-        Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
-        // Every task's thread has ended, so nothing holds the cell; never lose the powerbox anyway.
-        Err(a) => std::mem::take(&mut *a.lock_unpoisoned()),
-    };
+    // A thread that has counted itself out may still hold the run (and the cell) for a moment.
+    *host = std::mem::take(&mut *root.lock_unpoisoned());
     *fuel = host.fuel_left();
     let result = over.unwrap_or(Err(Trap::ThreadFault));
     // #1720: the trap-origin fault address, as the pump records it.
@@ -17284,14 +17319,10 @@ fn drive_threads(
 
 /// Task `ti`'s thread on executor 2: step it whenever it can run until it ends or the run is over,
 /// over `mem` (its view of its domain's window) and `fuel` (its hand of the domain's fuel).
-fn run_task_thread<'scope, 'env>(
-    scope: &'scope std::thread::Scope<'scope, 'env>,
-    run: &'env ThreadRun<'env>,
-    ti: usize,
-    mut mem: Option<Mem>,
-    mut fuel: Fuel,
-) {
-    let _end = EndOnPanic(run);
+fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, fuel: Fuel) {
+    let _exit = ThreadExit(&run);
+    // Declared after the guard, so they go before it counts the thread out.
+    let (mut mem, mut fuel) = (mem, fuel);
     let mut g = run.state.lock_unpoisoned();
     let park = std::sync::Arc::clone(&g.parks[ti]);
     let mut env = g.core.tasks[ti].env;
@@ -17336,7 +17367,7 @@ fn run_task_thread<'scope, 'env>(
         let stop = step_vcpu(
             &mut vm.vt,
             &mut FiberCell::Core(&run.state, env),
-            run.dom,
+            &run.dom,
             &mut ctx,
             COOP_QUANTUM,
             true, // a blocking `cont.resume` idles the task on the fiber (I48)
@@ -17361,7 +17392,8 @@ fn run_task_thread<'scope, 'env>(
         if !made.is_empty() {
             release(g);
             for (j, mem, fuel) in made {
-                scope.spawn(move || run_task_thread(scope, run, j, mem, fuel));
+                let r = std::sync::Arc::clone(&run);
+                run.start_or_end(spawn_thread(move || run_task_thread(r, j, mem, fuel)));
             }
             g = run.state.lock_unpoisoned();
         }
@@ -17378,7 +17410,7 @@ fn release(mut g: std::sync::MutexGuard<'_, Threads>) {
     }
 }
 
-impl ThreadRun<'_> {
+impl ThreadRun {
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
     fn ring(&self) {
         if let Some(bell) = &self.bell {
@@ -17390,7 +17422,25 @@ impl ThreadRun<'_> {
     /// The core's clock on this executor: nanoseconds since the run started, so a wait's deadline
     /// (`clock + timeout`, as the rules compute it) is a wall-clock one.
     fn now(&self) -> u64 {
-        self.start.elapsed().as_nanos() as u64
+        threads_now_ns().saturating_sub(self.start)
+    }
+
+    /// End the run with `ThreadFault` (if it is not over already) and wake every thread to see it.
+    fn end(&self, g: &mut Threads) {
+        g.over.get_or_insert(Err(Trap::ThreadFault));
+        g.woken = g.parks.clone();
+    }
+
+    /// Account for a thread the run counted in ([`Threads::live`]) but could not start: the run
+    /// cannot go on without it (D56: a task is a thread), so it ends.
+    fn start_or_end(&self, started: std::io::Result<()>) {
+        if started.is_err() {
+            let mut g = self.state.lock_unpoisoned();
+            g.live -= 1;
+            self.end(&mut g);
+            release(g);
+            self.ring();
+        }
     }
 
     /// Apply task `ti`'s stop under the lock, as the pump does between steps: its rule, then the
@@ -17413,7 +17463,7 @@ impl ThreadRun<'_> {
         // This executor has no emitted tier: the rules see an inert one, so none pauses for a host.
         let step = core.on_stop(
             &mut EmitTier::default(),
-            self.dom,
+            &self.dom,
             mem,
             &self.root,
             fuel,
@@ -17434,6 +17484,8 @@ impl ThreadRun<'_> {
             let (mem, fuel) = g.hand(g.core.tasks[j].env);
             made.push((j, mem, fuel));
         }
+        // Each new task's thread counts in now, before it starts, so the run cannot end unseen.
+        g.live += made.len();
         self.wake(g, &was_awake, Some(ti));
         made
     }
@@ -17532,14 +17584,13 @@ impl ThreadRun<'_> {
 
     /// What task `ti`'s thread waits for while the task is parked, or runnable in a stopped process.
     fn park_for(&self, core: &SchedCore, ti: usize) -> ParkFor {
-        let until = |ns: u64| ParkFor::Until(self.start + std::time::Duration::from_nanos(ns));
         let t = &core.tasks[ti];
         match t.state {
             // Its SIGCONT comes from another task's call or an embedder, with no rule to wake it.
             TaskState::Runnable => ParkFor::Poll { pending: false },
             TaskState::BlockedWait {
                 deadline: Some(d), ..
-            } => until(d),
+            } => ParkFor::Until(d),
             TaskState::BlockedPipeRead { .. }
             | TaskState::BlockedPipeWrite { .. }
             | TaskState::BlockedStdin => ParkFor::Poll { pending: false },
@@ -17554,7 +17605,7 @@ impl ThreadRun<'_> {
                         deadline: Some(d),
                         woken: None,
                         ..
-                    }) => until(*d),
+                    }) => ParkFor::Until(*d),
                     Some(FiberState::HostParked { .. }) => ParkFor::Poll { pending: false },
                     Some(FiberState::CapParked { woken: None, .. }) => {
                         ParkFor::Poll { pending: true }
@@ -17596,7 +17647,7 @@ impl ThreadRun<'_> {
             // Only a rule ends this park, and the rule's holder settled after it.
             ParkFor::Wake => return park.wait(g).unwrap_or_else(|e| e.into_inner()),
             ParkFor::Until(at) => {
-                let left = at.saturating_duration_since(std::time::Instant::now());
+                let left = std::time::Duration::from_nanos(at.saturating_sub(self.now()));
                 park.wait_timeout(g, left)
                     .unwrap_or_else(|e| e.into_inner())
                     .0
@@ -17619,7 +17670,7 @@ impl ThreadRun<'_> {
     /// The bell's lock is let go before the run's is taken, so a ring from under the run's lock
     /// cannot deadlock with it.
     fn watch(&self, bell: &(std::sync::Mutex<u64>, std::sync::Condvar), mut seen: u64) {
-        let _end = EndOnPanic(self);
+        let _exit = ThreadExit(self);
         loop {
             {
                 let mut gen = bell.0.lock().unwrap_or_else(|e| e.into_inner());
