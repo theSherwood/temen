@@ -1,0 +1,49 @@
+memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  t0 = thread.spawn 3 vz vz
+  t1 = thread.spawn 3 vz vz
+  t2 = thread.spawn 3 vz vz
+  t3 = thread.spawn 3 vz vz
+  j0 = thread.join t0
+  j1 = thread.join t1
+  j2 = thread.join t2
+  j3 = thread.join t3
+  vp = i64.const 37120
+  va = call 1 (vp)
+  s0 = i64.add j0 j1
+  s1 = i64.add j2 j3
+  s2 = i64.add s0 s1
+  vs = i64.add s2 va
+  return vs
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 8
+  vq = i64.add v0 vk
+  vn = call 2 ()
+  vd = i64.sub vq v0
+  vr = i64.add vn vd
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vlo = i64.const 36864
+  vhi = i64.const 40960
+  vmask = i64.const -1
+  vbuf = i64.const 45056
+  vcap = i64.const 64
+  vn = gc.roots vlo vhi vmask vbuf vcap
+  return vn
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vp = i64.const 37120
+  vr = call 1 (vp)
+  return vr
+  }
+}
