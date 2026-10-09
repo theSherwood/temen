@@ -69,7 +69,7 @@ async function init(cfg) {
       env: { memory },
       // No GPU surface, no card-output streaming and no parallel-driver run in a bash Worker → those
       // host seams stubbed (a refused `x2_spawn` ends such a run with `ThreadFault`).
-      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn: () => -1, x2_now_ms: () => performance.timeOrigin + performance.now(), x2_tierup: () => -1 },
+      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn: () => -1, x2_now_ms: () => performance.timeOrigin + performance.now(), x2_tierup: () => -1, x2_invoke: () => -1 },
     }));
     exports.__stack_pointer.value = stackTop;
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);

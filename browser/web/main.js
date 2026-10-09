@@ -167,11 +167,24 @@ async function main() {
     // forever in an emitted leaf: the run's end stops the emitted code, so the run returns.
     const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true });
     const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true });
+    // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
+    // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
+    // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's
+    // dispatch table. The same guests as the per-Worker `jitcodegen`, `jitruntime` and `jitb2`.
+    const jc32 = await runPath('/corpus/threads_jit_invoke.temenc', { ...x2, jitCodegen: true, jitService: 0 });
+    const jc64 = await runPath('/corpus/threads_jit_invoke_f64.temenc', { ...x2, jitCodegen: true, jitService: 1 });
+    const rtUnit = await fetchBytes('/corpus/jit_rt_unit.temenc');
+    const rtBlobs = [{ off: 0x6000, bytes: rtUnit }];
+    const jr = await runPath('/corpus/jit_rt.temenc', { ...x2, jitRuntime: true, jitRuntimeCodegen: true, jitBlobs: rtBlobs });
+    const b2Blobs = [...rtBlobs, { off: 0x7000, bytes: await fetchBytes('/corpus/jit_b2_unit.temenc') }];
+    const jb = await runPath('/corpus/jit_b2.temenc', { ...x2, jitRuntime: true, jitRuntimeCodegen: true, jitB2: true, jitBlobs: b2Blobs });
     const ms = (performance.now() - t0).toFixed(0);
     const ok = th.value === 4000n && jt.value === 1136n && io.value === 8n && out === 'tick\n'.repeat(8) &&
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
-      tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1;
+      tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
+      jc32.value === 1136n && jc32.tierups > 0 && jc64.value === 1136n && jc64.tierups > 0 &&
+      jr.value === 56n && jr.tierups > 0 && jb.value === 56n && jb.tierups > 0;
     set('x2', ok ? 'pass' : 'fail',
       `x2: threads ${th.value} (want 4000) across ${th.started} Workers · jit ${jt.value} (want 1136) · ` +
       `io ${io.value} (want 8), stdout ${JSON.stringify(out)} · on-ramp exit ${r.exit} (want 7), letters ` +
@@ -180,7 +193,9 @@ async function main() {
       fibers.map((f) => `${f.name} ${f.got}${f.ok ? '' : ` (want ${f.want})`}`).join(' · ') +
       ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
-      `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) ` +
+      `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
+      `§22 units on emitted wasm: host's i32 ${jc32.value}/${jc32.tierups}, f64 ${jc64.value}/${jc64.tierups} ` +
+      `(want 1136), runtime ${jr.value}/${jr.tierups}, B2 ${jb.value}/${jb.tierups} (want 56) ` +
       `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`x2 → threads ${th.value} across ${th.started} Workers in ${ms}ms`);
   } catch (e) {

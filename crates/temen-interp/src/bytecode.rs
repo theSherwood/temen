@@ -15969,8 +15969,11 @@ impl SchedCore {
                         // #1301
                     });
                     drop(g);
+                    // #1414 B6-3: emitted code addresses the window as one flat span, so a window
+                    // backed without one runs the unit interpreted.
                     let mapped = match mem.as_ref() {
                         None => Some(0),
+                        Some(m) if m.flat_win_base().is_none() => None,
                         Some(m) if *page_checked => Some(m.reserved_size()),
                         Some(m) => m.scalar_extent(),
                     };
@@ -17081,7 +17084,7 @@ struct ThreadRun {
     bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
     ended: std::sync::Condvar,
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
-    /// ([`TierUpCall::over`]).
+    /// ([`EmittedCall::over`]).
     over: std::sync::atomic::AtomicBool,
 }
 
@@ -17110,41 +17113,105 @@ impl ThreadPlatform {
 }
 
 /// The emitted tier on the parallel driver (#1414 B6-3): which calls tier up, and how a thread runs
-/// one itself, where its task stopped.
+/// emitted code itself, where its task stopped — a tier-up, or a §22 invoke of a unit with emitted
+/// wasm.
 #[derive(Clone)]
 pub struct ThreadTier {
     /// Per-module-0-function eligibility, as the pump's ([`TierUpConfig::eligible`]): a module-0
     /// task's direct call to an eligible function runs on the emitted tier.
     pub eligible: std::sync::Arc<[bool]>,
-    /// The size of a thread's env cell, the emitted code's per-thread scratch ([`TierUpCall::cell`]).
-    pub cell_bytes: usize,
-    /// Run one tier-up, on the calling thread. Once the run is over ([`TierUpCall::over`]) it
-    /// returns by the emitted code's next fuel check, whatever it returns: the run waits for its
-    /// thread.
-    pub run: fn(&mut TierUpCall<'_>) -> Result<(), Trap>,
+    /// Run one call on the emitted tier, on the calling thread. Once the run is over
+    /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
+    /// returns: the run waits for its thread.
+    pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
 }
 
-/// One tier-up a thread runs ([`ThreadTier::run`]): module-0 function `func` on the emitted tier,
-/// over its task's window.
-pub struct TierUpCall<'a> {
-    pub func: u32,
+/// What a call on the emitted tier runs ([`EmittedCall::target`]).
+pub enum EmittedTarget<'a> {
+    /// Function `func` of the run's tier-up module: a direct call to it tiered up.
+    Region(u32),
+    /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
+    /// and the types the argument and result slots carry.
+    Unit {
+        code: i32,
+        wasm: &'a std::sync::Arc<[u8]>,
+        params: &'a [ValType],
+        results: &'a [ValType],
+    },
+}
+
+/// One call a thread runs on the emitted tier ([`ThreadTier::run`]), over its task's window and
+/// dispatch table.
+pub struct EmittedCall<'a> {
+    pub target: EmittedTarget<'a>,
     /// The arguments, as raw i64 slots.
     pub argv: &'a [i64],
     /// The window's committed extent, the emitted `"mapped"` global (#717).
     pub mapped: u64,
     /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
     pub win: *const u8,
-    /// This thread's env cell ([`ThreadTier::cell_bytes`]), zeroed when the thread made it.
-    pub cell: *mut u8,
     /// Set once the run is over. Emitted code still running then stops at its next fuel check.
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
+    table: &'a SharedSlots,
+    host: &'a std::sync::Mutex<super::Host>,
+    now: &'a std::cell::Cell<u64>,
 }
 
-/// A call out of a tier-up's emitted code back into the interpreter (`env.call_interp`): function
+impl EmittedCall<'_> {
+    /// The generation of the task's dispatch table: it moves with every install and uninstall, so
+    /// a host that mirrors the table in emitted code rebuilds only when it changed.
+    pub fn table_gen(&self) -> u32 {
+        self.table.gen()
+    }
+
+    /// The `(domain, unit)` installed at `slot` of the task's dispatch table (`None` = empty, or one
+    /// of the program's own functions).
+    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
+        self.table.slot_unit(slot as usize)
+    }
+
+    /// `unit`'s emitted wasm, emitted now if it has not been yet; `None` for a unit the host's
+    /// emitter refuses, which stays on the interpreter.
+    pub fn unit_wasm(&self, unit: (u32, u32)) -> Option<std::sync::Arc<[u8]>> {
+        self.host
+            .lock_unpoisoned()
+            .jit_unit_wasm_or_emit(unit.0, unit.1)
+    }
+
+    /// The parameter and result types of `unit`'s entry.
+    pub fn unit_sig(&self, unit: (u32, u32)) -> Option<(Vec<ValType>, Vec<ValType>)> {
+        let funcs = self.host.lock_unpoisoned().jit_unit_funcs(unit.0, unit.1)?;
+        funcs.first().map(|f| (f.params.clone(), f.results.clone()))
+    }
+
+    /// The window's committed extent now, which a bounce may have grown ([`EmittedCall::mapped`]
+    /// is the call's).
+    pub fn mapped_now(&self) -> u64 {
+        self.now.get()
+    }
+}
+
+/// A §22 invoke the rules surfaced to run on the emitted tier ([`CoopStep::JitInvoke`]): its task's
+/// thread runs it before it steps the task on ([`ThreadRun::invoke`]).
+struct SurfacedInvoke {
+    code: i32,
+    wasm: std::sync::Arc<[u8]>,
+    argv: Box<[i64]>,
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+    /// The register the first result lands in.
+    dst: usize,
+    mapped: u64,
+}
+
+/// A task a stop made, with the window view and fuel hand its new thread starts with.
+type NewTask = (usize, Option<Mem>, Fuel);
+
+/// A call out of emitted code back into the interpreter (`env.call_interp`): function
 /// `target` of the task's dispatch table, its arguments in `io` and its results written back over
 /// them, run over the task's live window and powerbox. Returns how many results it wrote.
 pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
@@ -17322,8 +17389,9 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     let mut look = true;
     // The task's VM while its thread steps it; the slot holds this empty one meanwhile.
     let mut vm: Box<TaskVm> = Box::default();
-    // The thread's env cell for the emitted tier ([`TierUpCall::cell`]), made at its first tier-up.
-    let mut cell = None;
+    // A §22 invoke the rules surfaced at the task's last stop, which the thread runs on the emitted
+    // tier before it steps the task on.
+    let mut invoke = None;
     'run: loop {
         loop {
             if g.over.is_some() {
@@ -17354,7 +17422,12 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             durable: false,
             host: HostCell::Shared(&host),
         };
-        let stop = run.step(&mut vm, env, &mut ctx, &mut cell);
+        let stop = match invoke.take() {
+            Some(inv) => run
+                .invoke(&mut vm, &mut ctx, inv)
+                .and_then(|()| run.step(&mut vm, env, &mut ctx)),
+            None => run.step(&mut vm, env, &mut ctx),
+        };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
             _ => None,
@@ -17370,7 +17443,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         }
         exec = matches!(stop, Ok(VcpuStop::Exec { .. }));
         look = matches!(stop, Ok(VcpuStop::Preempted));
-        let made = run.apply(&mut g, ti, stop, exits);
+        let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
+        invoke = surfaced;
         if !made.is_empty() {
             release(g);
             for (j, mem, fuel) in made {
@@ -17402,7 +17476,6 @@ impl ThreadRun {
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
-        cell: &mut Option<Box<[u64]>>,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
         for _ in 0..TIERUP_LOOK {
@@ -17424,7 +17497,8 @@ impl ThreadRun {
                 }) => {
                     // Only a tier arms the eligibility a tier-up needs.
                     let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
-                    let vals = self.tier_up(tier, cell, &mut fibers, ctx, func, &argv, mapped)?;
+                    let target = EmittedTarget::Region(func);
+                    let vals = self.emitted(tier, &mut fibers, true, ctx, target, &argv, mapped)?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
@@ -17437,58 +17511,86 @@ impl ThreadRun {
         Ok(VcpuStop::Preempted)
     }
 
-    /// Run one tier-up on this thread ([`ThreadTier::run`]), over the task's window and the
-    /// thread's env cell. Its calls back into the interpreter run over the task's live window,
-    /// powerbox and table, with their fibers in the run's registry, as the pump's do.
+    /// Run the §22 invoke `inv` the rules surfaced at the task's last stop on this thread's emitted
+    /// tier ([`ThreadTier::run`]), and hand its results to the task as the interpreted invoke would.
+    /// Its calls back into the interpreter share a registry of their own, whose fibers die with the
+    /// invoke, as `run_invoke`'s do.
+    fn invoke(&self, vm: &mut TaskVm, ctx: &mut RunCtx, inv: SurfacedInvoke) -> Result<(), Trap> {
+        let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+        let mut fibers = FiberTables::default();
+        let target = EmittedTarget::Unit {
+            code: inv.code,
+            wasm: &inv.wasm,
+            params: &inv.params,
+            results: &inv.results,
+        };
+        let mut cell = fibers.cell();
+        let vals = self.emitted(tier, &mut cell, false, ctx, target, &inv.argv, inv.mapped)?;
+        // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
+        if vals.len() < inv.results.len() {
+            return Err(Trap::Malformed);
+        }
+        set_slot_results(&mut vm.vt.active, inv.dst as u32, &inv.results, vals);
+        Ok(())
+    }
+
+    /// Run one call on this thread's emitted tier ([`ThreadTier::run`]): `target`, over the task's
+    /// window and dispatch table. Its calls back into the interpreter run over the task's live
+    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up
+    /// (`run_level`), as the pump's are, or an invoke's own.
     #[allow(clippy::too_many_arguments)]
-    fn tier_up(
+    fn emitted(
         &self,
         tier: &ThreadTier,
-        cell: &mut Option<Box<[u64]>>,
         fibers: &mut FiberCell,
+        run_level: bool,
         ctx: &mut RunCtx,
-        func: u32,
+        target: EmittedTarget<'_>,
         argv: &[i64],
         mapped: u64,
     ) -> Result<Vec<i64>, Trap> {
-        // Words, so the scratch is 8-aligned.
-        let cell = cell.get_or_insert_with(|| vec![0; tier.cell_bytes.div_ceil(8)].into());
-        // A tier-up surfaces only over a window with a flat span, or none at all.
+        // Emitted code runs only over a window with a flat span, or none at all.
         let win = match ctx.mem.as_ref() {
             None => std::ptr::null(),
             Some(m) => m.flat_win_base().ok_or(Trap::Malformed)?,
         };
+        let host = match &ctx.host {
+            HostCell::Shared(h) => *h,
+            HostCell::Excl(_) => return Err(Trap::Malformed),
+        };
+        let now = std::cell::Cell::new(mapped);
         let RunCtx {
-            table,
-            fuel,
-            mem,
-            host,
-            ..
+            table, fuel, mem, ..
         } = ctx;
+        let table: &SharedSlots = table;
         let mut bounce = |target: u32, io: &mut [i64]| {
-            let run_level = BounceRunCtx { park: None };
-            coop_bounce(
+            let ran = coop_bounce(
                 &self.dom.source,
                 table,
                 fuel,
                 mem,
-                host,
+                &mut HostCell::Shared(host),
                 fibers,
-                Some(run_level),
+                run_level.then_some(BounceRunCtx { park: None }),
                 target,
                 io,
                 None,
-            )
+            );
+            // The bounce may have grown the window, which the emitted code reads again after it.
+            now.set(mem.as_ref().map_or(0, |m| m.scalar_extent().unwrap_or(0)));
+            ran
         };
-        let mut call = TierUpCall {
-            func,
+        let mut call = EmittedCall {
+            target,
             argv,
             mapped,
             win,
-            cell: cell.as_mut_ptr().cast(),
             over: &self.over,
             results: Vec::new(),
             bounce: &mut bounce,
+            table,
+            host,
+            now: &now,
         };
         (tier.run)(&mut call).map(|()| call.results)
     }
@@ -17508,7 +17610,7 @@ impl ThreadRun {
     }
 
     /// End the run with `res`, unless it is over already. Every thread stops at its next look, and
-    /// emitted code at its next fuel check ([`TierUpCall::over`]).
+    /// emitted code at its next fuel check ([`EmittedCall::over`]).
     fn conclude(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
         if g.over.is_none() {
             g.over = Some(res);
@@ -17536,15 +17638,16 @@ impl ThreadRun {
 
     /// Apply task `ti`'s stop under the lock, as the pump does between steps: its rule, then the
     /// wake half ([`Self::settle`]). `exits` is how many children had ended when the step began
-    /// ([`Self::missed_wake`]). Returns the tasks the rule made, each with the window view and fuel
-    /// hand its thread starts with, for the caller to start once it lets go of the lock.
+    /// ([`Self::missed_wake`]). Returns the tasks the rule made, for the caller to start once it
+    /// lets go of the lock, and the §22 invoke it surfaced, for the task's thread to run
+    /// ([`Self::invoke`]).
     fn apply(
         &self,
         g: &mut Threads,
         ti: usize,
         stop: Result<VcpuStop, Trap>,
         exits: usize,
-    ) -> Vec<(usize, Option<Mem>, Fuel)> {
+    ) -> (Vec<NewTask>, Option<SurfacedInvoke>) {
         let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
         let had = g.core.tasks.len();
         g.core.clock = self.now();
@@ -17556,17 +17659,40 @@ impl ThreadRun {
             ..
         } = &mut *g;
         // A thread runs its own task's tier-ups ([`ThreadRun::step`]), so no tier-up reaches the
-        // rules. What else could pause for a host is an emitted §22 invoke, which surfaces only for
-        // a host with a unit emitter; this executor's are given none yet (#1414 B6-3b), so one that
-        // surfaces anyway fails closed.
-        if core
-            .on_stop(emit, &self.dom, mem, &self.root, fuel, ti, stop)
-            .is_some()
-        {
-            debug_assert!(false, "executor 2 cannot run an emitted §22 invoke yet");
-            emit.pending_jit = None;
-            complete(&mut core.tasks, ti, Err(Trap::CapFault));
-        }
+        // rules. An emitted §22 invoke does, and goes back to the task's thread, which runs it
+        // ([`ThreadRun::invoke`]).
+        let invoke = match core.on_stop(emit, &self.dom, mem, &self.root, fuel, ti, stop) {
+            None => None,
+            Some(CoopStep::JitInvoke {
+                code,
+                wasm,
+                argv,
+                params,
+                results,
+                mapped,
+            }) => {
+                let (_, dst, _) = emit
+                    .pending_jit
+                    .take()
+                    .expect("a surfaced invoke is pending");
+                Some(SurfacedInvoke {
+                    code,
+                    wasm,
+                    argv,
+                    params,
+                    results,
+                    dst,
+                    mapped,
+                })
+            }
+            // Only a host with a leaf emitter surfaces anything else, and this executor's have none.
+            Some(_) => {
+                debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
+                emit.pending_tierup = None;
+                complete(&mut core.tasks, ti, Err(Trap::CapFault));
+                None
+            }
+        };
         if self.missed_wake(&g.core, ti, exits) {
             g.core.tasks[ti].state = TaskState::Runnable;
         }
@@ -17580,7 +17706,7 @@ impl ThreadRun {
         // Each new task's thread counts in now, before it starts, so the run cannot end unseen.
         g.live += made.len();
         self.wake(g, &was_awake, Some(ti));
-        made
+        (made, invoke)
     }
 
     /// The wake half of a pump round, under the lock: the teardown, every wait the wall clock has

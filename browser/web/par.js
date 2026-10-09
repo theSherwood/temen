@@ -71,6 +71,7 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
       x2_spawn: () => -1,
       x2_now_ms: () => performance.timeOrigin + performance.now(),
       x2_tierup: () => -1,
+      x2_invoke: () => -1,
     },
   };
   const { exports: ex } = await WebAssembly.instantiate(module, importObj);
@@ -98,9 +99,11 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               isn't seeded by a previous run's recipe;
 //   `x2`      ⇒ run on the **parallel driver** (executor 2, #1414 B6) instead of a `Vcpu` per Worker:
 //               the whole run is one in-Rust call on the root's Worker, each of its threads a Worker
-//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, none). Of the
-//               emitted-tier options it takes `tierup` (each thread runs its task's tier-ups on its
-//               own Worker, over a window of `winSize` that cannot grow) and refuses the rest;
+//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, `jitRuntime`,
+//               none). Of the emitted-tier options it takes `tierup` and the §22 ones (`jitCodegen`,
+//               `jitRuntimeCodegen`, `jitB2`): each thread runs its task's tier-ups and emitted
+//               invokes on its own Worker, over a window of `winSize` that cannot grow. It refuses
+//               `instCodegen` (#1414 B6-3c);
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
 //   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
@@ -111,8 +114,8 @@ export function makeRunner({ module, memory, ex }) {
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
   return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], x2 = false } = {}) {
-    if (x2 && (jitCodegen || instCodegen || jitB2 || jitRuntime || jitRuntimeCodegen)) {
-      throw new Error('the parallel driver tiers up regions only, for now (#1414 B6-3b, B6-3c)');
+    if (x2 && instCodegen) {
+      throw new Error('the parallel driver runs no detached child on emitted code yet (#1414 B6-3c)');
     }
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
@@ -159,6 +162,8 @@ export function makeRunner({ module, memory, ex }) {
     if (!x2 && prog === 0) throw new Error('module unsupported on the per-Worker driver (temen_par_compile null)');
     const win = ex.temen_par_alloc(winSize);
     for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
+    // The parallel driver's window is its own: it copies the staged blobs in from `win`.
+    const seedLen = jitBlobs.reduce((n, b) => Math.max(n, b.off + b.bytes.length), 0);
     // §14 real-codegen (`instCodegen`) publishes the same recipe as `inst`; each confined child whose
     // granted-unit entry is emitted runs it on wasm instead of interpreting (see worker.js).
     if (inst || instCodegen) {
@@ -218,7 +223,7 @@ export function makeRunner({ module, memory, ex }) {
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
           // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
           // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, jitRuntime, gptr, glen: guest.length, tierupCell, ...cfg });
+          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, jitRuntime, gptr, glen: guest.length, tierupCell, seedLen, ...cfg });
         };
         // The root vCPU runs on its own Worker (the page can't Atomics.wait).
         const rootSlot = ex.temen_par_alloc(SLOT);

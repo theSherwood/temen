@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**368 exports** in 39 families — 319 referenced from JS, 49 referenced by nothing, 15 behind a `cfg`.
+**376 exports** in 39 families — 327 referenced from JS, 49 referenced by nothing, 23 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -44,7 +44,7 @@
 | `trap` | 2 | 2 | 0 |
 | `warm` | 16 | 16 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
-| `x2` | 5 | 5 | 5 |
+| `x2` | 13 | 13 | 13 |
 
 ## Exports by family
 
@@ -529,8 +529,16 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 ### `x2`
 
+- `temen_x2_bytes_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_call_interp` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_mapped_now` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_nfuncs` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_shim_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_slot_unit` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_slot_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_start` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_table_gen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_table_log2` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_thread` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_wasm_len` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_wasm_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
