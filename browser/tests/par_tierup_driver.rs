@@ -307,7 +307,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
                             }
                         }
                     } else {
-                        assert_eq!(temen_par_jit_slot_unit(slot), -1, "nothing installed");
+                        assert_eq!(temen_par_jit_slot_unit(v, slot), -1, "nothing installed");
                         None
                     };
                     let fr = match entry {
@@ -419,9 +419,9 @@ fn par_linked_unit_dispatches_program_functions_through_the_b2_mirror() {
     }
 }
 
-// ---- #1339, #2259: the slot mirror survives the guest's `Jit.release`, not its run -----------------
+// ---- #1339, #2259: an installed unit survives the guest's `Jit.release`, not its run -------------
 
-/// #1339 — **the parallel driver's slot mirror is keyed on the unit, not the code handle.**
+/// #1339 — **a Worker's B2 table follows the unit installed in a slot, not the code handle.**
 ///
 /// `compile → install → release` is the ordinary §22 pattern: the unit stays installed in the shared
 /// dispatch table, and the guest drops the code handle it no longer needs (Forth's outer interpreter
@@ -434,15 +434,16 @@ fn par_linked_unit_dispatches_program_functions_through_the_b2_mirror() {
 /// The guest compiles `f(x) = x + K` from the host-staged blob, installs it (taking slot 1 — the
 /// first padding slot past its own single function), releases the handle, then `call.dyn`s the slot.
 /// Asserts the dispatch still computes, and then — the regression proper — that **after the release**
-/// the mirror still names the unit and the driver can still fetch its emitted wasm by that name: the
-/// two reads `worker.js::jitSyncTable` makes to fill that slot.
+/// the vCPU's table still names the unit and the driver can still fetch its emitted wasm by that
+/// name: the two reads `worker.js::jitSyncTable` makes to fill that slot.
 ///
-/// #2259 — and that the **next run's publish empties the mirror**. Its host numbers units afresh, so
-/// an entry left from this run named another unit of it: a Worker of the next run fetched that
-/// unit's wasm into the slot.
+/// #2259 — and that the **next run starts with an empty table**. Its host numbers units afresh, so
+/// an entry left from this run would name another unit of it: a Worker of the next run fetched that
+/// unit's wasm into the slot. The table belongs to the run's program, which par.js compiles for
+/// every run, as this test does.
 #[test]
 fn par_installed_unit_outlives_its_handle_but_not_its_run() {
-    // The par §22 statics (the powerbox, the slot mirror, the prefix shims) are process-global, so
+    // The par §22 statics (the powerbox, the prefix shims) are process-global, so
     // this shares `JIT_STATE_LOCK` with the other single-run test in this binary (#1182).
     let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use temen_browser::{
@@ -494,7 +495,6 @@ block 0 (v0: i32) {{
         1,
         "runtime-compile powerbox"
     );
-    let gen0 = temen_par_jit_table_gen();
     let prog = temen_par_compile_jit(guest_bytes.as_ptr(), guest_bytes.len());
     assert!(!prog.is_null(), "guest compiles");
 
@@ -503,6 +503,7 @@ block 0 (v0: i32) {{
     win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
     let v = temen_par_root(prog, win.as_mut_ptr(), win.len(), 0);
     assert!(!v.is_null(), "root vCPU builds");
+    let gen0 = temen_par_jit_table_gen(v);
     assert_eq!(temen_par_run(v), PAR_DONE, "the guest runs to completion");
     // `vres` (= X + K) + `vslot` (1, the first padding slot) + `vrel` (0, release ok).
     assert_eq!(
@@ -512,17 +513,17 @@ block 0 (v0: i32) {{
     );
 
     assert!(
-        temen_par_jit_slot_unit(1) >= 0,
-        "the slot mirror must still name the installed unit after `release`"
+        temen_par_jit_slot_unit(v, 1) >= 0,
+        "the table must still name the installed unit after `release`"
     );
     assert!(
-        temen_par_jit_unit_wasm_by_id_len(temen_par_jit_slot_unit(1)) > 0,
+        temen_par_jit_unit_wasm_by_id_len(temen_par_jit_slot_unit(v, 1)) > 0,
         "the driver must still fetch the installed unit's emitted wasm after `release`"
     );
     assert_ne!(
-        temen_par_jit_table_gen(),
+        temen_par_jit_table_gen(v),
         gen0,
-        "the install must advance the mirror generation so a Worker rebuilds"
+        "the install must move the table's generation so a Worker rebuilds"
     );
 
     assert_eq!(
@@ -530,8 +531,12 @@ block 0 (v0: i32) {{
         1,
         "the next run's powerbox"
     );
+    let next_prog = temen_par_compile_jit(guest_bytes.as_ptr(), guest_bytes.len());
+    assert!(!next_prog.is_null(), "the next run's program compiles");
+    let next = temen_par_root(next_prog, win.as_mut_ptr(), win.len(), 0);
+    assert!(!next.is_null(), "the next run's root vCPU builds");
     assert_eq!(
-        temen_par_jit_slot_unit(1),
+        temen_par_jit_slot_unit(next, 1),
         -1,
         "the next run starts with nothing installed"
     );
