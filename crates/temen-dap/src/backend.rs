@@ -155,6 +155,8 @@ fn build_run(
     } else {
         ScheduledDebugRun::new(module, func, args)?
     };
+    // #2254: the debug engine schedules every vCPU on one thread.
+    run.host_mut().set_workers(1);
     run.set_sched_seed(seed);
     Some(run)
 }

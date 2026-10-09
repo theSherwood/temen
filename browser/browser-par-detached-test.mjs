@@ -21,6 +21,9 @@
 // Two more #1865 pins. A root's child of its OWN module (a record's `module = -1`) stays on the
 // interpreter under `instCodegen` even when the granted unit emits a function at the same entry: only a
 // child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails closed.
+//
+// #2251: a plain root that returns its `self.parallelism` answers the page's core count
+// (`navigator.hardwareConcurrency`), since this driver gives each vCPU its own Worker.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -180,7 +183,18 @@ block 0 (v0: i64) {
 }
 `;
 
-const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc }) => {
+// #2251: `self.parallelism`, returned.
+const CPUS_SRC = `memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i32.const 0
+  v1 = call.cap 4294967295 19 () -> (i64) v0 ()
+  return v1
+  }
+}
+`;
+
+const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc, nineUnitSrc, carveRootSrc, cpusSrc }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
   const once = async (eng, codegen = false, src = { root: rootSrc, child: childSrc, minter }) => {
   const ex = eng.ex, memory = eng.memory;
@@ -198,7 +212,7 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const root = parse(src.root), child = src.child ? parse(src.child) : null;
   const run = makeRunner(eng);
   try {
-    const { value, started, tierups } = await run(root, codegen
+    const { value, started, tierups } = await run(root, src.plain ? {} : codegen
       ? { instCodegen: true, unit: child, minter: src.minter, winSize: src.winSize }
       : { inst: true, unit: child, minter: src.minter, winSize: src.winSize });
     return { value: value.toString(), started, tierups };
@@ -217,8 +231,10 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const emitted = await once(await loadEngine(fresh), true);
   const self = await once(await loadEngine(fresh), true, { root: selfRootSrc, child: nineUnitSrc, minter: 1 << 16 });
   const carve = await once(await loadEngine(fresh), false, { root: carveRootSrc, child: null, minter: 0, winSize: 1 << 20 });
-  return { ...first, second, emitted, self, carve, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
-}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC });
+  const cpus = await once(await loadEngine(fresh), false, { root: cpusSrc, child: null, plain: true });
+  const cores = String(navigator.hardwareConcurrency || 1);
+  return { ...first, second, emitted, self, carve, cpus, cores, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
+}, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA, selfRootSrc: SELF_ROOT_SRC, nineUnitSrc: NINE_UNIT_SRC, carveRootSrc: CARVE_ROOT_SRC, cpusSrc: CPUS_SRC });
 
 await browser.close();
 await new Promise((r) => server.close(r));
@@ -231,11 +247,13 @@ const emittedOk = em && !em.err && em.value === EXPECT && em.started === 4 && em
 const sf = res.self, cv = res.carve;
 const selfOk = sf && !sf.err && sf.value === '7' && sf.tierups === 0;
 const carveOk = cv && cv.err === 'guest trap: CapFault';
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk;
+const cpusOk = res.cpus && !res.cpus.err && res.cpus.value === res.cores;
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory && emittedOk && selfOk && carveOk && cpusOk;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
 console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(`  on emitted wasm: value ${em?.value}/${EXPECT} workers ${em?.started}/4 emitted children ${em?.tierups}/3${em?.err ? ` · ERR ${em.err}` : ''}`);
 console.log(`  own-module child under instCodegen: value ${sf?.value}/7 emitted ${sf?.tierups}/0${sf?.err ? ` · ERR ${sf.err}` : ''}`);
 console.log(`  carve spawn: ${carveOk ? 'fails closed' : `NOT refused (${cv?.err ?? cv?.value})`}`);
+console.log(`  self.parallelism: ${res.cpus?.value}/${res.cores} (the page's core count)${res.cpus?.err ? ` · ERR ${res.cpus.err}` : ''}`);
 console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
 process.exit(ok ? 0 : 1);

@@ -979,10 +979,12 @@ condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58)
 `i32.atomic.wait` and `FUTEX_WAKE` as `atomic.notify`, and fails any other number with `ENOSYS`.
 `std/threadpool` itself takes ticket spinlocks and atomics (#2202 part 1 made those the IR's).
 
-**The CPU count.** `sysconf(_SC_NPROCESSORS_ONLN)` (and `_CONF`) answers `self.parallelism`: the
-domain's lane cap when it has one (D66), else the host's worker count. `std/cpuinfo` asks
-`sched_getaffinity` first, which reports nothing here, and falls back to it, so `initPool()` starts
-`max(1, n - 1)` workers.
+**The CPU count.** `sysconf(_SC_NPROCESSORS_ONLN)` (and `_CONF`) answers `self.parallelism`: how
+many vCPUs the driver running the domain can run at once, bounded by its lane cap (D66). That is the
+host's worker count on the tree-walker and the JIT, 1 on the bytecode engine, whose driver runs every
+vCPU on one thread, and the page's core count under the browser's per-Worker driver (#2254).
+`std/cpuinfo` asks `sched_getaffinity` first, which reports nothing here, and falls back to it, so
+`initPool()` starts `max(1, n - 1)` workers.
 
 **What is not served.**
 - CPU affinity is a no-op.

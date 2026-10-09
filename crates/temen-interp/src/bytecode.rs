@@ -1946,7 +1946,7 @@ fn confined_child_host(
                 .ok_or(Trap::CapFault)?
         }
         None => {
-            let mut ch = Host::new();
+            let mut ch = host.child_host();
             let (cinst, cas) = ch.grant_starter_caps(child_size);
             (ch, cinst, cas)
         }
@@ -4909,6 +4909,17 @@ impl<'p> Vcpu<'p> {
     /// its state (e.g. `stdout`) after; per-call serialization is the documented 4c-host model.
     pub fn with_shared_host(mut self, host: &'p std::sync::Mutex<Host>) -> Vcpu<'p> {
         self.shared_host = Some(host);
+        self
+    }
+
+    /// Set how many vCPUs the driver running this one can run at once ([`Host::set_workers`]) on the
+    /// host its `call.cap`s go through: the shared powerbox when it has one, else its own. The
+    /// browser's per-Worker driver gives each vCPU its own Worker, so it passes the page's core count.
+    pub fn with_workers(mut self, n: usize) -> Vcpu<'p> {
+        match self.shared_host {
+            Some(h) => h.lock_unpoisoned().set_workers(n),
+            None => self.host.set_workers(n),
+        }
         self
     }
 

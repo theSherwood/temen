@@ -809,8 +809,27 @@ fn scalar_type_code(t: temen_ir::ValType) -> Option<u8> {
     }
 }
 
-/// Box a freshly-built vCPU as a [`ParVcpu`] (event operands zeroed, no pending tier-up args).
+/// #2251 — how many of a run's vCPUs run at once under this driver, which gives each its own Worker:
+/// the page's core count (`navigator.hardwareConcurrency`), set by [`temen_par_set_workers`] before
+/// the run. `0` until the page sets it, which leaves each host's default (1 on wasm).
+static PAR_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// #2251 — the page tells the per-Worker driver how many Workers can run at once, what a guest's
+/// `self.parallelism` answers (bounded by its lane cap). `navigator.hardwareConcurrency`; call it
+/// before starting the run. Linear memory is shared, so every Worker's engine sees it.
+#[no_mangle]
+pub extern "C" fn temen_par_set_workers(n: usize) {
+    PAR_WORKERS.store(n, std::sync::atomic::Ordering::Release);
+}
+
+/// Box a freshly-built vCPU as a [`ParVcpu`] (event operands zeroed, no pending tier-up args). Every
+/// vCPU of the run passes through here, so it is where the page's worker count reaches the host the
+/// vCPU's `call.cap`s go through.
 fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
+    let inner = match PAR_WORKERS.load(std::sync::atomic::Ordering::Acquire) {
+        0 => inner,
+        n => inner.with_workers(n),
+    };
     Box::into_raw(Box::new(ParVcpu {
         inner,
         a: 0,

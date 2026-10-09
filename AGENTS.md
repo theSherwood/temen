@@ -121,6 +121,16 @@ not from micro-optimizing hot code. Default to:
 
 **Always open a PR whenever you have changes** — every branch with commits gets a PR, no exceptions. Open it as soon as you have changes rather than waiting for the work to feel finished. If you have multiple slices queued to implement, you can put them on the same PR until the PR exceeds 1000 loc. When you complete slices after opening a PR, check for merge conflicts and address them.
 
+**Step back before you call a PR ready.** A PR opens early. Before you ask for review or merge, review the whole PR from above, not line by line:
+
+- **Design.** Does each decision serve the project's goals and select for the best final design, or is it a short-term workaround? Seen from a higher level, can any decision be obviated? Did a better design reveal itself during implementation?
+- **Shape.** Can any code paths be collapsed? Can anything be simplified? Does anything need refactoring to share a simpler architecture with related functionality (`INVARIANTS.md` #15)?
+- **Speed.** Is it fast? Where performance could have moved, measure it against main rather than assert it.
+- **Invariants.** Does it meet the demands of every invariant it touches?
+- **Loose ends.** Which tickets must be filed before the PR is done (`INVARIANTS.md` #14)?
+
+Act on what you find. A better design that fits the PR goes into the PR. A larger one, or one that changes a decision the owner made, goes to the owner as options with your recommendation before you ask for merge. Record the outcome in the PR description under **Step back**: what you weighed, what you changed, what you filed. That keeps a workaround from landing silently. "Nothing found" needs its reasons.
+
 **Put decisions in chat, never in the `AskUserQuestion` tool.** When the owner has to decide, write the options and your recommendation in your reply, and wait for theirs.
 
 **Don't subscribe to PR activity / auto-watch a PR unless explicitly asked.** Open the PR and report it; leave CI-watching, autofix-on-red, and merge-conflict babysitting to the owner. Only call `subscribe_pr_activity` (or set up scheduled CI check-ins) when the owner specifically requests it for that PR.

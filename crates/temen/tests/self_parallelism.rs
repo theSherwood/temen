@@ -1,6 +1,8 @@
 //! `self.parallelism` (self-namespace op 19): how many of a domain's vCPUs may run at once. That is
-//! its lane cap when it has one (D66), else the host's worker count (`pool_workers`). The host
-//! answers it, so each interpreter driver and the Cranelift JIT agree.
+//! the workers its driver has, an input the embedder sets (`Host::set_workers`; by default the real
+//! pool's size, `pool_workers`), bounded by its lane cap (D66). The host answers it, so each
+//! interpreter driver and the Cranelift JIT agree on a host, and an embedder that runs a one-thread
+//! driver says 1 (#2254).
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -97,46 +99,87 @@ fn every_engine(what: &str, src: &str, setup: &dyn Fn() -> (Host, Vec<Value>), w
     }
 }
 
-#[test]
-fn a_domain_with_no_lane_cap_reports_the_hosts_workers() {
-    let setup = || (Host::new(), Vec::new());
-    every_engine("no lane cap", ASK, &setup, pool_workers() as i64);
+/// A host with `workers` set, and lane cap `lane` when it is not negative.
+fn host(workers: Option<usize>, lane: i64) -> Host {
+    let mut host = Host::new();
+    if let Some(n) = workers {
+        host.set_workers(n);
+    }
+    if lane >= 0 {
+        host.set_lane_cap(lane);
+    }
+    host
 }
 
 #[test]
-fn a_domain_reports_its_lane_cap() {
-    let setup = || {
-        let mut host = Host::new();
-        host.set_lane_cap(3);
-        (host, Vec::new())
-    };
-    every_engine("lane cap 3", ASK, &setup, 3);
+fn a_domain_reports_its_drivers_workers() {
+    let unset = || (host(None, -1), Vec::new());
+    every_engine("workers unset", ASK, &unset, pool_workers() as i64);
+    let six = || (host(Some(6), -1), Vec::new());
+    every_engine("six workers", ASK, &six, 6);
 }
 
-/// The worker count is the host machine's, so a replay answers what the recording saw, as it does a
-/// clock read (DEBUGGING.md W1), whatever the replaying host would say.
+#[test]
+fn the_lane_cap_bounds_the_workers() {
+    let wide = || (host(Some(8), 3), Vec::new());
+    every_engine("lane 3 of 8 workers", ASK, &wide, 3);
+    let narrow = || (host(Some(2), 3), Vec::new());
+    every_engine("lane 3 of 2 workers", ASK, &narrow, 2);
+}
+
+/// A child runs on its parent's driver, so it has its parent's workers, within its own lane.
+#[test]
+fn a_child_has_its_parents_workers_within_its_own_lane() {
+    for (workers, want) in [(8, 2), (1, 1)] {
+        let setup = || {
+            let mut host = host(Some(workers), -1);
+            let inst = host.grant_instantiator(0, WIN as u64);
+            let child = host.grant_module(&module(CHILD));
+            let budget = host.grant_budget(-1, 1 << 20, -1);
+            (host, [inst, child, budget].map(Value::I32).to_vec())
+        };
+        let what = format!("a child's lane of 2, {workers} workers");
+        every_engine(&what, SPAWN, &setup, want);
+    }
+}
+
+/// The worker count is the machine's and the driver's, so a replay answers what the recording saw,
+/// as it does a clock read (DEBUGGING.md W1), whatever the replaying host would say.
 #[test]
 fn a_replay_answers_what_the_recording_saw() {
     let m = module(ASK);
     let run = |host: &mut Host| run_with_host(&m, 0, &[], &mut 1_000, host);
-    let mut recording = Host::new();
-    recording.set_lane_cap(3);
+    let mut recording = host(Some(3), -1);
     recording.record_caps();
     assert_eq!(run(&mut recording), Ok(vec![Value::I64(3)]));
-    let mut replaying = Host::new();
-    replaying.set_lane_cap(5);
+    let mut replaying = host(Some(5), -1);
     replaying.replay_cap_tape(recording.cap_tape());
     assert_eq!(run(&mut replaying), Ok(vec![Value::I64(3)]));
 }
 
+/// temen-run sets each backend's workers: the bytecode engine runs every vCPU on one thread, and
+/// the tree-walker's pool and the JIT run the host's workers.
 #[test]
-fn a_child_reports_the_lane_its_budget_carries() {
-    let setup = || {
-        let mut host = Host::new();
-        let inst = host.grant_instantiator(0, WIN as u64);
-        let child = host.grant_module(&module(CHILD));
-        let budget = host.grant_budget(-1, 1 << 20, -1);
-        (host, [inst, child, budget].map(Value::I32).to_vec())
-    };
-    every_engine("a child's lane of 2", SPAWN, &setup, 2);
+fn each_temen_run_backend_reports_its_drivers_workers() {
+    use temen_run::{Backend, Outcome, RunConfig};
+    let workers = pool_workers() as i64;
+    for (backend, want) in [
+        (Backend::TreeWalk, workers),
+        (Backend::Bytecode, 1),
+        (Backend::Jit, workers),
+    ] {
+        let run = temen_run::instantiate(module(ASK))
+            .expect("instantiates")
+            .run(backend, &RunConfig::default());
+        match run {
+            Ok(r) => assert_eq!(
+                r.outcome,
+                Outcome::Returned(vec![Value::I64(want)]),
+                "{backend:?}"
+            ),
+            // A target without the JIT's runtime.
+            Err(e) if backend == Backend::Jit && e.contains("nsupported") => {}
+            Err(e) => panic!("{backend:?}: {e}"),
+        }
+    }
 }
