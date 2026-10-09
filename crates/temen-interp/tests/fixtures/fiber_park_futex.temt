@@ -1,0 +1,42 @@
+memory 16 shadow 16448 65536
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  vs1, vv1 = cont.resume v2 v3
+  vs2, vv2 = cont.resume v2 v3
+  vaddr = i64.const 16384
+  vcnt = i32.const 1
+  vw = atomic.notify vaddr vcnt
+  vs3, vv3 = cont.resume v2 v3
+  vk1 = i64.const 100000
+  vs1e = i64.extend_i32_s vs1
+  va = i64.mul vs1e vk1
+  vk2 = i64.const 10000
+  vs2e = i64.extend_i32_s vs2
+  vb = i64.mul vs2e vk2
+  vk3 = i64.const 1000
+  vwe = i64.extend_i32_s vw
+  vc = i64.mul vwe vk3
+  vk4 = i64.const 100
+  vs3e = i64.extend_i32_s vs3
+  vd = i64.mul vs3e vk4
+  vab = i64.add va vb
+  vcd = i64.add vc vd
+  vabcd = i64.add vab vcd
+  vr = i64.add vabcd vv3
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}

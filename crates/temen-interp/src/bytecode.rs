@@ -17156,27 +17156,39 @@ impl Threads {
     }
 }
 
-/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, when
-/// the run started on [`threads_now_ns`], the external-wake bell an embedder armed (#1122), and
-/// where the run waits for its threads to end. Every thread holds it (`Arc`), so a thread is
-/// started with a closure of its own ([`spawn_thread`]) rather than a borrow.
+/// A run on executor 2: the domain its tasks run, the root's powerbox cell, the shared state, how
+/// it starts threads and reads the clock, when it started on that clock, the external-wake bell an
+/// embedder armed (#1122), and where the run waits for its threads to end. Every thread holds it
+/// (`Arc`), so a thread is started with a closure of its own rather than a borrow.
 struct ThreadRun {
     dom: std::sync::Arc<Domain>,
     root: DomainCell,
     state: std::sync::Mutex<Threads>,
+    platform: ThreadPlatform,
     start: u64,
     bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
     ended: std::sync::Condvar,
 }
 
-/// Executor 2's clock (B6): nanoseconds on a monotonic clock every thread of the run reads.
-fn threads_now_ns() -> u64 {
-    sched_wall_now()
+/// How executor 2, the parallel driver, starts a run's threads and reads its clock (#1414 B6). A
+/// run uses the OS's ([`ThreadPlatform::OS`]) unless its host was handed another
+/// ([`Host::set_thread_platform`]): a browser starts a thread as a Web Worker, and wasm32 has no
+/// clock of its own.
+#[derive(Clone, Copy)]
+pub struct ThreadPlatform {
+    /// Start `f` on a thread of its own, which nothing joins. An error refuses the thread.
+    pub spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
+    pub now_ns: fn() -> u64,
 }
 
-/// Executor 2's one way to start a thread (B6): an OS thread of its own (D56).
-fn spawn_thread(f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
-    std::thread::Builder::new().spawn(f).map(drop)
+impl ThreadPlatform {
+    /// An OS thread per task (D56), and the process-wide monotonic clock the pump's busy-poll
+    /// deadlines use.
+    pub const OS: ThreadPlatform = ThreadPlatform {
+        spawn: |f| std::thread::Builder::new().spawn(f).map(drop),
+        now_ns: sched_wall_now,
+    };
 }
 
 /// A thread's last act on executor 2, as it returns or unwinds: it counts itself out of the run
@@ -17234,8 +17246,7 @@ enum ParkFor {
 /// armed external-wake bell has a watcher that settles the run on each ring ([`ThreadRun::watch`]);
 /// and the run ends when its root does, the other tasks stopping at their next look, or with the
 /// pump's deadlock verdict ([`ThreadRun::settle`]). It returns once every thread has gone
-/// ([`ThreadExit`]). A thread starts and the clock is read in one place each ([`spawn_thread`],
-/// [`threads_now_ns`]), where the browser supplies its own (#1414 B6).
+/// ([`ThreadExit`]). A thread starts and the clock is read through the host's [`ThreadPlatform`].
 fn drive_threads(
     dom: Domain,
     entry: FuncIdx,
@@ -17257,6 +17268,7 @@ fn drive_threads(
         }
     };
     let bell = host.external_wake();
+    let platform = host.thread_platform();
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
@@ -17271,7 +17283,8 @@ fn drive_threads(
             live: 1, // the root's, on this thread
             panicked: false,
         }),
-        start: threads_now_ns(),
+        platform,
+        start: (platform.now_ns)(),
         bell,
         ended: std::sync::Condvar::new(),
     });
@@ -17281,7 +17294,7 @@ fn drive_threads(
         let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
         run.state.lock_unpoisoned().live += 1;
         let r = std::sync::Arc::clone(&run);
-        run.start_or_end(spawn_thread(move || r.watch(&bell, seen)));
+        run.start_thread(move || r.watch(&bell, seen));
     }
     run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
     // The run is over, and every thread leaves at its next look: wait for them all to go.
@@ -17393,7 +17406,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             release(g);
             for (j, mem, fuel) in made {
                 let r = std::sync::Arc::clone(&run);
-                run.start_or_end(spawn_thread(move || run_task_thread(r, j, mem, fuel)));
+                run.start_thread(move || run_task_thread(r, j, mem, fuel));
             }
             g = run.state.lock_unpoisoned();
         }
@@ -17422,7 +17435,7 @@ impl ThreadRun {
     /// The core's clock on this executor: nanoseconds since the run started, so a wait's deadline
     /// (`clock + timeout`, as the rules compute it) is a wall-clock one.
     fn now(&self) -> u64 {
-        threads_now_ns().saturating_sub(self.start)
+        (self.platform.now_ns)().saturating_sub(self.start)
     }
 
     /// End the run with `ThreadFault` (if it is not over already) and wake every thread to see it.
@@ -17431,10 +17444,10 @@ impl ThreadRun {
         g.woken = g.parks.clone();
     }
 
-    /// Account for a thread the run counted in ([`Threads::live`]) but could not start: the run
-    /// cannot go on without it (D56: a task is a thread), so it ends.
-    fn start_or_end(&self, started: std::io::Result<()>) {
-        if started.is_err() {
+    /// Start `f` on a thread of its own, one the run has counted in ([`Threads::live`]). A thread
+    /// that cannot start ends the run, which cannot go on without it (D56: a task is a thread).
+    fn start_thread(&self, f: impl FnOnce() + Send + 'static) {
+        if (self.platform.spawn)(Box::new(f)).is_err() {
             let mut g = self.state.lock_unpoisoned();
             g.live -= 1;
             self.end(&mut g);

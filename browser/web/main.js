@@ -133,6 +133,52 @@ async function main() {
     set('capio', 'fail', `capio: error ${e}`);
   }
 
+  // --- #1414 B6) the parallel driver (executor 2) across real Web Workers -------------------------
+  // The run is one in-Rust call on the root's Worker, and each of its threads a Worker the page
+  // starts. First the `threads`, `jit` and `capio` guests, with the same answers. Then the M:N
+  // guests: a fiber parked on a futex and woken by its own thread, resumed on another, woken by the
+  // park-time recheck, timed out while the root sleeps on the page's clock, and polled past its
+  // deadline. Then a deadlock and a live call to a serving child. The per-Worker driver hangs on the
+  // first two fiber guests and the deadlock, traps `FiberFault` on the next two, and declines the
+  // serving guest. The native suites run the same fixtures.
+  try {
+    const t0 = performance.now();
+    const x2 = { x2: true };
+    const th = await runPath('/corpus/threads.temenc', x2);
+    const jt = await runPath('/corpus/threads_jit_install.temenc', { ...x2, jit: true });
+    const io = await runPath('/corpus/threads_io.temenc', { ...x2, io: true });
+    const out = readParStdout(io.eng);
+    const r = await runPath('/corpus/threads_onramp.temenc', { ...x2, onramp: true });
+    const ob = readParStdoutBytes(r.eng);
+    const fb = await runPath('/corpus/threads_fibers.temenc', x2);
+    const ct = await runPath('/corpus/threads_child_trap.temenc', x2).then(() => 'no trap', (e) => e.message);
+    const letters = new TextDecoder().decode(ob.slice(0, 4)).split('').sort().join('');
+    const total = ob.length === 12 ? new DataView(ob.buffer).getBigInt64(4, true) : null;
+    const fibers = [];
+    for (const [name, want] of [['fiber_park_futex', 331100n], ['fiber_park_then_migrate', 3110n],
+      ['fiber_park_not_equal', 30101n], ['fiber_park_timed_wait', 30102n], ['fiber_park_poll_loop', 2n]]) {
+      const got = await runPath(`/corpus/${name}.temenc`, x2).then((v) => v.value, (e) => e.message);
+      fibers.push({ name, got, ok: got === want, want });
+    }
+    const dl = await runPath('/corpus/join_a_forever_waiter.temenc', x2).then(() => 'no trap', (e) => e.message);
+    const sv = await runPath('/corpus/live_caller.temenc', { ...x2, inst: true, winSize: 1 << 17, minter: 1 << 20 });
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = th.value === 4000n && jt.value === 1136n && io.value === 8n && out === 'tick\n'.repeat(8) &&
+      r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
+      fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n;
+    set('x2', ok ? 'pass' : 'fail',
+      `x2: threads ${th.value} (want 4000) across ${th.started} Workers · jit ${jt.value} (want 1136) · ` +
+      `io ${io.value} (want 8), stdout ${JSON.stringify(out)} · on-ramp exit ${r.exit} (want 7), letters ` +
+      `${letters}, total ${total} (want 8060) · migrated fiber ${fb.value} (want 13) · thread trap ` +
+      `${JSON.stringify(ct)} (want DivByZero) · ` +
+      fibers.map((f) => `${f.name} ${f.got}${f.ok ? '' : ` (want ${f.want})`}`).join(' · ') +
+      ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
+      `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`x2 → threads ${th.value} across ${th.started} Workers in ${ms}ms`);
+  } catch (e) {
+    set('x2', 'fail', `x2: error ${e}`);
+  }
+
   // --- 6) wasm-JIT tier: Temen IR compiled to wasm, run in-browser (BROWSER.md wasm-JIT slice 2/3c) --
   // The `alu` compute kernel is emitted to a wasm module by the cdylib (`temen_wasmjit_compile`),
   // instantiated against the page's OWN linear memory, and its `f0` called directly on the page

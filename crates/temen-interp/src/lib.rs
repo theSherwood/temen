@@ -23297,6 +23297,9 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
+    /// #1414 B6 — how the parallel driver starts this run's threads and reads its clock
+    /// ([`Host::set_thread_platform`]); the OS's unless an embedder hands it another.
+    thread_platform: bytecode::ThreadPlatform,
     /// #1768 — the caller-request arm of an engine that serves its personality's `fork`/`execve`/
     /// blocking `waitpid` **from the `call.cap` thunk** (the JIT's process driver): `None` — this run
     /// does not; `Some(None)` — armed ([`Host::arm_caller_requests`]); `Some(Some(img))` — an admitted
@@ -24045,6 +24048,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
+            thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
             jit_tables: Vec::new(),
@@ -30905,6 +30909,18 @@ impl Host {
     /// The armed external-wake doorbell, if any (see [`Host::arm_external_wake`]).
     pub(crate) fn external_wake(&self) -> Option<Arc<(Mutex<u64>, Condvar)>> {
         self.external_wake.clone()
+    }
+
+    /// #1414 B6 — hand this host's run the way it starts threads and reads the clock on the parallel
+    /// driver, in place of the OS's ([`bytecode::ThreadPlatform::OS`]). A browser does: it starts a
+    /// thread as a Web Worker, and wasm32 has no clock of its own.
+    pub fn set_thread_platform(&mut self, platform: bytecode::ThreadPlatform) {
+        self.thread_platform = platform;
+    }
+
+    /// How the parallel driver starts this run's threads and reads its clock.
+    pub(crate) fn thread_platform(&self) -> bytecode::ThreadPlatform {
+        self.thread_platform
     }
 
     pub(crate) fn wire_park_door(&self) {

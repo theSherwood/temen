@@ -119,6 +119,9 @@ self.onmessage = async (e) => {
           webgpu_op: () => -1n,
           // No page-defined powerbox in a snapshot worker (`web/powerbox.js` runs on the main thread).
           js_cap_call: () => -38n,
+          // No parallel-driver run here (#1414 B6): a refused `x2_spawn` ends one with `ThreadFault`.
+          x2_spawn: () => -1,
+          x2_now_ms: () => performance.timeOrigin + performance.now(),
           // The live-stdout tee (`temen_run_onramp_stream`): while a streaming Run is active, `chunkSink`
           // relays each write to the main thread; the worker's run stays synchronous, so the main thread
           // paints the chunks as they arrive (a Worker's postMessage delivers even while it computes).

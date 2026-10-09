@@ -23,11 +23,16 @@ export function engineImports(memory) {
   // dispatched to the function the page bound to that slot. Delegated to the same `globalThis` hook
   // the playground uses (`web/par.js`), so a harness that imports `powerbox.js` drives the real seam;
   // with no servicer installed a call is -ENOSYS, exactly as the engine documents.
+  // `x2_spawn`/`x2_now_ms` are the parallel driver's platform (#1414 B6), which starts each thread
+  // of a run as a Worker. A harness starts none: a refused `x2_spawn` ends such a run with
+  // `ThreadFault`.
   const imports = {
     temen_host: {
       ...foreign,
       webgpu_op: () => -1n,
       stdout_chunk: () => {},
+      x2_spawn: () => -1,
+      x2_now_ms: () => performance.timeOrigin + performance.now(),
       js_cap_call: (slot, op, argsPtr, nArgs, mem) => {
         const h = globalThis.__temen_js_cap_call;
         return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;

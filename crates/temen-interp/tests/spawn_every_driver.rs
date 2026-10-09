@@ -1805,27 +1805,9 @@ fn a_refusal_notes_the_import_nothing_satisfied() {
 }
 
 /// The root joins a thread that waits, with no timeout, on a word nothing will write: every task is
-/// parked and nothing can wake one, so the run is deadlocked and ends with `ThreadFault` (#1638).
-const JOIN_A_FOREVER_WAITER: &str = "memory 18
-func () -> (i64) {
-block 0 () {
-  vz = i64.const 0
-  va = i64.const 131072
-  vchild = thread.spawn 1 vz va
-  vst = thread.join vchild
-  return vst
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, va: i64) {
-  vexp = i32.const 0
-  vto = i64.const -1
-  vst = i32.atomic.wait va vexp vto
-  vst64 = i64.extend_i32_u vst
-  return vst64
-  }
-}
-";
+/// parked and nothing can wake one, so the run is deadlocked and ends with `ThreadFault` (#1638). A
+/// fixture, so the browser runs it too.
+const JOIN_A_FOREVER_WAITER: &str = include_str!("fixtures/join_a_forever_waiter.temt");
 
 /// #1652 — a deadlock ends the run with `ThreadFault`: on the oracle and the pump at their idle
 /// point, and on the parallel driver when its last running task parks. The debugger stops `Blocked`
@@ -1844,61 +1826,23 @@ fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
     );
 }
 
-/// The root spawns a serving child through a v1 record (paid from the `Budget` its second argument
-/// names), mints a live-callee offer over it (`child_offer`), and calls `add(40, 2)` through it. The
-/// call parks the root until the child's `svc.wait` serves it; the child returns how many calls it
-/// served, which the root joins: `1 * 100 + 42`.
-fn live_caller() -> String {
-    format!(
-        "memory 17
-type 0 func (i64, i64) -> (i64)
-type 1 interface {{ add: 0 }}
-export 0 interface \"adder\" 1 {{ add: 2 }}
-
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32) {{
-  vrb = i64.const 17628
-  i32.store vrb v1
-  vrp = i64.const 17600
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  v6 = i64.const 0
-  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
-  va = i64.const 40
-  vb = i64.const 2
-  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  vk = i64.const 100
-  vm = i64.mul vj vk
-  vs = i64.add vm vr
-  return vs
-  }}
-}}
-
-func (i64) -> (i64) {{
-block 0 (v0: i64) {{
-  vz = i32.const 0
-  vn = svc.wait vz
-  return vn
-  }}
-}}
-
-func (i64, i64) -> (i64) {{
-block 0 (va: i64, vb: i64) {{
-  vs = i64.add va vb
-  return vs
-  }}
-}}
-{rec}",
-        rec = rec::segment(17600, &SpawnRec::v1(1)),
-    )
-}
+/// The root spawns a serving child through a v1 record of its own module (`SpawnRec::v1(1)` at
+/// 17600, paid from the `Budget` its second argument names), mints a live-callee offer over it
+/// (`child_offer`), and calls `add(40, 2)` through it. The call parks the root until the child's
+/// `svc.wait` serves it; the child returns how many calls it served, which the root joins:
+/// `1 * 100 + 42`. A fixture, so the browser runs it too.
+const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 
 /// #744 — a live call to a serving child parks the caller until the child serves it, on every
 /// driver that serves its children: the oracle, the pump, and the parallel driver, whose root and
 /// child run on their own threads. (The debug scheduler and `Vcpu` decline the module.)
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
-    let m = module(&live_caller());
+    assert!(
+        LIVE_CALLER.contains(&rec::segment(17600, &SpawnRec::v1(1))),
+        "the fixture's spawn record is a v1 record of its own module"
+    );
+    let m = module(LIVE_CALLER);
     let setup = || {
         let mut h = Host::new();
         h.set_self_module(&std::sync::Arc::new(m.clone()));

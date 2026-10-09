@@ -392,6 +392,13 @@ property, so in practice:
   The `4c-host` / `4c-domain` follow-ons this left open (`call.cap` under a shared `Host`; §14/§22
   domain-mutating events) have since landed — see their checked entries above.
 
+  *Next (#1414 B6):* the native parallel driver, executor 2, runs in the browser too. The page hands
+  it a thread platform (`Host::set_thread_platform`): each thread of a run is a Worker the page
+  starts, running a boxed closure out of the one shared memory (`temen_x2_thread`), and the clock is
+  `performance.timeOrigin + performance.now()`. The whole run is one in-Rust call on the root's Worker
+  (`temen_x2_start`) under the same recipes, and `par.js`'s `x2` option picks it. It runs interpreted
+  for now; once it runs the emitted tier (B6-3) it replaces the per-Worker `Vcpu` driver (B6-4).
+
 ### Known wrinkles — all resolved in `4c-wasm`
 
 - **Main thread can't `atomic.wait`** (it traps in browsers) — *resolved*: every vCPU (including the

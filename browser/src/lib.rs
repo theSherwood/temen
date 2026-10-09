@@ -1399,6 +1399,33 @@ fn par_inst() -> Option<&'static ParInstCfg> {
     unsafe { p.as_ref() }
 }
 
+/// The §14 recipe's root powerbox for a run of `module`: an `Instantiator` over `[0, win_size)`,
+/// the granted module and a `WindowMinter` budget when the recipe has them, and the root's args
+/// (their handles, in that order).
+fn par_inst_powerbox(
+    cfg: &ParInstCfg,
+    module: &std::sync::Arc<temen_ir::Module>,
+) -> (Host, Vec<Value>) {
+    let mut host = Host::new();
+    host.set_self_module(module); // a record's `module = -1`
+    let inst = host.grant_instantiator(0, cfg.win_size);
+    let mut args = vec![Value::I32(inst)];
+    if let Some(m) = &cfg.module {
+        args.push(Value::I32(host.grant_module(m)));
+    }
+    if cfg.minter_quota > 0 {
+        args.push(Value::I32(host.grant_budget(
+            -1,
+            cfg.minter_quota as i64,
+            -1,
+        )));
+    }
+    // #2219: a root that spawns copies of itself finds its child image as `"child"`, as under the
+    // reference powerboxes. Granted after the positional handles, so they keep their values.
+    host.grant_child_image();
+    (host, args)
+}
+
 // ---- §14 instantiate_module **real codegen** (BROWSER.md § "wasm-JIT tier", slice 5) -------------
 // A detached child of the granted module whose entry is in-subset runs it on **emitted wasm** on its
 // own Worker, bound to its own `WebAssembly.Memory` (the module "compiles on push"), instead of the
@@ -2099,24 +2126,8 @@ pub extern "C" fn temen_par_root(
     // no args. Signatures unchanged either way — the JS host just calls the matching
     // `temen_par_powerbox*` first.
     if let Some(cfg) = par_inst() {
-        let mut host = Host::new();
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-        host.set_self_module(unsafe { prog_ref(prog) }.module()); // a record's `module = -1`, its image
-        let inst = host.grant_instantiator(0, cfg.win_size);
-        let mut args = vec![Value::I32(inst)];
-        if let Some(m) = &cfg.module {
-            args.push(Value::I32(host.grant_module(m)));
-        }
-        if cfg.minter_quota > 0 {
-            args.push(Value::I32(host.grant_budget(
-                -1,
-                (cfg.minter_quota) as i64,
-                -1,
-            )));
-        }
-        // #2219: a root that spawns copies of itself finds its child image as `"child"`, as under
-        // the reference powerboxes. Granted after the positional handles, so they keep their values.
-        host.grant_child_image();
+        let (host, args) = par_inst_powerbox(cfg, unsafe { prog_ref(prog) }.module());
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
             unsafe { prog_ref(prog) },
@@ -2934,6 +2945,135 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
         drop(unsafe { Box::from_raw(v) });
         par_vcpu_retire(); // the live-cap admit from this vCPU's constructor
     }
+}
+
+// ---- #1414 B6: the parallel driver across Workers --------------------------------------------------
+// The native parallel driver (executor 2: a thread per task over the pump's scheduling core) runs a
+// guest whole, in-Rust, from one call, given a way to start a thread and read a clock. Here a thread
+// is a Web Worker the page starts, running a boxed closure out of the one shared memory, and the
+// clock is the page's. The page never blocks, so the run itself starts on a Worker too. Interpreted
+// runs only: a task's emitted tier is #1414 B6-3.
+
+// The two imports the parallel driver's platform needs (`X2_PLATFORM`). (Plain `//`: rustdoc rejects
+// `///` on an extern block.)
+// - `x2_spawn(start)`: ask the page to start a Worker that runs `temen_x2_thread(start)`. 0 when the
+//   request is posted; nonzero when this agent cannot start Workers.
+// - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
+//   alike (`performance.timeOrigin + performance.now()`).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[link(wasm_import_module = "temen_host")]
+extern "C" {
+    fn x2_spawn(start: *mut core::ffi::c_void) -> i32;
+    fn x2_now_ms() -> f64;
+}
+
+/// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+type X2Thread = Box<dyn FnOnce() + Send>;
+
+/// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, and the
+/// page's clock.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+const X2_PLATFORM: bytecode::ThreadPlatform = bytecode::ThreadPlatform {
+    spawn: |f| {
+        let start = Box::into_raw(Box::new(f));
+        // SAFETY: on success the page hands `start` to exactly one Worker, which takes it back.
+        if unsafe { x2_spawn(start.cast()) } == 0 {
+            return Ok(());
+        }
+        // SAFETY: no Worker will run it, so it is still ours.
+        drop(unsafe { Box::from_raw(start) });
+        Err(std::io::Error::other("this agent cannot start a Worker"))
+    },
+    // SAFETY: a pure import.
+    now_ns: || (unsafe { x2_now_ms() } * 1e6) as u64,
+};
+
+/// Run the parallel-driver thread the page started this Worker for: `start` is what `x2_spawn`
+/// passed it. The Worker is the thread's alone, and closes once the thread returns.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
+    par_install_panic_capture(); // I22: a panic on this thread names its FILE:LINE
+                                 // SAFETY: `start` came from `X2_PLATFORM.spawn`, and the page handed it to this Worker alone.
+    let f = unsafe { Box::from_raw(start) };
+    f()
+}
+
+/// Run the guest at `[guest_ptr, guest_len)` on the parallel driver from this Worker, each of its
+/// threads on a Worker of its own. It runs under the published recipe's powerbox, as the per-Worker
+/// driver's root would: the shared I/O or on-ramp host ([`temen_par_powerbox_io`],
+/// [`temen_par_powerbox_onramp`]), the §14 root's ([`temen_par_powerbox_inst`]), the §22 host with
+/// its compiled unit ([`temen_par_powerbox`]), or none ([`temen_par_powerbox_none`]). An I/O host
+/// goes back where it was afterwards, so [`temen_par_stdout_len`] reads the run's output. The
+/// runtime-compile recipe ([`temen_par_powerbox_jit_runtime`]) is refused ([`STATUS_UNSUPPORTED`]):
+/// its unit blobs are staged into a window the page allocates, and this run's is the driver's own.
+///
+/// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
+/// tell the rest, as for [`temen_run_onramp`].
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_start(guest_ptr: *const u8, guest_len: usize) -> i64 {
+    use std::sync::atomic::Ordering;
+    par_install_panic_capture();
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[guest_ptr, guest_len)` is a live allocation it just filled.
+    let bytes = unsafe { host_slice(guest_ptr, guest_len) };
+    let Ok(m) = temen_encode::decode_module(bytes) else {
+        set(STATUS_DECODE_ERR);
+        return 0;
+    };
+    if PAR_JIT.load(Ordering::Acquire) != 0 {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
+    let m = std::sync::Arc::new(m);
+    let io = par_io();
+    let (mut host, args, init) = if let Some(io) = io {
+        (
+            std::mem::take(&mut *io.host.lock().unwrap_or_else(|e| e.into_inner())),
+            io.out.map(Value::I32).into_iter().collect(),
+            io.init.clone(),
+        )
+    } else if let Some(cfg) = par_inst() {
+        let (host, args) = par_inst_powerbox(cfg, &m);
+        (host, args, Vec::new())
+    } else {
+        match PAR_PB.swap(0, Ordering::AcqRel) {
+            0 => (Host::new(), Vec::new(), Vec::new()),
+            pb => {
+                // SAFETY: published by `temen_par_powerbox` and taken out of `PAR_PB` above, so
+                // this run owns it: no Worker of another run reads it.
+                let pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
+                (
+                    pb.host,
+                    vec![Value::I32(pb.jit), Value::I32(pb.code)],
+                    Vec::new(),
+                )
+            }
+        }
+    };
+    host.set_thread_platform(X2_PLATFORM);
+    let mut fuel = DEFAULT_FUEL;
+    let ran = bytecode::compile_and_run_capture_over_parallel_with_host(
+        &m, 0, &args, &mut fuel, &init, None, &mut host,
+    );
+    if let Some(io) = io {
+        *io.host.lock().unwrap_or_else(|e| e.into_inner()) = host;
+    }
+    let (status, value, exit_code, trap) = match ran.map(|(r, _)| r) {
+        None => (STATUS_UNSUPPORTED, 0, 0, None),
+        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code, None),
+        Some(Err(t)) => (STATUS_TRAP, 0, 0, Some(t)),
+        Some(Ok(vals)) => (STATUS_OK, first_i64(&vals), 0, None),
+    };
+    set(status);
+    // SAFETY: one run at a time per engine; the page reads these after the run, through this Worker.
+    unsafe {
+        EXIT_CODE = exit_code;
+        LAST_TRAP = trap.as_ref().map_or("", Trap::name);
+    }
+    value
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------

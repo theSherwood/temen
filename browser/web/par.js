@@ -66,6 +66,10 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
         const h = globalThis.__temen_stdout_chunk;
         if (h) h(new Uint8Array(memory.buffer, Number(ptr), Number(len)).slice());
       },
+      // The parallel driver's platform (#1414 B6): it runs on a Worker (`worker.js`), never on the
+      // page, which cannot block — so the page starts no thread of its own.
+      x2_spawn: () => -1,
+      x2_now_ms: () => performance.timeOrigin + performance.now(),
     },
   };
   const { exports: ex } = await WebAssembly.instantiate(module, importObj);
@@ -91,6 +95,10 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               an `exit(code)` from any vCPU ends the run with `exit` = code;
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
+//   `x2`      ⇒ run on the **parallel driver** (executor 2, #1414 B6) instead of a `Vcpu` per Worker:
+//               the whole run is one in-Rust call on the root's Worker, each of its threads a Worker
+//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, none). It runs
+//               interpreted, so it takes none of the emitted-tier options;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
 //   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
@@ -100,7 +108,10 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], x2 = false } = {}) {
+    if (x2 && (jitCodegen || instCodegen || tierup || jitB2 || jitRuntime || jitRuntimeCodegen)) {
+      throw new Error('the parallel driver runs interpreted: no emitted-tier options (#1414 B6-3)');
+    }
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
@@ -141,8 +152,9 @@ export function makeRunner({ module, memory, ex }) {
       if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length) !== 1) throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module)');
     }
     if (!jit && !jitCodegen && !io && !onramp && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
-    const prog = (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
-    if (prog === 0) throw new Error('module unsupported on the parallel driver (temen_par_compile null)');
+    // The parallel driver compiles the guest itself, on the root's Worker.
+    const prog = x2 ? 0 : (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
+    if (!x2 && prog === 0) throw new Error('module unsupported on the per-Worker driver (temen_par_compile null)');
     const win = ex.temen_par_alloc(winSize);
     for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
     // §14 real-codegen (`instCodegen`) publishes the same recipe as `inst`; each confined child whose
@@ -165,6 +177,12 @@ export function makeRunner({ module, memory, ex }) {
     const tierupCell = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? ex.temen_par_alloc(4) : 0;
 
     const workers = new Set();
+    // A parallel-driver thread's Worker closes itself once its thread is out of the engine, and the
+    // page leaves it be: the thread counts itself out of the run before it is done in the engine (it
+    // still drops what it held). Chromium stops a terminated Worker that is still running about two
+    // seconds later, wherever it is, and one stopped inside the engine's allocator holds its lock for
+    // good. Only a stop tears these down too, as the note on `signal` above says.
+    const x2threads = new Set();
     let started = 0;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
@@ -175,10 +193,13 @@ export function makeRunner({ module, memory, ex }) {
         const startVcpu = (cfg) => {
           started++;
           const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-          workers.add(w);
+          (cfg.role === 'x2thread' ? x2threads : workers).add(w);
           w.onmessage = (e) => {
             const m = e.data;
-            if (m.kind === 'spawn') {
+            if (m.kind === 'x2spawn') {
+              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own.
+              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase });
+            } else if (m.kind === 'spawn') {
               // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
               // child's message carries its own win/winSize — the carve; a detached child's carries its
               // own `childMem`, a shared Memory that transfers by reference — overriding the run defaults).
@@ -201,12 +222,13 @@ export function makeRunner({ module, memory, ex }) {
         const rootSlot = ex.temen_par_alloc(SLOT);
         const rootStackTop = ex.temen_par_alloc(STACK) + STACK;
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-        startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
+        startVcpu({ role: x2 ? 'x2root' : 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, exit, started, tierups };
     } finally {
       for (const w of workers) w.terminate();
+      if (signal && signal.aborted) for (const w of x2threads) w.terminate();
     }
   };
 }
