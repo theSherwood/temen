@@ -58,17 +58,19 @@ async function main() {
   // forever. So the run after one takes a fresh engine (`loadEngine(prev)`: a new memory over the
   // compiled module). Not every run: each engine's memory holds a large address-space reservation
   // until the page collects it, and a page of quick runs runs out of them. A run returns its engine,
-  // for reading its output back.
+  // for reading its output back. `tierupFloor` sets the tier-up size floor (#1026), which is the
+  // engine's, so a run that sets it takes an engine of its own.
   let cur = eng;
-  const run = async (guest, opts) => {
-    const own = cur;
+  const run = async (guest, { tierupFloor, ...opts } = {}) => {
+    const own = tierupFloor === undefined ? cur : await loadEngine(eng);
+    if (tierupFloor !== undefined) own.ex.temen_coop_set_tierup_floor(tierupFloor);
     let returned = false;
     try {
       const r = await makeRunner(own)(guest, opts);
       returned = r.value !== null;
       return { ...r, eng: own };
     } finally {
-      if (!returned) cur = await loadEngine(eng);
+      if (!returned && own === cur) cur = await loadEngine(eng);
     }
   };
   const runPath = async (guestPath, opts = {}) => {
@@ -176,9 +178,11 @@ async function main() {
     const sv = await runPath('/corpus/live_caller.temenc', { ...x2, inst: true, unitPath: '/corpus/live_caller_child.temenc', winSize: 1 << 17, minter: 1 << 20 });
     // #1414 B6-3: each thread runs its task's tier-ups on its own Worker — the `tierup` kernel's 8
     // workers each call the emitted leaf once. Then a root that returns while its thread counts
-    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns.
-    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true });
-    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true });
+    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns. The
+    // regions are the coop driver's emit (B6-3b-4), whose size floor (#1026) would keep these small
+    // leaves interpreted: the harness lowers it on these runs' engines, as coop's own tests do.
+    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
     // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
     // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's
