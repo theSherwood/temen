@@ -54,7 +54,7 @@ try {
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  const WORK_IDS = ['powerbox', 'threads', 'jit', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
+  const WORK_IDS = ['powerbox', 'threads', 'jit', 'capio', 'x2', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
 
   // One load, no retry: the page's old flake (#1996, a Worker handed the engine memory with a stale
@@ -79,6 +79,7 @@ try {
   const threads = await read('threads');
   const jit = await read('jit');
   const capio = await read('capio');
+  const x2 = await read('x2');
   const wasmjit = await read('wasmjit');
   const tierup = await read('tierup');
   const jitcodegen = await read('jitcodegen');
@@ -91,7 +92,7 @@ try {
 
   const pageOk = isolated.status === 'true' && powerbox.status === 'pass' &&
     threads.status === 'pass' && jit.status === 'pass' &&
-    capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
+    capio.status === 'pass' && x2.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
     jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
     instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
     instthreads.status === 'pass';
@@ -101,6 +102,7 @@ try {
   console.log(`  ${threads.text}`);
   console.log(`  ${jit.text}`);
   console.log(`  ${capio.text}`);
+  console.log(`  ${x2.text}`);
   console.log(`  ${wasmjit.text}`);
   console.log(`  ${tierup.text}`);
   console.log(`  ${jitcodegen.text}`);
@@ -403,7 +405,8 @@ try {
   console.log(`${ok ? 'PASS' : 'FAIL'}: Temen runs in a real browser — powerbox + genuine multi-Worker ` +
     `parallelism (incl. §22 guest-JIT on a shared Domain, §14 detached children on their ` +
     `own Workers, and 4d host I/O from worker vCPUs through one shared powerbox) over a shared ` +
-    `WebAssembly.Memory under cross-origin isolation — plus the playground (Temen text parsed ` +
+    `WebAssembly.Memory under cross-origin isolation, on the per-Worker driver and on the parallel ` +
+    `driver (a whole run in-Rust, each of its threads a Worker) — plus the playground (Temen text parsed ` +
     `in-browser via temen_parse, run across Workers in every powerbox mode) and the wasm-JIT tier ` +
     `(Temen IR compiled to wasm in-browser, f0 called directly, matching the interpreter) — including ` +
     `per-Worker JIT tier-up (a threaded guest's compute leaves run on emitted wasm on their own ` +

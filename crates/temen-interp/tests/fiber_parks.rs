@@ -18,50 +18,7 @@ use temen_interp::{run_with_host, Host, OffloadOutcome, StreamRole, Value};
 /// waiter — the fiber), and the third resume runs the fiber to completion with the wait's
 /// `WAIT_WOKEN` (0) status as its return. Composite: s1*100_000 + s2*10_000 + woken*1_000 +
 /// s3*100 + value = 3*100_000 + 3*10_000 + 1*1_000 + 1*100 + 0 = 331_100.
-const FUTEX_FIBER_PARK: &str = r#"
-memory 16 shadow 16448 65536
-func () -> (i64) {
-block 0 () {
-  v0 = ref.func 1
-  v1 = i64.const 0
-  v2 = cont.new v0 v1
-  v3 = i64.const 0
-  vs1, vv1 = cont.resume v2 v3
-  vs2, vv2 = cont.resume v2 v3
-  vaddr = i64.const 16384
-  vcnt = i32.const 1
-  vw = atomic.notify vaddr vcnt
-  vs3, vv3 = cont.resume v2 v3
-  vk1 = i64.const 100000
-  vs1e = i64.extend_i32_s vs1
-  va = i64.mul vs1e vk1
-  vk2 = i64.const 10000
-  vs2e = i64.extend_i32_s vs2
-  vb = i64.mul vs2e vk2
-  vk3 = i64.const 1000
-  vwe = i64.extend_i32_s vw
-  vc = i64.mul vwe vk3
-  vk4 = i64.const 100
-  vs3e = i64.extend_i32_s vs3
-  vd = i64.mul vs3e vk4
-  vab = i64.add va vb
-  vcd = i64.add vc vd
-  vabcd = i64.add vab vcd
-  vr = i64.add vabcd vv3
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 16384
-  vexp = i32.const 0
-  vto = i64.const -1
-  vst = i32.atomic.wait vaddr vexp vto
-  vst64 = i64.extend_i32_s vst
-  return vst64
-  }
-}
-"#;
+const FUTEX_FIBER_PARK: &str = include_str!("fixtures/fiber_park_futex.temt");
 
 #[test]
 fn a_fiber_futex_park_parks_the_fiber_not_the_vcpu() {
@@ -137,41 +94,7 @@ fn the_root_revokes_a_read_its_own_fiber_is_parked_in() {
 /// waits, so the register-then-recheck wakes it immediately — the resumer sees one
 /// `FIBER_PARKED` (the transient set-aside), and the next resume completes the wait with
 /// `WAIT_NOT_EQUAL` (1). Composite: 3*10_000 + 1*100 + 1 = 30_101.
-const NOT_EQUAL_INSTA_WAKE: &str = r#"
-memory 16 shadow 16448 65536
-func () -> (i64) {
-block 0 () {
-  vaddr = i64.const 16392
-  vfive = i64.const 5
-  i64.store vaddr vfive
-  vf = ref.func 1
-  vsp = i64.const 0
-  vk = cont.new vf vsp
-  vz = i64.const 0
-  vs1, vv1 = cont.resume vk vz
-  vs2, vv2 = cont.resume vk vz
-  vk1 = i64.const 10000
-  vs1e = i64.extend_i32_s vs1
-  va = i64.mul vs1e vk1
-  vk2 = i64.const 100
-  vs2e = i64.extend_i32_s vs2
-  vb = i64.mul vs2e vk2
-  vab = i64.add va vb
-  vr = i64.add vab vv2
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 16392
-  vexp = i32.const 0
-  vto = i64.const -1
-  vst = i32.atomic.wait vaddr vexp vto
-  vst64 = i64.extend_i32_s vst
-  return vst64
-  }
-}
-"#;
+const NOT_EQUAL_INSTA_WAKE: &str = include_str!("fixtures/fiber_park_not_equal.temt");
 
 #[test]
 fn a_prechanged_cell_wakes_the_parking_fiber_immediately() {
@@ -193,42 +116,7 @@ fn a_prechanged_cell_wakes_the_parking_fiber_immediately() {
 /// the fiber with `WAIT_TIMED_OUT` (2) delivered as the wait's result. Composite: s1*10_000 +
 /// s2*100 + v2 = 3*10_000 + 1*100 + 2 = 30_102. The cross-backend pinning (and the poll-fires-
 /// the-deadline rule) lives in `temen/tests/fiber_timed_wait.rs`.
-const TIMED_WAIT_TIMES_OUT: &str = r#"
-memory 16 shadow 16448 65536
-func () -> (i64) {
-block 0 () {
-  v0 = ref.func 1
-  v1 = i64.const 0
-  v2 = cont.new v0 v1
-  v3 = i64.const 0
-  vs1, vv1 = cont.resume v2 v3
-  va = i64.const 16392
-  ve = i32.const 0
-  vt = i64.const 100000000
-  vw = i32.atomic.wait va ve vt
-  vs2, vv2 = cont.resume v2 v3
-  vk1 = i64.const 10000
-  vs1e = i64.extend_i32_s vs1
-  vp1 = i64.mul vs1e vk1
-  vk2 = i64.const 100
-  vs2e = i64.extend_i32_s vs2
-  vp2 = i64.mul vs2e vk2
-  vp = i64.add vp1 vp2
-  vr = i64.add vp vv2
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 16384
-  vexp = i32.const 0
-  vto = i64.const 10000000
-  vst = i32.atomic.wait vaddr vexp vto
-  vst64 = i64.extend_i32_s vst
-  return vst64
-  }
-}
-"#;
+const TIMED_WAIT_TIMES_OUT: &str = include_str!("fixtures/fiber_park_timed_wait.temt");
 
 #[test]
 fn a_timed_fiber_wait_fires_its_deadline_and_completes() {
@@ -249,37 +137,7 @@ fn a_timed_fiber_wait_fires_its_deadline_and_completes() {
 /// touchpoints, so this pins that a poll of a still-blocked fiber whose deadline has passed
 /// completes the wait right there (rather than starving until a worker idles — the regression's
 /// tree-walker leg). Result: the fiber's `WAIT_TIMED_OUT` status (2).
-const POLL_LOOP_TIMES_OUT: &str = r#"
-memory 16 shadow 16448 65536
-func () -> (i64) {
-block 0 () {
-  v0 = ref.func 1
-  v1 = i64.const 0
-  v2 = cont.new v0 v1
-  br 1(v2)
-}
-block 1 (vk: i64) {
-  vz = i64.const 0
-  vs, vv = cont.resume vk vz
-  vone = i32.const 1
-  vdone = i32.eq vs vone
-  br_if vdone 2(vv) 1(vk)
-}
-block 2 (vr: i64) {
-  return vr
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 16384
-  vexp = i32.const 0
-  vto = i64.const 10000000
-  vst = i32.atomic.wait vaddr vexp vto
-  vst64 = i64.extend_i32_s vst
-  return vst64
-  }
-}
-"#;
+const POLL_LOOP_TIMES_OUT: &str = include_str!("fixtures/fiber_park_poll_loop.temt");
 
 #[test]
 fn a_resume_poll_loop_observes_the_passed_deadline() {
@@ -300,57 +158,12 @@ fn a_resume_poll_loop_observes_the_passed_deadline() {
 /// A fiber parks on a word on the root; the root spawns a thread that notifies the word and resumes
 /// the fiber itself, so it continues on another vCPU. The thread returns `woken * 100 + status * 10
 /// + value`, the root `first status * 1000 + that`: 3*1000 + 1*100 + 1*10 + 0 = 3110.
-const PARK_THEN_MIGRATE: &str = r#"
-memory 16 shadow 16448 65536
-func () -> (i64) {
-block 0 () {
-  v0 = ref.func 1
-  vz = i64.const 0
-  vk = cont.new v0 vz
-  vs1, vv1 = cont.resume vk vz
-  vt = thread.spawn 2 vz vk
-  vr = thread.join vt
-  vk1 = i64.const 1000
-  vs1e = i64.extend_i32_s vs1
-  va = i64.mul vs1e vk1
-  vres = i64.add va vr
-  return vres
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  vaddr = i64.const 16384
-  vexp = i32.const 0
-  vto = i64.const -1
-  vst = i32.atomic.wait vaddr vexp vto
-  vst64 = i64.extend_i32_s vst
-  return vst64
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, vk: i64) {
-  vaddr = i64.const 16384
-  vcnt = i32.const 1
-  vw = atomic.notify vaddr vcnt
-  vz = i64.const 0
-  vs, vv = cont.resume vk vz
-  vk100 = i64.const 100
-  vwe = i64.extend_i32_s vw
-  va = i64.mul vwe vk100
-  vk10 = i64.const 10
-  vse = i64.extend_i32_s vs
-  vb = i64.mul vse vk10
-  vab = i64.add va vb
-  vr = i64.add vab vv
-  return vr
-  }
-}
-"#;
+const PARK_THEN_MIGRATE: &str = include_str!("fixtures/fiber_park_then_migrate.temt");
 
 /// #2215 — the fiber park routing above on every driver that has it: a wait inside a fiber parks
 /// the fiber and its thread runs on, and a notify from that thread or another, the park-time
 /// recheck, the idle timer and a poll past the deadline each wake it. `Vcpu` still parks the whole
-/// thread there.
+/// thread there. The guests are fixtures, so the browser runs them on its parallel driver too.
 #[test]
 fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
     const DRIVERS: [Driver; 4] = [

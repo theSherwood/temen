@@ -33,7 +33,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime, tierupPaged, childMem, ticket } = e.data;
+    jitB2, jitRuntime, tierupPaged, childMem, ticket, start } = e.data;
   // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
   // _inst_codegen, temen_par_child*), where the shared-memory races have bitten: a double-free in the
@@ -50,9 +50,43 @@ self.onmessage = async (e) => {
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
   // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n } }));
+  // The parallel driver's platform (#1414 B6, `X2_PLATFORM` in lib.rs): each thread of its run is a
+  // Worker the page starts on `x2spawn`, with a stack and TLS block of its own allocated here, and
+  // its clock is one every Worker reads alike.
+  const x2_spawn = (threadStart) => {
+    const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
+    const stackTop = ex.temen_par_alloc(STACK) + STACK;
+    const tlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+    self.postMessage({ kind: 'x2spawn', start: threadStart, stackTop, tlsBase });
+    return 0;
+  };
+  const x2_now_ms = () => performance.timeOrigin + performance.now();
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
+  // #1414 B6 — the parallel driver: its run is one in-Rust call on the root's Worker, and each of its
+  // threads a call on a Worker of its own (`x2_spawn` above). The root reports as a root vCPU does.
+  if (role === 'x2root') {
+    const value = ex.temen_x2_start(gptr, glen);
+    const status = ex.temen_status(); // lib.rs STATUS_*: 0 ok · 3 trap · 5 exit
+    if (status === 0) {
+      self.postMessage({ kind: 'done', value: value.toString() });
+    } else if (status === 5) {
+      self.postMessage({ kind: 'exit', code: ex.temen_exit_code() });
+    } else if (status === 3) {
+      const p = ex.temen_trap_ptr(), n = ex.temen_trap_len();
+      const name = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n));
+      self.postMessage({ kind: 'trap', why: `guest trap: ${name}` });
+    } else {
+      self.postMessage({ kind: 'fail', why: `the parallel driver did not run the guest (status ${status})` });
+    }
+    return;
+  }
+  if (role === 'x2thread') {
+    ex.temen_x2_thread(start);
+    self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do
+    return;
+  }
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
   // mid-run (any Worker's in-wasm allocation — e.g. a §14 module compile+push), and views created
   // before a growth don't cover the new region (an Atomics access past the old length throws).
