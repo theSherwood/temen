@@ -1482,11 +1482,7 @@ fn real_epoll_leaves_report_failure() {
 /// the three epoll leaves above had no provider — so nothing in either module was reachable, pure or
 /// not. Importing them is the whole test: `run_libc_program` pins the manifest to
 /// [`POWERBOX_MANIFEST`], and reaching the `write` proves module-level initialization did not trap on
-/// the way.
-///
-/// This does **not** claim a working thread pool. `initPool()` is an explicit call, not a module
-/// initializer, and a program that makes it gets nim's own `assert gIoFd >= 0` — see the epoll rows
-/// in `COMPUTE_LEAVES` for why that loud failure is the intended outcome.
+/// the way. A pool that runs is [`nimonys_thread_tests_run_on_every_engine`]'s.
 #[test]
 fn real_threadpool_and_parfor_link_and_run() {
     for module in ["threadpool", "parfor"] {
@@ -3545,4 +3541,122 @@ fn a_nim_domain_and_a_c_domain_share_a_ring() {
         matches!(&jit, temen_jit::JitOutcome::Returned(v) if v[..] == [RING_COUNT, 0]),
         "JIT: (sent, wrong at the consumer): {jit:?}"
     );
+}
+
+/// A pool of four workers sums 0..999, one task per number.
+const POOL4: &str = "\
+import std / [atomics, threadpool, syncio]
+
+const NumTasks = 1000
+var total: int
+var done: int
+
+type AddFrame = object of CoroutineBase
+  amount: int
+
+proc addStep(coro: ptr CoroutineBase): Continuation {.nimcall.} =
+  let self = cast[ptr AddFrame](coro)
+  discard atomicFetchAdd(total, self.amount, moRelaxed)
+  discard atomicFetchAdd(done, 1, moRelease)
+  result = Continuation(fn: nil, env: nil)
+
+proc main =
+  initPool(4)
+  for i in 0 ..< NumTasks:
+    let frame = cast[ptr AddFrame](alloc(sizeof(AddFrame)))
+    frame.amount = i
+    submit(Continuation(fn: addStep, env: cast[ptr CoroutineBase](frame)), hint = i)
+  while atomicLoad(done, moAcquire) < NumTasks:
+    discard
+  shutdownPool()
+  echo \"workers: \", workerCount, \" sum: \", atomicLoad(total, moRelaxed)
+
+main()
+";
+
+/// nimony's own thread tests (`tests/nimony/threads/`), each against the output it records, on the
+/// tree-walker, the bytecode engine and the JIT. #2202's acceptance for threads: they start and join
+/// threads (`threads1`), keep each thread's `{.threadvar.}`s its own whether read by name or address
+/// (`tthreadlocals`), hand a thread's heap to the next one and free across threads (`tallocpool`,
+/// `tallochandoffrace`, `tforeignfree`), drop shared references concurrently (`tconcurrentdecref`),
+/// and run `std/threadpool` and `std/parfor` (`tpool1`, `tparfor`, `tparfib`, and [`POOL4`]'s four
+/// workers). The I/O-ring tests and `tpoolaffinity` (it narrows its own CPU affinity) are not here:
+/// the sandbox serves neither.
+///
+/// They link as the playground links a program, over the compute shim alone. Under the POSIX
+/// personality `nanosleep` parks for real, and the bytecode engine's logical clock does not move a
+/// timed wait on while another thread stays runnable, so `tpool1`'s spinning main starves its napping
+/// worker there (#2224).
+#[test]
+fn nimonys_thread_tests_run_on_every_engine() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+        return;
+    };
+    let dir = std::path::Path::new("../../nimony/tests/nimony/threads");
+    // Ample for any of them, so a regression that spins forever fails in minutes rather than hangs.
+    let mut cfg = temen_run::RunConfig::default();
+    cfg.limits.fuel = Some(1 << 34);
+    let mut failures = Vec::new();
+    let nimonys = [
+        "threads1",
+        "tthreadlocals",
+        "tallocpool",
+        "tallochandoffrace",
+        "tforeignfree",
+        "tconcurrentdecref",
+        "tpool1",
+        "tparfor",
+        "tparfib",
+    ]
+    .map(|name| {
+        let file = |ext: &str| std::fs::read_to_string(dir.join(format!("{name}.{ext}")));
+        (
+            name,
+            file("nim").expect("test source"),
+            file("output").expect("its output"),
+        )
+    });
+    // Theirs size the pool from the CPU count, which the sandbox does not report, so they get one
+    // worker; this one asks for four.
+    let pool4 = (
+        "pool4",
+        POOL4.to_string(),
+        "workers: 4 sum: 499500\n".to_string(),
+    );
+    for (name, src, want) in nimonys.into_iter().chain([pool4]) {
+        let mods = compile_to_leng(&path, &src);
+        let units: Vec<temen_leng::WholeModule> = mods
+            .iter()
+            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+            .collect();
+        let m = temen_leng::link_nim_powerbox(&units, Some(&libc))
+            .unwrap_or_else(|e| panic!("{name}: link: {e}"));
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("{name}: verify: {e:?}"));
+        for backend in [
+            temen_run::Backend::TreeWalk,
+            temen_run::Backend::Bytecode,
+            temen_run::Backend::Jit,
+        ] {
+            let started = std::time::Instant::now();
+            let run = temen_run::instantiate(m.clone())
+                .expect("instantiates")
+                .run(backend, &cfg);
+            eprintln!("  {name} on {backend:?}: {:?}", started.elapsed());
+            match run {
+                Ok(r) if String::from_utf8_lossy(&r.stdout).trim_end() == want.trim_end() => {}
+                Ok(r) => failures.push(format!(
+                    "{name} on {backend:?}: {:?}, printed {}",
+                    r.outcome,
+                    elide(&String::from_utf8_lossy(&r.stdout))
+                )),
+                Err(e) => failures.push(format!("{name} on {backend:?}: {e}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

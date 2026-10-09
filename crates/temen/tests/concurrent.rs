@@ -422,3 +422,90 @@ fn exhaustive_finds_known_race() {
         report.outcomes
     );
 }
+
+/// **A spinning barrier wider than the worker pool completes** (#2202). One more vCPU than the real
+/// executor has workers (the host's parallelism) each arrives at a barrier and spins until all have.
+/// Before the pool had a preemption quantum a vCPU kept its worker until it parked, so the spinners
+/// held every worker and the last one never ran. Now each yields after its quantum and the last one
+/// gets a turn. The fuel bound turns a regression into a failure instead of a hang. Layout:
+/// `mem[16384]` i64 arrivals, `mem[16400+4i]` i32 handle of `i`; the result is the sum of the joins,
+/// one per vCPU.
+#[test]
+fn a_spinning_barrier_wider_than_the_worker_pool_completes() {
+    let n = std::thread::available_parallelism()
+        .map_or(1, |p| p.get())
+        .min(32)
+        + 1;
+    let src = format!(
+        r#"
+memory 16
+func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 0
+  br 1(v0)
+}}
+block 1 (v1: i64) {{
+  v2 = i64.const {n}
+  v3 = i64.lt_u v1 v2
+  br_if v3 2(v1) 3()
+}}
+block 2 (v1: i64) {{
+  v2 = i64.const 0
+  v3 = thread.spawn 1 v2 v1
+  v4 = i64.const 4
+  v5 = i64.mul v1 v4
+  v6 = i64.const 16400
+  v7 = i64.add v6 v5
+  i32.store v7 v3
+  v8 = i64.const 1
+  v9 = i64.add v1 v8
+  br 1(v9)
+}}
+block 3 () {{
+  v0 = i64.const 0
+  br 4(v0, v0)
+}}
+block 4 (v0: i64, v1: i64) {{
+  v2 = i64.const {n}
+  v3 = i64.lt_u v0 v2
+  br_if v3 5(v0, v1) 6(v1)
+}}
+block 5 (v0: i64, v1: i64) {{
+  v2 = i64.const 4
+  v3 = i64.mul v0 v2
+  v4 = i64.const 16400
+  v5 = i64.add v4 v3
+  v6 = i32.load v5
+  v7 = thread.join v6
+  v8 = i64.add v1 v7
+  v9 = i64.const 1
+  v10 = i64.add v0 v9
+  br 4(v10, v8)
+}}
+block 6 (v0: i64) {{
+  return v0
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, v0: i64) {{
+  v1 = i64.const 16384
+  v2 = i64.const 1
+  v3 = i64.atomic.rmw.add v1 v2
+  br 1()
+}}
+block 1 () {{
+  v0 = i64.const 16384
+  v1 = i64.atomic.load v0
+  v2 = i64.const {n}
+  v3 = i64.lt_u v1 v2
+  br_if v3 1() 2()
+}}
+block 2 () {{
+  v0 = i64.const 1
+  return v0
+}}
+}}
+"#
+    );
+    stress(&src, n as i64, 3);
+}

@@ -5135,6 +5135,21 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// host parallelism. Workers are spawned **lazily** — a single-threaded guest never creates any.
 const MAX_WORKERS: usize = 32;
 
+/// How many ops a vCPU in an unbounded lane runs on a worker before it yields it to the next
+/// runnable vCPU: the real pool's preemption quantum. Without it a vCPU kept its worker until it
+/// parked, so guest threads that spin on each other livelocked once they outnumbered the workers:
+/// the spinners held every worker, and the thread they waited for never ran (#2202, nimony's
+/// `tallocpool` on four workers). A vCPU in a bounded lane is not preempted (see [`dispatch`]).
+///
+/// Its size is the price of one preemption at a bad moment: a thread that spins on one that lost
+/// its worker (a lock holder, or the next in a fair ticket lock's queue) burns up to a quantum
+/// before that thread runs again. Measured on nimony's thread pool, five vCPUs on two workers:
+/// `1 << 20` ran it in 0.16 s or 35 s depending on where preemptions landed, `1 << 16` in 3.3 s
+/// every time. A vCPU running alone yields too, and the round trip costs nothing measurable: a
+/// 20M-iteration loop took ~1 s at `u64::MAX`, `1 << 20` and `1 << 16` alike. The bytecode
+/// engine's cooperative quantum is a separate knob, sized for its deterministic interleaving.
+const POOL_QUANTUM: u64 = 1 << 16;
+
 /// A task identifier (a spawned vCPU). Distinct from the per-vCPU join *handle* (an index into the
 /// spawner's child table); the executor keys results/waiters by `TaskId`.
 type TaskId = u64;
@@ -5412,8 +5427,8 @@ enum Pending {
 enum Step {
     Done(Result<Vec<Value>, Trap>),
     Park(Blocked),
-    /// Ran out its scheduling quantum mid-execution (deterministic-explorer preemption); re-enqueue
-    /// and continue later. The real executor uses an unbounded quantum and never yields.
+    /// Ran out its scheduling quantum mid-execution; re-enqueue and continue later. The real pool's
+    /// quantum is [`POOL_QUANTUM`], the deterministic explorer's a small seeded one.
     Yield,
     /// **Debug pause** (DEBUGGING.md W2/S4): a breakpoint/step hit, before the op at this [`IrPc`].
     /// Only produced when an [`Inspector`] drives the vCPU; the [`VCpu`] continuation is intact, so
@@ -7985,9 +8000,9 @@ fn pipe_park_check(host: &Arc<Mutex<Host>>, pipe: u32, write: bool) -> (bool, u3
 /// The **park gate** (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24): a vCPU
 /// reaching a park safepoint after its domain — or the whole run — was torn down is reaped here
 /// instead of parking into the dead world (teardown is non-preemptive, so the sweep could not
-/// touch it while it ran; the park arms are exactly the "next safepoint"). Checked under the same
-/// lock as the park insert, so a teardown can never slip between the check and the park. Returns
-/// the vCPU back when its world is still alive.
+/// touch it while it ran; the park arms and the quantum's `Yield` are exactly the "next safepoint").
+/// Checked under the same lock as the park insert, so a teardown can never slip between the check
+/// and the park. Returns the vCPU back when its world is still alive.
 /// The pipe and `waitpid` park arms' half of [`Host::park_must_wake`]: a kill or a deliverable
 /// signal that landed before this park was filed wakes it here exactly as the sweep would have —
 /// the host's EINTR flag, and a re-admit whose rewound op re-executes (and the per-op poll traps a
@@ -8669,7 +8684,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 m.durable_set_sp(root_word, v.root_shadow_sp);
             }
         }
-        let step = v.run(u64::MAX);
+        // Only an unbounded vCPU is preempted: the pool's size is a cap the guest never asked for,
+        // and the quantum keeps it invisible, as the OS keeps the core count invisible to the JIT's
+        // threads. Inside a bounded lane a vCPU runs to its next park, as on the JIT, where a lane is
+        // held from resume to park; a yield would hand its lane to a sibling mid-body.
+        let step = v.run(if bounded { u64::MAX } else { POOL_QUANTUM });
         // D66 — the lanes are held exactly while the vCPU is on the worker: release them before any
         // routing below (a parked or finished task holds none), and re-admit everything that was
         // waiting on a lane — each re-checks at its own dispatch.
@@ -9665,8 +9684,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
             }
             Step::Yield => {
-                // Unreachable for the real pool (quantum is `u64::MAX`), but re-enqueue for safety.
+                // It spent its quantum: to the back of the queue, so every runnable vCPU gets a
+                // worker in turn. The quantum's end is a safepoint (DESIGN.md §12), so it goes
+                // through the park gate: a vCPU whose run or domain ended while it ran stops here.
+                // Without the gate, a sibling spinning when the root returned was re-queued forever.
                 let mut s = sched.lock();
+                let Some(v) = park_gate(&mut s, v) else {
+                    sched.work.notify_all();
+                    return;
+                };
                 s.runnable.push_back(v);
                 sched.work.notify_one();
             }
@@ -12528,9 +12554,9 @@ impl VCpu {
         }
     }
 
-    /// Run for up to `quantum` instructions, then finish / park / yield. The real executor passes
-    /// `u64::MAX` (run to completion or park); the deterministic explorer passes a small seeded
-    /// quantum to interleave vCPUs finely. Folds a trap into `Step::Done(Err)`.
+    /// Run for up to `quantum` instructions, then finish / park / yield. The real pool passes
+    /// [`POOL_QUANTUM`]; the deterministic explorer passes a small seeded quantum to interleave vCPUs
+    /// finely, and a debugger `u64::MAX`. Folds a trap into `Step::Done(Err)`.
     fn run(&mut self, quantum: u64) -> Step {
         match run_inner(self, quantum) {
             Ok(Inner::Done(v)) => Step::Done(Ok(v)),
@@ -13121,7 +13147,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
     let arena = v.arena();
-    let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
+    let mut budget = quantum; // instructions left before a forced `Yield`
                               // A timed `svc.wait`'s deadline fired (I38): consumed by the rewound serve arm below, which
                               // returns its count instead of re-parking. Only ever set in the same `run_inner` call that
                               // re-executes the arm (the pending is taken at resume, the rewound op runs first).
@@ -13861,9 +13887,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // `memop` mode (so thread-local computation runs to the next memory op before a yield is
             // possible — the partial-order reduction that keeps exhaustive exploration tractable).
             let visible = !memop || is_visible(&block.insts[frames[top].inst]);
-            // Deterministic-explorer preemption: yield at an instruction boundary (state consistent;
-            // `inst` not yet advanced) when the quantum is spent. The real pool passes `u64::MAX`, so
-            // it never yields. **This precedes the debug seam below**: a debug stop (breakpoint /
+            // Preemption: yield at an instruction boundary (state consistent; `inst` not yet
+            // advanced) when the quantum is spent. **This precedes the debug seam below**: a debug stop (breakpoint /
             // watch / step) at a budget-exhausted visible op must fire at the *start of its own turn*
             // (budget fresh, on the next pick), not inside the previous turn — otherwise a stop would
             // run the op in the prior turn, collapsing two one-visible-op turns into one and desyncing

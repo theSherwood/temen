@@ -9687,7 +9687,10 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
 /// cost), so `fiber_rt::make_fiber` refunds that prologue's charge.
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
-/// by the host from another thread, so a plain (non-atomic) load/store is correct — and cheaper; (2)
+/// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper. A
+/// domain's vCPUs share the cell, so their plain stores race and their charge is approximate; after
+/// a refill the check charges from the allowance it granted, so a sibling's stale `0` in `left` is
+/// never read as a spent chain; (2)
 /// the store of `fuel-1` back to the same address it just loaded creates a store⇒load dependency that
 /// stops Cranelift's alias analysis from treating the load as loop-invariant and hoisting it out (the
 /// reason `emit_epoch_check` needs an *atomic* load to achieve the same). Trap when the loaded value
@@ -9725,7 +9728,11 @@ fn emit_fuel_check(b: &mut FunctionBuilder, lower: &Lower) {
         .ins()
         .load(I64, MemFlags::trusted(), addr, crate::fuel::REFILL_OFF);
     b.ins().call_indirect(sig, refill, &[addr]);
-    let drawn = b.ins().load(I64, MemFlags::trusted(), addr, 0);
+    // What the refill granted, not a reload of `left`: a sibling vCPU's plain store may have put a
+    // stale `0` there since (see `fuel_refill`).
+    let drawn = b
+        .ins()
+        .load(I64, MemFlags::trusted(), addr, crate::fuel::GRANTED_OFF);
     b.ins()
         .brif(drawn, cont, &[BlockArg::from(drawn)], trap_blk, &[]);
     b.switch_to_block(trap_blk);
