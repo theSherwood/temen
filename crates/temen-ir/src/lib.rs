@@ -2538,9 +2538,10 @@ pub enum Inst {
     /// execution point*, so after a fiber migrates between vCPUs (D57: any vCPU may resume any
     /// resumable fiber) `get` returns the *new* vCPU's word — the correct per-CPU value, which the
     /// guest cannot otherwise name (the `thread.spawn` handle is the parent's view, not "which vCPU am
-    /// I on now"). Seeded at vCPU creation to a **dense id** (root = 0, children sequential in spawn
-    /// order), so before any `set` it doubles as a `vcpu.id`; the guest may overwrite it (e.g. a
-    /// pointer to its per-CPU block) for full thread-local storage. Authority-neutral, ambient (the
+    /// I on now"). Seeded at vCPU creation to a **dense id** within its domain (the domain's root = 0,
+    /// its threads sequential in spawn order; a §14 child's root is 0 again), so before any `set` it
+    /// doubles as a `vcpu.id`; the guest may overwrite it (e.g. a pointer to its per-CPU block) for
+    /// full thread-local storage. Authority-neutral, ambient (the
     /// `cap.self`/`gc.roots` family). Result is `i64`. (Determinism: program *output* must not depend
     /// on *which* vCPU runs you, only on per-CPU state being self-consistent — GC.md §3.2.)
     VcpuTlsGet,
