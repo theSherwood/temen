@@ -2295,6 +2295,13 @@ fn main() {
     let mem = Host::new().grant_powerbox_prefix(1 << 17)[3];
     emit("threads_paged", &threads_paged(mem, false));
     emit("threads_paged_trap", &threads_paged(mem, true));
+    // #1414 B6-3b-4c — a collecting guest whose regions spill: each of its 5 tasks' emitted leaf
+    // pushes the words it holds across its call to the collector to its thread's spill stack, and the
+    // collector counts them (55). The native suite runs the same fixture (`thread_platform.rs`).
+    emit(
+        "threads_gc_spill",
+        include_str!("../../crates/temen-interp/tests/fixtures/threads_gc_spill.temt"),
+    );
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);

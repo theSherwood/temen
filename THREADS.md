@@ -407,8 +407,9 @@ property, so in practice:
   `call.dyn` reaches what any thread installed (B6-3b). Regions and units are the coop driver's
   emit (`coop_emit_for` and its unit emitter): the run is of the module that emit outlined, and
   units mask against the run's window and table. A paged emit checks each access against its
-  thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A guest
-  whose emit spills keeps its regions interpreted until each thread keeps a spill stack (B6-3b-4c).
+  thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A spilling
+  emit pushes its frames' live words to its thread's spill stack, and a `gc.roots` in a bounce scans
+  them with the task beneath (B6-3b-4c).
   Detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
   driver (B6-4).
 

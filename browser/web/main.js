@@ -177,6 +177,9 @@ async function main() {
     const paged = { ...x2, onramp: true, tierup: true, tierupFloor: 0 };
     const pg = await runPath('/corpus/threads_paged.temenc', paged);
     const pgt = await runPath('/corpus/threads_paged_trap.temenc', paged).then(() => 'no trap', (e) => e.message);
+    // #1414 B6-3b-4c: a collecting guest. Each of its 5 tasks' emitted leaf pushes the words it holds
+    // across its call to the collector to its thread's spill stack, and the collector counts them.
+    const gs = await runPath('/corpus/threads_gc_spill.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
     // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
     // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's
@@ -194,6 +197,7 @@ async function main() {
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
       pg.value === 35n && pg.tierups === 5 && pgt.includes('MemoryFault') &&
+      gs.value === 55n && gs.tierups === 5 &&
       jc32.value === 1136n && jc32.tierups > 0 && jc64.value === 1136n && jc64.tierups > 0 &&
       jr.value === 56n && jr.tierups > 0 && jb.value === 56n && jb.tierups > 0;
     set('x2', ok ? 'pass' : 'fail',
@@ -207,6 +211,7 @@ async function main() {
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
       `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt)} ` +
       `(want MemoryFault) · ` +
+      `collector over spilled words ${gs.value} (want 55), ${gs.tierups} regions (want 5) · ` +
       `§22 units on emitted wasm: host's i32 ${jc32.value}/${jc32.tierups}, f64 ${jc64.value}/${jc64.tierups} ` +
       `(want 1136), runtime ${jr.value}/${jr.tierups}, B2 ${jb.value}/${jb.tierups} (want 56) ` +
       `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);

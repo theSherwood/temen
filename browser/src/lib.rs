@@ -3036,15 +3036,17 @@ fn x2_keep(bytes: Option<std::sync::Arc<[u8]>>) -> usize {
 
 /// The emitted code's call back into the interpreter (`env.call_interp`): function `target`, with
 /// its arguments at `args_ptr` (the call scratch, `XCALL_MAX_SLOTS` i64s) and its results written
-/// back there, over the running call's task. `0` on success; `1` when it trapped.
+/// back there, over the running call's task. `spill_len` is how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`temen_x2_spill_ptr`]). `0` on success; `1` when it
+/// trapped.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8, spill_len: usize) -> i32 {
     // SAFETY: the emitted code passes its env cell's call scratch, `XCALL_MAX_SLOTS` i64s wide.
     let io = unsafe {
         core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
     };
-    match x2_call(|c| (c.bounce)(target, io)) {
+    match x2_call(|c| (c.bounce)(target, io, spill_len)) {
         Some(Ok(_)) => 0,
         Some(Err(t)) => {
             X2_BOUNCE_TRAP.with(|c| c.set(Some(t)));
@@ -3139,6 +3141,24 @@ pub extern "C" fn temen_x2_mapped_now() -> u64 {
 #[no_mangle]
 pub extern "C" fn temen_x2_paged() -> i32 {
     x2_call(|c| c.pagestate().is_some() as i32).unwrap_or(0)
+}
+
+/// The base of the running thread's spill stack ([`bytecode::EmittedCall::spill`]), which lives as
+/// long as the thread: null when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_ptr() -> *mut u64 {
+    x2_call(|c| c.spill().map(|(base, _)| base))
+        .flatten()
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// The size of the running thread's spill stack in bytes ([`bytecode::EmittedCall::spill`]): `0`
+/// when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_bytes() -> usize {
+    x2_call(|c| c.spill().map_or(0, |(_, words)| words * 8)).unwrap_or(0)
 }
 
 /// The running call's page-state table ([`bytecode::EmittedCall::pagestate`]): what a Worker gives
@@ -3236,17 +3256,18 @@ pub extern "C" fn temen_x2_start(
         .max(win_size.next_power_of_two().trailing_zeros() as u8);
     // With `tierup`, regions run on the coop driver's emit, which outlines the guest's cap calls into
     // the module both tiers then run. A paged emit checks each access against its thread's page-state
-    // table. A spilling emit wants a spill stack per thread, which this driver does not keep yet
-    // (#1414 B6-3b-4c): such a guest's regions interpret.
+    // table, and a spilling one pushes its frames' live words to its thread's spill stack.
     let emit = (tierup != 0)
         .then(|| coop_emit_for(&m, true, win_log2).ok())
-        .flatten()
-        .filter(|e| !e.spill);
+        .flatten();
     let (m, regions) = match emit {
         Some(e) => {
             // A local-table emit leaves the run's table as it is.
             let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
-            (e.m, Some((e.wasm, e.eligible, table_log2, e.paged)))
+            (
+                e.m,
+                Some((e.wasm, e.eligible, table_log2, e.paged, e.spill)),
+            )
         }
         None => (m, None),
     };
@@ -3301,8 +3322,8 @@ pub extern "C" fn temen_x2_start(
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible, table_log2, paged) =
-            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0, false));
+        let (wasm, eligible, table_log2, paged, spill) =
+            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0, false, false));
         // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
         host.set_jit_table_log2(table_log2);
         // The units emit as the coop driver's do, over this run's window and table, or none does
@@ -3325,6 +3346,8 @@ pub extern "C" fn temen_x2_start(
         platform.tier = Some(bytecode::ThreadTier {
             eligible: eligible.into(),
             page_checked: paged,
+            // Each thread's spill stack is the size of the coop run's.
+            spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
             run: x2_run,
         });
     }

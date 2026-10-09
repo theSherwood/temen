@@ -17124,6 +17124,10 @@ pub struct ThreadTier {
     /// ([`TierUpConfig::page_checked`]): each call carries its thread's
     /// ([`EmittedCall::pagestate`]).
     pub page_checked: bool,
+    /// The words of the spill stack each thread keeps for its emitted frames to push their live words
+    /// to (#1627), as the coop driver's spilling emit does; `0` when the emit does not spill. A bounce
+    /// under a tier-up hands the interpreter's `gc.roots` what the frames beneath it pushed.
+    pub spill: usize,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
@@ -17165,6 +17169,7 @@ pub struct EmittedCall<'a> {
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
     pagestate: &'a std::cell::Cell<*const u8>,
+    spill: (*mut u64, usize),
 }
 
 impl EmittedCall<'_> {
@@ -17208,6 +17213,12 @@ impl EmittedCall<'_> {
         let p = self.pagestate.get();
         (!p.is_null()).then_some(p)
     }
+
+    /// The thread's spill stack, `(base, words)`, on a spilling tier (`None` otherwise): it lives
+    /// as long as the thread, and a bounce takes how many words the frames beneath it pushed.
+    pub fn spill(&self) -> Option<(*mut u64, usize)> {
+        (self.spill.1 > 0).then_some(self.spill)
+    }
 }
 
 /// A thread's page-state table for a page-checked emitted tier ([`build_pagestate_table`]), from
@@ -17234,6 +17245,15 @@ impl PageTable {
     }
 }
 
+/// What a thread keeps for its emitted calls: its page-state table, and its spill stack
+/// ([`ThreadTier::spill`]), made at its first emitted call and never moved after, since its emitted
+/// tier keeps the address.
+#[derive(Default)]
+struct TierState {
+    pages: PageTable,
+    spill: Vec<u64>,
+}
+
 /// A §22 invoke the rules surfaced to run on the emitted tier ([`CoopStep::JitInvoke`]): its task's
 /// thread runs it before it steps the task on ([`ThreadRun::invoke`]).
 struct SurfacedInvoke {
@@ -17252,8 +17272,9 @@ type NewTask = (usize, Option<Mem>, Fuel);
 
 /// A call out of emitted code back into the interpreter (`env.call_interp`): function
 /// `target` of the task's dispatch table, its arguments in `io` and its results written back over
-/// them, run over the task's live window and powerbox. Returns how many results it wrote.
-pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
+/// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
+pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -17433,7 +17454,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     // A §22 invoke the rules surfaced at the task's last stop, which the thread runs on the emitted
     // tier before it steps the task on.
     let mut invoke = None;
-    let mut pages = PageTable::default();
+    let mut tier = TierState::default();
     'run: loop {
         loop {
             if g.over.is_some() {
@@ -17451,7 +17472,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         if exec || g.core.tasks[ti].env != env {
             env = g.core.tasks[ti].env;
             (mem, fuel) = g.hand(env);
-            pages = PageTable::default();
+            tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
         let exits = g.core.hooked_twins.len();
@@ -17467,9 +17488,9 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         };
         let stop = match invoke.take() {
             Some(inv) => run
-                .invoke(&mut vm, &mut ctx, &mut pages, inv)
-                .and_then(|()| run.step(&mut vm, env, &mut ctx, &mut pages)),
-            None => run.step(&mut vm, env, &mut ctx, &mut pages),
+                .invoke(&mut vm, &mut ctx, &mut tier, inv)
+                .and_then(|()| run.step(&mut vm, env, &mut ctx, &mut tier)),
+            None => run.step(&mut vm, env, &mut ctx, &mut tier),
         };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
@@ -17519,7 +17540,7 @@ impl ThreadRun {
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
-        pages: &mut PageTable,
+        state: &mut TierState,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
         for _ in 0..TIERUP_LOOK {
@@ -17542,8 +17563,9 @@ impl ThreadRun {
                     // Only a tier arms the eligibility a tier-up needs.
                     let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
                     let target = EmittedTarget::Region(func);
+                    let task = Some(&vm.vt);
                     let vals =
-                        self.emitted(tier, &mut fibers, true, ctx, pages, target, &argv, mapped)?;
+                        self.emitted(tier, &mut fibers, task, ctx, state, target, &argv, mapped)?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
@@ -17564,7 +17586,7 @@ impl ThreadRun {
         &self,
         vm: &mut TaskVm,
         ctx: &mut RunCtx,
-        pages: &mut PageTable,
+        state: &mut TierState,
         inv: SurfacedInvoke,
     ) -> Result<(), Trap> {
         let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
@@ -17577,7 +17599,7 @@ impl ThreadRun {
         };
         let mut cell = fibers.cell();
         let vals = self.emitted(
-            tier, &mut cell, false, ctx, pages, target, &inv.argv, inv.mapped,
+            tier, &mut cell, None, ctx, state, target, &inv.argv, inv.mapped,
         )?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
@@ -17589,18 +17611,20 @@ impl ThreadRun {
 
     /// Run one call on this thread's emitted tier ([`ThreadTier::run`]): `target`, over the task's
     /// window and dispatch table. Its calls back into the interpreter run over the task's live
-    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up
-    /// (`run_level`), as the pump's are, or an invoke's own. On a page-checked tier the call reads
-    /// the thread's page-state table, `pages`, brought up to the task's page map, and is bounded by
-    /// its coverage instead of the reserved size the stop surfaced with (#750).
+    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up,
+    /// as the pump's are, or an invoke's own. A tier-up's `task` is what a `gc.roots` in a bounce
+    /// scans beneath it, with what its emitted frames pushed to the thread's spill stack (#1627),
+    /// as the pump's bounce does. On a page-checked tier the call reads the thread's page-state
+    /// table, brought up to the task's page map, and is bounded by its coverage instead of the
+    /// reserved size the stop surfaced with (#750).
     #[allow(clippy::too_many_arguments)]
     fn emitted(
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        run_level: bool,
+        task: Option<&VTask>,
         ctx: &mut RunCtx,
-        pages: &mut PageTable,
+        state: &mut TierState,
         target: EmittedTarget<'_>,
         argv: &[i64],
         mapped: u64,
@@ -17614,18 +17638,31 @@ impl ThreadRun {
             HostCell::Shared(h) => *h,
             HostCell::Excl(_) => return Err(Trap::Malformed),
         };
+        let TierState { pages, spill } = state;
+        if spill.is_empty() {
+            spill.resize(tier.spill, 0);
+        }
         let paged = tier.page_checked && ctx.mem.is_some();
         let (mapped, at) = match ctx.mem.as_ref().filter(|_| paged) {
             Some(m) => (pages.sync(m), pages.table.as_ptr()),
             None => (mapped, std::ptr::null()),
         };
+        let spilled = (spill.as_mut_ptr(), spill.len());
         let now = std::cell::Cell::new(mapped);
         let pagestate = std::cell::Cell::new(at);
         let RunCtx {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
-        let mut bounce = |target: u32, io: &mut [i64]| {
+        let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
+            // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
+            // scan that cannot see the emitted frames' words would miss roots.
+            let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
+            let beneath = task.zip(words).map(|(vt, words)| {
+                let mut b = Beneath::task(vt, FiberRegRef::Owned(&[]));
+                b.words.push(words);
+                b
+            });
             let ran = coop_bounce(
                 &self.dom.source,
                 table,
@@ -17633,10 +17670,10 @@ impl ThreadRun {
                 mem,
                 &mut HostCell::Shared(host),
                 fibers,
-                run_level.then_some(BounceRunCtx { park: None }),
+                task.map(|_| BounceRunCtx { park: None }),
                 target,
                 io,
-                None,
+                beneath.as_ref(),
             );
             // The bounce may have grown the window or moved its page map, which the emitted code
             // reads again after it.
@@ -17661,6 +17698,7 @@ impl ThreadRun {
             host,
             now: &now,
             pagestate: &pagestate,
+            spill: spilled,
         };
         (tier.run)(&mut call).map(|()| call.results)
     }
