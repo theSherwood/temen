@@ -72,6 +72,288 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
   && typeof WebAssembly.promising === 'function';
 
+// The **emitted tier** one host thread runs emitted code with (#1414 B6-3b): the shared dispatch table
+// that code calls through (Model B2, #880), what fills it — the run's region emit, installed §22 units,
+// and bounce shims for slots whose function stays on the interpreter — the globals every live
+// instance shares, the env cell, the bounce back into the interpreter, and how a trap in emitted code
+// is named. The coop driver keeps one for its run. `x` reads the run it serves:
+// - `tableLog2()`, `nfuncs()`: the table's size, and its natural prefix (the program's functions);
+// - `tableGen()`, `slotUnit(slot)`: the table's generation, and the `(domain, unit)` installed at a
+//   slot (a BigInt; negative for none);
+// - `slotUnitBytes(slot)`, `shimBytes(slot)`: the emitted wasm of a slot's installed unit, and a
+//   slot's bounce shim, each `null` when there is none;
+// - `callInterp(target, argsPtr, spillLen)`: one bounce into the interpreter (`0` returned, `1`
+//   trapped, `2` parked: #1896);
+// - `paged()`, `mapped()`, `mappedNow()`, `pagestatePtr()`, `winPtr()`: the window as emitted code
+//   sees it — whether it is page-checked, the event's extent (a paged run's table coverage), the
+//   extent now, the page-state table, and the base;
+// - `deliverFaultAddr(addr)`: where a memory fault in emitted code faulted;
+// - `spillBytes()`, `spillPtr()`: the spill stack a collecting guest's frames push to (#1627).
+// Everything here is synchronous but `syncTable` and `unitFor`, which the coop driver awaits at its
+// event boundaries.
+export function emittedTier(ex, memory, x) {
+  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
+  const fuelGlobals = [];
+  const pagestateGlobals = []; // #1009 paged: the "pagestate" base globals (only a paged main module has one)
+  // #1312: every live instance's "win" — the live window BASE. A coop run's window backing grows on
+  // a guest `vm_map`, and growing it reallocates, so the base can move mid-run. The emitted entry
+  // publishes its own `win` argument here, so this set only has to be written when the base actually
+  // changed: after a bounce that may have grown the window (below). Every emitted function reloads
+  // its `win` local from this global after each call, so the write takes effect immediately.
+  const winGlobals = [];
+  const register = (exports) => {
+    if (exports.mapped) mappedGlobals.push(exports.mapped);
+    if (exports.fuel) fuelGlobals.push(exports.fuel);
+    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
+    if (exports.win) winGlobals.push(exports.win);
+  };
+  // #846/#880 — the shared driver table (Model B2): the region emit and every §22 unit
+  // `call_indirect` through it, and the host populates its slots from the run's dispatch table (an
+  // installed unit's emitted `f0`, an emitted program function's `f{i}`, or a bounce shim for an
+  // interpreter-resident target). `env.call_interp` bounces a cross-tier helper back through the
+  // live-state bounce (routed to the tiering-up task's env), then fans the fresh "mapped" extent out
+  // to every live instance. A non-shimmable guest reports `table_log2 == 0` (a 1-slot table) and
+  // emits in local-table mode, so the shared table is inert for it.
+  const tsize = 1 << x.tableLog2();
+  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
+  const envBytes = ex.temen_wasmjit_env_bytes();
+  const envCell = Number(ex.temen_alloc(envBytes));
+  // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
+  // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
+  const spillBytes = x.spillBytes();
+  const spillBase = spillBytes ? Number(x.spillPtr()) : 0;
+  const spillOff = ex.temen_wasmjit_spill_sp_off();
+  const faultOff = ex.temen_wasmjit_fault_off();
+  // #1822 — the code the running emitted frames last passed to `env.trap` before aborting (a memory
+  // fault, spent fuel, a spill overflow), handed to the trap deliver so the guest sees that trap. Each
+  // event's entry resets it (`armEnv`); `0` — no `env.trap` — is a native wasm trap (`nativeTrap`).
+  let lastTrap = 0;
+  const recordTrap = (code) => { lastTrap = code; };
+  const armEnv = () => {
+    lastTrap = 0;
+    const dv = new DataView(memory.buffer);
+    dv.setBigInt64(envCell, 1n << 61n, true);
+    if (spillBase) {
+      dv.setUint32(envCell + spillOff, spillBase, true);
+      dv.setUint32(envCell + spillOff + 4, spillBase + spillBytes, true);
+    }
+  };
+  const bounce = (target, argsPtr) => {
+    // #1627: a spilling run hands the bounce the words its emitted frames pushed, `[base, cursor)`.
+    const spillLen = spillBase
+      ? (new DataView(memory.buffer).getUint32(envCell + spillOff, true) - spillBase) / 8
+      : 0;
+    return x.callInterp(target, argsPtr, spillLen);
+  };
+  // The region emit's exports, whose `f{i}` fill the table's natural prefix (`setProgram`).
+  let program = {};
+  // #1009: rebuild the table only when the run's dispatch table changed (a §22 install/uninstall
+  // moves its generation) — a card that never installs syncs the table once, not per tier-up.
+  let syncedGen = -1;
+  // What a bounce's return fans out to the live instances — and a parked call's (#1896).
+  const afterBounce = (rc) => {
+    // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
+    // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the table moved
+    // mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale or
+    // empty slot. Rebuild synchronously, before the globals fan-out below primes any instance this
+    // creates (a word unit is tiny; one over the sync compile budget gets a bounce shim now and its
+    // emitted unit at the next event-boundary sync).
+    if (rc === 0 && x.tableGen() !== syncedGen) syncTableSync();
+    // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
+    // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
+    if (x.paged()) {
+      const cover = x.mapped();
+      for (const g of mappedGlobals) g.value = cover;
+      const ps = Number(x.pagestatePtr());
+      for (const g of pagestateGlobals) g.value = ps;
+    } else {
+      const now = x.mappedNow();
+      for (const g of mappedGlobals) g.value = now;
+    }
+    // #1312: the bounce ran interpreted guest code, which may have `vm_map`-grown the window. A
+    // grow reallocates the backing and can MOVE it, so publish the current base to every live
+    // instance — the emitted frame reloads its `win` from this global on return from the bounce.
+    // Read it fresh here (never cached): this is the one point in the run where it can change.
+    const base = Number(x.winPtr());
+    for (const g of winGlobals) g.value = base;
+  };
+  const callInterp = (target, argsPtr) => {
+    const rc = bounce(target, argsPtr);
+    afterBounce(rc);
+    if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
+  };
+  const imports = (call_interp = callInterp, trap = recordTrap) => ({ env: {
+    memory,
+    __indirect_function_table: table,
+    trap,
+    call_interp,
+  } });
+  // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
+  // wording is the engine's, not the spec's, so only messages that say exactly one of the
+  // interpreter's traps are named; any other stays unnamed (`0`), as before. ("integer overflow" is
+  // not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
+  // interpreter calls `BadConversion`.)
+  const NATIVE_TRAPS = [
+    [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
+    [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
+    [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
+  ];
+  const nativeTrap = (e) => {
+    if (!(e instanceof WebAssembly.RuntimeError)) return 0;
+    const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
+    return hit ? hit[1] : 0;
+  };
+  // The trap emitted frames ended with (`e`, what they threw): their `env.trap` code, else the native
+  // trap's. A memory fault's guard left its faulting address in the env cell (#2126), which the run
+  // reports as the interpreter would.
+  const trapOf = (e) => {
+    const code = lastTrap || nativeTrap(e);
+    if (code === 8 /* MEMORY_FAULT */) {
+      x.deliverFaultAddr(new DataView(memory.buffer).getBigInt64(envCell + faultOff, true));
+    }
+    return code;
+  };
+  // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
+  // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
+  const jitUnits = new Map();
+  const shims = new Map();
+  const instantiateUnit = async (bytes) => {
+    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), imports());
+    register(inst.exports);
+    return inst.exports;
+  };
+  // #1233: the synchronous twin, for a rebuild inside a bounce (no event boundary to await at). An
+  // instance created mid-event never passes the per-event fuel re-arm — budget it now.
+  const instantiateUnitSync = (bytes) => {
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), imports());
+    register(inst.exports);
+    if (inst.exports.fuel) inst.exports.fuel.value = 1n << 61n;
+    return inst.exports;
+  };
+  const shimFor = async (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const bytes = x.shimBytes(slot);
+      if (bytes === null) return null;
+      f = (await instantiateUnit(bytes))['t'];
+      shims.set(key, f);
+    }
+    return f;
+  };
+  // Bounce shims are under 200 bytes each and a table rebuild instantiates one per interpreter-
+  // resident slot (~200 on the JACL compiler card). Going through the ASYNC compile queue for them is
+  // pathological: V8 can park one such `WebAssembly.instantiate` promise for seconds behind its own
+  // background work on the big emitted module (measured: the SECOND warm-coop run's rebuild took
+  // 6.2 s for 224 shims, one of them 6.15 s, while the first and third took ~50 ms — the playground's
+  // tier-up mode failed its second compile on this). Synchronous instantiation is immune (~25 ms for
+  // all 224) and a shim is far under the main-thread sync-compile budget; a shim that isn't (never
+  // seen) falls back to the async path.
+  const shimForFast = async (slot, code) => {
+    try {
+      return shimForSync(slot, code);
+    } catch {
+      return shimFor(slot, code);
+    }
+  };
+  const shimForSync = (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const bytes = x.shimBytes(slot);
+      if (bytes === null) return null;
+      f = instantiateUnitSync(bytes)['t'];
+      shims.set(key, f);
+    }
+    return f;
+  };
+  // `key`: a surfaced JIT_INVOKE's code handle (a Number — live for that invoke), or an installed
+  // slot's `(domain, unit)` identity (`slotUnit`, a BigInt) — distinct key types, one cache. An
+  // installed slot is never keyed by handle: the guest revokes it right after `install`.
+  // #1378 again, on the unit path: a guest-compiled §22 unit (a JACL macro body: ~1.1 KB) went through
+  // the ASYNC compile queue, and V8 parks that behind its background work on the just-compiled emitted
+  // module — measured 2.9 s / 3.7 s for the tour's two macro invokes on the first two warm-coop runs,
+  // 88 ms on the third. Instantiate synchronously when the unit is under the main-thread sync-compile
+  // budget (a `new WebAssembly.Module` over it throws — then the async path, as before).
+  const unitFor = async (key, bytes) => {
+    let unit = jitUnits.get(key);
+    if (unit === undefined) {
+      try {
+        unit = instantiateUnitSync(bytes);
+      } catch {
+        unit = await instantiateUnit(bytes);
+      }
+      jitUnits.set(key, unit);
+    }
+    return unit;
+  };
+  // Rebuild the shared table from the run's dispatch table whenever its generation moved: at each
+  // event boundary (`syncTable`) and — #1233 — inside `env.call_interp` after a bounce that installed
+  // or uninstalled (`syncTableSync`). A slot in the natural prefix holds the emitted program `f{slot}`
+  // (or a bounce shim if that function stayed interpreted); a slot past it holds an installed unit's
+  // `f0` (fetched by slot, cached by unit identity) or a shim for an interpreter-resident target.
+  const nfuncs = x.nfuncs();
+  const syncTable = async () => {
+    const gen = x.tableGen();
+    if (gen === syncedGen) return;
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = program['f' + slot] ?? await shimForFast(slot, -2);
+      } else {
+        const uid = x.slotUnit(slot);
+        if (uid >= 0n) {
+          const cached = jitUnits.get(uid);
+          if (cached !== undefined) entry = cached['f0'];
+          else {
+            const bytes = x.slotUnitBytes(slot);
+            entry =
+              bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, uid);
+          }
+        }
+      }
+      table.set(slot, entry);
+    }
+    syncedGen = gen;
+  };
+  const syncTableSync = () => {
+    const gen = x.tableGen();
+    if (gen === syncedGen) return;
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = program['f' + slot] ?? shimForSync(slot, -2);
+      } else {
+        const uid = x.slotUnit(slot);
+        if (uid >= 0n) {
+          const cached = jitUnits.get(uid);
+          if (cached !== undefined) entry = cached['f0'];
+          else {
+            const bytes = x.slotUnitBytes(slot);
+            if (bytes !== null) {
+              // Over the sync compile budget ⇒ a shim now; `syncTable` upgrades it at the next event.
+              try { const u = instantiateUnitSync(bytes); jitUnits.set(uid, u); entry = u['f0']; }
+              catch { entry = shimForSync(slot, uid); }
+            } else entry = shimForSync(slot, uid);
+          }
+        }
+      }
+      table.set(slot, entry);
+    }
+    syncedGen = gen;
+  };
+  return {
+    imports, register, mappedGlobals, fuelGlobals, pagestateGlobals, envCell, armEnv, bounce,
+    afterBounce, callInterp, recordTrap, trapOf, unitFor, syncTable,
+    // The region emit's exports, whose `f{i}` fill the table's natural prefix.
+    setProgram: (exports) => {
+      program = exports;
+      register(exports);
+    },
+    free: () => ex.temen_dealloc(envCell, envBytes),
+  };
+}
+
 //
 // `opts` (all optional):
 // - `cacheKey`: a stable identity for the run's region emit, to reuse its compiled Module across runs.
@@ -119,69 +401,39 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   // via temen_coop_tierup_win_ptr(); never cache it across events.
   const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 
-  const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
-  const fuelGlobals = [];
-  const pagestateGlobals = []; // #1009 paged: the "pagestate" base globals (only a paged main module has one)
-  // #1312: every live instance's "win" — the live window BASE. The coop run's window backing grows
-  // on a guest `vm_map`, and growing it reallocates, so the base can move mid-run. The emitted entry
-  // publishes its own `win` argument here, so this set only has to be written when the base actually
-  // changed: after a bounce that may have grown the window (below). Every emitted function reloads
-  // its `win` local from this global after each call, so the write takes effect immediately.
-  const winGlobals = [];
-  const registerGlobals = (exports) => {
-    if (exports.mapped) mappedGlobals.push(exports.mapped);
-    if (exports.fuel) fuelGlobals.push(exports.fuel);
-    if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
-    if (exports.win) winGlobals.push(exports.win);
-  };
-  // #846/#880 on the cooperative path — the shared driver table (Model B2): the main module and every
-  // §22 unit `call_indirect` through it, and the driver populates its slots from the engine's mirror at
-  // each event boundary (an installed unit's emitted `f0`, an emitted program function's `f{i}`, or a
-  // bounce shim for an interpreter-resident target). `env.call_interp` bounces a cross-tier helper back
-  // through the cooperative live-state bounce (routed to the tiering-up task's env), then fans the fresh
-  // "mapped" extent out to every live instance. A non-shimmable guest reports `table_log2 == 0` (a
-  // 1-slot table) and emits in local-table mode, so the shared table is inert for it.
-  const tsize = 1 << ex.temen_coop_table_log2();
-  const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
-  const bounce = (target, argsPtr) => {
-    // #1627: a spilling run hands the bounce the words its emitted frames pushed, `[base, cursor)`.
-    const spillLen = spillBase
-      ? (new DataView(memory.buffer).getUint32(envCell + spillOff, true) - spillBase) / 8
-      : 0;
-    return ex.temen_coop_call_interp(target, argsPtr, spillLen);
-  };
-  // What a bounce's return fans out to the live instances — and a parked call's (#1896).
-  const afterBounce = (rc) => {
-    // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
-    // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the slot mirror
-    // moved mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale
-    // or empty slot. Rebuild synchronously, before the globals fan-out below primes any instance
-    // this creates (a word unit is tiny; one over the sync compile budget gets a bounce shim now and
-    // its emitted unit at the next event-boundary sync).
-    if (rc === 0 && ex.temen_coop_table_gen() !== syncedGen) syncTableSync();
-    // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
-    // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
-    if (ex.temen_coop_paged()) {
-      const cover = ex.temen_coop_mapped();
-      for (const g of mappedGlobals) g.value = cover;
-      const ps = Number(ex.temen_coop_pagestate_ptr());
-      for (const g of pagestateGlobals) g.value = ps;
-    } else {
-      const now = ex.temen_coop_mapped_now();
-      for (const g of mappedGlobals) g.value = now;
-    }
-    // #1312: the bounce ran interpreted guest code, which may have `vm_map`-grown the window. A
-    // grow reallocates the backing and can MOVE it, so publish the current base to every live
-    // instance — the emitted frame reloads its `win` from this global on return from the bounce.
-    // Read it fresh here (never cached): this is the one point in the run where it can change.
-    const base = Number(ex.temen_coop_tierup_win_ptr());
-    for (const g of winGlobals) g.value = base;
-  };
-  const callInterp = (target, argsPtr) => {
-    const rc = bounce(target, argsPtr);
-    afterBounce(rc);
-    if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
-  };
+  const host = emittedTier(ex, memory, {
+    tableLog2: () => ex.temen_coop_table_log2(),
+    nfuncs: () => ex.temen_coop_nfuncs(),
+    tableGen: () => ex.temen_coop_table_gen(),
+    slotUnit: (slot) => ex.temen_coop_slot_unit(slot),
+    // The bytes of the unit installed at `slot` (`null` = interpreter-only), fetched **by slot** —
+    // the guest typically `release`s the code handle right after `install` (the unit stays installed,
+    // only its handle dies), so a by-handle fetch would come back empty and null the slot (#1233).
+    slotUnitBytes: (slot) => {
+      const len = ex.temen_coop_jit_wasm_by_slot_len(slot);
+      if (len === 0) return null;
+      const p = Number(ex.temen_coop_jit_wasm_by_handle_ptr());
+      return u8().slice(p, p + len);
+    },
+    shimBytes: (slot) => {
+      const len = ex.temen_coop_shim_wasm(slot);
+      if (len === 0) return null;
+      return u8().slice(Number(ex.temen_coop_shim_ptr()), Number(ex.temen_coop_shim_ptr()) + len);
+    },
+    callInterp: (target, argsPtr, spillLen) => ex.temen_coop_call_interp(target, argsPtr, spillLen),
+    paged: () => ex.temen_coop_paged(),
+    mapped: () => ex.temen_coop_mapped(),
+    mappedNow: () => ex.temen_coop_mapped_now(),
+    pagestatePtr: () => ex.temen_coop_pagestate_ptr(),
+    winPtr: () => ex.temen_coop_tierup_win_ptr(),
+    deliverFaultAddr: (addr) => ex.temen_coop_deliver_fault_addr(addr),
+    spillBytes: () => ex.temen_coop_spill_bytes(),
+    spillPtr: () => ex.temen_coop_spill_ptr(),
+  });
+  const {
+    mappedGlobals, fuelGlobals, pagestateGlobals, envCell, armEnv, bounce, afterBounce, callInterp,
+    recordTrap, trapOf, unitFor, syncTable,
+  } = host;
   // #1896 — a leaf's `call_interp` under JSPI. A call that parks (`2`) suspends the leaf's frames on
   // the promise returned here, and the driver runs on; `COOP_RUN_RESUME` resolves it once the call
   // has returned, with its results in the call's scratch.
@@ -200,36 +452,6 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       if (rc !== 0) throw new Error('bounce trap');
     })
     : callInterp;
-  // #1822 — the code the running emitted frames last passed to `env.trap` before aborting (a memory
-  // fault, spent fuel, a spill overflow), handed to the trap deliver so the guest sees that trap. Each
-  // event's entry resets it (`armEnv`); `0` — no `env.trap` — is a native wasm trap (`nativeTrap`).
-  let lastTrap = 0;
-  const recordTrap = (code) => { lastTrap = code; };
-  // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
-  // wording is the engine's, not the spec's, so only messages that say exactly one of the
-  // interpreter's traps are named; any other stays unnamed (`0`), as before. ("integer overflow" is
-  // not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
-  // interpreter calls `BadConversion`.)
-  const NATIVE_TRAPS = [
-    [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
-    [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
-    [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
-  ];
-  const nativeTrap = (e) => {
-    if (!(e instanceof WebAssembly.RuntimeError)) return 0;
-    const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
-    return hit ? hit[1] : 0;
-  };
-  // The trap emitted frames ended with (`e`, what they threw): their `env.trap` code, else the native
-  // trap's. A memory fault's guard left its faulting address in the env cell (#2126), which the run
-  // reports as the interpreter would.
-  const trapOf = (e) => {
-    const code = lastTrap || nativeTrap(e);
-    if (code === 8 /* MEMORY_FAULT */) {
-      ex.temen_coop_deliver_fault_addr(new DataView(memory.buffer).getBigInt64(envCell + faultOff, true));
-    }
-    return code;
-  };
   // #1954 — a sliced leaf's budget checkpoint under JSPI. Its emitted code calls `env.trap(OUT_OF_FUEL)`
   // when its fuel counter runs out and aborts only if the counter is still negative afterwards; this
   // import suspends the leaf's frames there, hands over what its calls printed, gives the embedder
@@ -252,12 +474,6 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       for (const g of leafFuelGlobals) g.value = leafFuel;
     })
     : recordTrap;
-  const unitImports = (call_interp = callInterp, trap = recordTrap) => ({ env: {
-    memory,
-    __indirect_function_table: table,
-    trap,
-    call_interp,
-  } });
 
   // The run's own emit (program 0). A nimony build (`temen_nim_open`) emits none of its own: its
   // programs are the leaf images its processes exec (#1896), each instantiated at its first TIERUP —
@@ -275,8 +491,9 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     } else {
       jitCacheStats.hits++;
     }
-    emitted = (await WebAssembly.instantiate(module, unitImports())).exports;
+    emitted = (await WebAssembly.instantiate(module, host.imports())).exports;
   }
+  host.setProgram(emitted);
   // #1954: a program is a leaf image iff the engine emitted one for it — the engine's answer, not a
   // guess from its index (a root leaf is program 0).
   const isLeaf = (m) => ex.temen_coop_leaf_wasm_len(m) > 0;
@@ -304,176 +521,12 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       } else {
         jitCacheStats.hits++;
       }
-      p = (await WebAssembly.instantiate(module, unitImports(leafCallInterp, leafTrap))).exports;
+      p = (await WebAssembly.instantiate(module, host.imports(leafCallInterp, leafTrap))).exports;
       if (sliceLeaves && p.fuel) leafFuelGlobals.push(p.fuel);
-      registerGlobals(p);
+      host.register(p);
       programs.set(m, p);
     }
     return p;
-  };
-  const envCell = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
-  // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
-  // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
-  const spillBytes = ex.temen_coop_spill_bytes();
-  const spillBase = spillBytes ? Number(ex.temen_coop_spill_ptr()) : 0;
-  const spillOff = ex.temen_wasmjit_spill_sp_off();
-  const faultOff = ex.temen_wasmjit_fault_off();
-  const armEnv = () => {
-    lastTrap = 0;
-    const dv = new DataView(memory.buffer);
-    dv.setBigInt64(envCell, 1n << 61n, true);
-    if (spillBase) {
-      dv.setUint32(envCell + spillOff, spillBase, true);
-      dv.setUint32(envCell + spillOff + 4, spillBase + spillBytes, true);
-    }
-  };
-  registerGlobals(emitted);
-  // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
-  // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
-  const jitUnits = new Map();
-  const shims = new Map();
-  const instantiateUnit = async (bytes) => {
-    const inst = await WebAssembly.instantiate(await WebAssembly.compile(bytes), unitImports());
-    registerGlobals(inst.exports);
-    return inst.exports;
-  };
-  // #1233: the synchronous twin, for a rebuild inside a bounce (no event boundary to await at). An
-  // instance created mid-event never passes the per-event fuel re-arm — budget it now.
-  const instantiateUnitSync = (bytes) => {
-    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), unitImports());
-    registerGlobals(inst.exports);
-    if (inst.exports.fuel) inst.exports.fuel.value = 1n << 61n;
-    return inst.exports;
-  };
-  const shimBytes = (slot) => {
-    const len = ex.temen_coop_shim_wasm(slot);
-    if (len === 0) return null;
-    return u8().slice(Number(ex.temen_coop_shim_ptr()), Number(ex.temen_coop_shim_ptr()) + len);
-  };
-  const shimFor = async (slot, code) => {
-    const key = `${slot}#${code}`;
-    let f = shims.get(key);
-    if (f === undefined) {
-      const bytes = shimBytes(slot);
-      if (bytes === null) return null;
-      f = (await instantiateUnit(bytes))['t'];
-      shims.set(key, f);
-    }
-    return f;
-  };
-  // Bounce shims are under 200 bytes each and a table rebuild instantiates one per interpreter-
-  // resident slot (~200 on the JACL compiler card). Going through the ASYNC compile queue for them is
-  // pathological: V8 can park one such `WebAssembly.instantiate` promise for seconds behind its own
-  // background work on the big emitted module (measured: the SECOND warm-coop run's rebuild took
-  // 6.2 s for 224 shims, one of them 6.15 s, while the first and third took ~50 ms — the playground's
-  // tier-up mode failed its second compile on this). Synchronous instantiation is immune (~25 ms for
-  // all 224) and a shim is far under the main-thread sync-compile budget; a shim that isn't (never
-  // seen) falls back to the async path.
-  const shimForFast = async (slot, code) => {
-    try {
-      return shimForSync(slot, code);
-    } catch {
-      return shimFor(slot, code);
-    }
-  };
-  const shimForSync = (slot, code) => {
-    const key = `${slot}#${code}`;
-    let f = shims.get(key);
-    if (f === undefined) {
-      const bytes = shimBytes(slot);
-      if (bytes === null) return null;
-      f = instantiateUnitSync(bytes)['t'];
-      shims.set(key, f);
-    }
-    return f;
-  };
-  // `key`: a surfaced JIT_INVOKE's code handle (a Number — live for that invoke), or an installed
-  // slot's `(domain, unit)` identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one
-  // cache. An installed slot is never keyed by handle: the guest revokes it right after `install`.
-  // #1378 again, on the unit path: a guest-compiled §22 unit (a JACL macro body: ~1.1 KB) went through
-  // the ASYNC compile queue, and V8 parks that behind its background work on the just-compiled emitted
-  // module — measured 2.9 s / 3.7 s for the tour's two macro invokes on the first two warm-coop runs,
-  // 88 ms on the third. Instantiate synchronously when the unit is under the main-thread sync-compile
-  // budget (a `new WebAssembly.Module` over it throws — then the async path, as before).
-  const unitFor = async (key, bytes) => {
-    let unit = jitUnits.get(key);
-    if (unit === undefined) {
-      try {
-        unit = instantiateUnitSync(bytes);
-      } catch {
-        unit = await instantiateUnit(bytes);
-      }
-      jitUnits.set(key, unit);
-    }
-    return unit;
-  };
-  // The bytes of the unit installed at `slot` (`null` = interpreter-only), fetched **by slot** —
-  // the guest typically `release`s the code handle right after `install` (the unit stays installed,
-  // only its handle dies), so a by-handle fetch would come back empty and null the slot (#1233).
-  const slotUnitBytes = (slot) => {
-    const len = ex.temen_coop_jit_wasm_by_slot_len(slot);
-    if (len === 0) return null;
-    const p = Number(ex.temen_coop_jit_wasm_by_handle_ptr());
-    return u8().slice(p, p + len);
-  };
-  // Rebuild the shared table from the engine's slot mirror whenever its generation moved: at each
-  // event boundary (`syncTable`) and — #1233 — inside `env.call_interp` after a bounce that installed
-  // or uninstalled (`syncTableSync`). A slot in the natural prefix holds the emitted program `f{slot}`
-  // (or a bounce shim if that function stayed interpreted); a slot past it holds an installed unit's
-  // `f0` (fetched by slot, cached by unit identity) or a shim for an interpreter-resident target.
-  // Exactly `driveTierupRun`'s `syncTable`, over the `temen_coop_*` accessors.
-  const nfuncs = ex.temen_coop_nfuncs();
-  // #1009: rebuild the table only when the slot mirror changed (a §22 install/uninstall bumps
-  // `temen_coop_table_gen`) — a card that never installs syncs the table once, not per tier-up.
-  let syncedGen = -1;
-  const syncTable = async () => {
-    const gen = ex.temen_coop_table_gen();
-    if (gen === syncedGen) return;
-    for (let slot = 0; slot < tsize; slot++) {
-      let entry = null;
-      if (slot < nfuncs) {
-        entry = emitted['f' + slot] ?? await shimForFast(slot, -2);
-      } else {
-        const uid = ex.temen_coop_slot_unit(slot);
-        if (uid >= 0n) {
-          const cached = jitUnits.get(uid);
-          if (cached !== undefined) entry = cached['f0'];
-          else {
-            const bytes = slotUnitBytes(slot);
-            entry =
-              bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, uid);
-          }
-        }
-      }
-      table.set(slot, entry);
-    }
-    syncedGen = gen;
-  };
-  const syncTableSync = () => {
-    const gen = ex.temen_coop_table_gen();
-    if (gen === syncedGen) return;
-    for (let slot = 0; slot < tsize; slot++) {
-      let entry = null;
-      if (slot < nfuncs) {
-        entry = emitted['f' + slot] ?? shimForSync(slot, -2);
-      } else {
-        const uid = ex.temen_coop_slot_unit(slot);
-        if (uid >= 0n) {
-          const cached = jitUnits.get(uid);
-          if (cached !== undefined) entry = cached['f0'];
-          else {
-            const bytes = slotUnitBytes(slot);
-            if (bytes !== null) {
-              // Over the sync compile budget ⇒ a shim now; `syncTable` upgrades it at the next event.
-              try { const u = instantiateUnitSync(bytes); jitUnits.set(uid, u); entry = u['f0']; }
-              catch { entry = shimForSync(slot, uid); }
-            } else entry = shimForSync(slot, uid);
-          }
-        }
-      }
-      table.set(slot, entry);
-    }
-    syncedGen = gen;
   };
 
   const deliver = (ret) => {
@@ -655,7 +708,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       }
     }
   } finally {
-    ex.temen_dealloc(envCell, ex.temen_wasmjit_env_bytes());
+    host.free();
     ex.temen_coop_close();
   }
   if (stopped) return null;
