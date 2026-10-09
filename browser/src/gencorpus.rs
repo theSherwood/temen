@@ -19,7 +19,7 @@ use temen_durable::{
     init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
     STATE_UNWINDING,
 };
-use temen_interp::{bytecode, Value};
+use temen_interp::{bytecode, Host, Value};
 
 // Three op-family kernels lifted verbatim from `crates/temen/tests/bytecode_diff.rs` (known parseable
 // and engine-supported), plus a divide-by-zero trap kernel.
@@ -1038,6 +1038,60 @@ block 0 (v0: i64) {
 // `75 × 100 + 9 = 7509`; the root sums 8 × 7509 = 60072. Offsets are 16 KiB multiples so they are
 // page-aligned on a 4 KiB (wasm) or 16 KiB host page. `target` on an `Rw` page (16 KiB + 8) passes; on
 // the unmapped page P (`threads_inst_paged_trap_unit`) the child faults on BOTH tiers.
+/// #1414 B6-3b-4b — paged regions on the parallel driver: an on-ramp guest whose `_start` seeds 7 at
+/// 64 KiB, protects that page read-only through the on-ramp's memory capability (`mem`, the handle
+/// the recipe grants it), spawns 4 threads that each read the cell through function 2, joins them,
+/// reads it itself, and returns the sum: 5 × 7 = 35. Function 2 is a leaf each thread runs on its
+/// Worker's emitted wasm, against that thread's page-state table. With `store`, the leaf first stores
+/// to the protected page, and the run traps `MemoryFault`.
+fn threads_paged(mem: i32, store: bool) -> String {
+    let store = if store { "  i64.store v0 v0\n" } else { "" };
+    format!(
+        r#"memory 17
+func () -> (i64) {{
+block 0 () {{
+  vp = i64.const 65536
+  v7 = i64.const 7
+  i64.store vp v7
+  vas = i32.const {mem}
+  vlen = i64.const 16384
+  vro = i32.const 1
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vp, vlen, vro)
+  vz = i64.const 0
+  t0 = thread.spawn 1 vz vz
+  t1 = thread.spawn 1 vz vz
+  t2 = thread.spawn 1 vz vz
+  t3 = thread.spawn 1 vz vz
+  j0 = thread.join t0
+  j1 = thread.join t1
+  j2 = thread.join t2
+  j3 = thread.join t3
+  va = call 2 (vp)
+  s0 = i64.add j0 j1
+  s1 = i64.add j2 j3
+  s2 = i64.add s0 s1
+  vs = i64.add s2 va
+  return vs
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vp = i64.const 65536
+  vl = call 2 (vp)
+  return vl
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{store}  vl = i64.load v0
+  return vl
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
 fn inst_paged_unit(target: u64) -> String {
     format!(
         r#"memory 16
@@ -2236,6 +2290,11 @@ fn main() {
     ] {
         emit(name, src);
     }
+    // #1414 B6-3b-4b — paged regions on the parallel driver (35, and its `MemoryFault` twin). The
+    // on-ramp recipe grants its memory capability fourth in its fixed prefix.
+    let mem = Host::new().grant_powerbox_prefix(1 << 17)[3];
+    emit("threads_paged", &threads_paged(mem, false));
+    emit("threads_paged_trap", &threads_paged(mem, true));
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);

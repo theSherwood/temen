@@ -171,6 +171,12 @@ async function main() {
     // leaves interpreted: the harness lowers it on these runs' engines, as coop's own tests do.
     const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    // #1414 B6-3b-4b: paged regions. An on-ramp guest protects a page read-only, and each of its 5
+    // tasks reads it through the emitted leaf, checked against its thread's page-state table; the
+    // twin's leaf stores there and traps.
+    const paged = { ...x2, onramp: true, tierup: true, tierupFloor: 0 };
+    const pg = await runPath('/corpus/threads_paged.temenc', paged);
+    const pgt = await runPath('/corpus/threads_paged_trap.temenc', paged).then(() => 'no trap', (e) => e.message);
     // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
     // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
     // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's
@@ -187,6 +193,7 @@ async function main() {
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
+      pg.value === 35n && pg.tierups === 5 && pgt.includes('MemoryFault') &&
       jc32.value === 1136n && jc32.tierups > 0 && jc64.value === 1136n && jc64.tierups > 0 &&
       jr.value === 56n && jr.tierups > 0 && jb.value === 56n && jb.tierups > 0;
     set('x2', ok ? 'pass' : 'fail',
@@ -198,6 +205,8 @@ async function main() {
       ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
+      `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt)} ` +
+      `(want MemoryFault) · ` +
       `§22 units on emitted wasm: host's i32 ${jc32.value}/${jc32.tierups}, f64 ${jc64.value}/${jc64.tierups} ` +
       `(want 1136), runtime ${jr.value}/${jr.tierups}, B2 ${jb.value}/${jb.tierups} (want 56) ` +
       `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);

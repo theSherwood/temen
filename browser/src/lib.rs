@@ -3134,6 +3134,24 @@ pub extern "C" fn temen_x2_mapped_now() -> u64 {
     x2_call(|c| c.mapped_now()).unwrap_or(0)
 }
 
+/// Whether the running call is page-checked ([`bytecode::EmittedCall::pagestate`]): 1 or 0.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_paged() -> i32 {
+    x2_call(|c| c.pagestate().is_some() as i32).unwrap_or(0)
+}
+
+/// The running call's page-state table ([`bytecode::EmittedCall::pagestate`]): what a Worker gives
+/// its instances' `"pagestate"` at the call and after each bounce. Null when the call is not
+/// page-checked.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_pagestate_ptr() -> *const u8 {
+    x2_call(|c| c.pagestate())
+        .flatten()
+        .unwrap_or(core::ptr::null())
+}
+
 /// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 type X2Thread = Box<dyn FnOnce() + Send>;
@@ -3217,18 +3235,18 @@ pub extern "C" fn temen_x2_start(
         .map_or(0, |mc| mc.size_log2)
         .max(win_size.next_power_of_two().trailing_zeros() as u8);
     // With `tierup`, regions run on the coop driver's emit, which outlines the guest's cap calls into
-    // the module both tiers then run. A paged or spilling emit wants a page-state table or a spill
-    // stack per thread, which this driver does not keep yet (#1414 B6-3b-4): such a guest's regions
-    // interpret.
+    // the module both tiers then run. A paged emit checks each access against its thread's page-state
+    // table. A spilling emit wants a spill stack per thread, which this driver does not keep yet
+    // (#1414 B6-3b-4c): such a guest's regions interpret.
     let emit = (tierup != 0)
         .then(|| coop_emit_for(&m, true, win_log2).ok())
         .flatten()
-        .filter(|e| !e.paged && !e.spill);
+        .filter(|e| !e.spill);
     let (m, regions) = match emit {
         Some(e) => {
             // A local-table emit leaves the run's table as it is.
             let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
-            (e.m, Some((e.wasm, e.eligible, table_log2)))
+            (e.m, Some((e.wasm, e.eligible, table_log2, e.paged)))
         }
         None => (m, None),
     };
@@ -3283,8 +3301,8 @@ pub extern "C" fn temen_x2_start(
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible, table_log2) =
-            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0));
+        let (wasm, eligible, table_log2, paged) =
+            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0, false));
         // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
         host.set_jit_table_log2(table_log2);
         // The units emit as the coop driver's do, over this run's window and table, or none does
@@ -3306,6 +3324,7 @@ pub extern "C" fn temen_x2_start(
         X2_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
         platform.tier = Some(bytecode::ThreadTier {
             eligible: eligible.into(),
+            page_checked: paged,
             run: x2_run,
         });
     }
