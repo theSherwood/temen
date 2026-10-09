@@ -56,8 +56,10 @@ async function main() {
   // Chromium stops a terminated Worker that is still running about two seconds later, wherever it is,
   // and one stopped inside the engine's allocator never releases the allocator's lock: every later
   // allocation in that memory spins forever, the page's own and the next run's.
-  const run = async (guest, opts) => {
+  // `tierupFloor` sets the run's engine's tier-up size floor (#1026) first.
+  const run = async (guest, { tierupFloor, ...opts } = {}) => {
     const own = await loadEngine(eng);
+    if (tierupFloor !== undefined) own.ex.temen_coop_set_tierup_floor(tierupFloor);
     return { ...(await makeRunner(own)(guest, opts)), eng: own };
   };
   const runPath = async (guestPath, opts = {}) => {
@@ -164,9 +166,11 @@ async function main() {
     const sv = await runPath('/corpus/live_caller.temenc', { ...x2, inst: true, winSize: 1 << 17, minter: 1 << 20 });
     // #1414 B6-3: each thread runs its task's tier-ups on its own Worker — the `tierup` kernel's 8
     // workers each call the emitted leaf once. Then a root that returns while its thread counts
-    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns.
-    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true });
-    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true });
+    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns. The
+    // regions are the coop driver's emit (B6-3b-4), whose size floor (#1026) would keep these small
+    // leaves interpreted: the harness lowers it on these runs' engines, as coop's own tests do.
+    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
     // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
     // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's

@@ -3179,13 +3179,14 @@ pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
 /// so [`temen_par_stdout_len`] reads the run's output. `[seed_ptr, seed_len)` is written into the
 /// window from offset 0 before the data segments: the unit blobs a runtime-compile guest reads.
 ///
-/// With `tierup` set, a module-0 task's calls to the functions the threads tier-up emit takes
-/// ([`threads_tierup`]) run on it, each on its thread's Worker. With §22 codegen on
+/// With `tierup` set, a module-0 task's calls to the functions the coop driver's region emit takes
+/// ([`coop_emit_for`], its tier-up floor included: [`temen_coop_set_tierup_floor`]) run on it, each
+/// on its thread's Worker, and the run is of the module that emit outlined. With §22 codegen on
 /// ([`temen_par_jit_set_codegen`]), a guest's `Jit.invoke` of a unit with emitted wasm runs it there
 /// too, its `call.dyn`s reaching the run's dispatch table through each Worker's mirror of it. The
 /// emitted code addresses the root's window as one span, so then the window is a flat one of the
-/// declared size or `win_size`, whichever is larger, and it cannot grow past that; otherwise it is
-/// the driver's own, which grows on demand.
+/// declared size or `win_size`, whichever is larger, rounded up to a power of two, and it cannot
+/// grow past that; otherwise it is the driver's own, which grows on demand.
 ///
 /// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
 /// tell the rest, as for [`temen_run_onramp`].
@@ -3207,6 +3208,29 @@ pub extern "C" fn temen_x2_start(
     let Ok(m) = temen_encode::decode_module(bytes) else {
         set(STATUS_DECODE_ERR);
         return 0;
+    };
+    // Emitted code addresses the window as one flat span masked to `1 << win_log2`, so a run with an
+    // emitted tier gets a flat window of exactly that size: the declared size or `win_size`,
+    // whichever is larger, rounded up to a power of two.
+    let win_log2 = m
+        .memory
+        .map_or(0, |mc| mc.size_log2)
+        .max(win_size.next_power_of_two().trailing_zeros() as u8);
+    // With `tierup`, regions run on the coop driver's emit, which outlines the guest's cap calls into
+    // the module both tiers then run. A paged or spilling emit wants a page-state table or a spill
+    // stack per thread, which this driver does not keep yet (#1414 B6-3b-4): such a guest's regions
+    // interpret.
+    let emit = (tierup != 0)
+        .then(|| coop_emit_for(&m, true, win_log2).ok())
+        .flatten()
+        .filter(|e| !e.paged && !e.spill);
+    let (m, regions) = match emit {
+        Some(e) => {
+            // A local-table emit leaves the run's table as it is.
+            let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
+            (e.m, Some((e.wasm, e.eligible, table_log2)))
+        }
+        None => (m, None),
     };
     let m = std::sync::Arc::new(m);
     let io = par_io();
@@ -3237,12 +3261,8 @@ pub extern "C" fn temen_x2_start(
             pb => {
                 // SAFETY: published by `temen_par_powerbox` and taken out of `PAR_PB` above, so
                 // this run owns it: no Worker of another run reads it.
-                let mut pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
+                let pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
                 codegen = par_jit_codegen();
-                if codegen {
-                    // The per-Worker driver emits the host's unit itself; here the host does.
-                    pb.host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
-                }
                 (
                     pb.host,
                     vec![Value::I32(pb.jit), Value::I32(pb.code)],
@@ -3251,23 +3271,32 @@ pub extern "C" fn temen_x2_start(
             }
         }
     };
-    let regions = if tierup != 0 {
-        threads_tierup(&m)
-    } else {
-        None
-    };
+    // §22 units run emitted when codegen asks and the run's table can fill every slot their
+    // `call.dyn`s may reach, as on the coop driver.
+    let codegen = codegen && all_shimmable(&m);
     let mut back = None;
     let mut platform = X2_PLATFORM;
     if regions.is_some() || codegen {
-        let declared = m.memory.map_or(0, |mc| 1usize << mc.size_log2);
         let page = temen_interp::host_page_size();
-        let Some(flat) = temen_interp::Region::owned_zeroed(declared.max(win_size) as u64, page)
-        else {
+        let Some(flat) = temen_interp::Region::owned_zeroed(1u64 << win_log2, page) else {
             set(STATUS_UNSUPPORTED);
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible) = regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()]));
+        let (wasm, eligible, table_log2) =
+            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0));
+        // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
+        host.set_jit_table_log2(table_log2);
+        // The units emit as the coop driver's do, over this run's window and table, or none does
+        // and every invoke interprets.
+        if codegen {
+            TIERUP_UNIT_SHARED.store(true, Ordering::Relaxed);
+            TIERUP_UNIT_WIN_LOG2.store(win_log2, Ordering::Relaxed);
+            TIERUP_UNIT_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
+            host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
+        } else {
+            host.set_jit_wasm_emitter(|_| None);
+        }
         *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = wasm;
         *X2_SIGS.lock().unwrap_or_else(|e| e.into_inner()) = m
             .funcs
@@ -13810,7 +13839,8 @@ block 0 (v0: i64) {
 
 /// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
-/// flag and its window log2. Stored at [`temen_coop_open`]; single-threaded wasm.
+/// flag and its window log2. Stored when a run opens ([`temen_coop_open`], and the parallel
+/// driver's `temen_x2_start`); one such run at a time.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -13830,7 +13860,8 @@ static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
 static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
 
-/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
+/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846), and
+/// the parallel driver for a run whose §22 units run emitted (`temen_x2_start`):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call.dyn` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
@@ -14280,6 +14311,29 @@ struct CoopEmit {
     spill: bool,
 }
 
+/// Whether every function of `m` can take a bounce shim (scalar operands, arity ≤ the env
+/// scratch's slot count): what a B2 dispatch table needs to fill each slot an emitted `call.dyn`
+/// may reach.
+fn all_shimmable(m: &temen_ir::Module) -> bool {
+    let scalar = |t: &temen_ir::ValType| {
+        matches!(
+            t,
+            temen_ir::ValType::I32
+                | temen_ir::ValType::I64
+                | temen_ir::ValType::F32
+                | temen_ir::ValType::F64
+        )
+    };
+    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
+    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
+    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
+    m.funcs.iter().all(|f| {
+        f.params.iter().all(scalar)
+            && f.results.iter().all(scalar)
+            && f.params.len().max(f.results.len()) <= max_slots
+    })
+}
+
 fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<CoopEmit, i32> {
     if onramp_check(m0).is_err() || m0.memory.is_none() {
         return Err(STATUS_UNSUPPORTED);
@@ -14302,29 +14356,13 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
         mc.size_log2 = win_log2;
     }
     // #926 slice 2f — B2 vs non-B2 emit (#880's parity gate for the shared-table world).
-    // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
-    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call.dyn`-bearing
-    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
-    // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
-    // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
-    // shared-table slot can never diverge from the interpreter's dispatch. An unsupported shape declines.
-    let scalar = |t: &temen_ir::ValType| {
-        matches!(
-            t,
-            temen_ir::ValType::I32
-                | temen_ir::ValType::I64
-                | temen_ir::ValType::F32
-                | temen_ir::ValType::F64
-        )
-    };
-    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
-    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
-    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
-    let all_shimmable = m.funcs.iter().all(|f| {
-        f.params.iter().all(scalar)
-            && f.results.iter().all(scalar)
-            && f.params.len().max(f.results.len()) <= max_slots
-    });
+    // A guest whose every function has a shimmable signature emits over the **shared reserved
+    // table** (Model B2): `call.dyn`-bearing functions tier up (the language-runtime dispatch-loop
+    // shape), their indirect calls reaching installed §22 units natively (old→new) and
+    // interpreter-resident targets through the live bounce. A non-shimmable guest (v128 /
+    // over-arity) emits in the old local-table mode, where a null shared-table slot can never
+    // diverge from the interpreter's dispatch. An unsupported shape declines.
+    let all_shimmable = all_shimmable(&m);
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
