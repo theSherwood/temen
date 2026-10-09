@@ -11979,8 +11979,9 @@ struct VCpu {
     /// child's parent in its [`FrozenVCpu`], letting thaw rebuild the per-parent join-table topology.
     parent_task: TaskId,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
-    /// seeded to this vCPU's dense id at construction (root = 0), guest-overwritable. Read at the
-    /// op's execution point — so a fiber that migrated here reads *this* vCPU's word.
+    /// seeded to this vCPU's id in its domain (0 at construction, a domain's root; `thread.spawn`
+    /// seeds a thread's from [`Host::next_vcpu_id`]), guest-overwritable. Read at the op's execution
+    /// point — so a fiber that migrated here reads *this* vCPU's word.
     tls: i64,
     /// `<setjmp.h>` checkpoints — `setjmp` records this vCPU's resume point here, keyed by a
     /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
@@ -12219,7 +12220,7 @@ impl VCpu {
             depth,
             id,
             parent_task: 0,
-            tls: id as i64, // §12 seed the per-vCPU TLS register to the dense vCPU id (root = 0)
+            tls: 0, // §12 a domain's root; `thread.spawn` seeds a thread's (#1775)
             setjmp_points: BTreeMap::new(),
             pending: None,
             sched,
@@ -17427,8 +17428,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let sink_inherit = freeze_sink.clone();
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
-                    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())
-                        .ok_or(Trap::ThreadFault)?;
+                    let mut h = host.lock_unpoisoned();
+                    let live = LiveVcpu::charge(h.own_node()).ok_or(Trap::ThreadFault)?;
+                    let vcpu_id = h.next_vcpu_id();
+                    drop(h);
                     let slot = threads.len(); // the handle `threads.push` below returns
                     let made = sched.spawn(move |id| {
                         let mut child = VCpu::new(
@@ -17457,6 +17460,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
+                        child.tls = vcpu_id; // §12: its id in its domain (#1775)
                         child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
@@ -23011,6 +23015,8 @@ pub struct Host {
     /// D66 — the domain that spawned this one (its [`Host::domain_id`]), `None` for a root. Set by
     /// [`Host::spawn_child_powerbox`] on every §14 builder path, so a child's lane chain can be walked.
     parent_domain: Option<u64>,
+    /// §12 — the threads this domain has started: the last one's vCPU id ([`Host::next_vcpu_id`]).
+    threads_started: i64,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -23951,6 +23957,7 @@ impl Host {
             lane_cap: -1, // D66 — unbounded by default
             granted_lanes: 0,
             parent_domain: None,
+            threads_started: 0,
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -27222,6 +27229,13 @@ impl Host {
             self.budgets.force_charge(self.own_budget, BUDGET_SPAWN, 1);
         }
         self.own_node()
+    }
+
+    /// §12 (#1775) — the vCPU id of a thread this domain starts, which seeds its `vcpu.tls` word:
+    /// dense within the domain in spawn order (its root 0, its threads 1, 2, …), as on the JIT.
+    pub(crate) fn next_vcpu_id(&mut self) -> i64 {
+        self.threads_started += 1;
+        self.threads_started
     }
 
     /// #1944 slice 3 — the node this domain's vCPUs draw their fuel from: its own.

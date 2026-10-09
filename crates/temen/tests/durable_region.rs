@@ -571,6 +571,51 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
     );
 }
 
+/// #2233 — **a thawed child that spins on its parent lets the parent run.** [`SHARING_PARENT`] sets
+/// the region's first word once it has mapped the region, after the cut, and [`SHARING_CHILD`] spins
+/// on that word before its tail. A thaw runs on one worker (DURABILITY.md §12.8), and the
+/// tree-walker's pool ran a vCPU until it parked, so the re-launched child's spin kept that worker
+/// and the thaw ran out of fuel. A vCPU in an unbounded lane now yields at its quantum (#2228); in a
+/// bounded one it still runs to its park (#2237).
+#[test]
+fn a_thawed_child_spinning_on_its_parent_lets_the_parent_run() {
+    let map = "  vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)\n";
+    let signal = format!("{map}  vone = i64.const 1\n  i64.atomic.store vwin vone\n");
+    let tail = "block 3 (vd: i64) {\n";
+    let spin = "block 3 (vd: i64) {
+  vf = i64.const 131072
+  vh = i64.atomic.load vf
+  vz = i64.const 0
+  vw = i64.eq vh vz
+  br_if vw 2(vd) 4(vd)
+}
+block 4 (vd: i64) {
+";
+    assert!(SHARING_PARENT.contains(map) && SHARING_CHILD.contains(tail));
+    let parent = confined(&SHARING_PARENT.replace(map, &signal));
+    let child = confined(&SHARING_CHILD.replace(tail, spin));
+    let (mut host, args) = sharing_host(&child, heap_region());
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let (base, ..) = run(&parent, 0, &mut host, &args, &win, None);
+    assert_eq!(base, Ok(vec![Value::I64(SHARED_WANT)]), "uninterrupted run");
+
+    let (mut fhost, args) = sharing_host(&child, heap_region());
+    let mut fwin = win.clone();
+    temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+    let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
+    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+    assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
+    let artifact = freeze_with_prots(&parent, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.grant_durable_module(&child);
+    let (mut twin, rprots, _) =
+        restore_with_prots(&artifact, &parent, &mut thost).expect("restores");
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (thawed, ..) = run(&parent, 0, &mut thost, &args, &twin, Some(&rprots));
+    assert_eq!(thawed, Ok(vec![Value::I64(SHARED_WANT)]), "the thaw");
+}
+
 /// **Step 3 — a region a JIT parent shares with its detached child rides the cut.** The JIT freeze
 /// lands at the spawn, before the parent's own `map`: the child's JIT page map names the region its
 /// pre-mapped pages alias, and the parent holds the handle. The thaw rebuilds one backing; the

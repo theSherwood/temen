@@ -1815,8 +1815,9 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   per-vCPU state, **read at the execution point** — so a fiber that migrated to
   another vCPU reads the *current* vCPU's word, the value only the runtime knows
   (the `thread.spawn` handle is the parent's view, not "which vCPU am I on now").
-  Seeded at vCPU creation to a **dense id** (root = 0, children sequential), so a
-  bare `get` doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
+  Seeded at vCPU creation to a **dense id** within its domain (root = 0, threads
+  sequential in spawn order; a §14 child's root is 0 again), so a bare `get`
+  doubles as a `vcpu.id`; the guest may overwrite it with a pointer to
   its per-CPU block for full `__thread`-style TLS. The natural primitive for a
   guest M:N runtime / GC's per-CPU state (mark stacks, allocator magazines). Not a
   cross-vCPU channel (each vCPU touches only its own word — no new visible op for

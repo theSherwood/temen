@@ -52,8 +52,8 @@ use temen_ir::{
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
-    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow, Trap, Value,
-    VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
+    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, Reg, RootWindow, Trap, Value, VarValue,
+    WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -8073,19 +8073,19 @@ fn dbg_spawn(
     dst: u32,
     module: usize,
     source: &ModuleSource,
-    node: NodeRef,
+    host: &mut Host,
 ) -> Result<(), Trap> {
     let mut vt = thread_task(source, module, func, sp, arg)?;
     if live_tasks(tasks) >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
-    // #2001 — the thread is one `spawn` of its domain's node (`node`) while it lives: a full
-    // ceiling refuses it as the live cap does.
-    let live = LiveVcpu::charge(node).ok_or(Trap::ThreadFault)?;
+    // #2001 — the thread is one `spawn` of its domain's node while it lives: a full ceiling
+    // refuses it as the live cap does.
+    let live = LiveVcpu::charge(host.own_node()).ok_or(Trap::ThreadFault)?;
     let env = tasks[ti].env; // a thread inherits its spawner's environment (shares its window)
     let cidx = tasks.len();
-    // §12: its `vcpu.tls` is its dense vCPU id, the task index, as the cooperative driver's.
-    vt.active.tls = cidx as i64;
+    // §12: its `vcpu.tls` starts at its id in its domain (#1775), as the cooperative driver's.
+    vt.active.tls = host.next_vcpu_id();
     tasks.push(TaskSlot::new(vt, env, live));
     let handle = tasks[ti].threads.len() as i32;
     tasks[ti].threads.push(Some(cidx));
@@ -8188,11 +8188,11 @@ fn service_advance(
                 module,
             } => {
                 *turn += 1;
-                let node = match tasks[ti].env {
-                    None => host.own_node(),
-                    Some(k) => extra_envs[k].host.own_node(),
+                let host = match tasks[ti].env {
+                    None => &mut *host,
+                    Some(k) => &mut extra_envs[k].host,
                 };
-                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, node) {
+                if let Err(t) = dbg_spawn(tasks, ti, func, sp, arg, dst, module, source, host) {
                     complete(tasks, ti, Err(t));
                 }
             }
@@ -15766,9 +15766,10 @@ impl SchedCore {
                     }
                 }
                 let cidx = tasks.len();
-                // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
-                // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
-                child.active.tls = cidx as i64;
+                // §12: its `vcpu.tls` starts at its id in its domain (#1775).
+                child.active.tls = task_host(root, extra_envs, tasks[ti].env)
+                    .lock_unpoisoned()
+                    .next_vcpu_id();
                 // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
                 // (the shared domain for a root-spawned thread, or the same confined `instantiate`
                 // env for one spawned by a confined child).
@@ -17864,9 +17865,8 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // §12 seed the child's `vcpu.tls` to its dense id (root = 0; ids start at 0 for the
-                // first child) — the cooperative `Spawn` arm's seeding.
-                child_vt.active.tls = id as i64 + 1;
+                // §12: its `vcpu.tls` starts at its id in its domain (#1775).
+                child_vt.active.tls = host.lock_unpoisoned().next_vcpu_id();
                 // The child runs over its own `Mem` view of the **same** shared backing (real atomics)
                 // and SHARES this vCPU's powerbox cell (a thread, not a process — cf. `ForkSelf`).
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
