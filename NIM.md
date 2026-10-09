@@ -986,11 +986,13 @@ vCPU on one thread, and the page's core count under the browser's per-Worker dri
 `std/cpuinfo` asks `sched_getaffinity` first, which reports nothing here, and falls back to it, so
 `initPool()` starts `max(1, n - 1)` workers.
 
+**Sleeping.** `nanosleep` is a timed wait (the shim's row 47), so an idle pool worker naps between
+polls rather than spins. The threaded engines sleep in real time. The bytecode engine's cooperative
+scheduler sleeps on its logical clock, which moves with the other threads' work, one ns per op, and
+jumps ahead when none can run (#2224).
+
 **What is not served.**
 - CPU affinity is a no-op.
-- The shim's `nanosleep` returns at once, so an idle pool worker spins rather than naps. Under the
-  POSIX personality it parks, and the bytecode engine does not time a wait out while another thread
-  is runnable (#2224), so a thread that spins on a napping one hangs there.
 - `std/ioring` needs io_uring or epoll.
 - The browser's wasm tier does not compile `vcpu.tls.get`, so in a threaded program a function that
   touches a thread-local stays on the interpreter there.

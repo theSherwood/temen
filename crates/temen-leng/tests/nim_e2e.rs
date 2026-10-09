@@ -2543,12 +2543,12 @@ fn nim_shells_out_through_the_posix_sh() {
 /// jobs this way: `running()`, then `sleep 1`, which is `nanosleep`. The bottom edge's `nanosleep`
 /// returned at once, so the poll spun, and on the cooperative scheduler it took half of every slice
 /// its child ran. nimony's build spent over half its time there (#1930). Now `nanosleep` parks the
-/// process (`POSIX_SLEEP_ADAPTER`).
+/// process (the compute shim's row 47).
 ///
-/// Every engine runs the tree to the child's status. On the cooperative scheduler (the bytecode
-/// engine) the count is exact: its clock reaches the sleeper's deadline only when nothing else can
-/// run, so the parent polls once, sleeps through the child's whole run, and finds it done. The
-/// threaded engines sleep in real time, so their count is the child's run time in milliseconds.
+/// Every engine runs the tree to the child's status. The threaded engines sleep in real time, so
+/// their count is the child's run time in milliseconds. The cooperative scheduler (the bytecode
+/// engine) sleeps on its logical clock, which moves with the child's work, one ns per op (#2224), so
+/// its count is the child's work in logical milliseconds: a handful, and the same on every run.
 #[test]
 fn a_nim_process_that_polls_its_child_sleeps() {
     let Some(path) = toolchain_path() else {
@@ -2625,9 +2625,9 @@ fn a_nim_process_that_polls_its_child_sleeps() {
             "{engine:?}: the parent saw its child's own status: {out:?}"
         );
         if engine == temen_run::Backend::Bytecode {
-            assert_eq!(
-                polls, 1,
-                "{engine:?}: the parent sleeps through its child's run, and does not spin"
+            assert!(
+                (1..=64).contains(&polls),
+                "{engine:?}: the parent sleeps between polls, and does not spin: {polls} polls"
             );
         }
         eprintln!("{engine:?}: {polls} poll(s)");
@@ -3583,10 +3583,9 @@ main()
 /// workers). The I/O-ring tests and `tpoolaffinity` (it narrows its own CPU affinity) are not here:
 /// the sandbox serves neither.
 ///
-/// They link as the playground links a program, over the compute shim alone. Under the POSIX
-/// personality `nanosleep` parks for real, and the bytecode engine's logical clock does not move a
-/// timed wait on while another thread stays runnable, so `tpool1`'s spinning main starves its napping
-/// worker there (#2224).
+/// They link as the playground links a program, over the compute shim alone. A pool's idle worker
+/// naps in `nanosleep`, a timed wait, while `tpool1`'s main spins on it: the bytecode engine's logical
+/// clock moves with main's work, so the nap ends there too (#2224).
 #[test]
 fn nimonys_thread_tests_run_on_every_engine() {
     let Some(path) = toolchain_path() else {

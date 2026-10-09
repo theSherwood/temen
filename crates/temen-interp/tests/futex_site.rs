@@ -102,8 +102,8 @@ fn a_waiter_whose_page_is_remapped_keeps_the_key_it_parked_on() {
 /// spawn func 1. Then wake the thread at the anonymous word `W` (the page after `B`), and after that at
 /// region byte 0 through `A`, each with a `notify` repeated until it wakes someone. Between tries the
 /// root waits out a 1 µs timeout on `W + 8`, which nobody writes: on the logical clock of the cooperative
-/// drivers that timeout fires only once every other task has parked, so the root never spins. Returns
-/// the thread's result.
+/// drivers that timeout fires once every other task has parked, or has done a thousand ops of work
+/// (#2224), so the root waits rather than spins. Returns the thread's result.
 ///
 /// func 1: wait at `W` for `0`, then at `B` for `0`, with no timeout; returns `first * 10 + second`,
 /// 0 when both were woken.

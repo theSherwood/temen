@@ -7689,8 +7689,8 @@ struct DbgTaskSnapshot {
 /// ladder keyed on the global turn and hands it back to [`ScheduledDebugRun::restore`].
 #[derive(Clone)]
 pub struct ScheduledContinuation {
-    /// The scheduled-mode op clock (visible ops across all vCPUs) — continuation state, unlike the
-    /// turn, which is the ladder's key.
+    /// The scheduled-mode clock's idle offset (the run's logical time is it plus the turn, #2224) —
+    /// continuation state, unlike the turn, which is the ladder's key.
     clock: u64,
     tasks: Vec<DbgTaskSnapshot>,
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
@@ -7875,8 +7875,9 @@ pub struct ScheduledDebugRun {
     /// Global count of visible ops executed across all vCPUs — the scheduled-mode logical clock and the
     /// reverse-`seek` coordinate.
     turn: u64,
-    /// The `memory.wait` deadline clock (advanced only when the whole run is stuck-waiting, to the
-    /// earliest deadline). Separate from `turn`: it measures futex timeout time, not ops.
+    /// The `memory.wait` deadline clock's idle offset: the time the run jumped ahead when it was
+    /// stuck waiting, to the earliest deadline. The engine's logical time is it plus `turn`, one ns
+    /// per op, as on the pump (#2224).
     clock: u64,
 }
 
@@ -8288,7 +8289,7 @@ fn service_advance(
                     mem,
                     || false,
                     false,
-                    clock,
+                    clock.saturating_add(*turn), // #2224: this engine's time
                     base,
                     expected,
                     width,
@@ -8810,7 +8811,9 @@ fn dbg_preview_pick(
 }
 
 /// Pick the next thread to run under the session's **schedule policy** (slice 7) — the
-/// [`dbg_preview_pick`] order. If none is runnable, advance the futex `clock` to the earliest
+/// [`dbg_preview_pick`] order. First time out every wait whose deadline this engine's logical time
+/// has reached: `clock + turn`, so time moves by one ns per op as on the pump (#2224), and `clock`
+/// is only the offset the idle jumps add. If none is runnable, advance the offset to the earliest
 /// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
 /// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
 /// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
@@ -8826,6 +8829,11 @@ fn dbg_pick_runnable(
     pref: Option<(usize, bool)>,
     turn: u64,
 ) -> Option<usize> {
+    let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut fibers.fibers)
+        .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
+        .collect();
+    let mut now = clock.saturating_add(turn);
+    time_out_due(tasks, &mut regs, now);
     loop {
         if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, turn) {
             return Some(i);
@@ -8833,12 +8841,10 @@ fn dbg_pick_runnable(
         // #1638 — only a waiter with a REAL deadline is a clock-advance candidate, so "nothing
         // runnable and every remaining waiter is indefinite" is the deadlock exit, not a
         // `WAIT_TIMED_OUT` the guest never asked for.
-        let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut fibers.fibers)
-            .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
-            .collect();
-        if !fire_next_timeout(tasks, &mut regs, clock) {
+        if !fire_next_timeout(tasks, &mut regs, &mut now) {
             return None;
         }
+        *clock = now - turn;
     }
 }
 
@@ -12849,11 +12855,12 @@ struct RunCtx<'a> {
 }
 
 /// #1157 — the cooperative preemption quantum: the op count a runnable task may run before the pump
-/// round-robins to a sibling. Armed by [`CoopSched::pump`] **only while ≥2 tasks are runnable**, so a
-/// single-runnable run (bash and every non-threaded browser guest) is untouched. Coarse on purpose
-/// (~1M ops): fine enough to bound a yield-free spin to sub-second, coarse enough that the interleaving
-/// stays close to the old run-to-completion order (fewer differential surprises). Op-count, so the
-/// schedule stays deterministic.
+/// round-robins to a sibling. Armed by [`CoopSched::pump`] **only while ≥2 tasks are runnable or a
+/// task waits with a deadline**, so a single-runnable run (bash and every non-threaded browser guest)
+/// is untouched. Coarse on purpose (~1M ops): fine enough to bound a yield-free spin to sub-second,
+/// coarse enough that the interleaving stays close to the old run-to-completion order (fewer
+/// differential surprises). Op-count, so the schedule stays deterministic. A quantum that runs out
+/// also moves the logical clock by its ops, 1 ns each (#2224).
 const COOP_QUANTUM: u64 = 1 << 20;
 
 /// Run one vCPU (its active `Vm` and any fibers it switches among) until it finishes or hits a
@@ -14030,8 +14037,8 @@ struct SchedCore {
     /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
     /// their domain's finish. Released once: the release decrements the shared end counts.
     released_envs: std::collections::BTreeSet<usize>,
-    /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
-    /// `wait` deadline).
+    /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
+    /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
 }
 
@@ -14877,11 +14884,15 @@ impl CoopSched {
             // yield-free spinner so the sibling gets the thread — deterministically (op-count, not
             // wall-clock). `COOP_QUANTUM` is coarse (~1M ops) to keep interleaving close to the old
             // run-to-completion order while still bounding a spin to sub-second.
-            let (quantum, preemptible) = if tasks
-                .iter()
-                .filter(|t| matches!(t.state, TaskState::Runnable))
-                .count()
-                >= 2
+            // #2224 — and while a task waits with a deadline: the clock that times the wait out
+            // moves with the quanta that run out (below), so a lone runnable task must still yield
+            // at its quantum, or a thread that naps never wakes while another spins on it.
+            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some()
+                || tasks
+                    .iter()
+                    .filter(|t| matches!(t.state, TaskState::Runnable))
+                    .count()
+                    >= 2
             {
                 (COOP_QUANTUM, true)
             } else {
@@ -15013,6 +15024,17 @@ impl CoopSched {
             // The first fault recorded wins; the run entry clears the slot beforehand.
             if let Some(a) = fault {
                 super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
+            }
+            // #2224 — logical time moves with work: a quantum that ran out moves the clock by its
+            // ops, 1 ns each, and times out the waits it reached. A timed wait then ends while
+            // another task keeps running, after as much of its work as the timeout names, and
+            // deterministically, as the op count is.
+            if preemptible && matches!(stop, Ok(VcpuStop::Preempted)) {
+                *clock = clock.saturating_add(quantum);
+                let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
+                    .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
+                    .collect();
+                time_out_due(tasks, &mut regs, *clock);
             }
             // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
             // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
