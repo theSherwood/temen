@@ -5131,7 +5131,8 @@ const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_WORKERS: usize = 32;
 
 /// The real pool's worker count: the host's parallelism, at most [`MAX_WORKERS`], and 1 where the
-/// host reports none (wasm). What [`Host::parallelism`] reports for a domain with no lane cap.
+/// host reports none (wasm). What [`Host::parallelism`] reports when the embedder sets no worker
+/// count ([`Host::set_workers`]).
 pub fn pool_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -22153,10 +22154,11 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 
 /// The reserved self-namespace op for `parallelism`: how many of this domain's vCPUs may run at
 /// once ([`Host::parallelism`]), what a guest sizes a thread pool from (`sysconf(_SC_NPROCESSORS_ONLN)`,
-/// Rust's `available_parallelism`, Go's `GOMAXPROCS`). Its lane cap when it has one (D66), else the
-/// host's worker count. Authority-neutral like `fuel.remaining`: it reads the domain's own grant and
-/// the host's size, and confers nothing. The host answers it, so every engine agrees. The worker
-/// count is the host machine's, so a replay records the answer, as it does a clock read
+/// Rust's `available_parallelism`, Go's `GOMAXPROCS`). The workers its driver has, an input the
+/// embedder sets ([`Host::set_workers`]; by default the real pool's size), bounded by its lane cap
+/// (D66). Authority-neutral like `fuel.remaining`: it reads the domain's own grant and its driver's
+/// size, and confers nothing. The host answers it, so engines given the same host agree. The worker
+/// count is the machine's and the driver's, so a replay records the answer, as it does a clock read
 /// (DEBUGGING.md W1).
 pub const CAP_SELF_PARALLELISM: u32 = 19;
 
@@ -23050,6 +23052,11 @@ pub struct Host {
     /// ([`Host::set_lane_cap`]). Enforced at **dispatch** by the scheduler, against this cap and every
     /// enclosing one (a task counts against its own lane and each ancestor's).
     lane_cap: i64,
+    /// How many vCPUs the driver running this domain can run at once: an input the embedder sets for
+    /// the driver it picks ([`Host::set_workers`]). `None` reads as the real pool's size
+    /// ([`pool_workers`]). A host derived from this one inherits it ([`Host::child_host`]), since it
+    /// runs on the same driver. [`Host::parallelism`] bounds it by the lane cap.
+    workers: Option<usize>,
     /// D66 — Σ of the lanes this domain has granted to its **live** detached children. A spawn admits
     /// only if `granted_lanes + lane ≤ lane_cap` ([`Host::admit_detached_spawn`]); a reaped child
     /// returns its lane ([`Host::give_lane`]). Ceiling semantics: this domain's own tasks may still fill
@@ -23998,6 +24005,7 @@ impl Host {
             ended: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
+            workers: None,
             granted_lanes: 0,
             parent_domain: None,
             threads_started: 0,
@@ -24184,8 +24192,9 @@ impl Host {
         if !simple || self.multi_door.load(Ordering::SeqCst) {
             return None;
         }
-        let mut twin = Host::new(); // fresh `domain_id`
-                                    // Own handle namespace, same bindings (indices into the shared backings below).
+        // A fresh `domain_id`, with what the embedder set for the whole run.
+        let mut twin = self.child_host();
+        // Own handle namespace, same bindings (indices into the shared backings below).
         twin.table = self.table.clone();
         // #1297 — §22 guest-JIT tables fork **with their live state**, exactly what a snapshot
         // carries (DURABILITY.md §12.5: units as immutable verified IR + quotas + the install
@@ -24242,9 +24251,6 @@ impl Host {
             }
         }
         twin.region_hook = self.region_hook.clone();
-        twin.region_factory = self.region_factory;
-        // #2219: one run, one list of notes.
-        twin.notes = Arc::clone(&self.notes);
         // Live-callee offers ride along, sharing the same callee `Arc` (fork shares the offer/fd) — the
         // forking caller is always parked inside a call through one, so it holds at least this.
         twin.live_impls = self.live_impls.clone();
@@ -27063,13 +27069,21 @@ impl Host {
         self.lane_cap
     }
 
-    /// How many of this domain's vCPUs may run at once, as `self.parallelism` answers it: its lane
-    /// cap when it has one (D66), else the host's worker count ([`pool_workers`]).
+    /// Set how many vCPUs the driver running this domain can run at once. The embedder sets it for
+    /// the driver it picks: a cooperative driver runs every vCPU on one thread, so 1. Unset, it is
+    /// the real pool's size ([`pool_workers`]).
+    pub fn set_workers(&mut self, n: usize) {
+        self.workers = Some(n.max(1));
+    }
+
+    /// How many of this domain's vCPUs may run at once, as `self.parallelism` answers it: the workers
+    /// its driver has ([`Host::set_workers`]), bounded by its lane cap when it has one (D66).
     pub fn parallelism(&self) -> i64 {
+        let workers = self.workers.unwrap_or_else(pool_workers) as i64;
         if self.lane_cap >= 0 {
-            self.lane_cap
+            workers.min(self.lane_cap)
         } else {
-            pool_workers() as i64
+            workers
         }
     }
 
@@ -30027,15 +30041,18 @@ impl Host {
         self.regions.push(backing);
         self.try_grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
-    /// A fresh host for a domain this one spawns (#1978): it mints `SharedRegion`s with this host's
-    /// [`Host::set_region_factory`], as the embedder installed it once for the whole run. Without it
-    /// a detached child's own `region_create` minted a [`VecBacking`], which has no OS handle, so the
-    /// JIT's `map` of it failed with `-EINVAL` while a region its parent granted mapped. Every place
-    /// that builds a child's host starts from this, so no spawn path can drop the factory again.
+    /// A fresh host for a domain this one spawns or forks (#1978): it keeps what the embedder set
+    /// once for the whole run. It mints `SharedRegion`s with this host's [`Host::set_region_factory`];
+    /// without it a detached child's own `region_create` minted a [`VecBacking`], which has no OS
+    /// handle, so the JIT's `map` of it failed with `-EINVAL` while a region its parent granted
+    /// mapped. It runs on this host's driver, so it has its workers ([`Host::set_workers`], #2254).
+    /// Every place that builds a child's or a twin's host starts from this, so no spawn path can drop
+    /// one of them again.
     pub(crate) fn child_host(&self) -> Host {
         let mut child = Host::new();
         child.region_factory = self.region_factory;
         child.notes = Arc::clone(&self.notes);
+        child.workers = self.workers;
         child
     }
 

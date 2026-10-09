@@ -103,6 +103,8 @@ export function makeRunner({ module, memory, ex }) {
   return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
+    // #2251: every vCPU gets its own Worker, so a guest's `self.parallelism` is the page's core count.
+    ex.temen_par_set_workers(globalThis.navigator?.hardwareConcurrency || 1);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
     // §22 real-codegen run: like `jit`, but the host-compiled unit's wasm is emitted + stashed, and a
     // guest `Jit.invoke` runs it on emitted wasm (each Worker instantiates the unit — see worker.js).

@@ -1096,7 +1096,7 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // deep inside `std/cpuinfo` (`sysconf(_SC_NPROCESSORS_ONLN)`, which is what `std/threadpool`
     // sizes itself from). Pinning makes the next such drift an unbound leaf named at link instead.
     // It answers `_SC_NPROCESSORS_CONF` and `_SC_NPROCESSORS_ONLN` (83, 84) with `self.parallelism`:
-    // the domain's lane cap, else the host's worker count. Any other name is -1.
+    // the workers the domain's driver has, bounded by its lane cap. Any other name is -1.
     ("sysconf", sig(&[I32], &[I64]), 48),
     ("nativeIoctl", ANY, 49),
     // **Threads** (#2202): `std/rawthreads`' pthreads, served for real.

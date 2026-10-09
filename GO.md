@@ -142,8 +142,8 @@ Phased work (each phase lands running + differentially tested, per AGENTS.md):
   deques + stealing of suspended fibers (transplant `steal_fibers`' scheduler shape
   into the runtime), channels/`sync` over futex, and cross-vCPU STW: safepoint polls
   at back-edges/call sites (piggybacked on the epoch/kill poll, `GC.md` §5) + the
-  §2.1 `quiesce` barrier. `GOMAXPROCS` = `self.parallelism` (the domain's lane cap, else the
-  host's worker count); per-P state indexed by `vcpu.tls.get`.
+  §2.1 `quiesce` barrier. `GOMAXPROCS` = `self.parallelism` (the workers the domain's driver
+  has, bounded by its lane cap); per-P state indexed by `vcpu.tls.get`.
 - **B3 — breadth, on demand.** `net` over the async ring, bigger stdlib surface,
   browser (the bytecode tier runs `gc.roots` modules; `thread.spawn`+`gc.roots`
   currently falls back to the reference interp — see §4.5).
