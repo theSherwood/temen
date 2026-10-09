@@ -6,9 +6,9 @@
 //!      the **bytecode engine** (`bytecode::compile_and_run`), so we can see where the bytecode
 //!      engine stands and measure Phase-2 (memory-op specialization) work against a real baseline
 //!      rather than guessing (INTERP_PERF.md "Benchmark first").
-//!   3. **bytecode concurrency** — threaded and fiber kernels on the cooperative pump and on the
-//!      parallel driver, the baseline a scheduler change is measured against (#1414 slice 3e).
-//!      `--threads` runs this section alone.
+//!   3. **bytecode concurrency** — threaded and fiber kernels on the cooperative pump, the parallel
+//!      driver and executor 2, the baseline a scheduler change is measured against (#1414 slice
+//!      3e). `--threads` runs this section alone.
 //!
 //! Each compute kernel takes its **loop count `n`** as the entry argument, so per-iteration compute
 //! is isolated by **subtraction** — `(time(large_n) − time(small_n)) / (large_n − small_n)` — which
@@ -81,13 +81,17 @@ fn main() {
 }
 
 /// **Bytecode concurrency** (#1414 slice 3e): the same threaded and fiber kernels on the cooperative
-/// pump (one OS thread, the op-count quantum) and on the parallel driver (one OS thread per vCPU).
-/// Per-iteration cost by subtraction, as the A/B above, so each run's compile, window and thread
-/// start-up cancel out. The parallel column is real OS threads, so it is noisier: compare runs of
-/// two builds on the same box, interleaved.
+/// pump (one OS thread, the op-count quantum), the parallel driver and executor 2 (each one OS
+/// thread per vCPU; executor 2 runs the pump's rules). Per-iteration cost by subtraction, as the
+/// A/B above, so each run's compile, window and thread start-up cancel out. The two threaded
+/// columns are real OS threads, so they are noisier: compare runs of two builds on the same box,
+/// interleaved.
 fn concurrency() {
     println!("\nbytecode concurrency (ns per iteration, compute-isolated by subtraction):");
-    println!("{:>14}  {:>12}  {:>12}", "kernel", "pump", "parallel");
+    println!(
+        "{:>14}  {:>12}  {:>12}  {:>12}",
+        "kernel", "pump", "parallel", "threads"
+    );
     // (name, source, small_n, large_n, runs on the parallel driver).
     let kernels = [
         ("par_compute", PAR_COMPUTE, 1_000, 101_000, true),
@@ -108,30 +112,31 @@ fn concurrency() {
         });
         let parallel = if on_parallel {
             let t = per_iter(&m, small, large, |m, n| {
-                std::hint::black_box(run_parallel(m, n));
+                std::hint::black_box(run_threaded(m, n, false));
             });
             format!("{t:>10.1}ns")
         } else {
             format!("{:>12}", "-")
         };
-        println!("{name:>14}  {pump:>10.1}ns  {parallel}");
+        let threads = per_iter(&m, small, large, |m, n| {
+            std::hint::black_box(run_threaded(m, n, true));
+        });
+        println!("{name:>14}  {pump:>10.1}ns  {parallel}  {threads:>10.1}ns");
     }
 }
 
-/// `m`'s function 0 on the parallel driver, as `temen-run`'s `run_with_caps_parallel` drives it.
-fn run_parallel(m: &ir::Module, n: i32) -> Vec<Value> {
+/// `m`'s function 0 on executor 2 (`threads`) or the parallel driver, as `temen-run`'s
+/// `run_with_caps_parallel` drives it.
+fn run_threaded(m: &ir::Module, n: i32, threads: bool) -> Vec<Value> {
     let mut host = temen_interp::Host::new();
     let mut fuel = u64::MAX;
-    let (r, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
-        m,
-        0,
-        &[Value::I32(n)],
-        &mut fuel,
-        &[],
-        None,
-        &mut host,
-    )
-    .expect("the parallel driver drives the kernel");
+    let entry = if threads {
+        bytecode::compile_and_run_capture_over_threads_with_host
+    } else {
+        bytecode::compile_and_run_capture_over_parallel_with_host
+    };
+    let (r, _image) = entry(m, 0, &[Value::I32(n)], &mut fuel, &[], None, &mut host)
+        .expect("the driver drives the kernel");
     r.expect("the kernel runs to completion")
 }
 
