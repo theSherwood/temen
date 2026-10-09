@@ -2,7 +2,7 @@
 //!
 //! Parallelism is a granted resource, bounded at **dispatch**: a domain's lane cap is how many tasks
 //! of its subtree may be running at once, checked when a worker picks a task and released the moment
-//! it parks, yields or finishes. A lane is a **ceiling**, not a stock — `split` hands a child a lane
+//! it parks or finishes. A lane is a **ceiling**, not a stock — `split` hands a child a lane
 //! bounded by the holder's own cap and the holder keeps its cap; the grantor's Σ-of-granted-lanes ≤
 //! its cap is enforced at spawn and a reaped child returns its lane.
 //!
@@ -102,9 +102,10 @@ block 4 () {
 "#;
 
 /// **The dispatch-time bound.** With the root's lane cap at 1, four siblings on the real worker pool
-/// never overlap: each holds the lane only while on a worker, and a worker admits a task only while
-/// every lane in its chain has room. (The counter is a real cross-thread atomic; with no cap and ≥2
-/// cores this program reports violations — that is the mutation the pin was checked against.)
+/// never overlap: each holds the lane until it finishes, across the quantums that preempt it (each
+/// runs ~100k ops), and a worker admits a task only while every lane in its chain has room. (The
+/// counter is a real cross-thread atomic; with no cap and ≥2 cores this program reports violations —
+/// that is the mutation the pin was checked against, and so is releasing the lane at a preemption.)
 #[test]
 fn a_lane_cap_of_one_serializes_four_spinning_siblings() {
     let m = module(FOUR_SPINNERS);

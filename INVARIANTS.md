@@ -131,8 +131,10 @@ and it moves down the graph like every other. Until D66 no runtime represented i
 `max_vcpus` bounded task *count* (parked tasks included), host parallelism was a global worker count,
 and on the JIT a §14 detached child was one OS thread, so a parent held whatever the OS allowed. Now a
 domain holds a **lane cap**, checked when a worker picks one of its tasks and released on
-park/yield/finish. A parent grants a child a lane ≤ its own cap, with Σ granted lanes ≤ the parent's
-cap enforced at grant time, and a running task counts against its own lane and every enclosing one.
+park/finish: a task preempted at its quantum keeps its lane, as a JIT thread holds its lane from
+resume to park (#2237). A parent grants a child a lane ≤ its own cap, with Σ granted lanes ≤ the
+parent's cap enforced at grant time, and a running task counts against its own lane and every
+enclosing one.
 The model is a **ceiling**, not a transfer: the parent's own tasks may fill any lane it holds,
 including a child's — so 6 / 2 / 2 is *A up to 6, B ≤ 2 contended with A, C ≤ 2 contended with A, B
 and C never contending with each other*. The other budget dimensions are ceilings too (#1944), with
