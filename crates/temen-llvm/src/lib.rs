@@ -13377,11 +13377,17 @@ fn lower_vm_builtin(
         // (0 running, 1 returned, 2 trapped; never parks), `__vm_detach` → op 10 (drop the join
         // claim), `__vm_kill` → op 12 (end the child and its subtree, running or parked: #2074). A
         // spawner's way to supervise children without inheriting their traps.
-        "__vm_wait" | "__vm_poll" | "__vm_detach" | "__vm_kill" => {
+        // #2220: `long __vm_grant(int inst, long child, long handle)` → op 19 (grant `handle` into
+        // the running child, answering the child's handle of it, which the spawner hands the child
+        // itself, or `-errno`).
+        "__vm_wait" | "__vm_poll" | "__vm_detach" | "__vm_kill" | "__vm_grant" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
-            let child = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let n = if name == "__vm_grant" { 2 } else { 1 }; // the child, then what is granted
+            let args = (1..=n)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
             let sig = temen_ir::FuncType {
-                params: vec![ValType::I64],
+                params: vec![ValType::I64; n],
                 results: vec![ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
@@ -13391,11 +13397,12 @@ fn lower_vm_builtin(
                     "__vm_poll" => 9,
                     "__vm_detach" => 10,
                     "__vm_kill" => 12,
+                    "__vm_grant" => 19,
                     _ => 18,
                 },
                 sig,
                 handle,
-                args: vec![child],
+                args,
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

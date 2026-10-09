@@ -2620,6 +2620,11 @@ locked_parent_hook!(
     (child_ctx: *mut c_void, export: i64) -> i32
 );
 locked_parent_hook!(
+    child_grant_locked,
+    child_grant,
+    (child_ctx: *mut c_void, handle: i64, trap_out: *mut i64) -> i32
+);
+locked_parent_hook!(
     budget_take_locked,
     budget_take,
     (
@@ -2893,6 +2898,11 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             child_offer_mint_locked
         } else {
             child_offer_mint
+        },
+        grant: if locked {
+            child_grant_locked
+        } else {
+            child_grant
         },
         thunk: cap_thunk_locked,
         register_serve: child_register_serve,
@@ -3433,6 +3443,38 @@ pub unsafe extern "C" fn child_offer_mint(
     parent
         .mint_child_offer(&child, export as u32)
         .unwrap_or(-22)
+}
+
+/// #2220 — the [`temen_jit::ChildGrant`] hook: `grant` (op 19) on the JIT, the interp op-19 arm's
+/// body ([`Host::grant_running_child`]) over the nursery-retained powerbox of a running child, its
+/// lock taken inside the parent's — the order every hook that holds both takes. The child ref is
+/// borrowed, not consumed (the nursery keeps its count). A live self-serve grant calls back through
+/// the cell the parent sits in, as at a detached spawn's build.
+///
+/// # Safety
+/// `parent_ctx` is the run's `cap_ctx` (the parent `Host`, its guest suspended in the thunk);
+/// `child_ctx` is null or a live [`temen_jit::GrantChild::retained_ctx`] not yet released;
+/// `trap_out` is the live trap cell.
+pub unsafe extern "C" fn child_grant(
+    parent_ctx: *mut c_void,
+    child_ctx: *mut c_void,
+    handle: i64,
+    trap_out: *mut i64,
+) -> i32 {
+    let parent = &mut *(parent_ctx as *mut Host);
+    let cell = parent.own_cell();
+    let mut child = (!child_ctx.is_null()).then(|| {
+        (*(child_ctx as *const Mutex<Host>))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    });
+    match parent.grant_running_child(cell.as_ref(), handle as i32, child.as_deref_mut()) {
+        Ok(h) => h as i32,
+        Err(t) => {
+            *trap_out = t.code();
+            0
+        }
+    }
 }
 
 /// PROCESS.md S2 (JIT parity) — the §14 **named-grant-list builder** for `instantiate_named` (op 11):

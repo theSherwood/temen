@@ -817,11 +817,12 @@ pub struct GrantChild {
     pub ctx: *mut core::ffi::c_void,
     /// CALLS.md 5c.0 — a **second reference** to the same child powerbox, retained by the nursery
     /// so `child_offer` (op 14) can mint a live-impl over the child and callers can reach its
-    /// world after the child thread exits (the interp's `child_hosts` retention, JIT twin). Null
-    /// for a builder that does not share the child `Host` (then op 14 answers `-EINVAL`,
-    /// fail-closed). When non-null, `ctx` and `retained_ctx` are two counted refs to one shared
-    /// `Host` (host-side an `Arc<Mutex<Host>>`): the child thread's ref is released at child exit
-    /// as before, the retained one by the nursery at teardown — each exactly once, via the same
+    /// world after the child thread exits (the interp's `child_hosts` retention, JIT twin), and so
+    /// `grant` (op 19, #2220) can grant into it while it runs. Null for a builder that does not
+    /// share the child `Host` (then ops 14 and 19 answer `-EINVAL`, fail-closed). When non-null,
+    /// `ctx` and `retained_ctx` are two counted refs to one shared `Host` (host-side an
+    /// `Arc<Mutex<Host>>`): the child thread's ref is released at child exit as before, the
+    /// retained one by the nursery at teardown — each exactly once, via the same
     /// [`GrantChildReleaser`].
     pub retained_ctx: *mut core::ffi::c_void,
     pub inst_handle: i32,
@@ -1071,6 +1072,9 @@ pub struct GrantChildHooks {
     /// retained child powerbox (`GrantChild::retained_ctx`): `(parent_ctx, child_ctx, export)` →
     /// the granted handle, or a negative errno (`-EINVAL` for a bad export / unshared child).
     pub mint: ChildOfferMint,
+    /// #2220 — grant a capability of the **parent's** into a running child's retained powerbox
+    /// (`grant`, op 19; see [`ChildGrant`]).
+    pub grant: ChildGrant,
     /// CALLS.md 5c.0 — the cap thunk granted-child compiles run against. A shared child `Host`
     /// (non-null `retained_ctx`) is reachable from the parent while the child runs, so its own
     /// `call.cap`s must synchronize: this is the lock-taking thunk variant (`ctx` = the shared
@@ -1128,6 +1132,17 @@ pub type ChildOfferMint = unsafe extern "C" fn(
     parent_ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,
     export: i64,
+) -> i32;
+
+/// #2220 — grant `handle`, resolved in the parent powerbox, into the retained powerbox `child_ctx` of
+/// a running child (null: the nursery holds no live child there) — see [`GrantChildHooks::grant`].
+/// Host-side it is the interp op-19 arm's body: the child's handle, or a negative errno. A forged
+/// `handle` sets `*trap_out` (`CapFault`), as a spawn's grant list does, and the result is unread.
+pub type ChildGrant = unsafe extern "C" fn(
+    parent_ctx: *mut core::ffi::c_void,
+    child_ctx: *mut core::ffi::c_void,
+    handle: i64,
+    trap_out: *mut i64,
 ) -> i32;
 
 /// Bind a child module's import manifest against its built powerbox host — see
@@ -7155,6 +7170,8 @@ struct InstEnv {
     // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
     // child's nursery-retained shared powerbox.
     child_offer_thunk: i64,
+    // #2220 — op 19 (`grant`): grant a capability into that powerbox while the child runs.
+    child_grant_thunk: i64,
     // PROCESS.md §5 / #1287 — op 15 (`instantiate_detached`): a separate-module child in its **own**
     // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
     // `Budget`; argv rides as the optional spawn-time payload.
@@ -7178,6 +7195,7 @@ impl InstEnv {
             instantiate_module_named_thunk: 0,
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
+            child_grant_thunk: 0,
             instantiate_detached_thunk: 0,
             self_prog: 0,
         }
@@ -7197,6 +7215,7 @@ impl InstEnv {
             instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
                 as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
+            child_grant_thunk: instantiator_rt::child_grant as *const () as i64,
             instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
             self_prog: 0, // the module's own program (#1726)
         }
@@ -10179,8 +10198,9 @@ fn lower_instantiator(
         // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
         // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL).
-        14 => Some((&[VI32, VI64], &[VI32])),
+        // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL); #2220
+        // grant: (child, handle) -> the child's handle (probeable -EINVAL / -EMFILE).
+        14 | 19 => Some((&[VI32, VI64], &[VI32])),
         // PROCESS.md §5 / #1287 instantiate_detached: (budget, module, grants_ptr, grants_n, entry,
         // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
         // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
@@ -10343,27 +10363,30 @@ fn lower_instantiator(
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
-        14 => {
+        14 | 19 => {
             // CALLS.md 5c.0 child_offer(nursery, mem_base, instantiator:i32, child:i32, export:i64,
             // trap_out) -> handle:i32. Mint a live-callee offer over a granted child's
             // nursery-retained shared powerbox; every miss is the probeable -EINVAL (the interp op-14
             // arm, errno-for-errno). A forged `Instantiator` is the `CapFault` every op gives (#1729);
-            // `mem_base` is only for that resolve — the mint reads no guest memory.
+            // `mem_base` is only for that resolve — the mint reads no guest memory. #2220's `grant`
+            // has the same shape over the same powerbox, its last arg the handle to grant.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let export = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
+            let arg = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
             for t in [I64, I64, I32, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
             let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.child_offer_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[nursery, mem_base, h, child, export, trap_out],
-            );
+            let thunk_addr = match op {
+                14 => lower.inst.child_offer_thunk,
+                _ => lower.inst.child_grant_thunk,
+            };
+            let thunk = b.ins().iconst(I64, thunk_addr);
+            let call =
+                b.ins()
+                    .call_indirect(tref, thunk, &[nursery, mem_base, h, child, arg, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

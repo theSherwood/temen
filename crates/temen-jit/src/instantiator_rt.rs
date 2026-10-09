@@ -689,6 +689,8 @@ pub(crate) struct Nursery {
     grant_bind_imports: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
     grant_mint: std::sync::atomic::AtomicUsize,
+    /// #2220 — the `grant` hook ([`crate::ChildGrant`] as usize; 0 = none).
+    grant_into: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the lock-taking cap thunk granted-child compiles run against
     /// ([`crate::CapThunk`] as usize; 0 ⇒ fall back to the run's `cap_thunk` — pre-5c.0 behavior,
     /// only correct for a builder that does not share the child `Host`).
@@ -811,6 +813,7 @@ impl Nursery {
             grant_parent_ctx: std::sync::atomic::AtomicUsize::new(0),
             grant_register_serve: std::sync::atomic::AtomicUsize::new(0),
             grant_mint: std::sync::atomic::AtomicUsize::new(0),
+            grant_into: std::sync::atomic::AtomicUsize::new(0),
             grant_thunk: std::sync::atomic::AtomicUsize::new(0),
             null_guard: std::sync::atomic::AtomicU64::new(0),
         }
@@ -879,6 +882,8 @@ impl Nursery {
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
         self.grant_mint.store(m, Ordering::Release);
+        self.grant_into
+            .store(hooks.map_or(0, |h| h.grant as usize), Ordering::Release);
         self.grant_thunk.store(t, Ordering::Release);
         self.grant_parent_ctx.store(pc, Ordering::Release);
     }
@@ -1193,6 +1198,21 @@ impl Nursery {
         {
             c.ring();
         }
+    }
+
+    /// The unjoined child at `slot`: the powerbox this nursery retains for it (`0`: its builder
+    /// shared none) and whether its outcome is in, as [`poll`] reads it. `None` for a forged or
+    /// joined handle — the interp's dead thread slot. What `child_offer` and `grant` reach a child by.
+    fn unjoined(&self, slot: i32) -> Option<(usize, bool)> {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let c = children.get(slot as usize).filter(|c| !c.joined)?;
+        let ended = c
+            .done
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        Some((c.retained, ended))
     }
 
     /// `Instantiator.kill` (#2074): end the child at `slot` and every child under it, running or
@@ -2947,22 +2967,55 @@ pub(crate) unsafe extern "C" fn child_offer(
     if mint_addr == 0 {
         return EINVAL;
     }
-    let retained = {
-        let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-        match children.get(child as usize) {
-            // A joined child mirrors the interp's dead thread-slot: nothing to offer.
-            Some(c) if !c.joined => c.retained,
-            _ => 0,
-        }
-        // Lock dropped before the mint (which takes the child + parent powerbox locks in turn).
-        // No release race: the retained ref is freed only at `join_children` (after guest code)
-        // or on a spawn error path (before the child is ever filed).
-    };
+    // A joined child mirrors the interp's dead thread-slot: nothing to offer. The nursery's lock is
+    // dropped before the mint (which takes the child + parent powerbox locks in turn). No release
+    // race: the retained ref is freed only at `join_children` (after guest code) or on a spawn error
+    // path (before the child is ever filed).
+    let retained = rt.unjoined(child).map_or(0, |(r, _)| r);
     if retained == 0 {
         return EINVAL;
     }
     let mint: crate::ChildOfferMint = core::mem::transmute(mint_addr);
     mint(rt.grant_ctx(), retained as *mut core::ffi::c_void, export)
+}
+
+/// #2220 — `grant` (Instantiator op 19) on the JIT: grant `handle` into a child that is running or
+/// parked, through the powerbox the nursery retains for it, with the [`crate::ChildGrant`] hook —
+/// the interp op-19 arm's body. A forged `Instantiator` or `handle` is a `CapFault`. A child whose
+/// outcome is in (what [`poll`] reports: it returned, trapped, or unwound for a freeze) has ended,
+/// and the hook is handed no child for it, nor for a forged or joined handle or a child that shared
+/// no powerbox: `-EINVAL`, as op 14's misses. A run with no hook grants nothing: `-EINVAL`.
+///
+/// # Safety
+/// As [`child_offer`]; `trap_out` is also written for a forged `handle`.
+pub(crate) unsafe extern "C" fn child_grant(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    child: i32,
+    handle: i64,
+    trap_out: *mut i64,
+) -> i32 {
+    let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
+    let grant_addr = rt.grant_into.load(Ordering::Acquire);
+    if grant_addr == 0 {
+        return EINVAL as i32;
+    }
+    // As op 14's: the nursery's lock is dropped before the hook takes the powerbox locks.
+    let retained = rt
+        .unjoined(child)
+        .filter(|&(_, ended)| !ended)
+        .map_or(0, |(r, _)| r);
+    let grant: crate::ChildGrant = core::mem::transmute(grant_addr);
+    grant(
+        rt.grant_ctx(),
+        retained as *mut core::ffi::c_void,
+        handle,
+        trap_out,
+    )
 }
 
 pub(crate) unsafe extern "C" fn join(
