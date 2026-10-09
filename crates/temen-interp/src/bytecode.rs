@@ -13046,7 +13046,7 @@ struct ChildEnv {
     fuel: Fuel,
     /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
     /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
-    /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
+    /// per-domain [`ParDomain`] registry, here. The root domain's is [`SchedCore::fibers`].
     fibers: FiberTables,
     /// #2074 — for a §14 child, the env whose task spawned it (`None`: the root domain); `None` for
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
@@ -13736,7 +13736,7 @@ enum CoopStep {
     },
 }
 
-/// Where a surfaced tier-up's results land ([`CoopSched::pending_tierup`]).
+/// Where a surfaced tier-up's results land ([`EmitTier::pending_tierup`]).
 #[derive(Clone, Copy)]
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
@@ -13752,7 +13752,7 @@ enum TierUpDst {
 struct Suspended {
     /// The call's interpreted continuation, its parked op rewound.
     vm: Vm,
-    /// Where the leaf's results land, and their types ([`CoopSched::pending_tierup`]).
+    /// Where the leaf's results land, and their types ([`EmitTier::pending_tierup`]).
     dst: TierUpDst,
     results: Box<[ValType]>,
     /// A process the call asked for ([`Handoff::Spawn`]), which the pump starts before the call runs
@@ -13852,13 +13852,10 @@ fn park_task(
     tasks[ti].state = state;
 }
 
-/// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
-/// resumable-across-FFI tier-up driver (#926 slice 2) can own it between host round-trips. `drive`
-/// builds one with [`new`](CoopSched::new) and runs it to completion with [`pump`](CoopSched::pump);
-/// the fields are exactly the run-shared locals `drive` used to hold — the task set, the run-shared
-/// §12 fiber registry (+ its durable parallel arrays), the §14 confined child environments, the
-/// fork/teardown bookkeeping, and the logical clock.
-struct CoopSched {
+/// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
+/// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
+/// child environments, the fork/teardown bookkeeping, and the logical clock.
+struct SchedCore {
     /// The live vCPUs: the root task (index 0) and its `thread.spawn`/`instantiate` descendants.
     tasks: Vec<TaskSlot>,
     /// §14 `instantiate` children's confined environments (handle = `env` index). The root and its
@@ -13888,6 +13885,12 @@ struct CoopSched {
     /// The scheduler's logical clock (advanced only when no task is runnable, to the earliest due
     /// `wait` deadline).
     clock: u64,
+}
+
+/// The cooperative pump's state for the host's emitted tier (#926): which module-0 calls tier up,
+/// the leaf emitter, the one outstanding host round-trip, the JIT table mirror and an emitted
+/// invoke's fiber registry. Inert on the native `drive`.
+struct EmitTier {
     /// #926 slice 2: wasm-JIT tier-up eligibility for this run's **module-0** tasks (the root and its
     /// same-module `thread.spawn` descendants). `None` ⇒ everything interprets, exactly the native
     /// `drive` (which never sets it). When set, each qualifying task's `Vm` carries it, so a direct
@@ -13899,15 +13902,17 @@ struct CoopSched {
     page_checked: bool,
     /// #1896: the host's emitter for leaf images ([`TierUpConfig::leaf`]); `None` interprets them.
     leaf: Option<LeafEmitter>,
-    /// The task currently paused on a surfaced tier-up, awaiting [`deliver_tierup`](Self::deliver_tierup):
-    /// `(task index, where its results land, result types)`. At most one is ever outstanding —
-    /// the driver services one tier-up round-trip before pumping again — so a single slot suffices.
-    /// `None` between round-trips (and always, on the native driver).
+    /// The task currently paused on a surfaced tier-up, awaiting
+    /// [`deliver_tierup`](CoopSched::deliver_tierup): `(task index, where its results land, result
+    /// types)`. At most one is ever outstanding — the driver services one tier-up round-trip before
+    /// pumping again — so a single slot suffices. `None` between round-trips (and always, on the
+    /// native driver).
     pending_tierup: Option<(usize, TierUpDst, Box<[ValType]>)>,
     /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
-    /// [`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals): `(task index, dst slot, result
-    /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
-    /// invoke are never outstanding at once: each is one `pump` yield). `None` off the browser driver.
+    /// [`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals): `(task index, dst slot,
+    /// result types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a
+    /// tier-up and an invoke are never outstanding at once: each is one `pump` yield). `None` off
+    /// the browser driver.
     pending_jit: Option<(usize, usize, Box<[ValType]>)>,
     /// #926 slice 2f / #1233 — the driver-table **slot → unit-identity mirror** for the browser B2
     /// coop driver: `slot_units[s]` is the `(domain, unit)` a guest `Jit.install`ed at dispatch slot
@@ -13929,11 +13934,25 @@ struct CoopSched {
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
     /// fiber one callback parks is resumable by a later bounce of the *same* invoke), then it is cleared
-    /// when the invoke resolves ([`deliver_jit_invoke_vals`](Self::deliver_jit_invoke_vals) / `_trap`) —
-    /// so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s loop-local registry
-    /// does. A tier-up region's bounces use the run-level `fibers` instead (a parked fiber persists for
-    /// the run to resume). Empty except during an outstanding invoke; always empty on the native `drive`.
+    /// when the invoke resolves ([`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals) /
+    /// `_trap`) — so an invoke's fibers die with it, exactly as the interpreted `run_invoke`'s
+    /// loop-local registry does. A tier-up region's bounces use the run-level `fibers` instead (a
+    /// parked fiber persists for the run to resume). Empty except during an outstanding invoke;
+    /// always empty on the native `drive`.
     invoke_fibers: FiberTables,
+    /// #1954 — the root program's leaf start, when the host's emitter took the root image
+    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
+    root_leaf: Option<LeafStart>,
+}
+
+/// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
+/// resumable-across-FFI tier-up driver (#926 slice 2) can own it between host round-trips. `drive`
+/// builds one with [`new`](CoopSched::new) and runs it to completion with
+/// [`pump`](CoopSched::pump). It is the run's scheduling [`SchedCore`], the emitted tier's
+/// [`EmitTier`], and the session's flags.
+struct CoopSched {
+    core: SchedCore,
+    emit: EmitTier,
     /// #1122 route (a) — when set, an all-parked, externally-wakeable settle yields
     /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
     /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
@@ -13946,9 +13965,6 @@ struct CoopSched {
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
     /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
     freeze_on_quiesce: bool,
-    /// #1954 — the root program's leaf start, when the host's emitter took the root image
-    /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
-    root_leaf: Option<LeafStart>,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -14351,32 +14367,38 @@ impl CoopSched {
         }
 
         Ok(CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            dead_envs,
-            forked_twins,
-            hooked_twins,
-            released_envs,
-            clock,
-            eligible,
-            page_checked,
-            leaf,
-            pending_tierup: None,
-            pending_jit: None,
-            // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
-            // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
-            slot_units: vec![None; 1usize << host.jit_table_log2()],
-            table_gen: 0,
-            // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
-            invoke_fibers: FiberTables::default(),
+            core: SchedCore {
+                tasks,
+                extra_envs,
+                fibers,
+                fiber_sp,
+                fiber_meta,
+                dead_envs,
+                forked_twins,
+                hooked_twins,
+                released_envs,
+                clock,
+            },
+            emit: EmitTier {
+                eligible,
+                page_checked,
+                leaf,
+                pending_tierup: None,
+                pending_jit: None,
+                // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a
+                // `Jit.install`'s returned slot always indexes it. `1 << 0 == 1` and unused on the
+                // native `drive`.
+                slot_units: vec![None; 1usize << host.jit_table_log2()],
+                table_gen: 0,
+                // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
+                // bounces.
+                invoke_fibers: FiberTables::default(),
+                root_leaf: None,
+            },
             suspend_on_idle: false,
             slice_left: None,
             freeze_on_quiesce: host.is_durable()
                 && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
-            root_leaf: None,
         })
     }
 
@@ -14406,7 +14428,7 @@ impl CoopSched {
             Err(_) => true,
         };
         if ended {
-            refund_ended_windows(&mut self.tasks, root, &mut self.extra_envs, true);
+            refund_ended_windows(&mut self.core.tasks, root, &mut self.core.extra_envs, true);
         }
         step
     }
@@ -14421,35 +14443,16 @@ impl CoopSched {
         budget: u64,
     ) -> Result<CoopStep, Trap> {
         let CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            dead_envs,
-            forked_twins,
-            hooked_twins,
-            released_envs,
-            clock,
-            eligible,
-            page_checked,
-            leaf,
-            pending_tierup,
-            pending_jit,
-            slot_units,
-            table_gen,
-            // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
-            // callbacks), never touched by the scheduler loop itself.
-            invoke_fibers: _,
+            core,
+            emit,
             suspend_on_idle,
             slice_left,
             freeze_on_quiesce,
-            root_leaf,
         } = self;
         // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
         // (over a window one bound cannot describe it runs interpreted instead, as an exec'd leaf).
-        if let Some(start) = root_leaf.take() {
-            if let Some(step) = leaf_step(start, 0, mem.as_ref(), pending_tierup) {
+        if let Some(start) = emit.root_leaf.take() {
+            if let Some(step) = leaf_step(start, 0, mem.as_ref(), &mut emit.pending_tierup) {
                 return Ok(step);
             }
         }
@@ -14460,6 +14463,23 @@ impl CoopSched {
         // long-Runnable high-index one).
         let mut last_pick: usize = 0;
         loop {
+            let SchedCore {
+                tasks,
+                extra_envs,
+                fibers,
+                fiber_sp,
+                fiber_meta,
+                dead_envs,
+                forked_twins,
+                hooked_twins,
+                released_envs,
+                clock,
+            } = &mut *core;
+            let EmitTier {
+                leaf,
+                pending_tierup,
+                ..
+            } = &mut *emit;
             // #1122 — the external-wake generation, snapshotted FIRST, before any of this settle's
             // reads: the all-parked block below waits for a ring newer than this, so every fact an
             // embedder door raises and then rings for — bytes fed to a pipe, a deliverable signal,
@@ -14873,1017 +14893,19 @@ impl CoopSched {
             };
             // The step is over: what follows may lock any domain's cell, this task's included.
             drop(guard);
-            match stop {
-                Err(trap) => {
-                    // The first fault recorded wins; the run entry clears the slot beforehand.
-                    if let Some(a) = fault {
-                        super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
-                    }
-                    complete(tasks, ti, Err(trap))
-                }
-                // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
-                // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
-                // thread; this task resumes on a later turn.
-                // A sliced pump whose slice is spent returns here instead, to its embedder.
-                Ok(VcpuStop::Preempted) => {
-                    if *slice_left == Some(0) {
-                        return Ok(CoopStep::Paused);
-                    }
-                }
-                Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
-                // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
-                // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
-                // past the call, so the task is resumable with just the result slots filled. Stash the
-                // delivery target — `(task, dst, result types)` — and surface the region to the driver;
-                // `deliver_tierup` writes the emitted results back into `tasks[ti].vm.vt.active` and the next
-                // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
-                // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
-                // no task is eligible, so this arm is never reached (the bitmap is `None`).
-                Ok(VcpuStop::TierUp {
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                }) => {
-                    debug_assert!(
-                        pending_tierup.is_none(),
-                        "a tier-up is already outstanding — deliver_tierup was skipped"
-                    );
-                    *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
-                    return Ok(CoopStep::TierUp {
-                        module: 0,
-                        func,
-                        argv,
-                        mapped,
-                    });
-                }
-                // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
-                // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
-                // interrupts it (the re-run completes `-EINTR`), exactly like a pipe park. Invariant 14:
-                // the tree-walker's stdin park, carried to the cooperative driver.
-                // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and its
-                // resumer runs on (or idles on it, under a blocking resume). Fiber 0's park is its
-                // task's (the arms below). A vanished pipe's op just re-runs, and fails closed.
-                Ok(
-                    stop @ (VcpuStop::PipeRead { .. }
-                    | VcpuStop::PipeWrite { .. }
-                    | VcpuStop::StdinPark),
-                ) if tasks[ti].vm.vt.active_id != ROOT_FIBER => {
-                    host_park_fiber(tasks, ti, fibers, fiber_sp, mem, extra_envs, root, &stop);
-                }
-                Ok(VcpuStop::StdinPark) => {
-                    tasks[ti].state = TaskState::BlockedStdin;
-                }
-                // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
-                // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
-                // top-of-loop scan re-marks it `Runnable` once the fiber wakes.
-                Ok(VcpuStop::BlockOnFiber { fiber }) => {
-                    tasks[ti].state = TaskState::BlockedOnFiber { fiber };
-                }
-                // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
-                Ok(VcpuStop::SvcWait) => {
-                    tasks[ti].state = TaskState::BlockedSvc;
-                }
-                Ok(VcpuStop::LiveCall {
-                    ticket,
-                    callee,
-                    dst,
-                }) => {
-                    // The enqueue already happened in the op exec (holding only the callee's lock).
-                    // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
-                    // `svc_wake` — then park the caller on its ticket. The callee is a child env's
-                    // domain, or the root's: a child calling back through a self-serve grant (#744).
-                    let callee_env = domain_of(root, extra_envs, &callee);
-                    // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
-                    // already-torn-down callee can never be replied — complete with the probeable
-                    // errno instead of parking forever (the tree-walker's dead-callee park probe).
-                    if callee_env.flatten().is_some_and(|k| dead_envs.contains(&k)) {
-                        tasks[ti].deliver(dst, Reg::from_i64(super::CAP_REVOKED));
-                        continue;
-                    }
-                    if let Some(env) = callee_env {
-                        wake_serve_loops(tasks, env);
-                    }
-                    tasks[ti].state = TaskState::BlockedTicket {
-                        ticket,
-                        callee,
-                        dst,
-                    };
-                }
-                Ok(VcpuStop::CapPending { id, dst }) => {
-                    // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
-                    // (`CapParked` — the slice-5a contract; the ordered drain right after the
-                    // park is the register-then-recheck closing the completion-raced-the-park
-                    // window). The root keeps the inline wait (guest-invisible — the oracle
-                    // parks the vCPU here instead; the cooperative driver has nothing else to
-                    // run on this task anyway). Two more inline cases, both mirroring the
-                    // oracle's predicate: a durable run (`freeze_drive` has no cap-park
-                    // re-derivation — the freeze must never meet one) and a confined
-                    // `instantiate` child (its completions live on ITS host; keeping the child
-                    // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
-                    let durable = root.lock_unpoisoned().is_durable();
-                    if tasks[ti].vm.vt.active_id != ROOT_FIBER
-                        && !durable
-                        && tasks[ti].env.is_none()
-                    {
-                        let comps = root.lock_unpoisoned().completions();
-                        let k = tasks[ti].vm.vt.active_id;
-                        // The drain right after the park is the register-then-recheck: a completion
-                        // that raced the park wakes the fiber at once.
-                        if let Some(k) = park_running_fiber(
-                            &mut tasks[ti].vm.vt,
-                            fibers,
-                            fiber_sp,
-                            mem,
-                            durable,
-                            true,
-                            |vm| FiberState::CapParked {
-                                vm,
-                                dst,
-                                id,
-                                woken: None,
-                            },
-                            |fibers| {
-                                drain_cap_parked(fibers, &comps);
-                                matches!(
-                                    fibers.get(k),
-                                    Some(FiberState::CapParked { woken: Some(_), .. })
-                                )
-                            },
-                        ) {
-                            tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
-                        }
-                    } else if tasks[ti].env.is_none()
-                        && !durable
-                        && root.lock_unpoisoned().completions().is_host_owned(id)
-                    {
-                        // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
-                        // powerbox): park the task until the embedder answers it. The pump surfaces
-                        // the park once nothing else can run.
-                        tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
-                    } else {
-                        let comps = task_host(root, extra_envs, tasks[ti].env)
-                            .lock_unpoisoned()
-                            .completions();
-                        // #1366: a host-completed punt no one here can surface — decline. (A
-                        // confined child's host never admits one; a durable run's freeze cannot
-                        // meet a park.)
-                        match comps.wait_unless_host_owned(id) {
-                            Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
-                            None => complete(tasks, ti, Err(Trap::CapFault)),
-                        }
-                    }
-                }
-                Ok(VcpuStop::ChildOffer { child, export, dst }) => {
-                    // Mint a live-callee offer over a running child's export: shape from the
-                    // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
-                    // order), interned structurally into the wirer's table. A bad child handle /
-                    // no such export is a probeable -EINVAL, matching the oracle — and so is a
-                    // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
-                    // offer into itself, so a step never locks its own cell twice.
-                    let callee = usize::try_from(child)
-                        .ok()
-                        .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
-                        .and_then(|cidx| tasks[cidx].env)
-                        .filter(|&k| Some(k) != tasks[ti].env)
-                        .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
-                    let cap = callee.and_then(|callee: DomainCell| {
-                        let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
-                        task_host(root, extra_envs, tasks[ti].env)
-                            .lock_unpoisoned()
-                            .wire_live_impl(&callee, export, &names, &sigs)
-                            .ok()
-                    });
-                    tasks[ti].deliver(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
-                }
-                Ok(VcpuStop::CloneCaller {
-                    reply_orig,
-                    reply_twin,
-                    dst,
-                    has_result,
-                }) => {
-                    // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
-                    // parked on this handler's dispatch into a live **twin** (private window +
-                    // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
-                    // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
-                    // same fork `call.cap`. Fail-closed to a single reply on any shape the driver can't
-                    // duplicate — never a hang, mirroring the oracle's degrade (temen-interp
-                    // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
-                    let result: i64 = 'fork: {
-                        // The running handler's dispatch ticket names the parked caller; outside a
-                        // handler there is none → `-EINVAL`, exactly as the oracle.
-                        let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
-                            break 'fork super::EINVAL;
-                        };
-                        // The server (this task) is the callee the caller parked on. In the fork
-                        // topology the server is a spawned child with an `Arc` host (never the root).
-                        let Some(server_env) = tasks[ti].env else {
-                            break 'fork super::EINVAL;
-                        };
-                        let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
-                        // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
-                        // the caller has already parked (it enqueued + woke us before we ran), so a miss
-                        // is defensive → degrade.
-                        let caller_ti = tasks.iter().position(|t| {
-                            matches!(&t.state,
-                            TaskState::BlockedTicket { ticket: tk, callee, .. }
-                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
-                        });
-                        let degrade = |tasks: &mut Vec<TaskSlot>,
-                                       caller_ti: Option<usize>|
-                         -> i64 {
-                            // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
-                            // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
-                            let fallback = reply_orig.unwrap_or(super::EAGAIN);
-                            if let Some(cti) = caller_ti {
-                                if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state
-                                {
-                                    tasks[cti].deliver(cdst, Reg::from_i64(fallback));
-                                    tasks[cti].state = TaskState::Runnable;
-                                }
-                            }
-                            reply_orig.map_or(super::EAGAIN, |_| 0)
-                        };
-                        let Some(caller_ti) = caller_ti else {
-                            break 'fork degrade(tasks, None);
-                        };
-                        let TaskState::BlockedTicket {
-                            dst: caller_dst, ..
-                        } = tasks[caller_ti].state
-                        else {
-                            break 'fork super::EINVAL;
-                        };
-                        let caller_env = tasks[caller_ti].env;
-                        // Only a bare root caller (no spawned children/threads, no live fiber chain)
-                        // forks faithfully — the oracle's `bare` gate. Anything else degrades.
-                        let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vm.vt);
-                        // Duplicate the caller's window (private copy — fork does not share memory) and
-                        // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
-                        // or a non-forkable window/powerbox fails closed to a single reply.
-                        // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
-                        // here and that push, so the fork factories learn it up front (#863 slice 2).
-                        let twin_pid = tasks.len() as u64;
-                        // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
-                        let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
-                            caller_env.and_then(|ck| {
-                                let env = &extra_envs[ck];
-                                let (twin_mem, twin_host, live) =
-                                    fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
-                                Some((ck, twin_mem, twin_host, live))
-                            })
-                        } else {
-                            None
-                        };
-                        let Some((ck, twin_mem, twin_host, live)) = forked else {
-                            break 'fork degrade(tasks, Some(caller_ti));
-                        };
-                        // The twin's continuation is the caller's, with `reply_twin` injected at the
-                        // caller's reply slot.
-                        let mut twin_vt =
-                            twin_task(&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
-                        // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
-                        // keep an inherited bitmap only if its private `fork_private` window is
-                        // servable (flat; the owned-flat twin backing makes the tier-up shapes so
-                        // on every target); a `Paged` twin window strips it and interprets,
-                        // fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
-                        }
-                        // The twin is its own domain: a fresh env over the private window + duplicated
-                        // powerbox, its own dispatch table seeded with the caller's installs (#1297),
-                        // the caller's env fuel.
-                        let twin_table = extra_envs[ck].table.fork();
-                        let twin_eidx = extra_envs.len();
-                        let program = extra_envs[ck].program;
-                        extra_envs.push(ChildEnv {
-                            mem: twin_mem,
-                            host: twin_host.into_cell(),
-                            table: twin_table,
-                            fuel: extra_envs[ck].fuel.for_thread(),
-                            fibers: FiberTables::default(),
-                            spawner: None,
-                            nested: false,
-                            program,
-                        });
-                        let twin_ti = tasks.len();
-                        tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
-                        // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
-                        // its exit status to the parent (FORK.md §8.6); retired when reaped.
-                        forked_twins.insert(twin_ti);
-                        // Deliver the original's reply and re-run it: explicit `reply_orig`, or pid mode
-                        // = the twin's task id (parent-sees-pid). The handler's own return still writes
-                        // the ticket's completion cell, but the caller is now `Runnable` (not
-                        // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
-                        let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
-                        tasks[caller_ti].deliver(caller_dst, Reg::from_i64(orig_reply));
-                        tasks[caller_ti].state = TaskState::Runnable;
-                        twin_ti as i64
-                    };
-                    if has_result {
-                        tasks[ti].deliver(dst, Reg::from_i64(result));
-                    }
-                }
-                Ok(VcpuStop::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                }) => {
-                    // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
-                    // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
-                    // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
-                    // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
-                    let result: i64 = 'reap: {
-                        let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
-                            break 'reap super::EINVAL;
-                        };
-                        let Some(server_env) = tasks[ti].env else {
-                            break 'reap super::EINVAL;
-                        };
-                        let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
-                        let caller_ti = tasks.iter().position(|t| {
-                            matches!(&t.state,
-                            TaskState::BlockedTicket { ticket: tk, callee, .. }
-                                if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
-                        });
-                        // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
-                        // handler's own return delivers to the still-parked caller (the normal serve path).
-                        let Some(pid_us) = usize::try_from(pid)
-                            .ok()
-                            .filter(|p| forked_twins.contains(p))
-                        else {
-                            break 'reap super::ECHILD;
-                        };
-                        // The cooperative driver parks the caller before the handler runs, so a miss is
-                        // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
-                        let Some(caller_ti) = caller_ti else {
-                            break 'reap super::EAGAIN;
-                        };
-                        let TaskState::BlockedTicket {
-                            dst: caller_dst, ..
-                        } = tasks[caller_ti].state
-                        else {
-                            break 'reap super::EINVAL;
-                        };
-                        // Twin finished → deliver its status now and retire it; else park the caller on it
-                        // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
-                        // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
-                        // the settle scan never claims it (harmless, mirroring `clone_caller`).
-                        if let TaskState::Done(res) = &tasks[pid_us].state {
-                            let status = super::reap_status(res);
-                            forked_twins.remove(&pid_us);
-                            tasks[caller_ti].deliver(caller_dst, Reg::from_i64(status));
-                            tasks[caller_ti].state = TaskState::Runnable;
-                            status
-                        } else {
-                            tasks[caller_ti].state = TaskState::BlockedReap {
-                                pid: pid_us,
-                                dst: caller_dst,
-                            };
-                            0
-                        }
-                    };
-                    if has_result {
-                        tasks[ti].deliver(dst, Reg::from_i64(result));
-                    }
-                }
-                Ok(VcpuStop::Exec {
-                    cmd,
-                    grants_ptr,
-                    grants_n,
-                    entry,
-                    size_log2,
-                    dst,
-                    personality,
-                }) => {
-                    // FORK.md §8.6 — `execve` image-replace (#1080). Every refusal writes a probeable
-                    // errno to `dst` and lets the caller run on (POSIX: `execve` returns only on
-                    // failure); a success swaps this task's activation to the command and never returns.
-                    macro_rules! refuse {
-                        ($e:expr) => {{
-                            tasks[ti].deliver(dst, Reg::from_i32($e as i32));
-                            continue;
-                        }};
-                    }
-                    // Admissible from a clean root computation only (no serve handler, root fiber, a
-                    // non-durable domain) — the tree-walker's `clean_root`. Both a **root-context** exec
-                    // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
-                    // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
-                    // differ only in where the rebuilt activation's window/host/table live.
-                    let clean = tasks[ti].vm.vt.active.serve_ticket.is_none()
-                        && tasks[ti].vm.vt.active_id == ROOT_FIBER
-                        && !root.lock_unpoisoned().is_durable();
-                    if !clean {
-                        refuse!(super::EINVAL);
-                    }
-                    // The build (resolve + compile + admit + powerbox + personality carry + image
-                    // materialize) runs against the exec'ing task's own window + powerbox, then the
-                    // rebuilt activation is installed where its `env` points.
-                    // The rebuilt activation lands where the task's `env` points, with the window the
-                    // image was built in, which replaces the caller's.
-                    let start = match tasks[ti].env {
-                        None => {
-                            // Root: build against the driver window/host, then migrate the task into a
-                            // confined env holding the command powerbox + its module table (the shared
-                            // `dom.table` maps module 0, not the pushed command).
-                            let built = exec_image_build(
-                                &mut root.lock_unpoisoned(),
-                                mem.as_ref(),
-                                dom,
-                                cmd,
-                                grants_ptr,
-                                grants_n,
-                                entry,
-                                size_log2,
-                                personality,
-                                leaf.as_ref(),
-                            );
-                            match built {
-                                Err(e) => refuse!(e),
-                                Ok(built) => {
-                                    tasks[ti].vm.vt = built.vt;
-                                    // The driver window is released for the image's own.
-                                    drop(mem.take());
-                                    let eidx = extra_envs.len();
-                                    extra_envs.push(ChildEnv {
-                                        mem: Some(built.mem),
-                                        host: built.host.into_cell(),
-                                        table: built.table,
-                                        fuel: fuel.for_thread(),
-                                        fibers: FiberTables::default(),
-                                        spawner: None,
-                                        nested: false,
-                                        program: tasks[ti].vm.vt.active.module as u32,
-                                    });
-                                    tasks[ti].env = Some(eidx);
-                                    built.leaf
-                                }
-                            }
-                        }
-                        Some(k) => {
-                            // Fork twin: build against its confined env (its powerbox carries the
-                            // personality), then overwrite the env's window, host and table — the fuel
-                            // and task id are kept.
-                            let host_arc = std::sync::Arc::clone(&extra_envs[k].host);
-                            let built = {
-                                let mut g = host_arc.lock_unpoisoned();
-                                exec_image_build(
-                                    &mut g,
-                                    extra_envs[k].mem.as_ref(),
-                                    dom,
-                                    cmd,
-                                    grants_ptr,
-                                    grants_n,
-                                    entry,
-                                    size_log2,
-                                    personality,
-                                    leaf.as_ref(),
-                                )
-                            };
-                            match built {
-                                Err(e) => refuse!(e),
-                                Ok(built) => {
-                                    tasks[ti].vm.vt = built.vt;
-                                    extra_envs[k].host = built.host.into_cell();
-                                    extra_envs[k].table = built.table;
-                                    extra_envs[k].mem = Some(built.mem);
-                                    extra_envs[k].program = tasks[ti].vm.vt.active.module as u32;
-                                    built.leaf
-                                }
-                            }
-                        }
-                    };
-                    if let Some(start) = start {
-                        let win = tasks[ti].env.and_then(|k| extra_envs[k].mem.as_ref());
-                        if let Some(step) = leaf_step(start, ti, win, pending_tierup) {
-                            return Ok(step);
-                        }
-                    }
-                }
-                Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
-                    // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a request
-                    // from a fiber keeps its placeholder, and a serve handler is not a clean root.
-                    if tasks[ti].vm.vt.active_id != ROOT_FIBER {
-                        tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
-                        continue;
-                    }
-                    if tasks[ti].vm.vt.active.serve_ticket.is_some() {
-                        tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
-                        continue;
-                    }
-                    let (r, step) = spawn_task(
-                        tasks,
-                        extra_envs,
-                        forked_twins,
-                        pending_tierup,
-                        leaf.as_ref(),
-                        dom,
-                        mem,
-                        root,
-                        fuel,
-                        ti,
-                        cmd,
-                        plan,
-                    );
-                    tasks[ti].deliver(dst, Reg::from_i64(r));
-                    if let Some(step) = step {
-                        return Ok(step);
-                    }
-                }
-                Ok(VcpuStop::ForkSelf { dst }) => {
-                    // #799/#1080 — personality `fork()`: duplicate THIS task into a twin (private window
-                    // copy + forked powerbox). The parent (`ti`) keeps running with the twin's pid; the
-                    // twin resumes at the same op (pc already advanced) with `0`. A non-bare or
-                    // non-forkable caller fails closed to `-EAGAIN` (a value, never a hang — invariant 5).
-                    // The bytecode port of the tree-walker's `Blocked::ForkSelf` → `fork_vcpu` engine.
-                    // The twin's **personality pid** is its task index + 1: the process table's root is
-                    // pid 1 (grant) at task index 0, so `pid = index + 1` aligns the two spaces (twins
-                    // get 2, 3, … — never colliding with the root's 1), and a `waitpid(pid)` maps back to
-                    // task index `pid - 1` (the reap settle below). `twin_ti` stays the raw task index.
-                    let twin_ti = tasks.len();
-                    let twin_pid = twin_ti as u64 + 1;
-                    // The window + powerbox to duplicate: a confined child from its `extra_env`, or a
-                    // **root** caller (`env: None`, e.g. `bash -c` forking) from the driver window/host.
-                    // The twin shares the caller's budget node (`fork_powerbox`), so it draws from it
-                    // as a thread would (#1944 slice 3). The live cap is checked first, as the oracle's
-                    // `fork_vcpu` checks it (#2006).
-                    let env = tasks[ti].env;
-                    let room = fork_bare(&tasks[ti].threads, &tasks[ti].vm.vt)
-                        && live_tasks(tasks) < super::MAX_VCPUS;
-                    let forked = if room {
-                        let win = match env {
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                            None => mem.as_ref(),
-                        };
-                        fork_process(task_host(root, extra_envs, env), win, twin_pid)
-                    } else {
-                        None
-                    };
-                    match forked {
-                        None => {
-                            tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
-                        }
-                        Some((twin_mem, twin_host, live)) => {
-                            // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
-                            // park (a bash pipeline subshell is a twin that forks and waits its
-                            // command), and its signal doors on the run's bell.
-                            wire_process(&twin_host, root);
-                            // The return-twice `0`; the parent keeps the twin's pid, set below.
-                            let mut twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0);
-                            // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
-                            // may keep it only if its OWN private window (`fork_private`, pushed into
-                            // `extra_envs` below) is servable — the driver then answers each of the
-                            // twin's events over that window via the pending-env routing. The
-                            // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
-                            // on every target; a twin still on the `Paged` fallback (unbounded
-                            // reservation, allocation failure) is not: strip the bitmap so it
-                            // interprets, fail-closed.
-                            if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                                twin_vt.active.jit_eligible = None;
-                                twin_vt.active.jit_page_checked = false;
-                            }
-                            // #1297: the twin's own dispatch table, seeded with the caller's installs.
-                            let (twin_table, twin_fuel, program) = match env {
-                                Some(k) => (
-                                    extra_envs[k].table.fork(),
-                                    extra_envs[k].fuel.for_thread(),
-                                    extra_envs[k].program,
-                                ),
-                                None => (dom.table.fork(), fuel.for_thread(), 0),
-                            };
-                            let twin_eidx = extra_envs.len();
-                            extra_envs.push(ChildEnv {
-                                mem: twin_mem,
-                                host: twin_host.into_cell(),
-                                table: twin_table,
-                                fuel: twin_fuel,
-                                fibers: FiberTables::default(),
-                                spawner: None,
-                                nested: false,
-                                program,
-                            });
-                            debug_assert_eq!(
-                                tasks.len(),
-                                twin_ti,
-                                "twin lands at its pre-read index"
-                            );
-                            tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
-                            forked_twins.insert(twin_ti);
-                            tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
-                        }
-                    }
-                }
-                Ok(VcpuStop::ReapWait { child }) => {
-                    // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
-                    // wake). Park until the named child completes; the settle scan re-admits it after
-                    // firing the twin's exit hooks, so the re-executed op finds the twin retired.
-                    let state = TaskState::BlockedReapPersonality { child };
-                    park_task(tasks, forked_twins, hooked_twins, ti, state);
-                }
-                Ok(VcpuStop::PipeRead { pipe }) => {
-                    // #1080 rung 4 — park this task on a blocking pipe read; the settle scan polls
-                    // `pipe_read_ready` and re-admits (the rewound read re-executes) when ready.
-                    tasks[ti].state = TaskState::BlockedPipeRead { pipe };
-                }
-                Ok(VcpuStop::PipeWrite { pipe }) => {
-                    tasks[ti].state = TaskState::BlockedPipeWrite { pipe };
-                }
-                Ok(VcpuStop::Spawn {
-                    func,
-                    sp,
-                    arg,
-                    dst,
-                    module,
-                }) => {
-                    let mut child = match thread_task(&dom.source, module as usize, func, sp, arg) {
-                        Ok(vt) => vt,
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    if live_tasks(tasks) >= super::MAX_VCPUS {
-                        complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
-                        continue;
-                    }
-                    // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
-                    // ceiling refuses it as the live cap does.
-                    let node = task_host(root, extra_envs, tasks[ti].env)
-                        .lock_unpoisoned()
-                        .own_node();
-                    let Some(live) = LiveVcpu::charge(node) else {
-                        complete(tasks, ti, Err(Trap::ThreadFault));
-                        continue;
-                    };
-                    // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
-                    // eligible calls too (the run's bitmap is per-module-0-function, shared across the
-                    // root and its same-module threads). A child spawned in another module (a confined
-                    // §22 unit spawning its own function) runs a different module, where the module-0
-                    // bitmap does not apply — leave it interpreting.
-                    //
-                    // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
-                    // inherit the bitmap exactly when that env's window is tier-up-servable — the
-                    // driver answers every per-event read (`win` base, mapped extent, page state) for
-                    // the pending task's env ([`CoopRun::pending_win`] and friends), so a §14
-                    // confined child's thread now tiers up over its own carve. A window the driver
-                    // cannot flatly address (a fork twin's `Paged` private copy on wasm) fails
-                    // closed to the interpreter, which is always right.
-                    if module == 0
-                        && tierup_servable(
-                            match tasks[ti].env {
-                                None => mem.as_ref(),
-                                Some(k) => extra_envs[k].mem.as_ref(),
-                            },
-                            mem.as_ref(),
-                        )
-                    {
-                        if let Some(e) = eligible.as_ref() {
-                            child.active.jit_eligible = Some(std::sync::Arc::clone(e));
-                            child.active.jit_page_checked = *page_checked;
-                        }
-                    }
-                    let cidx = tasks.len();
-                    // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
-                    // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
-                    child.active.tls = cidx as i64;
-                    // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
-                    // (the shared domain for a root-spawned thread, or the same confined `instantiate`
-                    // env for one spawned by a confined child).
-                    let env = tasks[ti].env;
-                    tasks.push(TaskSlot::new(child, env, live));
-                    let handle = tasks[ti].threads.len() as i32;
-                    tasks[ti].threads.push(Some(cidx));
-                    tasks[ti].deliver(dst, Reg::from_i32(handle));
-                }
-                // §14 confined children (ops 0, 5, 13, 17): admitted by the one shared
-                // `admit_confined_child` against the spawning task's own window, fuel and powerbox
-                // (#1727), then a task of this executor over its own environment — a nested child is
-                // its own domain (a fresh natural table over the module it runs, no installed §22
-                // units). `join` is the shared seam below.
-                Ok(VcpuStop::Instantiate { spawn, dst }) => {
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    let pfuel = match tasks[ti].env {
-                        None => fuel.can_burn(),
-                        Some(k) => extra_envs[k].fuel.can_burn(),
-                    };
-                    let spawner = &tasks[ti].vm.vt.active;
-                    let admitted = admit_confined_child(
-                        &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
-                        pm,
-                        pfuel,
-                        &dom.source,
-                        spawner,
-                        spawn,
-                    );
-                    let child = match admitted {
-                        Ok(Some(c)) => c,
-                        Ok(None) => {
-                            tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    // #816 env-routed tier-up: a same-module child runs the spawner's module, so the
-                    // run's bitmap applies to it too — inherited when the child's window is servable
-                    // (`nested_view` shares the parent backing, so a root-lineage carve always is; a
-                    // fork twin's descendant is gated by its backing like the twin). The driver serves
-                    // each of the child's tier-ups over its own carve via the pending-env routing
-                    // (`CoopRun::pending_win`/`mem_map_info`); the emitted module's per-access live
-                    // bound (elision off for instantiator-bearing modules, temen-wasm-jit
-                    // `elide_bound`) confines them to the carve.
-                    let tierup = match (&child.program, eligible.as_ref()) {
-                        (ChildProgram::Spawner(..), Some(e))
-                            if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
-                        {
-                            Some((std::sync::Arc::clone(e), *page_checked))
-                        }
-                        _ => None,
-                    };
-                    let started = coop_start_child(
-                        tasks,
-                        extra_envs,
-                        root,
-                        ti,
-                        &dom.source,
-                        child,
-                        spawn.entry,
-                        dst,
-                        tierup,
-                    );
-                    if let Err(t) = started {
-                        complete(tasks, ti, Err(t));
-                    }
-                }
-                // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
-                // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
-                // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
-                // Admission first (entry shape, the window = the module's declared memory, the args
-                // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
-                // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
-                // `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants (the op-11
-                // record format, fail-closed), and a pre-mapped `SharedRegion` staged and applied to
-                // the window before the child runs an op. `join` is the shared seam below.
-                Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
-                    let pm: Option<&Mem> = match tasks[ti].env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    // #2078 — a child of the spawning frame's own module runs it, as a same-module
-                    // confined child does: no second compile (#2143: an installed unit's, from a
-                    // frame of one).
-                    let spawner = spawner_module(&dom.source, &tasks[ti].vm.vt.active);
-                    let table = tasks[ti].env.map_or(&*dom.table, |k| &extra_envs[k].table);
-                    let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
-                    let admitted = admit_detached_in_process(
-                        &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
-                        pm,
-                        spawn,
-                        spawner,
-                        unit,
-                    );
-                    let child = match admitted {
-                        Ok(Some(c)) => c,
-                        Ok(None) => {
-                            tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-                            continue;
-                        }
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    };
-                    // #816 env-routed tier-up, as for a confined child: a child running the root's
-                    // unit inherits the run's bitmap when the driver can address its own window
-                    // flatly; any other window stays interpreted.
-                    let tierup = match (&child.program, eligible.as_ref()) {
-                        (ChildProgram::Spawner(0, _), Some(e))
-                            if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
-                        {
-                            Some((std::sync::Arc::clone(e), *page_checked))
-                        }
-                        _ => None,
-                    };
-                    let started = coop_start_child(
-                        tasks,
-                        extra_envs,
-                        root,
-                        ti,
-                        &dom.source,
-                        child,
-                        spawn.entry,
-                        dst,
-                        tierup,
-                    );
-                    if let Err(t) = started {
-                        complete(tasks, ti, Err(t));
-                    }
-                }
-                // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
-                // forged or spent handle is a `ThreadFault`, like `join`'s.
-                Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
-                    let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
-                    child_ctl(tasks, &spawners, ti, child, dst, ctl);
-                }
-                Ok(VcpuStop::Join { handle, dst, wait }) => {
-                    join_child(tasks, ti, handle, dst, wait)
-                }
-                Ok(VcpuStop::Wait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                }) => {
-                    let durable = || root.lock_unpoisoned().is_durable();
-                    // The wait is against THIS task's domain: the root's registry and window, or its
-                    // confined `instantiate` env's. A child's `wait` on its mapped ring flag must not
-                    // re-read an unrelated root byte.
-                    let (fibers, fiber_sp, mem) = match tasks[ti].env {
-                        None => (&mut *fibers, &mut *fiber_sp, &mut *mem),
-                        Some(e) => {
-                            let e = &mut extra_envs[e];
-                            (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
-                        }
-                    };
-                    futex_wait(
-                        tasks, ti, fibers, fiber_sp, mem, durable, true, *clock, base, expected,
-                        width, timeout, dst,
-                    );
-                }
-                Ok(VcpuStop::Notify { base, count, dst }) => {
-                    // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
-                    // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
-                    // from one child's window matches a waiter parked from another child's window on the
-                    // same `SharedRegion` byte.
-                    let win = |env: Option<usize>| match env {
-                        None => mem.as_ref(),
-                        Some(k) => extra_envs[k].mem.as_ref(),
-                    };
-                    let key = futex_key_in(win(tasks[ti].env), base);
-                    let want = count as u32;
-                    let mut woken = wake_waiters(tasks, key, want, win);
-                    // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
-                    // registry, then each child env's.
-                    let regs = fibers.iter_mut().chain(
-                        extra_envs
-                            .iter_mut()
-                            .flat_map(|e| e.fibers.fibers.iter_mut()),
-                    );
-                    woken += wake_fiber_waiters(regs, key, want - woken);
-                    tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
-                }
-                // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
-                // and its own dispatch table: a §14 child's is `extra_envs[k].table`, so its installs
-                // stay out of the parent's `call.dyn` (#1296). #926 slice 2f / #1233: the B2 mirror
-                // (`slot → (domain, unit)`, keyed on the unit so it survives the guest's `release`)
-                // lets the browser driver rebuild its `WebAssembly.Table` when it moves; it is the
-                // ROOT's emitted dispatch table, so only a root task's ops move it. The op itself
-                // always runs interpreted (a unit with a `call.cap` never emits): here between host
-                // events, or inside a tier-up region's bounce via `drive_nested`'s twin of these
-                // arms, after which the driver re-syncs before the emitted frame resumes.
-                Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                    let env = tasks[ti].env;
-                    let unit = task_host(root, extra_envs, env)
-                        .lock_unpoisoned()
-                        .resolve_jit_unit(h, code);
-                    let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
-                    let mut mirror = JitMirror {
-                        units: slot_units,
-                        gen: table_gen,
-                    };
-                    let mirror = env.is_none().then_some(&mut mirror);
-                    let active = &mut tasks[ti].vm.vt.active;
-                    if let Err(t) = jit_install(unit, &dom.source, table, mirror, active, dst) {
-                        complete(tasks, ti, Err(t));
-                        continue;
-                    }
-                }
-                Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                    let env = tasks[ti].env;
-                    let authority = task_host(root, extra_envs, env)
-                        .lock_unpoisoned()
-                        .resolve_jit_domain(h)
-                        .map(drop);
-                    let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
-                    let mut mirror = JitMirror {
-                        units: slot_units,
-                        gen: table_gen,
-                    };
-                    let mirror = env.is_none().then_some(&mut mirror);
-                    let active = &mut tasks[ti].vm.vt.active;
-                    let cleared =
-                        jit_uninstall(authority, &dom.source, table, slot, mirror, active, dst);
-                    if let Err(t) = cleared {
-                        complete(tasks, ti, Err(t));
-                        continue;
-                    }
-                }
-                Ok(VcpuStop::JitInvoke {
-                    h,
-                    code,
-                    argv,
-                    dst,
-                    params,
-                    results,
-                }) => {
-                    // #926 slice 2e — surface to the browser host when this run drives tier-up
-                    // (`eligible` set) and the unit has **emitted wasm** with an all-scalar signature
-                    // over a representable window: the host runs the emitted `f0` and delivers the
-                    // results back ([`deliver_jit_invoke_vals`]). Otherwise — the native `drive` (no
-                    // `eligible`), an interpreter-only unit (no emitted wasm), a non-scalar signature,
-                    // or an unrepresentable window — fall through to the interpreted service below,
-                    // which is always correct (the fail-closed default the single-vCPU pump also uses).
-                    let scalar = |t: &ValType| {
-                        matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
-                    };
-                    // A §14 child's invoke is serviced interpreted below, against its own window
-                    // and host (#1296); only the root's units surface to the emitted tier.
-                    let emittable = eligible.is_some()
-                        && tasks[ti].env.is_none()
-                        && params.iter().all(scalar)
-                        && results.iter().all(scalar);
-                    let surfaced = if emittable {
-                        // Resolve the unit's emitted wasm exactly as the browser FFI's resolver does
-                        // (`jit_unit_wasm`), and the #717 committed-extent bound over the run's window
-                        // (a `Jit.invoke` runs against the shared root powerbox/window).
-                        let mut g = root.lock_unpoisoned();
-                        let wasm = g.resolve_jit_domain(h).ok().and_then(|domain| {
-                            let (cd, cu) = g.resolve_jit_code(code).ok()?;
-                            (cd == domain).then(|| g.jit_unit_wasm_or_emit(cd, cu))?
-                            // #1301
-                        });
-                        drop(g);
-                        let mapped = match mem.as_ref() {
-                            None => Some(0),
-                            Some(m) if *page_checked => Some(m.reserved_size()),
-                            Some(m) => m.scalar_extent(),
-                        };
-                        wasm.zip(mapped)
-                    } else {
-                        None
-                    };
-                    if let Some((wasm, mapped)) = surfaced {
-                        *pending_jit = Some((ti, dst as usize, results.clone()));
-                        return Ok(CoopStep::JitInvoke {
-                            code,
-                            wasm,
-                            argv,
-                            params,
-                            results,
-                            mapped,
-                        });
-                    }
-                    // Interpreted ([`jit_invoke_unit`], [`run_invoke`]) over the TASK's window, table
-                    // and host: the root's, or a §14 child's own (`extra_envs[k]`) — a child's unit
-                    // never sees the parent's window.
-                    let env = tasks[ti].env;
-                    let unit = task_host(root, extra_envs, env)
-                        .lock_unpoisoned()
-                        .resolve_jit_unit(h, code);
-                    let (table, mem, host, parked) = match env {
-                        None => (&*dom.table, &mut *mem, &**root, FiberRegRef::Owned(fibers)),
-                        Some(k) => {
-                            let ChildEnv {
-                                mem,
-                                host,
-                                table,
-                                fibers,
-                                ..
-                            } = &mut extra_envs[k];
-                            (&*table, mem, &**host, FiberRegRef::Owned(&fibers.fibers))
-                        }
-                    };
-                    let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results)
-                        .and_then(|(umod, args)| {
-                            run_invoke(
-                                &dom.source,
-                                table,
-                                umod,
-                                &args,
-                                fuel,
-                                mem,
-                                &mut HostCell::Shared(host),
-                                Some(&Beneath::task(&tasks[ti].vm.vt, parked)),
-                            )
-                        });
-                    match ran {
-                        Ok(vals) => {
-                            let slots = vals.into_iter().map(val_to_slot);
-                            set_slot_results(&mut tasks[ti].vm.vt.active, dst, &results, slots);
-                        }
-                        Err(t) => {
-                            complete(tasks, ti, Err(t));
-                            continue;
-                        }
-                    }
-                }
+            // The first fault recorded wins; the run entry clears the slot beforehand.
+            if let Some(a) = fault {
+                super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
+            }
+            // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
+            // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
+            // thread; this task resumes on a later turn.
+            // A sliced pump whose slice is spent returns here instead, to its embedder.
+            if matches!(stop, Ok(VcpuStop::Preempted)) && *slice_left == Some(0) {
+                return Ok(CoopStep::Paused);
+            }
+            if let Some(step) = core.on_stop(emit, dom, mem, root, fuel, ti, stop) {
+                return Ok(step);
             }
         }
     }
@@ -15895,18 +14917,19 @@ impl CoopSched {
     /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
     fn deliver_tierup(&mut self, vals: &[i64]) {
         let (ti, dst, results) = self
+            .emit
             .pending_tierup
             .take()
             .expect("deliver_tierup with no pending tier-up");
         if vals.len() < results.len() {
-            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
         }
         let vals = results.iter().zip(vals).map(|(ty, v)| slot_to_val(*ty, *v));
         match dst {
             TierUpDst::Frame(dst) => {
                 for (i, v) in vals.enumerate() {
-                    self.tasks[ti]
+                    self.core.tasks[ti]
                         .vm
                         .vt
                         .active
@@ -15914,7 +14937,7 @@ impl CoopSched {
                 }
             }
             // #1896: the process ran whole: it returned from its entry.
-            TierUpDst::Entry { .. } => complete(&mut self.tasks, ti, Ok(vals.collect())),
+            TierUpDst::Entry { .. } => complete(&mut self.core.tasks, ti, Ok(vals.collect())),
         }
     }
 
@@ -15922,10 +14945,11 @@ impl CoopSched {
     /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
     fn deliver_tierup_trap(&mut self, trap: Trap) {
         let (ti, _dst, _results) = self
+            .emit
             .pending_tierup
             .take()
             .expect("deliver_tierup_trap with no pending tier-up");
-        complete(&mut self.tasks, ti, Err(trap));
+        complete(&mut self.core.tasks, ti, Err(trap));
     }
 
     /// #926 slice 2e — deliver a surfaced `Jit.invoke`'s emitted `f0` result slots into the paused
@@ -15933,17 +14957,18 @@ impl CoopSched {
     /// the invoking task's frame via `pending_jit`). A short reply traps the task.
     fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
         // #926 slice 2g: the emitted invoke resolved — its bounce registry dies with it (Vcpu parity).
-        self.invoke_fibers = FiberTables::default();
+        self.emit.invoke_fibers = FiberTables::default();
         let (ti, dst, results) = self
+            .emit
             .pending_jit
             .take()
             .expect("deliver_jit_invoke_vals with no pending invoke");
         if vals.len() < results.len() {
-            complete(&mut self.tasks, ti, Err(Trap::Malformed));
+            complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
         }
         for (i, ty) in results.iter().enumerate() {
-            self.tasks[ti].vm.vt.active.set(
+            self.core.tasks[ti].vm.vt.active.set(
                 dst as u32 + i as u32,
                 Reg::from_value(slot_to_val(*ty, vals[i])),
             );
@@ -15954,12 +14979,1045 @@ impl CoopSched {
     /// [`deliver_tierup_trap`](Self::deliver_tierup_trap)).
     fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
         // #926 slice 2g: the emitted invoke resolved (trapped) — its bounce registry dies with it.
-        self.invoke_fibers = FiberTables::default();
+        self.emit.invoke_fibers = FiberTables::default();
         let (ti, _dst, _results) = self
+            .emit
             .pending_jit
             .take()
             .expect("deliver_jit_invoke_trap with no pending invoke");
-        complete(&mut self.tasks, ti, Err(trap));
+        complete(&mut self.core.tasks, ti, Err(trap));
+    }
+}
+
+impl SchedCore {
+    /// The stop half of a pump round (#1414 3e): what a task's step stopped on, applied to the run,
+    /// one arm per stop (a park, a spawn, a fork, a live call, a futex op, a JIT op). `Some(step)`
+    /// pauses the pump for its host: a tier-up, a leaf start or an emitted `Jit.invoke`, recorded in
+    /// `emit`. A preempted task stays `Runnable`: who runs next is the executor's call.
+    ///
+    /// Inlined: the arms need an 8 KB frame, and set up on every stop it cost the pump's pingpong
+    /// benchmark 3%. Inside the caller the frame is set up once per pump call, as before the move.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn on_stop(
+        &mut self,
+        emit: &mut EmitTier,
+        dom: &Domain,
+        mem: &mut Option<Mem>,
+        root: &DomainCell,
+        fuel: &mut Fuel,
+        ti: usize,
+        stop: Result<VcpuStop, Trap>,
+    ) -> Option<CoopStep> {
+        let SchedCore {
+            tasks,
+            extra_envs,
+            fibers,
+            fiber_sp,
+            dead_envs,
+            forked_twins,
+            hooked_twins,
+            clock,
+            ..
+        } = self;
+        let EmitTier {
+            eligible,
+            page_checked,
+            leaf,
+            pending_tierup,
+            pending_jit,
+            slot_units,
+            table_gen,
+            ..
+        } = emit;
+        match stop {
+            Err(trap) => complete(tasks, ti, Err(trap)),
+            Ok(VcpuStop::Preempted) => {}
+            Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
+            // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
+            // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
+            // past the call, so the task is resumable with just the result slots filled. Stash the
+            // delivery target — `(task, dst, result types)` — and surface the region to the driver;
+            // `deliver_tierup` writes the emitted results back into `tasks[ti].vm.vt.active` and the next
+            // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
+            // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
+            // no task is eligible, so this arm is never reached (the bitmap is `None`).
+            Ok(VcpuStop::TierUp {
+                func,
+                argv,
+                dst,
+                results,
+                mapped,
+            }) => {
+                debug_assert!(
+                    pending_tierup.is_none(),
+                    "a tier-up is already outstanding — deliver_tierup was skipped"
+                );
+                *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
+                return Some(CoopStep::TierUp {
+                    module: 0,
+                    func,
+                    argv,
+                    mapped,
+                });
+            }
+            // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
+            // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
+            // interrupts it (the re-run completes `-EINTR`), exactly like a pipe park. Invariant 14:
+            // the tree-walker's stdin park, carried to the cooperative driver.
+            // #1952 — a fiber's pipe or stdin op that must wait parks the fiber alone, and its
+            // resumer runs on (or idles on it, under a blocking resume). Fiber 0's park is its
+            // task's (the arms below). A vanished pipe's op just re-runs, and fails closed.
+            Ok(
+                stop @ (VcpuStop::PipeRead { .. }
+                | VcpuStop::PipeWrite { .. }
+                | VcpuStop::StdinPark),
+            ) if tasks[ti].vm.vt.active_id != ROOT_FIBER => {
+                host_park_fiber(tasks, ti, fibers, fiber_sp, mem, extra_envs, root, &stop);
+            }
+            Ok(VcpuStop::StdinPark) => {
+                tasks[ti].state = TaskState::BlockedStdin;
+            }
+            // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
+            // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
+            // top-of-loop scan re-marks it `Runnable` once the fiber wakes.
+            Ok(VcpuStop::BlockOnFiber { fiber }) => {
+                tasks[ti].state = TaskState::BlockedOnFiber { fiber };
+            }
+            // §3.6 (I36 slice 2) — the serve/call/offer trio, cooperative form.
+            Ok(VcpuStop::SvcWait) => {
+                tasks[ti].state = TaskState::BlockedSvc;
+            }
+            Ok(VcpuStop::LiveCall {
+                ticket,
+                callee,
+                dst,
+            }) => {
+                // The enqueue already happened in the op exec (holding only the callee's lock).
+                // Wake any svc.wait-parked task of the callee's domain — the tree-walker's
+                // `svc_wake` — then park the caller on its ticket. The callee is a child env's
+                // domain, or the root's: a child calling back through a self-serve grant (#744).
+                let callee_env = domain_of(root, extra_envs, &callee);
+                // §12 teardown / D37 death-is-revocation (owner 2026-07-24): a call through an
+                // already-torn-down callee can never be replied — complete with the probeable
+                // errno instead of parking forever (the tree-walker's dead-callee park probe).
+                if callee_env.flatten().is_some_and(|k| dead_envs.contains(&k)) {
+                    tasks[ti].deliver(dst, Reg::from_i64(super::CAP_REVOKED));
+                    return None;
+                }
+                if let Some(env) = callee_env {
+                    wake_serve_loops(tasks, env);
+                }
+                tasks[ti].state = TaskState::BlockedTicket {
+                    ticket,
+                    callee,
+                    dst,
+                };
+            }
+            Ok(VcpuStop::CapPending { id, dst }) => {
+                // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
+                // (`CapParked` — the slice-5a contract; the ordered drain right after the
+                // park is the register-then-recheck closing the completion-raced-the-park
+                // window). The root keeps the inline wait (guest-invisible — the oracle
+                // parks the vCPU here instead; the cooperative driver has nothing else to
+                // run on this task anyway). Two more inline cases, both mirroring the
+                // oracle's predicate: a durable run (`freeze_drive` has no cap-park
+                // re-derivation — the freeze must never meet one) and a confined
+                // `instantiate` child (its completions live on ITS host; keeping the child
+                // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
+                let durable = root.lock_unpoisoned().is_durable();
+                if tasks[ti].vm.vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
+                    let comps = root.lock_unpoisoned().completions();
+                    let k = tasks[ti].vm.vt.active_id;
+                    // The drain right after the park is the register-then-recheck: a completion
+                    // that raced the park wakes the fiber at once.
+                    if let Some(k) = park_running_fiber(
+                        &mut tasks[ti].vm.vt,
+                        fibers,
+                        fiber_sp,
+                        mem,
+                        durable,
+                        true,
+                        |vm| FiberState::CapParked {
+                            vm,
+                            dst,
+                            id,
+                            woken: None,
+                        },
+                        |fibers| {
+                            drain_cap_parked(fibers, &comps);
+                            matches!(
+                                fibers.get(k),
+                                Some(FiberState::CapParked { woken: Some(_), .. })
+                            )
+                        },
+                    ) {
+                        tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
+                    }
+                } else if tasks[ti].env.is_none()
+                    && !durable
+                    && root.lock_unpoisoned().completions().is_host_owned(id)
+                {
+                    // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
+                    // powerbox): park the task until the embedder answers it. The pump surfaces
+                    // the park once nothing else can run.
+                    tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
+                } else {
+                    let comps = task_host(root, extra_envs, tasks[ti].env)
+                        .lock_unpoisoned()
+                        .completions();
+                    // #1366: a host-completed punt no one here can surface — decline. (A
+                    // confined child's host never admits one; a durable run's freeze cannot
+                    // meet a park.)
+                    match comps.wait_unless_host_owned(id) {
+                        Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
+                        None => complete(tasks, ti, Err(Trap::CapFault)),
+                    }
+                }
+            }
+            Ok(VcpuStop::ChildOffer { child, export, dst }) => {
+                // Mint a live-callee offer over a running child's export: shape from the
+                // CALLEE's module (fetched before the wirer's lock — the tree-walker's lock
+                // order), interned structurally into the wirer's table. A bad child handle /
+                // no such export is a probeable -EINVAL, matching the oracle — and so is a
+                // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
+                // offer into itself, so a step never locks its own cell twice.
+                let callee = usize::try_from(child)
+                    .ok()
+                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                    .and_then(|cidx| tasks[cidx].env)
+                    .filter(|&k| Some(k) != tasks[ti].env)
+                    .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
+                let cap = callee.and_then(|callee: DomainCell| {
+                    let (names, sigs) = callee.lock_unpoisoned().offer_shape(export)?;
+                    task_host(root, extra_envs, tasks[ti].env)
+                        .lock_unpoisoned()
+                        .wire_live_impl(&callee, export, &names, &sigs)
+                        .ok()
+                });
+                tasks[ti].deliver(dst, Reg::from_i32(cap.unwrap_or(super::EINVAL as i32)));
+            }
+            Ok(VcpuStop::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+                has_result,
+            }) => {
+                // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
+                // parked on this handler's dispatch into a live **twin** (private window +
+                // duplicated powerbox, its own env), deliver `reply_twin` to the twin and
+                // `reply_orig` (pid mode: the twin's task id) to the original; both resume past the
+                // same fork `call.cap`. Fail-closed to a single reply on any shape the driver can't
+                // duplicate — never a hang, mirroring the oracle's degrade (temen-interp
+                // `fork_parked_caller`). `reap` (fork+wait) is a later slice — such modules fold.
+                let result: i64 = 'fork: {
+                    // The running handler's dispatch ticket names the parked caller; outside a
+                    // handler there is none → `-EINVAL`, exactly as the oracle.
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                        break 'fork super::EINVAL;
+                    };
+                    // The server (this task) is the callee the caller parked on. In the fork
+                    // topology the server is a spawned child with an `Arc` host (never the root).
+                    let Some(server_env) = tasks[ti].env else {
+                        break 'fork super::EINVAL;
+                    };
+                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    // Locate the parked caller on `(ticket, this server)`. In the cooperative driver
+                    // the caller has already parked (it enqueued + woke us before we ran), so a miss
+                    // is defensive → degrade.
+                    let caller_ti = tasks.iter().position(|t| {
+                        matches!(&t.state,
+                        TaskState::BlockedTicket { ticket: tk, callee, .. }
+                            if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                    });
+                    let degrade = |tasks: &mut Vec<TaskSlot>, caller_ti: Option<usize>| -> i64 {
+                        // One reply to the caller, no twin. Explicit mode delivers `reply_orig`; pid
+                        // mode delivers `-EAGAIN` (POSIX fork failure). Returns the handler's result.
+                        let fallback = reply_orig.unwrap_or(super::EAGAIN);
+                        if let Some(cti) = caller_ti {
+                            if let TaskState::BlockedTicket { dst: cdst, .. } = tasks[cti].state {
+                                tasks[cti].deliver(cdst, Reg::from_i64(fallback));
+                                tasks[cti].state = TaskState::Runnable;
+                            }
+                        }
+                        reply_orig.map_or(super::EAGAIN, |_| 0)
+                    };
+                    let Some(caller_ti) = caller_ti else {
+                        break 'fork degrade(tasks, None);
+                    };
+                    let TaskState::BlockedTicket {
+                        dst: caller_dst, ..
+                    } = tasks[caller_ti].state
+                    else {
+                        break 'fork super::EINVAL;
+                    };
+                    let caller_env = tasks[caller_ti].env;
+                    // Only a bare root caller (no spawned children/threads, no live fiber chain)
+                    // forks faithfully — the oracle's `bare` gate. Anything else degrades.
+                    let bare = fork_bare(&tasks[caller_ti].threads, &tasks[caller_ti].vm.vt);
+                    // Duplicate the caller's window (private copy — fork does not share memory) and
+                    // powerbox (own handle namespace, shared `Arc` backings). A root caller (no env)
+                    // or a non-forkable window/powerbox fails closed to a single reply.
+                    // The twin's pid is its task index (`twin_ti` below); nothing is pushed between
+                    // here and that push, so the fork factories learn it up front (#863 slice 2).
+                    let twin_pid = tasks.len() as u64;
+                    // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
+                    let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
+                        caller_env.and_then(|ck| {
+                            let env = &extra_envs[ck];
+                            let (twin_mem, twin_host, live) =
+                                fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
+                            Some((ck, twin_mem, twin_host, live))
+                        })
+                    } else {
+                        None
+                    };
+                    let Some((ck, twin_mem, twin_host, live)) = forked else {
+                        break 'fork degrade(tasks, Some(caller_ti));
+                    };
+                    // The twin's continuation is the caller's, with `reply_twin` injected at the
+                    // caller's reply slot.
+                    let mut twin_vt =
+                        twin_task(&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
+                    // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
+                    // keep an inherited bitmap only if its private `fork_private` window is
+                    // servable (flat; the owned-flat twin backing makes the tier-up shapes so
+                    // on every target); a `Paged` twin window strips it and interprets,
+                    // fail-closed.
+                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                        twin_vt.active.jit_eligible = None;
+                        twin_vt.active.jit_page_checked = false;
+                    }
+                    // The twin is its own domain: a fresh env over the private window + duplicated
+                    // powerbox, its own dispatch table seeded with the caller's installs (#1297),
+                    // the caller's env fuel.
+                    let twin_table = extra_envs[ck].table.fork();
+                    let twin_eidx = extra_envs.len();
+                    let program = extra_envs[ck].program;
+                    extra_envs.push(ChildEnv {
+                        mem: twin_mem,
+                        host: twin_host.into_cell(),
+                        table: twin_table,
+                        fuel: extra_envs[ck].fuel.for_thread(),
+                        fibers: FiberTables::default(),
+                        spawner: None,
+                        nested: false,
+                        program,
+                    });
+                    let twin_ti = tasks.len();
+                    tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
+                    // Mark the twin reapable so a later servicer-side `wait()` (`reap`) can deliver
+                    // its exit status to the parent (FORK.md §8.6); retired when reaped.
+                    forked_twins.insert(twin_ti);
+                    // Deliver the original's reply and re-run it: explicit `reply_orig`, or pid mode
+                    // = the twin's task id (parent-sees-pid). The handler's own return still writes
+                    // the ticket's completion cell, but the caller is now `Runnable` (not
+                    // `BlockedTicket`), so the settle scan never claims it — harmless, no flag needed.
+                    let orig_reply = reply_orig.unwrap_or(twin_ti as i64);
+                    tasks[caller_ti].deliver(caller_dst, Reg::from_i64(orig_reply));
+                    tasks[caller_ti].state = TaskState::Runnable;
+                    twin_ti as i64
+                };
+                if has_result {
+                    tasks[ti].deliver(dst, Reg::from_i64(result));
+                }
+            }
+            Ok(VcpuStop::Reap {
+                pid,
+                dst,
+                has_result,
+            }) => {
+                // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
+                // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
+                // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
+                // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
+                let result: i64 = 'reap: {
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                        break 'reap super::EINVAL;
+                    };
+                    let Some(server_env) = tasks[ti].env else {
+                        break 'reap super::EINVAL;
+                    };
+                    let server_host = std::sync::Arc::clone(&extra_envs[server_env].host);
+                    let caller_ti = tasks.iter().position(|t| {
+                        matches!(&t.state,
+                        TaskState::BlockedTicket { ticket: tk, callee, .. }
+                            if *tk == ticket && std::sync::Arc::ptr_eq(callee, &server_host))
+                    });
+                    // The pid must be a twin this run minted; otherwise a genuine `-ECHILD`, which the
+                    // handler's own return delivers to the still-parked caller (the normal serve path).
+                    let Some(pid_us) = usize::try_from(pid)
+                        .ok()
+                        .filter(|p| forked_twins.contains(p))
+                    else {
+                        break 'reap super::ECHILD;
+                    };
+                    // The cooperative driver parks the caller before the handler runs, so a miss is
+                    // defensive → `-EAGAIN` (retryable, never a false `-ECHILD` — the twin is real).
+                    let Some(caller_ti) = caller_ti else {
+                        break 'reap super::EAGAIN;
+                    };
+                    let TaskState::BlockedTicket {
+                        dst: caller_dst, ..
+                    } = tasks[caller_ti].state
+                    else {
+                        break 'reap super::EINVAL;
+                    };
+                    // Twin finished → deliver its status now and retire it; else park the caller on it
+                    // (the settle scan wakes it on twin-exit). Either way the caller's reply is handled
+                    // here — the handler's own return lands on a caller no longer `BlockedTicket`, so
+                    // the settle scan never claims it (harmless, mirroring `clone_caller`).
+                    if let TaskState::Done(res) = &tasks[pid_us].state {
+                        let status = super::reap_status(res);
+                        forked_twins.remove(&pid_us);
+                        tasks[caller_ti].deliver(caller_dst, Reg::from_i64(status));
+                        tasks[caller_ti].state = TaskState::Runnable;
+                        status
+                    } else {
+                        tasks[caller_ti].state = TaskState::BlockedReap {
+                            pid: pid_us,
+                            dst: caller_dst,
+                        };
+                        0
+                    }
+                };
+                if has_result {
+                    tasks[ti].deliver(dst, Reg::from_i64(result));
+                }
+            }
+            Ok(VcpuStop::Exec {
+                cmd,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+                personality,
+            }) => {
+                // FORK.md §8.6 — `execve` image-replace (#1080). Every refusal writes a probeable
+                // errno to `dst` and lets the caller run on (POSIX: `execve` returns only on
+                // failure); a success swaps this task's activation to the command and never returns.
+                macro_rules! refuse {
+                    ($e:expr) => {{
+                        tasks[ti].deliver(dst, Reg::from_i32($e as i32));
+                        return None;
+                    }};
+                }
+                // Admissible from a clean root computation only (no serve handler, root fiber, a
+                // non-durable domain) — the tree-walker's `clean_root`. Both a **root-context** exec
+                // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
+                // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
+                // differ only in where the rebuilt activation's window/host/table live.
+                let clean = tasks[ti].vm.vt.active.serve_ticket.is_none()
+                    && tasks[ti].vm.vt.active_id == ROOT_FIBER
+                    && !root.lock_unpoisoned().is_durable();
+                if !clean {
+                    refuse!(super::EINVAL);
+                }
+                // The build (resolve + compile + admit + powerbox + personality carry + image
+                // materialize) runs against the exec'ing task's own window + powerbox, then the
+                // rebuilt activation is installed where its `env` points.
+                // The rebuilt activation lands where the task's `env` points, with the window the
+                // image was built in, which replaces the caller's.
+                let start = match tasks[ti].env {
+                    None => {
+                        // Root: build against the driver window/host, then migrate the task into a
+                        // confined env holding the command powerbox + its module table (the shared
+                        // `dom.table` maps module 0, not the pushed command).
+                        let built = exec_image_build(
+                            &mut root.lock_unpoisoned(),
+                            mem.as_ref(),
+                            dom,
+                            cmd,
+                            grants_ptr,
+                            grants_n,
+                            entry,
+                            size_log2,
+                            personality,
+                            leaf.as_ref(),
+                        );
+                        match built {
+                            Err(e) => refuse!(e),
+                            Ok(built) => {
+                                tasks[ti].vm.vt = built.vt;
+                                // The driver window is released for the image's own.
+                                drop(mem.take());
+                                let eidx = extra_envs.len();
+                                extra_envs.push(ChildEnv {
+                                    mem: Some(built.mem),
+                                    host: built.host.into_cell(),
+                                    table: built.table,
+                                    fuel: fuel.for_thread(),
+                                    fibers: FiberTables::default(),
+                                    spawner: None,
+                                    nested: false,
+                                    program: tasks[ti].vm.vt.active.module as u32,
+                                });
+                                tasks[ti].env = Some(eidx);
+                                built.leaf
+                            }
+                        }
+                    }
+                    Some(k) => {
+                        // Fork twin: build against its confined env (its powerbox carries the
+                        // personality), then overwrite the env's window, host and table — the fuel
+                        // and task id are kept.
+                        let host_arc = std::sync::Arc::clone(&extra_envs[k].host);
+                        let built = {
+                            let mut g = host_arc.lock_unpoisoned();
+                            exec_image_build(
+                                &mut g,
+                                extra_envs[k].mem.as_ref(),
+                                dom,
+                                cmd,
+                                grants_ptr,
+                                grants_n,
+                                entry,
+                                size_log2,
+                                personality,
+                                leaf.as_ref(),
+                            )
+                        };
+                        match built {
+                            Err(e) => refuse!(e),
+                            Ok(built) => {
+                                tasks[ti].vm.vt = built.vt;
+                                extra_envs[k].host = built.host.into_cell();
+                                extra_envs[k].table = built.table;
+                                extra_envs[k].mem = Some(built.mem);
+                                extra_envs[k].program = tasks[ti].vm.vt.active.module as u32;
+                                built.leaf
+                            }
+                        }
+                    }
+                };
+                if let Some(start) = start {
+                    let win = tasks[ti].env.and_then(|k| extra_envs[k].mem.as_ref());
+                    if let Some(step) = leaf_step(start, ti, win, pending_tierup) {
+                        return Some(step);
+                    }
+                }
+            }
+            Ok(VcpuStop::SpawnSelf { cmd, plan, dst }) => {
+                // A personality `posix_spawn` ([`spawn_task`]). The tree-walker's gate: a request
+                // from a fiber keeps its placeholder, and a serve handler is not a clean root.
+                if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                    tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
+                    return None;
+                }
+                if tasks[ti].vm.vt.active.serve_ticket.is_some() {
+                    tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
+                    return None;
+                }
+                let (r, step) = spawn_task(
+                    tasks,
+                    extra_envs,
+                    forked_twins,
+                    pending_tierup,
+                    leaf.as_ref(),
+                    dom,
+                    mem,
+                    root,
+                    fuel,
+                    ti,
+                    cmd,
+                    plan,
+                );
+                tasks[ti].deliver(dst, Reg::from_i64(r));
+                if let Some(step) = step {
+                    return Some(step);
+                }
+            }
+            Ok(VcpuStop::ForkSelf { dst }) => {
+                // #799/#1080 — personality `fork()`: duplicate THIS task into a twin (private window
+                // copy + forked powerbox). The parent (`ti`) keeps running with the twin's pid; the
+                // twin resumes at the same op (pc already advanced) with `0`. A non-bare or
+                // non-forkable caller fails closed to `-EAGAIN` (a value, never a hang — invariant 5).
+                // The bytecode port of the tree-walker's `Blocked::ForkSelf` → `fork_vcpu` engine.
+                // The twin's **personality pid** is its task index + 1: the process table's root is
+                // pid 1 (grant) at task index 0, so `pid = index + 1` aligns the two spaces (twins
+                // get 2, 3, … — never colliding with the root's 1), and a `waitpid(pid)` maps back to
+                // task index `pid - 1` (the reap settle below). `twin_ti` stays the raw task index.
+                let twin_ti = tasks.len();
+                let twin_pid = twin_ti as u64 + 1;
+                // The window + powerbox to duplicate: a confined child from its `extra_env`, or a
+                // **root** caller (`env: None`, e.g. `bash -c` forking) from the driver window/host.
+                // The twin shares the caller's budget node (`fork_powerbox`), so it draws from it
+                // as a thread would (#1944 slice 3). The live cap is checked first, as the oracle's
+                // `fork_vcpu` checks it (#2006).
+                let env = tasks[ti].env;
+                let room = fork_bare(&tasks[ti].threads, &tasks[ti].vm.vt)
+                    && live_tasks(tasks) < super::MAX_VCPUS;
+                let forked = if room {
+                    let win = match env {
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                        None => mem.as_ref(),
+                    };
+                    fork_process(task_host(root, extra_envs, env), win, twin_pid)
+                } else {
+                    None
+                };
+                match forked {
+                    None => {
+                        tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
+                    }
+                    Some((twin_mem, twin_host, live)) => {
+                        // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
+                        // park (a bash pipeline subshell is a twin that forks and waits its
+                        // command), and its signal doors on the run's bell.
+                        wire_process(&twin_host, root);
+                        // The return-twice `0`; the parent keeps the twin's pid, set below.
+                        let mut twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0);
+                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                        // may keep it only if its OWN private window (`fork_private`, pushed into
+                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // twin's events over that window via the pending-env routing. The
+                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                        // on every target; a twin still on the `Paged` fallback (unbounded
+                        // reservation, allocation failure) is not: strip the bitmap so it
+                        // interprets, fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                            twin_vt.active.jit_eligible = None;
+                            twin_vt.active.jit_page_checked = false;
+                        }
+                        // #1297: the twin's own dispatch table, seeded with the caller's installs.
+                        let (twin_table, twin_fuel, program) = match env {
+                            Some(k) => (
+                                extra_envs[k].table.fork(),
+                                extra_envs[k].fuel.for_thread(),
+                                extra_envs[k].program,
+                            ),
+                            None => (dom.table.fork(), fuel.for_thread(), 0),
+                        };
+                        let twin_eidx = extra_envs.len();
+                        extra_envs.push(ChildEnv {
+                            mem: twin_mem,
+                            host: twin_host.into_cell(),
+                            table: twin_table,
+                            fuel: twin_fuel,
+                            fibers: FiberTables::default(),
+                            spawner: None,
+                            nested: false,
+                            program,
+                        });
+                        debug_assert_eq!(tasks.len(), twin_ti, "twin lands at its pre-read index");
+                        tasks.push(TaskSlot::new(twin_vt, Some(twin_eidx), live));
+                        forked_twins.insert(twin_ti);
+                        tasks[ti].deliver(dst, Reg::from_i64(twin_pid as i64));
+                    }
+                }
+            }
+            Ok(VcpuStop::ReapWait { child }) => {
+                // #799 — personality blocking `waitpid()`: the op was rewound (it re-executes on
+                // wake). Park until the named child completes; the settle scan re-admits it after
+                // firing the twin's exit hooks, so the re-executed op finds the twin retired.
+                let state = TaskState::BlockedReapPersonality { child };
+                park_task(tasks, forked_twins, hooked_twins, ti, state);
+            }
+            Ok(VcpuStop::PipeRead { pipe }) => {
+                // #1080 rung 4 — park this task on a blocking pipe read; the settle scan polls
+                // `pipe_read_ready` and re-admits (the rewound read re-executes) when ready.
+                tasks[ti].state = TaskState::BlockedPipeRead { pipe };
+            }
+            Ok(VcpuStop::PipeWrite { pipe }) => {
+                tasks[ti].state = TaskState::BlockedPipeWrite { pipe };
+            }
+            Ok(VcpuStop::Spawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            }) => {
+                let mut child = match thread_task(&dom.source, module as usize, func, sp, arg) {
+                    Ok(vt) => vt,
+                    Err(t) => {
+                        complete(tasks, ti, Err(t));
+                        return None;
+                    }
+                };
+                if live_tasks(tasks) >= super::MAX_VCPUS {
+                    complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
+                    return None;
+                }
+                // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
+                // ceiling refuses it as the live cap does.
+                let node = task_host(root, extra_envs, tasks[ti].env)
+                    .lock_unpoisoned()
+                    .own_node();
+                let Some(live) = LiveVcpu::charge(node) else {
+                    complete(tasks, ti, Err(Trap::ThreadFault));
+                    return None;
+                };
+                // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
+                // eligible calls too (the run's bitmap is per-module-0-function, shared across the
+                // root and its same-module threads). A child spawned in another module (a confined
+                // §22 unit spawning its own function) runs a different module, where the module-0
+                // bitmap does not apply — leave it interpreting.
+                //
+                // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
+                // inherit the bitmap exactly when that env's window is tier-up-servable — the
+                // driver answers every per-event read (`win` base, mapped extent, page state) for
+                // the pending task's env ([`CoopRun::pending_win`] and friends), so a §14
+                // confined child's thread now tiers up over its own carve. A window the driver
+                // cannot flatly address (a fork twin's `Paged` private copy on wasm) fails
+                // closed to the interpreter, which is always right.
+                if module == 0
+                    && tierup_servable(
+                        match tasks[ti].env {
+                            None => mem.as_ref(),
+                            Some(k) => extra_envs[k].mem.as_ref(),
+                        },
+                        mem.as_ref(),
+                    )
+                {
+                    if let Some(e) = eligible.as_ref() {
+                        child.active.jit_eligible = Some(std::sync::Arc::clone(e));
+                        child.active.jit_page_checked = *page_checked;
+                    }
+                }
+                let cidx = tasks.len();
+                // §12 seed the child vCPU's TLS register to its dense id (root is task 0), so
+                // `vcpu.tls.get` returns the worker index — the tree-walker's `tls: id` seeding.
+                child.active.tls = cidx as i64;
+                // A thread shares its spawner's window/powerbox — so it inherits the spawner's env
+                // (the shared domain for a root-spawned thread, or the same confined `instantiate`
+                // env for one spawned by a confined child).
+                let env = tasks[ti].env;
+                tasks.push(TaskSlot::new(child, env, live));
+                let handle = tasks[ti].threads.len() as i32;
+                tasks[ti].threads.push(Some(cidx));
+                tasks[ti].deliver(dst, Reg::from_i32(handle));
+            }
+            // §14 confined children (ops 0, 5, 13, 17): admitted by the one shared
+            // `admit_confined_child` against the spawning task's own window, fuel and powerbox
+            // (#1727), then a task of this executor over its own environment — a nested child is
+            // its own domain (a fresh natural table over the module it runs, no installed §22
+            // units). `join` is the shared seam below.
+            Ok(VcpuStop::Instantiate { spawn, dst }) => {
+                let pm: Option<&Mem> = match tasks[ti].env {
+                    None => mem.as_ref(),
+                    Some(k) => extra_envs[k].mem.as_ref(),
+                };
+                let pfuel = match tasks[ti].env {
+                    None => fuel.can_burn(),
+                    Some(k) => extra_envs[k].fuel.can_burn(),
+                };
+                let spawner = &tasks[ti].vm.vt.active;
+                let admitted = admit_confined_child(
+                    &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
+                    pm,
+                    pfuel,
+                    &dom.source,
+                    spawner,
+                    spawn,
+                );
+                let child = match admitted {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
+                        return None;
+                    }
+                    Err(t) => {
+                        complete(tasks, ti, Err(t));
+                        return None;
+                    }
+                };
+                // #816 env-routed tier-up: a same-module child runs the spawner's module, so the
+                // run's bitmap applies to it too — inherited when the child's window is servable
+                // (`nested_view` shares the parent backing, so a root-lineage carve always is; a
+                // fork twin's descendant is gated by its backing like the twin). The driver serves
+                // each of the child's tier-ups over its own carve via the pending-env routing
+                // (`CoopRun::pending_win`/`mem_map_info`); the emitted module's per-access live
+                // bound (elision off for instantiator-bearing modules, temen-wasm-jit
+                // `elide_bound`) confines them to the carve.
+                let tierup = match (&child.program, eligible.as_ref()) {
+                    (ChildProgram::Spawner(..), Some(e))
+                        if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
+                    {
+                        Some((std::sync::Arc::clone(e), *page_checked))
+                    }
+                    _ => None,
+                };
+                let started = coop_start_child(
+                    tasks,
+                    extra_envs,
+                    root,
+                    ti,
+                    &dom.source,
+                    child,
+                    spawn.entry,
+                    dst,
+                    tierup,
+                );
+                if let Err(t) = started {
+                    complete(tasks, ti, Err(t));
+                }
+            }
+            // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
+            // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
+            // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
+            // Admission first (entry shape, the window = the module's declared memory, the args
+            // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
+            // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
+            // `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants (the op-11
+            // record format, fail-closed), and a pre-mapped `SharedRegion` staged and applied to
+            // the window before the child runs an op. `join` is the shared seam below.
+            Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
+                let pm: Option<&Mem> = match tasks[ti].env {
+                    None => mem.as_ref(),
+                    Some(k) => extra_envs[k].mem.as_ref(),
+                };
+                // #2078 — a child of the spawning frame's own module runs it, as a same-module
+                // confined child does: no second compile (#2143: an installed unit's, from a
+                // frame of one).
+                let spawner = spawner_module(&dom.source, &tasks[ti].vm.vt.active);
+                let table = tasks[ti].env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
+                let admitted = admit_detached_in_process(
+                    &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
+                    pm,
+                    spawn,
+                    spawner,
+                    unit,
+                );
+                let child = match admitted {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
+                        return None;
+                    }
+                    Err(t) => {
+                        complete(tasks, ti, Err(t));
+                        return None;
+                    }
+                };
+                // #816 env-routed tier-up, as for a confined child: a child running the root's
+                // unit inherits the run's bitmap when the driver can address its own window
+                // flatly; any other window stays interpreted.
+                let tierup = match (&child.program, eligible.as_ref()) {
+                    (ChildProgram::Spawner(0, _), Some(e))
+                        if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
+                    {
+                        Some((std::sync::Arc::clone(e), *page_checked))
+                    }
+                    _ => None,
+                };
+                let started = coop_start_child(
+                    tasks,
+                    extra_envs,
+                    root,
+                    ti,
+                    &dom.source,
+                    child,
+                    spawn.entry,
+                    dst,
+                    tierup,
+                );
+                if let Err(t) = started {
+                    complete(tasks, ti, Err(t));
+                }
+            }
+            // PROCESS.md S3 — `poll`/`detach`/`kill`, as the tree-walker's op 9/10/12 arms: a
+            // forged or spent handle is a `ThreadFault`, like `join`'s.
+            Ok(VcpuStop::ChildCtl { child, dst, ctl }) => {
+                let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
+                child_ctl(tasks, &spawners, ti, child, dst, ctl);
+            }
+            Ok(VcpuStop::Join { handle, dst, wait }) => join_child(tasks, ti, handle, dst, wait),
+            Ok(VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            }) => {
+                let durable = || root.lock_unpoisoned().is_durable();
+                // The wait is against THIS task's domain: the root's registry and window, or its
+                // confined `instantiate` env's. A child's `wait` on its mapped ring flag must not
+                // re-read an unrelated root byte.
+                let (fibers, fiber_sp, mem) = match tasks[ti].env {
+                    None => (&mut *fibers, &mut *fiber_sp, &mut *mem),
+                    Some(e) => {
+                        let e = &mut extra_envs[e];
+                        (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
+                    }
+                };
+                futex_wait(
+                    tasks, ti, fibers, fiber_sp, mem, durable, true, *clock, base, expected, width,
+                    timeout, dst,
+                );
+            }
+            Ok(VcpuStop::Notify { base, count, dst }) => {
+                // Wake up to `count` waiters, lowest task index first (deterministic). Key on the
+                // notifying task's own memory + backing identity (mirrors the wait arm), so a notify
+                // from one child's window matches a waiter parked from another child's window on the
+                // same `SharedRegion` byte.
+                let win = |env: Option<usize>| match env {
+                    None => mem.as_ref(),
+                    Some(k) => extra_envs[k].mem.as_ref(),
+                };
+                let key = futex_key_in(win(tasks[ti].env), base);
+                let want = count as u32;
+                let mut woken = wake_waiters(tasks, key, want, win);
+                // §3.6 slice 5a: then event-parked FIBER waiters, in every domain: the root's
+                // registry, then each child env's.
+                let regs = fibers.iter_mut().chain(
+                    extra_envs
+                        .iter_mut()
+                        .flat_map(|e| e.fibers.fibers.iter_mut()),
+                );
+                woken += wake_fiber_waiters(regs, key, want - woken);
+                tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
+            }
+            // §22 install/uninstall ([`jit_install`], [`jit_uninstall`]) against the TASK's host
+            // and its own dispatch table: a §14 child's is `extra_envs[k].table`, so its installs
+            // stay out of the parent's `call.dyn` (#1296). #926 slice 2f / #1233: the B2 mirror
+            // (`slot → (domain, unit)`, keyed on the unit so it survives the guest's `release`)
+            // lets the browser driver rebuild its `WebAssembly.Table` when it moves; it is the
+            // ROOT's emitted dispatch table, so only a root task's ops move it. The op itself
+            // always runs interpreted (a unit with a `call.cap` never emits): here between host
+            // events, or inside a tier-up region's bounce via `drive_nested`'s twin of these
+            // arms, after which the driver re-syncs before the emitted frame resumes.
+            Ok(VcpuStop::JitInstall { h, code, dst }) => {
+                let env = tasks[ti].env;
+                let unit = task_host(root, extra_envs, env)
+                    .lock_unpoisoned()
+                    .resolve_jit_unit(h, code);
+                let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                let mut mirror = JitMirror {
+                    units: slot_units,
+                    gen: table_gen,
+                };
+                let mirror = env.is_none().then_some(&mut mirror);
+                let active = &mut tasks[ti].vm.vt.active;
+                if let Err(t) = jit_install(unit, &dom.source, table, mirror, active, dst) {
+                    complete(tasks, ti, Err(t));
+                    return None;
+                }
+            }
+            Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
+                let env = tasks[ti].env;
+                let authority = task_host(root, extra_envs, env)
+                    .lock_unpoisoned()
+                    .resolve_jit_domain(h)
+                    .map(drop);
+                let table = env.map_or(&*dom.table, |k| &extra_envs[k].table);
+                let mut mirror = JitMirror {
+                    units: slot_units,
+                    gen: table_gen,
+                };
+                let mirror = env.is_none().then_some(&mut mirror);
+                let active = &mut tasks[ti].vm.vt.active;
+                let cleared =
+                    jit_uninstall(authority, &dom.source, table, slot, mirror, active, dst);
+                if let Err(t) = cleared {
+                    complete(tasks, ti, Err(t));
+                    return None;
+                }
+            }
+            Ok(VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            }) => {
+                // #926 slice 2e — surface to the browser host when this run drives tier-up
+                // (`eligible` set) and the unit has **emitted wasm** with an all-scalar signature
+                // over a representable window: the host runs the emitted `f0` and delivers the
+                // results back ([`deliver_jit_invoke_vals`]). Otherwise — the native `drive` (no
+                // `eligible`), an interpreter-only unit (no emitted wasm), a non-scalar signature,
+                // or an unrepresentable window — fall through to the interpreted service below,
+                // which is always correct (the fail-closed default the single-vCPU pump also uses).
+                let scalar = |t: &ValType| {
+                    matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
+                };
+                // A §14 child's invoke is serviced interpreted below, against its own window
+                // and host (#1296); only the root's units surface to the emitted tier.
+                let emittable = eligible.is_some()
+                    && tasks[ti].env.is_none()
+                    && params.iter().all(scalar)
+                    && results.iter().all(scalar);
+                let surfaced = if emittable {
+                    // Resolve the unit's emitted wasm exactly as the browser FFI's resolver does
+                    // (`jit_unit_wasm`), and the #717 committed-extent bound over the run's window
+                    // (a `Jit.invoke` runs against the shared root powerbox/window).
+                    let mut g = root.lock_unpoisoned();
+                    let wasm = g.resolve_jit_domain(h).ok().and_then(|domain| {
+                        let (cd, cu) = g.resolve_jit_code(code).ok()?;
+                        (cd == domain).then(|| g.jit_unit_wasm_or_emit(cd, cu))?
+                        // #1301
+                    });
+                    drop(g);
+                    let mapped = match mem.as_ref() {
+                        None => Some(0),
+                        Some(m) if *page_checked => Some(m.reserved_size()),
+                        Some(m) => m.scalar_extent(),
+                    };
+                    wasm.zip(mapped)
+                } else {
+                    None
+                };
+                if let Some((wasm, mapped)) = surfaced {
+                    *pending_jit = Some((ti, dst as usize, results.clone()));
+                    return Some(CoopStep::JitInvoke {
+                        code,
+                        wasm,
+                        argv,
+                        params,
+                        results,
+                        mapped,
+                    });
+                }
+                // Interpreted ([`jit_invoke_unit`], [`run_invoke`]) over the TASK's window, table
+                // and host: the root's, or a §14 child's own (`extra_envs[k]`) — a child's unit
+                // never sees the parent's window.
+                let env = tasks[ti].env;
+                let unit = task_host(root, extra_envs, env)
+                    .lock_unpoisoned()
+                    .resolve_jit_unit(h, code);
+                let (table, mem, host, parked) = match env {
+                    None => (&*dom.table, &mut *mem, &**root, FiberRegRef::Owned(fibers)),
+                    Some(k) => {
+                        let ChildEnv {
+                            mem,
+                            host,
+                            table,
+                            fibers,
+                            ..
+                        } = &mut extra_envs[k];
+                        (&*table, mem, &**host, FiberRegRef::Owned(&fibers.fibers))
+                    }
+                };
+                let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
+                    |(umod, args)| {
+                        run_invoke(
+                            &dom.source,
+                            table,
+                            umod,
+                            &args,
+                            fuel,
+                            mem,
+                            &mut HostCell::Shared(host),
+                            Some(&Beneath::task(&tasks[ti].vm.vt, parked)),
+                        )
+                    },
+                );
+                match ran {
+                    Ok(vals) => {
+                        let slots = vals.into_iter().map(val_to_slot);
+                        set_slot_results(&mut tasks[ti].vm.vt.active, dst, &results, slots);
+                    }
+                    Err(t) => {
+                        complete(tasks, ti, Err(t));
+                        return None;
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -16231,7 +16289,7 @@ impl CoopRun {
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
-        sched.root_leaf = root_leaf;
+        sched.emit.root_leaf = root_leaf;
         Ok(CoopRun {
             dom,
             mem,
@@ -16267,7 +16325,7 @@ impl CoopRun {
                 Ok(s) => s,
                 Err(e) => return Some(Err(e)),
             };
-        sched.root_leaf = root_leaf;
+        sched.emit.root_leaf = root_leaf;
         Some(Ok(CoopRun {
             dom,
             mem,
@@ -16290,10 +16348,11 @@ impl CoopRun {
 
     fn pending_ti(&self) -> Option<usize> {
         self.sched
+            .emit
             .pending_tierup
             .as_ref()
             .map(|(ti, ..)| *ti)
-            .or_else(|| self.sched.pending_jit.as_ref().map(|(ti, ..)| *ti))
+            .or_else(|| self.sched.emit.pending_jit.as_ref().map(|(ti, ..)| *ti))
     }
 
     /// #816: the window the outstanding round-trip's task runs over — `extra_envs[k].mem` for an
@@ -16302,8 +16361,11 @@ impl CoopRun {
     /// [`bounce`](Self::bounce)'s env dispatch, so the driver's reads and the bounced cap calls
     /// always agree on which window is live.
     fn pending_mem(&self) -> Option<&Mem> {
-        match self.pending_ti().and_then(|ti| self.sched.tasks[ti].env) {
-            Some(k) => self.sched.extra_envs[k].mem.as_ref(),
+        match self
+            .pending_ti()
+            .and_then(|ti| self.sched.core.tasks[ti].env)
+        {
+            Some(k) => self.sched.core.extra_envs[k].mem.as_ref(),
             None => self.mem.as_ref(),
         }
     }
@@ -16314,7 +16376,7 @@ impl CoopRun {
     /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
     pub fn pending_env(&self) -> i64 {
         self.pending_ti()
-            .and_then(|ti| self.sched.tasks[ti].env)
+            .and_then(|ti| self.sched.core.tasks[ti].env)
             .map_or(-1, |k| k as i64)
     }
 
@@ -16361,12 +16423,12 @@ impl CoopRun {
         if !settle_host_cap(&mut self.host.lock_unpoisoned(), id, value) {
             return false;
         }
-        let parked = self.sched.tasks.iter().position(
+        let parked = self.sched.core.tasks.iter().position(
             |t| matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id),
         );
         if let Some(ti) = parked {
             let _ = self.host.lock_unpoisoned().completions().try_take(id);
-            let t = &mut self.sched.tasks[ti];
+            let t = &mut self.sched.core.tasks[ti];
             if let TaskState::BlockedHostCap { dst, .. } = t.state {
                 // #1954: a call that parked in a bounce out of an emitted leaf waits in the call's
                 // continuation, which the pump runs next; any other in the task's own frame.
@@ -16391,9 +16453,14 @@ impl CoopRun {
     /// rebuilds its `WebAssembly.Table` when the generation moves (a slot at or past the program's
     /// `f{i}` prefix holds an installed unit's `f0`). Keyed on the unit index rather than the §22
     /// code handle so it survives the guest's `Jit.release` of that handle — see
-    /// [`CoopSched::slot_units`].
+    /// [`EmitTier::slot_units`].
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        self.sched.slot_units.get(slot as usize).copied().flatten()
+        self.sched
+            .emit
+            .slot_units
+            .get(slot as usize)
+            .copied()
+            .flatten()
     }
 
     /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
@@ -16401,7 +16468,7 @@ impl CoopRun {
     /// `WebAssembly.Table` at and rebuilds only when this advances (the single-shot pump's
     /// `temen_onramp_tierup_table_gen` twin).
     pub fn table_gen(&self) -> u32 {
-        self.sched.table_gen
+        self.sched.emit.table_gen
     }
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
@@ -16434,7 +16501,12 @@ impl CoopRun {
 
     /// What the run holds now ([`Footprint`]).
     pub fn footprint(&self) -> Footprint {
-        let children = self.sched.extra_envs.iter().filter(|e| e.mem.is_some());
+        let children = self
+            .sched
+            .core
+            .extra_envs
+            .iter()
+            .filter(|e| e.mem.is_some());
         Footprint {
             windows: usize::from(self.mem.is_some()) + children.count(),
             units: self.dom.source.snapshot().len(),
@@ -16564,7 +16636,7 @@ impl CoopRun {
         let ti = self.pending_ti().ok_or(Trap::Malformed)?;
         // Mid-invoke iff a `Jit.invoke` (not a tier-up) is the outstanding round-trip — never both at
         // once (the one-round-trip discipline). Selects the invoke-confined registry below.
-        let in_invoke = self.sched.pending_jit.is_some();
+        let in_invoke = self.sched.emit.pending_jit.is_some();
         let CoopRun {
             dom,
             mem,
@@ -16573,18 +16645,26 @@ impl CoopRun {
             sched,
         } = self;
         let CoopSched {
-            tasks,
-            extra_envs,
-            fibers,
-            fiber_sp,
-            fiber_meta,
-            invoke_fibers,
-            slot_units,
-            table_gen,
-            pending_tierup,
-            forked_twins,
-            hooked_twins,
-            clock,
+            core:
+                SchedCore {
+                    tasks,
+                    extra_envs,
+                    fibers,
+                    fiber_sp,
+                    fiber_meta,
+                    forked_twins,
+                    hooked_twins,
+                    clock,
+                    ..
+                },
+            emit:
+                EmitTier {
+                    invoke_fibers,
+                    slot_units,
+                    table_gen,
+                    pending_tierup,
+                    ..
+                },
             ..
         } = sched;
         // #1896: a leaf whose host suspends its frames can park in a bounce.
