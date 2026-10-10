@@ -15,7 +15,7 @@ use temen_text::parse_module;
 
 // 8 vCPUs each `atomic.rmw.add` a shared counter 500× → 4000; the root then joins them. The host
 // (below) creates each spawned vCPU on its own OS thread and blocks each join — so this is the same
-// genuine parallelism as `drive_parallel`, but driven entirely through the public resumable API.
+// genuine parallelism as the parallel driver, but driven entirely through the public resumable API.
 const THREADS: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {

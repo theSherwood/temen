@@ -1422,8 +1422,8 @@ fn std_threads_spec_mpsc_channel() {
 // === #848 — the parallel-driver smoke lane =======================================================
 // The `std_threads_spec_*` tests above pin their programs on the **cooperative** driver (`drive`), the
 // deterministic oracle: one OS thread, a fixed round-robin schedule, an exact result every run. These
-// smoke tests re-run a representative subset under the **parallel** driver (`drive_parallel`, THREADS.md
-// 4c): one real OS thread per vCPU over a single shared window, with genuine races. The schedule is
+// smoke tests re-run a representative subset under the **parallel** driver (executor 2, THREADS.md
+// 4c): one real OS thread per task over a single shared window, with genuine races. The schedule is
 // nondeterministic, so we assert only the *outcome* (which the guests' own synchronization makes
 // schedule-independent) — proving the threaded `std` codegen + the futex/atomics primitives are correct
 // under real concurrency, not just the cooperative interleaving. See `run_with_caps_parallel`.

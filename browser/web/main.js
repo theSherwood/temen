@@ -386,14 +386,15 @@ block 0 (v0: i64) {
   }
 
   // --- 10) §14 **VM-in-VM real codegen** (a detached child's spawn on emitted wasm, #1865) -----------
-  // Same detached root, but the granted unit's entry SPAWNS: it reads its "K"=75, spawns a pure
-  // grandchild (→ 9) of its own module DETACHED — an op-17 v1 record paid from its own `budget`, the node
-  // that paid for its window (#1944) — joins it, returns 84 → 8 × 84 = 672. With codegen the spawning
-  // entry itself runs on EMITTED WASM: its spawn and join arrive as `env.instantiate_rec`/`env.join`,
-  // admitted and resolved by the child's own vCPU, each grandchild on its own Worker in its own
-  // `Memory` (17 Workers). Both tiers must agree, and codegen must actually emit.
+  // The detached root, granting each child the unit itself as `"unit"`, and the granted unit's entry
+  // SPAWNS: it reads its "K"=75, spawns `"unit"` DETACHED with a payload that makes it a pure grandchild
+  // (→ 9) — an op-17 v1 record paid from its own `budget`, the node that paid for its window (#1944) —
+  // joins it, returns 84 → 8 × 84 = 672. With codegen the spawning entry itself runs on EMITTED WASM:
+  // its spawn and join arrive as `env.instantiate_rec`/`env.join`, admitted and resolved by the child's
+  // own vCPU, each grandchild on its own Worker in its own `Memory` (17 Workers). Both tiers must agree,
+  // and codegen must actually emit.
   try {
-    const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
+    const guest = await fetchBytes('/corpus/threads_inst_nested.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_nested_detached_unit.temenc');
     const opt = { unit, winSize: 1 << 20, minter: 16 * 65536 };
     const t0 = performance.now();

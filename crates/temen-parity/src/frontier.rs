@@ -46,8 +46,10 @@
 //!
 //! **Concurrency** is the third shape again. There is no predicate to read at all: whether a
 //! capability is "carried by both drivers" is only answerable by running it on both, so the column
-//! is derived by driving each capability's ops on `bytecode::drive` and `bytecode::run_vcpu_parallel`
-//! and comparing the answers shape by shape (`tests/concurrency_conformance.rs`). The comparison is
+//! is derived by driving each capability's ops on `bytecode::drive` and on the parallel driver
+//! and comparing the answers shape by shape (`tests/concurrency_conformance.rs`). Since #1414 3e
+//! the parallel driver runs the pump's own scheduling rules, so this compares two executors of one
+//! rule set, not the per-Worker driver (#2230). The comparison is
 //! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
 //! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
 //!
@@ -291,7 +293,7 @@ const U: Cell = Cell {
 };
 /// `Full` on the **concurrency** axis: both drivers, given the same call, give the same answer.
 /// `tests/concurrency_conformance.rs` drives each of the row's ops on `bytecode::drive` and on
-/// `bytecode::run_vcpu_parallel` and compares them shape by shape.
+/// the parallel driver and compares them shape by shape.
 const K: Cell = Cell {
     status: Status::Full,
     note: "",

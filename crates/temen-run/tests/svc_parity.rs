@@ -8,20 +8,22 @@
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
 
-/// `_start`: resolve the granted `"vm"` Instantiator and `"budget"` by name, spawn the serving child
-/// (func 1) detached through a v1 record, mint `child_offer(child, export 0)`, call `add(40, 2)`
-/// through the live cap (parking until the child's `svc.wait` serves it), join, and exit with the
-/// reply — 42.
+/// `_start`: resolve the granted `"vm"` Instantiator, `"budget"` and `"child"` by name, spawn the
+/// serving child (the image of func 1) detached through a v1 record, mint
+/// `child_offer(child, export 0)`, call `add(40, 2)` through the live cap (parking until the child's
+/// `svc.wait` serves it), join, and return the reply — 42. The image keeps the `"adder"` export, so
+/// the child serves it.
 const SERVING_PROGRAM: &str = "\
 memory 17
 data 16384 \"vm\"
 data 16400 \"budget\"
+data 16416 \"child\"
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface \"adder\" 1 { add: 2 }
-import 0 \"exit\" (i32) -> ()
+export 0 func \"child\" 1
 
-func 0 () -> () {
+func 0 () -> (i64) {
 block 0 () {
   vp = i64.const 16384
   vl = i64.const 2
@@ -29,15 +31,17 @@ block 0 () {
   vbp = i64.const 16400
   vbl = i64.const 6
   vbud = self.resolve vbp vbl
-  ; a v1 record at 17536 (above the #1094 NULL guard and the durable control words): entry 1, the
-  ; running module (-1), its declared window, no pager or pre-mapped region, paid from `budget`
+  vcp = i64.const 16416
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl
+  ; a v1 record at 17536 (above the #1094 NULL guard and the durable control words): entry 0 of
+  ; the `child` image, its declared window, no pager or pre-mapped region, paid from `budget`
   q0a0 = i64.const 17536
-  q0v0 = i64.const 4294967297
+  q0v0 = i64.const 1
   i64.store q0a0 q0v0
   q0v2 = i64.const -4294967296
   i64.store q0a0 q0v2 offset=16
-  q0m = i32.const -1
-  i32.store q0a0 q0m offset=24
+  i32.store q0a0 vchild offset=24
   i32.store q0a0 vbud offset=28
   q0v9 = i64.const 4294967295
   i64.store q0a0 q0v9 offset=72
@@ -48,9 +52,7 @@ block 0 () {
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
   vj = call.cap 6 1 (i32) -> (i64) vh (v5)
-  vc = i32.wrap_i64 vr
-  call.import 0 (vc)
-  unreachable
+  return vr
   }
 }
 
@@ -78,9 +80,10 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
         temen_interp::bytecode::admits(&m),
         "the cooperative bytecode driver serves it, not the tree-walker"
     );
-    let registry = Imports::new().provide("exit", HostCap::exit());
-    let inst = instantiate_with_imports(m, registry).expect("instantiate");
+    let image = std::sync::Arc::new(temen_ir::child_image_at(&m, 1).expect("child image"));
+    let inst = instantiate_with_imports(m, Imports::new()).expect("instantiate");
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        let image = std::sync::Arc::clone(&image);
         let r = inst
             .run_with_caps(
                 backend,
@@ -91,12 +94,18 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
                         HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
                     ),
                     ("budget", HostCap::detached_budget(1 << 20)),
+                    (
+                        "child",
+                        HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                            h.grant_module(&image)
+                        }),
+                    ),
                 ],
             )
             .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
         assert_eq!(
             r.outcome,
-            Outcome::Exited(42),
+            Outcome::Returned(vec![temen_interp::Value::I64(42)]),
             "{backend:?}: spawn → child_offer → park → svc.wait-serve → reply → join → 42"
         );
     }

@@ -1311,12 +1311,12 @@ block 0 (va: i64, vb: i64) {{
 /// parent's live world — `join*100 + served` = `4201` — the guest-served exec backend (EXEC.md row 4)
 /// end to end: mint-at-spawn into the child only, caller parks, parent serves, reply, join. Every
 /// backend agrees, and each runs the parent itself, serving the child's call over the root's shared
-/// cell: the Cranelift JIT and the cooperative bytecode driver.
+/// cell: the Cranelift JIT, the cooperative bytecode driver and the parallel driver (`None`).
 #[test]
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS {
+    for b in BACKENDS.map(Some).into_iter().chain([None]) {
         // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
         // the default) run inline on the child's thread when it finds the parent parked.
         for handoff in [true, false] {
@@ -1325,7 +1325,7 @@ fn a_parent_serves_its_childs_exec_with_its_own_code() {
                 ..RunConfig::default()
             };
             assert_eq!(
-                run_detached_with(b, &src, 1 << 20, cfg),
+                run_detached_on(b, &src, 1 << 20, cfg),
                 Ok(4_201),
                 "{b:?}, handoff {handoff}: the child's exec.run(40,2) → the parent's handler \
                  replies 42; the parent served 1 and joined 42"
@@ -1593,6 +1593,16 @@ fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
 /// deadline: the #1217 pins guard against a *hang* (a pager parked for a child that is gone), so a
 /// regression must fail the test, not stall the binary until CI's timeout.
 fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> Result<i32, String> {
+    run_detached_on(Some(backend), src, mem, cfg)
+}
+
+/// [`run_detached_with`] on `backend`, or on the parallel driver for `None`.
+fn run_detached_on(
+    backend: Option<Backend>,
+    src: &str,
+    mem: u64,
+    cfg: RunConfig,
+) -> Result<i32, String> {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let images: Vec<(String, Arc<Module>)> = m
@@ -1626,7 +1636,10 @@ fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> R
                 }),
             ));
         }
-        let r = inst.run_with_caps(backend, &cfg, &caps);
+        let r = match backend {
+            Some(b) => inst.run_with_caps(b, &cfg, &caps),
+            None => inst.run_with_caps_parallel(&cfg, &caps),
+        };
         let _ = tx.send(r.map(|r| r.outcome).map_err(|e| e.to_string()));
     });
     let outcome = rx

@@ -467,14 +467,26 @@ block 3 () {
 "#;
 
 // ---- §14 nested child guests (detached child domains) -------------------------------------------
-// Func 0 receives an `Instantiator` (iface 6) and resolves the 1 MiB `"budget"` by name
-// (`instantiate_exec`); it spawns func 1 of its own module detached — an op-17 v1 record at 17408,
-// module `-1` — in a fresh window of the module's declared size, paid from the budget; `join` is
-// `call.cap 6 1`.
+// Func 0 receives an `Instantiator` (iface 6) and resolves the 1 MiB `"budget"` and its child images
+// by name (`instantiate_exec` grants the image of each function the guest exports, under its name);
+// it spawns the image it exports func 1 under, `"child"`, detached — an op-17 v1 record at 17408 — in
+// a fresh window of the module's declared size, paid from the budget; `join` is `call.cap 6 1`.
 
-/// A nested-corpus guest (`memory {mem}`): func 0 spawns func 1 (`child`, whole `func`s) through a
-/// v1 record asking for window `2^size_log2` (`0`: the declared one). With `join` it joins the child
-/// into `vj`; either way `tail` ends the block (the spawn's handle is `vh`). `data` adds segments.
+/// Text-IR stores laying the 16-byte grant record `{name_off, name_len, handle, flags = 0}` at `at`:
+/// the handle in the `i32` register `handle`, named by the `name_len` bytes at `name_at`.
+fn grant_rec_ir(at: u64, name_at: u64, name_len: usize, handle: &str) -> String {
+    format!(
+        "  gr{at} = i64.const {at}\n  gn{at} = i32.const {name_at}\n  i32.store gr{at} gn{at}\n  \
+         gl{at} = i32.const {name_len}\n  i32.store gr{at} gl{at} offset=4\n  \
+         i32.store gr{at} {handle} offset=8\n  gz{at} = i32.const 0\n  i32.store gr{at} gz{at} offset=12\n"
+    )
+}
+
+/// A nested-corpus guest (`memory {mem}`): func 0 spawns `"child"`, the image of func 1 (`child`,
+/// whole `func`s), through a v1 record asking for window `2^size_log2` (`0`: the declared one). With
+/// `join` it joins the child into `vj`; either way `tail` ends the block (the spawn's handle is `vh`).
+/// `data` adds segments. With `grandchild`, func 2 is exported as `"grandchild"` too, and the child is
+/// granted its image under that name.
 fn nested_guest(
     mem: u8,
     size_log2: i64,
@@ -482,20 +494,37 @@ fn nested_guest(
     data: &str,
     tail: &str,
     child: &str,
+    grandchild: bool,
 ) -> String {
     let rec = temen_ir::SpawnRec {
         size_log2,
-        ..temen_ir::SpawnRec::v1(1)
+        grants_ptr: 16448,
+        grants_n: u64::from(grandchild),
+        ..temen_ir::SpawnRec::v1(0)
     };
-    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, None, "vbud");
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vchild", "vbud");
     let join = if join {
         "  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n"
     } else {
         ""
     };
+    // The grant record at 16448 hands the child the grandchild's image.
+    let (names, pass) = if grandchild {
+        (
+            "data 16416 \"grandchild\"\nexport 1 func \"grandchild\" 2\n",
+            format!(
+                "  vgp = i64.const 16416\n  vgl = i64.const 10\n  vg = self.resolve vgp vgl\n{}",
+                grant_rec_ir(16448, 16416, "grandchild".len(), "vg")
+            ),
+        )
+    } else {
+        ("", String::new())
+    };
     format!(
-        "memory {mem}\ndata 16384 \"budget\"\n{seg}{data}func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
-         vbp = i64.const 16384\n  vbl = i64.const 6\n  vbud = self.resolve vbp vbl\n{stores}  \
+        "memory {mem}\ndata 16384 \"budget\"\ndata 16400 \"child\"\nexport 0 func \"child\" 1\n{names}{seg}{data}\
+         func (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
+         vbp = i64.const 16384\n  vbl = i64.const 6\n  vbud = self.resolve vbp vbl\n  \
+         vcp = i64.const 16400\n  vcl = i64.const 5\n  vchild = self.resolve vcp vcl\n{pass}{stores}  \
          vrp = i64.const 17408\n  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n{join}{tail}  }}\n}}\n{child}"
     )
 }
@@ -512,15 +541,16 @@ fn child_isolated() -> String {
          v10 = i64.const 1000\n  v11 = i64.mul vj v10\n  v12 = i64.add v11 v9\n  return v12\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 65543\n  v2 = i32.const 123\n  \
          i32.store8 v1 v2\n  v3 = i64.const 42\n  return v3\n  }\n}\n",
+        false,
     )
 }
 
 // Depth-2 VM-in-VM: the child spawns a grandchild of its own, detached, from its own `"budget"` — the
-// node that paid for its window (#1944) — so confinement composes. The grandchild returns 77,
-// propagated up through two joins.
+// node that paid for its window (#1944) — so confinement composes. The grandchild, the image the root
+// granted it as `"grandchild"`, returns 77, propagated up through two joins.
 fn child_depth2() -> String {
     let (seg, stores) =
-        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(2), None, "vb");
+        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(0), "vgc", "vb");
     nested_guest(
         17,
         0,
@@ -529,11 +559,13 @@ fn child_depth2() -> String {
         "  return vj\n",
         &format!(
             "func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  vi = i32.wrap_i64 va\n  \
-             vbp = i64.const 16384\n  vbl = i64.const 6\n  vb = self.resolve vbp vbl\n{stores}  \
+             vbp = i64.const 16384\n  vbl = i64.const 6\n  vb = self.resolve vbp vbl\n  \
+             vgp = i64.const 16416\n  vgl = i64.const 10\n  vgc = self.resolve vgp vgl\n{stores}  \
              vrp = i64.const 17504\n  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)\n  \
              vj = call.cap 6 1 (i32) -> (i64) vi (vh)\n  return vj\n  }}\n}}\n\
              func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  v = i64.const 77\n  return v\n  }}\n}}\n"
         ),
+        true,
     )
 }
 
@@ -550,6 +582,7 @@ fn child_addrspace() -> String {
         "func (i64, i64) -> (i64) {\nblock 0 (v0: i64, v1: i64) {\n  v2 = i32.wrap_i64 v1\n  \
          v3 = i64.const 65536\n  v4 = i64.const 16384\n  v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n  \
          return v5\n  }\n}\n",
+        false,
     )
 }
 
@@ -563,6 +596,7 @@ fn child_refused() -> String {
         "",
         "  v6 = i64.extend_i32_s vh\n  return v6\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 0\n  return v1\n  }\n}\n",
+        false,
     )
 }
 
@@ -575,6 +609,7 @@ fn child_trap() -> String {
         "",
         "  return vj\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  unreachable\n  }\n}\n",
+        false,
     )
 }
 
@@ -1276,19 +1311,27 @@ block 0 (va: i64, vb: i64) {
 // #1865 — a root `(instantiator, module, budget) -> sum`
 // that spawns the granted module `n` times through one op-17 v1 record (module and budget filled in
 // at run time), each child in a fresh window of its own on its own Worker and `Memory`, paid from the
-// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600.
-fn inst_detached_root(n: u64) -> String {
-    let (seg, stores) = temen_browser::plan::spawn_rec_ir(
-        17408,
-        &temen_ir::SpawnRec::v1(0),
-        Some("vmod0"),
-        "vbud0",
-    );
+// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600. With `grant_unit` each
+// child is granted the module itself as `"unit"`, to spawn copies of itself by (#2219).
+fn inst_detached_root(n: u64, grant_unit: bool) -> String {
+    let rec = temen_ir::SpawnRec {
+        grants_ptr: 16464,
+        grants_n: u64::from(grant_unit),
+        ..temen_ir::SpawnRec::v1(0)
+    };
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vmod0", "vbud0");
+    // The grant record at 16464 names the module `"unit"`.
+    let grant = if grant_unit {
+        grant_rec_ir(16464, 16448, "unit".len(), "vmod0")
+    } else {
+        String::new()
+    };
     format!(
         r#"memory 20
+data 16448 "unit"
 {seg}func (i32, i32, i32) -> (i64) {{
 block 0 (vinst0: i32, vmod0: i32, vbud0: i32) {{
-{stores}  vi0 = i64.const 0
+{grant}{stores}  vi0 = i64.const 0
   br 1(vi0, vinst0)
 }}
 block 1 (vi: i64, vinst: i32) {{
@@ -1338,48 +1381,66 @@ block 6 (vs3: i64) {{
     )
 }
 
-// #1865 — the §14 VM-in-VM granted module: the child reads its own "K" (75), spawns
-// func 1 of its own module (a pure grandchild → 9) detached through an op-17 v1 record, paid from its
-// own `"budget"` — the node that paid for its window (#1944) — joins it and returns 75 + 9 = 84. With
-// [`inst_detached_root`]: 8 × 84 = 672. On the codegen tier the spawn and join arrive as the Worker's
-// `env.instantiate_rec`/`env.join`, admitted and resolved by the child's own vCPU; the `"budget"`
-// lookup (`self.resolve`, outside the emitter subset) is func 2, a bounce, so the entry emits.
+// #1865, #2219 — the §14 VM-in-VM granted module, its role selected by its args payload. Spawned with
+// none, the child reads its own "K" (75), spawns the module it was granted as `"unit"` — itself —
+// detached through an op-17 v1 record, paid from its own `"budget"` (the node that paid for its
+// window, #1944), with a one-word payload that makes it the pure grandchild (→ 9), joins it and
+// returns 75 + 9 = 84. With [`inst_detached_root`] granting the unit on: 8 × 84 = 672. On the codegen
+// tier the spawn and join arrive as the Worker's `env.instantiate_rec`/`env.join`, admitted and
+// resolved by the child's own vCPU; the name lookups (`self.resolve`, outside the emitter subset) are
+// func 1, a bounce, so the entry emits.
 fn inst_nested_detached_unit() -> String {
-    let (seg, stores) =
-        temen_browser::plan::spawn_rec_ir(17408, &temen_ir::SpawnRec::v1(1), None, "vb");
+    let rec = temen_ir::SpawnRec {
+        args: (24576, 8),
+        ..temen_ir::SpawnRec::v1(0)
+    };
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vu", "vb");
     format!(
         r#"memory 16
 data 16384 "K"
 data 16392 "budget"
+data 16400 "unit"
 {seg}func (i64) -> (i64) {{
 block 0 (va: i64) {{
-  vinst = i32.wrap_i64 va
+  vab = i64.const {args}
+  vrole = i64.load vab
+  vz = i64.const 0
+  vleaf = i64.ne vrole vz
+  br_if vleaf 2() 1(va)
+}}
+block 1 (va1: i64) {{
+  vinst = i32.wrap_i64 va1
   vq = i64.const 16384
   vk8 = i32.load8_u vq
   vk = i64.extend_i32_u vk8
-  vb = call 2 ()
+  vbp = i64.const 16392
+  vbl = i64.const 6
+  vb = call 1 (vbp, vbl)
+  vup = i64.const 16400
+  vul = i64.const 4
+  vu = call 1 (vup, vul)
+  vpay = i64.const 24576
+  vone = i64.const 1
+  i64.store vpay vone
 {stores}  vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
   vr = i64.add vk vj
   return vr
-  }}
 }}
-func (i64) -> (i64) {{
-block 0 (va: i64) {{
+block 2 () {{
   v9 = i64.const 9
   return v9
   }}
 }}
-func () -> (i32) {{
-block 0 () {{
-  vbp = i64.const 16392
-  vbl = i64.const 6
-  vb = self.resolve vbp vbl
-  return vb
+func (i64, i64) -> (i32) {{
+block 0 (vp: i64, vl: i64) {{
+  vh = self.resolve vp vl
+  return vh
   }}
 }}
-"#
+"#,
+        args = temen_ir::module_args_base(),
     )
 }
 
@@ -2156,8 +2217,9 @@ fn main() {
     emit("threads_jit_install", THREADS_JIT_INSTALL);
     // §14 instantiate **across Workers** (THREADS.md 4c-domain §14-D2) — the confined-executor-child
     // kernels + the granted module for op 5. Ground truths (40 / 72 / 600) asserted in the JS host.
-    emit("threads_inst_detached", &inst_detached_root(8));
-    emit("threads_inst_detached_one", &inst_detached_root(1));
+    emit("threads_inst_detached", &inst_detached_root(8, false));
+    emit("threads_inst_detached_one", &inst_detached_root(1, false));
+    emit("threads_inst_nested", &inst_detached_root(8, true));
     emit("threads_inst_unit_grow", THREADS_INST_UNIT_GROW);
     emit(
         "threads_inst_nested_detached_unit",

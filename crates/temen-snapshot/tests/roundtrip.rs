@@ -1388,13 +1388,14 @@ block 0 (vx: i64) {
 
 /// §13.4 slice 4d — a **supervisor holding a live cap** onto a serving child freezes (its
 /// `LiveImpl` handle captured structurally by the callee's join slot, v15) and thaws with the
-/// cap **re-linked** to the re-created child. The supervisor spawns a same-module child server
-/// detached, mints a `child_offer` cap over its `echo` export, then parks in `svc.wait` holding
-/// the cap; freeze-on-quiesce captures the subtree. On thaw the runtime re-launches the child
-/// and re-links the supervisor's restored `LiveImpl`; a dispatch seeded into the supervisor's
-/// own queue lets its `svc.wait` return, and it then calls `echo(7)` through the re-linked cap
-/// — reaching the re-launched child (which serves it from its own re-parked accept loop) and
-/// returning 107. A broken re-link would fault or hang instead.
+/// cap **re-linked** to the re-created child. The supervisor spawns its own program's server, the
+/// durable image of func 2, detached, mints a `child_offer` cap over its `echo` export (the image
+/// keeps the program's exports), then parks in `svc.wait` holding the cap; freeze-on-quiesce
+/// captures the subtree. On thaw the runtime re-launches the child and re-links the supervisor's
+/// restored `LiveImpl`; a dispatch seeded into the supervisor's own queue lets its `svc.wait`
+/// return, and it then calls `echo(7)` through the re-linked cap — reaching the re-launched child
+/// (which serves it from its own re-parked accept loop) and returning 107. A broken re-link would
+/// fault or hang instead.
 const SRC_4D_SUPERVISOR: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -1402,10 +1403,10 @@ type 1 interface { echo: 0 }
 export 0 interface "svc" 1 { echo: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  ; a v1 record at 17536 (op 17): entry 2 of the durable module `v1`, its declared window, no
+  ; a v1 record at 17536 (op 17): entry 0 of the durable image `v1`, its declared window, no
   ; pager or pre-mapped region, paid from the budget `v2`
   q0a0 = i64.const 17536
-  q0v0 = i64.const 8589934593
+  q0v0 = i64.const 1
   i64.store q0a0 q0v0
   q0v2 = i64.const -4294967296
   i64.store q0a0 q0v2 offset=16
@@ -1450,6 +1451,11 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
+    // The server's image is cut from the uninstrumented program and then instrumented, so its
+    // bootstrap is instrumented too (#2245).
+    let server = temen_ir::child_image_at(&m, 2).expect("the server's image");
+    let server = transform_module_assume_confined(&server).expect("transform the image");
+    temen_verify::verify_module(&server).expect("verify the image");
 
     // Freeze the supervisor (parked in svc.wait, holding the child_offer cap) + the idle child.
     let mut h = Host::new();
@@ -1457,7 +1463,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     h.set_self_module(&inst);
     let args = [
         h.grant_instantiator(0, WINDOW as u64),
-        h.grant_durable_module(&inst),
+        h.grant_durable_module(&server),
         h.grant_budget(-1, 1 << 20, -1),
     ]
     .map(Value::I32);
@@ -1478,7 +1484,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     let mut rhost = Host::new();
     rhost.set_durable(true);
     rhost.set_self_module(&inst);
-    rhost.grant_durable_module(&inst); // the child's program, re-granted (D-scope)
+    rhost.grant_durable_module(&server); // the child's program, re-granted (D-scope)
     let rwin = restore(&artifact, &inst, &mut rhost).expect("restore");
     rhost
         .svc_enqueue(0, 0, vec![0])

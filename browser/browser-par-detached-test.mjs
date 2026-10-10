@@ -18,9 +18,10 @@
 // emitted store on the grown page passes only if the Worker re-read the child's `"mapped"` after the
 // bounce. Non-vacuity: `tierups === 3`, one per child that ran emitted.
 //
-// Two more #1865 pins. A root's child of its OWN module (a record's `module = -1`) stays on the
-// interpreter under `instCodegen` even when the granted unit emits a function at the same entry: only a
-// child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails closed.
+// Two more #1865 pins. A root's child that runs the root's own child image (granted as `"child"`)
+// stays on the interpreter under `instCodegen` even though the granted unit emits functions at the same
+// indices: only a child whose program is the unit runs the unit's emit. And a carve spawn (op 0) fails
+// closed.
 //
 // #2251: a plain root that returns its `self.parallelism` answers the page's core count
 // (`navigator.hardwareConcurrency`), since this driver gives each vCPU its own Worker.
@@ -116,25 +117,31 @@ block 0 () {
 // spawn, made before any join, finds less than a window left, however far the three have grown.
 const CHILD_LOG2 = 16, CHILD_GROWTH = 16384;
 const MINTER_QUOTA = 3 * ((1 << CHILD_LOG2) + CHILD_GROWTH);
-// #1865: the root spawns its OWN func 1 (→ 7) through an op-17 v1 record (`module = -1`) and joins
-// it, with a granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may
-// run its emit, so with `instCodegen` this child stays interpreted: 7, no emitted children.
+// #1865: the root spawns a copy of itself — its child image, which starts at its `_child` export
+// (func 1, → 7), granted as `"child"` (#2219) — through an op-17 v1 record and joins it, with a
+// granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may run its
+// emit, so with `instCodegen` this child stays interpreted: 7, no emitted children.
 const SELF_ROOT_SRC = `memory 16
+data 17504 "child"
+export 0 func "_child" 1
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vm: i32, vbud: i32) {
+  vcp = i64.const 17504
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl
   vr0 = i64.const 17408
-  vf0 = i64.const 4294967297
+  vf0 = i64.const 1
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296
   i64.store vr2 vf2
   vr3 = i64.const 17432
-  vself = i32.const -1
-  i32.store vr3 vself
+  i32.store vr3 vchild
   vr3b = i64.const 17436
   i32.store vr3b vbud
   vr9 = i64.const 17480
-  i32.store vr9 vself
+  vnone = i32.const -1
+  i32.store vr9 vnone
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr

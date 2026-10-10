@@ -371,6 +371,10 @@ V8 since early 2025 — BROWSER.md's table64 blocker deserves a concrete re-test
 > **Now the deletion's map (2026-09-29):** the "Decision B" column and §6.1's (b)/(c) sites are, under
 > the carve retirement, the list of what moves or is deleted — including the durability and pager
 > rows the withdrawn "durable ⇒ nested" / "pager ⇒ nested" rulings had avoided.
+>
+> **The native parallel driver (#1414 3e):** it is executor 2 now, `drive_threads`, on the
+> cooperative pump's rules; the `drive_parallel`, `run_vcpu_parallel` and `ThreadRegistry` this
+> sweep names are deleted.
 
 Scope of the change: **add JIT-tier hosting of an existing op**, plus a default-recommendation
 flip. The nested path (op 13) is **not modified** — which bounds the blast radius sharply.

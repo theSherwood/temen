@@ -3422,25 +3422,23 @@ int main(void) {
 }
 "#;
 
-/// The parent, over `(Instantiator, AddressSpace, Nim module, C module, Budget)`: it mints a 64 KiB
-/// region, spawns the Nim child (entry `nim_entry`, its 16 MiB window, the region at 8 MiB) and the
-/// C child (entry 0, its 128 KiB window, the region at 64 KiB, above its data and stack), each
-/// detached with the region pre-mapped, and returns both children's results. A pre-map must lie
+/// The parent, over `(Instantiator, AddressSpace, Nim producer, C module, Budget)`: it mints a 64 KiB
+/// region, spawns the Nim child (the producer's image, its 16 MiB window, the region at 8 MiB) and
+/// the C child (its 128 KiB window, the region at 64 KiB, above its data and stack), each detached
+/// at entry 0 with the region pre-mapped, and returns both children's results. A pre-map must lie
 /// inside the window the child's module declares.
-fn ring_parent(nim_entry: u32) -> temen_ir::Module {
-    let text = format!(
-        "memory 17
-func (i32, i32, i32, i32, i32) -> (i64, i64) {{
-block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
+fn ring_parent() -> temen_ir::Module {
+    let text = "memory 17
+func (i32, i32, i32, i32, i32) -> (i64, i64) {
+block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {
   len = i64.const 65536
   region = call.cap 5 5 (i64) -> (i64) aspace (len)
   b = i64.extend_i32_u budget
   z = i64.const 0
   nm = i64.extend_i32_u nim
-  ne = i64.const {nim_entry}
   nl = i64.const 24
   no = i64.const 8388608
-  pn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, nm, z, z, ne, nl, z, z, z, region, no)
+  pn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, nm, z, z, z, nl, z, z, z, region, no)
   cm = i64.extend_i32_u c
   cl = i64.const 17
   co = i64.const 65536
@@ -3448,11 +3446,10 @@ block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
   jn = call.cap 6 1 (i32) -> (i64) inst (pn)
   jc = call.cap 6 1 (i32) -> (i64) inst (pc)
   return jn, jc
-  }}
-}}
-"
-    );
-    let m = temen_text::parse_module(&text).expect("parse the parent");
+  }
+}
+";
+    let m = temen_text::parse_module(text).expect("parse the parent");
     temen_verify::verify_module(&m).expect("verify the parent");
     m
 }
@@ -3494,13 +3491,15 @@ fn a_nim_domain_and_a_c_domain_share_a_ring() {
         .find(|e| e.name == "ringProducer")
         .expect("the producer's entry")
         .func;
+    // #2219: the child runs a module, from its function 0: the producer's image.
+    let producer = temen_ir::child_image_at(&nim, entry).expect("the producer's image");
     let c = chibicc_child("ring_consumer", RING_CONSUMER, &[]);
-    let parent = ring_parent(entry);
+    let parent = ring_parent();
     let host = || {
         let mut host = temen_interp::Host::new();
         let inst = host.grant_instantiator(0, 1 << 17);
         let aspace = host.grant_address_space(0, 1 << 17);
-        let nim = host.grant_module(&nim);
+        let nim = host.grant_module(&producer);
         let c = host.grant_module(&c);
         let budget = host.grant_budget(-1, (1 << 24) + (1 << 17), -1);
         (host, [inst, aspace, nim, c, budget])

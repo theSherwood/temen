@@ -27,19 +27,24 @@ const ENV_PTR: i32 = 1024;
 /// Where a unit builds its spawn record: above the #1094 NULL guard.
 const REC_AT: u64 = 18432;
 
-/// The stores that build a v1 record spawning func 1 detached — the module's own declared window,
-/// no budget, no grants.
-fn spawn_func1() -> String {
-    support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(1))
+/// The stores that build a v1 record spawning the `Module` in `v1` (func 1's image) detached — the
+/// module's own declared window, no budget, no grants.
+fn spawn_child() -> String {
+    format!(
+        "{}  vma = i64.const {}\n  vmh = i32.wrap_i64 v1\n  i32.store vma vmh\n",
+        support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0)),
+        REC_AT + 24
+    )
 }
 
-/// A §14 guest: func 0's entry takes its `Instantiator` handle, spawns func 1 through a v1 record,
-/// `join`s the child, and returns its result. Func 1 (the child) is pure compute — `9`.
+/// A §14 guest: func 0's entry takes its `Instantiator` handle and its child's `Module` (func 1's
+/// image), spawns the child through a v1 record, `join`s it, and returns its result. Func 1 (the
+/// child) is pure compute — `9`.
 fn nested() -> String {
     format!(
         r#"memory 16
-func (i64) -> (i64) {{
-block 0 (v0: i64) {{
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
   vinst = i32.wrap_i64 v0
 {stores}  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -54,7 +59,7 @@ block 0 () {{
   }}
 }}
 "#,
-        stores = spawn_func1()
+        stores = spawn_child()
     )
 }
 
@@ -275,8 +280,8 @@ fn threaded_unit_matches_oracle() {
 fn nested_float_leaf() -> String {
     format!(
         r#"memory 16
-func (i64) -> (i64) {{
-block 0 (v0: i64) {{
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
   vinst = i32.wrap_i64 v0
 {stores}  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -300,7 +305,7 @@ block 0 (v0: f64) {{
   }}
 }}
 "#,
-        stores = spawn_func1()
+        stores = spawn_child()
     )
 }
 

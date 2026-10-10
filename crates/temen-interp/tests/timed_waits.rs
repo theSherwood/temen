@@ -1,8 +1,9 @@
-//! #2224 — a timed wait ends while another task keeps running. The tree-walker, the parallel drivers
-//! and Executor 2 time a wait out on the wall clock. The cooperative pump and the debug scheduler keep
-//! a logical clock for determinism, and it used to move only when no task was runnable, so a thread
-//! that napped never woke while another spun on it. Now it moves with the work done, one ns per op:
-//! the pump moves it by each quantum that runs out, the debug scheduler by each turn.
+//! #2224 — a timed wait ends while another task keeps running. The tree-walker and the parallel
+//! driver (executor 2) time a wait out on the wall clock. The cooperative pump and the debug
+//! scheduler keep a logical clock for determinism, and it used to move only when no task was
+//! runnable, so a thread that napped never woke while another spun on it. Now it moves with the
+//! work done, one ns per op: the pump moves it by each quantum that runs out, the debug scheduler
+//! by each turn.
 
 #[path = "support/drivers.rs"]
 mod drivers;

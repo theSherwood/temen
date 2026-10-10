@@ -349,12 +349,16 @@ block 0 (vsp: i64, vk: i64) {
 
 /// #2215 — the fiber park routing above on every driver that has it: a wait inside a fiber parks
 /// the fiber and its thread runs on, and a notify from that thread or another, the park-time
-/// recheck, the idle timer and a poll past the deadline each wake it. Executor 2 (`Threads`) has
-/// it on OS threads; the parallel driver it replaces and `Vcpu` still park the whole thread there
-/// (#1414 slice 3e).
+/// recheck, the idle timer and a poll past the deadline each wake it. `Vcpu` still parks the whole
+/// thread there.
 #[test]
 fn a_fiber_futex_park_parks_the_fiber_on_every_driver() {
-    const DRIVERS: [Driver; 4] = [Driver::Oracle, Driver::Coop, Driver::Threads, Driver::Debug];
+    const DRIVERS: [Driver; 4] = [
+        Driver::Oracle,
+        Driver::Coop,
+        Driver::Parallel,
+        Driver::Debug,
+    ];
     let cases = [
         ("the same thread wakes it", FUTEX_FIBER_PARK, 331_100),
         (

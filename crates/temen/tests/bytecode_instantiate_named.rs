@@ -14,8 +14,8 @@
 //! `grants: Some((grants_ptr, grants_n))` field; op 5 stays `None`, byte-identical). The cooperative
 //! `drive` path reads the grant records from the parent window and builds the child's by-name powerbox
 //! via the shared `Host::spawn_named_child` (`lib.rs` ~14982) — the same builder the tree-walker's
-//! op-13 arm (~7734) uses. The other bytecode drivers (debugger replay, OS-thread parallel) fail op 13
-//! closed, since only the cooperative single-thread driver is the browser's wasm-safe entry.
+//! op-13 arm (~7734) uses. The other bytecode drivers then failed op 13 closed; since #1855 every
+//! driver admits it the same way (`temen-interp/tests/spawn_every_driver.rs`).
 #![cfg(unix)]
 
 use temen_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
