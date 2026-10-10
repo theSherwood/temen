@@ -916,6 +916,15 @@ impl Translator {
                                 // value *is* this initializer). The name is suffixed with the module
                                 // stem in `translate_object_module` (the linker resolves it there).
                                 self.funcref_inits.push((off, sym.to_string()));
+                            } else if let (Some("addr"), Some(target)) =
+                                (init.tag(), init.args().first().and_then(|n| n.as_atom()))
+                            {
+                                // A **data pointer** global: a module-level `let q = addr p` is
+                                // `(addr p.0.)`. Seed the slot, and point it at `p` once every
+                                // global is placed ([`Self::resolve_data_ptrs`]), as a string's
+                                // `more = (addr strlit…)` is.
+                                self.data_inits.push((off, vec![0; 8]));
+                                self.data_ptrs.push((off, pointee(target.to_string())));
                             } else if init.as_atom().is_some() {
                                 // A **symbol** initializer that is *not* a funcref gvar — another
                                 // global's address (a data pointer). Its value is opaque in this model;
@@ -1143,17 +1152,32 @@ impl Translator {
     }
 
     /// This unit's **funcref data relocations** as `temen_ir::DataFuncref`s: each `proctype` gvar with
-    /// a static proc initializer, at its slot offset, naming the initializer proc under its
-    /// stem-suffixed global name (the form the linker's func-symbol table resolves). See
+    /// a static proc initializer, at its slot offset, naming the initializer proc under its global
+    /// name (the form the linker's func-symbol table resolves): a proc this unit defines takes the
+    /// unit's stem, and a sibling's name is already global. See
     /// [`funcref_inits`](Self::funcref_inits); called after translation (link mode only).
     pub fn funcref_relocs(&self, stem: &str) -> Vec<temen_ir::DataFuncref> {
         self.funcref_inits
             .iter()
             .map(|(at, sym)| temen_ir::DataFuncref {
                 at: *at,
-                name: format!("{sym}{stem}"),
+                name: if self.proc_names.contains(sym) {
+                    format!("{sym}{stem}")
+                } else {
+                    sym.clone()
+                },
             })
             .collect()
+    }
+
+    /// True if `sym` names a proc: one this module defines ([`proc_names`](Self::proc_names)), or a
+    /// sibling unit's under its global name ([`ext_proc_params`](Self::ext_proc_params), the linker's
+    /// table of every proc in the program). A vtable's `mt` table can hold both: a closure
+    /// iterator's coroutine has its own `=destroy` and `system`'s `cancel`. Recognizing only the
+    /// first left the whole `Rtti` const a zeroed placeholder, so destroying the iterator called
+    /// through a null method slot.
+    fn is_proc_sym(&self, sym: &str) -> bool {
+        self.proc_names.contains(sym) || self.ext_proc_params.contains_key(sym)
     }
 
     /// The module's **`exportc` symbols** as exports under their *C* names — the conventional entry
@@ -1278,10 +1302,7 @@ impl Translator {
                     if off + w <= bytes.len() {
                         bytes[off..off + w].copy_from_slice(&(n as u64).to_le_bytes()[..w]);
                     }
-                } else if let Some(sym) = peel_cast(v)
-                    .as_atom()
-                    .filter(|s| self.proc_names.contains(*s))
-                {
+                } else if let Some(sym) = peel_cast(v).as_atom().filter(|s| self.is_proc_sym(s)) {
                     // A **funcref element** — a `(cast (ptr void) proc)` (or bare proc) in a vtable's
                     // `mt` table. Emit a funcref reloc at this slot; the linker writes its func index.
                     funcrelocs.push((off as u64, sym.to_string()));
@@ -1392,8 +1413,7 @@ impl Translator {
                 // An explicit null pointer field — an SSO string's `more` when the text fits inline.
                 // The blob is already zeroed, so this is a no-op; it exists to stop `(nil)` falling
                 // through to the placeholder path and discarding the whole aggregate.
-            } else if matches!(peel_cast(&ka[1]).as_atom(), Some(s) if self.proc_names.contains(s))
-            {
+            } else if matches!(peel_cast(&ka[1]).as_atom(), Some(s) if self.is_proc_sym(s)) {
                 // A **funcref pointer field** — a bare/`cast`-wrapped proc symbol in a pointer slot.
                 let sym = peel_cast(&ka[1]).as_atom().unwrap();
                 funcrelocs.push((off as u64, sym.to_string()));
@@ -1610,16 +1630,14 @@ impl Translator {
     /// scalar `i64` (the pointer itself); otherwise an integer scalar.
     fn tydesc(&self, node: &Node) -> Result<TyDesc, LengError> {
         match node.tag() {
-            // A **function pointer** written inline: `(proctype …)`. nimony also spells a callable
-            // field as `(ptr <proctype>)`; both are the same funcref value, so map either to `FnPtr`.
+            // A **function pointer** written inline: `(proctype …)`.
             Some("proctype") => Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(node)?))),
             // A **typed pointer**: value type `i64`, carrying the pointee for `deref`. A pointer to
             // an opaque/void pointee (`(ptr (void))`, `(ptr)`) stays a bare `i64` scalar. A pointer
-            // to a `proctype` (inline or named) is a funcref, not a data pointer.
+            // to a `proctype` points at a funcref slot, as in nimony's C backend, where a proctype
+            // is already the function pointer: an `openArray` of procs holds an `(aptr <proctype>)`
+            // and its `[]` returns a `(ptr <proctype>)`.
             Some("ptr") | Some("aptr") => match node.args().first() {
-                Some(t) if self.is_proctype(t) => {
-                    Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(t)?)))
-                }
                 Some(t) if t.tag() != Some("void") => Ok(TyDesc::Ptr(Box::new(self.tydesc(t)?))),
                 _ => Ok(TyDesc::Scalar {
                     ty: ValType::I64,
@@ -1692,11 +1710,6 @@ impl Translator {
                 None => Err(LengError::Malformed("expected a type".into())),
             },
         }
-    }
-
-    /// True if `t` denotes a `proctype` — written inline as `(proctype …)` or as a named proctype.
-    fn is_proctype(&self, t: &Node) -> bool {
-        t.tag() == Some("proctype") || t.as_atom().is_some_and(|n| self.proctypes.contains_key(n))
     }
 
     /// The `call.dyn` signature of a `proctype` — a named one (looked up) or an inline
@@ -5806,10 +5819,10 @@ impl<'a> FuncGen<'a> {
     fn indirect_callee(&mut self, a0: &Node) -> Result<Option<(u32, FnPtrSig)>, LengError> {
         if a0.tag() == Some("cast") {
             let ca = a0.args();
-            // A cast whose target is a funcref — an inline `(proctype …)`, a named proctype, or a
-            // `(ptr proctype)` alias (nimony's RTTI method-slot cast). The source is the funcref
-            // value: a `proctype` field/slot is already an `i32` index; an opaque `(ptr void)` method
-            // slot is an `i64` that narrows to the `i32` table index.
+            // A cast whose target is a funcref — an inline `(proctype …)` or a named proctype
+            // (nimony's RTTI method-slot cast). The source is the funcref value: a `proctype`
+            // field/slot is already an `i32` index; an opaque `(ptr void)` method slot is an `i64`
+            // that narrows to the `i32` table index.
             if ca.len() >= 2 {
                 if let Ok(TyDesc::FnPtr(sig)) = self.t.tydesc(&ca[0]) {
                     let v = self.expr(&ca[1])?;

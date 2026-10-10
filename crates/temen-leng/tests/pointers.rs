@@ -120,3 +120,19 @@ fn no_memory_decl_without_pointers() {
     let text = temen_leng::translate_to_text(leng).unwrap();
     assert!(!text.contains("memory "), "no memory expected:\n{text}");
 }
+
+#[test]
+fn a_global_initialized_with_another_globals_address() {
+    // A module-level `let q = addr p` keeps its initializer: `(gvar :q.0. . (ptr int) (addr p.0.))`.
+    // `q` holds `p`'s address from the start, so a write through it lands in `p`.
+    let leng = "\
+(stmts
+ (gvar :p.0. . (i +64) 40)
+ (gvar :q.0. . (ptr (i +64)) (addr p.0.))
+ (proc :go.0 . (i +64) .
+  (stmts .
+   (asgn (deref q.0.) (add (i +64) (deref q.0.) 2))
+   (ret p.0.))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[]), 42);
+}
