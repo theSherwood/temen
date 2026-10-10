@@ -8,4 +8,4 @@ close the issue its header names.
 Every file starts with a `# KNOWN GAP — …` comment naming the issue. The directory is the whole
 expectation mechanism — there is no per-case list to keep in sync.
 
-Currently empty — #1488 (sub-word arithmetic) was the last open gap and is fixed.
+Each gap is a row in [`../MATRIX.md`](../MATRIX.md).

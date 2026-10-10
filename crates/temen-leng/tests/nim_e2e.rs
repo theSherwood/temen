@@ -77,8 +77,7 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mut mods = Vec::new();
-    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    let mods = program_modules(&dir.join("nimcache"), "prog");
     assert!(
         mods.iter().any(|(s, _)| s.starts_with("sysv")),
         "expected the system module among {:?}",
@@ -88,35 +87,44 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
     mods
 }
 
-fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// The Leng modules of the program nimony built as `output` (its binary's file name), as
+/// `(stem, x_nif_text)`: the `.x.nif` of every object its link manifest names. One `nimcache` holds
+/// more than that program. A macro is a plugin program built there, and so is a `const` nimony
+/// evaluates at compile time (and `std/macros` routes `parsegen`/`regex` through plugins of its own).
+/// Each helper has its own `<stem>/<stem>.linkmanifest.nif`, and sweeping its modules in too fails
+/// the link with `DuplicateSymbol("main")`. Empty when no manifest names `output`.
+fn program_modules(nimcache: &std::path::Path, output: &str) -> Vec<(String, String)> {
+    let manifest = std::fs::read_dir(nimcache)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|d| {
+            let stem = d.file_name().to_string_lossy().into_owned();
+            let text =
+                std::fs::read_to_string(d.path().join(format!("{stem}.linkmanifest.nif"))).ok()?;
+            let out = text.split("(output \"").nth(1)?.split('"').next()?;
+            (std::path::Path::new(out).file_name()? == output).then_some((d.path(), text))
+        });
+    let Some((build_dir, text)) = manifest else {
+        return Vec::new();
     };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            // `<scratch>_d` is a **macro plugin's own sub-build** (`semos.buildPlugin`: a plugin is
-            // a separate executable Nimony compiles at compile time, in its own cache directory, with
-            // its own C `main`). Those modules belong to a different program, not this one — sweeping
-            // them in is how `import std/macros` started failing with `DuplicateSymbol("main")` under
-            // v0.6.2, which routes `parsegen`/`regex` through plugins. The sibling `_v` is the
-            // validator's sem-only run of the same source; skip it too.
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with("_d") || name.ends_with("_v") {
-                continue;
-            }
-            collect_x_nif(&p, out);
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if let Some(stem) = name.strip_suffix(".x.nif") {
-                if out.iter().all(|(s, _)| s != stem) {
-                    // NIF is bytes, not UTF-8 text: a `char` literal at or above 0x80 is a lone
-                    // byte (the sweep hit one on `strutils`).
-                    let bytes = std::fs::read(&p).unwrap();
-                    out.push((stem.to_string(), temen_leng::nif_text(&bytes).into_owned()));
-                }
-            }
-        }
-    }
+    text.split("(file \"")
+        .skip(1)
+        .filter_map(|f| f.split('"').next()?.strip_suffix(".o"))
+        .filter_map(|f| std::path::Path::new(f).file_name()?.to_str())
+        .map(|stem| {
+            // The program's own module is compiled in its build directory, the rest in `nimcache`.
+            let x_nif = [build_dir.as_path(), nimcache]
+                .map(|d| d.join(format!("{stem}.x.nif")))
+                .into_iter()
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("`{output}` links {stem}.o, but no {stem}.x.nif"));
+            // NIF is bytes, not UTF-8 text: a `char` literal at or above 0x80 is a lone byte (the
+            // sweep hit one on `strutils`).
+            let bytes = std::fs::read(&x_nif).unwrap();
+            (stem.to_string(), temen_leng::nif_text(&bytes).into_owned())
+        })
+        .collect()
 }
 
 /// Link the compiled Nim modules together with the W3 runtime shim into one verified, import-free
@@ -126,7 +134,7 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
 fn link_with_runtime(mods: &[(String, String)]) -> Module {
     // Order the **program module first** (the `system` module — stem `sysv…` — last), the convention
     // `link` builds on: the first unit's first proc is func 0, the natural entry, and the C `main`/init
-    // chain lives in the program module. `collect_x_nif`'s directory order is filesystem-dependent, so
+    // chain lives in the program module. Callers pass modules in whatever order they collected them, so
     // pin it here — an init-chain run through `main` is order-sensitive (a `system`-first layout mislays
     // the entry region). Stable sort keeps any multi-module program's own order.
     let mut ordered: Vec<&(String, String)> = mods.iter().collect();
@@ -1265,8 +1273,7 @@ fn try_compile_to_leng(
             msg.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
         ));
     }
-    let mut mods = Vec::new();
-    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    let mods = program_modules(&dir.join("nimcache"), "prog");
     let _ = std::fs::remove_dir_all(&dir);
     Ok(mods)
 }
@@ -1963,8 +1970,7 @@ fn native_build(
         .env("PATH", nim_path)
         .output()
         .map_err(|e| e.to_string())?;
-    let mut mods = Vec::new();
-    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    let mods = program_modules(&dir.join("nimcache"), "prog");
     let _ = std::fs::remove_dir_all(&dir);
     if !out.status.success() {
         return Err(format!(
@@ -2230,6 +2236,94 @@ fn is_clean_exit(outcome: &str) -> bool {
 }
 
 /// The `.nim` programs in `dir`, sorted, or empty if the directory is absent.
+/// `nim_diff/MATRIX.md` is the conformance matrix (#956): a row per feature, the corpus cases that
+/// exercise it, and its status. This checks it against the corpus without the toolchain, so the matrix
+/// cannot drift from what [`nim_differential_corpus`] runs. A ✅ row's cases are in `nim_diff/`; a
+/// `❌ #N` row's are in `known_gaps/` under a header naming #N; an n/a row (nimony itself rejects the
+/// construct) names none; and every case is in exactly one row. A passing case may not keep a
+/// `KNOWN GAP` header either; two kept theirs after #1488 was fixed.
+#[test]
+fn the_matrix_matches_the_corpus() {
+    let dir = std::path::Path::new("tests/nim_diff");
+    let matrix = std::fs::read_to_string(dir.join("MATRIX.md")).expect("read MATRIX.md");
+    let stems = |d: &std::path::Path| -> Vec<String> {
+        nim_cases(d)
+            .iter()
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect()
+    };
+    let header = |case: std::path::PathBuf| -> String {
+        let src = std::fs::read_to_string(&case).unwrap_or_else(|e| panic!("{case:?}: {e}"));
+        src.lines().next().unwrap_or("").to_string()
+    };
+    let passing = stems(dir);
+    let gaps = stems(&dir.join("known_gaps"));
+    let mut named: Vec<&str> = Vec::new();
+    let mut wrong: Vec<String> = Vec::new();
+    for row in matrix.lines().filter(|l| l.starts_with('|')) {
+        let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+        let [feature, cases, status] = cells[..] else {
+            wrong.push(format!("not a three-cell row: {row}"));
+            continue;
+        };
+        if feature == "Feature" || feature.chars().all(|c| c == '-') {
+            continue; // a table's header or separator
+        }
+        let cases: Vec<&str> = cases.split('`').skip(1).step_by(2).collect();
+        named.extend(&cases);
+        if status == "✅" {
+            if cases.is_empty() {
+                wrong.push(format!("{feature}: ✅ names no case"));
+            }
+            for c in cases.iter().filter(|c| !passing.iter().any(|p| p == *c)) {
+                wrong.push(format!("{feature}: `{c}` is ✅ but not in nim_diff/"));
+            }
+        } else if let Some(issue) = status.strip_prefix("❌ #") {
+            if cases.is_empty() || !issue.chars().all(|c| c.is_ascii_digit()) {
+                wrong.push(format!(
+                    "{feature}: a gap needs a case and an issue, not `{status}`"
+                ));
+            }
+            let want = format!("# KNOWN GAP — #{issue}");
+            for c in cases {
+                if !gaps.iter().any(|g| g == c) {
+                    wrong.push(format!("{feature}: `{c}` is ❌ but not in known_gaps/"));
+                } else if !header(dir.join("known_gaps").join(format!("{c}.nim")))
+                    .strip_prefix(&want)
+                    .is_some_and(|rest| !rest.starts_with(|d: char| d.is_ascii_digit()))
+                {
+                    wrong.push(format!("{feature}: `{c}`'s header does not start `{want}`"));
+                }
+            }
+        } else if status.starts_with("n/a") {
+            if !cases.is_empty() {
+                wrong.push(format!(
+                    "{feature}: n/a, so nimony has nothing to run, yet names {cases:?}"
+                ));
+            }
+        } else {
+            wrong.push(format!("{feature}: unknown status `{status}`"));
+        }
+    }
+    for case in passing.iter().chain(&gaps) {
+        match named.iter().filter(|n| *n == case).count() {
+            1 => {}
+            0 => wrong.push(format!("`{case}` is in no row")),
+            k => wrong.push(format!("`{case}` is in {k} rows")),
+        }
+    }
+    for case in &passing {
+        if header(dir.join(format!("{case}.nim"))).starts_with("# KNOWN GAP") {
+            wrong.push(format!("`{case}` passes, but its header says KNOWN GAP"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "MATRIX.md disagrees with the corpus:\n  - {}",
+        wrong.join("\n  - ")
+    );
+}
+
 fn nim_cases(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -2249,28 +2343,6 @@ fn elide(s: &str) -> String {
         return s.to_string();
     }
     format!("{}…{}", &s[..100], &s[s.len() - 40..])
-}
-
-/// The modification time of `<stem>.x.nif` under `dir` (searched recursively), or the epoch when it
-/// cannot be read — how the spike tells this build's program module from a previous one's left in the
-/// shared `nimcache`.
-#[cfg(test)]
-fn x_nif_mtime(dir: &std::path::Path, stem: &str) -> std::time::SystemTime {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return std::time::UNIX_EPOCH;
-    };
-    let mut best = std::time::UNIX_EPOCH;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            best = best.max(x_nif_mtime(&p, stem));
-        } else if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{stem}.x.nif")) {
-            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
-                best = best.max(t);
-            }
-        }
-    }
-    best
 }
 
 /// **A nim program reads and writes real files** through the POSIX personality — the route
@@ -2905,7 +2977,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
 ///
 /// This compiles the real `src/nifler2/nifler2.nim` **in the nimony tree** (its imports are relative,
 /// so it cannot be copied into a scratch dir the way [`compile_to_leng`] does for a source string)
-/// and links its whole `.x.nif` closure. It is the same route as the corpus — `collect_x_nif` then
+/// and links its whole `.x.nif` closure. It is the same route as the corpus — `program_modules` then
 /// `link_nim_powerbox` — parameterized by *where the source lives*, not a second copy of it.
 ///
 /// Gated on `NIM_NIFLER2=1`: the compile is minutes and the closure is 10× the corpus, far past what
@@ -2985,84 +3057,20 @@ fn nifler2_links_through_leng() {
     );
     eprintln!("  nifler2: nimony c ok in {}s", started.elapsed().as_secs());
 
-    let mut mods = Vec::new();
-    collect_x_nif(&root.join("nimcache"), &mut mods);
-    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so it accumulates the
-    // modules of **every** program ever built there — a previous `nifler2` build's as well as this
-    // one's. Sweeping all of them in is wrong twice over: two `main`s fail the link
-    // `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
-    // cross-module references need not resolve in *this* program.
-    //
-    // Take the program's own module set instead of patching the symptom. nimony writes one
-    // `<stem>.c` per module into the program's own build directory (`nimcache/<program stem>/`), so
-    // that directory's `.c` stems are exactly this program's closure. Restricting to it drops the
-    // foreign modules *and* their `main`s together — one rule instead of a duplicate-`main` hack
-    // that left the rest of the foreign program in the link.
-    //
-    // The program module is identified as before (the newest `.x.nif` carrying `main`), because the
-    // build directory is named after it. If that directory is absent — an older toolchain, or a
-    // layout change — fall back to keeping the newest `main` and sweeping the rest, which is what
-    // this did before and is merely imprecise rather than wrong.
-    let mains: Vec<usize> = mods
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
-        .map(|(i, _)| i)
-        .collect();
-    if !mains.is_empty() {
-        // Which of them is *this* program? Not the newest: `nimony c` is cached, so a run whose
-        // output is already up to date rewrites nothing and mtime then names whichever program was
-        // built last — the hexer probe and the nifler2 probe would both select hexer, and the
-        // nifler2 run would silently link hexer's closure. A program module's own `.x.nif` carries
-        // its source path in its line info (60 hits for `src/hexer/hexer.nim` in hexer's, 0 in every
-        // other program module's), so match on the source we were actually asked to build. Fall back
-        // to newest-by-mtime when nothing matches, which is the old behaviour.
-        let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(&rel));
-        let keep = by_src.unwrap_or_else(|| {
-            *mains
-                .iter()
-                .max_by_key(|&&i| {
-                    let stem = &mods[i].0;
-                    x_nif_mtime(&root.join("nimcache"), stem)
-                })
-                .expect("a newest program module")
-        });
-        if by_src.is_none() {
-            eprintln!("  nifler2: no program module names `{rel}` — falling back to newest `main`");
-        }
-        let keep_stem = mods[keep].0.clone();
-        let build_dir = root.join("nimcache").join(&keep_stem);
-        let own: std::collections::HashSet<String> = std::fs::read_dir(&build_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                e.path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_suffix(".c"))
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        if own.is_empty() {
-            eprintln!(
-                "  nifler2: no build dir for `{keep_stem}` — keeping newest `main` only ({} program modules)",
-                mains.len()
-            );
-            let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
-            for i in drop.into_iter().rev() {
-                mods.remove(i);
-            }
-        } else {
-            let before = mods.len();
-            mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
-            eprintln!(
-                "  nifler2: program `{keep_stem}` owns {} modules; dropped {} foreign of {before}",
-                own.len(),
-                before - mods.len()
-            );
-        }
-    }
+    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so it holds the modules of
+    // every program ever built there: hexer's, a previous probe's, each plugin's. The link manifest
+    // of the binary just built names this program's own (`program_modules`). Matching on the binary,
+    // not on the newest `main`, matters because `nimony c` is cached: a run whose output is already
+    // up to date rewrites nothing, and the newest program would then be whichever was built last.
+    let bin = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("binary name");
+    let mods = program_modules(&root.join("nimcache"), bin);
+    assert!(
+        !mods.is_empty(),
+        "no link manifest in the nimcache names `{bin}`"
+    );
     eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
     if let Ok(want) = std::env::var("NIM_CLOSURE_HAS") {
         eprintln!(

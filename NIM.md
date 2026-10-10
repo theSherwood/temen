@@ -462,7 +462,11 @@ plumbing. Five workstreams, roughly independent:
     top-level `let r = 2*3+36` as an un-folded arithmetic tree in the gvar's data slot, and
     `const_scalar_int` now folds `add`/`sub`/`mul`/`div`/`mod`/`neg` over constant operands. A row that
     starts working *or* regresses fails the test — the "green/red matrix, each red a ticket" the
-    totality work grinds down.
+    totality work grinds down. The wider matrix is
+    [`crates/temen-leng/tests/nim_diff/MATRIX.md`](crates/temen-leng/tests/nim_diff/MATRIX.md), over the
+    differential corpus: a row per feature, each case diffed byte for byte against native nimony, each
+    gap with its issue, and the constructs nimony itself rejects. A toolchain-free test keeps it in
+    step with the corpus.
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one temen module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done

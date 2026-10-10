@@ -1,6 +1,6 @@
-# KNOWN GAP — #1488: sub-word integer arithmetic is never truncated to its declared width. A `uint8`
-# local lives in an `i32` SSA slot and the result of an `add`/`mul`/`shl` is stored back un-narrowed,
-# so `255'u8 + 1` is 256 instead of 0 and `0'u8 - 1` leaks the whole 32-bit slot (4294967295).
+# Unsigned sub-word arithmetic wraps at its declared width: `255'u8 + 1` is 0 and `0'u8 - 1` is
+# 255. A `uint8`/`uint16` lives in an `i32` slot, so each `add`/`mul`/`shl` result is narrowed back
+# to its width (#1488).
 import std/syncio
 
 proc go(): string =

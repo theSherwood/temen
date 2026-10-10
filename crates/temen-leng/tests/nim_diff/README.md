@@ -4,20 +4,21 @@ Each `.nim` file here is built once by native `nimony c --run` and run **twice**
 Temen from that build's Leng — and the two outputs are diffed byte for byte by
 `nim_differential_corpus` in `../nim_e2e.rs`.
 
-**Adding a case is adding a file.** There is no expected value to write down: the native toolchain is
-the oracle, so a case cannot bake in a wrong constant, and a case that stops compiling natively is
-reported as a corpus bug rather than a Temen one.
+**Adding a case is adding a file**, and naming it in a row of [`MATRIX.md`](MATRIX.md), the
+feature→status matrix the corpus backs (#956). There is no expected value to write down: the native
+toolchain is the oracle, so a case cannot bake in a wrong constant, and a case that stops compiling
+natively is reported as a corpus bug rather than a Temen one.
 
 Rules for a case:
 
 - **Deterministic.** No clock, no addresses, no PRNG without a fixed seed, no iteration order nim does
   not itself pin. The whole value of the suite is that a diff means a real defect.
-- **Inside nimony's subset.** It is a strict subset of Nim: no `echo`, `$seq`, `toHex`; `[]` on a seq,
-  `hasKey` and `parseInt` are `.raises` and need a `try`/`except`. `ref` is **non-nullable** — nimony
-  rejects both `let c = Cell(next: nil)` ("expected non-nil value") and an uninitialized `var head:
-  Cell` ("cannot prove that head.0 has been initialized"), so a nil-terminated linked list is not
-  expressible and is not a Temen gap. If the driver reports "does not run under native nimony", the
-  program is wrong, not Temen.
+- **Inside nimony's subset.** It is a strict subset of Nim; the matrix's n/a rows list what the
+  corpus has run into. `[]` on a seq, `hasKey` and `parseInt` are `.raises` and need a
+  `try`/`except`. `ref` is **non-nullable** — nimony rejects both `let c = Cell(next: nil)`
+  ("expected non-nil value") and an uninitialized `var head: Cell` ("cannot prove that head.0 has
+  been initialized"), so a nil-terminated linked list is not expressible and is not a Temen gap. If
+  the driver reports "does not run under native nimony", the program is wrong, not Temen.
 - **Print something.** A case that prints nothing compares nothing.
 - **Narrow.** One construct family per file, so a diff points at a cause.
 
@@ -33,4 +34,5 @@ instructions to promote the file into the main corpus and close its issue. The d
 expectation — there is no per-case enum to keep in sync.
 
 Put a case here only when the divergence is understood and tracked. An unexplained diff belongs in
-the main corpus, red, until someone explains it.
+the main corpus, red, until someone explains it. Its matrix row reads `❌ #N`, with the issue its
+header names.
