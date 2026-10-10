@@ -109,13 +109,12 @@ fn call_through_funcref_param() {
 fn virtual_dispatch_through_a_vtable() {
     // The RTTI shape nimony emits for method calls: an object's `vt` points at a vtable whose `mt`
     // flexarray holds method funcrefs (as opaque `(ptr void)` slots). A virtual call loads
-    // `o.vt.mt[0]`, casts it to the method's `(ptr proctype)`, and dispatches. This exercises the
+    // `o.vt.mt[0]`, casts it to the method's proctype, and dispatches. This exercises the
     // whole chain the real `finalizeCoroutine`/exception-destroy hooks use: the cast-deref static
     // type walk, flexarray funcref indexing, and the `i64` method-slot → `i32` funcref narrowing.
     let leng = "\
 (stmts
  (type :Getter.0. . (proctype . (params (param :self.0 . (ptr Obj.0.))) (i +64) (pragmas (nimcall))))
- (type :GetterP.0. . (ptr Getter.0.))
  (type :Vtbl.0. . (object . (fld :mt.0 . (flexarray (ptr (void))))))
  (type :Obj.0. . (object . (fld :vt.0 . (ptr Vtbl.0.)) (fld :x.0 . (i +64))))
  (proc :getX.0 (params (param :self.0 . (ptr Obj.0.))) (i +64) .
@@ -123,7 +122,7 @@ fn virtual_dispatch_through_a_vtable() {
  (proc :dispatch.0 (params (param :o.0 . (ptr Obj.0.))) (i +64) .
   (stmts .
    (ret (call
-     (cast GetterP.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
+     (cast Getter.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
      o.0))))
  (proc :ref_getX.0 . (i +64) .
   (stmts . (discard getX.0) (ret 0))))";
@@ -182,7 +181,6 @@ fn dispatch_through_a_materialized_const_vtable() {
     let leng = "\
 (stmts
  (type :Getter.0. . (proctype . (params (param :self.0 . (ptr Obj.0.))) (i +64) (pragmas (nimcall))))
- (type :GetterP.0. . (ptr Getter.0.))
  (type :Vtbl.0. . (object . (fld :mt.0 . (flexarray (ptr (void))))))
  (type :Obj.0. . (object . (fld :vt.0 . (ptr Vtbl.0.)) (fld :x.0 . (i +64))))
  (proc :decoy.0 (params (param :self.0 . (ptr Obj.0.))) (i +64) .
@@ -195,7 +193,7 @@ fn dispatch_through_a_materialized_const_vtable() {
   (stmts .
    (asgn (dot (deref o.0) vt.0 0) (cast (ptr Vtbl.0.) (addr theVt.0.)))
    (ret (call
-     (cast GetterP.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
+     (cast Getter.0. (pat (dot (deref (dot (deref o.0) vt.0 0)) mt.0 0) 0))
      o.0)))))";
     let unit = temen_leng::WholeModule {
         stem: "vt7test",
@@ -277,4 +275,29 @@ fn baseobj_upcasts_to_the_base_subobject() {
         iword, 7,
         "baseobj read the base sub-object's tag at offset 0"
     );
+}
+
+#[test]
+fn a_pointer_to_a_proctype_points_at_a_funcref_slot() {
+    // A proctype is already the function pointer, as in nimony's C backend, so a pointer to one
+    // points at a funcref slot. An `openArray` of procs is the shape: its `[]` takes the elements as
+    // `(aptr <proctype>)` and returns one's address as `(ptr <proctype>)`. leng read both as the
+    // funcref itself, so `[]` failed to translate ("not a pointer expression").
+    let leng = "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :f.0. . IntFn.0. .)
+ (proc :dbl.0 (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2))))
+ (proc :at.0 (params (param :a.0 . (aptr IntFn.0.)) (param :i.0 . (i +64))) (ptr IntFn.0.) .
+  (stmts . (ret (haddr (pat a.0 i.0)))))
+ (proc :go.0 (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (asgn f.0. dbl.0)
+   (var :p.0 . (ptr IntFn.0.) (call at.0 (addr f.0.) 0))
+   (ret (call (deref p.0) v.0)))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // dbl = func 0, at = func 1, go = func 2. `go` makes an indirect call, so under the funcref ABI
+    // it takes a leading `$sp` (18432).
+    assert_eq!(run(&m, 2, &[18432, 21]), 42);
 }

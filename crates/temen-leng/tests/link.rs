@@ -1009,3 +1009,105 @@ fn a_siblings_proc_bound_to_a_local() {
         "dbl(21) called through a local bound to a sibling unit's proc"
     );
 }
+
+/// The func index the merge gave `name`.
+fn func_named(m: &temen_ir::Module, name: &str) -> u32 {
+    m.exports
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "{name} exported: {:?}",
+                m.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        })
+        .func
+}
+
+/// A unit defining `dbl(x) = 2x`, for the sibling-funcref tests below.
+const DBL_UNIT: temen_leng::WholeModule = temen_leng::WholeModule {
+    stem: "moda",
+    src: "\
+(stmts
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))",
+};
+
+#[test]
+fn a_const_vtable_names_a_siblings_proc() {
+    // A closure iterator's coroutine has a vtable `const` whose `mt` table holds its own `=destroy`
+    // and `system`'s `cancel`: a proc this unit defines beside a sibling's. leng recognized only the
+    // first as a funcref, so the whole const fell back to a zeroed placeholder, and destroying the
+    // iterator called through a null slot (an `IndirectCallType` trap).
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (type :Vtbl.0. . (object . (fld :n.0 . (i +64)) (fld :mt.0 . (flexarray (ptr (void))))))
+ (const :vt.0. . Vtbl.0.
+  (oconstr Vtbl.0. (kv n.0 2)
+   (kv mt.0 (aconstr (flexarray (ptr (void))) (cast (ptr (void)) inc.0.) (cast (ptr (void)) dbl.0.moda)))))
+ (proc :inc.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (add (i +64) x.0 1))))
+ (proc :useit.0. (params (param :i.0 . (i +64)) (param :v.0 . (i +64))) (i +64) .
+  (stmts . (ret (call (cast IntFn.0. (pat (dot vt.0. mt.0 0) i.0)) v.0)))))",
+    };
+    let m = temen_leng::link_whole_units(&[DBL_UNIT, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    let useit = func_named(&m, "useit.0.modb");
+    // `useit` makes an indirect call → frame-needing under the funcref ABI: leading `$sp` (18432).
+    assert_eq!(
+        run(&m, useit, &[18432, 0, 41]),
+        42,
+        "mt[0] is this unit's inc"
+    );
+    assert_eq!(
+        run(&m, useit, &[18432, 1, 21]),
+        42,
+        "mt[1] is the sibling's dbl"
+    );
+}
+
+#[test]
+fn a_funcref_global_initialized_with_a_siblings_proc() {
+    // `var hook: IntFn = dbl` with `dbl` in another unit. The relocation names `dbl` by its global
+    // name, `dbl.0.moda`; suffixing that with this unit's stem as well left it unresolvable.
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (gvar :hook.0. . IntFn.0. dbl.0.moda)
+ (proc :drive.0. (params (param :n.0 . (i +64))) (i +64) .
+  (stmts . (ret (call hook.0. n.0)))))",
+    };
+    let m = temen_leng::link_whole_units(&[DBL_UNIT, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    let drive = func_named(&m, "drive.0.modb");
+    assert_eq!(run(&m, drive, &[18432, 21]), 42);
+}
+
+#[test]
+fn a_global_initialized_with_a_siblings_globals_address() {
+    // `let q = addr p` with `p` in another unit: `q`'s slot is relocated to `p` at link, so a write
+    // through `q` lands in the sibling's global.
+    let a = temen_leng::WholeModule {
+        stem: "moda",
+        src: "\
+(stmts
+ (gvar :p.0. . (i +64) 40)
+ (proc :getp.0. . (i +64) .
+  (stmts . (ret p.0.))))",
+    };
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (gvar :q.0. . (ptr (i +64)) (addr p.0.moda))
+ (proc :bump.0. . (i +64) .
+  (stmts .
+   (asgn (deref q.0.) (add (i +64) (deref q.0.) 2))
+   (ret (call getp.0.moda)))))",
+    };
+    let m = temen_leng::link_whole_units(&[a, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(run(&m, func_named(&m, "bump.0.modb"), &[]), 42);
+}

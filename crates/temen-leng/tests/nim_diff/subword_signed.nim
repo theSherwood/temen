@@ -1,5 +1,5 @@
-# KNOWN GAP — #1488: the signed half of the same hole. `int8`/`int16` results are stored back into
-# their `i32` slot without a sign-extending narrow, so `127'i8 + 1` is 128 instead of -128.
+# Signed sub-word arithmetic wraps at its declared width: `127'i8 + 1` is -128. An `int8`/`int16`
+# lives in an `i32` slot, so each result is sign-extended back to its width (#1488).
 import std/syncio
 
 proc go(): string =
