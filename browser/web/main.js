@@ -50,7 +50,27 @@ async function main() {
     set('powerbox', 'fail', `powerbox: error ${e}`);
   }
 
-  const run = makeRunner(eng);
+  // Runs share an engine until one ends other than by its root returning: a trap, a failure or an
+  // `exit`. Such a run can end with Workers still running in the engine (a thread's trap ends a run
+  // while the root still runs), and the page terminates them. Chromium stops a terminated Worker that
+  // is still running about two seconds later, wherever it is, and one stopped inside the engine's
+  // allocator never releases the allocator's lock: every later allocation in that memory spins
+  // forever. So the run after one takes a fresh engine (`loadEngine(prev)`: a new memory over the
+  // compiled module). Not every run: each engine's memory holds a large address-space reservation
+  // until the page collects it, and a page of quick runs runs out of them. A run returns its engine,
+  // for reading its output back.
+  let cur = eng;
+  const run = async (guest, opts) => {
+    const own = cur;
+    let returned = false;
+    try {
+      const r = await makeRunner(own)(guest, opts);
+      returned = r.value !== null;
+      return { ...r, eng: own };
+    } finally {
+      if (!returned) cur = await loadEngine(eng);
+    }
+  };
   const runPath = async (guestPath, opts = {}) => {
     const o = { ...opts };
     if (o.unitPath) {
@@ -95,13 +115,13 @@ async function main() {
   // Result 8 and stdout "tick\n"×8 are schedule-independent; the page reads stdout back afterward.
   try {
     const t0 = performance.now();
-    const { value, started } = await runPath('/corpus/threads_io.temenc', { io: true });
-    const out = readParStdout(eng);
+    const { value, started, eng: ioEng } = await runPath('/corpus/threads_io.temenc', { io: true });
+    const out = readParStdout(ioEng);
     // #152 — the same shared-powerbox model with the **on-ramp** grants: a manifest-`_start` guest
     // (`tests/fixtures/threads_onramp.temt`) whose 4 threads each `write` a letter through the one
     // bound `write` import, then the root writes the 8-byte total (8060) and `exit`s 7.
     const r = await runPath('/corpus/threads_onramp.temenc', { onramp: true });
-    const ob = readParStdoutBytes(eng);
+    const ob = readParStdoutBytes(r.eng);
     // #1761 — a fiber created on the root Worker, resumed on a spawned one (one run-shared fiber
     // registry), reading `vcpu.tls` on each: 0 on the root, 1 on the thread → 13.
     const fb = await runPath('/corpus/threads_fibers.temenc', {});
