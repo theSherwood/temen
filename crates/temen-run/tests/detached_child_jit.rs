@@ -9,6 +9,9 @@
 //! `AddressSpace`), stores/loads on the grown page and returns `word + attest`. Same result as the
 //! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use core::ffi::c_void;
 use core::ptr::null_mut;
 use std::sync::Mutex;
@@ -387,6 +390,34 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   }
 }
 "#;
+
+/// [`SPAWN_JOIN`], granting the child what the host named `name`, under that name: the root resolves
+/// it and hands it on in the spawn's grant list.
+fn parent_granting_by_name(name: &str) -> String {
+    format!(
+        r#"memory 17
+data 17920 "{name}"
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vnp = i64.const 17920
+  vnl = i64.const {len}
+  vg = self.resolve vnp vnl
+{grant}  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vgp = i64.const 17664
+  vgn = i64.const 1
+  vz = i64.const 0
+  vlog = i64.const 16
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vj
+  }}
+}}
+"#,
+        len = name.len(),
+        grant = rec::grant("g", 17664, 17920, name.len(), "vg"),
+    )
+}
 
 /// A detached child (`memory 16`) that spawns a thread, joins it, then spawns another and joins it,
 /// returning the sum of their results: each thread returns its `arg` plus one, 11 and 21.
@@ -873,9 +904,10 @@ fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
 }
 
 /// #1956 — a detached child (`memory 16`) that reads a depth `d` from its payload. While `d > 0` it
-/// spawns its own module detached from its own `"budget"`, with `d - 1` as the payload, joins it and
-/// returns `10 * result + d`; at `d = 0` it returns 7. `orphan` makes the `d = 1` level return 5
-/// without joining, and the `d = 0` level count down 200 000 first, so it outlives its parent.
+/// spawns the module it was granted as `"nester"` (itself) detached from its own `"budget"`, with
+/// `d - 1` as the payload and `"nester"` granted on, joins it and returns `10 * result + d`; at `d = 0`
+/// it returns 7. `orphan` makes the `d = 1` level return 5 without joining, and the `d = 0` level
+/// count down 200 000 first, so it outlives its parent.
 fn nester(orphan: bool) -> String {
     let (join, leaf) = if orphan {
         (
@@ -891,6 +923,7 @@ fn nester(orphan: bool) -> String {
     format!(
         r#"memory 16
 data 20000 "budget"
+data 20016 "nester"
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vab = i64.const {args}
@@ -908,12 +941,17 @@ block 1 (vi: i64, vd1: i64) {{
   vnl = i64.const 6
   vb = self.resolve vnp vnl
   vbw = i64.extend_i32_u vb
-  vself = i64.const -1
+  vmp = i64.const 20016
+  vml = i64.const 6
+  vnest = self.resolve vmp vml
+{grant}  vmw = i64.extend_i32_u vnest
+  vgp = i64.const 20032
+  vgn = i64.const 1
   vzero = i64.const 0
   vlog = i64.const 16
   vpl = i64.const 8
   vinst = i32.wrap_i64 vi
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vzero, vzero, vzero, vlog, vzero, vpp, vpl)
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vzero, vlog, vzero, vpp, vpl)
   {join}
 }}
 block 2 () {{
@@ -932,30 +970,35 @@ block 4 () {{
 }}
 "#,
         args = temen_ir::module_args_base(),
+        grant = rec::grant("g", 20032, 20016, 6, "vnest"),
     )
 }
 
 /// `v0` Instantiator, `v1` the [`nester`] module, `v2` the `Budget`: spawn it detached with depth `d`
-/// as its payload, join it, and return its result.
+/// as its payload and itself granted as `"nester"`, join it, and return its result.
 fn nest_root(d: i64) -> String {
     format!(
         r#"memory 17
+data 20016 "nester"
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
   vpp = i64.const 18432
   vd = i64.const {d}
   i64.store vpp vd
-  vmh = i64.extend_i32_u v1
+{grant}  vmh = i64.extend_i32_u v1
   vb = i64.extend_i32_u v2
+  vgp = i64.const 20032
+  vgn = i64.const 1
   vz = i64.const 0
   vlog = i64.const 16
   vpl = i64.const 8
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vpp, vpl)
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vpp, vpl)
   vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vj
   }}
 }}
-"#
+"#,
+        grant = rec::grant("g", 20032, 20016, 6, "v1"),
     )
 }
 
@@ -1036,10 +1079,13 @@ fn a_child_joining_its_child_under_a_lane_cap_of_one_steps_aside_on_the_jit() {
     assert_eq!(jit, JitOutcome::Returned(vec![712]), "the JIT");
 }
 
-/// A detached child (`memory 16`) whose thread spawns a grandchild (func 2, which returns 5) from the
-/// child's `"budget"` and joins it; the child joins the thread, which returns the result plus 100.
+/// A detached child (`memory 16`) whose thread spawns a grandchild (the image of func 2, which returns
+/// 5, granted it as `"grandchild"`) from the child's `"budget"` and joins it; the child joins the
+/// thread, which returns the result plus 100.
 const CHILD_THREAD_SPAWNS: &str = r#"memory 16
 data 20000 "budget"
+data 20016 "grandchild"
+export 0 func "grandchild" 2
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vz = i64.const 0
@@ -1054,12 +1100,14 @@ block 0 (vsp: i64, vi: i64) {
   vnl = i64.const 6
   vb = self.resolve vnp vnl
   vbw = i64.extend_i32_u vb
-  vself = i64.const -1
+  vgp = i64.const 20016
+  vgl = i64.const 10
+  vg = self.resolve vgp vgl
+  vgw = i64.extend_i32_u vg
   vz = i64.const 0
-  ve = i64.const 2
   vlog = i64.const 16
   vinst = i32.wrap_i64 vi
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vz, vz, ve, vlog, vz, vz, vz)
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vgw, vz, vz, vz, vlog, vz, vz, vz)
   vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
   vk = i64.const 100
   vr = i64.add vj vk
@@ -1081,10 +1129,14 @@ block 0 (v0: i64) {
 fn a_childs_thread_joining_a_grandchild_gives_back_the_childs_lane_on_the_jit() {
     let (interp, jit) = within_a_minute("a child's thread joining a grandchild", || {
         let c = module(CHILD_THREAD_SPAWNS);
-        let p = module(SPAWN_JOIN);
-        // The run's budget, narrowed to a node with one lane: the child's lane.
+        let grandchild = temen_ir::child_image_at(&c, 2).expect("grandchild image");
+        let p = module(&parent_granting_by_name("grandchild"));
+        // The run's budget, narrowed to a node with one lane: the child's lane. The host names the
+        // grandchild's image as the child program exports it, and the root grants it on.
         let one_lane = || {
             let (mut host, mut h) = host(&c, 1 << 20);
+            let g = host.grant_module(&grandchild);
+            host.register_cap_name("grandchild", g);
             h[2] = host
                 .cap_dispatch_slots(cap_id::BUDGET, 0, h[2], &[-1, 1 << 20, -1, -1, 1], None)
                 .expect("split")[0] as i32;

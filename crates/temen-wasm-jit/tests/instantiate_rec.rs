@@ -24,17 +24,24 @@ const ENV_PTR: i32 = 1024;
 /// Where the parent builds its record: above the #1094 NULL guard.
 const REC_AT: u64 = 18432;
 
-/// Parent (func 0, `(i64 inst) -> (i64)`): build a v1 record for func 1 at [`REC_AT`] — the module's
-/// declared window, no pager, its own module, no budget, no fuel cap, no grants —
+/// The `Module` handle the parent is handed for its child, which its record must name.
+const CHILD_MODULE_HANDLE: i32 = 99;
+
+/// Parent (func 0, `(i64 inst, i64 child) -> (i64)`): build a v1 record at [`REC_AT`] for `child`,
+/// func 1's image — the module's declared window, no pager, no budget, no fuel cap, no grants —
 /// `instantiate_rec`, `join`, return. Child (func 1): pure compute, returns 9.
 fn rec_parent() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(1));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let module_at = REC_AT + 24;
     format!(
         r#"memory 16
-func (i64) -> (i64) {{
-block 0 (v0: i64) {{
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
   vinst = i32.wrap_i64 v0
-{stores}  vrp = i64.const {REC_AT}
+{stores}  vma = i64.const {module_at}
+  vmh = i32.wrap_i64 v1
+  i32.store vma vmh
+  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
   return vr
@@ -54,6 +61,11 @@ fn parse(src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     m
+}
+
+/// The child the parent spawns: func 1's image.
+fn child_image(m: &temen_ir::Module) -> temen_ir::Module {
+    temen_ir::child_image_at(m, 1).expect("the child's image")
 }
 
 fn oracle_child(m: &temen_ir::Module, entry: u32) -> i64 {
@@ -154,7 +166,7 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
 #[test]
 fn record_spawn_bounces_and_matches_interp() {
     let m = parse(&rec_parent());
-    let want = oracle_child(&m, 1);
+    let want = oracle_child(&child_image(&m), 0);
     assert_eq!(want, 9, "child oracle");
 
     let wasm = compile_module_nested(&m, false).expect("op-17 entry emits (nested)");
@@ -191,13 +203,15 @@ fn record_spawn_bounces_and_matches_interp() {
                 let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
                 assert_eq!(
                     rec,
-                    temen_ir::SpawnRec::v1(1),
+                    temen_ir::SpawnRec {
+                        modh: CHILD_MODULE_HANDLE,
+                        ..temen_ir::SpawnRec::v1(0)
+                    },
                     "the record the parent built, detached"
                 );
-                let entry = rec.entry;
                 caller.data_mut().saw_rec_bounce = true;
-                let m = caller.data().module.clone();
-                let r = oracle_child(&m, entry);
+                let image = child_image(&caller.data().module);
+                let r = oracle_child(&image, rec.entry);
                 let st = caller.data_mut();
                 st.children.push(r);
                 (st.children.len() - 1) as i32
@@ -211,7 +225,12 @@ fn record_spawn_bounces_and_matches_interp() {
         .start(&mut store)
         .unwrap();
     let f0 = instance.get_func(&store, "f0").expect("f0 exported");
-    let params = [Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(7)];
+    let params = [
+        Val::I32(WIN_BASE),
+        Val::I32(ENV_PTR),
+        Val::I64(7),
+        Val::I64(CHILD_MODULE_HANDLE.into()),
+    ];
     let mut results = [Val::I64(0)];
     f0.call(&mut store, &params, &mut results).expect("f0 runs");
 

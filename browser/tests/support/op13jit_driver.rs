@@ -24,7 +24,7 @@ pub fn driver(grants: &[&str], tail: &str) -> Vec<u8> {
         grants_n: grants.len() as u64,
         ..temen_ir::SpawnRec::v1(0)
     };
-    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, Some("v1"), "v2");
+    let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     let (tail, ret) = if tail.is_empty() {
         ("", "vr")
     } else {

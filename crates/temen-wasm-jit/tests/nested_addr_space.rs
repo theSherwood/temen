@@ -43,23 +43,26 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// Entry `(address_space, instantiator, budget) -> i64`: the §14 story in one function — `sub`-carve
-/// the window (outlined bounce), then spawn a child through a v1 record paid from `budget` + `join` it
-/// (the dedicated import bounce), folding both results. The child (func 1) mirrors the driver contract
-/// (`(i64) -> (i64)`, ignores its starter arg) and returns 9.
+/// Entry `(address_space, instantiator, budget, child) -> i64`: the §14 story in one function —
+/// `sub`-carve the window (outlined bounce), then spawn `child`, func 1's image, through a v1 record
+/// paid from `budget` + `join` it (the dedicated import bounce), folding both results. The child
+/// mirrors the driver contract (`(i64) -> (i64)`, ignores its starter arg) and returns 9.
 fn composed() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(1));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let module_at = REC_AT + 24;
     let budget_at = REC_AT + 28;
     format!(
         r#"memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, vchild: i32) {{
   vps = call.cap 5 3 () -> (i64) v0 ()
   voff = i64.const 65536
   vslog = i64.const 16
   vsub = call.cap 5 4 (i64, i64) -> (i32) v0 (voff, vslog)
   vps2 = call.cap 5 3 () -> (i64) vsub ()
-{stores}  vba = i64.const {budget_at}
+{stores}  vma = i64.const {module_at}
+  i32.store vma vchild
+  vba = i64.const {budget_at}
   i32.store vba v2
   vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) v1 (vrp)
@@ -89,27 +92,31 @@ fn parse(src: &str) -> temen_ir::Module {
     m
 }
 
+/// The child [`composed`] spawns: func 1's image.
+fn child_image(m: &temen_ir::Module) -> temen_ir::Module {
+    temen_ir::child_image_at(m, 1).expect("the child's image")
+}
+
 /// Grant the host exactly as both tiers must: AddressSpace over the whole window, then (iff the
-/// entry takes them) an Instantiator and a Budget that pays for the child's window. Same order ⇒
-/// identical handle encodings across hosts.
-fn granted_host(with_inst: bool) -> (Host, Vec<Value>) {
+/// entry takes them) an Instantiator, a Budget that pays for the child's window, and the child's
+/// image. Same order ⇒ identical handle encodings across hosts.
+fn granted_host(m: &temen_ir::Module, with_inst: bool) -> (Host, Vec<Value>) {
     let mut h = Host::new();
     let a = h.grant_address_space(0, WIN);
     let mut args = vec![Value::I32(a)];
     if with_inst {
         let i = h.grant_instantiator(0, WIN);
         let b = h.grant_budget(-1, -1, -1);
-        args.extend([Value::I32(i), Value::I32(b)]);
+        let c = h.grant_module(&child_image(m));
+        args.extend([Value::I32(i), Value::I32(b), Value::I32(c)]);
     }
     (h, args)
 }
 
 /// The whole-entry oracle: the bytecode cooperative driver over an identically-granted host — it
-/// services the generic ADDRESS_SPACE dispatch *and* the spawn/`join` in one run. The host knows the
-/// running module, as an embedder registers it, so the record's `-1` names it.
+/// services the generic ADDRESS_SPACE dispatch *and* the spawn/`join` in one run.
 fn oracle(m: &temen_ir::Module, with_inst: bool) -> i64 {
-    let (mut host, args) = granted_host(with_inst);
-    host.set_self_module(&std::sync::Arc::new(m.clone()));
+    let (mut host, args) = granted_host(m, with_inst);
     let mut fuel = 50_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut host) {
         Some(Ok(v)) => match v.first() {
@@ -124,6 +131,8 @@ fn oracle(m: &temen_ir::Module, with_inst: bool) -> i64 {
 /// persistent powerbox-carrying `Host` (so `sub`'s mint lands in the same table the entry's handles
 /// came from), spawned-child results, and the bounce counters (non-vacuity).
 struct HostState {
+    /// The handle of the child's image, which the record must name.
+    child: Option<i32>,
     m: temen_ir::Module,
     host: Host,
     children: Vec<i64>,
@@ -139,12 +148,17 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
     outline_nested_cap_calls(&mut m);
     let wasm = compile_module_nested(&m, false).expect("nested entry emits");
 
-    let (host, args) = granted_host(with_inst);
+    let (host, args) = granted_host(&m, with_inst);
+    let child = args.get(3).map(|v| match v {
+        Value::I32(h) => *h,
+        other => panic!("child handle {other:?}"),
+    });
     let engine = Engine::default();
     let module = WModule::new(&engine, &wasm).expect("nested wasm validates");
     let mut store: Store<HostState> = Store::new(
         &engine,
         HostState {
+            child,
             m,
             host,
             children: Vec::new(),
@@ -214,8 +228,8 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
         )
         .unwrap();
     // The dedicated §14 spawn/join bounce (as in instantiate_rec.rs): read the record back out of
-    // the parent's window, decode it, and run the child entry detached on the tree-walker (the child
-    // here is pure). The op-0 import is part of every nested module's layout but never fires.
+    // the parent's window, decode it, and run the child's image detached on the tree-walker (the
+    // child here is pure). The op-0 import is part of every nested module's layout but never fires.
     linker
         .func_wrap(
             "env",
@@ -229,12 +243,15 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
                 mem.read(&caller, (win as u64 + record_ptr as u64) as usize, &mut rec)
                     .expect("record in-window");
                 let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
-                assert!(rec.detached && rec.modh == -1, "a v1 self-spawn: {rec:?}");
                 let st = caller.data_mut();
+                assert!(
+                    rec.detached && Some(rec.modh) == st.child && rec.entry == 0,
+                    "a v1 spawn of the child's image: {rec:?}"
+                );
                 st.inst_bounces += 1;
-                let m = st.m.clone();
+                let image = child_image(&st.m);
                 let mut fuel = u64::MAX;
-                let r = match temen_interp::run(&m, rec.entry, &[Value::I64(0)], &mut fuel) {
+                let r = match temen_interp::run(&image, 0, &[Value::I64(0)], &mut fuel) {
                     Ok(v) => match v.first() {
                         Some(Value::I64(x)) => *x,
                         other => panic!("child result: {other:?}"),

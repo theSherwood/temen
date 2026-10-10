@@ -268,12 +268,15 @@ fn scheduled_window_write_survives_seek() {
     );
 }
 
-/// A guest that resolves its `"instantiator"` and `"budget"`, spawns a detached copy of itself (an
-/// op-17 v1 record, `module = -1`) and returns what the copy returns. The copy, func 1, adds 1 to a
-/// word of its own window 3000 times and returns it.
+/// A guest that resolves its `"instantiator"`, `"budget"` and `"child"`, spawns a detached copy of
+/// itself (an op-17 v1 record naming its child image, which starts at its `_child` export, func 1)
+/// and returns what the copy returns. The copy adds 1 to a word of its own window 3000 times and
+/// returns it.
 const SELF_SPAWN: &str = r#"memory 17
 data 17472 "instantiator"
 data 17488 "budget"
+data 17504 "child"
+export 0 func "_child" 1
 func () -> (i64) {
 block 0 () {
   p1 = i64.const 17472
@@ -282,8 +285,11 @@ block 0 () {
   p2 = i64.const 17488
   l2 = i64.const 6
   vbud = self.resolve p2 l2
+  p3 = i64.const 17504
+  l3 = i64.const 5
+  vchild = self.resolve p3 l3
   vz = i64.const 0
-  r0 = i64.const 4294967297
+  r0 = i64.const 1
   a0 = i64.const 17536
   i64.store a0 r0
   a1 = i64.const 17544
@@ -294,8 +300,8 @@ block 0 () {
   vb64 = i64.extend_i32_u vbud
   v32 = i64.const 32
   vbs = i64.shl vb64 v32
-  vself = i64.const 4294967295
-  r3 = i64.or vbs vself
+  vc64 = i64.extend_i32_u vchild
+  r3 = i64.or vbs vc64
   a3 = i64.const 17560
   i64.store a3 r3
   a4 = i64.const 17568
@@ -308,8 +314,9 @@ block 0 () {
   i64.store a7 vz
   a8 = i64.const 17600
   i64.store a8 vz
+  vnone = i64.const 4294967295
   a9 = i64.const 17608
-  i64.store a9 vself
+  i64.store a9 vnone
   a10 = i64.const 17616
   i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
@@ -345,14 +352,15 @@ block 2 () {
 /// recorded write replays there**: break at the head of the child's loop, add a million to its count,
 /// and it finishes a million higher, before and after a `seek(0)` re-drive. The write is recorded
 /// with the focused task; recording it as the root's window replayed it there, and the re-drive
-/// counted to 3000.
+/// counted to 3000. The breakpoint names module 1: the debug run numbers the child image, a granted
+/// module, at its first spawn.
 #[test]
 fn a_window_write_to_a_stopped_child_survives_seek() {
     let m = parse_module(SELF_SPAWN).expect("parses");
     let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, true, Vec::new(), false, None, None)
         .expect("bytecode subset");
     let bp = IrPc {
-        module: 0,
+        module: 1,
         func: 1,
         block: 1,
         inst: 0,
