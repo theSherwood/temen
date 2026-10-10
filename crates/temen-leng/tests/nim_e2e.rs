@@ -3466,9 +3466,18 @@ fn a_nim_domain_and_a_c_domain_share_a_ring() {
         return;
     };
     let mods = compile_to_leng(&path, RING_PRODUCER);
-    let units: Vec<temen_leng::WholeModule> = mods
-        .iter()
-        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+    // `child_image_at` puts the child's bootstrap in function 0, so function 0 must be a proc nothing
+    // calls. It is the first unit's first proc: the program module comes first, and its first proc is
+    // `produce`, which the glue calls. A unit of one empty proc takes the slot instead.
+    let reserved = temen_leng::WholeModule {
+        stem: "reserved",
+        src: "(stmts (proc :reserved.0. . . . (stmts)))",
+    };
+    let units: Vec<temen_leng::WholeModule> = std::iter::once(reserved)
+        .chain(
+            mods.iter()
+                .map(|(stem, src)| temen_leng::WholeModule { stem, src }),
+        )
         .collect();
     let shim = temen_leng::nim_compute_shim_unit(&units).expect("compute shim unit");
     // nimony names a C import `<name>.0.`.
