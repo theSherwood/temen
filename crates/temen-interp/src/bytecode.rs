@@ -2054,6 +2054,15 @@ impl FreshWindow {
         }
         Ok(mem)
     }
+
+    /// #2102 — a backing emitted code can address on every target: a flat buffer of the declared
+    /// window that grows in place when the child maps past it, as a cooperative run's root window
+    /// does (#1312). The engine's own reservation is flat only where it is an `mmap`. `None` when
+    /// the allocation fails, and the child then runs over the engine's reservation, interpreted.
+    fn flat_backing(&self) -> Option<std::sync::Arc<super::Region>> {
+        super::Region::growable(1u64 << self.size_log2, super::host_page_size())
+            .map(std::sync::Arc::new)
+    }
 }
 
 /// Admit an op-15 spawn against `host` (the parent powerbox) and build the child, with its window
@@ -2218,8 +2227,15 @@ fn admit_detached_child(
     Ok(Some((child, window)))
 }
 
+/// A run's tier-up eligibility bitmap ([`TierUpConfig::eligible`]): a flag per module-0 function.
+type Eligible = std::sync::Arc<[bool]>;
+
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own.
+/// built at once, over a reservation of the engine's own. Returns the child, and the tier-up bitmap
+/// it inherits from the run's, `eligible`: the run's own when the child runs the root's unit (#816).
+/// Such a child's window is built over a [`FreshWindow::flat_backing`] instead, so that it can tier
+/// up on every target (#2102). Only the cooperative pump has a bitmap, and it is the single owner a
+/// backing that relocates needs.
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
@@ -2227,14 +2243,20 @@ fn admit_detached_in_process(
     source: &ModuleSource,
     spawner: Option<(u32, std::sync::Arc<Compiled>)>,
     unit: Option<(u32, u32)>,
-) -> Result<Option<AdmittedChild>, Trap> {
+    eligible: Option<&Eligible>,
+) -> Result<Option<(AdmittedChild, Option<Eligible>)>, Trap> {
     let Some((mut child, window)) =
         admit_detached_child(host, pm, s, false, source, spawner, unit)?
     else {
         return Ok(None);
     };
-    child.mem = Some(window.build(None, &mut child.host)?);
-    Ok(Some(child))
+    let inherits = match child.program {
+        ChildProgram::Spawner(0, _) => eligible.cloned(),
+        _ => None,
+    };
+    let back = inherits.as_ref().and_then(|_| window.flat_backing());
+    child.mem = Some(window.build(back, &mut child.host)?);
+    Ok(Some((child, inherits)))
 }
 
 /// Compile a module `host` granted, for a child: through the host's memo when its embedder handed it
@@ -8518,7 +8540,9 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some(child) = admit_detached_in_process(owner, pm, spawn, source, spawner, unit)? else {
+    let Some((child, _)) =
+        admit_detached_in_process(owner, pm, spawn, source, spawner, unit, None)?
+    else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -15913,8 +15937,9 @@ impl SchedCore {
                     &dom.source,
                     spawner,
                     unit,
+                    eligible.as_ref(),
                 );
-                let child = match admitted {
+                let (child, inherits) = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
@@ -15925,17 +15950,12 @@ impl SchedCore {
                         return None;
                     }
                 };
-                // #816 env-routed tier-up, as for a confined child: a child running the root's
-                // unit inherits the run's bitmap when the driver can address its own window
-                // flatly; any other window stays interpreted.
-                let tierup = match (&child.program, eligible.as_ref()) {
-                    (ChildProgram::Spawner(0, _), Some(e))
-                        if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
-                    {
-                        Some((std::sync::Arc::clone(e), *page_checked))
-                    }
-                    _ => None,
-                };
+                // #816 env-routed tier-up, as for a confined child: the child keeps the bitmap it
+                // inherits while the driver can address its window flatly, which only a failed
+                // flat allocation prevents.
+                let tierup = inherits
+                    .filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()))
+                    .map(|e| (e, *page_checked));
                 let started =
                     coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
                 if let Err(t) = started {
@@ -16890,11 +16910,12 @@ impl CoopRun {
 /// - a window sharing the **root backing** (a root-env thread, a §14 child carve via `nested_view`)
 ///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
 ///   carve offset);
-/// - any other window (a fork twin's private `fork_private` copy) qualifies only if its own region
-///   is flat-addressable ([`Mem::flat_win_base`]). `fork_private` now picks an owned flat buffer
-///   for a bounded twin of a flat parent (#816 item 3), so tier-up-shaped twins qualify on every
-///   target; a twin that still lands on the `Paged` fallback (unbounded reservation, allocation
-///   failure) stays interpreted, fail-closed.
+/// - any other window (a detached child's own, a fork twin's private `fork_private` copy) qualifies
+///   only if its own region is flat-addressable ([`Mem::flat_win_base`]). A detached child that
+///   inherits the run's bitmap gets a growable flat window on every target (#2102), and a twin
+///   gets a flat backing wherever its parent's grows in place or holds its whole reservation (#816
+///   item 3). A window still on a non-flat backing (an allocation failure) stays interpreted,
+///   fail-closed.
 ///
 /// A memory-less run has no window to serve — no bitmap.
 fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {

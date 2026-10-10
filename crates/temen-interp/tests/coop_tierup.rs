@@ -709,13 +709,11 @@ fn coop_tierup_child_env_tasks_tier_up() {
         "cooperative tier-up run with a detached child diverged from the pure-interp oracle"
     );
     // #816 env routing: all three eligible calls surface — the root's, the detached child entry's
-    // (spawn-arm inheritance), and the child-env worker's (thread-arm inheritance). #2102: off unix a
-    // detached window has no flat backing, so only the root's does there.
-    let want_tierups = if cfg!(unix) { 3 } else { 1 };
+    // (spawn-arm inheritance), and the child-env worker's (thread-arm inheritance) — on every
+    // target, since a tier-up run builds a detached child's window flat (#2102).
     assert_eq!(
-        tierups, want_tierups,
-        "root + child entry + child worker must all tier up where a detached window is flat \
-         (#816, #2102), got {tierups}"
+        tierups, 3,
+        "root + child entry + child worker must all tier up (#816, #2102), got {tierups}"
     );
 }
 
@@ -859,10 +857,9 @@ block 0 (vx: i64) {
 // `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
 // copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
 // reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
-// With the flat twin-backing seam, the twin's private window is an owned flat buffer, so its leaf
-// call TIERS UP (previously: interpreted fail-closed on wasm) — and its event's `pending_win` must
-// resolve OUTSIDE the root backing (the twin's own allocation), while the original's resolves
-// inside it (its §14 carve). Differential against the same run with no bitmap.
+// The manager takes a `Budget`, which a detached guest's record charges. `fork_twin_src` fills
+// in where the manager spawns the guest (`@GUEST@`) and the guest's scratch (`@S0@`, `@S8@`,
+// `@S16@`): its names and its stdout word, which it keeps in its own window.
 const SRC_FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -870,8 +867,8 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32) {
   vlog = i64.const 12
   vq = i64.const 0
   q1v0 = i64.const 4294967296
@@ -912,28 +909,7 @@ block 0 (v0: i32, vout: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
-  i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
-  i64.store q2a6 q2v6
-  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
+@GUEST@  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
   return vjc
   }
@@ -967,17 +943,15 @@ block 0 (vpid: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vsvc = i64.const 6518387
-  vzero = i64.const 0
-  i64.store vzero vsvc
+  vs0 = i64.const @S0@
+  i64.store vs0 vsvc
   voname = i64.const 111
-  va8 = i64.const 8
-  i64.store va8 voname
-  vp0 = i64.const 0
+  vs8 = i64.const @S8@
+  i64.store vs8 voname
   vl3 = i64.const 3
-  vhsvc = self.resolve vp0 vl3
-  vp8 = i64.const 8
+  vhsvc = self.resolve vs0 vl3
   vl1 = i64.const 1
-  vho = self.resolve vp8 vl1
+  vho = self.resolve vs8 vl1
   br 1(vhsvc, vho)
   }
 block 1 (vhsvc: i32, vho: i32) {
@@ -1001,10 +975,10 @@ block 3 (vr: i64, vstatus: i64, vhsvc: i32, vho: i32) {
   }
 block 4 (vr: i64, vho: i32) {
   vleaf = call 5 (vr)
-  vp16 = i64.const 16
-  i64.store vp16 vleaf
+  vs16 = i64.const @S16@
+  i64.store vs16 vleaf
   vlen = i64.const 8
-  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vp16, vlen)
+  vw = call.cap 0 1 (i64, i64) -> (i64) vho (vs16, vlen)
   return vr
   }
 }
@@ -1019,109 +993,184 @@ block 0 (vx: i64) {
 }
 "#;
 
+/// Where [`fork_twin_src`]'s guest runs: in a 4 KiB carve of the root window (a v0 record, which
+/// #1867 retires), or detached, in a window of its own (a v1 record, #2102).
+#[derive(Clone, Copy, Debug)]
+enum Guest {
+    Carve,
+    Detached,
+}
+
+/// [`SRC_FORK_TWIN`] with its guest placed `guest`. Its scratch is at 0 in the carve, which is
+/// unguarded, and above the NULL guard a detached window has (#964).
+fn fork_twin_src(guest: Guest) -> String {
+    let (spawn, scratch, rec) = match guest {
+        Guest::Carve => (CARVE_GUEST, 0, String::new()),
+        Guest::Detached => (
+            "  q2a0 = i64.const 17664\n  q2b = i64.const 17692\n  i32.store q2b vbud\n",
+            16896,
+            rec::segment(
+                17664,
+                &temen_ir::SpawnRec {
+                    grants_ptr: 16640,
+                    grants_n: 2,
+                    ..temen_ir::SpawnRec::v1(4)
+                },
+            ),
+        ),
+    };
+    SRC_FORK_TWIN
+        .replace("@GUEST@", spawn)
+        .replace("@S0@", &scratch.to_string())
+        .replace("@S8@", &(scratch + 8).to_string())
+        .replace("@S16@", &(scratch + 16).to_string())
+        + &rec
+}
+
+/// The guest's v0 carve record at 17664: entry 4, a 4 KiB carve at 135168, its grants `"svc"` and
+/// `"o"` at 16640.
+const CARVE_GUEST: &str = "  q2v0 = i64.const 17179869184
+  q2v1 = i64.const 135168
+  q2v2 = i64.const -4294967284
+  q2v3 = i64.const 4294967295
+  q2v4 = i64.const 0
+  q2v5 = i64.const 16640
+  q2v6 = i64.const 2
+  q2a0 = i64.const 17664
+  i64.store q2a0 q2v0
+  q2a1 = i64.const 17672
+  i64.store q2a1 q2v1
+  q2a2 = i64.const 17680
+  i64.store q2a2 q2v2
+  q2a3 = i64.const 17688
+  i64.store q2a3 q2v3
+  q2a4 = i64.const 17696
+  i64.store q2a4 q2v4
+  q2a5 = i64.const 17704
+  i64.store q2a5 q2v5
+  q2a6 = i64.const 17712
+  i64.store q2a6 q2v6
+";
+
 /// Every target (unlike the unix-only pending-win test): the run backing is an **owned flat**
 /// buffer (`Region::owned_zeroed` — the same shape as the browser's `Region::shared` window), so
 /// the raw window views resolve even where `Region::new` would fall back to `Paged` (Windows),
-/// and the twin-backing seam's non-unix arm gets real end-to-end CI coverage there.
+/// and the twin-backing seam's non-unix arm gets real end-to-end CI coverage there. A detached
+/// guest's window and its twin's are flat on every target too (#2102). Differential against the
+/// same run with no bitmap.
 #[test]
 fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
+    // Both leaf calls tier up: the original guest's and the fork twin's, whose private
+    // `fork_private` window is its OWN flat allocation, outside the root backing. A carve guest's
+    // window lies INSIDE the root backing, and both span the 4 KiB carve; a detached guest's
+    // 256 KiB window is its own, and so is its twin's.
+    for (guest, want_events) in [
+        (Guest::Carve, vec![(false, 4096), (true, 4096)]),
+        (Guest::Detached, vec![(false, 1 << 18), (false, 1 << 18)]),
+    ] {
+        let m = std::sync::Arc::new(parse_module(&fork_twin_src(guest)).unwrap());
+        temen_verify::verify_module(&m).expect("verify");
+        // Oracle: pure-interp cooperative run. The original resumes with 100 and the twin with
+        // 200; both write leaf(reply) to the shared stdout: leaf(100) = 307, leaf(200) = 607.
+        let (want, want_out, oracle_events) = fork_twin_run(&m, None);
+        assert_eq!(want, Ok(vec![Value::I64(100)]), "{guest:?}: oracle value");
+        assert_eq!(
+            want_out,
+            vec![307, 607],
+            "{guest:?}: both copies ran and wrote (oracle)"
+        );
+        assert!(oracle_events.is_empty(), "the oracle never tiers up");
+
+        let eligible: std::sync::Arc<[bool]> =
+            std::sync::Arc::from(vec![false, false, false, false, false, true]);
+        let (got, got_out, mut events) = fork_twin_run(
+            &m,
+            Some(TierUpConfig {
+                eligible,
+                page_checked: false,
+                leaf: None,
+            }),
+        );
+        assert_eq!(
+            got, want,
+            "{guest:?}: the tier-up run diverged from the oracle"
+        );
+        assert_eq!(got_out, want_out, "{guest:?}: stdout parity");
+        events.sort_unstable();
+        assert_eq!(
+            events, want_events,
+            "{guest:?}: the original's event and the twin's, (in the root backing?, span)"
+        );
+    }
+}
+
+/// Run `m`, a [`fork_twin_src`] program, on the cooperative driver with `tierup` or without, over
+/// an owned flat 256 KiB root backing: its result, its sorted stdout words, and for each tier-up
+/// event, whether the pending window lies in the root backing, and its span.
+#[allow(clippy::type_complexity)]
+fn fork_twin_run(
+    m: &std::sync::Arc<temen_ir::Module>,
+    tierup: Option<TierUpConfig>,
+) -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(bool, u64)>) {
     const FORK_FUEL: u64 = 40_000_000;
-    let m = std::sync::Arc::new(parse_module(SRC_FORK_TWIN).unwrap());
-    temen_verify::verify_module(&m).expect("verify");
-    // (ptr-in-root-backing?, len) per tier-up event, plus the whole-run result and stdout.
-    #[allow(clippy::type_complexity)]
-    let run_with =
-        |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(bool, u64)>) {
-            let mut host = Host::new();
-            host.set_self_module(&m);
-            let inst = host.grant_instantiator(0, 1u64 << 18);
-            let sink = host.shared_stdout();
-            let out_h = host.grant_stream(temen_interp::StreamRole::Out);
-            let args = [Value::I32(inst), Value::I32(out_h)];
-            let back = std::sync::Arc::new(
-                temen_interp::Region::owned_zeroed(1 << 18, 4096).expect("256 KiB allocates"),
-            );
-            let root_base = back.raw_base().expect("flat backing") as usize;
-            let mut run = bytecode::CoopRun::new_over(
-                &m,
-                0,
-                &args,
-                FORK_FUEL,
-                host,
-                tierup,
-                &[],
-                18,
-                std::sync::Arc::clone(&back),
-            )
-            .expect("supported")
-            .expect("entry in range");
-            let mut events: Vec<(bool, u64)> = Vec::new();
-            let result = loop {
-                match run.run() {
-                    bytecode::CoopEvent::Done(vals) => break Ok(vals),
-                    bytecode::CoopEvent::Trapped(t) => break Err(t),
-                    bytecode::CoopEvent::Idle
-                    | bytecode::CoopEvent::Paused
-                    | bytecode::CoopEvent::CapPark { .. } => {
-                        panic!("unexpected Idle (suspend_on_idle is never armed here)")
-                    }
-                    bytecode::CoopEvent::Resume { .. } => {
-                        panic!("unexpected Resume (no leaf image here)")
-                    }
-                    bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
-                    bytecode::CoopEvent::TierUp { func, argv, .. } => {
-                        assert_eq!(func, 5, "only the leaf is eligible");
-                        assert!(events.len() < 10, "runaway tier-ups");
-                        let (ptr, len) = run
-                            .pending_win()
-                            .expect("every tiering task's window must resolve a flat view");
-                        let in_root =
-                            (ptr as usize) >= root_base && (ptr as usize) < root_base + (1 << 18);
-                        events.push((in_root, len));
-                        let x = argv[0];
-                        run.deliver_tierup(&[x * 3 + 7]);
-                    }
-                }
-            };
-            let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let mut out: Vec<i64> = bytes
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                .collect();
-            out.sort_unstable();
-            (result, out, events)
-        };
-
-    // Oracle: pure-interp cooperative run. The original resumes with 100 and the twin with 200;
-    // both write leaf(reply) to the shared stdout: leaf(100) = 307, leaf(200) = 607.
-    let (want, want_out, oracle_events) = run_with(None);
-    assert_eq!(want, Ok(vec![Value::I64(100)]), "oracle value");
-    assert_eq!(
-        want_out,
-        vec![307, 607],
-        "both copies ran and wrote (oracle)"
+    let mut host = Host::new();
+    host.set_self_module(m);
+    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let sink = host.shared_stdout();
+    let out_h = host.grant_stream(temen_interp::StreamRole::Out);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let args = [Value::I32(inst), Value::I32(out_h), Value::I32(budget)];
+    let back = std::sync::Arc::new(
+        temen_interp::Region::owned_zeroed(1 << 18, 4096).expect("256 KiB allocates"),
     );
-    assert!(oracle_events.is_empty(), "the oracle never tiers up");
-
-    let eligible: std::sync::Arc<[bool]> =
-        std::sync::Arc::from(vec![false, false, false, false, false, true]);
-    let (got, got_out, events) = run_with(Some(TierUpConfig {
-        eligible,
-        page_checked: false,
-        leaf: None,
-    }));
-    assert_eq!(got, want, "fork-twin tier-up run diverged from the oracle");
-    assert_eq!(got_out, want_out, "stdout parity");
-    // Both leaf calls tier up: the original guest's (a §14 child — its carve window lies INSIDE
-    // the root backing) and the fork twin's (its private `fork_private` window is its OWN flat
-    // allocation, outside the root backing). Both windows span the 4 KiB carve geometry.
-    let mut sorted = events.clone();
-    sorted.sort_unstable();
-    assert_eq!(
-        sorted,
-        vec![(false, 4096), (true, 4096)],
-        "one in-root-carve event (the original) + one private-window event (the twin), got {events:?}"
-    );
+    let root_base = back.raw_base().expect("flat backing") as usize;
+    let mut run = bytecode::CoopRun::new_over(
+        m,
+        0,
+        &args,
+        FORK_FUEL,
+        host,
+        tierup,
+        &[],
+        18,
+        std::sync::Arc::clone(&back),
+    )
+    .expect("supported")
+    .expect("entry in range");
+    let mut events: Vec<(bool, u64)> = Vec::new();
+    let result = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::Idle
+            | bytecode::CoopEvent::Paused
+            | bytecode::CoopEvent::CapPark { .. } => {
+                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
+            bytecode::CoopEvent::Resume { .. } => {
+                panic!("unexpected Resume (no leaf image here)")
+            }
+            bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 5, "only the leaf is eligible");
+                assert!(events.len() < 10, "runaway tier-ups");
+                let (ptr, len) = run
+                    .pending_win()
+                    .expect("every tiering task's window must resolve a flat view");
+                let in_root = (ptr as usize) >= root_base && (ptr as usize) < root_base + (1 << 18);
+                events.push((in_root, len));
+                let x = argv[0];
+                run.deliver_tierup(&[x * 3 + 7]);
+            }
+        }
+    };
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out: Vec<i64> = bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    out.sort_unstable();
+    (result, out, events)
 }
 
 // #816 item 4 — `SharedProgram::coop_run_over_grown`, the warm session's cooperative constructor:

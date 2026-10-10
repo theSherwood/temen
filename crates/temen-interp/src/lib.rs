@@ -33465,19 +33465,26 @@ impl Mem {
         Some(twin)
     }
 
-    /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing.
-    /// [`Region::new`] is the right default — a lazy `mmap` on unix — but its non-unix fallback is
-    /// the non-flat `Sparse` table: no flat address, so emitted `win + addr` code can never serve the twin's window and
-    /// the twin interprets forever (the tier-up `tierup_servable` gate strips its bitmap). So when
-    /// the default comes back non-flat, this (my) window is itself flat-addressable (the tier-up
-    /// shapes: the browser's `Region::shared` window over the cdylib's linear memory), and the
-    /// reservation is bounded by my backing's length — the run window size, the cost cap on the
-    /// eager allocation (a coop run clamps its reservation to the run window; an unclamped
-    /// `DEFAULT_RESERVED_LOG2` engine-owned non-flat parent never lands here) —
-    /// the twin gets an **owned flat** buffer and tiers up over its private window on every
-    /// target. Fail-soft: an allocation failure keeps the default (the twin then stays
-    /// interpreted, exactly the pre-seam behavior).
+    /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing. Emitted
+    /// `win + addr` code can serve the twin's window only over a flat backing; otherwise the tier-up
+    /// `tierup_servable` gate strips its bitmap and it interprets.
+    /// - When my backing grows in place ([`Region::Growable`]: a cooperative tier-up run's root
+    ///   window, or a detached child's in such a run, #2102), the twin's does too, sized to my
+    ///   window, on every target. Only a run with a single owner builds one, and the twin is in
+    ///   that run.
+    /// - Otherwise [`Region::new`]: a lazy `mmap` on unix, but off unix the non-flat `Sparse`
+    ///   table. When that comes back non-flat, this (my) window is itself flat-addressable (the
+    ///   browser's `Region::shared` window over the cdylib's linear memory), and the reservation is
+    ///   bounded by my backing's length (the cost cap on the eager allocation), the twin gets an
+    ///   **owned flat** buffer instead ([`twin_backing_from`](Mem::twin_backing_from)).
+    ///
+    /// Fail-soft: an allocation failure keeps the default, and the twin then stays interpreted.
     fn twin_backing(&self, reserved: u64) -> Region {
+        if matches!(*self.back, Region::Growable(_)) {
+            if let Some(grows) = Region::growable(self.window.mapped(), self.page) {
+                return grows;
+            }
+        }
         self.twin_backing_from(Region::new(reserved, self.page), reserved)
     }
 
@@ -37013,6 +37020,26 @@ mod mem_fork_tests {
             b.raw_base().is_none(),
             "a non-flat parent's twin keeps the default backing"
         );
+    }
+
+    /// #2102 — a window over a backing that grows in place (a cooperative tier-up run's root, or a
+    /// detached child's in such a run) forks a twin whose backing grows too: flat and sized to the
+    /// window, on every target, under the 1 TiB reservation the bounded-twin rule above refuses.
+    #[test]
+    fn a_twin_of_a_window_that_grows_in_place_grows_in_place() {
+        let page = host_page_size();
+        let m = Mem::with_reservation_over(
+            DEFAULT_RESERVED_LOG2,
+            16,
+            Arc::new(Region::growable(1 << 16, page).expect("64 KiB allocates")),
+            None,
+        );
+        let b = m.twin_backing(m.window.reserved());
+        assert!(
+            b.raw_base().is_some() && b.can_grow(),
+            "the twin's backing must be flat and grow in place"
+        );
+        assert_eq!(b.len(), 1 << 16, "sized to the window, not the reservation");
     }
 
     /// #1145 — the flat primary-backing seam, pinned on the non-unix arm (a forced `Paged` default,
