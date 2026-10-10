@@ -1834,10 +1834,11 @@ fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
     );
 }
 
-/// The root spawns a serving child through a v1 record (paid from the `Budget` its second argument
-/// names), mints a live-callee offer over it (`child_offer`), and calls `add(40, 2)` through it. The
-/// call parks the root until the child's `svc.wait` serves it; the child returns how many calls it
-/// served, which the root joins: `1 * 100 + 42`.
+/// The root spawns a serving child, func 1's image (its third argument), through a v1 record paid
+/// from the `Budget` its second argument names. It mints a live-callee offer over the child
+/// (`child_offer`) and calls `add(40, 2)` through it. The call parks the root until the child's
+/// `svc.wait` serves it; the child returns how many calls it served, which the root joins:
+/// `1 * 100 + 42`.
 fn live_caller() -> String {
     format!(
         "memory 17
@@ -1845,10 +1846,12 @@ type 0 func (i64, i64) -> (i64)
 type 1 interface {{ add: 0 }}
 export 0 interface \"adder\" 1 {{ add: 2 }}
 
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32) {{
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
   vrb = i64.const 17628
   i32.store vrb v1
+  vrm = i64.const 17624
+  i32.store vrm v2
   vrp = i64.const 17600
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
@@ -1879,7 +1882,7 @@ block 0 (va: i64, vb: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17600, &SpawnRec::v1(1)),
+        rec = rec::segment(17600, &SpawnRec::v1(0)),
     )
 }
 
@@ -1891,10 +1894,10 @@ fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     let m = module(&live_caller());
     let setup = || {
         let mut h = Host::new();
-        h.set_self_module(&std::sync::Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 17);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        (h, vec![Value::I32(i), Value::I32(b)])
+        let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
+        (h, [i, b, c].map(Value::I32).to_vec())
     };
     let drivers = [Driver::Oracle, Driver::Coop, Driver::Parallel];
     agree_on(

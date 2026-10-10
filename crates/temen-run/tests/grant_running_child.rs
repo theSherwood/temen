@@ -43,6 +43,11 @@ const READY: u64 = 24;
 const SAVED: u64 = 20480;
 /// Where the name `"budget"` sits, by which a detached child resolves the budget that paid for it.
 const BUDGET_NAME: u64 = 17664;
+/// Where a parent names its child functions: the name of the `i`th at `NAMES + 16 * i`. Each is
+/// exported under it, and [`setup`] grants the function's child image by it.
+const NAMES: u64 = 17680;
+/// Where a child keeps the grant list that hands it its own child's image.
+const GRANTS: u64 = 17728;
 
 fn module(src: &str) -> Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -50,16 +55,21 @@ fn module(src: &str) -> Module {
     m
 }
 
-/// The parent's powerbox: its `Instantiator` and `AddressSpace` over its 256 KiB window, and a 2 MiB
-/// `Budget` that pays for its children. Regions are OS shared memory, so the JIT can alias them.
+/// The parent's powerbox: its `Instantiator` and `AddressSpace` over its 256 KiB window, a 2 MiB
+/// `Budget` that pays for its children, and the child image of each function it exports, under the
+/// export's name. Regions are OS shared memory, so the JIT can alias them.
 fn setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
         h.set_region_factory(temen_run::new_shared_region);
-        h.set_self_module(&Arc::new(m.clone()));
         let i = h.grant_instantiator(0, 1 << 18);
         let a = h.grant_address_space(0, 1 << 18);
         let b = h.grant_budget(-1, 1 << 21, -1);
+        for e in &m.exports {
+            let image = temen_ir::child_image_at(m, e.func).expect("child image");
+            let mh = h.grant_module(&image);
+            h.register_cap_name(&e.name, mh);
+        }
         (h, vec![Value::I32(i), Value::I32(a), Value::I32(b)])
     }
 }
@@ -127,9 +137,18 @@ fn mint_and_map(p: &str, r: &str, at: u64) -> String {
     )
 }
 
-/// Spawn by the record at `rec_at`, paid from `vbud`, into register `dst`; with `mailbox`, that
-/// region is pre-mapped into the child.
-fn spawn(p: &str, rec_at: u64, mailbox: Option<&str>, dst: &str) -> String {
+/// Resolve the child image a parent named `name`, its `i`th, into register `dst`.
+fn image(p: &str, i: u64, name: &str, dst: &str) -> String {
+    format!(
+        "  {p}np = i64.const {}\n  {p}nl = i64.const {}\n  {dst} = self.resolve {p}np {p}nl\n",
+        NAMES + 16 * i,
+        name.len()
+    )
+}
+
+/// Spawn the module in register `module` by the record at `rec_at`, paid from `vbud`, into register
+/// `dst`; with `mailbox`, that region is pre-mapped into the child.
+fn spawn(p: &str, rec_at: u64, module: &str, mailbox: Option<&str>, dst: &str) -> String {
     let region = mailbox.map_or(String::new(), |r| {
         format!(
             "  {p}ra = i64.const {}\n  i32.store {p}ra {r}\n",
@@ -137,8 +156,10 @@ fn spawn(p: &str, rec_at: u64, mailbox: Option<&str>, dst: &str) -> String {
         )
     });
     format!(
-        "  {p}ba = i64.const {}\n  i32.store {p}ba vbud\n{region}  {p}rp = i64.const {rec_at}\n\
+        "  {p}ma = i64.const {}\n  i32.store {p}ma {module}\n\
+         \x20 {p}ba = i64.const {}\n  i32.store {p}ba vbud\n{region}  {p}rp = i64.const {rec_at}\n\
          \x20 {dst} = call.cap 6 17 (i64) -> (i32) vinst ({p}rp)\n",
+        rec_at + rec::MODULE_AT,
         rec_at + rec::BUDGET_AT
     )
 }
@@ -217,7 +238,7 @@ block {sleep} ({p}k3: i64) {{
     )
 }
 
-/// A child (entry `func 1`) that posts `1` at mailbox word [`READY`], then waits on mailbox word
+/// A child that posts `1` at mailbox word [`READY`], then waits on mailbox word
 /// `slot` for the index of a region, maps it at [`GRANTED`] and returns the `i64` there, plus a
 /// million times the map's status.
 fn child_reads_granted(slot: u64) -> String {
@@ -247,7 +268,7 @@ block 0 (v0: i64) {{
     )
 }
 
-/// A child (entry `func 1`) that returns 7.
+/// A child that returns 7.
 const CHILD_RETURNS_7: &str = "func (i64) -> (i64) {
 block 0 (v0: i64) {
   v7 = i64.const 7
@@ -256,7 +277,7 @@ block 0 (v0: i64) {
 }
 ";
 
-/// A child (entry `func 1`) that spins until it is killed.
+/// A child that spins until it is killed.
 const CHILD_SPINS: &str = "func (i64) -> (i64) {
 block 0 (v0: i64) {
   br 1()
@@ -269,26 +290,34 @@ block 1 () {
 
 /// A parent `(i32 inst, i32 aspace, i32 budget) -> i64` whose block 0 runs `body` and returns `vr`,
 /// over the records `recs` and the name a child resolves its `"budget"` by, with the child functions
-/// `children` after it.
-fn parent(recs: &[(u64, SpawnRec)], body: &str, children: &str) -> String {
+/// `children` after it, each exported under its name ([`NAMES`]).
+fn parent(recs: &[(u64, SpawnRec)], body: &str, children: &[(&str, &str)]) -> String {
     let recs: String = recs.iter().map(|(at, r)| rec::segment(*at, r)).collect();
+    let mut names = String::new();
+    let mut exports = String::new();
+    let mut funcs = String::new();
+    for (i, (name, func)) in children.iter().enumerate() {
+        names.push_str(&format!("data {} \"{name}\"\n", NAMES + 16 * i as u64));
+        exports.push_str(&format!("export {i} func \"{name}\" {}\n", i + 1));
+        funcs.push_str(func);
+    }
     format!(
         "memory 18
 data {BUDGET_NAME} \"budget\"
-{recs}func (i32, i32, i32) -> (i64) {{
+{names}{recs}{exports}func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vas: i32, vbud: i32) {{
 {body}  return vr
   }}
 }}
-{children}"
+{funcs}"
     )
 }
 
-/// The record of a child (entry `entry`) whose mailbox is pre-mapped at [`MAILBOX`].
-fn mailbox_rec(entry: u32) -> SpawnRec {
+/// The record of a child whose mailbox is pre-mapped at [`MAILBOX`].
+fn mailbox_rec() -> SpawnRec {
     SpawnRec {
         child_off: MAILBOX,
-        ..SpawnRec::v1(entry)
+        ..SpawnRec::v1(0)
     }
 }
 
@@ -300,11 +329,12 @@ fn a_running_child_maps_a_region_its_parent_granted_it() {
     let held = ["vinst", "vch", "vreg"];
     let body = format!(
         "{}{}  vword = i64.const 4242\n  vwat = i64.const {GRANTED}\n  i64.store vwat vword\n\
-         {}{}  wn = i64.const 100\n  br 1(wn)\n}}\n{}block 5 (vready: i32) {{\n{}{}{}\
+         {}{}{}  wn = i64.const 100\n  br 1(wn)\n}}\n{}block 5 (vready: i32) {{\n{}{}{}\
          \x20 vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
-        spawn("s", REC_A, Some("vm"), "vch"),
+        image("i", 0, "child", "vmod"),
+        spawn("s", REC_A, "vmod", Some("vm"), "vch"),
         save(&held),
         await_word("w", MAILBOX + READY, 1, 5),
         restore(&held),
@@ -312,9 +342,9 @@ fn a_running_child_maps_a_region_its_parent_granted_it() {
         post("p", MAILBOX, "vgot"),
     );
     let m = module(&parent(
-        &[(REC_A, mailbox_rec(1))],
+        &[(REC_A, mailbox_rec())],
         &body,
-        &child_reads_granted(0),
+        &[("child", &child_reads_granted(0))],
     ));
     agree_everywhere("a grant into a running child", &m, &ok(4242));
 }
@@ -322,13 +352,17 @@ fn a_running_child_maps_a_region_its_parent_granted_it() {
 /// #2220 — the grant holds one level down (INVARIANTS #14, nesting): the root spawns child C and joins
 /// it; C, a detached child, does what [`a_running_child_maps_a_region_its_parent_granted_it`]'s parent
 /// does, through its own starter `AddressSpace` and the `"budget"` that paid for it, granting a region
-/// into its own running child G (func 2), which returns the word C wrote there.
+/// into its own running child G, which returns the word C wrote there. The root hands C the image of
+/// G by the grant list of C's spawn, under the name the program exports it by, `"grandchild"`.
 #[test]
 fn a_detached_child_grants_into_its_own_running_child() {
     let held = ["vinst", "vch", "vreg"];
     let root = format!(
-        "{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
-        spawn("s", REC_A, None, "vch"),
+        "{}{}{}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+        image("c", 0, "child", "vcm"),
+        image("g", 1, "grandchild", "vgm"),
+        rec::grant("gl", GRANTS, NAMES + 16, "grandchild".len(), "vgm"),
+        spawn("s", REC_A, "vcm", None, "vch"),
     );
     let c = format!(
         "func (i64, i64) -> (i64) {{
@@ -341,7 +375,7 @@ block 0 (v0: i64, v1: i64) {{
 {}{}  vword = i64.const 4242
   vwat = i64.const {GRANTED}
   i64.store vwat vword
-{}{}  wn = i64.const 100
+{}{}{}  wn = i64.const 100
   br 1(wn)
 }}
 {}block 5 (vready: i32) {{
@@ -352,7 +386,8 @@ block 0 (v0: i64, v1: i64) {{
 ",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
-        spawn("s", REC_B, Some("vm"), "vch"),
+        image("i", 1, "grandchild", "vgm"),
+        spawn("s", REC_B, "vgm", Some("vm"), "vch"),
         save(&held),
         await_word("w", MAILBOX + READY, 1, 5),
         restore(&held),
@@ -360,10 +395,15 @@ block 0 (v0: i64, v1: i64) {{
         post("p", MAILBOX, "vgot"),
         name = BUDGET_NAME,
     );
+    let with_grandchild = SpawnRec {
+        grants_ptr: GRANTS,
+        grants_n: 1,
+        ..SpawnRec::v1(0)
+    };
     let m = module(&parent(
-        &[(REC_A, SpawnRec::v1(1)), (REC_B, mailbox_rec(2))],
+        &[(REC_A, with_grandchild), (REC_B, mailbox_rec())],
         &root,
-        &format!("{c}{}", child_reads_granted(0)),
+        &[("child", &c), ("grandchild", &child_reads_granted(0))],
     ));
     agree_everywhere("a grant from a detached child into its own", &m, &ok(4242));
 }
@@ -374,13 +414,15 @@ block 0 (v0: i64, v1: i64) {{
 #[test]
 fn two_running_children_rendezvous_on_a_region_their_parent_granted_both() {
     let body = format!(
-        "{}{}{}{}{}{}{}{}  vja = call.cap 6 1 (i32) -> (i64) vinst (vca)\n\
+        "{}{}{}{}{}{}{}{}{}{}  vja = call.cap 6 1 (i32) -> (i64) vinst (vca)\n\
          \x20 vjb = call.cap 6 1 (i32) -> (i64) vinst (vcb)\n  vk = i64.const 1000\n\
          \x20 vx = i64.mul vja vk\n  vr = i64.add vx vjb\n",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
-        spawn("sa", REC_A, Some("vm"), "vca"),
-        spawn("sb", REC_B, Some("vm"), "vcb"),
+        image("ia", 0, "a", "vma"),
+        spawn("sa", REC_A, "vma", Some("vm"), "vca"),
+        image("ib", 1, "b", "vmb"),
+        spawn("sb", REC_B, "vmb", Some("vm"), "vcb"),
         grant("qa", "vca", "vreg", "vga"),
         grant("qb", "vcb", "vreg", "vgb"),
         post("pa", MAILBOX, "vga"),
@@ -440,9 +482,9 @@ block 0 (v0: i64) {{
         data = GRANTED + 8,
     );
     let m = module(&parent(
-        &[(REC_A, mailbox_rec(1)), (REC_B, mailbox_rec(2))],
+        &[(REC_A, mailbox_rec()), (REC_B, mailbox_rec())],
         &body,
-        &format!("{a}{b}"),
+        &[("a", &a), ("b", &b)],
     ));
     agree_everywhere("two children meeting on a granted region", &m, &ok(1077));
 }
@@ -451,10 +493,11 @@ block 0 (v0: i64) {{
 /// region, then runs `after`: `grant * 1000 + vj`, which `before` or `after` defines.
 fn grant_between(before: &str, after: &str) -> String {
     format!(
-        "{}{}{before}{}{after}  vg64 = i64.extend_i32_s vgot\n  vk = i64.const 1000\n\
+        "{}{}{}{before}{}{after}  vg64 = i64.extend_i32_s vgot\n  vk = i64.const 1000\n\
          \x20 vx = i64.mul vg64 vk\n  vr = i64.add vx vj\n",
         mint_and_map("g", "vreg", GRANTED),
-        spawn("s", REC_A, None, "vch"),
+        image("i", 0, "child", "vmod"),
+        spawn("s", REC_A, "vmod", None, "vch"),
         grant("q", "vch", "vreg", "vgot"),
     )
 }
@@ -465,12 +508,12 @@ fn grant_between(before: &str, after: &str) -> String {
 #[test]
 fn a_grant_to_an_ended_child_fails() {
     let returned = module(&parent(
-        &[(REC_A, SpawnRec::v1(1))],
+        &[(REC_A, SpawnRec::v1(0))],
         &grant_between(
             "  vw = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
             "  vj = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
         ),
-        CHILD_RETURNS_7,
+        &[("child", CHILD_RETURNS_7)],
     ));
     agree_everywhere(
         "a grant after the child returned",
@@ -478,13 +521,13 @@ fn a_grant_to_an_ended_child_fails() {
         &ok(-22 * 1000 + 7),
     );
     let killed = module(&parent(
-        &[(REC_A, SpawnRec::v1(1))],
+        &[(REC_A, SpawnRec::v1(0))],
         &grant_between(
             "  vk1 = call.cap 6 12 (i32) -> (i32) vinst (vch)\n\
              \x20 vj = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
             "",
         ),
-        CHILD_SPINS,
+        &[("child", CHILD_SPINS)],
     ));
     agree_everywhere(
         "a grant after the child was killed",
@@ -514,7 +557,7 @@ fn a_grant_into_a_carve_child_is_refused() {
         mint_and_map("g", "vreg", GRANTED),
         grant("q", "vch", "vreg", "vgot"),
     );
-    let m = module(&parent(&[], &body, CHILD_SPINS));
+    let m = module(&parent(&[], &body, &[("child", CHILD_SPINS)]));
     agree_everywhere(
         "a grant into a carve child",
         &m,
@@ -535,11 +578,16 @@ fn a_handle_no_spawn_could_grant_faults() {
         ),
     ] {
         let body = format!(
-            "  vzero = i32.const 0\n{}{handle}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
-            spawn("s", REC_A, None, "vch"),
+            "  vzero = i32.const 0\n{}{}{handle}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+            image("i", 0, "child", "vmod"),
+            spawn("s", REC_A, "vmod", None, "vch"),
             grant("q", "vch", "vforged", "vgot"),
         );
-        let m = module(&parent(&[(REC_A, SpawnRec::v1(1))], &body, CHILD_RETURNS_7));
+        let m = module(&parent(
+            &[(REC_A, SpawnRec::v1(0))],
+            &body,
+            &[("child", CHILD_RETURNS_7)],
+        ));
         agree_everywhere(what, &m, &trapped(Trap::CapFault));
     }
 }
@@ -552,7 +600,7 @@ fn a_handle_no_spawn_could_grant_faults() {
 #[test]
 fn a_grant_into_a_full_table_fails_emfile() {
     let body = format!(
-        "{}{}{}  vn0 = i64.const 0\n  br 1(vinst, vch, vreg, vn0)\n}}
+        "{}{}{}{}  vn0 = i64.const 0\n  br 1(vinst, vch, vreg, vn0)\n}}
 block 1 (vi: i32, vc: i32, vh: i32, vn: i64) {{
   vh64 = i64.extend_i32_s vh
   vg = call.cap 6 19 (i32, i64) -> (i32) vi (vc, vh64)
@@ -578,7 +626,8 @@ block 3 (vi3: i32, vc3: i32, vg3: i32, vn4: i64) {{
 ",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
-        spawn("s", REC_A, Some("vm"), "vch"),
+        image("i", 0, "child", "vmod"),
+        spawn("s", REC_A, "vmod", Some("vm"), "vch"),
         post("p", MAILBOX + 16, "vgo"),
     );
     let child = format!(
@@ -595,7 +644,11 @@ block 0 (v0: i64) {{
 ",
         wait = await_word("w", MAILBOX + 16, 1, 5),
     );
-    let m = module(&parent(&[(REC_A, mailbox_rec(1))], &body, &child));
+    let m = module(&parent(
+        &[(REC_A, mailbox_rec())],
+        &body,
+        &[("child", &child)],
+    ));
     agree_everywhere(
         "grants until the child's table is full",
         &m,

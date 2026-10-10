@@ -7088,17 +7088,22 @@ pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 }
 
 /// Run `m`'s function 0 with an `Instantiator` (iface 6) granted over `[0, 128 KiB)` — the §14
-/// **nested-child** seam: function 0 may spawn detached children of its own module (an op-17 v1 record,
-/// module `-1`) paid from the 1 MiB `"budget"` it resolves by name, each in a fresh window of its own on
-/// the cooperative executor, and `join` them; §14 coroutines use the same `Instantiator`. Returns
-/// `(status, i64-widened value)`. Shared by the wasm [`temen_run_nested`] export and the native
-/// `gencorpus` ground truth.
+/// **nested-child** seam: function 0 may spawn detached children paid from the 1 MiB `"budget"` it
+/// resolves by name, each in a fresh window of its own on the cooperative executor, and `join` them;
+/// §14 coroutines use the same `Instantiator`. Each function `m` exports is granted as a child image
+/// under its export's name (#2219), which a spawn names. Returns `(status, i64-widened value)`. Shared
+/// by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
 pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
-    host.set_self_module(&std::sync::Arc::new(m.clone()));
     let inst = host.grant_instantiator(0, 128 << 10);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
+    for e in &m.exports {
+        if let Ok(image) = temen_ir::child_image_at(m, e.func) {
+            let child = host.grant_module(&image);
+            host.register_cap_name(&e.name, child);
+        }
+    }
     let mut fuel = 5_000_000u64;
     match bytecode::compile_and_run_with_host(m, 0, &[Value::I32(inst)], &mut fuel, &mut host) {
         None => (STATUS_UNSUPPORTED, 0),
@@ -11260,7 +11265,7 @@ fn op13_mini_driver() -> String {
         grants_n: 1,
         ..temen_ir::SpawnRec::v1(0)
     };
-    let (seg, stores) = plan::spawn_rec_ir(17408, &rec, Some("v1"), "v2");
+    let (seg, stores) = plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     format!(
         r#"memory 16
 data 18432 "fs"

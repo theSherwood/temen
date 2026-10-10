@@ -1,15 +1,16 @@
 //! The playground's **detached-child demo** (`browser/web/play.js`, the `detached` card), pinned on
-//! every engine: a plain powerbox guest resolves `instantiator`, `addrspace`, `budget` and `module` by
-//! name, mints a `SharedRegion`, maps it into its own window, and spawns **its own func 1** as a §5
-//! detached child with the region pre-mapped (`Instantiator` op 15, the 11-arg form) — no separate
-//! child module, no grant list, no `map` in the child. The child reads the parent's word through the
-//! alias, writes its answer beside it, returns; the parent reads the answer back after `join`.
+//! every engine: a plain powerbox guest resolves `instantiator`, `addrspace`, `budget` and `child` by
+//! name, mints a `SharedRegion`, maps it into its own window, and spawns **a copy of itself** (its
+//! child image, which starts at its `_child` export) as a §5 detached child with the region
+//! pre-mapped (`Instantiator` op 15, the 11-arg form) — no grant list, no `map` in the child. The
+//! child reads the parent's word through the alias, writes its answer beside it, returns; the parent
+//! reads the answer back after `join`.
 //!
 //! Three things this pins: the by-name spawn grants both reference powerboxes make
-//! (`Host::grant_detached_spawn_caps` — `"module"` is the running module, `"budget"` a window's worth
-//! of detached memory); the cooperative executor servicing op 15 as a fresh-window task (the bytecode
-//! engine's `drive`, what the browser on-ramp runs on); and the CLI's JIT resolving a `Module` grant
-//! for the spawn (`module_resolver`). The tree-walk oracle is the reference.
+//! (`Host::grant_detached_spawn_caps` — `"child"` is the program's child image, `"budget"` a window's
+//! worth of detached memory); the cooperative executor servicing op 15 as a fresh-window task (the
+//! bytecode engine's `drive`, what the browser on-ramp runs on); and the CLI's JIT resolving a
+//! `Module` grant for the spawn (`module_resolver`). The tree-walk oracle is the reference.
 
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Value};
@@ -19,8 +20,9 @@ const DEMO: &str = r#"memory 17
 data 20480 "instantiator"
 data 20496 "addrspace"
 data 20512 "budget"
-data 20528 "module"
+data 20528 "child"
 export 0 func "_start" 0
+export 1 func "_child" 1
 func () -> (i64) {
 block 0 () {
   vp0 = i64.const 20480
@@ -33,8 +35,8 @@ block 0 () {
   vl2 = i64.const 6
   vbud = self.resolve vp2 vl2
   vp3 = i64.const 20528
-  vl3 = i64.const 6
-  vmod = self.resolve vp3 vl3
+  vl3 = i64.const 5
+  vchild = self.resolve vp3 vl3
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -45,9 +47,9 @@ block 0 () {
   vin = i64.const 41
   i64.store vwo vin
   vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vmod
+  vmh = i64.extend_i32_u vchild
   vz = i64.const 0
-  vent = i64.const 1
+  vent = i64.const 0
   vlog = i64.const 17
   vreg = i64.extend_i32_u vrh
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)

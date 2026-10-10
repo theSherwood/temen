@@ -233,12 +233,8 @@ impl Plan {
                 args: (argv_at[k].0, argv_at[k].1 as u64),
                 ..temen_ir::SpawnRec::v1(0)
             };
-            let (seg, stores) = spawn_rec_ir(
-                at,
-                &rec,
-                Some(&format!("v{}", 1 + k)),
-                &format!("v{}", 1 + n),
-            );
+            let (seg, stores) =
+                spawn_rec_ir(at, &rec, &format!("v{}", 1 + k), &format!("v{}", 1 + n));
             data.push_str(&seg);
             body.push_str(&format!(
                 "{stores}  vrp{s} = i64.const {at}\n  vh{s} = call.cap 6 17 (i64) -> (i32) v0 (vrp{s})\n"
@@ -297,27 +293,21 @@ impl Plan {
 }
 
 /// An op-17 spawn record `rec` at window offset `at` of a guest being generated: the data segment that
-/// holds its bytes, and the stores that fill its `module` field (unless `modh` is `None`: the record's
-/// own, e.g. `-1` for the spawner's module) and its `budget` field from `i32` values (handles are only
-/// known at run time).
+/// holds its bytes, and the stores that fill its `module` and `budget` fields from the `i32` registers
+/// `modh` and `budget` (handles are only known at run time).
 pub fn spawn_rec_ir(
     at: u64,
     rec: &temen_ir::SpawnRec,
-    modh: Option<&str>,
+    modh: &str,
     budget: &str,
 ) -> (String, String) {
     let esc: String = rec.encode().iter().map(|b| format!("\\x{b:02x}")).collect();
-    let mut stores = String::new();
-    if let Some(modh) = modh {
-        stores.push_str(&format!(
-            "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n",
-            m = at + 24
-        ));
-    }
-    stores.push_str(&format!(
-        "  rb{at} = i64.const {b}\n  i32.store rb{at} {budget}\n",
+    let stores = format!(
+        "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n  rb{at} = i64.const {b}\n  \
+         i32.store rb{at} {budget}\n",
+        m = at + 24,
         b = at + 28
-    ));
+    );
     (format!("data {at} \"{esc}\"\n"), stores)
 }
 

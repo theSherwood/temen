@@ -617,12 +617,14 @@ fn a_notify_racing_a_tasks_park_is_not_lost() {
     }
 }
 
-/// #1956 — `v0` Instantiator, `v1` AddressSpace, `v2` the [`GRANDCHILD_SPINS`] module, `v4` Budget.
-/// Mints a 64 KiB region, maps it at 65536 of its own window and grants it to the child by name
-/// (`"r"`). The child hands it on to a grandchild that spins over it; the root joins the child, then
-/// spins over the region itself, and returns `1000·VIOL + the child's result`.
+/// #1956 — `v0` Instantiator, `v1` AddressSpace, `v2` the [`GRANDCHILD_SPINS`] module, `v3` its
+/// grandchild's image, `v4` Budget. Mints a 64 KiB region, maps it at 65536 of its own window and
+/// grants the child that region (`"r"`) and the grandchild's image (`"grandchild"`) by name. The child
+/// hands the region on to the grandchild, which spins over it; the root joins the child, then spins
+/// over the region itself, and returns `1000·VIOL + the child's result`.
 const ROOT_SPINS_BESIDE_GRANDCHILD: &str = r#"memory 17
 data 18464 "r"
+data 18480 "grandchild"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vlen = i64.const 65536
@@ -638,12 +640,19 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vrec2 = i64.const 18440
   vh64 = i64.extend_i32_u vrh
   i64.store vrec2 vh64
+  vrec3 = i64.const 18448
+  vgname = i64.const 42949691440
+  i64.store vrec3 vgname
+  vrec4 = i64.const 18456
+  vg64 = i64.extend_i32_u v3
+  i64.store vrec4 vg64
   vmh = i64.extend_i32_u v2
   vb = i64.extend_i32_u v4
   vz = i64.const 0
   vone = i64.const 1
+  vtwo = i64.const 2
   vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vrec, vone, vz, vlog, vz, vz, vz)
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vrec, vtwo, vz, vlog, vz, vz, vz)
   vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
   vrun = i64.const 65536
   vold = i64.atomic.rmw.add vrun vone
@@ -681,13 +690,16 @@ block 4 (vj4: i64) {
 }
 "#;
 
-/// #1956 — the child (func 0) and the grandchild (func 1) of [`ROOT_SPINS_BESIDE_GRANDCHILD`]. The
-/// child spawns its own module's func 1 detached from its own `"budget"`, with the region it was
-/// granted as `"r"` pre-mapped at 65536, and returns its handle plus 7 without joining it. The
-/// grandchild spins over the region as [`SPINNER`] does.
+/// #1956 — the child (func 0) and the grandchild (func 1, exported as `"grandchild"`) of
+/// [`ROOT_SPINS_BESIDE_GRANDCHILD`]. The child spawns the grandchild's image it was granted as
+/// `"grandchild"` detached from its own `"budget"`, with the region it was granted as `"r"`
+/// pre-mapped at 65536, and returns its handle plus 7 without joining it. The grandchild spins over
+/// the region as [`SPINNER`] does.
 const GRANDCHILD_SPINS: &str = r#"memory 17
 data 20000 "budget"
 data 20016 "r"
+data 20032 "grandchild"
+export 0 func "grandchild" 1
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vnp = i64.const 20000
@@ -698,13 +710,15 @@ block 0 (v0: i64) {
   vrl = i64.const 1
   vr = self.resolve vrp vrl
   vrw = i64.extend_i32_u vr
-  vself = i64.const -1
+  vgp = i64.const 20032
+  vgl = i64.const 10
+  vgc = self.resolve vgp vgl
+  vgw = i64.extend_i32_u vgc
   vz = i64.const 0
-  ve = i64.const 1
   vlog = i64.const 17
   voff = i64.const 65536
   vinst = i32.wrap_i64 v0
-  vg = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vself, vz, vz, ve, vlog, vz, vz, vz, vrw, voff)
+  vg = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vgw, vz, vz, vz, vlog, vz, vz, vz, vrw, voff)
   vg64 = i64.extend_i32_s vg
   v7 = i64.const 7
   vres = i64.add vg64 v7
@@ -755,9 +769,9 @@ block 4 () {
 fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
     let p = module(ROOT_SPINS_BESIDE_GRANDCHILD);
     let c = module(GRANDCHILD_SPINS);
-    // `host`'s two modules are the same one here: the child spawns its own.
-    assert_eq!(run_interp(&p, &c, &c, 1), 7, "the oracle");
+    let g = temen_ir::child_image_at(&c, 1).expect("the grandchild's image");
+    assert_eq!(run_interp(&p, &c, &g, 1), 7, "the oracle");
     for run in 0..3 {
-        assert_eq!(run_jit(&p, &c, &c, 1), 7, "run {run}: no overlap");
+        assert_eq!(run_jit(&p, &c, &g, 1), 7, "run {run}: no overlap");
     }
 }
