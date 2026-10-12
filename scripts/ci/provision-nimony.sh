@@ -125,10 +125,10 @@ ln -sf "$WORK/nimony" "$NIM_ROOT/dist/nimony"
 # which is the actual precondition, and it self-heals: anything partial or broken falls through to
 # the build below instead of being served to the tests.
 #
-# It also closes a gap the tests cannot see. `nim_e2e.rs` / `nim_conformance.rs` decide to SKIP on
-# whether `nimony` *exists* — so a half-restored or broken cache would not skip, it would surface
-# as confusing failures in the suite proper. Verifying here means the toolchain is either good or
-# rebuilt before a test looks at it.
+# It also closes a gap the tests cannot see. `nim_e2e.rs` decides to SKIP on whether `nimony`
+# *exists* — so a half-restored or broken cache would not skip, it would surface as confusing
+# failures in the suite proper. Verifying here means the toolchain is either good or rebuilt before
+# a test looks at it.
 toolchain_works() {
   [ -x nimony/bin/nimony ] || return 1
   local probe rc

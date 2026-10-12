@@ -4,9 +4,10 @@ Which Nim features run on Temen (#956). Each row is a feature, the corpus cases 
 its status:
 
 - **✅**: the cases are in this directory. `nim_differential_corpus` (`../nim_e2e.rs`) builds each one
-  with native nimony, runs it on Temen, and fails if the two outputs differ by a byte.
+  with native nimony, runs it on each of Temen's engines (the tree-walker, bytecode and the JIT), and
+  fails if any engine's output differs from native's by a byte.
 - **❌ #N**: the case is in [`known_gaps/`](known_gaps/), its header names issue #N, and it still
-  diverges. The corpus fails when it starts to match, so the row and the issue get updated.
+  diverges. The corpus fails when it matches on every engine, so the row and the issue get updated.
 - **n/a**: nimony itself rejects the construct, so there is no native output to compare. The note
   gives nimony's error.
 
@@ -23,7 +24,7 @@ means adding it to a row.
 | Integer widths, signedness, unsigned comparison | `int_widths`, `int_compare`, `uint64_bounds` | ✅ |
 | Sub-word integers (`int8`…`uint16`): wrapping, calls, conversions, consumers | `subword_signed`, `subword_unsigned`, `subword_signed_to_unsigned`, `subword_calls`, `subword_canonical_consumers` | ✅ |
 | `char`, and UTF-8 bytes as unsigned | `chars`, `utf8_bytes` | ✅ |
-| Floats: `$`, formatting, `std/math` | `float_dollar`, `float_format`, `float_math` | ✅ |
+| Floats: `$`, formatting, `std/math`, conversion to `int` | `float_dollar`, `float_format`, `float_math` | ✅ |
 | Enums: names, ordinals, explicit values, string values | `enums` | ✅ |
 | `distinct` types, module-level `const` | `distinct_const` | ✅ |
 | `set[enum]`, sparse ordinals included | `sets_enum`, `sets_enum_sparse` | ✅ |

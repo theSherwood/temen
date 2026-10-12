@@ -1,8 +1,8 @@
 # The nim differential corpus
 
-Each `.nim` file here is built once by native `nimony c --run` and run **twice** — natively, and on
-Temen from that build's Leng — and the two outputs are diffed byte for byte by
-`nim_differential_corpus` in `../nim_e2e.rs`.
+Each `.nim` file here is built once by native `nimony c --run` and run natively and, from that
+build's Leng, on each of Temen's engines (the tree-walker, bytecode and the JIT). Each engine's
+output is diffed byte for byte against native's by `nim_differential_corpus` in `../nim_e2e.rs`.
 
 **Adding a case is adding a file**, and naming it in a row of [`MATRIX.md`](MATRIX.md), the
 feature→status matrix the corpus backs (#956). There is no expected value to write down: the native
@@ -29,9 +29,9 @@ happened not to look.
 ## `known_gaps/`
 
 Programs that are **expected** to diverge, each naming the issue in its header comment. They are
-still compiled and run every time: a gap that quietly starts working is reported as a failure, with
-instructions to promote the file into the main corpus and close its issue. The directory *is* the
-expectation — there is no per-case enum to keep in sync.
+still compiled and run every time: a gap that quietly starts working on every engine is reported as
+a failure, with instructions to promote the file into the main corpus and close its issue. The
+directory *is* the expectation — there is no per-case enum to keep in sync.
 
 Put a case here only when the divergence is understood and tracked. An unexplained diff belongs in
 the main corpus, red, until someone explains it. Its matrix row reads `❌ #N`, with the issue its

@@ -444,29 +444,17 @@ plumbing. Five workstreams, roughly independent:
   general **`goto`** (the low-level `jmp`/`lab`/`jtrue`/`mflag`/`vflag` jump family), then
   **exceptions** (`try`/`onerr`/`raise` as an error-flag model), then **seq/string** (nimony's
   built-in containers). Non-zero global/data initializers land here too.
-  - **Measured from the language side (#956).** `crates/temen-leng/tests/nim_conformance.rs` is a
-    toolchain-gated feature→status matrix (generics, exceptions, closures, methods, `seq`/`string`/
-    `Table`, floats, iterators, variant objects, `ref`+ARC destructors), each driven Nim-source →
-    whole toolchain → run on both engines and asserted against a committed baseline (a **compute**
-    fixture reads back an `int` global; an **I/O** fixture links through the nim→powerbox bridge and
-    checks stdout). **15/15 run end-to-end**: method **dynamic dispatch** landed with #979 (the `Rtti`
-    vtable's `mt` method table is materialized as funcref relocs); **exceptions** run (#980) — hexer
-    lowers `raise`/`try`/`except` to nimony's **error-flag model** (a can-raise proc returns an
-    `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the handler), all
-    constructs temen-leng already handles, and the earlier "gap" was a fixture using standard-Nim
-    `newException`, not nimony's model; **`oconstr` in expression position** landed (#990) — a
-    tuple/object literal as an rvalue materializes into a scratch temp (the position-aware
-    `agg_temp_bytes` reserves it); and **`Table`** runs (#993) — as an I/O fixture through the powerbox
-    manifest bridge (its `panic` → `syncio` `sysWrite` binds to the POSIX personality, which the pure
-    compute shim can't); and the **const-arith gvar initializer** row runs (#760) — nimony emits a
-    top-level `let r = 2*3+36` as an un-folded arithmetic tree in the gvar's data slot, and
-    `const_scalar_int` now folds `add`/`sub`/`mul`/`div`/`mod`/`neg` over constant operands. A row that
-    starts working *or* regresses fails the test — the "green/red matrix, each red a ticket" the
-    totality work grinds down. The wider matrix is
-    [`crates/temen-leng/tests/nim_diff/MATRIX.md`](crates/temen-leng/tests/nim_diff/MATRIX.md), over the
-    differential corpus: a row per feature, each case diffed byte for byte against native nimony, each
-    gap with its issue, and the constructs nimony itself rejects. A toolchain-free test keeps it in
-    step with the corpus.
+  - **Measured from the language side (#956).** The feature→status matrix is
+    [`crates/temen-leng/tests/nim_diff/MATRIX.md`](crates/temen-leng/tests/nim_diff/MATRIX.md), over
+    the differential corpus: a row per feature, each case built by native nimony and diffed byte for
+    byte against the same build run on each of Temen's engines, each gap with its issue, and the
+    constructs nimony itself rejects. A toolchain-free test keeps it in step with the corpus. Rows
+    that took translator work: method **dynamic dispatch** (#979: the `Rtti` vtable's `mt` method
+    table is materialized as funcref relocs); **exceptions** (#980: hexer lowers `raise`/`try`/
+    `except` to nimony's **error-flag model**, where a can-raise proc returns an `(ErrorCode, value)`
+    tuple and the caller branches on the code and `jmp`s to the handler); and **`oconstr` in
+    expression position** (#990: a tuple/object literal as an rvalue materializes into a scratch temp
+    that the position-aware `agg_temp_bytes` reserves).
 - **W2 — Linker (the long pole).** A real program is many modules; nimony emits one Leng file per
   module. W2 resolves cross-module symbols, merges globals/data, and lays out one temen module from N
   Leng inputs — the analog of what the C on-ramp gets from `clang`+`lld` for free. **✅ Core done
