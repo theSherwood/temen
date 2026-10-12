@@ -403,11 +403,17 @@ impl Region {
     }
 
     /// Reset `[off, off+len)` to zero (the `map`/`unmap` "fresh page" semantics). Range is clamped
-    /// to `[0, size)`. Control-plane: assumes no concurrent access to the range.
+    /// to `[0, size)`. Control-plane: assumes no concurrent access to the range. The lazy backings
+    /// (`Mapped` on Linux, `Sparse`, `Paged`) drop whole pages rather than write them, so a large
+    /// zero leaves the range unbacked until it is touched — call it once per range, not per page.
     pub fn zero(&self, off: u64, len: u64) {
         let len = clamp_len(off, len, self.len());
         if len == 0 {
             return;
+        }
+        #[cfg(unix)]
+        if let Region::Mapped(m) = self {
+            return m.zero(off, len);
         }
         match self.backing() {
             Backing::Raw(s) => s.zero(off, len),
@@ -996,13 +1002,16 @@ mod mapped {
 
     /// One anonymous `mmap` of `[0, size)` (rounded up to `map_len`), owned here — the unix parallel
     /// backing. A **thin owner**: every raw-pointer accessor body lives once in [`Shared`], which this
-    /// wraps; `Mapped` adds only the reservation's lifecycle (`mmap` in `new`, `munmap` in `Drop`).
+    /// wraps; `Mapped` adds only the reservation's lifecycle (`mmap` in `new`, `munmap` in `Drop`)
+    /// and a page-dropping [`zero`](Mapped::zero).
     /// The base is page-aligned, so any naturally-aligned 4/8-byte access is hardware-atomic-able.
     /// `Send`/`Sync` are **automatic** — a `Shared` (itself declared shareable under the crate's raced-
-    /// atomics contract) plus a `usize` — so `Mapped` needs no `unsafe impl` of its own.
+    /// atomics contract) plus two `usize`s — so `Mapped` needs no `unsafe impl` of its own.
     pub struct Mapped {
         pub(super) raw: Shared,
         map_len: usize,
+        /// The page the mapping was rounded to — the alignment [`zero`](Mapped::zero) drops at.
+        page: usize,
     }
 
     impl Mapped {
@@ -1051,7 +1060,39 @@ mod mapped {
             Some(Mapped {
                 raw: Shared::new(base, size),
                 map_len,
+                page,
             })
+        }
+
+        /// Zero `[off, off+len)` (already clamped to `[0, size)`) — the same contract as `Paged`'s
+        /// and `Sparse`'s `zero`: a **whole page is dropped**, a partial one is cleared in place. On
+        /// Linux the whole pages go back to the kernel with `MADV_DONTNEED`, which on this private
+        /// anonymous mapping guarantees they read zero (zero-fill on demand). So a `map`/`unmap` of a
+        /// large range costs no residency: a page is only backed once the guest touches it (#2267).
+        /// Elsewhere — Darwin treats `MADV_DONTNEED` as advisory, and miri has a heap backing — or if
+        /// the call fails, zeros are written.
+        pub(super) fn zero(&self, off: u64, len: u64) {
+            #[cfg(all(target_os = "linux", not(miri)))]
+            {
+                let page = self.page as u64;
+                let (lo, hi) = (off.next_multiple_of(page), (off + len) / page * page);
+                // SAFETY: `[lo, hi)` is whole pages inside this mapping (`[off, off+len)` is in
+                // range), private and anonymous, so dropping them only makes them read zero.
+                if hi > lo
+                    && unsafe {
+                        libc::madvise(
+                            self.raw.base_ptr().add(lo as usize) as *mut libc::c_void,
+                            (hi - lo) as usize,
+                            libc::MADV_DONTNEED,
+                        )
+                    } == 0
+                {
+                    self.raw.zero(off, lo - off);
+                    self.raw.zero(hi, off + len - hi);
+                    return;
+                }
+            }
+            self.raw.zero(off, len)
         }
     }
 
@@ -2048,6 +2089,79 @@ mod tests {
         drop(a);
         // SAFETY: same layout; `a` dropped above.
         unsafe { std::alloc::dealloc(base, layout) };
+    }
+
+    /// `Mapped` has its own page-dropping [`zero`](mapped::Mapped::zero) again (#2267), so it can
+    /// drift from the `Paged` reference — the twin deleted when `Mapped` only delegated to `Shared`
+    /// is back. Three pages, so the fuzz's random zero/fill ranges (up to two pages) hit whole-page
+    /// drops and partial edges alike. (Under miri the backing is a heap buffer and `zero` writes.)
+    #[cfg(unix)]
+    #[test]
+    fn differential_mapped_vs_paged_fuzz() {
+        let (size, page) = (3 * 4096, 4096);
+        let a = Region::new(size, page);
+        assert!(
+            matches!(a, Region::Mapped(_)),
+            "unix Region::new is the mmap backing"
+        );
+        fuzz_against(
+            &a,
+            &Region::Paged(Paged::new(size, page)),
+            size,
+            page,
+            0x2267_0d0e_5a11_d0e5,
+        );
+    }
+
+    /// The point of `Mapped::zero` on Linux: whole pages are handed back rather than written, so a
+    /// large zero — what a `vm_map` commit issues — leaves an untouched range unbacked and releases a
+    /// dirty one, while partial edge pages are cleared in place. Checked per page with `mincore`,
+    /// which reads only this mapping, so parallel tests cannot perturb it (unlike process RSS).
+    /// Residency is read before any byte is: a read of a dropped page maps the zero page back in.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn mapped_zero_drops_whole_pages() {
+        // SAFETY: `sysconf` has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let r = Region::new(64 * page, page);
+        let Region::Mapped(m) = &r else {
+            panic!("unix Region::new is the mmap backing")
+        };
+        let base = m.raw.base_ptr();
+        let resident = |first: u64, n: u64| -> Vec<bool> {
+            let mut v = vec![0u8; n as usize];
+            // SAFETY: pages `[first, first+n)` lie inside this live mapping; `v` is one byte a page.
+            let rc = unsafe {
+                libc::mincore(
+                    base.add((first * page) as usize) as *mut libc::c_void,
+                    (n * page) as usize,
+                    v.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0);
+            v.iter().map(|b| b & 1 == 1).collect()
+        };
+        // Zeroing a never-touched range must not back it.
+        r.zero(8 * page, 48 * page);
+        assert!(
+            resident(8, 48).iter().all(|&x| !x),
+            "an untouched zero faulted pages in"
+        );
+        // Dirty pages 1..=6, then zero `[page+100, 6*page-100)`: whole pages 2..=4 are dropped,
+        // the partial edges 1 and 5 are cleared in place, page 6 is outside the range.
+        for off in page..7 * page {
+            r.set_byte(off, 0xAB);
+        }
+        let (lo, hi) = (page + 100, 6 * page - 100);
+        r.zero(lo, hi - lo);
+        assert_eq!(resident(1, 6), [true, false, false, false, true, true]);
+        for off in page..7 * page {
+            let want = if (lo..hi).contains(&off) { 0 } else { 0xAB };
+            assert_eq!(r.byte(off), want, "byte {off}");
+        }
+        // A dropped page is an ordinary page again once written.
+        r.set_byte(3 * page + 7, 0x5A);
+        assert_eq!(r.byte(3 * page + 7), 0x5A);
     }
 }
 

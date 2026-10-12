@@ -1263,9 +1263,11 @@ natively), other arm64 vary. All backends agree by querying the same value — t
 JIT/`temen-run` via `sysconf`, the `#![forbid(unsafe_code)]` interpreter via the safe
 `page_size` crate — so protection, zeroing, and the page map line up page-for-page
 on any host, and the interp↔JIT differential is page-size-agnostic. Two
-host-specific subtleties the parity work surfaced: (1) `unmap` must **explicitly
-zero** the range — `MADV_DONTNEED` releases anonymous backing on Linux but is only
-advisory on Darwin; (2) the chibicc frontend emits portable IR and can't know the
+host-specific subtleties the parity work surfaced: (1) `map` and `unmap` zero their
+range, and *how* is per-OS — on Linux whole pages are dropped with `MADV_DONTNEED`,
+exact for private anonymous memory, so a commit stays unbacked until touched (the
+§1a lazy page supply, #2267) and an unmap releases memory; Darwin (where it is only
+advisory) and Windows write zeros; (2) the chibicc frontend emits portable IR and can't know the
 host page, so it pins its compile-time layout constants (RO-data isolation,
 heap-growth granularity) to the **largest common host page (16 KiB)** — a multiple
 of 4 KiB, harmless on 4 KiB hosts, correct on 16 KiB. The guest can also **query**
