@@ -1,7 +1,12 @@
 //! #2267 — the JIT window's `map`/`unmap` drop pages instead of writing them (Linux), so a large
 //! commit stays unbacked until the guest touches it, while every committed page still reads zero.
-//! Residency is read per page with `mincore`, which sees only this test's mapping — so parallel
-//! tests cannot perturb it, unlike process RSS.
+//!
+//! What `map` must not do is *touch* the pages it commits, and that is measured exactly: this
+//! thread's own minor faults across the call (writing zeros over a commit faults every page in).
+//! Whether the kernel backs an untouched range anyway is its own policy, not `map`'s — the Azure CI
+//! kernel backs a few percent of a freshly `mprotect`ed range on its own — so the commit's
+//! residency is reported, not asserted. `unmap` is checked with `mincore` on the one page it
+//! dropped and left inaccessible, which reads only this test's mapping.
 #![cfg(target_os = "linux")]
 
 use temen_interp::GuestMem;
@@ -57,20 +62,36 @@ impl Drop for Reservation {
     }
 }
 
+/// This thread's minor page faults so far: one per page it touched for the first time.
+fn minor_faults() -> i64 {
+    // SAFETY: an all-zero `rusage` is a valid value for the out-parameter `getrusage` fills.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `usage` is a valid out-parameter; `RUSAGE_THREAD` names the calling thread.
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+        0
+    );
+    usage.ru_minflt
+}
+
 #[test]
-fn map_leaves_a_large_commit_unbacked_and_every_commit_reads_zero() {
+fn map_does_not_touch_a_large_commit_and_every_commit_reads_zero() {
     let page = temen_interp::host_page_size() as usize;
     let (prefix, reserved) = (64 << 10, 1 << 30);
     let r = Reservation::new(reserved, prefix);
     let mut w = MprotectWindow::new(r.base, prefix as u64, reserved as u64);
     let (tail, big) = (1usize << 20, 256usize << 20);
+    let pages = big / page;
 
-    // A 256 MiB commit into the reserved tail backs nothing until it is touched.
+    // A 256 MiB commit into the reserved tail. Writing zeros over it would fault in all of its
+    // pages; dropping them faults in none, leaving only the page map's own bookkeeping.
+    let before = minor_faults();
     assert_eq!(w.map(tail as u64, big as u64, PROT_RW), 0);
-    assert_eq!(
-        r.resident(tail, big, page),
-        0,
-        "the commit faulted its pages in"
+    let faults = minor_faults() - before;
+    assert!(
+        (faults as usize) < pages / 8,
+        "map touched the commit: {faults} faults for {pages} pages ({} resident)",
+        r.resident(tail, big, page)
     );
 
     // SAFETY: the page at `tail` is committed read/write for every access below; between the
