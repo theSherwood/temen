@@ -162,12 +162,10 @@ jobs:
         env:
           NIMONY_REV: ${{ matrix.part == 'upstream' && 'master' || '' }}
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
-      - name: Nim end-to-end tests (both engines)
+      # Includes the conformance corpus (#956, `nim_diff/MATRIX.md`), every case on every engine.
+      - name: Nim end-to-end tests (every engine)
         if: matrix.part != 'selfhost'
         run: cargo test -p temen-leng --test nim_e2e -- --nocapture
-      - name: Nim language conformance matrix (#956)
-        if: matrix.part != 'selfhost'
-        run: cargo test -p temen-leng --test nim_conformance -- --nocapture
       # #1609: the self-hosted lane end to end, release mode — nimony's own driver (Temen, no C)
       # builds a program in-guest (nifmake → nifler/nimsem/hexer/temen-link through the POSIX
       # /bin/sh), every artifact byte-identical to native nimony's, and the program runs.

@@ -2025,27 +2025,86 @@ fn import_sig_dbg(
     }
 }
 
-/// Run a program's Leng on **Temen**: `link_nim_powerbox` against the guest libc, then `_start`
-/// under the standard powerbox. Returns what the program printed **and how the run ended**. Every
-/// failure mode (link, verify, trap) comes back as `Err` with its reason, so the differential
-/// reports *where* a program diverged rather than panicking on the first one.
+/// The engines every corpus program runs on, each held to native's bytes on its own. So the corpus
+/// is also the engines' differential over real Nim programs: an engine bug shows as that engine
+/// diverging from native.
+const ENGINES: [temen_run::Backend; 3] = [
+    temen_run::Backend::TreeWalk,
+    temen_run::Backend::Bytecode,
+    temen_run::Backend::Jit,
+];
+
+/// Run a program's Leng on **Temen** and diff it against `want`, native's output: link it with
+/// `link_nim_powerbox` against the guest libc, then run `_start` under the standard powerbox on each
+/// of [`ENGINES`]. Returns each way Temen diverged, so an empty list means every engine printed
+/// exactly `want` and exited cleanly. Every failure mode (link, verify, trap) is a divergence with
+/// its reason, so the differential reports *where* a program diverged rather than panicking on the
+/// first one.
 ///
-/// The outcome is returned alongside the bytes because a program that produces no output has told
-/// you nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing),
-/// `Exited(127)` (panicked through `cAbort`) and a trap are three different bugs that a bare `""`
-/// renders identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
-fn temen_output(
+/// A divergence names how the run ended, because a program that produces no output has told you
+/// nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing), `Exited(127)`
+/// (panicked through `cAbort`) and a trap are three different bugs that a bare `""` renders
+/// identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
+fn temen_divergences(
     libc: &[u8],
     name: &str,
     mods: &[(String, String)],
-) -> Result<(String, String), String> {
+    want: &str,
+) -> Vec<String> {
+    let inst = match temen_instance(libc, name, mods) {
+        Ok(inst) => inst,
+        Err(e) => return vec![format!("{e}  (native prints {:?})", elide(want))],
+    };
+    let config = temen_run::RunConfig::default();
+    ENGINES
+        .iter()
+        .filter_map(|&engine| {
+            let run = match inst.run_with_caps(engine, &config, &[]) {
+                Ok(run) => run,
+                Err(e) => {
+                    return Some(format!(
+                        "{engine:?}: run: {e}  (native prints {:?})",
+                        elide(want)
+                    ))
+                }
+            };
+            let got = String::from_utf8_lossy(&run.stdout);
+            let outcome = format!("{:?}", run.outcome);
+            if got != want {
+                Some(format!(
+                    "{engine:?}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
+                    elide(&got),
+                    elide(want)
+                ))
+            } else if !is_clean_exit(&outcome) {
+                // The bytes are only half the answer. `native_build` rejects a program that exits
+                // non-zero natively, so every corpus case ends cleanly on the oracle: a Temen run
+                // that ends any other way has diverged even when it printed the right bytes.
+                // `Exited(127)` is what a nim panic looks like once `cAbort` reaches the stubbed
+                // `kill`, and a program that panics after printing its output would otherwise pass.
+                Some(format!(
+                    "{engine:?}: output matches but the run ended {outcome} (native exits 0)"
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Link a program's Leng with `link_nim_powerbox` against the guest libc and instantiate it under
+/// the standard powerbox, or say why it cannot run.
+fn temen_instance(
+    libc: &[u8],
+    name: &str,
+    mods: &[(String, String)],
+) -> Result<temen_run::Instance, String> {
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let m = temen_leng::link_nim_powerbox(&units, Some(libc)).map_err(|e| format!("link: {e}"))?;
     dump_module(name, &m);
-    temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
     let extra: Vec<&str> = m
         .imports
         .iter()
@@ -2057,15 +2116,13 @@ fn temen_output(
         // here — this is how the missing half of libm surfaced (#1375).
         return Err(format!("unbound leaves: {}", extra.join(", ")));
     }
-    let run = temen_run::run_powerbox(&m, &[]).map_err(|e| format!("run: {e}"))?;
-    Ok((
-        String::from_utf8_lossy(&run.stdout).into_owned(),
-        format!("{:?}", run.outcome),
-    ))
+    // The instance `run_powerbox` builds, verified the same way, with the engine left to the run.
+    temen_run::instantiate(m)
 }
 
 /// **The nim differential corpus** — every `tests/nim_diff/*.nim` built once by native nimony and run
-/// twice, natively and on Temen, with the two outputs diffed byte for byte.
+/// natively and on each of Temen's [`ENGINES`], with each Temen output diffed byte for byte against
+/// native's.
 ///
 /// This exists because the wrong-answer bugs keep being found by accident. `$3.14` printing
 /// `17.966570549813729` (#1472) sat in `main` behind a suite that only ever asserted `formatFloat`;
@@ -2172,59 +2229,43 @@ fn corpus_case(
     known_gap: bool,
 ) -> Option<String> {
     let name = case.file_stem().unwrap().to_string_lossy().to_string();
+    let label = if known_gap {
+        format!("known_gaps/{name}")
+    } else {
+        name.clone()
+    };
     let src = std::fs::read_to_string(case).expect("read case");
-    if known_gap {
-        let Ok((want, mods)) = native_build(nim_path, &name, &src) else {
-            return Some(format!(
-                "known_gaps/{name}: does not run under native nimony either"
-            ));
-        };
-        return match temen_output(libc, &name, &mods) {
-            Ok((got, _)) if got == want => Some(format!(
-                "known_gaps/{name}: NOW MATCHES native — the gap is fixed. Move it into \
-                 tests/nim_diff/ and close the issue named in its header."
-            )),
-            Ok(_) | Err(_) => {
-                eprintln!("  known_gaps/{name}: still diverges (expected)");
-                None
-            }
-        };
-    }
     // Announce the case **before** running it, and time it. Reporting only on success makes a slow
     // or non-terminating case invisible: the suite just stops producing output, which reads as "hung
     // on the first case" no matter which case it actually is. That cost real debugging time on the
     // v0.6.2 bump.
-    eprintln!("  {name}: …");
+    eprintln!("  {label}: …");
     let started = std::time::Instant::now();
     let (want, mods) = match native_build(nim_path, &name, &src) {
         Ok(built) => built,
         // Outside nimony's own subset: the corpus program is wrong, not Temen. Say so loudly — a
         // case that never runs natively silently tests nothing.
-        Err(e) => return Some(format!("{name}: does not run under native nimony — {e}")),
+        Err(e) => return Some(format!("{label}: does not run under native nimony — {e}")),
     };
-    match temen_output(libc, &name, &mods) {
-        // The bytes are only half the answer. `native_build` rejects a program that exits non-zero
-        // natively, so every corpus case ends cleanly on the oracle — a Temen run that ends any
-        // other way has diverged even when it printed the right bytes. `Exited(127)` is what a nim
-        // panic looks like once `cAbort` reaches the stubbed `kill`, and a program that panics after
-        // printing its output would otherwise pass.
-        Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => Some(format!(
-            "{name}: output matches but the run ended {outcome} (native exits 0)"
-        )),
-        Ok((got, _)) if got == want => {
+    let diverged = temen_divergences(libc, &name, &mods, &want);
+    match (known_gap, diverged.is_empty()) {
+        (false, true) => {
             eprintln!(
-                "  {name}: ok in {}ms ({:?})",
+                "  {label}: ok in {}ms ({:?})",
                 started.elapsed().as_millis(),
-                elide(&got)
+                elide(&want)
             );
             None
         }
-        Ok((got, outcome)) => Some(format!(
-            "{name}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
-            elide(&got),
-            elide(&want)
+        (false, false) => Some(format!("{label}: {}", diverged.join("\n    "))),
+        (true, true) => Some(format!(
+            "{label}: NOW MATCHES native on every engine — the gap is fixed. Move it into \
+             tests/nim_diff/ and close the issue named in its header."
         )),
-        Err(e) => Some(format!("{name}: {e}  (native prints {:?})", elide(&want))),
+        (true, false) => {
+            eprintln!("  {label}: still diverges (expected)");
+            None
+        }
     }
 }
 
@@ -2235,7 +2276,6 @@ fn is_clean_exit(outcome: &str) -> bool {
     outcome == "Returned([I32(0)])" || outcome == "Exited(0)"
 }
 
-/// The `.nim` programs in `dir`, sorted, or empty if the directory is absent.
 /// `nim_diff/MATRIX.md` is the conformance matrix (#956): a row per feature, the corpus cases that
 /// exercise it, and its status. This checks it against the corpus without the toolchain, so the matrix
 /// cannot drift from what [`nim_differential_corpus`] runs. A ✅ row's cases are in `nim_diff/`; a
@@ -2324,6 +2364,7 @@ fn the_matrix_matches_the_corpus() {
     );
 }
 
+/// The `.nim` programs in `dir`, sorted, or empty if the directory is absent.
 fn nim_cases(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();

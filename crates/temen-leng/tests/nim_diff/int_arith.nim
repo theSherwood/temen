@@ -1,4 +1,5 @@
-# Arithmetic, division/modulo signs, and shifts. Nim's `div`/`mod` truncate toward zero.
+# Arithmetic, division/modulo signs, and shifts. Nim's `div`/`mod` truncate toward zero. `c` is a
+# module-level `let` initialized with constant arithmetic.
 import std/syncio
 
 let a = 17
@@ -9,3 +10,5 @@ let big = 9223372036854775807'i64
 write(stdout, $(big - 1) & "|" & $(-big - 1) & "\n")
 let ua = 0xF0F0F0F0'u32
 write(stdout, $int(ua shr 4) & "|" & $int(ua shl 4) & "|" & $int(not ua) & "\n")
+let c = 2 * 3 + 36
+write(stdout, $c & "\n")
