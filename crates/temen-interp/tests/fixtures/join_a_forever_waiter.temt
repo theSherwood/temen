@@ -1,0 +1,19 @@
+memory 18
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  va = i64.const 131072
+  vchild = thread.spawn 1 vz va
+  vst = thread.join vchild
+  return vst
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, va: i64) {
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait va vexp vto
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}

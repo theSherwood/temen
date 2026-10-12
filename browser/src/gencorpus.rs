@@ -2257,6 +2257,53 @@ fn main() {
     );
     // A spawned thread's trap ends the run (DESIGN.md §12 / I37) — asserted in JS.
     emit("threads_child_trap", THREADS_CHILD_TRAP);
+    // #1414 B6 — what only the parallel driver runs in a browser: the M:N guests (a fiber parked on
+    // a futex and woken by its own thread or resumed on another, a park-time recheck, a timed park on
+    // the page's clock, a resume poll past its deadline), a deadlock, and a live call to a serving
+    // child. The native suites run the same fixtures on every driver (`fiber_parks.rs`,
+    // `spawn_every_driver.rs`); ground truths asserted in JS.
+    for (name, src) in [
+        (
+            "fiber_park_futex",
+            include_str!("../../crates/temen-interp/tests/fixtures/fiber_park_futex.temt"),
+        ),
+        (
+            "fiber_park_then_migrate",
+            include_str!("../../crates/temen-interp/tests/fixtures/fiber_park_then_migrate.temt"),
+        ),
+        (
+            "fiber_park_not_equal",
+            include_str!("../../crates/temen-interp/tests/fixtures/fiber_park_not_equal.temt"),
+        ),
+        (
+            "fiber_park_timed_wait",
+            include_str!("../../crates/temen-interp/tests/fixtures/fiber_park_timed_wait.temt"),
+        ),
+        (
+            "fiber_park_poll_loop",
+            include_str!("../../crates/temen-interp/tests/fixtures/fiber_park_poll_loop.temt"),
+        ),
+        (
+            "join_a_forever_waiter",
+            include_str!("../../crates/temen-interp/tests/fixtures/join_a_forever_waiter.temt"),
+        ),
+        (
+            "live_caller",
+            include_str!("../../crates/temen-interp/tests/fixtures/live_caller.temt"),
+        ),
+    ] {
+        let (m, _) = emit(name, src);
+        // #2219: the live caller spawns func 1's child image, which the page grants as the run's
+        // unit.
+        if name == "live_caller" {
+            let image = temen_ir::child_image_at(&m, 1).expect("live_caller's child image");
+            std::fs::write(
+                "corpus/live_caller_child.temenc",
+                temen_encode::encode_module(&image),
+            )
+            .expect("write module");
+        }
+    }
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);
