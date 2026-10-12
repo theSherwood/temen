@@ -36,7 +36,7 @@ Twelve. File every issue as a sub-issue of exactly one:
 | Epic | Workstream | Owning docs |
 |---|---|---|
 | #705 | **Verify** — verifier & confinement masking (the security hinge) | DESIGN §3–5; INVARIANTS 2; `temen-verify`, `temen-mask` |
-| #706 | **Backends** — JIT/bytecode/interp tiers, codegen, differential parity | LLVM.md, OPT.md, OPS_PARITY.md; DESIGN §17/§22 |
+| #2269 (#706 is full) | **Backends** — JIT/bytecode/interp tiers, codegen, differential parity | LLVM.md, OPT.md, OPS_PARITY.md; DESIGN §17/§22 |
 | #707 | **IR/substrate** — binary format, text round-trip, op spec | DESIGN §3a/3b; SPEC.md; `temen-ir`, `temen-text` |
 | #708 | **Concurrency** — fibers, scheduling, migration, fork mechanism | THREADS.md, FORK.md; DESIGN §23; `temen-fiber` |
 | #709 | **Process** — domains, offers, serving, capabilities, nesting | PROCESS.md, IMPORTS.md, POWERBOX.md; DESIGN §12a |
@@ -47,6 +47,12 @@ Twelve. File every issue as a sub-issue of exactly one:
 | #714 | **Perf** — benchmark harness, regressions vs wasmtime | INTERP_PERF.md, OPT.md; DESIGN §1a; `bench/` |
 | #702 | **CI** — CI matrix, fuzzing, flakiness, dev tooling | AGENTS.md, `.github/` |
 | #948 | **Refactoring** — simplification, consolidation/dedup, deletion, hygiene | CLAUDE.md/AGENTS.md (prime directive); INVARIANTS #1 |
+
+**An epic holds at most 100 sub-issues** (GitHub's cap; closed children count too).
+When one fills, open `Epic: <Workstream> II (area:<x>)` with the same labels, put a
+banner on the full epic pointing at it, and update its row above. The full epic
+keeps its children, and the shared `area:` label keeps the workstream whole across
+both. Always file under the epic this table lists.
 
 `Perf`, `CI`, and `Refactoring` are cross-cutting — an issue homed elsewhere
 carries a `touches:perf` / `touches:ci` / `touches:refactor` label instead of

@@ -4109,6 +4109,32 @@ impl MprotectWindow {
     #[cfg(windows)]
     fn hw_release_hint(&self, _off: u64, _len: u64) {}
 
+    /// Make the private (non-§13) pages `[off, off+len)` — committed RW by the caller — read zero,
+    /// and report whether their backing went back to the OS too. On Linux the pages are **dropped**
+    /// with `MADV_DONTNEED`, which is exact on this private anonymous reservation (zero-fill on
+    /// demand), so a fresh commit stays non-resident until the guest touches it (#2267). Elsewhere —
+    /// Darwin treats `MADV_DONTNEED` as advisory, windows keeps committed pages — zeros are written.
+    /// Never call it over a §13 alias: dropping a shared page re-reads the region instead of zeroing.
+    fn zero_private(&self, off: u64, len: u64) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: page-aligned, within the reserved mapping (validated), and private anonymous.
+            let rc = unsafe {
+                libc::madvise(
+                    self.base.add(off as usize) as *mut c_void,
+                    len as usize,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if rc == 0 {
+                return true;
+            }
+        }
+        // SAFETY: committed RW (callers `hw_commit_rw` first) and within the reserved mapping.
+        unsafe { std::ptr::write_bytes(self.base.add(off as usize), 0, len as usize) };
+        false
+    }
+
     /// Drop the §13 alias over `[off, off+len)`: the range stops being the region's memory and is
     /// the window's own again — private, zero, inaccessible — with the region's bytes untouched for
     /// every other mapping of it. On unix, a fresh private anonymous `MAP_FIXED` mapping replaces
@@ -4205,10 +4231,22 @@ impl GuestMem for MprotectWindow {
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
         // Commit + make RW so the zero-fill lands, zero (a fresh commit reads zero), then apply the
-        // requested protection.
+        // requested protection. A private range is dropped rather than written, so it stays unbacked
+        // until touched; a range holding a §13 alias keeps the write-through zero (dropping a shared
+        // page would re-read the region, not zero it).
         self.hw_commit_rw(start, plen);
-        // SAFETY: the page range is RW and within the reserved mapping (validated).
-        unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
+        let aliased = self
+            .prot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(pages.clone())
+            .any(|(_, p)| matches!(p, PageState::Backed { .. }));
+        if aliased {
+            // SAFETY: the page range is RW and within the reserved mapping (validated).
+            unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
+        } else {
+            self.zero_private(start, plen);
+        }
         for page in pages {
             self.set_prot(page, prot, false);
         }
@@ -4219,10 +4257,11 @@ impl GuestMem for MprotectWindow {
     /// faults, and a re-`map` reads zero. Operates on the page range (page-granular work needs whole
     /// pages) to match `Mem::unmap`.
     ///
-    /// We **explicitly zero** the range so a later re-`map` reads zero on every platform: on Linux
-    /// `MADV_DONTNEED` alone would suffice (next fault returns a fresh zero page), but Darwin treats
-    /// it as advisory (stale bytes survive) and windows keeps the page committed — so the zero is what
-    /// makes them all agree, and `hw_release_hint` is then a pure footprint optimization.
+    /// The range is **zeroed** so a later re-`map` reads zero on every platform: on Linux by
+    /// dropping the pages (`MADV_DONTNEED`, exact for private anonymous memory — the next fault
+    /// returns a fresh zero page), elsewhere by writing zeros, since Darwin treats `MADV_DONTNEED` as
+    /// advisory (stale bytes survive) and windows keeps the page committed. `hw_release_hint` is then
+    /// a pure footprint optimization for the platforms that wrote.
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -4254,12 +4293,13 @@ impl GuestMem for MprotectWindow {
                 (false, None) => {}
             }
         }
-        // Commit + make RW, zero it, hint the OS to drop the backing, then protect NONE so any later
-        // access faults (detect-and-kill).
+        // Commit + make RW, zero it (the aliased runs are private again by now), hint the OS to drop
+        // whatever backing the zero did not already release, then protect NONE so any later access
+        // faults (detect-and-kill).
         self.hw_commit_rw(start, plen);
-        // SAFETY: the page range is RW and within the reserved mapping (validated).
-        unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
-        self.hw_release_hint(start, plen);
+        if !self.zero_private(start, plen) {
+            self.hw_release_hint(start, plen);
+        }
         self.hw_apply(start, plen, 0 /* none */);
         for page in pages {
             self.set_prot(page, 0, false);

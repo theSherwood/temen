@@ -33458,9 +33458,9 @@ impl Mem {
         if !prot_copy.is_empty() {
             twin.space_write().prot = prot_copy;
         }
-        // The `vm_map`-committed tail pages (collected above): commit a zeroed page in the twin's
-        // own backing, then copy the parent's bytes — base-relative on both sides, like
-        // [`snapshot`](Mem::snapshot). The prot entries came over in `prot_copy`.
+        // The `vm_map`-committed tail pages (collected above): copy the parent's bytes into the twin's
+        // own fresh backing — base-relative on both sides, like [`snapshot`](Mem::snapshot). Every byte
+        // of each page is written, so no zeroing first. The prot entries came over in `prot_copy`.
         let base = self.window.base();
         let tbase = twin.window.base();
         if let Some(&last) = tail_pages.last() {
@@ -33470,7 +33470,6 @@ impl Mem {
         }
         for &pg in &tail_pages {
             let off = pg * self.page;
-            twin.back.zero(tbase + off, self.page);
             for i in 0..self.page {
                 twin.set_byte(off + i, self.byte(base + off + i));
             }
@@ -34417,6 +34416,17 @@ impl Mem {
         Ok((offset / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
     }
 
+    /// Zero the window's own backing under `pages` (a [`prot_pages`](Mem::prot_pages) range) in one
+    /// call: a lazy backing drops whole pages instead of writing them ([`Region::zero`]), so a large
+    /// range stays unbacked until the guest touches it — one call per range, never one per page.
+    fn zero_pages(&self, pages: core::ops::RangeInclusive<u64>) {
+        let (first, last) = pages.into_inner();
+        self.back.zero(
+            self.window.base() + first * self.page,
+            (last + 1 - first) * self.page,
+        );
+    }
+
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
     /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
     /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
@@ -35229,10 +35239,7 @@ impl GuestMem for Mem {
                 self.set_prot(&mut space.prot, page, prot, false);
             }
         }
-        for page in pages {
-            self.back
-                .zero(self.window.base() + page * self.page, self.page); // commit ⇒ fresh zeroed page
-        }
+        self.zero_pages(pages); // commit ⇒ fresh zeroed pages
         0
     }
 
@@ -35248,10 +35255,7 @@ impl GuestMem for Mem {
                 self.set_prot(&mut space.prot, page, 0, false);
             }
         }
-        for page in pages {
-            self.back
-                .zero(self.window.base() + page * self.page, self.page);
-        }
+        self.zero_pages(pages);
         0
     }
 
@@ -35318,8 +35322,8 @@ impl GuestMem for Mem {
         region: u32,
         backing: RegionBacking,
     ) -> i64 {
-        let pages: Vec<u64> = match self.prot_pages(win_off, len) {
-            Ok(p) => p.collect(),
+        let pages = match self.prot_pages(win_off, len) {
+            Ok(p) => p,
             Err(e) => return e,
         };
         if !region_off.is_multiple_of(self.page) || prot & PROT_READ == 0 {
@@ -35335,7 +35339,7 @@ impl GuestMem for Mem {
         {
             let mut space = self.space_write();
             space.regions.insert(region, Arc::downgrade(&backing));
-            for (i, &page) in pages.iter().enumerate() {
+            for (i, page) in pages.clone().enumerate() {
                 space.prot.insert(
                     page,
                     PageProt::Backed {
@@ -35346,10 +35350,7 @@ impl GuestMem for Mem {
                 );
             }
         }
-        for &page in &pages {
-            self.back
-                .zero(self.window.base() + page * self.page, self.page); // bytes live in the region now, not anonymous
-        }
+        self.zero_pages(pages); // bytes live in the region now, not anonymous
         0
     }
 
@@ -37501,6 +37502,34 @@ mod prot_tests {
         // Re-mapping zero-fills (the old contents are gone).
         assert_eq!(m.map(tail, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+    }
+
+    /// `map` over pages that still hold bytes is a fresh commit too: a live page, one hidden by
+    /// `protect(0)` (which keeps contents, #1909), and a prefix page all read zero after it. The lazy
+    /// backings drop whole pages rather than writing them (#2267) — this pins that the drop still
+    /// zeroes, so laziness can never be bought by skipping "already-committed" pages.
+    #[test]
+    fn remap_of_live_or_hidden_pages_zeroes() {
+        let mut m = mem_growable();
+        let tail = 1u64 << 16;
+        // Two pages, so the one range zero spans more than a page.
+        assert_eq!(m.map(tail, 2 * page(), PROT_READ | PROT_WRITE), 0);
+        assert!(m.store(tail, 0, StoreOp::I64, Value::I64(7)).is_ok());
+        assert!(m
+            .store(tail + page(), 0, StoreOp::I64, Value::I64(8))
+            .is_ok());
+        assert_eq!(m.map(tail, 2 * page(), PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert_eq!(m.load(tail + page(), 0, LoadOp::I64), Ok(Value::I64(0)));
+        // Hidden with its contents kept, then re-mapped.
+        assert!(m.store(tail, 0, StoreOp::I64, Value::I64(9)).is_ok());
+        assert_eq!(m.protect(tail, page(), 0), 0);
+        assert_eq!(m.map(tail, page(), PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(tail, 0, LoadOp::I64), Ok(Value::I64(0)));
+        // A page of the initially committed prefix.
+        assert!(m.store(page(), 0, StoreOp::I64, Value::I64(5)).is_ok());
+        assert_eq!(m.map(page(), page(), PROT_READ | PROT_WRITE), 0);
+        assert_eq!(m.load(page(), 0, LoadOp::I64), Ok(Value::I64(0)));
     }
 
     #[test]
