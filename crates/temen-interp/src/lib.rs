@@ -34679,10 +34679,16 @@ impl Mem {
     /// produced a rejected address is allowed to have overflowed — reporting the wrapped value is
     /// honest about what was asked for, where saturating would invent a different question.
     fn report_out_of_window(&self, addr: u64, offset: u64) -> Trap {
-        let rel = addr.wrapping_add(offset);
+        self.report_fault_rel(addr.wrapping_add(offset));
+        Trap::MemoryFault
+    }
+
+    /// Record `rel`, a window-relative address, as where this window's fatal memory fault faulted
+    /// ([`Self::peek_fault_rel`]): an out-of-window refusal's, or the address the emitted tier's
+    /// guard left for a fault in emitted code (#2126, #2275).
+    pub(crate) fn report_fault_rel(&self, rel: u64) {
         self.fault_report
             .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
-        Trap::MemoryFault
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds

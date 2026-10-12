@@ -3102,6 +3102,16 @@ pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8, spill_len
     }
 }
 
+/// #2275 — where a memory fault in the running call's emitted code faulted: the address its guard
+/// left in the env cell at [`temen_wasmjit_fault_off`], window-relative (`-1` there means none). The
+/// Worker hands it over before the call returns its trap, and the task's window records it
+/// ([`bytecode::EmittedCall::fault`]), so the run reports it as it reports an interpreted fault.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_deliver_fault_addr(addr: i64) {
+    x2_call(|c| c.fault = u64::try_from(addr).ok());
+}
+
 /// The `log2` size of the run's dispatch table ([`X2_TABLE_LOG2`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
@@ -3424,19 +3434,10 @@ pub extern "C" fn temen_x2_start(
     } else if let Some(cfg) = rt {
         *cfg.host.lock().unwrap_or_else(|e| e.into_inner()) = host;
     }
-    let (status, value, exit_code, trap) = match ran.map(|(r, _)| r) {
-        None => (STATUS_UNSUPPORTED, 0, 0, None),
-        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code, None),
-        Some(Err(t)) => (STATUS_TRAP, 0, 0, Some(t)),
-        Some(Ok(vals)) => (STATUS_OK, first_i64(&vals), 0, None),
-    };
-    set(status);
-    // SAFETY: one run at a time per engine; the page reads these after the run, through this Worker.
-    unsafe {
-        EXIT_CODE = exit_code;
-        LAST_TRAP = trap.as_ref().map_or("", Trap::name);
-    }
-    value
+    // The run reports as every browser run does (#1414 S4-1), a memory fault's address included
+    // (#2275): the driver records the first fault of any of the run's threads, interpreted or
+    // emitted. Its output went out through the powerbox as it ran, so the report carries none.
+    PbOutcome::ended(ran.map(|(r, _)| r), Vec::new(), Vec::new()).publish()
 }
 
 // ---- host powerbox: console + clock, marshalled through host-allocated memory ----------------

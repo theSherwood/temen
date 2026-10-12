@@ -17058,6 +17058,10 @@ pub struct EmittedCall<'a> {
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
+    /// Where a `MemoryFault` the emitted code ended with faulted, window-relative: the address its
+    /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
+    /// interpreted fault (#2275).
+    pub fault: Option<u64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
     table: &'a SharedSlots,
@@ -17599,6 +17603,7 @@ impl ThreadRun {
             win,
             over: &self.over,
             results: Vec::new(),
+            fault: None,
             bounce: &mut bounce,
             table,
             host,
@@ -17606,7 +17611,12 @@ impl ThreadRun {
             pagestate: &pagestate,
             spill: spilled,
         };
-        (tier.run)(&mut call).map(|()| call.results)
+        let ran = (tier.run)(&mut call);
+        let (results, fault) = (call.results, call.fault);
+        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
+            m.report_fault_rel(rel);
+        }
+        ran.map(|()| results)
     }
 
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.

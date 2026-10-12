@@ -106,7 +106,8 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               none). Of the emitted-tier options it takes `tierup` and the §22 ones (`jitCodegen`,
 //               `jitRuntimeCodegen`, `jitB2`): each thread runs its task's tier-ups and emitted
 //               invokes on its own Worker, over a window of `winSize` that cannot grow. It refuses
-//               `instCodegen` (#1414 B6-3c);
+//               `instCodegen` (#1414 B6-3c). A run it ends with a trap rejects with an Error whose
+//               `faultAddr` is where a memory fault faulted, window-relative (`-1n` for none, #2275);
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
 //   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
@@ -225,7 +226,7 @@ export function makeRunner({ module, memory, ex }) {
             } else if (m.kind === 'exit') {
               resolve({ exit: m.code });
             } else if (m.kind === 'trap' || m.kind === 'fail') {
-              reject(new Error(m.why || 'guest trap'));
+              reject(Object.assign(new Error(m.why || 'guest trap'), { faultAddr: m.faultAddr }));
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));

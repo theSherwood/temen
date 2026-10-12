@@ -263,6 +263,22 @@ fn a_trap_in_emitted_code_traps_its_task() {
     assert_eq!(ran, Err(Trap::DivByZero));
 }
 
+/// #2275 — a memory fault in emitted code reports where it faulted, as an interpreted one does: the
+/// address its guard left, which the faulting task's window records for the run.
+#[test]
+fn a_memory_fault_in_emitted_code_reports_its_address() {
+    let ran = run_over(
+        &module(FOUR_COUNTERS),
+        tier(|call| {
+            call.fault = Some(0x1234);
+            Err(Trap::MemoryFault)
+        }),
+        flat_window(),
+    );
+    assert_eq!(ran, Err(Trap::MemoryFault));
+    assert_eq!(temen_interp::last_capture_fault_addr(), Some(0x1234));
+}
+
 /// The root spawns a thread that calls function 2 forever, waits for the cell at 16392 to be set,
 /// and returns 42 without joining it.
 const ROOT_LEAVES_A_CALLER: &str = "memory 16

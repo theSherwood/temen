@@ -105,7 +105,7 @@ self.onmessage = async (e) => {
         mappedNow: () => ex.temen_x2_mapped_now(),
         pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
         winPtr: () => x2Win,
-        deliverFaultAddr: () => {},
+        deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
         spillBytes: () => ex.temen_x2_spill_bytes(),
         spillPtr: () => ex.temen_x2_spill_ptr(),
         fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
@@ -185,7 +185,7 @@ self.onmessage = async (e) => {
     } else if (status === 3) {
       const p = ex.temen_trap_ptr(), n = ex.temen_trap_len();
       const name = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n));
-      self.postMessage({ kind: 'trap', why: `guest trap: ${name}` });
+      self.postMessage({ kind: 'trap', why: `guest trap: ${name}`, faultAddr: ex.temen_fault_addr() });
     } else {
       self.postMessage({ kind: 'fail', why: `the parallel driver did not run the guest (status ${status})` });
     }
