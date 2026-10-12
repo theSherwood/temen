@@ -1006,11 +1006,13 @@ mod mapped {
     /// and a page-dropping [`zero`](Mapped::zero).
     /// The base is page-aligned, so any naturally-aligned 4/8-byte access is hardware-atomic-able.
     /// `Send`/`Sync` are **automatic** — a `Shared` (itself declared shareable under the crate's raced-
-    /// atomics contract) plus two `usize`s — so `Mapped` needs no `unsafe impl` of its own.
+    /// atomics contract) plus plain `usize`s — so `Mapped` needs no `unsafe impl` of its own.
     pub struct Mapped {
         pub(super) raw: Shared,
         map_len: usize,
-        /// The page the mapping was rounded to — the alignment [`zero`](Mapped::zero) drops at.
+        /// The page the mapping was rounded to — the alignment [`zero`](Mapped::zero) drops at. Only
+        /// Linux drops pages, so only Linux keeps it.
+        #[cfg(all(target_os = "linux", not(miri)))]
         page: usize,
     }
 
@@ -1060,6 +1062,7 @@ mod mapped {
             Some(Mapped {
                 raw: Shared::new(base, size),
                 map_len,
+                #[cfg(all(target_os = "linux", not(miri)))]
                 page,
             })
         }
