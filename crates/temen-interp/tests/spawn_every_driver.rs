@@ -1829,8 +1829,10 @@ const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 /// child run on their own threads. (The debug scheduler and `Vcpu` decline the module.)
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
+    // Without its newline: a Windows checkout ends the fixture's lines with `\r\n`.
+    let record = rec::segment(17600, &SpawnRec::v1(0));
     assert!(
-        LIVE_CALLER.contains(&rec::segment(17600, &SpawnRec::v1(0))),
+        LIVE_CALLER.contains(record.trim_end()),
         "the fixture's spawn record starts the child image at its entry"
     );
     let m = module(LIVE_CALLER);
