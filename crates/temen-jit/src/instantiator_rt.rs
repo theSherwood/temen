@@ -2830,9 +2830,11 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         mem_size,
         grants_ptr as u64,
         grants_n as u64,
-        reservation,   // starter caps span the reservation — a root's shape
-        budget as i32, // the handle `take` just charged: the child's `"budget"`
-        lane,          // and the lane it reserved
+        reservation, // starter caps span the reservation — a root's shape
+        lease.0,     // the lease `take` just charged: its budget the child's `"budget"`
+        lease.1,
+        lease.2,
+        lane, // and the lane it reserved
         &mut gc,
         trap_out,
     ) == 0

@@ -13,7 +13,7 @@
 //!   drained cleanly.
 
 use std::sync::Arc;
-use temen_interp::{cap_id, run_with_host, Host, NonDurableKind, Trap, Value};
+use temen_interp::{cap_id, run_with_host, Host, Lease, NonDurableKind, Trap, Value, WINDOW_RUNS};
 use temen_ir::{BinOp, Block, Func, FuncType, Inst, IntTy, LoadOp, Terminator, ValType};
 
 /// A one-block leaf `(params) -> (results)` whose body just returns its first param (or
@@ -82,8 +82,12 @@ fn offer_funcs() -> Arc<[Func]> {
 /// #1867 — a detached child of `parent` holding `grants` by name, its window paid from a budget
 /// granted for it: the child a spawn builds once the carve is gone.
 fn spawn_child(parent: &mut Host, grants: &[(String, i32)]) -> Option<(Host, i32, i32)> {
-    let budget = parent.grant_budget(-1, 1 << 20, -1);
-    parent.spawn_detached_child(grants, 1 << 16, budget, -1)
+    let lease = Lease {
+        budget: parent.grant_budget(-1, 1 << 20, -1),
+        bytes: 1 << 16,
+        runs: WINDOW_RUNS,
+    };
+    parent.spawn_detached_child(grants, 1 << 16, lease, -1)
 }
 
 #[test]

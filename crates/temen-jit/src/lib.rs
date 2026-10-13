@@ -887,10 +887,11 @@ pub type GrantNamedChildBuilder = unsafe extern "C" fn(
 ) -> i32;
 
 /// The host callback for **`instantiate_detached`** (Instantiator op 15): [`GrantNamedChildBuilder`]'s
-/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: `budget`, the handle it
-/// charged for the child's window, which becomes the child's `"budget"`, and `lane`, the lane it
-/// reserved, which the child is stamped with. The thunk passes both from one spawn to the next hook,
-/// so a second vCPU's spawn between the two cannot hand this child its budget or lane (#1972).
+/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: the `(budget, bytes, runs)`
+/// lease it charged for the child's window, whose budget becomes the child's `"budget"` and whose
+/// runs the child's window is paid for up to (#2268), and `lane`, the lane it reserved, which the
+/// child is stamped with. The thunk passes both from one spawn to the next hook, so a second vCPU's
+/// spawn between the two cannot hand this child its budget or lane (#1972).
 ///
 /// # Safety
 /// As [`GrantNamedChildBuilder`].
@@ -902,6 +903,8 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     grants_n: u64,
     child_size: u64,
     budget: i32,
+    bytes: u64,
+    runs: u64,
     lane: i64,
     out: *mut GrantChild,
     trap_out: *mut i64,

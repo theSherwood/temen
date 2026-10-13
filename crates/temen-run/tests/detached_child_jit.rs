@@ -604,6 +604,8 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
                 0,
                 reservation,
                 budget,
+                WINDOW,
+                temen_ir::WINDOW_RUNS,
                 lane,
                 &mut gc,
                 &mut trap,
@@ -713,6 +715,63 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     );
     assert!(i >= 0, "interp admits it: {i}");
     assert_eq!(i, j, "the JIT admits it under the same handle");
+}
+
+/// #2268 — a detached child's lease holds its window's runs up to its program's bound, and its window
+/// holds `maps` only for the runs it has past them: the runs of its read-only segment are charged
+/// once, not again as its window starts. A child with a read-only segment, funded with room for one
+/// split past its lease, protects a page read-only (two runs) on both backends; funded one short, it
+/// is refused `-ENOMEM` on both.
+#[test]
+fn a_detached_childs_window_is_charged_past_its_lease_on_both_backends() {
+    // 128 KiB apart, and clear of the NULL guard: never neighbours, on a 4 KiB host or a 16 KiB one.
+    let c = module(
+        r#"data ro 196608 "\xab"
+memory 18
+func (i64, i64) -> (i64) {
+block 0 (vi: i64, vs: i64) {
+  vh = i32.wrap_i64 vs
+  vp = call.cap 5 3 () -> (i64) vh ()
+  vr = i32.const 1
+  va = i64.const 65536
+  vq = call.cap 5 2 (i64, i64, i32) -> (i64) vh (va, vp, vr)
+  return vq
+  }
+}
+"#,
+    );
+    let lease = temen_interp::MAPS_PER_DOMAIN
+        + temen_interp::MAPS_PER_VCPU
+        + (temen_ir::window_runs_bound(&c.data, false) - temen_ir::WINDOW_RUNS);
+    let parent = |maps: u64| {
+        module(&format!(
+            r#"memory 17
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vall = i64.const -1
+  vmaps = i64.const {maps}
+  vsub = call.cap 14 0 (i64, i64, i64, i64, i64, i64) -> (i32) v2 (vall, vall, vall, vall, vall, vmaps)
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u vsub
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 18
+  vq = i64.const 0
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  return vr
+  }}
+}}
+"#
+        ))
+    };
+    const ENOMEM: i64 = -12;
+    let room = parent(lease + 2);
+    assert_eq!(run_interp(&room, &c, 1 << 18), 0, "interp: the split fits");
+    assert_eq!(run_jit(&room, &c, 1 << 18), 0, "jit: the split fits");
+    let short = parent(lease + 1);
+    assert_eq!(run_interp(&short, &c, 1 << 18), ENOMEM, "interp: one short");
+    assert_eq!(run_jit(&short, &c, 1 << 18), ENOMEM, "jit: one short");
 }
 
 /// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it runs

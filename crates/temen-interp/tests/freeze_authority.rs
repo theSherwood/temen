@@ -219,7 +219,12 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
     });
     let budget = parent.grant_budget(-1, 1 << 20, -1);
     let (mut child, _, _) = parent
-        .spawn_detached_child(&[("freeze".to_string(), progeny)], 1 << 16, budget, -1)
+        .spawn_detached_child(
+            &[("freeze".to_string(), progeny)],
+            1 << 16,
+            window(budget),
+            -1,
+        )
         .expect("detached-progeny authority re-grants");
     assert!(child.holds_freeze_authority(FreezeScope::DetachedProgeny));
     assert!(
@@ -235,7 +240,7 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
     );
 
     let (mut bare, _, _) = parent
-        .spawn_detached_child(&[], 1 << 16, budget, -1)
+        .spawn_detached_child(&[], 1 << 16, window(budget), -1)
         .expect("spawn");
     let own = bare.resolve_cap_name("budget").expect("the child's budget");
     assert!(
@@ -244,7 +249,12 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
     );
     assert!(
         parent
-            .spawn_detached_child(&[("freeze".to_string(), carve)], 1 << 16, budget, -1)
+            .spawn_detached_child(
+                &[("freeze".to_string(), carve)],
+                1 << 16,
+                window(budget),
+                -1
+            )
             .is_none(),
         "the carve form is never handed down"
     );

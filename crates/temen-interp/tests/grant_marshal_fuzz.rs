@@ -14,7 +14,9 @@
 //!      re-grant. A forged handle (one the parent never granted) is refused — `can_regrant` holds — and a
 //!      wholly-valid list is never falsely refused.
 
-use temen_interp::{read_grant_records, read_slice, ForkedProc, Host, HostProc, Trap};
+use temen_interp::{
+    read_grant_records, read_slice, ForkedProc, Host, HostProc, Lease, Trap, WINDOW_RUNS,
+};
 
 const CHILD_SIZE: u64 = 1 << 12;
 
@@ -62,9 +64,13 @@ fn parent_host() -> (Host, i32) {
 /// record or name outside the window is `Err(MemoryFault)`, a non-UTF-8 name `Err(CapFault)`.
 fn marshal(host: &mut Host, window: &[u8], grants_ptr: u64, grants_n: u64) -> Result<bool, Trap> {
     let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))?;
-    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let lease = Lease {
+        budget: host.grant_budget(-1, 1 << 20, -1),
+        bytes: CHILD_SIZE,
+        runs: WINDOW_RUNS,
+    };
     Ok(host
-        .spawn_detached_child(&grants, CHILD_SIZE, budget, -1)
+        .spawn_detached_child(&grants, CHILD_SIZE, lease, -1)
         .is_some())
 }
 

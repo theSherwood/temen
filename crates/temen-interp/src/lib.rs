@@ -3085,7 +3085,7 @@ fn relaunch_detached(
     let lease = spawner
         .host
         .lock_unpoisoned()
-        .relaunch_lease(&host, memory_log2)
+        .relaunch_lease(&mut host, memory_log2)
         .map(|lease| (Arc::clone(&spawner.host), lease));
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
@@ -15498,7 +15498,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
                                 let (cinst, cas) = ch.grant_starter_caps(reservation);
                                 // #1944 — the budget that paid for the window is the child's own.
-                                host.lock_unpoisoned().give_child_budget(budget, &mut ch);
+                                host.lock_unpoisoned().give_child_budget(lease, &mut ch);
                                 for (name, gh) in &glist {
                                     let _ = host.lock_unpoisoned().grant_entry_into_child(
                                         Some(host),
@@ -20395,7 +20395,9 @@ static MAPS_IN_USE: AtomicU64 = AtomicU64::new(0);
 /// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
 /// mapping past the OS limit fails an `mmap` or `mprotect` anywhere in the process, the host's own
 /// allocations included, which aborts it; so every `maps` charge, on every engine and in every run,
-/// is checked against this as well as its own chain. Other hosts have no such limit: unbounded.
+/// is held against this as well as its own chain, and refused past it as past a ceiling. A charge
+/// forced past its ceilings ([`BudgetTree::force_charge`]: what an embedder chose to run, or a thaw
+/// rebuilds) counts here too, unrefused. Other hosts have no such limit: unbounded.
 pub fn maps_pool() -> u64 {
     static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
@@ -20468,6 +20470,8 @@ pub const DEFAULT_MAPS: u64 = u64::MAX;
 /// ([`Host::admit_detached_spawn`]), which the child's end hands back ([`Host::release_detached`]):
 /// `budget` is the spawner's handle on it, `bytes` the window's declared size, and `runs` the bound on
 /// the window's runs of page state ([`window_runs_bound`]), all reserved before the window is built.
+/// The lease holds them for the child's life, and its window holds `maps` only for the runs it has
+/// past `runs` ([`Host::give_child_budget`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     pub budget: i32,
@@ -23423,8 +23427,13 @@ pub struct Host {
     /// JIT: counted as the window starts ([`Host::start_window`]), then what each page op leaves
     /// ([`Host::page_op`]).
     runs: u64,
-    /// #2268 — what this domain holds of `maps` for its window's [`Self::runs`] past [`WINDOW_RUNS`],
-    /// on `own_budget` and every ancestor. Handed back with its memory ([`Host::release_memory`]).
+    /// #2268 — the runs of its window that the share this domain runs on already pays for: a fresh
+    /// window's [`WINDOW_RUNS`], in a domain's own [`MAPS_PER_DOMAIN`], or for a detached child the
+    /// bound its [`Lease`] holds ([`Host::give_child_budget`]).
+    paid_runs: u64,
+    /// #2268 — what this domain holds of `maps` for its window's [`Self::runs`] past
+    /// [`Self::paid_runs`], on `own_budget` and every ancestor. Handed back with its memory
+    /// ([`Host::release_memory`]).
     maps: u64,
     /// #2268 — [`MAPS_PER_DOMAIN`] while this domain holds it itself: a run's root, from its
     /// activation ([`Host::begin_activation`]), and a process, from its creation
@@ -24403,6 +24412,7 @@ impl Host {
             own_window: 0,
             main_vcpu: false,
             runs: WINDOW_RUNS,
+            paid_runs: WINDOW_RUNS,
             maps: 0,
             domain_maps: 0,
             ended: false,
@@ -27592,8 +27602,9 @@ impl Host {
     ///
     /// #2268 — a freeze carries no `maps` (each process's mappings are its own), so the lease's are
     /// charged again here, past any ceiling: the bound on its window's runs from its program
-    /// ([`window_runs_bound`]), the window's §13 pages counted with the rest once it starts.
-    pub fn relaunch_lease(&self, child: &Host, window_log2: u8) -> Option<Lease> {
+    /// ([`window_runs_bound`]), which `child`'s window is paid for up to ([`Self::paid_runs`]); what
+    /// it holds past them, its §13 pages among them, is counted once it starts.
+    pub fn relaunch_lease(&self, child: &mut Host, window_log2: u8) -> Option<Lease> {
         let node = child.budget_node(child.resolve_cap_name("budget")?)?;
         let slot = self
             .table
@@ -27607,6 +27618,7 @@ impl Host {
             runs: window_runs_bound(data, false),
         };
         self.budgets.force_charge(node, BUDGET_MAPS, lease.maps());
+        child.paid_runs = lease.runs;
         Some(lease)
     }
 
@@ -27618,15 +27630,17 @@ impl Host {
         }
     }
 
-    /// #1944 slice 2 — give `child` the node behind `budget`, the one its admission charged
+    /// #1944 slice 2 — give `child` the node behind `lease`'s budget, the one its admission charged
     /// ([`Host::admit_detached_spawn`]), as its `"budget"`: the budget that pays for a child's window
     /// is the child's own. The child's host joins this domain's tree, so its window counts inside that
     /// node's ceiling and its own spawns charge the node and every ancestor. The name resolves to it
-    /// ahead of any re-grant the spawner also called `"budget"`.
-    pub fn give_child_budget(&self, budget: i32, child: &mut Host) {
-        if let Some(node) = self.budget_node(budget) {
+    /// ahead of any re-grant the spawner also called `"budget"`. #2268 — and the runs of its window
+    /// the lease holds are paid for ([`Self::paid_runs`]): its window holds `maps` only past them.
+    pub fn give_child_budget(&self, lease: Lease, child: &mut Host) {
+        if let Some(node) = self.budget_node(lease.budget) {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
+            child.paid_runs = lease.runs;
             if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
                 child.cap_names.insert(0, ("budget".to_string(), h));
             }
@@ -27645,9 +27659,9 @@ impl Host {
     ///
     /// #2268 — likewise the runs of page state the op adds to the window, which are its OS mappings
     /// on a JIT: `change` says what the op does to its pages' classes, and the growth that predicts
-    /// past a fresh window's runs is charged to `maps` first, all or nothing; after the op the charge
-    /// is settled to the runs it left. Every engine counts the same page map, so each refuses the
-    /// same op.
+    /// past the runs already paid for ([`Self::paid_runs`]) is charged to `maps` first, all or
+    /// nothing; after the op the charge is settled to the runs it left. Every engine counts the same
+    /// page map, so each refuses the same op.
     fn page_op(
         &mut self,
         mem: &mut dyn GuestMem,
@@ -27665,9 +27679,10 @@ impl Host {
             Commits::Every => before.tail - held,
             Commits::Own => before.tail - held - before.aliased,
         };
-        // #2268 — and the runs of page state it would leave past a fresh window's.
+        // #2268 — and the runs of page state it would leave past those already paid for.
         let (was, will) = mem.page_runs(off, len, change);
-        let extra = |runs: u64| runs.saturating_sub(WINDOW_RUNS);
+        let paid = self.paid_runs;
+        let extra = |runs: u64| runs.saturating_sub(paid);
         let more = extra((self.runs + will).saturating_sub(was)).saturating_sub(extra(self.runs));
         let charge = [(BUDGET_MEM, worst), (BUDGET_MAPS, more)];
         if (worst > 0 || more > 0) && !self.budgets.add(self.own_budget, &charge, true) {
@@ -27772,25 +27787,23 @@ impl Host {
     }
 
     /// #2268 — this domain's window has started, before its guest runs, with `runs` runs of page
-    /// state ([`GuestMem::window_runs`]), which its page ops count from: it holds their count past
-    /// [`WINDOW_RUNS`] of `maps` ([`Self::maps`]), past any ceiling — the window exists, and what could
-    /// refuse it was its admission, or its embedder's choice to run it. Every engine calls this where
-    /// a window starts: a root's activation ([`Self::begin_activation`]), and the JIT's window-ready
-    /// hook and the interpreters' builds of a detached child's window.
+    /// state ([`GuestMem::window_runs`]), which its page ops count from: what it holds of `maps`
+    /// ([`Self::maps`]) is settled to their count past those already paid for ([`Self::paid_runs`]),
+    /// past any ceiling — the window exists, and what could refuse it was its admission (a detached
+    /// child's lease, an exec's [`Self::exec_image`]), or its embedder's choice to run it. Every
+    /// engine calls this where a window starts: a root's activation ([`Self::begin_activation`]), the
+    /// JIT's window-ready hook, and the interpreters' builds of a detached child's window and an
+    /// exec's.
     pub fn start_window(&mut self, runs: u64) {
-        let (held, owed) = (
-            self.runs.saturating_sub(WINDOW_RUNS),
-            runs.saturating_sub(WINDOW_RUNS),
-        );
-        if owed > held {
+        let owed = runs.saturating_sub(self.paid_runs);
+        if owed > self.maps {
             self.budgets
-                .force_charge(self.own_budget, BUDGET_MAPS, owed - held);
-        } else if held > owed {
+                .force_charge(self.own_budget, BUDGET_MAPS, owed - self.maps);
+        } else if self.maps > owed {
             self.budgets
-                .refund(self.own_budget, BUDGET_MAPS, held - owed);
+                .refund(self.own_budget, BUDGET_MAPS, self.maps - owed);
         }
-        self.maps = (self.maps + owed).saturating_sub(held);
-        self.runs = runs;
+        (self.runs, self.maps) = (runs, owed);
     }
 
     /// #1944 slice 3, #2113 — open an activation of the run this domain roots, over `window`, with
@@ -31200,13 +31213,13 @@ impl Host {
     /// read authority over its minted window) and its starter caps span `reservation` — the whole
     /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-15
     /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
-    /// both backends stamp the same attestation and caps. `budget` and `lane` are what the admission
+    /// both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
     /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.
     pub fn spawn_detached_child(
         &mut self,
         grants: &[(String, i32)],
         reservation: u64,
-        budget: i32,
+        lease: Lease,
         lane: i64,
     ) -> Option<(Host, i32, i32)> {
         let attestation = self.detached_child_attestation();
@@ -31227,7 +31240,7 @@ impl Host {
             grants,
             reservation,
             attestation,
-            Some(budget),
+            Some(lease),
             cell.as_ref(),
         )?;
         ch.set_durable(durable);
@@ -31235,8 +31248,8 @@ impl Host {
         Some((ch, cinst, cas))
     }
 
-    /// The child powerbox: its starter caps, then `budget` as its own `"budget"` (a detached child,
-    /// [`Self::give_child_budget`]), then each of `grants` under its name — the order the
+    /// The child powerbox: its starter caps, then `lease`'s budget as its own `"budget"` (a detached
+    /// child, [`Self::give_child_budget`]), then each of `grants` under its name — the order the
     /// tree-walker's detached arm grants them in, so a child's handles are the same on every engine.
     /// `cell` is this host's own shared cell, which a #744 live self-serve grant calls back through
     /// (`None` refuses such a grant, as `can_regrant` refuses every negative handle).
@@ -31245,7 +31258,7 @@ impl Host {
         grants: &[(String, i32)],
         child_size: u64,
         attestation: Attestation,
-        budget: Option<i32>,
+        lease: Option<Lease>,
         cell: Option<&Arc<Mutex<Host>>>,
     ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
@@ -31265,8 +31278,8 @@ impl Host {
         ch.set_self_module_opt(self.self_module.clone());
         ch.set_attestation(attestation);
         let (cinst, cas) = ch.grant_starter_caps(child_size);
-        if let Some(budget) = budget {
-            self.give_child_budget(budget, &mut ch);
+        if let Some(lease) = lease {
+            self.give_child_budget(lease, &mut ch);
         }
         for (name, handle) in grants {
             // Pre-checked above, so this cannot fail: each entry is granted into the child under its
@@ -31696,7 +31709,8 @@ impl Host {
     /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
     ///
     /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
-    /// `-E2BIG` for a command whose declared window does not fit the caller's, `-EINVAL` otherwise.
+    /// `-E2BIG` for a command whose declared window does not fit the caller's, `-ENOMEM` for one whose
+    /// window's runs of page state its budget has no `maps` for (#2268), `-EINVAL` otherwise.
     /// `Ok` is the commit point: the caller's powerbox has handed its personality to the new image,
     /// so the engine must now replace the image. The engine-specific gates (a durable domain, a
     /// context that cannot be replaced — a fiber, a serve handler, sibling threads) are the caller's
@@ -31730,31 +31744,55 @@ impl Host {
         if memory_log2 > win_log2 {
             return Err(E2BIG);
         }
+        // #2268 — the image's window may start with more runs of page state than the caller's holds
+        // `maps` for: what the image's bound needs past those is charged first, all or nothing, and
+        // handed back if a later step refuses.
+        let runs = window_runs_bound(&g.data, false);
+        let need = runs.saturating_sub(self.paid_runs);
+        let more = need.saturating_sub(self.maps);
+        if more > 0 && !self.budgets.charge(self.own_budget, BUDGET_MAPS, more) {
+            return Err(ENOMEM);
+        }
+        let refused = |h: &Host| {
+            h.budgets.refund(h.own_budget, BUDGET_MAPS, more);
+            EINVAL
+        };
         let child_size = 1u64 << win_log2;
-        let (mut host, ci, ca) = self
-            .spawn_child_powerbox(grants, window_reserved, self.attestation, None, None)
-            .ok_or(EINVAL)?;
+        let Some((mut host, ci, ca)) =
+            self.spawn_child_powerbox(grants, window_reserved, self.attestation, None, None)
+        else {
+            return Err(refused(self));
+        };
         // #1944 slice 3 — an exec replaces the image, not the domain: the new image's use is charged
         // to the node the old one's was, as a process keeps its cgroup across `execve`, so a child
         // cannot exec its way out of the budget that caps it.
         host.budgets = Arc::clone(&self.budgets);
         host.own_budget = self.own_budget;
         let mut starters = [ci, ca];
-        self.exec_carry(
+        let carried = self.exec_carry(
             &mut host,
             &g.module,
             &g.module.imports,
             &g.module.types,
             &mut starters,
-        )
-        .map_err(|()| EINVAL)?;
+        );
+        if carried.is_err() {
+            return Err(refused(self));
+        }
         // #2106 — committed: the window is the caller's size, so a declared window the domain paid
         // for itself stays paid for, as a root's main vCPU stays charged (#2113).
         host.own_window = std::mem::take(&mut self.own_window);
         host.main_vcpu = std::mem::take(&mut self.main_vcpu);
-        // #2268 — and so is the domain's own share of the host's mappings; the new window's runs are
-        // counted once it starts ([`Self::start_window`]).
+        // #2268 — and so is the domain's own share of the host's mappings, and its window's: what the
+        // caller's held, settled to the image's bound, and to the runs its window starts with once it
+        // does ([`Self::start_window`]).
         host.domain_maps = std::mem::take(&mut self.domain_maps);
+        let held = std::mem::take(&mut self.maps);
+        if held > need {
+            self.budgets
+                .refund(self.own_budget, BUDGET_MAPS, held - need);
+        }
+        (host.paid_runs, host.runs, host.maps) = (self.paid_runs, runs, need);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
@@ -36583,7 +36621,14 @@ mod growth_tests {
         let budget = parent.grant_budget(-1, ceiling, -1);
         let node = parent.budget_node(budget).expect("a live budget");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(
+            Lease {
+                budget,
+                bytes: 0,
+                runs: WINDOW_RUNS,
+            },
+            &mut child,
+        );
         let (_, space) = child.grant_starter_caps(1 << 20);
         let mut mem = Mem::with_reservation(20, 16, None);
         let args = [
@@ -36799,6 +36844,76 @@ mod growth_tests {
 }
 
 #[cfg(test)]
+mod exec_maps_tests {
+    //! #2268 — an exec's image may start with more runs of page state than the caller's window holds
+    //! `maps` for: the exec charges what the image's bound needs past them before it commits — all or
+    //! nothing, a refusal (`-ENOMEM`) changing nothing — and the image takes the caller's over, settled
+    //! to the runs its window starts with.
+    use super::*;
+
+    /// A detached child whose budget's `maps` ceiling is `maps`, its window started with `runs` runs:
+    /// `(parent, node, child)`.
+    fn caller(maps: i64, runs: u64) -> (Host, u32, Host) {
+        let mut parent = Host::new();
+        let root = parent.grant_budget(-1, -1, -1);
+        let budget = parent
+            .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[-1, -1, -1, -1, -1, maps], None)
+            .expect("split")[0] as i32;
+        let node = parent.budget_node(budget).expect("a live budget");
+        let mut child = Host::new();
+        let lease = Lease {
+            budget,
+            bytes: 0,
+            runs: WINDOW_RUNS,
+        };
+        parent.give_child_budget(lease, &mut child);
+        child.start_window(runs);
+        (parent, node, child)
+    }
+
+    /// Exec `host` into a command with two read-only segments, whose window starts with at most four
+    /// runs past a fresh one's.
+    fn exec(host: &mut Host) -> Result<ExecImage, i64> {
+        let cmd = temen_text::parse_module(
+            "data ro 32768 \"\\xab\"\ndata ro 49152 \"\\xcd\"\nmemory 16\n\
+             func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        host.exec_image(&command, &[], 0, 0, 1 << 16, 1 << 20)
+    }
+
+    fn maps(host: &Host, node: u32) -> i64 {
+        host.budgets.used(node, BUDGET_MAPS)
+    }
+
+    #[test]
+    fn an_exec_charges_its_images_runs_before_it_commits() {
+        let (parent, node, mut child) = caller(3, WINDOW_RUNS);
+        assert_eq!(
+            exec(&mut child).err(),
+            Some(ENOMEM),
+            "four runs do not fit three"
+        );
+        assert_eq!(maps(&parent, node), 0, "and the refusal charged nothing");
+
+        let (parent, node, mut child) = caller(4, WINDOW_RUNS + 2);
+        assert_eq!(maps(&parent, node), 2, "the caller's window holds two");
+        let mut image = exec(&mut child).expect("they count toward the image's four");
+        assert_eq!(maps(&parent, node), 4, "the image holds its bound");
+        image.host.start_window(WINDOW_RUNS + 2);
+        assert_eq!(
+            maps(&parent, node),
+            2,
+            "settled to the runs its window starts with"
+        );
+        image.host.release_memory();
+        assert_eq!(maps(&parent, node), 0, "and its end hands them back");
+    }
+}
+
+#[cfg(test)]
 mod region_charge_tests {
     //! #2111 — a guest-minted region spends `channel` of its minter's node and every ancestor until
     //! no domain holds it.
@@ -36813,7 +36928,14 @@ mod region_charge_tests {
         let budget = parent.grant_budget_channel(-1, -1, -1, ceiling);
         let node = parent.budget_node(budget).expect("a live budget");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(
+            Lease {
+                budget,
+                bytes: 0,
+                runs: WINDOW_RUNS,
+            },
+            &mut child,
+        );
         let (_, space) = child.grant_starter_caps(1 << 20);
         (parent, node, child, space)
     }
@@ -36891,7 +37013,14 @@ mod live_vcpu_tests {
         let budget = parent.grant_budget(-1, -1, 1);
         let node = parent.budget_node(budget).expect("a live budget");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(
+            Lease {
+                budget,
+                bytes: 0,
+                runs: WINDOW_RUNS,
+            },
+            &mut child,
+        );
         let held = LiveVcpu::charge(child.own_node()).expect("room for one");
         assert!(
             LiveVcpu::charge(child.own_node()).is_none(),
@@ -36927,7 +37056,14 @@ mod fiber_charge_tests {
         let budget = parent.grant_budget(-1, ceiling, -1);
         let node = parent.budget_node(budget).expect("a live budget");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(
+            Lease {
+                budget,
+                bytes: 0,
+                runs: WINDOW_RUNS,
+            },
+            &mut child,
+        );
         (parent, node, child)
     }
 
@@ -39155,7 +39291,14 @@ mod channel_budget_tests {
             .cap_dispatch_slots(cap_id::BUDGET, 0, b, &[-1, -1, -1, PIPE_CAP as i64], None)
             .expect("split")[0] as i32;
         let mut child = Host::new();
-        parent.give_child_budget(node, &mut child);
+        parent.give_child_budget(
+            Lease {
+                budget: node,
+                bytes: 0,
+                runs: WINDOW_RUNS,
+            },
+            &mut child,
+        );
         assert!(child.try_grant_pipe().is_some(), "one pipe fits the node");
         assert!(child.try_grant_pipe().is_none(), "a second exceeds it");
         let room = |h: &mut Host, b: i32| {

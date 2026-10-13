@@ -208,7 +208,14 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
         .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[100, -1, -1], None)
         .expect("split")[0] as i32;
     let mut child = Host::new();
-    h.give_child_budget(node, &mut child);
+    h.give_child_budget(
+        Lease {
+            budget: node,
+            bytes: 0,
+            runs: WINDOW_RUNS,
+        },
+        &mut child,
+    );
     let src = child.own_node();
     assert_eq!(src.draw(), Some(50), "half the chain's room");
     assert_eq!(fuel_room(&mut h, node), 50);
@@ -291,7 +298,14 @@ fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
     assert_eq!(fuel_room(&mut h, sub), -1, "nor does it clamp a split");
 
     let mut child = Host::new();
-    h.give_child_budget(sub, &mut child);
+    h.give_child_budget(
+        Lease {
+            budget: sub,
+            bytes: 0,
+            runs: WINDOW_RUNS,
+        },
+        &mut child,
+    );
     let mut fuel = Fuel::drawn(child.own_node());
     for _ in 0..5 {
         fuel.burn().expect("the activation's room");

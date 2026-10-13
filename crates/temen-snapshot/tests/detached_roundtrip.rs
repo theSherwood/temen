@@ -12,13 +12,22 @@ use std::sync::{Arc, Mutex};
 use temen_durable::{init_durable_window, transform_module, write_state, STATE_UNWINDING};
 use temen_interp::{
     module_digest, run_capture_reserved_with_host, CapturedDetached, CapturedProt, DetachedLaunch,
-    DurableBinding, Host, MemLayout, StreamRole, ThawedDetached, Value,
+    DurableBinding, Host, Lease, MemLayout, StreamRole, ThawedDetached, Value, WINDOW_RUNS,
 };
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::Module;
 use temen_snapshot::{freeze_with_prots, restore_with_prots, FreezeError, PageProt, RestoreError};
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
+
+/// A detached child's lease on `budget`, for a fresh window of its 128 KiB.
+fn lease(budget: i32) -> Lease {
+    Lease {
+        budget,
+        bytes: 1 << 17,
+        runs: WINDOW_RUNS,
+    }
+}
 
 fn instrument(src: &str) -> Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -202,7 +211,7 @@ fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
     spawner.set_durable(true);
     let out = spawner.grant_stream(StreamRole::Out);
     let (chost, _, _) = spawner
-        .spawn_detached_child(&[("stdout".to_string(), out)], 1 << 17, -1, 2)
+        .spawn_detached_child(&[("stdout".to_string(), out)], 1 << 17, lease(-1), 2)
         .expect("the child's powerbox");
     let inherited = DurableBinding::Stream {
         role: StreamRole::Out,
@@ -301,7 +310,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
         host.budget_mem_take(paid, 1 << 17),
         "the child's window, charged"
     );
-    host.give_child_budget(paid, &mut chost);
+    host.give_child_budget(lease(paid), &mut chost);
     let cb = chost
         .resolve_cap_name("budget")
         .expect("the child's budget");

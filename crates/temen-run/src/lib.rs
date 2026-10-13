@@ -1613,7 +1613,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             // re-drawn; the child keeps its own cap either way.
         }
         // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
-        let window_lease = host.relaunch_lease(&r.host, r.memory_log2);
+        let window_lease = host.relaunch_lease(&mut r.host, r.memory_log2);
         let children = detached_seeds(&mut r.host)?;
         // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
         // from the id an interpreter capture gave it.
@@ -2580,6 +2580,8 @@ locked_parent_hook!(
         grants_n: u64,
         child_size: u64,
         budget: i32,
+        bytes: u64,
+        runs: u64,
         lane: i64,
         out: *mut temen_jit::GrantChild,
         trap_out: *mut i64,
@@ -3531,7 +3533,8 @@ pub unsafe extern "C" fn grant_named_child_build(
 /// build_detached`]): the same by-name grant records as [`grant_named_child_build`], built through
 /// [`Host::spawn_detached_child`] — the child attests `window_exposed = false`, its starter caps span
 /// `child_size` = the window reservation (a root's shape; the JIT thunk passes it), and it gets what
-/// [`budget_mem_take`] just admitted it with: `budget` as its `"budget"`, and `lane`.
+/// [`budget_mem_take`] just admitted it with: the lease's `budget` as its `"budget"`, the `runs` its
+/// window is paid for up to, and `lane`.
 ///
 /// # Safety
 /// As [`grant_named_child_build`].
@@ -3544,6 +3547,8 @@ pub unsafe extern "C" fn grant_detached_child_build(
     grants_n: u64,
     child_size: u64,
     budget: i32,
+    bytes: u64,
+    runs: u64,
     lane: i64,
     out: *mut temen_jit::GrantChild,
     trap_out: *mut i64,
@@ -3553,7 +3558,12 @@ pub unsafe extern "C" fn grant_detached_child_build(
         return 0;
     };
     let parent = &mut *(ctx as *mut Host);
-    let built = parent.spawn_detached_child(&grants, child_size, budget, lane);
+    let lease = temen_interp::Lease {
+        budget,
+        bytes,
+        runs,
+    };
+    let built = parent.spawn_detached_child(&grants, child_size, lease, lane);
     finish_child_build(parent, built, out, trap_out)
 }
 

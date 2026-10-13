@@ -2209,7 +2209,7 @@ fn admit_detached_child(
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
     // #1944 — the budget that paid for the window is the child's own.
-    host.give_child_budget(s.budget, &mut child_host);
+    host.give_child_budget(lease, &mut child_host);
     for (name, gh) in &glist {
         let _ = host.grant_entry_into_child(cell.as_ref(), name, *gh, &mut child_host);
     }
@@ -17019,7 +17019,7 @@ mod dbg_domain_end_tests {
         };
         parent.admit_detached_spawn(lease).expect("admitted");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(lease, &mut child);
         let mut fibers = FiberTables::default();
         fibers.fibers.push(FiberState::Pending {
             funcref: 0,
