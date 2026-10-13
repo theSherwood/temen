@@ -61,13 +61,60 @@ self.onmessage = async (e) => {
     return 0;
   };
   const x2_now_ms = () => performance.timeOrigin + performance.now();
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms } }));
+  // A tier-up of the thread's task (#1414 B6-3): `f{func}(win, cell, ...argv)` on this Worker's
+  // instance of the run's tier-up module, made at its first one, with `"mapped"` set; its results
+  // are written at `out`. Returns how many, or -(1 + the code the emitted code trapped with). Its
+  // `call_interp` reaches the task's interpreter through `temen_x2_call_interp`. The emitted code
+  // runs on a slice of fuel: each time it spends one, its `env.trap(OUT_OF_FUEL)` looks at the
+  // run's `over` byte and grants another unless the run is over, so a run that ends while this
+  // thread is in emitted code stops it within a slice. The emitted tier is not metered: the slice is
+  // only how often it looks.
+  const X2_SLICE = 1n << 20n;
+  let x2Emitted = null, x2Trap = 0, x2Over = 0;
+  const x2_tierup = (func, argv, argc, win, mapped, cell, over, out) => {
+    if (x2Emitted === null) {
+      const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
+      const bytes = new Uint8Array(memory.buffer).slice(p, p + n);
+      x2Emitted = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+        env: {
+          memory,
+          trap: (code) => {
+            if (code === 11 /* temen_ir::trap_code::OUT_OF_FUEL */ &&
+              Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0) {
+              x2Emitted.fuel.value = X2_SLICE;
+              return;
+            }
+            x2Trap = code;
+          },
+          call_interp: (f, a) => { if (ex.temen_x2_call_interp(f, a) !== 0) throw new Error('bounce trap'); },
+        },
+      }).exports;
+    }
+    x2Over = over;
+    x2Emitted.mapped.value = mapped;
+    x2Emitted.fuel.value = X2_SLICE;
+    if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
+    const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
+    const args = [];
+    for (let i = 0; i < argc; i++) args.push(view[at + i]);
+    x2Trap = 0;
+    try {
+      const ret = x2Emitted['f' + func](win, cell, ...args);
+      const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+      const res = new BigInt64Array(memory.buffer); // the emitted code may have grown the memory
+      for (let i = 0; i < rets.length; i++) res[(out >>> 3) + i] = BigInt(rets[i]);
+      return rets.length;
+    } catch {
+      return -1 - x2Trap;
+    }
+  };
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // #1414 B6 — the parallel driver: its run is one in-Rust call on the root's Worker, and each of its
   // threads a call on a Worker of its own (`x2_spawn` above). The root reports as a root vCPU does.
   if (role === 'x2root') {
-    const value = ex.temen_x2_start(gptr, glen);
+    const value = ex.temen_x2_start(gptr, glen, winSize, tierup ? 1 : 0);
     const status = ex.temen_status(); // lib.rs STATUS_*: 0 ok · 3 trap · 5 exit
     if (status === 0) {
       self.postMessage({ kind: 'done', value: value.toString() });

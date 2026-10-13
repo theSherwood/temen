@@ -396,8 +396,13 @@ property, so in practice:
   it a thread platform (`Host::set_thread_platform`): each thread of a run is a Worker the page
   starts, running a boxed closure out of the one shared memory (`temen_x2_thread`), and the clock is
   `performance.timeOrigin + performance.now()`. The whole run is one in-Rust call on the root's Worker
-  (`temen_x2_start`) under the same recipes, and `par.js`'s `x2` option picks it. It runs interpreted
-  for now; once it runs the emitted tier (B6-3) it replaces the per-Worker `Vcpu` driver (B6-4).
+  (`temen_x2_start`) under the same recipes, and `par.js`'s `x2` option picks it. With `tierup`, a
+  thread runs its own task's tier-ups on its Worker's instance of the run's tier-up module
+  (`ThreadTier`), over a flat window, without the lock. Emitted code runs on slices of fuel, and at
+  the end of each it looks at the run's `over` flag, so the run's end stops emitted code still
+  running (B6-3a). The emitted §22 invoke and the B2 table (B6-3b) and
+  detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
+  driver (B6-4).
 
 ### Known wrinkles — all resolved in `4c-wasm`
 
