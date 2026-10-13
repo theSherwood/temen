@@ -19449,15 +19449,17 @@ pub use temen_ir::cap_id;
 ///
 /// A seeded shape is also the interface's **op registry**: `cap_dispatch_slots` derives its
 /// unknown-op `CapFault` from `shape.len()`, so an interface with a shape needs no `_ =>` arm.
-fn preseeded_iface_shapes() -> &'static [(u32, Vec<(&'static str, FuncType)>); 2] {
+fn preseeded_iface_shapes() -> &'static [(u32, IfaceOps); 2] {
     // Built once: every capability call checks its op against it.
-    static SHAPES: std::sync::OnceLock<[(u32, Vec<(&'static str, FuncType)>); 2]> =
-        std::sync::OnceLock::new();
+    static SHAPES: std::sync::OnceLock<[(u32, IfaceOps); 2]> = std::sync::OnceLock::new();
     SHAPES.get_or_init(seed_iface_shapes)
 }
 
+/// A built-in interface's canonical ops, in op order: each one's name and signature.
+type IfaceOps = Vec<(&'static str, FuncType)>;
+
 /// [`preseeded_iface_shapes`]' table, as it is built.
-fn seed_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
+fn seed_iface_shapes() -> [(u32, IfaceOps); 2] {
     let rw = FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
