@@ -15454,7 +15454,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let lease = Lease {
                                 budget,
                                 bytes: child_size,
-                                runs: window_runs_bound(&cm.data, premap.is_some()),
+                                runs: window_runs_bound(&cm.module.data, premap.is_some()),
                             };
                             let admitted = (ok_entry
                                 && child_size != 0
@@ -31818,7 +31818,7 @@ impl Host {
         // #2268 — the image's window may start with more runs of page state than the caller's holds
         // `maps` for: what the image's bound needs past those is charged first, all or nothing, and
         // handed back if a later step refuses.
-        let runs = window_runs_bound(&g.data, false);
+        let runs = window_runs_bound(&g.module.data, false);
         let need = runs.saturating_sub(self.paid_runs);
         let more = need.saturating_sub(self.maps);
         if more > 0 && !self.budgets.charge(self.own_budget, BUDGET_MAPS, more) {

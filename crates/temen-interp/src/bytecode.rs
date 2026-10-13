@@ -2199,7 +2199,7 @@ fn admit_detached_child(
     let lease = Lease {
         budget: s.budget,
         bytes: child_size,
-        runs: super::window_runs_bound(&cdata, s.premap.is_some()),
+        runs: super::window_runs_bound(&cmodule.data, s.premap.is_some()),
     };
     let Some(lane) = host.admit_detached_spawn(lease) else {
         return Ok(None);
