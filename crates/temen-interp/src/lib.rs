@@ -2737,19 +2737,16 @@ fn seed_domain(
                 continue;
             }
             let csize = 1u64 << fnr.size_log2;
-            // Resolve the child's function table: the parent's own for a same-module child, or a
-            // re-granted **separate module** matched by content digest (host-supplied at restore).
-            // A missing / mismatched re-grant leaves the join slot empty, so the recording
-            // parent's re-executed `thread.join` fails closed — the per-child R5 identity gate.
-            let cfuncs = match fnr.module_digest {
-                None => Some(Arc::clone(funcs)),
-                Some(d) => host_shared.lock_unpoisoned().module_by_digest(&d),
+            // Resolve the child's function table and type section (#922): the parent's own for a
+            // same-module child, or a re-granted **separate module** matched by content digest
+            // (host-supplied at restore). A missing / mismatched re-grant leaves the join slot
+            // empty, so the recording parent's re-executed `thread.join` fails closed — the
+            // per-child R5 identity gate.
+            let tables = match fnr.module_digest {
+                None => Some((Arc::clone(funcs), Arc::clone(types))),
+                Some(d) => host_shared.lock_unpoisoned().tables_by_digest(&d),
             };
-            let ctypes = match fnr.module_digest {
-                None => Some(Arc::clone(types)),
-                Some(d) => host_shared.lock_unpoisoned().module_types_by_digest(&d),
-            }; // (#922)
-            let Some(cfuncs) = cfuncs else {
+            let Some((cfuncs, ctypes)) = tables else {
                 if parent == id {
                     while root.threads.len() <= fnr.slot {
                         root.threads.push(None);
@@ -2761,12 +2758,9 @@ fn seed_domain(
                 }
                 continue;
             };
-            // The child's type section pairs with its funcs (same digest lookup); a missing
-            // one is an empty section (the funcs unwrap above already gated the real absence).
-            let ctypes = ctypes.unwrap_or_else(|| Arc::from(Vec::new())); // (#922)
-                                                                          // Flip the child's carve from its frozen phase to a thaw: clear its own global
-                                                                          // freeze word and set its context-0 thaw word — `begin_thaw`, at the **absolute**
-                                                                          // carve offset (the carve rides the root image at any depth).
+            // Flip the child's carve from its frozen phase to a thaw: clear its own global freeze
+            // word and set its context-0 thaw word — `begin_thaw`, at the **absolute** carve offset
+            // (the carve rides the root image at any depth).
             if let Some(m) = root.mem.as_mut() {
                 let _ = m.write_bytes(abs_carve + STATE_OFF, &STATE_NORMAL.to_le_bytes());
                 let _ = m.write_bytes(
@@ -5555,9 +5549,6 @@ pub struct ExecImage {
     /// The backed prefix of the window the command runs in: the caller's (the image-replace keeps
     /// the caller's window geometry).
     pub child_size: u64,
-    pub(crate) funcs: Arc<[Func]>,
-    pub(crate) types: Arc<[temen_ir::TypeEntry]>,
-    pub(crate) data: Arc<[Data]>,
     /// The pipes the old image's released ends left with no writers / no readers: a scheduler
     /// wakes their readers (EOF) / writers (`-EPIPE`).
     pub zeroed_pipes: (Vec<u32>, Vec<u32>),
@@ -5566,7 +5557,8 @@ pub struct ExecImage {
 struct ExecReq {
     funcs: Arc<[Func]>,
     types: Arc<[temen_ir::TypeEntry]>,
-    data: Arc<[Data]>,
+    /// The command module: its data segments seed the new window.
+    module: Arc<Module>,
     entry: u64,
     host: Host,
     /// Entry args in the fresh powerbox: the granted `Instantiator`, then `AddressSpace` iff the
@@ -5601,7 +5593,12 @@ impl ExecReq {
         let dt = Arc::new(DomainTable::new(&self.funcs, 0));
         let mem = caller.map(|m| {
             let back = m.twin_backing(m.window.reserved());
-            m.exec_window(back, &self.data, self.null_guard, self.args.as_deref())
+            m.exec_window(
+                back,
+                &self.module.data,
+                self.null_guard,
+                self.args.as_deref(),
+            )
         });
         VCpu::new(
             self.funcs,
@@ -11899,31 +11896,6 @@ mod take_child_tests {
     }
 }
 
-/// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
-/// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
-/// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
-/// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
-///
-/// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
-/// A resolved §14 `Module` grant's pieces, as the eval loop carries them from the op decode
-/// into the shared spawn logic (`Arc`s — spawning shares, never copies). `None` = a
-/// same-module child (runs the parent's own program).
-struct ChildMod {
-    /// The child module's declared durable shadow arena (INVARIANTS.md #16), `None` if none.
-    shadow: Option<ShadowArena>,
-    funcs: Arc<[Func]>,
-    memory_log2: Option<u8>,
-    data: Arc<[Data]>,
-    durable: bool,
-    digest: [u8; 32],
-    imports: Arc<[temen_ir::Import]>,
-    types: Arc<[temen_ir::TypeEntry]>,
-    /// §3.6 — the whole granted module, registered as the child's **self module** at spawn so
-    /// a separate-module child serves its *own* offers (enqueue admission and handler
-    /// resolution go through it), exactly as a same-module child serves the parent's.
-    module: Arc<Module>,
-}
-
 /// A computation paused under a `Jit.invoke` while the invoked unit runs inline ([`VCpu::below`]):
 /// its live frames, its parked root computation's frames if a fiber was running, and its fiber
 /// registry — everything its own `gc.roots` would have scanned.
@@ -11933,6 +11905,12 @@ struct Paused {
     registry: Arc<FiberRegistry>,
 }
 
+/// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
+/// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
+/// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
+/// `registry` of spawned threads — is `Arc`-shared across all vCPUs.
+///
+/// All the run state is **owned**, so a vCPU is `Send` and self-contained — the basis for moving it
 /// between worker threads and (next) parking its continuation on a blocking op.
 struct VCpu {
     /// The owned function table; `Frame::func` resolves against it.
@@ -13213,23 +13191,25 @@ fn admit_exec(
     // fails the whole exec closed, before anything is mutated.
     let grants =
         read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).map_err(|_| EINVAL)?;
-    let img = {
+    let (command, img) = {
         let mut h = host.lock_unpoisoned();
         let command = h.exec_module(cmd)?;
-        h.exec_image(
+        let img = h.exec_image(
             &command,
             &grants,
             entry,
             size_log2,
             m.window.mapped(),
             m.window.reserved(),
-        )?
+        )?;
+        (command, img)
     };
+    let (funcs, types) = command.0.tables();
     let req = Box::new(ExecReq {
         null_guard: temen_ir::module_null_guard(),
-        funcs: img.funcs,
-        types: img.types,
-        data: img.data,
+        funcs,
+        types,
+        module: img.module,
         entry,
         host: img.host,
         entry_args: img.entry_args.into_iter().map(Value::I64).collect(),
@@ -14601,7 +14581,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // resolution happens at child construction via `regrant_into_child`. Validated here.
                     let (op, child_mod, askip, named): (
                         u32,
-                        Option<ChildMod>,
+                        Option<ModuleGrant>,
                         usize,
                         Vec<(String, i32)>,
                     ) = match *op {
@@ -14610,21 +14590,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mh =
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as i32;
-                            let g = {
-                                let hg = host.lock_unpoisoned();
-                                let g = hg.resolve_module(mh)?;
-                                ChildMod {
-                                    funcs: g.funcs.clone(),
-                                    shadow: g.shadow,
-                                    memory_log2: g.memory_log2,
-                                    data: g.data.clone(),
-                                    durable: g.durable,
-                                    digest: g.digest,
-                                    imports: g.imports.clone(),
-                                    types: g.types.clone(),
-                                    module: Arc::clone(&g.module),
-                                }
-                            };
+                            let g = host.lock_unpoisoned().resolve_module(mh)?.clone();
                             (
                                 0, // instantiate_module → instantiate
                                 Some(g),
@@ -14718,19 +14684,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     pager_ref = Some((Arc::clone(host), pager));
                                 }
                                 let g = if modh >= 0 {
-                                    let hg = host.lock_unpoisoned();
-                                    let g = hg.resolve_module(modh)?;
-                                    Some(ChildMod {
-                                        funcs: g.funcs.clone(),
-                                        shadow: g.shadow,
-                                        memory_log2: g.memory_log2,
-                                        data: g.data.clone(),
-                                        durable: g.durable,
-                                        digest: g.digest,
-                                        imports: g.imports.clone(),
-                                        types: g.types.clone(),
-                                        module: Arc::clone(&g.module),
-                                    })
+                                    Some(host.lock_unpoisoned().resolve_module(modh)?.clone())
                                 } else {
                                     None
                                 };
@@ -14751,21 +14705,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mh =
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as i32;
-                            let g = {
-                                let hg = host.lock_unpoisoned();
-                                let g = hg.resolve_module(mh)?;
-                                ChildMod {
-                                    funcs: g.funcs.clone(),
-                                    shadow: g.shadow,
-                                    memory_log2: g.memory_log2,
-                                    data: g.data.clone(),
-                                    durable: g.durable,
-                                    digest: g.digest,
-                                    imports: g.imports.clone(),
-                                    types: g.types.clone(),
-                                    module: Arc::clone(&g.module),
-                                }
-                            };
+                            let g = host.lock_unpoisoned().resolve_module(mh)?.clone();
                             let grants_ptr =
                                 get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
                                     as u64;
@@ -14782,7 +14722,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => (o, None, 0, Vec::new()),
                     };
                     // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |cm| &cm.funcs);
+                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |cm| &cm.module.funcs);
                     match op {
                         // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
                         // §14 data plane is shared memory: the parent seeds the child's sub-window
@@ -14823,7 +14763,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 0
                             };
                             let mod_ok = child_mod.as_ref().is_none_or(|cm| {
-                                cm.memory_log2.is_some_and(|ml| ml <= size_log2 as u8)
+                                cm.memory_log2().is_some_and(|ml| ml <= size_log2 as u8)
                             });
                             let fits = bytecode::carve_fits(
                                 off,
@@ -14856,7 +14796,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // nesting composes at any depth.
                                 let abs_base =
                                     mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
-                                let child_shadow = child_mod.as_ref().and_then(|cm| cm.shadow);
+                                let child_shadow = child_mod.as_ref().and_then(ModuleGrant::shadow);
                                 let child_mem = mem.as_ref().map(|m| {
                                     m.nested_view(
                                         abs_base,
@@ -14877,7 +14817,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // `readonly` segments is skipped for nested children (documented —
                                 // intra-domain self-corruption is a §1 non-goal).
                                 if let (Some(cm), Some(m)) = (&child_mod, mem.as_ref()) {
-                                    m.write_segments(abs_base, &cm.data, child_size);
+                                    m.write_segments(abs_base, &cm.module.data, child_size);
                                 }
                                 // Attenuated powerbox: the child gets, over its *own* window (a strict
                                 // subset of the parent's authority), an `Instantiator` (so it can
@@ -15003,9 +14943,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // slot with nothing to bind fails the spawn closed — probeable
                                 // `-EINVAL`, before any child code runs.
                                 let manifest_ok = match &child_mod {
-                                    Some(cm) => {
-                                        ch.bind_child_manifest(&cm.imports, &cm.types).is_ok()
-                                    }
+                                    Some(cm) => ch
+                                        .bind_child_manifest(&cm.module.imports, &cm.module.types)
+                                        .is_ok(),
                                     // #1234: a **same-module** child runs our program, so its import
                                     // manifest *is* ours — bind it against the child's own attenuated
                                     // powerbox, through the same binder and the same `CHILD_BINDABLE`
@@ -15017,19 +14957,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // nothing to bind, so its slots stay empty and fail closed on use
                                     // exactly as before.
                                     None if !named.is_empty() => {
-                                        let (im, ty) = {
-                                            let hg = host.lock_unpoisoned();
-                                            (
-                                                hg.module_imports(SELF_MODULE),
-                                                hg.module_types(SELF_MODULE),
-                                            )
-                                        };
-                                        match (im, ty) {
-                                            (Some(im), Some(ty)) => {
-                                                ch.bind_same_module_manifest(&im, &ty).is_ok()
-                                            }
-                                            _ => true,
-                                        }
+                                        let sm = host.lock_unpoisoned().self_module.clone();
+                                        sm.is_none_or(|sm| {
+                                            ch.bind_same_module_manifest(&sm.imports, &sm.types)
+                                                .is_ok()
+                                        })
                                     }
                                     None => true,
                                 };
@@ -15083,13 +15015,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // one `entry` was validated against above (`cfs`), so an installed
                                     // §22 unit's child runs the unit's function, not module 0's
                                     // (#1726; the module-aware rule `thread.spawn` already follows).
-                                    let cfuncs = child_mod.as_ref().map_or_else(
-                                        || Arc::clone(&cur_funcs),
-                                        |cm| Arc::clone(&cm.funcs),
-                                    );
-                                    let ctypes = child_mod.as_ref().map_or_else(
-                                        || Arc::clone(&cur_types),
-                                        |cm| Arc::clone(&cm.types),
+                                    let (cfuncs, ctypes) = child_mod.as_ref().map_or_else(
+                                        || (Arc::clone(&cur_funcs), Arc::clone(&cur_types)),
+                                        ModuleGrant::tables,
                                     ); // (#922)
                                     let csched = sched.clone();
                                     // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
@@ -15438,22 +15366,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // 5/13); the child runs it as its own program + self module. `-1` is
                             // the spawning frame's program: an installed unit's own, from a frame
                             // of one (#2143).
-                            let cm = {
-                                let hg = host.lock_unpoisoned();
-                                let g =
-                                    hg.resolve_spawn_module(mh, dt.unit_id(frames[top].module))?;
-                                ChildMod {
-                                    funcs: g.funcs.clone(),
-                                    shadow: g.shadow,
-                                    memory_log2: g.memory_log2,
-                                    data: g.data.clone(),
-                                    durable: g.durable,
-                                    digest: g.digest,
-                                    imports: g.imports.clone(),
-                                    types: g.types.clone(),
-                                    module: Arc::clone(&g.module),
-                                }
-                            };
+                            let unit = dt.unit_id(frames[top].module);
+                            let cm = host
+                                .lock_unpoisoned()
+                                .resolve_spawn_module(mh, unit)?
+                                .clone();
                             // Named grants (the op-11 record format), pre-validated fail-closed. A
                             // detached spawn may carry #744's live self-serve grant, from a v1
                             // record or op 15's positional form alike.
@@ -15467,12 +15384,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                             };
                             authorize_eval_grants(&host.lock_unpoisoned(), &glist)?;
-                            let cfs: &[Func] = &cm.funcs;
+                            let cfs: &[Func] = &cm.module.funcs;
                             let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
-                            let size_log2 = temen_ir::detached_size_log2(size_log2, cm.memory_log2);
+                            let size_log2 =
+                                temen_ir::detached_size_log2(size_log2, cm.memory_log2());
                             let child_size = if (0..64).contains(&size_log2) {
                                 1u64 << size_log2
                             } else {
@@ -15480,7 +15398,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             };
                             // §14 transparency: the detached window equals the module's
                             // declared memory (a module with no memory can't spawn).
-                            let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
+                            let mod_ok = cm.memory_log2() == Some(size_log2 as u8);
                             let premap_ok = match premap {
                                 Some((r, o)) => {
                                     host.lock_unpoisoned().premap_admit(r, o, child_size)?
@@ -15522,8 +15440,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let mut fm = Mem::from_spec(WindowSpec {
                                     reserved_log2: DEFAULT_RESERVED_LOG2,
                                     mapped_log2: size_log2 as u8,
-                                    shadow: cm.shadow,
-                                    data: &cm.data,
+                                    shadow: cm.shadow(),
+                                    data: &cm.module.data,
                                     null_guard: temen_ir::module_null_guard(),
                                     ..WindowSpec::default()
                                 });
@@ -15590,9 +15508,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // — its manifest is the parent's whole import surface).
                                 let same_module = host.lock_unpoisoned().is_self_module(mh);
                                 let bound = if same_module {
-                                    ch.bind_same_module_manifest(&cm.imports, &cm.types)
+                                    ch.bind_same_module_manifest(
+                                        &cm.module.imports,
+                                        &cm.module.types,
+                                    )
                                 } else {
-                                    ch.bind_child_manifest(&cm.imports, &cm.types)
+                                    ch.bind_child_manifest(&cm.module.imports, &cm.module.types)
                                 };
                                 if bound.is_err() {
                                     undo();
@@ -15618,8 +15539,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // for what it burns.
                                     let child_fuel =
                                         Fuel::drawn(child_host.lock_unpoisoned().own_node());
-                                    let cfuncs = Arc::clone(&cm.funcs);
-                                    let ctypes = Arc::clone(&cm.types); // child module type section (#922)
+                                    let (cfuncs, ctypes) = cm.tables(); // with its type section (#922)
                                     let csched = sched.clone();
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
@@ -20960,7 +20880,7 @@ pub enum DurableBinding {
     /// content digest. The module *bytes* never ride an artifact (D-scope): the restoring host
     /// re-grants the same module and this digest re-resolves the handle against it — exactly the
     /// rule a separate-module [`FrozenNested`] child already re-attaches by
-    /// ([`Host::module_by_digest`]), reused rather than duplicated.
+    /// ([`Host::tables_by_digest`]), reused rather than duplicated.
     ///
     /// A grant *without* the attestation stays non-durable ([`NonDurableKind::Module`]): a durable
     /// domain may not instantiate one anyway (DURABILITY.md §4), so there is nothing a thaw could
@@ -23901,26 +23821,20 @@ struct JitTableState {
 const JIT_DEFAULT_MAX_UNITS: u32 = 4096;
 const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitted IR
 
-/// One §14 module grant: the verified module's functions, declared window size, data segments — what
+/// One §14 module grant: the verified module — its functions, declared window size, data segments, what
 /// spawning a child domain of it needs — and its first-class export table, so a parent can resolve a
-/// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx.
-/// `Clone` so a module can be **re-granted into a child** (FORK.md §8.6 — the `funcs`/`data`/`module`
-/// are `Arc`s, so the copy is cheap): a parent hands a command module to a nested guest to `execve`.
+/// child entry **by name** (`Module` op 0, F2) instead of hardcoding its funcidx. It holds the module
+/// once (#1883): the engines compile and spawn from `module`, and only the tree-walker, which runs
+/// from shared slices, makes its own ([`ModuleGrant::tables`]).
+/// `Clone` so a module can be **re-granted into a child** (FORK.md §8.6 — its fields are `Arc`s, so
+/// the copy is cheap): a parent hands a command module to a nested guest to `execve`.
 #[derive(Clone)]
 struct ModuleGrant {
-    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
-    shadow: Option<ShadowArena>,
-    funcs: Arc<[Func]>,
-    memory_log2: Option<u8>,
-    data: Arc<[Data]>,
-    exports: Arc<[temen_ir::Export]>,
-    /// The module's import manifest (IMPORTS.md phase 3 / S2.1): retained so a child spawn can
-    /// bind each slot against the child's granted powerbox - the child executes `call.import`
-    /// through these bindings; nothing is rewritten and no handle is stashed in its window.
-    imports: Arc<[temen_ir::Import]>,
-    /// The module's type section (§3.5): retained beside `imports` so the child-spawn binder
-    /// can resolve each import's requirement set (names + signatures) for the coverage walk.
-    types: Arc<[temen_ir::TypeEntry]>,
+    /// §3.6 — the granted module. Also registered as a spawned child's **self module**, so a
+    /// separate-module child can serve its own offers (impl-export admission, handler resolution,
+    /// reflection) exactly as the top-level program serves via `set_self_module`. A spawn binds the
+    /// child's slots against its import manifest and type section (IMPORTS.md phase 3 / S2.1, §3.5).
+    module: Arc<Module>,
     /// DURABILITY.md §4: the granting host attests this module is **freezable** (it ran
     /// `temen_durable::transform_module` on it — a compile-mode fact only the host knows, like
     /// verification). A durable domain refuses to instantiate a grant without this bit, so its
@@ -23931,28 +23845,48 @@ struct ModuleGrant {
     /// against the restore host's re-granted modules (host-supplied at restore, D-scope — the module
     /// bytes never ride the artifact). Computed by [`module_digest`], shared with the codec's R5 gate.
     digest: [u8; 32],
-    /// §3.6 — the whole granted module, registered as a spawned child's **self module** so a
-    /// separate-module child can serve its own offers (impl-export admission, handler
-    /// resolution, reflection) exactly as the top-level program serves via `set_self_module`.
-    module: Arc<Module>,
+    /// The module's function table and type section as the shared slices the tree-walker runs a
+    /// vCPU from ([`Self::tables`]): made the first time it is asked for, and shared by every copy of
+    /// this grant.
+    tables: Arc<std::sync::OnceLock<Tables>>,
 }
+
+/// A function table and its type section, as a vCPU owns them.
+type Tables = (Arc<[Func]>, Arc<[temen_ir::TypeEntry]>);
 
 impl ModuleGrant {
     /// The record a grant of `m` keeps — one derivation for a `Module` grant
     /// ([`Host::grant_module`]) and for an image an `execve` promotes ([`Host::exec_module`]).
     fn of(m: Arc<Module>, durable: bool) -> ModuleGrant {
         ModuleGrant {
-            funcs: m.funcs.clone().into(),
-            shadow: m.memory.and_then(|mc| mc.shadow),
-            memory_log2: m.memory.map(|mc| mc.size_log2),
-            data: m.data.clone().into(),
-            exports: m.exports.clone().into(),
-            imports: m.imports.clone().into(),
-            types: m.types.clone().into(),
-            durable,
             digest: module_digest(&m),
             module: m,
+            durable,
+            tables: Arc::default(),
         }
+    }
+
+    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
+    fn shadow(&self) -> Option<ShadowArena> {
+        self.module.memory.and_then(|mc| mc.shadow)
+    }
+
+    /// The `log2` of the module's declared window, `None` if it declares no memory.
+    fn memory_log2(&self) -> Option<u8> {
+        self.module.memory.map(|mc| mc.size_log2)
+    }
+
+    /// The module's function table and type section as shared slices: what the tree-walker, and a
+    /// JIT re-launching a thawed detached child, run a child of this grant from. The bytecode engine
+    /// and the JIT's spawns compile from `module` and never make them.
+    fn tables(&self) -> Tables {
+        let (funcs, types) = self.tables.get_or_init(|| {
+            (
+                self.module.funcs.as_slice().into(),
+                self.module.types.as_slice().into(),
+            )
+        });
+        (Arc::clone(funcs), Arc::clone(types))
     }
 }
 
@@ -23968,8 +23902,10 @@ pub struct ExecModule(ModuleGrant);
 pub struct PreparedModule(ModuleGrant);
 
 impl PreparedModule {
-    pub fn new(m: Arc<Module>) -> PreparedModule {
-        PreparedModule(ModuleGrant::of(m, false))
+    /// Prepare `m`: a `Module` moves in, an `Arc<Module>` is shared. Either way the grant holds that
+    /// one copy.
+    pub fn new(m: impl Into<Arc<Module>>) -> PreparedModule {
+        PreparedModule(ModuleGrant::of(m.into(), false))
     }
 
     /// The module it grants.
@@ -23982,30 +23918,9 @@ impl PreparedModule {
 /// (functions, memory, data, exports), computed the same way at freeze-grant and thaw-grant so a
 /// separate-module child re-attaches against the matching re-granted module. Debug info and
 /// (already-resolved) imports are excluded — they don't affect execution, and stripping them keeps
-/// the identity tolerant of a debug-stripped re-grant.
+/// the identity tolerant of a debug-stripped re-grant ([`temen_encode::encode_module_identity`]).
 pub fn module_digest(m: &Module) -> [u8; 32] {
-    let canon = Module {
-        data_ptrs: Vec::new(),
-        data_funcrefs: Vec::new(),
-        // Which data bytes are function indices is part of the image (#1830): it decides what an
-        // analysis of its indirect calls may assume, so two modules that differ in it are two.
-        data_funcref_slots: m.data_funcref_slots.clone(),
-        tls: Vec::new(),
-        funcs: m.funcs.clone(),
-        memory: m.memory,
-        data: m.data.clone(),
-        exports: m.exports.clone(),
-        // Interface offers and the interface section are semantic (they are what wiring
-        // resolves against), so they ride the identity digest like function exports do.
-        impl_exports: m.impl_exports.clone(),
-        types: m.types.clone(),
-        imports: Vec::new(),
-        // Data exports are resolved-away link metadata (backends ignore them) — like imports, they
-        // don't affect execution, so they stay out of the module-identity digest.
-        data_exports: Vec::new(),
-        debug_info: None,
-    };
-    temen_encode::digest256(&temen_encode::encode_module(&canon))
+    temen_encode::digest256(&temen_encode::encode_module_identity(m))
 }
 
 /// A compiled §22 unit's program as a module: its already-instrumented+verified funcs and type
@@ -24043,8 +23958,8 @@ impl Default for Host {
 
 /// The spawn-record `module` selector meaning **this module** — a §14 child that runs the parent's
 /// own program rather than a granted separate `Module` (CONSOLIDATION.md §3d, [`temen_ir::SpawnRec`]).
-/// `Host::module_imports`/`module_types` accept it so a same-module child's manifest is fetched
-/// through the same call as a separate-module child's (#1234).
+/// A spawn's module operand takes it ([`Host::spawn_module`]), so a same-module child is named the
+/// way a separate-module child is, and binds the running module's manifest (#1234).
 pub const SELF_MODULE: i32 = -1;
 
 impl Host {
@@ -24449,36 +24364,6 @@ impl Host {
         Some(twin)
     }
 
-    /// Install this domain's **import-binding table** (§7 / IMPORTS.md phase 1): entry `i` is the
-    /// instantiation-time resolution of the module's import `i` — the bound `(type_id, op)` plus the
-    /// granted handle. An executable [`temen_ir::CAP_IMPORT_TYPE_ID`] dispatch translates through it,
-    /// so a `call.import` runs without the module ever being rewritten. Host-controlled only (the
-    /// guest cannot reach this); an unbound index is a `CapFault` at use, fail-closed.
-    /// The import manifest of a granted §14 `Module`, or `None` for a forged/closed handle. The
-    /// JIT's op-13 child builder reads it (via `temen_run::child_bind_imports`) to bind the child's
-    /// slots — the same manifest the interpreter's inline spawn reads from its `ModuleGrant`.
-    pub fn module_imports(&self, handle: i32) -> Option<Arc<[temen_ir::Import]>> {
-        if handle == SELF_MODULE {
-            return self
-                .self_module
-                .as_ref()
-                .map(|m| Arc::from(m.imports.clone()));
-        }
-        self.resolve_module(handle).ok().map(|g| g.imports.clone())
-    }
-
-    /// The type section of a granted §14 `Module` (§3.5): read beside [`Host::module_imports`]
-    /// by the child-manifest binder to resolve each import's requirement set.
-    pub fn module_types(&self, handle: i32) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        if handle == SELF_MODULE {
-            return self
-                .self_module
-                .as_ref()
-                .map(|m| Arc::from(m.types.clone()));
-        }
-        self.resolve_module(handle).ok().map(|g| g.types.clone())
-    }
-
     /// S2.1 / IMPORTS.md phase 3 + §3.3: bind a **child** module's import manifest against this
     /// (child) host's granted powerbox, so the child's `call.import`s dispatch through instance
     /// bindings — no rewrite, no window stash. Binding, per slot, in order:
@@ -24840,6 +24725,11 @@ impl Host {
             .filter(|b| !(self.durable && temen_ir::durable_abi::is_serve_op(b.type_id, b.op)))
     }
 
+    /// Install this domain's **import-binding table** (§7 / IMPORTS.md phase 1): entry `i` is the
+    /// instantiation-time resolution of the module's import `i` — the bound `(type_id, op)` plus the
+    /// granted handle. An executable [`temen_ir::CAP_IMPORT_TYPE_ID`] dispatch translates through it,
+    /// so a `call.import` runs without the module ever being rewritten. Host-controlled only (the
+    /// guest cannot reach this); an unbound index is a `CapFault` at use, fail-closed.
     pub fn set_import_bindings(&mut self, mut bindings: Vec<BoundImport>) {
         debug_assert!(
             bindings
@@ -25359,7 +25249,7 @@ impl Host {
     ) -> Option<DetachedRelaunch> {
         self.alias_inherited_stdio(&mut host);
         let (_, g) = self.grant_by_digest(&launch.digest)?;
-        let memory_log2 = g.memory_log2?;
+        let memory_log2 = g.memory_log2()?;
         host.set_durable(true);
         host.set_lane_cap(launch.lane);
         host.set_self_module_opt(Some(Arc::clone(&g.module)));
@@ -25377,15 +25267,16 @@ impl Host {
             host.grown = window.grown_bytes();
         }
         let bound = if launch.same_module {
-            host.bind_same_module_manifest(&g.imports, &g.types)
+            host.bind_same_module_manifest(&g.module.imports, &g.module.types)
         } else {
-            host.bind_child_manifest(&g.imports, &g.types)
+            host.bind_child_manifest(&g.module.imports, &g.module.types)
         };
         bound.ok()?;
+        let (funcs, types) = g.tables();
         Some(DetachedRelaunch {
-            funcs: Arc::clone(&g.funcs),
-            types: Arc::clone(&g.types),
-            shadow: g.shadow,
+            funcs,
+            types,
+            shadow: g.shadow(),
             memory_log2,
             module: Arc::clone(&g.module),
             host,
@@ -28942,6 +28833,9 @@ impl Host {
     /// domain via the `Instantiator`'s module ops (the "plugin" grant). **`m` must already be
     /// verified** (`temen_verify::verify_module`): like every run entry, the host is trusted to grant
     /// only verifier-passing modules — a guest can never inject code, only spawn what it was given.
+    ///
+    /// It grants a copy of `m`. A host that owns its module, or shares it, grants it without one
+    /// through a [`PreparedModule`] ([`Host::grant_prepared`]).
     pub fn grant_module(&mut self, m: &Module) -> i32 {
         self.grant_module_inner(m, false)
     }
@@ -29102,18 +28996,11 @@ impl Host {
         self.grant_by_digest(digest).map(|(i, _)| i)
     }
 
-    /// The function table of the grant [`Self::grant_by_digest`] names.
-    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
-        self.grant_by_digest(digest)
-            .map(|(_, g)| Arc::clone(&g.funcs))
-    }
-
-    /// The type section of the granted module matching `digest` (FuncType interning, #922) — the
-    /// sibling of [`Self::module_by_digest`] so a re-granted separate-module thread child resolves
-    /// its call variants' interned signatures.
-    fn module_types_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        self.grant_by_digest(digest)
-            .map(|(_, g)| Arc::clone(&g.types))
+    /// The function table and type section ([`ModuleGrant::tables`]) of the grant
+    /// [`Self::grant_by_digest`] names — what a re-granted separate-module thread child runs from,
+    /// its call variants' interned signatures resolved in the type section (#922).
+    fn tables_by_digest(&self, digest: &[u8; 32]) -> Option<Tables> {
+        self.grant_by_digest(digest).map(|(_, g)| g.tables())
     }
 
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
@@ -29191,17 +29078,18 @@ impl Host {
         bool,
     )> {
         let g = self.resolve_spawn_module(handle, unit).ok()?;
+        let m = &g.module;
         Some((
-            g.funcs.as_ptr(),
-            g.funcs.len(),
-            g.memory_log2.map_or(-1, |l| l as i32),
-            g.data.as_ptr(),
-            g.data.len(),
+            m.funcs.as_ptr(),
+            m.funcs.len(),
+            g.memory_log2().map_or(-1, |l| l as i32),
+            m.data.as_ptr(),
+            m.data.len(),
             // #922: the child module's type section, so the JIT nesting runtime can resolve the
             // child's interned `call.dyn` type indices when it re-compiles the child.
-            g.types.as_ptr(),
-            g.types.len(),
-            g.shadow.unwrap_or(ShadowArena::EMPTY),
+            m.types.as_ptr(),
+            m.types.len(),
+            g.shadow().unwrap_or(ShadowArena::EMPTY),
             g.durable,
         ))
     }
@@ -29530,7 +29418,7 @@ impl Host {
             return EINVAL;
         };
         match validate(bytes) {
-            Ok(m) => self.grant_module(&m) as i64,
+            Ok(m) => self.grant_module_shared(Arc::new(m), false) as i64,
             Err(e) => e,
         }
     }
@@ -31256,7 +31144,7 @@ impl Host {
         window_reserved: u64,
     ) -> Result<ExecImage, i64> {
         let g = &m.0;
-        let f = g.funcs.get(entry as usize).ok_or(EINVAL)?;
+        let f = g.module.funcs.get(entry as usize).ok_or(EINVAL)?;
         let arity = bytecode::child_entry_ok(&f.params, &f.results)
             .then_some(f.params.len())
             .ok_or(EINVAL)?;
@@ -31264,7 +31152,7 @@ impl Host {
             .is_power_of_two()
             .then(|| window_mapped.trailing_zeros() as u8)
             .ok_or(EINVAL)?;
-        let memory_log2 = g.memory_log2.ok_or(EINVAL)?;
+        let memory_log2 = g.memory_log2().ok_or(EINVAL)?;
         if !(0..64).contains(&size_log2)
             || !window_reserved.is_power_of_two()
             || window_reserved < window_mapped
@@ -31312,9 +31200,6 @@ impl Host {
             child_size,
             digest: g.digest,
             module: Arc::clone(&g.module),
-            funcs: Arc::clone(&g.funcs),
-            types: Arc::clone(&g.types),
-            data: Arc::clone(&g.data),
         })
     }
 
@@ -32423,10 +32308,12 @@ impl Host {
                     let Ok(name) = std::str::from_utf8(&bytes) else {
                         return Ok(vec![EINVAL]);
                     };
-                    Ok(vec![match g.exports.iter().find(|e| e.name == name) {
-                        Some(e) => e.func as i64,
-                        None => EINVAL,
-                    }])
+                    Ok(vec![
+                        match g.module.exports.iter().find(|e| e.name == name) {
+                            Some(e) => e.func as i64,
+                            None => EINVAL,
+                        },
+                    ])
                 }
                 _ => Err(Trap::CapFault),
             },
@@ -36473,6 +36360,31 @@ mod spawn_module_tests {
         })
     }
 
+    /// #1883 — a grant holds its module once. It shares the granted `Arc<Module>` and makes no copy
+    /// of the code; the tree-walker's own tables are made when first asked for, and every copy of the
+    /// grant shares them.
+    #[test]
+    fn a_grant_holds_its_module_once() {
+        let m = Arc::new(
+            temen_text::parse_module(
+                "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+            )
+            .expect("parse"),
+        );
+        let prepared = PreparedModule::new(Arc::clone(&m));
+        let mut host = Host::new();
+        let h = host.grant_prepared(&prepared);
+        let g = host.resolve_module(h).expect("the grant");
+        assert!(Arc::ptr_eq(&g.module, &m), "the grant shares the module");
+        assert!(g.tables.get().is_none(), "granting copies no code");
+        let (funcs, _) = g.tables();
+        assert_eq!(&*funcs, &m.funcs[..]);
+        assert!(
+            Arc::ptr_eq(&funcs, &prepared.0.tables().0),
+            "every copy of the grant shares the one table"
+        );
+    }
+
     /// #2143 — from an installed unit's frame, `-1` names the unit's program as a module: its
     /// functions over the table's memory, with no data, no shadow arena and no durable attestation, so
     /// a durable domain refuses the spawn. Without a unit it is still the running module, and a unit
@@ -36499,15 +36411,15 @@ mod spawn_module_tests {
         let g = host
             .resolve_spawn_module(SELF_MODULE, Some((c.domain, c.unit)))
             .expect("the unit's module");
-        assert_eq!(&*g.funcs, &unit.funcs[..]);
-        assert_eq!(g.memory_log2, Some(16));
-        assert!(g.data.is_empty() && g.shadow.is_none() && !g.durable);
+        assert_eq!(g.module.funcs, unit.funcs);
+        assert_eq!(g.memory_log2(), Some(16));
+        assert!(g.module.data.is_empty() && g.shadow().is_none() && !g.durable);
 
         let own = host
             .resolve_spawn_module(SELF_MODULE, None)
             .expect("the running module");
         assert_eq!(
-            own.data.len(),
+            own.module.data.len(),
             1,
             "without a unit, `-1` is the running module"
         );
