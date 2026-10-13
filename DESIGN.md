@@ -1082,7 +1082,11 @@ the Phase-1 core loop.
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
 - Each domain gets a large **reserved virtual-address window** (e.g. 2^40,
-  host-configurable). Guest pointers are **offsets into the window**.
+  host-configurable). Guest pointers are **offsets into the window**. A window
+  spends the process's address space, about 127 of them on a 47-bit host, so one
+  the address space has no room for is **refused, never a host panic** (#2305): a
+  run ends with `ThreadFault` before it starts, a detached spawn answers
+  `-EINVAL`, a fork `-EAGAIN`.
 - Real **demand-paged virtual memory via the host's MMU**: `map` / `unmap` /
   `protect`, file-backed mappings, guard pages, and COW are **host
   capabilities**, implemented with `mmap` / `mprotect` / `userfaultfd`.

@@ -4603,7 +4603,17 @@ impl CompiledModule {
             (twin.window, t.win_size, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
-            let mut window = mem::GuestWindow::new(t.win_mapped, t.win_reserved);
+            // #2305 — a run the address space has no window for ends as one the process cannot hold
+            // (#2268): `ThreadFault` before its first instruction, never a host panic. Nothing ran, so
+            // a snapshot is the window it was handed, unchanged (a session keeps its state).
+            let Some(mut window) = mem::GuestWindow::try_new(t.win_mapped, t.win_reserved) else {
+                t.last_trap_backtrace = Vec::new();
+                t.last_trap_fiber = None;
+                let image = snapshot_cap
+                    .and(init_mem)
+                    .map_or_else(Vec::new, <[u8]>::to_vec);
+                return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), image));
+            };
             let win_size = t.win_size;
             // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
             if let Some(init) = init_mem {
@@ -5887,8 +5897,14 @@ pub(crate) unsafe fn compile_child_and_run(
     let fn_table_ptr = child.fn_table.as_ptr();
 
     // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
-    // child starts from the bytes the parent placed there (the §14 data plane is shared memory).
-    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    // child starts from the bytes the parent placed there (the §14 data plane is shared memory). #2305
+    // — one the address space has no room for ends the child as a run it cannot hold: `ThreadFault`
+    // before it starts, its carve untouched.
+    let Some(mut child_window) =
+        mem::GuestWindow::try_new(child_size as usize, child_size as usize)
+    else {
+        return Ok((0, TrapKind::ThreadFault as i64, false));
+    };
     let child_base = child_window.base();
     {
         // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory

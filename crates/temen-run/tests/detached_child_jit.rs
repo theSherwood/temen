@@ -9,30 +9,17 @@
 //! `AddressSpace`), stores/loads on the grown page and returns `word + attest`. Same result as the
 //! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
 
+#[path = "support/detached.rs"]
+mod detached;
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
 use core::ffi::c_void;
 use core::ptr::null_mut;
+use detached::{grant_hooks, host, jit_on_reserved, module, parent_room_after_refusal};
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
-use temen_jit::{
-    compile_and_run_capture_reserved_with_host_ex, GrantChild, GrantChildHooks, JitOutcome,
-    TrapKind,
-};
-
-/// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
-/// the parent pointer it decodes are chosen together (this used to hand-roll both, and nothing
-/// checked that the pointer matched the ctx the run baked).
-fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
-    temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
-}
-
-fn module(text: &str) -> temen_ir::Module {
-    let m = temen_text::parse_module(text).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    m
-}
+use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome, TrapKind};
 
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
 const ARGV_WORD: i64 = i64::from_le_bytes(*b"hello-de");
@@ -105,14 +92,6 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
     )
 }
 
-fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
-    let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 17);
-    let modh = host.grant_module(child);
-    let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
-    (host, [inst, modh, budget])
-}
-
 fn run_jit(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i64 {
     match jit_outcome(parent, host(child, quota)) {
         JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
@@ -127,20 +106,7 @@ fn jit_outcome(parent: &temen_ir::Module, (mut host, h): (Host, [i32; 3])) -> Ji
 
 /// [`jit_outcome`] over a host the caller keeps.
 fn jit_on(parent: &temen_ir::Module, host: &mut Host, h: [i32; 3]) -> JitOutcome {
-    let args = [h[0] as i64, h[1] as i64, h[2] as i64];
-    let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
-        parent,
-        0,
-        &args,
-        &[],
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        temen_run::cap_thunk,
-        host as *mut Host as *mut c_void,
-        Some(temen_run::module_resolver),
-        Some(grant_hooks(host as *mut Host)),
-    )
-    .expect("jit run");
-    jo
+    jit_on_reserved(parent, host, h, temen_ir::DEFAULT_RESERVED_LOG2)
 }
 
 fn run_interp(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i64 {
@@ -483,38 +449,6 @@ block 0 (v0: i64) {
   }
 }
 "#;
-
-/// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
-/// 2^16, grants `(gp, gn)`), and if the spawn is refused return the room left in `v2`, else `-1`.
-fn parent_room_after_refusal(gp: u64, gn: u64) -> String {
-    format!(
-        r#"memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32) {{
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  vgp = i64.const {gp}
-  vgn = i64.const {gn}
-  vlog = i64.const 16
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
-  vz32 = i32.const 0
-  vneg = i32.lt_s vh vz32
-  br_if vneg 1(v2) 2()
-}}
-block 1 (vb: i32) {{
-  vf = i64.const 1
-  vr = call.cap 14 1 (i64) -> (i64) vb (vf)
-  return vr
-}}
-block 2 () {{
-  vm = i64.const -1
-  return vm
-  }}
-}}
-"#
-    )
-}
 
 /// #1975 — a spawn refused after its admission charges nothing. The child's imports are bound after
 /// the budget's take, and an unbound one refuses the spawn `-EINVAL`: the refusal hands the take
