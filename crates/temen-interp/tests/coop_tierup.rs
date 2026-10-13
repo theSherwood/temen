@@ -26,7 +26,7 @@ mod coop;
 #[path = "support/rec.rs"]
 mod rec;
 
-use temen_interp::bytecode::TierUpConfig;
+use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_text::parse_module;
 
@@ -81,9 +81,12 @@ fn coop_tierup_run(
     eligible: std::sync::Arc<[bool]>,
 ) -> (Result<Vec<Value>, Trap>, u32) {
     let tierup = TierUpConfig {
-        eligible,
-        page_checked: false,
+        root: ProgramEmit {
+            eligible,
+            page_checked: false,
+        },
         leaf: None,
+        modules: None,
     };
     let mut run = coop::coop_run(m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
@@ -272,9 +275,12 @@ fn coop_tierup_bounce_matches_pure_interp() {
     };
 
     let tierup = TierUpConfig {
-        eligible,
-        page_checked: false,
+        root: ProgramEmit {
+            eligible,
+            page_checked: false,
+        },
         leaf: None,
+        modules: None,
     };
     let mut run = coop::coop_run(&m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
@@ -385,9 +391,12 @@ fn a_bounce_polls_a_fiber_the_pump_parked() {
     assert_eq!(want, Ok(vec![Value::I64(31)]), "oracle value");
 
     let tierup = TierUpConfig {
-        eligible,
-        page_checked: false,
+        root: ProgramEmit {
+            eligible,
+            page_checked: false,
+        },
         leaf: None,
+        modules: None,
     };
     let mut run = coop::coop_run(&m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
@@ -581,18 +590,21 @@ fn coop_tierup_live_futex_matches_pure_interp() {
 // address flatly. This test pins the inheritance: the child entry's and the child-env worker's calls
 // to the eligible leaf both surface, and the run still matches the pure-interp oracle.
 //
-// func 0 (root; args = its Instantiator and a `Budget`): spawns func 1 detached, by the v1 record
-// appended at 17408 (a window of its own, the module's declared memory), joins it, calls the eligible
-// leaf f3 itself, and sums. func 1 (child entry): calls the leaf directly (the spawn-arm inheritance:
-// the child runs the root's unit, #2078), thread.spawns f2 INSIDE the child env (the thread-arm
+// func 0 (root; args = its Instantiator, a `Budget` and the child's `Module`): spawns a child
+// detached, by the v1 record appended at 17408 (a window of its own, the module's declared memory),
+// joins it, calls the eligible leaf f3 itself, and sums. The child runs func 1 — in a copy of this
+// program (module `-1`, which #2219's slice 3 retires) or in a child image of it (#2248). func 1
+// (child entry): calls the leaf directly, thread.spawns f2 INSIDE the child env (the thread-arm
 // inheritance) and joins it. func 2 (child-env worker): calls the leaf. func 3: the pure all-i64 leaf
 // f(x) = x*3 + 7.
 const SRC_CHILD_ENV: &str = r#"
 memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
   vrb = i64.const 17436
   i32.store vrb v1
+  vrm = i64.const 17432
+  i32.store vrm v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
@@ -631,92 +643,232 @@ block 0 (vx: i64) {
 }
 "#;
 
-#[test]
-fn coop_tierup_child_env_tasks_tier_up() {
-    let src = format!(
-        "{SRC_CHILD_ENV}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(1))
-    );
-    let m = parse_module(&src).unwrap();
-    temen_verify::verify_module(&m).expect("verify");
-    // Drive with an Instantiator granted over the root window (the §14 spawn authority); the
-    // shared `coop_tierup_run` harness has no grant seam, so inline its loop here.
-    let run_with = |tierup: Option<TierUpConfig>| -> (Result<Vec<Value>, Trap>, u32) {
-        let mut host = Host::new();
-        host.set_self_module(&std::sync::Arc::new(m.clone()));
-        let inst = host.grant_instantiator(0, 128 << 10);
-        let budget = host.grant_budget(-1, 1 << 20, -1);
-        let args = [Value::I32(inst), Value::I32(budget)];
-        let mut run = coop::coop_run(&m, 0, &args, FUEL, host, tierup)
-            .expect("supported")
-            .expect("entry in range");
-        let mut tierups = 0u32;
-        loop {
-            match run.run() {
-                bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
-                bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
-                bytecode::CoopEvent::Idle
-                | bytecode::CoopEvent::Paused
-                | bytecode::CoopEvent::CapPark { .. } => {
-                    panic!("unexpected Idle (suspend_on_idle is never armed here)")
-                }
-                bytecode::CoopEvent::Resume { .. } => {
-                    panic!("unexpected Resume (no leaf image here)")
-                }
-                bytecode::CoopEvent::JitInvoke { .. } => {
-                    panic!("unexpected JitInvoke (no vm_jit guest here)")
-                }
-                bytecode::CoopEvent::TierUp { func, argv, .. } => {
-                    tierups += 1;
-                    assert!(
-                        tierups < 50,
-                        "runaway tier-ups (last func={func}, argv={argv:?})"
-                    );
-                    let targs: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
-                    let mut fuel = FUEL;
-                    match bytecode::compile_and_run(&m, func, &targs, &mut fuel).expect("supported")
-                    {
-                        Ok(vals) => {
-                            let slots: Vec<i64> = vals
-                                .iter()
-                                .map(|v| match v {
-                                    Value::I64(x) => *x,
-                                    Value::I32(x) => *x as i64,
-                                    _ => panic!("non-integer tier-up result"),
-                                })
-                                .collect();
-                            run.deliver_tierup(&slots);
-                        }
-                        Err(t) => run.deliver_tierup_trap(t),
-                    }
+/// The granted modules a run offered its host's emitter ([`modules_emitter`]): `(program, image)`.
+type Offered = std::sync::Arc<std::sync::Mutex<Vec<(u32, temen_ir::Module)>>>;
+
+/// A host's emitter for granted modules, as these tests fake one: it answers every module it is
+/// offered with `emit` (`None` declines), and records the offer. The digest it is handed must be
+/// the image's.
+fn modules_emitter(emit: Option<ProgramEmit>) -> (ModuleEmitter, Offered) {
+    let offered = Offered::default();
+    let record = std::sync::Arc::clone(&offered);
+    let emitter: ModuleEmitter = std::sync::Arc::new(move |o: &ModuleOffer| {
+        assert_eq!(
+            o.digest,
+            temen_interp::module_digest(o.image),
+            "the offer's digest"
+        );
+        record.lock().unwrap().push((o.module, o.image.clone()));
+        emit.clone()
+    });
+    (emitter, offered)
+}
+
+/// What a [`TierUp`](bytecode::CoopEvent::TierUp) event's emitted region computes: function `func`
+/// of the program it names, run standalone — `m`, the run's own (`0`), or an image the run offered.
+fn emulate_region(
+    m: &temen_ir::Module,
+    offered: &Offered,
+    module: u32,
+    func: u32,
+    argv: &[i64],
+) -> Result<Vec<i64>, Trap> {
+    let image = (module != 0).then(|| {
+        let offered = offered.lock().unwrap();
+        let (_, image) = offered
+            .iter()
+            .find(|(k, _)| *k == module)
+            .expect("a tier-up names the run's program or one it offered");
+        image.clone()
+    });
+    let args: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
+    let mut fuel = FUEL;
+    let vals = bytecode::compile_and_run(image.as_ref().unwrap_or(m), func, &args, &mut fuel)
+        .expect("supported")?;
+    Ok(vals
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => *x,
+            Value::I32(x) => *x as i64,
+            _ => panic!("non-integer tier-up result"),
+        })
+        .collect())
+}
+
+/// Run `m` cooperatively with `tierup` or without, its root handed an `Instantiator`, a `Budget`
+/// and `module`, granting `image` for it when there is one. Each tier-up runs its region
+/// ([`emulate_region`]). Returns the result and the program each tier-up named, in order.
+fn run_spawner(
+    m: &temen_ir::Module,
+    image: Option<&temen_ir::Module>,
+    tierup: Option<TierUpConfig>,
+    offered: &Offered,
+) -> (Result<Vec<Value>, Trap>, Vec<u32>) {
+    let mut host = Host::new();
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let module = image.map_or(-1, |image| host.grant_module(image));
+    let args = [inst, budget, module].map(Value::I32);
+    let mut run = coop::coop_run(m, 0, &args, FUEL, host, tierup)
+        .expect("supported")
+        .expect("entry in range");
+    let mut named = Vec::new();
+    loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => return (Ok(vals), named),
+            bytecode::CoopEvent::Trapped(t) => return (Err(t), named),
+            bytecode::CoopEvent::Idle
+            | bytecode::CoopEvent::Paused
+            | bytecode::CoopEvent::CapPark { .. } => {
+                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
+            bytecode::CoopEvent::Resume { .. } => {
+                panic!("unexpected Resume (no leaf image here)")
+            }
+            bytecode::CoopEvent::JitInvoke { .. } => {
+                panic!("unexpected JitInvoke (no vm_jit guest here)")
+            }
+            bytecode::CoopEvent::TierUp {
+                module, func, argv, ..
+            } => {
+                named.push(module);
+                assert!(named.len() < 50, "runaway tier-ups (last func={func})");
+                match emulate_region(m, offered, module, func, &argv) {
+                    Ok(slots) => run.deliver_tierup(&slots),
+                    Err(t) => run.deliver_tierup_trap(t),
                 }
             }
         }
-    };
+    }
+}
 
-    // Oracle: pure-interp cooperative run. Worker f(5)=22 + child entry f(7)=28 → child 50;
-    // root f(3)=16 → 66.
-    let (want, oracle_tierups) = run_with(None);
-    assert_eq!(want, Ok(vec![Value::I64(66)]), "oracle value");
-    assert_eq!(oracle_tierups, 0, "the oracle never tiers up");
-
-    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
-    let (got, tierups) = run_with(Some(TierUpConfig {
-        eligible,
+/// The child's tasks tier up with the root: in a copy of the root's program, through the root's
+/// emit (#816), and in a granted image of it, through the image's own (#2248) — or, where the host
+/// declines the image, they interpret. Differential against the same run with no tier-up.
+#[test]
+fn coop_tierup_child_env_tasks_tier_up() {
+    let leaf = || ProgramEmit {
+        eligible: std::sync::Arc::from(vec![false, false, false, true]),
         page_checked: false,
-        leaf: None,
+    };
+    // `(child, the image's emit, the programs the tier-ups name)`. The child's two calls surface
+    // first: the root is parked on the join.
+    for (child, emit, want_named) in [
+        ("copy", None, vec![0, 0, 0]),
+        ("image", Some(leaf()), vec![1, 1, 0]),
+        ("declined image", None, vec![0]),
+    ] {
+        let image_child = child != "copy";
+        let entry = if image_child { 0 } else { 1 };
+        let src = format!(
+            "{SRC_CHILD_ENV}{}",
+            rec::segment(17408, &temen_ir::SpawnRec::v1(entry))
+        );
+        let m = parse_module(&src).unwrap();
+        temen_verify::verify_module(&m).expect("verify");
+        let image = image_child.then(|| temen_ir::child_image_at(&m, 1).expect("child image"));
+
+        // Oracle: pure-interp cooperative run. Worker f(5)=22 + child entry f(7)=28 → child 50;
+        // root f(3)=16 → 66.
+        let (want, oracle_named) = run_spawner(&m, image.as_ref(), None, &Offered::default());
+        assert_eq!(want, Ok(vec![Value::I64(66)]), "{child}: oracle value");
+        assert!(
+            oracle_named.is_empty(),
+            "{child}: the oracle never tiers up"
+        );
+
+        let (modules, offered) = modules_emitter(emit);
+        let tierup = TierUpConfig {
+            root: leaf(),
+            leaf: None,
+            modules: Some(modules),
+        };
+        let (got, named) = run_spawner(&m, image.as_ref(), Some(tierup), &offered);
+        assert_eq!(
+            got, want,
+            "{child}: cooperative tier-up run with a detached child diverged from the oracle"
+        );
+        // #816 env routing: all three eligible calls surface — the root's, the detached child
+        // entry's and the child-env worker's — on every target, since a child that tiers up gets
+        // a flat window (#2102).
+        assert_eq!(named, want_named, "{child}: the programs the tier-ups name");
+        let offers: Vec<u32> = offered.lock().unwrap().iter().map(|(k, _)| *k).collect();
+        let want_offers: &[u32] = if image_child { &[1] } else { &[] };
+        assert_eq!(
+            offers, want_offers,
+            "{child}: the modules offered to the host"
+        );
+    }
+}
+
+/// #2248 — a granted module is offered to the host once per run, and every child that runs it
+/// tiers up through the one emit. The root spawns two children of the image and joins each.
+#[test]
+fn coop_tierup_offers_a_granted_module_once() {
+    const SRC: &str = r#"
+memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrb = i64.const 17436
+  i32.store vrb v1
+  vrm = i64.const 17432
+  i32.store vrm v2
+  vrp = i64.const 17408
+  vh1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
+  vh2 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
+  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vr = i64.add vj1 vj2
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v7 = i64.const 7
+  vr = call 2 (v7)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+"#;
+    let src = format!("{SRC}{}", rec::segment(17408, &temen_ir::SpawnRec::v1(0)));
+    let m = parse_module(&src).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let image = temen_ir::child_image_at(&m, 1).expect("child image");
+    let (want, _) = run_spawner(&m, Some(&image), None, &Offered::default());
+    assert_eq!(
+        want,
+        Ok(vec![Value::I64(56)]),
+        "oracle: two children, f(7) = 28 each"
+    );
+
+    let (modules, offered) = modules_emitter(Some(ProgramEmit {
+        eligible: std::sync::Arc::from(vec![false, false, true]),
+        page_checked: false,
     }));
+    let tierup = TierUpConfig {
+        root: ProgramEmit::default(),
+        leaf: None,
+        modules: Some(modules),
+    };
+    let (got, named) = run_spawner(&m, Some(&image), Some(tierup), &offered);
+    assert_eq!(got, want, "the tier-up run diverged from the oracle");
     assert_eq!(
-        got, want,
-        "cooperative tier-up run with a detached child diverged from the pure-interp oracle"
+        named,
+        vec![1, 1],
+        "each child's leaf call tiers up, in the image"
     );
-    // #816 env routing: all three eligible calls surface — the root's, the detached child entry's
-    // (spawn-arm inheritance), and the child-env worker's (thread-arm inheritance) — on every
-    // target, since a tier-up run builds a detached child's window flat (#2102).
-    assert_eq!(
-        tierups, 3,
-        "root + child entry + child worker must all tier up (#816, #2102), got {tierups}"
-    );
+    let offers: Vec<u32> = offered.lock().unwrap().iter().map(|(k, _)| *k).collect();
+    assert_eq!(offers, vec![1], "the image is offered once");
 }
 
 /// #816 — the routed **flat window view**: while a confined child's tier-up is pending,
@@ -793,9 +945,12 @@ block 0 (vx: i64) {
         FUEL,
         host,
         Some(TierUpConfig {
-            eligible,
-            page_checked: false,
+            root: ProgramEmit {
+                eligible,
+                page_checked: false,
+            },
             leaf: None,
+            modules: None,
         }),
         &[],
         17,
@@ -859,9 +1014,10 @@ block 0 (vx: i64) {
 // `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
 // copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
 // reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
-// The manager takes a `Budget`, which a detached guest's record charges. `fork_twin_src` fills
-// in where the manager spawns the guest (`@GUEST@`) and the guest's scratch (`@S0@`, `@S8@`,
-// `@S16@`): its names and its stdout word, which it keeps in its own window.
+// The manager takes a `Budget`, which a detached guest's record charges, and the `Module` a granted
+// guest runs. `fork_twin_src` fills in where the manager spawns the guest (`@GUEST@`) and the
+// guest's scratch (`@S0@`, `@S8@`, `@S16@`): its names and its stdout word, which it keeps in its
+// own window.
 const SRC_FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -869,8 +1025,8 @@ type 1 interface { fork: 0, wait: 0 }
 export 0 interface "svc" 1 { fork: 2, wait: 3 }
 data 16684 "svc"
 data 16694 "o"
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, vout: i32, vbud: i32) {
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32) {
   vlog = i64.const 12
   vq = i64.const 0
   q1v0 = i64.const 4294967296
@@ -996,33 +1152,39 @@ block 0 (vx: i64) {
 "#;
 
 /// Where [`fork_twin_src`]'s guest runs: in a 4 KiB carve of the root window (a v0 record, which
-/// #1867 retires), or detached, in a window of its own (a v1 record, #2102).
-#[derive(Clone, Copy, Debug)]
+/// #1867 retires), or detached, in a window of its own (a v1 record, #2102) — running the manager's
+/// own program (module `-1`, which #2219's slice 3 retires), or a child image of it (#2248).
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Guest {
     Carve,
     Detached,
+    Image,
 }
 
 /// [`SRC_FORK_TWIN`] with its guest placed `guest`. Its scratch is at 0 in the carve, which is
 /// unguarded, and above the NULL guard a detached window has (#964).
 fn fork_twin_src(guest: Guest) -> String {
+    let detached = |module: &str, entry| {
+        let spawn = format!(
+            "  q2a0 = i64.const 17664\n  q2b = i64.const 17692\n  i32.store q2b vbud\n{module}"
+        );
+        let rec = rec::segment(
+            17664,
+            &temen_ir::SpawnRec {
+                grants_ptr: 16640,
+                grants_n: 2,
+                ..temen_ir::SpawnRec::v1(entry)
+            },
+        );
+        (spawn, 16896, rec)
+    };
     let (spawn, scratch, rec) = match guest {
-        Guest::Carve => (CARVE_GUEST, 0, String::new()),
-        Guest::Detached => (
-            "  q2a0 = i64.const 17664\n  q2b = i64.const 17692\n  i32.store q2b vbud\n",
-            16896,
-            rec::segment(
-                17664,
-                &temen_ir::SpawnRec {
-                    grants_ptr: 16640,
-                    grants_n: 2,
-                    ..temen_ir::SpawnRec::v1(4)
-                },
-            ),
-        ),
+        Guest::Carve => (CARVE_GUEST.to_string(), 0, String::new()),
+        Guest::Detached => detached("", 4),
+        Guest::Image => detached("  q2m = i64.const 17688\n  i32.store q2m vmod\n", 0),
     };
     SRC_FORK_TWIN
-        .replace("@GUEST@", spawn)
+        .replace("@GUEST@", &spawn)
         .replace("@S0@", &scratch.to_string())
         .replace("@S8@", &(scratch + 8).to_string())
         .replace("@S16@", &(scratch + 16).to_string())
@@ -1065,16 +1227,21 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     // Both leaf calls tier up: the original guest's and the fork twin's, whose private
     // `fork_private` window is its OWN flat allocation, outside the root backing. A carve guest's
     // window lies INSIDE the root backing, and both span the 4 KiB carve; a detached guest's
-    // 256 KiB window is its own, and so is its twin's.
+    // 256 KiB window is its own, and so is its twin's. An image guest's calls are its image's
+    // (program 1), and so are its twin's (#2248).
     for (guest, want_events) in [
-        (Guest::Carve, vec![(false, 4096), (true, 4096)]),
-        (Guest::Detached, vec![(false, 1 << 18), (false, 1 << 18)]),
+        (Guest::Carve, vec![(0, false, 4096), (0, true, 4096)]),
+        (
+            Guest::Detached,
+            vec![(0, false, 1 << 18), (0, false, 1 << 18)],
+        ),
+        (Guest::Image, vec![(1, false, 1 << 18), (1, false, 1 << 18)]),
     ] {
         let m = std::sync::Arc::new(parse_module(&fork_twin_src(guest)).unwrap());
         temen_verify::verify_module(&m).expect("verify");
         // Oracle: pure-interp cooperative run. The original resumes with 100 and the twin with
         // 200; both write leaf(reply) to the shared stdout: leaf(100) = 307, leaf(200) = 607.
-        let (want, want_out, oracle_events) = fork_twin_run(&m, None);
+        let (want, want_out, oracle_events) = fork_twin_run(&m, guest, None);
         assert_eq!(want, Ok(vec![Value::I64(100)]), "{guest:?}: oracle value");
         assert_eq!(
             want_out,
@@ -1083,14 +1250,19 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
         );
         assert!(oracle_events.is_empty(), "the oracle never tiers up");
 
-        let eligible: std::sync::Arc<[bool]> =
-            std::sync::Arc::from(vec![false, false, false, false, false, true]);
+        // The image keeps the program's functions where they are, so one emit fits both.
+        let leaf = ProgramEmit {
+            eligible: std::sync::Arc::from(vec![false, false, false, false, false, true]),
+            page_checked: false,
+        };
+        let (modules, _) = modules_emitter(Some(leaf.clone()));
         let (got, got_out, mut events) = fork_twin_run(
             &m,
+            guest,
             Some(TierUpConfig {
-                eligible,
-                page_checked: false,
+                root: leaf,
                 leaf: None,
+                modules: Some(modules),
             }),
         );
         assert_eq!(
@@ -1101,19 +1273,21 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
         events.sort_unstable();
         assert_eq!(
             events, want_events,
-            "{guest:?}: the original's event and the twin's, (in the root backing?, span)"
+            "{guest:?}: the original's event and the twin's, (program, in the root backing?, span)"
         );
     }
 }
 
-/// Run `m`, a [`fork_twin_src`] program, on the cooperative driver with `tierup` or without, over
-/// an owned flat 256 KiB root backing: its result, its sorted stdout words, and for each tier-up
-/// event, whether the pending window lies in the root backing, and its span.
+/// Run `m`, a [`fork_twin_src`] program with its guest placed `guest`, on the cooperative driver
+/// with `tierup` or without, over an owned flat 256 KiB root backing: its result, its sorted stdout
+/// words, and for each tier-up event, the program it names, whether the pending window lies in the
+/// root backing, and its span.
 #[allow(clippy::type_complexity)]
 fn fork_twin_run(
     m: &std::sync::Arc<temen_ir::Module>,
+    guest: Guest,
     tierup: Option<TierUpConfig>,
-) -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(bool, u64)>) {
+) -> (Result<Vec<Value>, Trap>, Vec<i64>, Vec<(u32, bool, u64)>) {
     const FORK_FUEL: u64 = 40_000_000;
     let mut host = Host::new();
     host.set_self_module(m);
@@ -1121,7 +1295,11 @@ fn fork_twin_run(
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(temen_interp::StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    let args = [Value::I32(inst), Value::I32(out_h), Value::I32(budget)];
+    let module = match guest {
+        Guest::Image => host.grant_module(&temen_ir::child_image_at(m, 4).expect("child image")),
+        Guest::Carve | Guest::Detached => -1,
+    };
+    let args = [inst, out_h, budget, module].map(Value::I32);
     let back = std::sync::Arc::new(
         temen_interp::Region::owned_zeroed(1 << 18, 4096).expect("256 KiB allocates"),
     );
@@ -1139,7 +1317,7 @@ fn fork_twin_run(
     )
     .expect("supported")
     .expect("entry in range");
-    let mut events: Vec<(bool, u64)> = Vec::new();
+    let mut events: Vec<(u32, bool, u64)> = Vec::new();
     let result = loop {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
@@ -1153,14 +1331,16 @@ fn fork_twin_run(
                 panic!("unexpected Resume (no leaf image here)")
             }
             bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
-            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+            bytecode::CoopEvent::TierUp {
+                module, func, argv, ..
+            } => {
                 assert_eq!(func, 5, "only the leaf is eligible");
                 assert!(events.len() < 10, "runaway tier-ups");
                 let (ptr, len) = run
                     .pending_win()
                     .expect("every tiering task's window must resolve a flat view");
                 let in_root = (ptr as usize) >= root_base && (ptr as usize) < root_base + (1 << 18);
-                events.push((in_root, len));
+                events.push((module, in_root, len));
                 let x = argv[0];
                 run.deliver_tierup(&[x * 3 + 7]);
             }
@@ -1231,9 +1411,12 @@ block 0 (vx: i64) {
                 FUEL,
                 Host::new(),
                 Some(TierUpConfig {
-                    eligible: std::sync::Arc::clone(&eligible),
-                    page_checked: false,
+                    root: ProgramEmit {
+                        eligible: std::sync::Arc::clone(&eligible),
+                        page_checked: false,
+                    },
                     leaf: None,
+                    modules: None,
                 }),
                 back,
                 17,

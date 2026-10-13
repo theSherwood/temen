@@ -4,10 +4,11 @@
 //!
 //! Pipeline: `nimony c` (→ nifler → nimony → hexer, then hexer's dead-code elimination) emits the
 //! program's modules as DCE'd Leng — the `.c.nif`s `nimony t` hands `temen-link` — then
-//! `temen_leng::link_nim_powerbox` bridges nimony's bottom edge to the §3e powerbox (compute leaves →
-//! shim, `sysWrite(fd,buf,len)` → the STREAM `write(buf,len)` cap), and the merged powerbox module is
-//! verified and re-serialized with `temen_encode::encode_module` — the browser-loadable form the
-//! playground's `temen_run_onramp` runs (host grants stdout, so the program prints for real).
+//! `temen_leng::link_nim` links them on the **capability edge** (`Edge::Caps`: compute leaves → shim,
+//! fd 0/1/2 → the host's `stream_read`/`stream_write`/`stderr` caps, the exit status → `exit`), and
+//! the merged powerbox module is verified and re-serialized with `temen_encode::encode_module` — the
+//! browser-loadable form the playground's `temen_run_onramp` runs (the host grants its streams, so
+//! the program prints for real).
 //!
 //! ```text
 //! NIMONY_BIN=<abs>/nimony/bin NIM_BIN=<dir of nim> \
@@ -23,7 +24,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // `[--posix] [--root <tree>] [--nimcache <dir>] <src> <out.temen>`.
+    // `[--posix] [--root <tree>] [--nimcache <dir>] <src> <out.temen>`. `--posix` links on the POSIX
+    // edge instead of the capability edge.
     //
     // The program is built for the Temen platform, `-d:temen`, as `nimony t` builds what it builds
     // (#763): a compiler built for Temen builds the programs it runs itself (compile-time
@@ -140,11 +142,11 @@ fn main() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    // Two runtimes over one compute half (see `temen_leng::nim_posix_runtime`): the default folds
-    // the syscalls onto the single STREAM `write` cap — right for a program that only prints — while
-    // `--posix` forwards them to a real `temen_posix` personality under its own op names (`__px_*`,
-    // #1668), so the result binds like any command — at root, or `execve`'d. A compiler phase needs the latter: it opens, reads and writes files, and (for
-    // nimsem) spawns `nifler` through an `exec` cap.
+    // One link, two bottom edges (`temen_leng::Edge`): the default is the capability edge, the host's
+    // streams and exit and nothing ambient, while `--posix` forwards the syscalls to a real
+    // `temen_posix` personality under its own op names (`__px_*`, #1668), so the result binds like any
+    // command — at root, or `execve`'d. A compiler phase needs the latter: it opens, reads and writes
+    // files, and (for nimsem) spawns `nifler` through an `exec` cap.
     // The **prebuilt guest libc** (`LIBC_SERVED`): `snprintf`/`strtod`/libm, which no hand-written
     // shim reasonably carries. Without it those stay unbound manifest imports and the program cannot
     // be instantiated — which is how a real phase first failed here, on 24 unbound trig leaves
@@ -158,14 +160,14 @@ fn main() {
             d.exists().then(|| d.to_path_buf())
         })
         .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("read libc {p:?}: {e}")));
-    let module = if posix {
-        let (px_names, px_sigs) = temen_posix::cap_vtable();
-        temen_leng::link_nim_posix(&units, (&px_names, &px_sigs), libc.as_deref(), false)
-            .unwrap_or_else(|e| panic!("nim→posix bridge: {e}"))
+    let (px_names, px_sigs) = temen_posix::cap_vtable();
+    let edge = if posix {
+        temen_leng::Edge::Posix((&px_names, &px_sigs))
     } else {
-        temen_leng::link_nim_powerbox(&units, libc.as_deref())
-            .unwrap_or_else(|e| panic!("nim→powerbox bridge: {e}"))
+        temen_leng::Edge::Caps
     };
+    let module = temen_leng::link_nim(&units, edge, libc.as_deref(), false)
+        .unwrap_or_else(|e| panic!("nim link: {e}"));
     // Verify before shipping (the escape-freedom floor, DESIGN §2a) and sanity-check the entry shape.
     temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify: {e:?}"));
     assert!(
@@ -180,9 +182,9 @@ fn main() {
         module.funcs.len(),
         module.imports.len(),
         if posix {
-            "posix-personality"
+            "POSIX-edge"
         } else {
-            "powerbox"
+            "capability-edge"
         },
     );
 }

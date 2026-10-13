@@ -31,10 +31,11 @@ use temen_browser::{
     STATUS_UNSUPPORTED,
 };
 use temen_browser::{
-    temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr, temen_coop_deliver_cap,
-    temen_coop_leaf_wasm_len, temen_coop_leaf_wasm_ptr, temen_coop_module, temen_coop_read,
-    temen_coop_read_ptr, temen_coop_run_for, COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS,
-    COOP_NO_REGIONS, COOP_RUN_CAP_PARK, COOP_RUN_PAUSED, COOP_RUN_RESUME,
+    stage_child_program, temen_alloc, temen_coop_cap_len, temen_coop_cap_ptr,
+    temen_coop_deliver_cap, temen_coop_module, temen_coop_program_wasm_len,
+    temen_coop_program_wasm_ptr, temen_coop_read, temen_coop_read_ptr, temen_coop_run_for,
+    COOP_LEAF_OFF, COOP_LEAF_ROOT, COOP_LEAF_SUSPENDS, COOP_NO_REGIONS, COOP_RUN_CAP_PARK,
+    COOP_RUN_PAUSED, COOP_RUN_RESUME,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -144,38 +145,38 @@ export 0 func "_start" 0
 }
 
 /// Service one cooperative TIERUP on wasmi (the browser JS host's `driveCoopTierupRun` role): mirror
-/// the live window into a fresh instance's memory, write the event's `"mapped"` sync (#717), call
-/// `f{func}(win, env, ...argv)`, copy the window back, and return the i64 results (or `None` on a wasm
-/// trap — delivered as a trap to the paused task). The pure leaf never bounces, so `env.call_interp`
-/// is a trap-stub here.
+/// the pending task's window into a fresh instance's memory, write the event's `"mapped"` sync
+/// (#717), call `f{func}(win, env, ...argv)` of the program the event names, copy the window back,
+/// and return the i64 results (or the `env.trap` code on a wasm trap — delivered as a trap to the
+/// paused task). An `env.call_interp` bounce runs as the JS driver runs it ([`bounce_mirrored`]).
 fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     // SAFETY: the paused task is parked inside the TIERUP event; the session stash (wasm, argv,
     // window) is stable until the deliver call, and this thread is the only accessor (FFI_LOCK).
-    let wasm = unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) };
+    // The pending event's program: one the run emitted on its own (a granted module a child runs,
+    // #2248), else the run's own region emit.
+    let module = temen_coop_module();
+    let wasm = unsafe {
+        match temen_coop_program_wasm_len(module) {
+            0 => std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()),
+            n => std::slice::from_raw_parts(temen_coop_program_wasm_ptr(module), n),
+        }
+    };
     let func = temen_coop_func();
     let argv = unsafe { std::slice::from_raw_parts(temen_coop_argv_ptr(), temen_coop_argv_len()) };
-    // #816 env-routed tier-up: the PENDING task's window — the browser JS driver's per-event `win`.
-    // A §14 child's event mirrors just its own window. Only `[0, mapped)` is mirrored: no emitted
-    // access reaches past it, and a detached child's span is its whole native reservation.
-    let mapped = temen_coop_mapped();
-    let win_len = temen_coop_tierup_win_len().min(mapped as usize);
-    let win_ptr = temen_coop_tierup_win_ptr() as *mut u8;
 
     let engine = Engine::default();
     let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
-    let mut store: Store<i32> = Store::new(&engine, 0);
-    let pages = ((WIN_BASE as usize + win_len) as u32).div_ceil(1 << 16) + 1;
-    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+    let mut store: Store<Mirror> = Store::new(&engine, Mirror::default());
+    let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
     memory
         .write(&mut store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
         .unwrap();
-    // SAFETY: see above — exclusive mirror of the parked window.
-    let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
-    memory.write(&mut store, WIN_BASE as usize, live).unwrap();
+    store.data_mut().mem = Some(memory);
 
-    let mut linker: Linker<i32> = Linker::new(&engine);
+    let mut linker: Linker<Mirror> = Linker::new(&engine);
     linker.define("env", "memory", memory).unwrap();
-    // A closed leaf never `call.dyn`s; an all-null table satisfies the B2 import (unused here).
+    // A shared-table (B2) emit imports the driver's table; its leaves never `call.dyn` here, so an
+    // all-null one satisfies the import. A granted module's emit has none (#2248).
     let table = wasmi::Table::new(
         &mut store,
         wasmi::TableType::new(wasmi::core::ValType::FuncRef, 1 << 10, Some(1 << 10)),
@@ -186,18 +187,12 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
         .define("env", "__indirect_function_table", table)
         .unwrap();
     linker
-        .func_wrap("env", "trap", |mut c: Caller<'_, i32>, code: i32| {
-            *c.data_mut() = code;
+        .func_wrap("env", "trap", |mut c: Caller<'_, Mirror>, code: i32| {
+            c.data_mut().trap = code;
         })
         .unwrap();
     linker
-        .func_wrap::<_, ()>(
-            "env",
-            "call_interp",
-            |_: Caller<'_, i32>, _f: i32, _a: i32| {
-                unreachable!("no cross-tier call expected from this pure leaf");
-            },
-        )
+        .func_wrap("env", "call_interp", bounce_mirrored)
         .unwrap();
     let instance = linker
         .instantiate(&mut store, &module)
@@ -205,34 +200,17 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
         .start(&mut store)
         .unwrap();
     // #717 driver contract: the event's committed-extent snapshot lands in the emitted `"mapped"`
-    // global before the call (the fuel global self-initializes to the standard budget).
-    instance
-        .get_global(&store, "mapped")
-        .expect("emitted module exports the live-mapped global")
-        .set(&mut store, Val::I64(mapped))
-        .unwrap();
-    // #1151 paged leaf: the leaf's emitted accesses consult the page-state table (base in the
-    // exported `"pagestate"` global). Place it just after the (serving-window) mirror and point the
-    // global at it — the #750 driver contract, here for a paged tier-up over the serving vCPU's own
-    // window (root OR a §14 child's). No-op for a non-paged run (the global is absent).
-    if temen_coop_paged() != 0 {
-        let plen = temen_coop_pagestate_len();
-        // SAFETY: the pending-event page-state table is stable until the deliver call.
-        let table =
-            unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }.to_vec();
-        let table_base = WIN_BASE as usize + win_len;
-        let need = (table_base + plen).div_ceil(1 << 16) as u32;
-        let have = memory.size(&store) as u32;
-        if need > have {
-            memory.grow(&mut store, (need - have) as u64).unwrap();
-        }
-        memory.write(&mut store, table_base, &table).unwrap();
+    // global before the call (the fuel global self-initializes to the standard budget). #1151 paged
+    // leaf: its accesses consult the page-state table (base in the exported `"pagestate"` global),
+    // placed just after the mirror — the #750 driver contract, over the pending task's own window
+    // (root OR a §14 child's).
+    store.data_mut().mapped = Some(
         instance
-            .get_global(&store, "pagestate")
-            .expect("paged emitted module exports the page-state base global")
-            .set(&mut store, Val::I32(table_base as i32))
-            .unwrap();
-    }
+            .get_global(&store, "mapped")
+            .expect("emitted module exports the live-mapped global"),
+    );
+    store.data_mut().pagestate = instance.get_global(&store, "pagestate");
+    mirror_in(&mut store, temen_coop_mapped());
     let entry = format!("f{func}");
     let f = instance
         .get_func(&store, &entry)
@@ -244,10 +222,7 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     let ran = f.call(&mut store, &params, &mut results);
 
     // Copy emitted writes back into the live window before the task resumes.
-    let mut buf = vec![0u8; win_len];
-    memory.read(&store, WIN_BASE as usize, &mut buf).unwrap();
-    // SAFETY: see above — exclusive mirror of the parked window.
-    unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&buf);
+    mirror_out(&store);
 
     match ran {
         Ok(()) => Ok(results
@@ -259,7 +234,83 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
             })
             .collect()),
         // #1822: the code the emitted frames passed to `env.trap` (0 for a native wasm trap).
-        Err(_) => Err(*store.data()),
+        Err(_) => Err(store.data().trap),
+    }
+}
+
+/// [`service_coop_on_wasmi`]'s store: the code the emitted frames last passed to `env.trap`, the
+/// memory the pending window is mirrored into at [`WIN_BASE`], how much of the window it holds,
+/// and the emitted module's `"mapped"` and `"pagestate"` globals.
+#[derive(Default)]
+struct Mirror {
+    trap: i32,
+    mem: Option<Memory>,
+    len: usize,
+    mapped: Option<wasmi::Global>,
+    pagestate: Option<wasmi::Global>,
+}
+
+/// Mirror the pending window's first `mapped` bytes in at [`WIN_BASE`] — no emitted access reaches
+/// past them, and a detached child's span is its whole native reservation — and sync `"mapped"` to
+/// them, and on a paged event the page-state table just after them to `"pagestate"`.
+fn mirror_in(mut store: impl AsContextMut<Data = Mirror>, mapped: i64) {
+    let mem = store.as_context().data().mem.expect("memory set");
+    let len = temen_coop_tierup_win_len().min(mapped as usize);
+    // SAFETY: the paused task is parked inside the event; its window is exclusively ours.
+    let live = unsafe { std::slice::from_raw_parts(temen_coop_tierup_win_ptr(), len) };
+    let paged = temen_coop_paged() != 0;
+    let plen = if paged { temen_coop_pagestate_len() } else { 0 };
+    ensure_mirror(&mut store, mem, WIN_BASE as usize + len + plen);
+    mem.write(&mut store, WIN_BASE as usize, live).unwrap();
+    store.as_context_mut().data_mut().len = len;
+    let global = store.as_context().data().mapped.expect("mapped set");
+    global.set(&mut store, Val::I64(mapped)).unwrap();
+    if paged {
+        // SAFETY: the pending event's page-state table is stable until the deliver call.
+        let table = unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) };
+        let base = WIN_BASE as usize + len;
+        mem.write(&mut store, base, table).unwrap();
+        let global = store.as_context().data().pagestate;
+        let global = global.expect("paged emitted module exports the page-state base global");
+        global.set(&mut store, Val::I32(base as i32)).unwrap();
+    }
+}
+
+/// Copy the mirror back into the pending window.
+fn mirror_out(store: impl wasmi::AsContext<Data = Mirror>) {
+    let (mem, len) = (store.as_context().data().mem.unwrap(), store.as_context().data().len);
+    let mut buf = vec![0u8; len];
+    mem.read(&store, WIN_BASE as usize, &mut buf).unwrap();
+    // SAFETY: as in `mirror_in`.
+    unsafe { std::slice::from_raw_parts_mut(temen_coop_tierup_win_ptr() as *mut u8, len) }
+        .copy_from_slice(&buf);
+}
+
+/// `env.call_interp` for [`service_coop_on_wasmi`], as the JS driver serves it: the emitted frames'
+/// writes go back to the pending window, the callee runs on the paused task
+/// (`temen_coop_call_interp`), and the window, `"mapped"` and the page-state table come back in,
+/// since the callee may have mapped or unmapped pages.
+fn bounce_mirrored(
+    mut c: Caller<'_, Mirror>,
+    target: i32,
+    args_ptr: i32,
+) -> Result<(), wasmi::Error> {
+    let mem = c.data().mem.unwrap();
+    mirror_out(&c);
+    let mut slots = [0u8; 512];
+    mem.read(&c, args_ptr as usize, &mut slots).unwrap();
+    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr(), 0);
+    let mapped = match temen_coop_paged() != 0 {
+        true => temen_coop_mapped(),
+        false => temen_coop_mapped_now(),
+    };
+    mirror_in(&mut c, mapped);
+    mem.write(&mut c, args_ptr as usize, &slots).unwrap();
+    match rc {
+        0 => Ok(()),
+        _ => Err(wasmi::Error::from(
+            wasmi::core::TrapCode::UnreachableCodeReached,
+        )),
     }
 }
 
@@ -1059,9 +1110,9 @@ impl CoopB2Driver {
         // an interpreted run (`COOP_NO_REGIONS`, root not a leaf) has nothing emitted at all.
         // SAFETY: the session's emitted bytes, live until it closes.
         let main_wasm = unsafe {
-            match (temen_coop_wasm_len(), temen_coop_leaf_wasm_len(0)) {
+            match (temen_coop_wasm_len(), temen_coop_program_wasm_len(0)) {
                 (0, 0) => Vec::new(),
-                (0, n) => std::slice::from_raw_parts(temen_coop_leaf_wasm_ptr(0), n).to_vec(),
+                (0, n) => std::slice::from_raw_parts(temen_coop_program_wasm_ptr(0), n).to_vec(),
                 (n, _) => std::slice::from_raw_parts(temen_coop_wasm_ptr(), n).to_vec(),
             }
         };
@@ -3455,31 +3506,66 @@ impl Drop for InstantiatorGuard {
 /// The by-name `"budget"` (`grant_detached_spawn_caps`), packed into one word for `self.resolve`.
 const BUDGET_NAME: i64 = i64::from_le_bytes(*b"budget\0\0");
 
-/// The stores that resolve `"budget"` and build a v1 record at 34816 spawning f1 of the guest's own
-/// module (`-1`) detached — its declared window, no pager or pre-mapped region — paid from that
-/// budget. Leaves the record's address in `vrec`.
-fn v1_record_f1() -> String {
+/// The by-name `"child"` (`grant_child_image`, from the guest's `_child` export), packed into one
+/// word for `self.resolve`.
+const CHILD_NAME: i64 = i64::from_le_bytes(*b"child\0\0\0");
+
+/// What a guest's child runs f1 in: a copy of the guest's own program (module `-1`, which #2219's
+/// slice 3 retires), or the program's child image (#2219), which the host emits on its own (#2248).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Child {
+    Copy,
+    Image,
+}
+
+impl Child {
+    /// The program the child's tier-ups name: the guest's own, or the image, the first module the
+    /// run compiles after it.
+    fn program(self) -> u32 {
+        match self {
+            Child::Copy => 0,
+            Child::Image => 1,
+        }
+    }
+}
+
+/// The stores that resolve `"budget"` and build a v1 record at 34816 spawning `child`'s f1 detached
+/// — its declared window, no pager or pre-mapped region — paid from that budget. Leaves the
+/// record's address in `vrec`.
+fn v1_record_f1(child: Child) -> String {
+    // The record's first word: detached, and the entry. An image starts at its bootstrap,
+    // function 0, which calls f1.
+    let (module, entry) = match child {
+        Child::Copy => ("  vrm = i32.const -1\n".to_string(), 1u64 << 32),
+        Child::Image => (
+            format!(
+                "  vcw = i64.const {CHILD_NAME}\n  vca = i64.const 33824\n  i64.store vca vcw\n  \
+                 vcl = i64.const 5\n  vrm = self.resolve vca vcl\n"
+            ),
+            0,
+        ),
+    };
     format!(
         "  vbw = i64.const {BUDGET_NAME}
   vba = i64.const 33808
   i64.store vba vbw
   vbl = i64.const 6
   vb = self.resolve vba vbl
-  vrec = i64.const 34816
-  vrw0 = i64.const 4294967297
+{module}  vrec = i64.const 34816
+  vrw0 = i64.const {word}
   i64.store vrec vrw0
   vrw2 = i64.const -4294967296
   i64.store vrec vrw2 offset=16
-  vrm = i32.const -1
   i32.store vrec vrm offset=24
   i32.store vrec vb offset=28
   vrw9 = i64.const 4294967295
   i64.store vrec vrw9 offset=72
-"
+",
+        word = entry | 1
     )
 }
 
-fn coop_child_guest_text() -> String {
+fn coop_child_guest_text(child: Child) -> String {
     let out_h = onramp_out_handle();
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
@@ -3543,26 +3629,221 @@ block 0 (vx: i64) {{
   }}
 }}
 export 0 func "_start" 0
+export 1 func "_child" 1
 "#,
-        record = v1_record_f1()
+        record = v1_record_f1(child)
     )
 }
 
+/// The child tiers up over its own window: in a copy of the guest's program, its call to the leaf,
+/// through the guest's emit (#816); in the guest's child image, its bootstrap's call to f1, through
+/// the image's own emit (#2248), which runs f1's call to the leaf in emitted code too.
 #[test]
 fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     let _g = instantiator_guard();
-    let m = temen_text::parse_module(&coop_child_guest_text()).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let bytes = temen_encode::encode_module(&m);
+    for child in [Child::Copy, Child::Image] {
+        let m = temen_text::parse_module(&coop_child_guest_text(child)).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
 
-    // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
-    let want = onramp_exec_root(&m, b"");
-    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+        // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
+        let want = onramp_exec_root(&m, b"");
+        assert_eq!(want.status, STATUS_OK, "{child:?}: oracle sanity");
+        assert_eq!(
+            want.value, 80,
+            "{child:?}: oracle: 43 + 16 + 21 - 0 (each marker landed in its own window)"
+        );
+
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
+        assert_eq!(
+            opened,
+            0,
+            "{child:?}: open must accept the instantiating eligible-leaf guest (status {})",
+            temen_status()
+        );
+
+        // f1 and the leaf f2 both return one value.
+        let n_results = m.funcs[2].results.len();
+        // Per-event ((program, function), window base, mapped): the child's event serves its own
+        // window with its own committed extent; the root's serves the run window with the root's.
+        let mut events: Vec<((u32, i32), usize, i64)> = Vec::new();
+        loop {
+            match temen_coop_run() {
+                COOP_RUN_TIERUP => {
+                    assert!(events.len() < 50, "runaway tier-ups");
+                    events.push((
+                        (temen_coop_module(), temen_coop_func()),
+                        temen_coop_tierup_win_ptr() as usize,
+                        temen_coop_mapped(),
+                    ));
+                    match service_coop_on_wasmi(n_results) {
+                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                        Err(code) => temen_coop_deliver_trap(code),
+                    }
+                }
+                COOP_RUN_DONE => break,
+                ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+            }
+        }
+        // The child's event first (the root is parked on the join), then the root's own leaf
+        // call — each served over ITS task's window (#1117's env routing, here over real emitted
+        // wasm).
+        let [(child_call, child_win, child_mapped), (root_call, root_win, root_mapped)] =
+            events[..]
+        else {
+            panic!("{child:?}: expected the child's event then the root's, got {events:?}");
+        };
+        let child_func = match child {
+            Child::Copy => 2,
+            Child::Image => 1,
+        };
+        assert_eq!(
+            (child_call, root_call),
+            ((child.program(), child_func), (0, 2)),
+            "{child:?}: each event's (program, function): its task's program's"
+        );
+        assert_eq!(
+            root_win,
+            temen_coop_win_ptr() as usize,
+            "{child:?}: the root's event serves the run window"
+        );
+        assert_ne!(
+            child_win, root_win,
+            "{child:?}: the child's event serves its own window, not the run window"
+        );
+        assert_eq!(
+            (child_mapped, root_mapped),
+            (131072, 131072),
+            "{child:?}: each event's mapped is its own window's committed extent"
+        );
+
+        assert_eq!(
+            temen_status(),
+            want.status,
+            "{child:?}: status parity with the oracle"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            want.value,
+            "{child:?}: value parity with the oracle (both markers landed in the right windows)"
+        );
+        // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor
+        // (FFI_LOCK).
+        let got_out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(
+            got_out, want.stdout,
+            "{child:?}: stdout parity with the oracle"
+        );
+        temen_coop_close();
+    }
+}
+
+/// #2248 — a child that runs a module the run did not build tiers up through that module's own
+/// emit. The root spawns `"worker"`, a separate program staged as a card's `//// child:` program
+/// is, and joins it, then calls its own f1. The worker's f1 computes 5x + 1 where the root's
+/// computes 3x + 7, so a region served from the wrong program's emit answers the wrong value.
+#[test]
+fn coop_tierup_serves_a_granted_module_through_its_own_emit() {
+    let _g = instantiator_guard();
+    let out_h = onramp_out_handle();
+    let root = temen_text::parse_module(&format!(
+        r#"memory 17
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "worker"
+func () -> (i64) {{
+block 0 () {{
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vwp = i64.const 40984
+  vwl = i64.const 6
+  vw = self.resolve vwp vwl
+  vrec = i64.const 34816
+  vw0 = i64.const 1
+  i64.store vrec vw0
+  vw2 = i64.const -4294967296
+  i64.store vrec vw2 offset=16
+  i32.store vrec vw offset=24
+  i32.store vrec vb offset=28
+  vw9 = i64.const 4294967295
+  i64.store vrec vw9 offset=72
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  v3 = i64.const 3
+  vlocal = call 1 (v3)
+  vk = i64.const 1000
+  vjk = i64.mul vj vk
+  vsum = i64.add vjk vlocal
+  vsl = i64.const 35840
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vwr = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }}
+}}
+export 0 func "_start" 0
+"#
+    ))
+    .expect("parse");
+    let worker = temen_text::parse_module(
+        r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v5 = i64.const 5
+  vr = call 1 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v5 = i64.const 5
+  vm = i64.mul vx v5
+  v1 = i64.const 1
+  va = i64.add vm v1
+  return va
+  }
+}
+"#,
+    )
+    .expect("parse");
+    temen_verify::verify_module(&root).expect("verify");
+    temen_verify::verify_module(&worker).expect("verify");
+    let bytes = temen_encode::encode_module(&root);
+
+    // Each run takes the staged program, so stage it before each.
+    stage_child_program("worker", worker.clone());
+    let want = onramp_exec_root(&root, b"");
     assert_eq!(
-        want.value, 80,
-        "oracle: 43 + 16 + 21 - 0 (each marker landed in its own window)"
+        (want.status, want.value),
+        (STATUS_OK, 26 * 1000 + 16),
+        "oracle: the worker's f1(5) = 26, the root's f1(3) = 16"
     );
 
+    stage_child_program("worker", worker);
     let opened = temen_coop_open(
         bytes.as_ptr(),
         bytes.len(),
@@ -3573,26 +3854,14 @@ fn coop_tierup_serves_a_detached_child_over_its_own_window() {
         0,
         0,
     );
-    assert_eq!(
-        opened,
-        0,
-        "open must accept the instantiating eligible-leaf guest (status {})",
-        temen_status()
-    );
-
-    let n_results = m.funcs[2].results.len();
-    let mut tierups = 0u32;
-    // Per-event (window base, mapped): the child's event serves its own window with its own
-    // committed extent; the root's serves the run window with the root's.
-    let mut events: Vec<(usize, i64)> = Vec::new();
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let mut calls = Vec::new();
     loop {
         match temen_coop_run() {
             COOP_RUN_TIERUP => {
-                tierups += 1;
-                assert!(tierups < 50, "runaway tier-ups");
-                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
-                events.push((temen_coop_tierup_win_ptr() as usize, temen_coop_mapped()));
-                match service_coop_on_wasmi(n_results) {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                match service_coop_on_wasmi(1) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                     Err(code) => temen_coop_deliver_trap(code),
                 }
@@ -3601,35 +3870,16 @@ fn coop_tierup_serves_a_detached_child_over_its_own_window() {
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    // The child's event first (the root is parked on the join), then the root's own leaf call —
-    // each served over ITS task's window (#1117's env routing, here over real emitted wasm).
-    let [(child_win, child_mapped), (root_win, root_mapped)] = events[..] else {
-        panic!("expected the child's event then the root's, got {events:?}");
-    };
+    // The worker's call first (the root is parked on the join), then the root's.
     assert_eq!(
-        root_win,
-        temen_coop_win_ptr() as usize,
-        "the root's event serves the run window"
-    );
-    assert_ne!(
-        child_win, root_win,
-        "the child's event serves its own window, not the run window"
+        calls,
+        vec![(1, 1), (0, 1)],
+        "each f1 call tiers up in its own program, (program, function)"
     );
     assert_eq!(
-        (child_mapped, root_mapped),
-        (131072, 131072),
-        "each event's mapped is its own window's committed extent"
-    );
-    assert_eq!(
-        tierups, 2,
-        "expected 2 tier-ups (child + root), got {tierups}"
-    );
-
-    assert_eq!(temen_status(), want.status, "status parity with the oracle");
-    assert_eq!(
-        temen_coop_value(),
-        want.value,
-        "value parity with the oracle (both markers landed in the right windows)"
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the oracle: each region ran its own program's f1"
     );
     // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
     let got_out =
@@ -3849,14 +4099,14 @@ fn coop_tierup_serves_a_parents_children() {
 // ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
-/// a same-module child at f1 detached through a v1 record, join it, return the join value. f1 (child
+/// a child at f1 (`child`) detached through a v1 record, join it, return the join value. f1 (child
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
 /// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
 /// as the interpreter oracle does. This is the emitted-execution twin of `temen-wasm-jit`'s
 /// `nested_paged.rs` (which drives the same trap with a hand-rolled harness), carried here through the
 /// real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting + code-origin axes).
-fn coop_child_paged_guest_text() -> String {
+fn coop_child_paged_guest_text(child: Child) -> String {
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
     w0.copy_from_slice(&name[0..8]);
@@ -3899,87 +4149,100 @@ block 0 (vx: i64) {{
   }}
 }}
 export 0 func "_start" 0
+export 1 func "_child" 1
 "#,
-        record = v1_record_f1()
+        record = v1_record_f1(child)
     )
 }
 
 #[test]
 fn coop_tierup_child_paged_traps_over_its_own_window() {
     let _g = instantiator_guard();
-    let m = temen_text::parse_module(&coop_child_paged_guest_text()).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let bytes = temen_encode::encode_module(&m);
+    for child in [Child::Copy, Child::Image] {
+        let m = temen_text::parse_module(&coop_child_paged_guest_text(child)).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
 
-    // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of its
-    // window then loads it, so the run traps `MemoryFault`.
-    let want = onramp_exec_root(&m, b"");
-    assert_eq!(
-        want.status, STATUS_TRAP,
-        "oracle: the child's load of its own unmapped page traps"
-    );
+        // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of
+        // its window then loads it, so the run traps `MemoryFault`.
+        let want = onramp_exec_root(&m, b"");
+        assert_eq!(
+            want.status, STATUS_TRAP,
+            "{child:?}: oracle: the child's load of its own unmapped page traps"
+        );
 
-    let opened = temen_coop_open(
-        bytes.as_ptr(),
-        bytes.len(),
-        core::ptr::null(),
-        0,
-        0,
-        core::ptr::null(),
-        0,
-        0,
-    );
-    assert_eq!(
-        opened,
-        0,
-        "open must accept the page-op child guest paged (status {})",
-        temen_status()
-    );
+        let opened = temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            0,
+        );
+        assert_eq!(
+            opened,
+            0,
+            "{child:?}: open must accept the page-op child guest paged (status {})",
+            temen_status()
+        );
 
-    let n_results = m.funcs[2].results.len();
-    let mut tierups = 0u32;
-    loop {
-        match temen_coop_run() {
-            COOP_RUN_TIERUP => {
-                tierups += 1;
-                assert!(tierups < 50, "runaway tier-ups");
-                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
-                // The child's leaf runs paged over its window; loading the unmapped page must trap,
-                // so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
-                match service_coop_on_wasmi(n_results) {
-                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                    Err(code) => temen_coop_deliver_trap(code),
+        // f1 and the leaf f2 both return one value.
+        let n_results = m.funcs[2].results.len();
+        let mut calls = Vec::new();
+        loop {
+            match temen_coop_run() {
+                COOP_RUN_TIERUP => {
+                    assert!(calls.len() < 50, "runaway tier-ups");
+                    assert_ne!(temen_coop_paged(), 0, "{child:?}: the child's code is paged");
+                    calls.push((temen_coop_module(), temen_coop_func()));
+                    // The child's code runs paged over its window; loading the unmapped page must
+                    // trap, so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
+                    match service_coop_on_wasmi(n_results) {
+                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                        Err(code) => temen_coop_deliver_trap(code),
+                    }
                 }
+                COOP_RUN_DONE | COOP_RUN_TRAP => break,
+                ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
             }
-            COOP_RUN_DONE | COOP_RUN_TRAP => break,
-            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
-    }
 
-    assert!(
-        tierups >= 1,
-        "non-vacuity: the child's paged leaf must have tiered up (and trapped) in emitted wasm"
-    );
-    assert_eq!(
-        temen_status(),
-        want.status,
-        "trap parity with the interpreter oracle over the child's window"
-    );
-    assert_eq!(
-        temen_coop_value(),
-        want.value,
-        "value parity with the oracle on the trapping run"
-    );
-    // #1822: and it is the oracle's trap — the emitted leaf's `env.trap(MEMORY_FAULT)` code reaches
-    // the guest, where it used to be delivered as `Unreachable`.
-    // SAFETY: the end-of-run trap-name slot, read before anything else runs.
-    let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
-    assert_eq!(
-        std::str::from_utf8(trap).unwrap(),
-        want.trap.as_ref().map_or("", |t| t.name()),
-        "trap-kind parity with the oracle on the trapping run"
-    );
-    temen_coop_close();
+        // Non-vacuity: the child's paged code tiered up (and trapped) in emitted wasm, in its own
+        // program's emit. In a copy, f1 is the child's entry and runs interpreted, and its call to
+        // the leaf tiers up; in the image, the bootstrap's call to f1 does, and f1 bounces to the
+        // `unmap` and calls the leaf in emitted code.
+        let child_func = match child {
+            Child::Copy => 2,
+            Child::Image => 1,
+        };
+        assert_eq!(
+            calls,
+            vec![(child.program(), child_func)],
+            "{child:?}: the child tiers up once, (program, function)"
+        );
+        assert_eq!(
+            temen_status(),
+            want.status,
+            "{child:?}: trap parity with the interpreter oracle over the child's window"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            want.value,
+            "{child:?}: value parity with the oracle on the trapping run"
+        );
+        // #1822: and it is the oracle's trap — the emitted leaf's `env.trap(MEMORY_FAULT)` code
+        // reaches the guest, where it used to be delivered as `Unreachable`.
+        // SAFETY: the end-of-run trap-name slot, read before anything else runs.
+        let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+        assert_eq!(
+            std::str::from_utf8(trap).unwrap(),
+            want.trap.as_ref().map_or("", |t| t.name()),
+            "{child:?}: trap-kind parity with the oracle on the trapping run"
+        );
+        temen_coop_close();
+    }
 }
 
 // ============================================================================================
@@ -5344,12 +5607,12 @@ fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
     };
     assert_eq!(open(COOP_LEAF_SUSPENDS), 0);
     assert_eq!(
-        (temen_coop_wasm_len(), temen_coop_leaf_wasm_len(0) > 0),
+        (temen_coop_wasm_len(), temen_coop_program_wasm_len(0) > 0),
         (0, true)
     );
     assert_eq!(open(COOP_LEAF_ROOT), 0);
     assert_eq!(
-        (temen_coop_wasm_len() > 0, temen_coop_leaf_wasm_len(0)),
+        (temen_coop_wasm_len() > 0, temen_coop_program_wasm_len(0)),
         (true, 0)
     );
     temen_coop_close();

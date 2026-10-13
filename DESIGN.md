@@ -2444,6 +2444,19 @@ writes the answer into that continuation; the pump runs it and `Resume` hands th
 Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
 `CapFault`: no one could ever complete it there.
 
+**Children tier up in their own program (#2248).** A task tiers up the direct calls of the program
+it runs that the program's emit makes eligible: the run's own (`TierUpConfig::root`), or a granted
+module's. The first time a child of the run runs a granted module, the module is offered to the
+host's emitter (`TierUpConfig::modules`, a `ModuleOffer`), and its answer serves every child, thread
+and fork twin that runs the module for the rest of the run (`ProgramEmits`). The `CoopEvent::TierUp`
+names the program. The browser emits a granted module as it emits the run's own, bouncing over the
+live window (`compile_module_tierup_live`), with two differences. It emits against the module's
+declared window, because every window a child of the module runs in is at least that. And it
+dispatches through a table of the module's own functions, because the driver's shared table mirrors
+only the run's own dispatch table (#2273): a `call.dyn` site emits only when the whole module does.
+The parallel driver's tier (`ThreadTier`, #1414 B6-3a) emits the run's own program only, so there a
+child of a granted module interprets until its tier takes the module emitter too (#1414 ED-1).
+
 ---
 
 ## 15. Resource monitoring & metering  [SETTLED]

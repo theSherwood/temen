@@ -18,6 +18,9 @@
 // whole program is program 0's leaf — no region emit — and its bounce to the grow helper moves the
 // window under the leaf's own frames, which the driver's `"win"` fan-out must follow.
 //
+// #2248: then a child that runs its program's child image, a granted module, tiers up through the
+// image's own emit, a program of the run's besides its own, over its own window (#2102).
+//
 // Usage:  node browser-coop-grow-test.mjs [module.wasm]   (build the threads cdylib first)
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -191,7 +194,7 @@ if (opened !== 0) {
 } else {
   const leafOpen = {
     region: ex.temen_coop_wasm_len(),
-    leaf: ex.temen_coop_leaf_wasm_len(0),
+    leaf: ex.temen_coop_program_wasm_len(0),
     win: ex.temen_coop_win_len(),
   };
   let leafWin = 0;
@@ -217,7 +220,138 @@ if (opened !== 0) {
   }
 }
 
+// ---- 5. #2248: a granted child's program tiers up -------------------------------------------------
+// The root spawns its child image (granted as `"child"` from its `_child` export) detached, joins
+// it and writes its result. The image's bootstrap calls f1, which the image's emit tiers up whole:
+// f1 calls f2 natively, and f2 bounces to f3, which stays interpreted (it resolves a name), for the
+// address it then stores through and loads back — in the CHILD's window, the pending task's.
+const CHILD_SRC = String.raw`memory 16
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "child"
+data ro 40992 "stdout"
+func () -> (i64) {
+block 0 () {
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vcp = i64.const 40984
+  vcl = i64.const 5
+  vc = self.resolve vcp vcl
+  vrec = i64.const 34816
+  vw0 = i64.const 1
+  i64.store vrec vw0
+  vw2 = i64.const -4294967296
+  i64.store vrec vw2 offset=16
+  i32.store vrec vc offset=24
+  i32.store vrec vb offset=28
+  vw9 = i64.const 4294967295
+  i64.store vrec vw9 offset=72
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vsl = i64.const 35840
+  i64.store vsl vj
+  vop = i64.const 40992
+  vol = i64.const 6
+  vout = self.resolve vop vol
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vj
+  }
+}
+func (i64) -> (i64) {
+block 0 (vinst: i64) {
+  vseed = i64.const 11
+  vr = call 2 (vseed)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vacc: i64) {
+  vg = call 3 (vacc)
+  i64.store vg vacc
+  vld = i64.load vg
+  vsum = i64.add vacc vld
+  return vsum
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vnp = i64.const 40992
+  vnl = i64.const 6
+  vh = self.resolve vnp vnl
+  vaddr = i64.const 32768
+  return vaddr
+  }
+}
+export 0 func "_start" 0
+export 1 func "_child" 1
+`;
+const csrc = new TextEncoder().encode(CHILD_SRC);
+const cs = Number(ex.temen_alloc(csrc.length));
+u8().set(csrc, cs);
+const cparsed = ex.temen_parse(cs, csrc.length);
+ex.temen_dealloc(cs, csrc.length);
+const childGuest = u8().slice(Number(ex.temen_parse_ptr()), Number(ex.temen_parse_ptr()) + Number(ex.temen_parse_len()));
+if (cparsed !== 1) throw new Error(`child guest: ${dec.decode(childGuest)}`);
+const cp = Number(ex.temen_alloc(childGuest.length));
+u8().set(childGuest, cp);
+ex.temen_run_onramp(cp, childGuest.length, 0, 0);
+const childWant = { status: ex.temen_status(), out: readStdout() };
+if (childWant.status !== 0 || childWant.out.length !== 8) {
+  throw new Error(`child oracle sanity: status ${childWant.status}, ${childWant.out.length} bytes`);
+}
+// Its functions are tiny: let every emittable one tier up.
+ex.temen_coop_set_tierup_floor(0);
+const childOpened = ex.temen_coop_open(cp, childGuest.length, 0, 0, 1, 0, 0, 0);
+ex.temen_dealloc(cp, childGuest.length);
+// The program each tier-up names, each bounce's pending program, and each program whose own emit
+// the driver loaded.
+const childPrograms = [];
+const childBounces = [];
+const childLoaded = [];
+if (childOpened !== 0) {
+  fail(`the child guest's open refused (status ${ex.temen_status()})`);
+} else {
+  const exChild = { ...ex,
+    temen_coop_module: () => {
+      const m = ex.temen_coop_module();
+      childPrograms.push(m);
+      return m;
+    },
+    temen_coop_call_interp: (...a) => {
+      childBounces.push(ex.temen_coop_module());
+      return ex.temen_coop_call_interp(...a);
+    },
+    temen_coop_program_wasm_ptr: (m) => {
+      childLoaded.push(m);
+      return ex.temen_coop_program_wasm_ptr(m);
+    } };
+  const childStatus = await driveCoopTierupRun(exChild, memory, {});
+  const childGot = { status: ex.temen_status(), out: readStdout() };
+  if (!childPrograms.includes(1)) {
+    fail(`the child must tier up in its image, program 1: tier-ups named ${JSON.stringify(childPrograms)}`);
+  }
+  // An image keeps the program's functions where they are, so the run's own emit would compute the
+  // same: the driver must have run the image's own.
+  if (JSON.stringify(childLoaded) !== '[1]') {
+    fail(`the driver must load program 1's own emit once: loaded ${JSON.stringify(childLoaded)}`);
+  }
+  if (!childBounces.includes(1)) {
+    fail(`the child's emitted frames must bounce to f3: bounces from ${JSON.stringify(childBounces)}`);
+  }
+  if (childStatus !== 0 || childGot.status !== childWant.status) {
+    fail(`child: status ${childGot.status} (returned ${childStatus}), oracle ${childWant.status}`);
+  }
+  if (childGot.out !== childWant.out) fail('child: stdout differs from the oracle');
+}
+ex.temen_coop_set_tierup_floor(4096);
+
 if (process.exitCode) process.exit(process.exitCode);
 console.log(`ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `
   + `window ${winAtOpen} → ${winAtLastBounce} bytes, stdout matches the bytecode oracle; `
-  + 'as a root leaf, the same over a growing window');
+  + 'as a root leaf, the same over a growing window; a child image tiers up as program '
+  + `${JSON.stringify([...new Set(childPrograms)])}`);

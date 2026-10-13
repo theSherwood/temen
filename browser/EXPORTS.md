@@ -12,7 +12,7 @@
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
 | `child` | 1 | 1 | 0 |
-| `coop` | 59 | 49 | 0 |
+| `coop` | 60 | 50 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
@@ -29,7 +29,7 @@
 | `notes` | 2 | 2 | 0 |
 | `onramp` | 66 | 55 | 0 |
 | `op13jit` | 9 | 9 | 0 |
-| `par` | 75 | 75 | 2 |
+| `par` | 74 | 74 | 2 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -129,10 +129,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_jit_wasm_len`
 - `temen_coop_jit_wasm_ptr`
 - `temen_coop_leaf_emits`
-- `temen_coop_leaf_key`
-- `temen_coop_leaf_key_ptr`
-- `temen_coop_leaf_wasm_len`
-- `temen_coop_leaf_wasm_ptr`
 - `temen_coop_mapped`
 - `temen_coop_mapped_now`
 - `temen_coop_module`
@@ -141,6 +137,11 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_paged`
 - `temen_coop_pagestate_len` — *unreferenced*
 - `temen_coop_pagestate_ptr`
+- `temen_coop_program_key`
+- `temen_coop_program_key_ptr`
+- `temen_coop_program_leaf`
+- `temen_coop_program_wasm_len`
+- `temen_coop_program_wasm_ptr`
 - `temen_coop_read` — *unreferenced*
 - `temen_coop_read_ptr` — *unreferenced*
 - `temen_coop_run`
@@ -403,7 +404,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_powerbox_none`
 - `temen_par_powerbox_onramp`
 - `temen_par_root`
-- `temen_par_root_call_interp`
 - `temen_par_run`
 - `temen_par_set_workers`
 - `temen_par_shim_wasm_len`

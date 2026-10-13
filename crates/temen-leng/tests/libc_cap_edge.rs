@@ -1,8 +1,9 @@
-//! The committed guest libc's **capability edge** must be fully served by the nim link's stub unit.
+//! The committed guest libc's **capability edge** must be fully served by the nim link: by its stub
+//! unit, or by the program's own edge.
 //!
 //! `nim_e2e.rs`'s `run_libc_program` asserts the real property — linking the guest libc must not widen
-//! a nim program's capability manifest past the one `write` STREAM cap — but every test in that file
-//! needs the real nimony toolchain and skips without one. So the coupling between
+//! a nim program's capability manifest past its edge's — but every test in that file needs the real
+//! nimony toolchain and skips without one. So the coupling between
 //! `browser/web/assets/pg_libc.temeno`'s import table and `LIBC_CAP_STUB_NAMES` was checked only in the
 //! one CI job that has the toolchain, and a rename of the libc's stdin/stdout edge
 //! (`write`/`read` -> `stream_write`/`stream_read`, when `<unistd.h>` gained real fd-dispatching
@@ -12,10 +13,11 @@
 //! This needs no toolchain: it links the libc against its own stub unit and reads the merged import
 //! table directly.
 
-/// Every import the committed guest libc declares is resolved by the stub unit or aliased onto the
-/// powerbox `write` cap, so `write` is the only name left unbound. The libc grows no heap of its own
-/// (its `malloc` is the playground's heap unit, #2172, stubbed here), so it imports none of the core's
-/// memory ops: a nim program's `vm_map`/`vm_page_size` are its own.
+/// Every import the committed guest libc declares is resolved by the stub unit, or is one of its
+/// streams and its exit, which every edge serves: on the capability edge they are the host's
+/// capabilities, and the POSIX edge forwards them to the personality. The libc grows no heap of its
+/// own (its `malloc` is the playground's heap unit, #2172, stubbed here), so it imports none of the
+/// core's memory ops: a nim program's `vm_map`/`vm_page_size` are its own.
 #[test]
 fn libc_cap_edge_is_fully_served() {
     let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
@@ -30,8 +32,8 @@ fn libc_cap_edge_is_fully_served() {
     left.sort_unstable();
     assert_eq!(
         left,
-        vec!["write"],
-        "the guest libc has an import the stub unit does not serve — add it to \
+        vec!["exit", "stderr", "stream_read", "stream_write"],
+        "the guest libc has an import neither the stub unit nor the edges serve — add it to \
          LIBC_CAP_STUB_NAMES (with a body of the right shape in LIBC_CAP_STUBS), or it becomes a \
          capability every nim program declares"
     );

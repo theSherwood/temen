@@ -56,8 +56,9 @@ struct Session {
     /// binding source-line breakpoints. A terminator is a pc like any other (#1713), so a line whose
     /// only code is `return x;` or a loop condition's branch binds.
     line_index: BTreeMap<(u32, u32), IrPc>,
-    /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
-    breakpoints: Vec<IrPc>,
+    /// IR pcs currently set as breakpoints, each with the debug-info file it was set in, so
+    /// `setBreakpoints` can replace one source's set per the protocol and leave the others' armed.
+    breakpoints: Vec<(u32, IrPc)>,
     /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
     /// nonzero in the stopped frame for the breakpoint to actually stop (DEBUGGING.md W5). Absent ⇒
     /// unconditional. Evaluated by [`expr::eval_int`] over the frame's source variables.
@@ -543,12 +544,18 @@ impl DapServer {
         let files = session.debug.as_ref().map(|d| &d.files);
         let file_idx = files.and_then(|fs| match_file(fs, path));
 
-        // Per DAP, setBreakpoints *replaces* this source's breakpoints — clear the old set first.
-        // (Conditions are keyed by pc; clearing the whole map is fine since slice 1 is single-source.)
-        for pc in session.breakpoints.drain(..) {
+        // Per DAP, setBreakpoints *replaces this source's* breakpoints, and only this source's: a
+        // client sends one request per source, so clearing every source's left only the last one's
+        // armed while the earlier ones still read `verified` (#2295). A pc lies on one file's line,
+        // so the per-file sets are disjoint, and a path that names no file has none to clear.
+        session.breakpoints.retain(|&(file, pc)| {
+            if Some(file) != file_idx {
+                return true;
+            }
             session.inspector.clear_breakpoint(pc);
-        }
-        session.conditions.clear();
+            session.conditions.remove(&pc);
+            false
+        });
 
         let requested = args
             .and_then(|a| a.get("breakpoints"))
@@ -558,10 +565,12 @@ impl DapServer {
         let mut out = Vec::new();
         for bp in &requested {
             let line = bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32;
-            match file_idx.and_then(|fi| resolve_line(&session.line_index, fi, line)) {
-                Some((actual_line, pc)) => {
+            let bound = file_idx
+                .and_then(|fi| resolve_line(&session.line_index, fi, line).map(|at| (fi, at)));
+            match bound {
+                Some((fi, (actual_line, pc))) => {
                     session.inspector.set_breakpoint(pc);
-                    session.breakpoints.push(pc);
+                    session.breakpoints.push((fi, pc));
                     // A `condition` (an integer expression) only stops when it evaluates nonzero.
                     if let Some(cond) = bp.get("condition").and_then(|c| c.as_str()) {
                         if !cond.trim().is_empty() {

@@ -507,6 +507,27 @@ fn link_selected_with_extra(
     manifest: bool,
     synth_start: bool,
 ) -> Result<Module, LengError> {
+    link_lowered(
+        &lower_selected(units, synth_start)?,
+        &extra,
+        manifest,
+        synth_start,
+    )
+}
+
+/// **Lower** units for a link: translate each one's Leng to an object, against the pools the whole
+/// set shares (below), and pair each with its export tables as a [`temen_ir::LinkUnit`], after the
+/// powerbox `_start` ([`synth_start_unit`]) when `synth_start` is set. [`link_lowered`] links the
+/// result.
+///
+/// The lowering is all but the whole cost of a link, and nothing linked beside the units changes
+/// it. So a link that binds the same units twice lowers them once (#1790): the nim link's first pass,
+/// which only discovers the system calls the compute shim leaves ([`nim_compute_exports`]), and its
+/// real link share one lowering.
+fn lower_selected(
+    units: &[(&str, &str, Select)],
+    synth_start: bool,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
     // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
     // module), and a field can *be* an object another unit defines — and both are resolved at
@@ -701,7 +722,7 @@ fn link_selected_with_extra(
             )?))
         })
         .collect::<Result<_, LengError>>()?;
-    let mut link_units = Vec::with_capacity(objects.len() + extra.len() + 1);
+    let mut link_units = Vec::with_capacity(objects.len() + 1);
     // The powerbox `_start` links **first** so it is function 0 (the manifest entry shape), and so
     // the linker's single-pass funcref baking numbers the program's `data.funcref` initializers
     // above it — no fragile post-link index shift. See [`synth_start_unit`].
@@ -723,16 +744,35 @@ fn link_selected_with_extra(
             data_exports,
         });
     }
-    link_units.extend(extra);
+    Ok(link_units)
+}
+
+/// Link units [`lower_selected`] lowered, with `extra` after them: pre-built runtime units whose
+/// exports resolve the lowered units' unbound imports. Both are borrowed, so one lowering serves
+/// any number of links.
+///
+/// `synth_start` must be what the units were lowered with: a powerbox program, whose shadow arena
+/// and heap words are placed once the merged window is known.
+fn link_lowered(
+    lowered: &[temen_ir::LinkUnit],
+    extra: &[temen_ir::LinkUnit],
+    manifest: bool,
+    synth_start: bool,
+) -> Result<Module, LengError> {
+    let link_units: Vec<temen_ir::LinkUnitRef> = lowered
+        .iter()
+        .chain(extra)
+        .map(temen_ir::LinkUnitRef::from)
+        .collect();
     // `manifest`: retain any import **no unit exports** (the raw-syscall leaves — `write`/`read`/
     // `_exit`, spelled by their nim symbol) in the merged manifest instead of failing the link, so
     // the host binds them at instantiation (NIM.md W3: "raw syscalls → unresolved named imports the
     // POSIX personality resolves at load"). The fail-closed `link` is the default (a whole-program
     // link whose every leaf resolves to the pure-IR runtime shim).
     let linked = if manifest {
-        temen_ir::link_with_manifest(&link_units)
+        temen_ir::link_with_manifest_ref(&link_units)
     } else {
-        temen_ir::link(&link_units)
+        temen_ir::link_ref(&link_units)
     };
     let mut linked = linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))?;
     // A synth-`_start` module is a powerbox program: declare its durable shadow arena, then seed its
@@ -886,11 +926,17 @@ pub fn link_whole_powerbox_manifest(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
+    link_lowered(&lower_program(units)?, &runtime, true, true)
+}
+
+/// A nim program's whole units, lowered for its link ([`lower_selected`]) after a powerbox `_start`:
+/// what [`link_whole_powerbox_manifest`] links, and what both of the nim link's passes share.
+fn lower_program(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     let sel: Vec<(&str, &str, Select)> = units
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, true, true)
+    lower_selected(&sel, true)
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
@@ -1045,12 +1091,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("close", ANY, 21),
     ("getdents64", ANY, 22),
     ("wait4", ANY, 23),
-    // #1609 — `execve` is still a fail-closed stub for the **powerbox** runtime (a stdout-only
-    // guest has nothing to become), but `nim_posix_runtime` withholds it via
-    // [`POSIX_SERVED_LEAVES` ] so it survives as a retained import bound to `temen_posix`'s
-    // `OP_EXECVE`. nimony's `std/os` inlines the fork/execve/waitpid trio instead of routing
-    // through one interceptable `system()`, so this leaf is the whole bottom edge of a no-C nim
-    // program's "run that command" — stubbed, a self-hosting nimsem cannot spawn nifler at all.
+    // #1609 — `execve` is still a fail-closed stub on the **capability** edge (a guest with no
+    // process table has nothing to become), but the POSIX edge takes it ([`POSIX_SERVED_LEAVES`]),
+    // so it survives as a retained import bound to `temen_posix`'s `OP_EXECVE`. nimony's `std/os`
+    // inlines the fork/execve/waitpid trio instead of routing through one interceptable `system()`,
+    // so this leaf is the whole bottom edge of a no-C nim program's "run that command" — stubbed, a
+    // self-hosting nimsem cannot spawn nifler at all.
     ("execve", ANY, 24),
     ("clock_gettime", ANY, 25),
     // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
@@ -1362,7 +1408,7 @@ pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Le
 }
 
 /// **Every** `importc` leaf a set of nim units declares, as `(import symbol, C name)` — the one walk
-/// both the guest libc ([`libc_leaves_of`]) and the POSIX edge ([`nim_posix_runtime`]) read, so the
+/// both the guest libc ([`libc_leaves_of`]) and the POSIX edge ([`posix_runtime`]) read, so the
 /// two can never disagree about what a leaf is called.
 ///
 /// Each leaf is yielded under **both spellings the linker may see**: the bare leng symbol
@@ -1388,58 +1434,38 @@ fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Len
     Ok(out)
 }
 
-/// Stubs for the guest libc's **non-`write` host caps**. The prebuilt libc is one translation unit,
-/// so linking it for `snprintf`/`strtod` also pulls in its file layer (`fopen`, …) — dead for a nim
-/// program, which has its own I/O, but its capability imports would still have to be bound at
-/// instantiation or the run refuses to start. Resolving them here to fail-closed stubs keeps the nim
-/// program's manifest to what it uses itself (pg_libc's `write` has the same `(buf, len) -> n` shape,
-/// so it unifies with the syscall adapter's). A nim program never reaches these; if one ever did, it
-/// sees a clean failure (`-1` / EOF), never a silent wrong answer. Func order is fixed — see
-/// [`LIBC_CAP_STUB_NAMES`].
+/// Stubs for the guest libc's **file layer and heap**. The prebuilt libc is one translation unit, so
+/// linking it for `snprintf`/`strtod` also pulls in its file layer (`fopen`, …): dead for a nim
+/// program, which has its own I/O, but its imports would still have to be bound at instantiation or
+/// the run refuses to start. They resolve here to fail-closed stubs instead: `vm_fs` fails (`-1`), and
+/// the heap (`malloc`/`realloc`, for its streams and `strdup`) returns NULL. Nothing in
+/// [`LIBC_SERVED`] allocates, and the heap is the playground's heap unit (#2172), which a nim program
+/// does not link, since its own allocator owns the window's heap. A nim program never reaches these;
+/// if one ever did, it would see a clean failure, never a silent wrong answer. Func order is fixed:
+/// see [`LIBC_CAP_STUB_NAMES`].
 ///
-/// The libc's heap (`malloc`/`realloc`, for its streams and `strdup`) is stubbed the same way, to
-/// return NULL: nothing in [`LIBC_SERVED`] allocates, and the heap is the playground's heap unit
-/// (#2172), which a nim program does not link, since its own allocator owns the window's heap. The
-/// core's memory ops (`vm_map`, `vm_page_size`) are **never** stubbed: they are the program's own
-/// imports — its heap grows with them ([`HEAP_GROW`]) — and a stub exported under one of those names
-/// captured the heap hook's import at link: its `vm_map` answered success and committed nothing, so a
-/// program linked with the libc grew its heap onto pages that were never there (#763).
+/// The libc's **streams and exit** are not stubbed. `stream_write`, `stream_read`, `stderr` and
+/// `exit` are the program's own fd 1, fd 0, fd 2 and exit status, which every [`Edge`] serves. On the
+/// capability edge they are the four capabilities [`CAPS_EDGE`] imports, so the two units ask the host
+/// for one set; on the POSIX edge the generated edge forwards them to the personality
+/// ([`posix_edge_unit`]). A stub exported under one of those names would capture the edge's own import
+/// at link, as one did the heap hook's `vm_map` (#763): it answered success and committed nothing, so
+/// a program linked with the libc grew its heap onto pages that were never there. The core's memory
+/// ops (`vm_map`, `vm_page_size`) are never stubbed, for the same reason.
 const LIBC_CAP_STUBS: &str = "\
-import 0 \"write\" (i64, i64) -> (i64)
-
 func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) { v5 = i64.const -1 return v5 } }
-func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
-func (i32) -> () { block 0 (v0: i32) { return } }
-func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }
-func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
 func (i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64) { v3 = i64.const 0 return v3 } }";
 
-/// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
+/// The libc imports [`LIBC_CAP_STUBS`] serves, in its func order.
 ///
-/// **Keyed by the guest libc's actual import names, so it moves when that edge is renamed.** The libc
-/// used to reach stdin/stdout through the frontend's fd-less `write`/`read` builtins; once `<unistd.h>`
-/// gained real fd-dispatching definitions those became `__vm_stream_write`/`__vm_stream_read`, i.e.
-/// `stream_write`/`stream_read`. A name here that the libc no longer imports is not an error — the
-/// export simply goes unused, the libc's real import stays unbound, and it surfaces in the *program's*
-/// capability manifest. `libc_cap_edge_is_fully_served` pins that, because the nim end-to-end test
-/// that caught it needs the real nimony toolchain and skips without one.
-///
-/// `stream_write` is the one that is **aliased rather than stubbed**: it resolves to a body that
-/// tail-calls the powerbox `write` cap, the same import [`SYSCALL_ADAPTER`] carries, so the two
-/// coalesce into the single manifest import the program already had. Stubbing it would have kept the
-/// manifest just as narrow while silently swallowing anything the libc ever writes. `stderr` (the
-/// libc's fd 2, temen#1915) is aliased the same way: a nim program has one output stream, so the libc's
-/// diagnostics reach it as they did before fd 2 got its own capability.
-const LIBC_CAP_STUB_NAMES: &[&str] = &[
-    "vm_fs",
-    "stream_read",
-    "exit",
-    "stream_write",
-    "stderr",
-    "malloc",
-    "realloc",
-];
+/// **Keyed by the guest libc's actual import names, so it moves when the libc renames one.** A name
+/// here that the libc no longer imports is not an error: the export simply goes unused, the libc's
+/// real import stays unbound, and it surfaces in the *program's* capability manifest.
+/// `libc_cap_edge_is_fully_served` pins the libc's imports to these and the four the edges serve,
+/// because the nim end-to-end tests that would catch a drift need the real nimony toolchain and skip
+/// without one.
+const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "malloc", "realloc"];
 
 /// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
 /// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus
@@ -1477,22 +1503,99 @@ pub fn nim_libc_units(
     Ok(vec![libc_unit, stub_unit])
 }
 
-/// The **syscall adapter** unit. nimony spells its bottom-edge syscalls `sysWrite(fd, buf, len)` (etc.,
-/// the C `write` ABI), but the §3e powerbox's STREAM `write` cap is `(buf, len) -> n` — no `fd`. This
-/// unit reconciles the two: `nimWrite` (func 0) drops `fd` and tail-calls the powerbox `write` (its
-/// one import), so the cap sees the shape it expects; the file-op syscalls `read`/`close`/`open`/
-/// `lseek` (funcs 1–4) — imported by `syncio` but never reached by a stdout-only program — resolve to
-/// harmless stubs (EOF / success / -1). The powerbox binds the retained `write` STREAM cap at run, so
-/// the program writes to the real host stdout. Func order is fixed; [`link_nim_powerbox`] maps the
-/// retained `sysWrite`/`sysRead`/`sysClose`/`sysOpen`/`sysLseek` names onto it.
-const SYSCALL_ADAPTER: &str = "\
-import 0 \"write\" (i64, i64) -> (i64)
+/// The **capability edge** ([`Edge::Caps`]): nimony's system calls on the host's capabilities and
+/// nothing else. A capability host has streams, not a file-descriptor table, so this unit gives a nim
+/// program the three it starts with, and its exit:
+///
+/// - `sysWrite(fd, buf, len)` (func 0) writes fd 1 to `stream_write` and fd 2 to `stderr`. Any other
+///   fd is `-1`: nothing on this edge opens one.
+/// - `sysRead(fd, buf, len)` (func 1) reads fd 0 from `stream_read`, and any other fd is `-1`.
+/// - `sysClose` (func 2) succeeds, as the compute shim's `close` does. `sysOpen` and `sysLseek`
+///   (funcs 3 and 4) fail closed, so a program that opens a file gets nim's `IOError`.
+/// - `_exit(code)` (func 5) ends the program through `exit`: nim's `quit`, a panic's 127, and
+///   `std/posix`'s `exitnow`. On the compute shim's stub `_exit` returns, so `quit()` did not end the
+///   program.
+///
+/// `cWriteErr`, `panics.nim`'s `write(2, …)`, goes through func 0 too, so a panic's message reaches
+/// `stderr`; the compute shim's stub dropped it.
+///
+/// The imports are the host's capability names (`temen_ir::default_cap_resolver`). The streams are
+/// spelled `stream_write`/`stream_read`: the names a layer that defines its own fd-dispatching
+/// `write`/`read` reaches stdout and stdin by. The guest libc is such a layer, and its own capability
+/// imports are these four names at these shapes, so the two units ask the host for one set
+/// ([`LIBC_CAP_STUBS`]). Func order is fixed: [`CAPS_EDGE_LEAVES`] maps the leaves onto it.
+const CAPS_EDGE: &str = "\
+import 0 \"stream_write\" (i64, i64) -> (i64)
+import 1 \"stream_read\" (i64, i64) -> (i64)
+import 2 \"stderr\" (i64, i64) -> (i64)
+import 3 \"exit\" (i32) -> ()
 
-func (i32, i64, i64) -> (i64) { block 0 (v0: i32, v1: i64, v2: i64) { v3 = call.import 0 (v1, v2) return v3 } }
-func (i32, i64, i64) -> (i64) { block 0 (v0: i32, v1: i64, v2: i64) { v3 = i64.const 0 return v3 } }
+func (i32, i64, i64) -> (i64) {
+block 0 (v0: i32, v1: i64, v2: i64) {
+  v3 = i32.const 1
+  v4 = i32.eq v0 v3
+  br_if v4 1(v1, v2) 2(v0, v1, v2)
+  }
+block 1 (v0: i64, v1: i64) {
+  v2 = call.import 0 (v0, v1)
+  return v2
+  }
+block 2 (v0: i32, v1: i64, v2: i64) {
+  v3 = i32.const 2
+  v4 = i32.eq v0 v3
+  br_if v4 3(v1, v2) 4()
+  }
+block 3 (v0: i64, v1: i64) {
+  v2 = call.import 2 (v0, v1)
+  return v2
+  }
+block 4 () {
+  v0 = i64.const -1
+  return v0
+  }
+}
+
+func (i32, i64, i64) -> (i64) {
+block 0 (v0: i32, v1: i64, v2: i64) {
+  v3 = i32.eqz v0
+  br_if v3 1(v1, v2) 2()
+  }
+block 1 (v0: i64, v1: i64) {
+  v2 = call.import 1 (v0, v1)
+  return v2
+  }
+block 2 () {
+  v0 = i64.const -1
+  return v0
+  }
+}
+
 func (i32) -> (i32) { block 0 (v0: i32) { v1 = i32.const 0 return v1 } }
 func (i64, i32, i64) -> (i32) { block 0 (v0: i64, v1: i32, v2: i64) { v3 = i32.const -1 return v3 } }
-func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.const -1 return v3 } }";
+func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.const -1 return v3 } }
+func (i32) -> () { block 0 (v0: i32) { call.import 3 (v0) return } }";
+
+/// The leaves [`CAPS_EDGE`] serves, by nim name prefix, and the func serving each. The system calls
+/// (`sys…`) survive pass 1 as retained imports; `cWriteErr`, `cExitSys` and `exitnow` are compute-shim
+/// leaves, which [`nim_runtime`] withholds from the shim on this edge ([`Edge::takes`]).
+const CAPS_EDGE_LEAVES: &[(&str, u32)] = &[
+    ("sysWrite", 0),
+    ("cWriteErr", 0),
+    ("sysRead", 1),
+    ("sysClose", 2),
+    ("sysOpen", 3),
+    ("sysLseek", 4),
+    ("cExitSys", 5),
+    ("exitnow", 5),
+];
+
+/// The [`CAPS_EDGE`] func serving the leaf `name`, or `None` for a leaf the edge leaves alone.
+fn caps_edge_func(name: &str) -> Option<u32> {
+    CAPS_EDGE_LEAVES
+        .iter()
+        .find(|(p, _)| name.starts_with(p))
+        .map(|(_, f)| *f)
+}
 
 /// The **POSIX-personality open adapter**: the one place nimony's C bottom edge and `temen_posix`'s
 /// op ABI disagree.
@@ -1646,7 +1749,7 @@ block 2 (v0: i64, v1: i64) {
   }
 }";
 
-/// The private alias under which [`nim_posix_runtime`] re-exports the compute shim's **anonymous**
+/// The private alias under which [`posix_runtime`] re-exports the compute shim's **anonymous**
 /// `mmap` so [`POSIX_MMAP_ADAPTER`] can call it. The shim IR is unchanged — only the export list
 /// gains a second name for the same func, so there is still one allocator.
 const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
@@ -1762,34 +1865,70 @@ fn import_sig<'a>(m: &'a Module, imp: &temen_ir::Import) -> Option<(&'a [ValType
     }
 }
 
-/// Link whole nimony modules into a **powerbox-runnable module** — the shape `temen_run::run_powerbox`
-/// (and the browser's `temen_run_onramp`) executes with the host granting stdout, so a real Nim I/O
-/// program *prints for real* with no custom personality.
+/// The **bottom edge** of a nim program: what stands behind its system calls, below the compute shim
+/// every program links. It is a parameter of the one nim link ([`link_nim`]), not a second link
+/// (INVARIANTS #15). Both edges link the same compute shim, heap hook and guest libc, and differ only
+/// in the units behind the system calls and in the leaves they take from the shim ([`Edge::takes`]).
+#[derive(Clone, Copy)]
+pub enum Edge<'a> {
+    /// A **POSIX personality**'s ops, spelled and shaped as `temen_posix::cap_vtable()` publishes
+    /// them: files, processes, pipes and a working directory, for a POSIX-like host. nimony's own
+    /// build links here (`temen-link`).
+    Posix(PersonalityVtable<'a>),
+    /// The host's **capabilities** and nothing ambient, for a host with no POSIX ([`CAPS_EDGE`]):
+    /// fd 0, 1 and 2 are the `stream_read`, `stream_write` and `stderr` streams, and the exit status
+    /// goes to `exit`. Files, processes and the environment fail closed on the compute shim's stubs,
+    /// so nim raises `IOError` or `OSError`, and the clock reads the shim's zero epoch.
+    Caps,
+}
+
+impl Edge<'_> {
+    /// Whether the edge serves the compute-shim leaf `name` for real, so [`nim_runtime`] withholds it
+    /// from the shim, whose version of it is a stub.
+    fn takes(&self, name: &str) -> bool {
+        match self {
+            Edge::Posix(_) => POSIX_SERVED_LEAVES.iter().any(|p| name.starts_with(p)),
+            Edge::Caps => caps_edge_func(name).is_some(),
+        }
+    }
+}
+
+/// Link a nim program's units into one module on the bottom edge `edge`: the runtime
+/// [`nim_runtime`] builds for it, plus the prebuilt guest libc's units ([`nim_libc_units`]) when
+/// `libc` is given (`snprintf`, `strtod` and libm, which no hand-written shim carries; without them
+/// those stay unbound manifest imports). The units are lowered once, in [`link_order`]
+/// ([`lower_program`]): the runtime's discovery pass and the link itself both link that lowering,
+/// which is all but the whole cost of a link (#1790). The program ships through
+/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, each function cleaned up without
+/// folding floats, its blocks in reverse postorder). Every caller links through this, so a phase
+/// built on the host and a program built in-guest by the self-hosted lane are one link.
 ///
-/// [`link_whole_with_runtime`] binds *every* bottom-edge leaf to a pure-IR shim (a self-contained
-/// module for the offline runner). This instead splits the bottom edge the way the powerbox wants it:
-/// the **pure-compute leaves** (memcpy/atomics/bswap/bump-`mmap`/…) resolve to [`POWERBOX_COMPUTE_SHIM`],
-/// while the **syscalls** route through [`SYSCALL_ADAPTER`], which reconciles nimony's
-/// `sysWrite(fd,buf,len)` with the §3e powerbox STREAM `write(buf,len)` cap and leaves that cap a
-/// bound-at-run manifest import (`write`). The merged module is a powerbox entry (`_start` at func 0).
+/// The result is a powerbox entry (`_start` at func 0). Its manifest is the edge's (the personality's
+/// ops, or the host's capabilities), plus the core's memory ops its heap grows with. Re-verify it like
+/// any linked output.
 ///
-/// Two link passes: the first (compute shim only) surfaces the retained syscall imports — their nim
-/// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
-/// thing re-linked. The units link in [`link_order`], and the program ships through
-/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, each function cleaned up without folding
-/// floats, its blocks in reverse postorder). Re-verify
-/// the result like any linked output (the caller runs `run_powerbox`, which verifies).
-pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<Module, LengError> {
+/// `debug` links a **debug build**, which keeps the units' debug info. A **release build** drops it,
+/// so no engine pays for it (#2186): nim code carries none, but the prebuilt libc carries its own, for
+/// a debugger to step into, and the Cranelift JIT captures every explicit trap's backtrace in a module
+/// that has any.
+pub fn link_nim(
+    units: &[WholeModule],
+    edge: Edge,
+    libc: Option<&[u8]>,
+    debug: bool,
+) -> Result<Module, LengError> {
     let units = &link_order(units);
-    let mut runtime = nim_powerbox_runtime(units)?;
-    // The **prebuilt guest libc** ([`LIBC_SERVED`]), when the caller supplies it: `snprintf`/`strtod`/
-    // libm, which no hand-written shim could reasonably carry. Without it those leaves stay unbound
-    // manifest imports and a program that formats a float (or calls `sin`) cannot run.
+    // One lowering for both passes (#1790): the runtime's discovery link and this one.
+    let program = lower_program(units)?;
+    let mut runtime = runtime_for(units, &program, edge)?;
     if let Some(libc) = libc {
         runtime.extend(nim_libc_units(libc, units)?);
     }
-    // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
-    link_whole_powerbox_manifest(units, runtime).map(|m| temen_opt::optimize_linked(&m))
+    let mut m = link_lowered(&program, &runtime, true, true)?;
+    if !debug {
+        m.debug_info = None;
+    }
+    Ok(temen_opt::optimize_linked(&m))
 }
 
 /// The order a nim program's modules link in: the `system` module first, then the rest by stem. A
@@ -1817,68 +1956,118 @@ fn link_order<'a>(units: &[WholeModule<'a>]) -> Vec<WholeModule<'a>> {
     ordered
 }
 
-/// Build the **nim→powerbox runtime link units** ([compute shim, syscall adapter]) that
-/// [`link_nim_powerbox`] links a program against — split out so a caller (or the #1054
-/// order-independence test) can link whole units against the same runtime via
-/// [`link_whole_powerbox_manifest`] directly. The result is independent of the units' order (it
-/// depends only on which bottom-edge leaves and raw syscalls the program references), so one build
+/// The **runtime** a nim program links against on `edge`: the compute shim, the edge's units and the
+/// heap hook. [`link_nim`] links with it; a caller (or the #1054 order-independence test) can also link
+/// whole units against it with [`link_whole_powerbox_manifest`] directly. The result does not depend
+/// on the units' order, only on which leaves and system calls the program references, so one build
 /// serves every permutation.
-pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let (compute_exports, m1) = nim_compute_exports(units)?;
+///
+/// Two link passes over one lowering of the units ([`lower_program`], shared with [`link_nim`]'s own
+/// link, #1790). Pass 1 links them against the compute shim alone ([`nim_compute_exports`]), so the
+/// system calls survive as retained imports: their nim names (`sysWrite.0.` …) are not known until
+/// link. Then the edge takes what it serves:
+///
+/// - The leaves [`Edge::takes`] names leave the compute shim, whose versions of them are stubs:
+///   `quit` returns, a panic's message is dropped, and there is no file, process or working
+///   directory.
+/// - The retained system calls and the withheld leaves bind to the edge's units: [`CAPS_EDGE`] on
+///   [`Edge::Caps`]; on [`Edge::Posix`], [`POSIX_OPEN_ADAPTER`], [`POSIX_MMAP_ADAPTER`] and the
+///   generated POSIX edge ([`posix_edge_unit`]).
+pub fn nim_runtime(
+    units: &[WholeModule],
+    edge: Edge,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    runtime_for(units, &lower_program(units)?, edge)
+}
 
-    // Map each retained syscall onto the adapter's fixed func order.
-    let mut adapter_exports: Vec<(String, u32)> = Vec::new();
-    for imp in &m1.imports {
-        let n = &imp.name;
-        let f = if n.starts_with("sysWrite") {
-            0
-        } else if n.starts_with("sysRead") {
-            1
-        } else if n.starts_with("sysClose") {
-            2
-        } else if n.starts_with("sysOpen") {
-            3
-        } else if n.starts_with("sysLseek") {
-            4
-        } else {
-            continue; // anything else stays a manifest import the powerbox binds (write) or rejects
-        };
-        adapter_exports.push((n.clone(), f));
+/// [`nim_runtime`] over `program`, the units already lowered ([`lower_program`]), so the link that
+/// follows lowers nothing again.
+fn runtime_for(
+    units: &[WholeModule],
+    program: &[temen_ir::LinkUnit],
+    edge: Edge,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let (mut compute_exports, m1) = nim_compute_exports(units, program)?;
+    // The shapes the edge serves its withheld leaves at, captured before the shim loses them: a
+    // withheld leaf is no longer a shim export, and it is not a pass-1 import either (pass 1 bound
+    // it to the shim), so this is the only place its nim-side signature is still visible.
+    let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
+        .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+    let withheld: Vec<(String, temen_ir::FuncType)> = compute_exports
+        .iter()
+        .filter(|(n, _)| edge.takes(n))
+        .map(|(n, i)| {
+            let f = &shim.funcs[*i as usize];
+            (
+                n.clone(),
+                temen_ir::FuncType {
+                    params: f.params.clone(),
+                    results: f.results.clone(),
+                },
+            )
+        })
+        .collect();
+    compute_exports.retain(|(n, _)| !edge.takes(n));
+    match edge {
+        Edge::Posix(personality) => {
+            posix_runtime(units, compute_exports, &m1, withheld, personality)
+        }
+        Edge::Caps => caps_runtime(compute_exports, &m1, &withheld),
     }
-    let adapter = temen_ir::LinkUnit {
-        module: temen_text::parse_module(SYSCALL_ADAPTER)
-            .map_err(|e| LengError::Malformed(format!("syscall adapter parse: {e:?}")))?,
-        exports: adapter_exports,
+}
+
+/// [`nim_runtime`] on the capability edge: the compute shim, [`CAPS_EDGE`] serving each of
+/// [`CAPS_EDGE_LEAVES`] the program has, and the heap hook. The program's imports are then the host's
+/// alone: the edge's capabilities and the core's memory ops ([`HEAP_GROW`]).
+fn caps_runtime(
+    compute_exports: Vec<(String, u32)>,
+    m1: &Module,
+    withheld: &[(String, temen_ir::FuncType)],
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let mut exports: Vec<(String, u32)> = Vec::new();
+    // A leaf can arrive both ways: retained by pass 1, then widened into the shim's set, then withheld.
+    for n in m1
+        .imports
+        .iter()
+        .map(|i| &i.name)
+        .chain(withheld.iter().map(|(n, _)| n))
+    {
+        if let Some(f) = caps_edge_func(n) {
+            if exports.iter().all(|(e, _)| e != n) {
+                exports.push((n.clone(), f));
+            }
+        }
+    }
+    let edge = temen_ir::LinkUnit {
+        module: temen_text::parse_module(CAPS_EDGE)
+            .map_err(|e| LengError::Malformed(format!("capability edge parse: {e:?}")))?,
+        exports,
         ..Default::default()
     };
-
     Ok(vec![
         compute_shim_unit(compute_exports)?,
-        adapter,
+        edge,
         heap_grow_unit()?,
     ])
 }
 
-/// The **compute-shim link unit alone** — the half of [`nim_powerbox_runtime`] that carries no
-/// syscalls, exporting exactly the pure-compute leaves `units` reference.
-///
-/// Link against this (rather than the full runtime) when the true syscalls must stay **retained
-/// imports**, so a host personality can bind them by name — the POSIX route, where `sysWrite`/
-/// `sysOpen`/… go to `temen_posix`'s memfs ops instead of [`SYSCALL_ADAPTER`]'s stdout-only stubs.
-/// Same discovery, same table: one route through the compute bottom edge, two bindings above it.
+/// The **compute-shim link unit alone**, exporting exactly the pure-compute leaves `units` reference,
+/// on the shim's own fixed heap ([`SHIM_HEAP_FIXED`]) and with no edge: the system calls stay
+/// **retained imports**, for a caller to bind by name. Same discovery, same table as [`nim_runtime`]:
+/// one route through the compute bottom edge.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
-    let mut exports = nim_compute_exports(units)?.0;
+    let mut exports = nim_compute_exports(units, &lower_program(units)?)?.0;
     exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
     compute_shim_unit(exports)
 }
 
-/// Bottom-edge leaves the **personality** serves for real, so [`nim_posix_runtime`] withholds them from
+/// Bottom-edge leaves the **personality** serves for real, so [`Edge::Posix`] takes them from
 /// [`POWERBOX_COMPUTE_SHIM`]'s stubs and its POSIX edge forwards each to the op of the same C name
-/// ([`posix_edge_unit`]) — argument-for-argument; a leaf that needs reconciling (a NUL-terminated
+/// ([`posix_edge_unit`]), argument for argument. A leaf that needs reconciling (a NUL-terminated
 /// path where the op wants `(ptr, len)`) belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
 ///
 /// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
-///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
+///   `getCurrentDir()` raises, which is right for the capability edge and wrong where a real cwd
 ///   exists.
 /// - `fstat` → the matching `temen_posix` op. Bound to the shim it reports **size 0**, so
 ///   `memfiles.open` (`open` + `fstat` + `mmap`) maps every file as empty and the program reads a
@@ -1888,6 +2077,8 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 ///   and the program runs on past the error path that called it. nimsem printed `command expected`
 ///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
 ///   error path is built on `quit`, so on this route none of them ended the program.
+/// - `cWriteErr` → the personality's `write`: `panics.nim`'s `write(2, …)`, a panic's message. The
+///   shim's stub drops it, so a program that panicked said nothing about why.
 /// - `fork` / `execve` / `wait4` / `exitnow` → the `temen_posix` process ops (#1609). These four
 ///   join **together**, because `execShellCmd` is all of them or none: nimony's `os` inlines
 ///   `fork` + `execve("/bin/sh", ["-c", cmd])` + `waitpid` (itself an inline wrapper over
@@ -1902,19 +2093,25 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 /// - `pspawn` → the personality's spawn. A program built for Temen starts its processes with it
 ///   instead of `fork` + `execve`, so a program that never forks can run on the emitted tier.
 const POSIX_SERVED_LEAVES: &[&str] = &[
-    "getcwd", "cExitSys", "fstat", "execve", "fork", "wait4", "exitnow", "pipe", "dup2", "close",
+    "getcwd",
+    "cExitSys",
+    "cWriteErr",
+    "fstat",
+    "execve",
+    "fork",
+    "wait4",
+    "exitnow",
+    "pipe",
+    "dup2",
+    "close",
     "pspawn",
 ];
 
-/// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
-/// [`nim_powerbox_runtime`] makes, over the same compute half.
-///
-/// Both are `[compute shim, syscall edge]`. They differ only in what stands behind the syscalls:
-/// `nim_powerbox_runtime` uses [`SYSCALL_ADAPTER`], which folds them onto the single §3e STREAM
-/// `write` cap and fails every file operation closed (a stdout-only program). This forwards them to
-/// a real `temen_posix` personality — so a program that opens and reads files (`nifler2 parse in.nim
-/// out.nif`) works — through [`POSIX_OPEN_ADAPTER`] (the path ops' NUL walk),
-/// [`POSIX_MMAP_ADAPTER`], and the generated POSIX edge ([`posix_edge_unit`]).
+/// [`nim_runtime`] on the **POSIX edge**: the syscalls forwarded to a real `temen_posix`
+/// personality, so a program that opens and reads files (`nifler2 parse in.nim out.nif`) works,
+/// through [`POSIX_OPEN_ADAPTER`] (the path ops' NUL walk), [`POSIX_MMAP_ADAPTER`], and the generated
+/// POSIX edge ([`posix_edge_unit`]). `compute_exports` has already lost the leaves the edge takes,
+/// which arrive as `withheld` with their shim shapes.
 ///
 /// **The linked program imports the personality's own names** (#1668), exactly as `personality`
 /// publishes them — `__px_write`, `__px_open`, … — so it binds the way a chibicc command does: by the
@@ -1923,37 +2120,13 @@ const POSIX_SERVED_LEAVES: &[&str] = &[
 /// Besides those it imports only the core's memory ops its heap grows with ([`HEAP_GROW`]:
 /// `vm_map`, `vm_page_size`), which every host binds to the program's own window, as it does an
 /// on-ramp command's.
-pub fn nim_posix_runtime(
+fn posix_runtime(
     units: &[WholeModule],
+    mut compute_exports: Vec<(String, u32)>,
+    m1: &Module,
+    withheld: Vec<(String, temen_ir::FuncType)>,
     personality: PersonalityVtable,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let (mut compute_exports, m1) = nim_compute_exports(units)?;
-    // The shapes the POSIX edge forwards from, captured before the shim loses the served leaves: a
-    // withheld leaf is no longer a shim export, and it is not a pass-1 import either (pass 1 bound
-    // it to the shim), so this is the only place its nim-side signature is still visible.
-    let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
-        .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
-    let withheld: Vec<(String, temen_ir::FuncType)> = compute_exports
-        .iter()
-        .filter(|(n, _)| POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)))
-        .map(|(n, i)| {
-            let f = &shim.funcs[*i as usize];
-            (
-                n.clone(),
-                temen_ir::FuncType {
-                    params: f.params.clone(),
-                    results: f.results.clone(),
-                },
-            )
-        })
-        .collect();
-    // Withhold the leaves the **personality serves for real** from the compute shim, whose versions
-    // of them are deliberate fail-closed stubs ("a playground guest is granted no ambient
-    // filesystem"). Bound to the stub, `getcwd` returns NULL and nim's `getCurrentDir()` raises —
-    // which is right for the stdout-only powerbox and wrong here, where a real cwd exists. Dropped
-    // from the shim's export set they survive as retained imports the host binds to the matching
-    // `temen_posix` op, whose `getcwd(buf, size) -> buf` is the C ABI unchanged.
-    compute_exports.retain(|(n, _)| !POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)));
     // `sysOpen`'s nim name is only known once the program is linked (pass 1's retained imports).
     let mut opens: Vec<(String, u32)> = m1
         .imports
@@ -2067,7 +2240,7 @@ pub fn nim_posix_runtime(
         .imports
         .iter()
         .filter_map(|i| {
-            let (p, r) = import_sig(&m1, i)?;
+            let (p, r) = import_sig(m1, i)?;
             Some((
                 i.name.clone(),
                 temen_ir::FuncType {
@@ -2090,41 +2263,13 @@ pub fn nim_posix_runtime(
     Ok(out)
 }
 
-/// Link a nim program's units into one **POSIX-personality** module: the [`link_nim_powerbox`] of a
-/// program that opens files, forks and execs. It is [`nim_posix_runtime`], plus the prebuilt guest
-/// libc's units when `libc` is given (`snprintf`, `strtod`, libm, which no hand-written shim
-/// carries: without them those stay unbound manifest imports), linked by
-/// [`link_whole_powerbox_manifest`] in [`link_order`], then [`temen_opt::optimize_linked`]. Every caller
-/// links through this, so a phase built on the host and a program built in-guest by the self-hosted
-/// lane are one link.
-///
-/// `debug` links a **debug build**, which keeps the units' debug info. A **release build** drops it, so
-/// no engine pays for it (#2186): nim code carries none, but the prebuilt libc carries its own, for a
-/// debugger to step into, and the Cranelift JIT captures every explicit trap's backtrace in a module
-/// that has any.
-pub fn link_nim_posix(
-    units: &[WholeModule],
-    personality: PersonalityVtable,
-    libc: Option<&[u8]>,
-    debug: bool,
-) -> Result<Module, LengError> {
-    let units = &link_order(units);
-    let mut runtime = nim_posix_runtime(units, personality)?;
-    if let Some(libc) = libc {
-        runtime.extend(nim_libc_units(libc, units)?);
-    }
-    let mut m = link_whole_powerbox_manifest(units, runtime)?;
-    if !debug {
-        m.debug_info = None;
-    }
-    Ok(temen_opt::optimize_linked(&m))
-}
-
-/// **`temen-link -o:<out.temen> [-g] [--libc:<path>] <main.c.nif> <dep.c.nif>...`**, the command
-/// nimony's Temen backend plans after dead-code elimination (#1609): link a program's `.c.nif` modules
-/// with [`link_nim_posix`], against the prebuilt guest libc (`/lib/temen/libc.temeno` unless `--libc:`
-/// names another; linked without one if it is absent), and write the encoded module. A release build
-/// unless `-g` asks for a debug build, as `cc -g` does.
+/// **`temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>...`**,
+/// the command nimony's Temen backend plans after dead-code elimination (#1609): link a program's
+/// `.c.nif` modules with [`link_nim`], against the prebuilt guest libc (`/lib/temen/libc.temeno`
+/// unless `--libc:` names another; linked without one if it is absent), and write the encoded module.
+/// The program links on the POSIX edge, over `personality`'s ops, unless `--edge:caps` asks for the
+/// capability edge ([`Edge`]); nimony's own build links on POSIX. A release build unless `-g` asks for
+/// a debug build, as `cc -g` does.
 ///
 /// It reaches files only through `read` and `write`. The in-guest `temen-link` passes the
 /// personality's file ops; an embedder that serves the command natively passes its filesystem. Either
@@ -2141,6 +2286,7 @@ pub fn link_command(
     let mut out = None;
     let mut libc_path = "/lib/temen/libc.temeno";
     let mut debug = false;
+    let mut edge = Edge::Posix(personality);
     let mut inputs = Vec::new();
     for &a in args {
         if let Some(o) = a.strip_prefix("-o:") {
@@ -2149,6 +2295,12 @@ pub fn link_command(
             libc_path = l;
         } else if a == "-g" {
             debug = true;
+        } else if let Some(e) = a.strip_prefix("--edge:") {
+            edge = match e {
+                "posix" => Edge::Posix(personality),
+                "caps" => Edge::Caps,
+                _ => return 1,
+            };
         } else {
             inputs.push(a);
         }
@@ -2169,7 +2321,7 @@ pub fn link_command(
         .map(|(stem, src)| WholeModule { stem, src })
         .collect();
     let libc = read(libc_path);
-    let Ok(module) = link_nim_posix(&units, personality, libc.as_deref(), debug) else {
+    let Ok(module) = link_nim(&units, edge, libc.as_deref(), debug) else {
         return 3;
     };
     if !write(out, &temen_encode::encode_module(&module)) {
@@ -2224,8 +2376,9 @@ fn functype_text(params: &[ValType], results: &[ValType]) -> String {
 /// Only a leaf whose arity matches its op is forwarded. A mismatch means the ABIs genuinely differ — a
 /// C string where the op takes `(ptr, len)` — and belongs in [`POSIX_OPEN_ADAPTER`]'s walk; it is an
 /// error here, so it cannot be bound wrong in silence. Two exceptions, both named: `fork`, whose op
-/// takes an unused operand the leaf does not have; and the guest libc's fd-less stdout `write`
-/// (`(buf, len)`, [`LIBC_CAP_STUBS`]), which is `write` to fd 1.
+/// takes an unused operand the leaf does not have; and the guest libc's streams and exit
+/// (`stream_write`, `stream_read`, `stderr` and `exit`, [`LIBC_CAP_STUBS`]), which are fds 1, 0 and 2
+/// and the process's exit.
 ///
 /// **Pipes are the core's** (#972, #763), as a C guest's are (`demos/bash/bash_shim.c`): `pipe`
 /// mints a core pipe (the self-namespace op `CAP_SELF_PIPE`), whose read end parks while writers
@@ -2317,20 +2470,38 @@ fn posix_edge_unit(
             body,
         ));
     }
-    // The guest libc's stdout: `write(buf, len)` is `write(1, buf, len)`.
-    if let Some((opname, opsig)) = op("write") {
-        let shape = temen_ir::FuncType {
-            params: vec![ValType::I64; 2],
-            results: vec![ValType::I64],
-        };
-        fwds.push((
-            "write".into(),
-            shape,
-            opname,
-            opsig.clone(),
+    // The guest libc's streams and exit ([`LIBC_CAP_STUBS`]): its stdout, stdin and stderr are fds 1,
+    // 0 and 2 (`stream_write(buf, len)` is `write(1, buf, len)`), and its exit status is the process's.
+    let stream = temen_ir::FuncType {
+        params: vec![ValType::I64; 2],
+        results: vec![ValType::I64],
+    };
+    let exit = temen_ir::FuncType {
+        params: vec![ValType::I32],
+        results: Vec::new(),
+    };
+    for (name, c, lead, body, shape) in [
+        (
+            "stream_write",
+            "write",
             vec![1],
             EdgeBody::Tagged(1),
-        ));
+            &stream,
+        ),
+        ("stream_read", "read", vec![0], EdgeBody::Tagged(0), &stream),
+        ("stderr", "write", vec![2], EdgeBody::Tagged(1), &stream),
+        ("exit", "exit", Vec::new(), EdgeBody::Plain, &exit),
+    ] {
+        if let Some((opname, opsig)) = op(c) {
+            fwds.push((
+                name.into(),
+                shape.clone(),
+                opname,
+                opsig.clone(),
+                lead,
+                body,
+            ));
+        }
     }
 
     let mut imports: Vec<(String, temen_ir::FuncType)> = Vec::new();
@@ -2547,16 +2718,19 @@ fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, 
 
 /// Which [`COMPUTE_LEAVES`] rows `units` actually reference, plus the **pass-1 link** they were
 /// discovered against (whose surviving imports are the true syscalls — what the caller binds next).
-fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Module), LengError> {
+/// `program` is `units` lowered ([`lower_program`]): pass 1 links it, and the caller links it again.
+fn nim_compute_exports(
+    units: &[WholeModule],
+    program: &[temen_ir::LinkUnit],
+) -> Result<(Vec<(String, u32)>, Module), LengError> {
     // The compute shim must know which leaf names to export; discover them from the `system` unit's
-    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
-    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
+    // imports, in its lowered object (every pure-compute leaf originates there). The program's units
+    // follow its powerbox `_start` ([`lower_program`]).
     let sys = units
         .iter()
-        .find(|u| u.stem.starts_with("sysv"))
+        .position(|u| u.stem.starts_with("sysv"))
         .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
-    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
-        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
+    let sys_obj = &program[1 + sys].module;
     let mut compute_exports: Vec<(String, u32)> = Vec::new();
     let widen = |m: &Module, exports: &mut Vec<(String, u32)>| {
         for imp in &m.imports {
@@ -2567,11 +2741,15 @@ fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Mod
             }
         }
     };
-    widen(&sys_obj, &mut compute_exports);
+    widen(sys_obj, &mut compute_exports);
 
     // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
-    let m1 =
-        link_whole_powerbox_manifest(units, vec![compute_shim_unit(compute_exports.clone())?])?;
+    let m1 = link_lowered(
+        program,
+        &[compute_shim_unit(compute_exports.clone())?],
+        true,
+        true,
+    )?;
 
     // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
     // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
@@ -2613,6 +2791,64 @@ mod tests {
         let grow = heap_grow_unit().expect("heap grow parses");
         let f = &grow.module.funcs[0];
         assert_eq!((f.params.clone(), f.results.clone()), hook);
+    }
+
+    /// A leaf the capability edge takes from the compute shim is served at the shape the shim served
+    /// it at, nim's own. A drift would fail every program's link (#1524), and the end-to-end tests
+    /// that would show it need the toolchain.
+    #[test]
+    fn the_capability_edge_takes_the_shims_leaves_at_their_shapes() {
+        let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM).expect("shim parses");
+        let edge = temen_text::parse_module(CAPS_EDGE).expect("capability edge parses");
+        let sig = |m: &Module, f: u32| {
+            let f = &m.funcs[f as usize];
+            (f.params.clone(), f.results.clone())
+        };
+        let mut taken = Vec::new();
+        for (leaf, f) in CAPS_EDGE_LEAVES {
+            // A system call has no shim row: pass 1 leaves it for the edge.
+            if let Some(i) = compute_leaf_index(leaf, None) {
+                assert_eq!(sig(&edge, *f), sig(&shim, i), "`{leaf}`");
+                taken.push(*leaf);
+            }
+        }
+        assert_eq!(taken, ["cWriteErr", "cExitSys", "exitnow"]);
+    }
+
+    /// What the guest libc leaves after its stubs, its streams and exit, both edges serve at the
+    /// libc's shapes: the capability edge imports the same capabilities, and the POSIX edge forwards
+    /// each to the personality. A gap would leave the libc an import no host binds, and a shape drift
+    /// would fail the link.
+    #[test]
+    fn the_libcs_streams_and_exit_are_the_edges() {
+        let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
+            eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+            return;
+        };
+        let units = nim_libc_units(&libc, &[]).expect("build libc + stub link units");
+        let left = temen_ir::link_with_manifest(&units).expect("link the libc against its stubs");
+        assert!(!left.imports.is_empty(), "the libc reaches no stream");
+        let caps = temen_text::parse_module(CAPS_EDGE).expect("capability edge parses");
+        let (names, sigs) = temen_posix::cap_vtable();
+        let posix = posix_edge_unit(&[], &[], (&names, &sigs)).expect("POSIX edge");
+        for imp in &left.imports {
+            let want = import_sig(&left, imp);
+            let cap = caps.imports.iter().find(|c| c.name == imp.name);
+            assert_eq!(
+                cap.and_then(|c| import_sig(&caps, c)),
+                want,
+                "`{}` on the capability edge",
+                imp.name
+            );
+            let fwd = posix.exports.iter().find(|(e, _)| *e == imp.name);
+            let fwd = fwd.map(|(_, f)| &posix.module.funcs[*f as usize]);
+            assert_eq!(
+                fwd.map(|f| (f.params.as_slice(), f.results.as_slice())),
+                want,
+                "`{}` on the POSIX edge",
+                imp.name
+            );
+        }
     }
 
     /// One step of a scenario against the compute shim's page allocator ([`run_heap_steps`]). Each

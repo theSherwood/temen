@@ -1398,8 +1398,9 @@ int main(void) {
     desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
       "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
       "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
-      "against the real compiled `system` module, and the nim→powerbox bridge wired its bottom edge to " +
-      "the sandbox's caps (nimony's `write(fd,buf,len)` → the powerbox `write` stream). Click Run: the " +
+      "against the real compiled `system` module on Nim's **capability edge**, which gives the program " +
+      "the sandbox's streams and exit and nothing else (nimony's `write(1, buf, len)` → the powerbox " +
+      "stdout stream). Click Run: the " +
       "output below is the guest's **real stdout** — a Nim program printing on the Temen. (The Nim→Leng " +
       "front end runs at build time for now, unlike the `temen-leng` card below, which runs the translator " +
       "itself in your browser; committed `nim_hello.temen`, gated by `nim_hello_asset.rs`.)",
@@ -2171,6 +2172,9 @@ const readModuleStdoutBytes = () =>
 const readModuleStderr = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.temen_stderr_ptr(), eng.ex.temen_stderr_ptr() + eng.ex.temen_stderr_len()));
+// Why the last link entry failed (#2297): the reason it leaves on the stderr slot ("multiple definition
+// of `strlen`"), else its status.
+const linkFailure = () => readModuleStderr().trim() || `status ${eng.ex.temen_status()}`;
 // What the host noted about the last run (#2219), one per line: a spawn refused for the import nothing
 // satisfied. `temen_notes_len` stashes them for `temen_notes_ptr`, so it goes first.
 const readRunNotes = () => {
@@ -2857,7 +2861,7 @@ async function openPgUnits(rec, c) {
       new Uint8Array(eng.memory.buffer).set(bytes, p);
       const h = eng.ex.temen_link_lib_open(p, bytes.length);
       eng.ex.temen_dealloc(p, bytes.length);
-      if (h < 0) throw new Error(`${baseName(url)} declined (status ${eng.ex.temen_status()})`);
+      if (h < 0) throw new Error(`${baseName(url)} declined: ${linkFailure()}`);
       handles.push(h);
     }
   } catch (e) {
@@ -2968,7 +2972,7 @@ function stageChildren(handles, kids) {
   for (const k of kids) {
     if (linkPgChild(handles, k.name, k.unit) !== 0) {
       eng.ex.temen_child_programs_clear();
-      return `link of child ${k.name}.c failed: status ${eng.ex.temen_status()}`;
+      return `link of child ${k.name}.c failed: ${linkFailure()}`;
     }
   }
   return null;
@@ -3086,7 +3090,7 @@ async function runChibicc(c) {
   if (useJit) {
     const tEncode = performance.now();
     if (linkPgProgram(eng.ex.temen_link_encode_libs, units, unit) !== 0) {
-      setState(c, 'error', `link failed: status ${eng.ex.temen_status()}`);
+      setState(c, 'error', `link failed: ${linkFailure()}`);
       runEnd(rec, { ok: false });
       return;
     }
@@ -3117,7 +3121,8 @@ async function runChibicc(c) {
   if (!r) {
     if (!stage()) return;
     const rv = linkPgProgram(eng.ex.temen_link_run_libs, units, unit);
-    r = { rv, status: eng.ex.temen_status(), stdout: readModuleStdout() };
+    // On a failure the stderr slot says why: the run's own stderr, or the link's reason (#2297).
+    r = { rv, status: eng.ex.temen_status(), stdout: readModuleStdout(), stderr: readModuleStderr() };
   }
   eng.ex.temen_child_programs_clear(); // what a run that never started left staged
   // What the host noted about the run (#2219): a spawn refused for the import nothing satisfied.
@@ -3141,7 +3146,9 @@ async function runChibicc(c) {
     logTo(c, `ran compiled program (${runTierName}) → ${r.rv} (status ${r.status}) in ${runMs.toFixed(0)}ms`);
     runEnd(rec, { ok: true, status: r.status, result: r.rv });
   } else {
-    setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)`);
+    const why = (r.stderr || '').trim();
+    setState(c, 'error', `compiled program failed: status ${r.status} (1=decode 2=unsupported 3=trap)` +
+      (why ? ` — ${why}` : ''));
     logTo(c, `compiled program status ${r.status}`);
     runEnd(rec, { ok: false, status: r.status, result: r.rv });
   }
@@ -4704,8 +4711,7 @@ async function chibiccCompileIR(c) {
   eng.ex.temen_dealloc(sp, srcBytes.length);
   if ((status === 0 || status === 5) && ir.length > 0) {
     if (linkPgProgram(eng.ex.temen_link_text_libs, units, new TextEncoder().encode(ir)) !== 0) {
-      status = eng.ex.temen_status();
-      return { ir: '', status, stderr: `link against the prebuilt C units failed: status ${status}` };
+      return { ir: '', status: eng.ex.temen_status(), stderr: `link against the prebuilt C units failed: ${linkFailure()}` };
     }
     ir = readModuleStdout();
   }

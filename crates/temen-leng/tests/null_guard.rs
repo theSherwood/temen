@@ -1,6 +1,6 @@
 //! **#964/#1094 — the NULL guard is on for every temen-leng powerbox program.** The guarded
-//! synth-`_start` link path ([`temen_leng::link_whole_powerbox_manifest`], and the `link_nim_powerbox`
-//! bridge built on it) shifts Leng's whole low layout one guard up, so `[0, POWERBOX_NULL_GUARD)` holds
+//! synth-`_start` link path ([`temen_leng::link_whole_powerbox_manifest`], and the `link_nim` link
+//! built on it) shifts Leng's whole low layout one guard up, so `[0, POWERBOX_NULL_GUARD)` holds
 //! *nothing* and a host (`run_powerbox`, the DAP, the browser on-ramp) seeds it `Unmapped`
 //! unconditionally (#1094 — the one canonical layout) — a NULL dereference then traps on every engine
 //! instead of reading zeros. This test pins the layout contract **toolchain-free** (no nimony needed),

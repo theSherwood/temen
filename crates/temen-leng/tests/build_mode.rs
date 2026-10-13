@@ -70,3 +70,69 @@ fn temen_link_links_a_release_build_unless_asked_for_debug() {
     );
     temen_verify::verify_module(&release).expect("the release build verifies");
 }
+
+/// `--edge:caps` links the **capability edge**: the program asks the host for its streams and its
+/// exit, and the core's memory ops its heap grows with, instead of the personality's ops. The POSIX
+/// edge is the default, and an edge `temen-link` does not know is a bad argument.
+#[test]
+fn temen_link_links_the_edge_it_is_asked_for() {
+    let Ok(libc) = std::fs::read("../../browser/web/assets/pg_libc.temeno") else {
+        eprintln!("SKIP: browser/web/assets/pg_libc.temeno absent");
+        return;
+    };
+    let system = std::fs::read("tests/fixtures/real_system_arc.leng.nif").expect("the system unit");
+    let units = ["prog.c.nif", "sysvq0asl.c.nif"];
+    let link = |edge: &[&str]| {
+        temen_link(
+            &[edge, &["-o:prog.temen"], &units[..]].concat(),
+            &system,
+            &libc,
+        )
+    };
+    // What the program asks its host for. The `system` fixture is one module of a program, so it also
+    // leaves its siblings' nim symbols (`arcInc.0.` …) unbound on either edge; those are not
+    // capabilities.
+    let imports = |m: &temen_ir::Module| {
+        let mut names: Vec<String> = m
+            .imports
+            .iter()
+            .map(|i| i.name.clone())
+            .filter(|n| !n.contains('.'))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    let caps = link(&["--edge:caps"]);
+    assert_eq!(
+        imports(&caps),
+        [
+            "exit",
+            "stderr",
+            "stream_read",
+            "stream_write",
+            "vm_map",
+            "vm_page_size"
+        ]
+    );
+    temen_verify::verify_module(&caps).expect("the capability edge's build verifies");
+    let posix = link(&[]);
+    assert!(
+        imports(&posix)
+            .iter()
+            .all(|n| n.starts_with("__px_") || n.starts_with("vm_")),
+        "the POSIX edge imports the personality's ops: {:?}",
+        imports(&posix)
+    );
+    assert!(
+        link(&["--edge:posix"]) == posix,
+        "the POSIX edge is the default"
+    );
+    let (names, sigs) = temen_posix::cap_vtable();
+    let status = temen_leng::link_command(
+        &["--edge:wasi", "-o:x.temen", "prog.c.nif"],
+        (&names, &sigs),
+        &mut |_| None,
+        &mut |_, _| true,
+    );
+    assert_eq!(status, 1, "an unknown edge is a bad argument");
+}

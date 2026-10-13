@@ -774,6 +774,9 @@ pub struct SharedSlots {
     /// it spawns, so its `module = -1` names the unit's program (#2143). Per domain, not on the shared
     /// [`Compiled`]: a child whose program is that same unit runs it as its own.
     jit_units: std::sync::Mutex<Vec<(usize, (u32, u32))>>,
+    /// Bumped by every install and uninstall, after the slot it changed (#1009), so a host that
+    /// mirrors the table in emitted code rebuilds only when it moved ([`SharedSlots::gen`]).
+    gen: std::sync::atomic::AtomicU32,
 }
 
 impl SharedSlots {
@@ -796,6 +799,7 @@ impl SharedSlots {
         SharedSlots {
             slots,
             jit_units: std::sync::Mutex::new(Vec::new()),
+            gen: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -815,6 +819,7 @@ impl SharedSlots {
                 .map(|s| AtomicU64::new(s.load(Ordering::Acquire)))
                 .collect(),
             jit_units: std::sync::Mutex::new(self.jit_units.lock_unpoisoned().clone()),
+            gen: std::sync::atomic::AtomicU32::new(self.gen()),
         }
     }
 
@@ -828,6 +833,25 @@ impl SharedSlots {
     fn jit_unit(&self, m: usize) -> Option<(u32, u32)> {
         let units = self.jit_units.lock_unpoisoned();
         units.iter().find(|&&(k, _)| k == m).map(|&(_, id)| id)
+    }
+
+    /// The `(table, unit)` installed at `slot` (#1233): `None` for an empty slot, one of the
+    /// domain's own functions, or a slot past the end. A host mirroring the table in emitted code
+    /// fetches each slot's emitted unit by it. It names the unit rather than the §22 code handle,
+    /// which the guest may release once the unit is installed.
+    fn slot_unit(&self, slot: usize) -> Option<(u32, u32)> {
+        let ts = super::unpack_slot(
+            self.slots
+                .get(slot)?
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        self.jit_unit(ts.module as usize)
+    }
+
+    /// The table's generation: it moves with every install and uninstall, so a host that mirrors the
+    /// table rebuilds its mirror only when this changed. Read it before the slots it covers.
+    fn gen(&self) -> u32 {
+        self.gen.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -919,6 +943,15 @@ impl ModuleSource {
         let i = mods.code.len() - 1;
         mods.by_digest.push((*digest, i));
         Some(i)
+    }
+
+    /// The content digest unit `i` was compiled from ([`unit_of`](Self::unit_of)), when it was.
+    fn digest_of(&self, i: usize) -> Option<[u8; 32]> {
+        let mods = self.mods.lock_unpoisoned();
+        mods.by_digest
+            .iter()
+            .find(|&&(_, u)| u == i)
+            .map(|&(d, _)| d)
     }
 
     /// The **non-primary** units (`mods[1..]`) — a time-travel checkpoint captures these (cheap `Arc`
@@ -1126,22 +1159,17 @@ impl Domain {
 /// coverage (the one place a guest-provided unit can outrun it, with no tree-walker fallback
 /// mid-run), and lands in the task's own `table`: a §14 child's installs stay out of its parent's
 /// `call.dyn` (#1296). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
-/// full; `mirror`, the driver's emitted dispatch table when this task has one, records the slot.
-/// Returns the slot filled.
+/// full. Returns the slot filled.
 fn jit_install(
     unit: Result<super::ResolvedJitUnit, Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
-    mirror: Option<&mut JitMirror<'_>>,
     active: &mut Vm,
     dst: u32,
 ) -> Result<Option<usize>, Trap> {
     let (funcs, types, id) = unit?;
     let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
     let slot = jit_install_into(source, table, unit, id);
-    if let (Some(slot), Some(m)) = (slot, mirror) {
-        m.set(slot, Some(id));
-    }
     active.set(dst, Reg::from_i64(slot.map_or(super::ENOSPC, |s| s as i64)));
     Ok(slot)
 }
@@ -1149,23 +1177,18 @@ fn jit_install(
 /// §22 `Jit.uninstall` (op 4), as every bytecode driver services it. `authority` is the host's check
 /// of the op's `Jit` handle ([`Host::resolve_jit_domain`]: a forged one is its `CapFault`). A filled
 /// padding slot of the task's own `table` clears back to trapping (`0` at `active`'s `dst`); a
-/// real-function, out-of-range or empty slot is `-EINVAL`. `mirror` forgets a cleared slot. Returns
-/// the slot cleared.
+/// real-function, out-of-range or empty slot is `-EINVAL`. Returns the slot cleared.
 fn jit_uninstall(
     authority: Result<(), Trap>,
     source: &ModuleSource,
     table: &SharedSlots,
     slot: i64,
-    mirror: Option<&mut JitMirror<'_>>,
     active: &mut Vm,
     dst: u32,
 ) -> Result<Option<usize>, Trap> {
     authority?;
     let n_real = source.primary().progs.len();
     let cleared = jit_uninstall_from(source, table, slot as usize, n_real).then_some(slot as usize);
-    if let (Some(slot), Some(m)) = (cleared, mirror) {
-        m.set(slot, None);
-    }
     active.set(dst, Reg::from_i64(cleared.map_or(super::EINVAL, |_| 0)));
     Ok(cleared)
 }
@@ -1238,6 +1261,7 @@ fn jit_install_into(
         .push((mods.code.len() - 1, id));
     let module = (mods.code.len() - 1) as u32;
     table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
+    table.gen.fetch_add(1, Ordering::AcqRel);
     Some(slot)
 }
 
@@ -1258,6 +1282,7 @@ fn jit_uninstall_from(
         && (table.slots[slot].load(Ordering::Relaxed) >> 32) as u32 != super::TABLE_EMPTY
     {
         table.slots[slot].store(super::pack_slot(super::TABLE_EMPTY, 0), Ordering::Release);
+        table.gen.fetch_add(1, Ordering::AcqRel);
         true
     } else {
         false
@@ -2231,15 +2256,12 @@ fn admit_detached_child(
     Ok(Some((child, window)))
 }
 
-/// A run's tier-up eligibility bitmap ([`TierUpConfig::eligible`]): a flag per module-0 function.
-type Eligible = std::sync::Arc<[bool]>;
-
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own. Returns the child, and the tier-up bitmap
-/// it inherits from the run's, `eligible`: the run's own when the child runs the root's unit (#816).
-/// Such a child's window is built over a [`FreshWindow::flat_backing`] instead, so that it can tier
-/// up on every target (#2102). Only the cooperative pump has a bitmap, and it is the single owner a
-/// backing that relocates needs.
+/// built at once, over a reservation of the engine's own. Returns the child, and the emit of the
+/// program it runs, as `emit` answers for it: the cooperative pump's ([`ProgramEmits::for_child`]),
+/// `None` on a driver with no emitted tier. A child with an emit gets its window over a
+/// [`FreshWindow::flat_backing`] instead, so that it can tier up on every target (#2102). Only the
+/// cooperative pump has emits, and it is the single owner a backing that relocates needs.
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
@@ -2247,20 +2269,17 @@ fn admit_detached_in_process(
     source: &ModuleSource,
     spawner: Option<(u32, std::sync::Arc<Compiled>)>,
     unit: Option<(u32, u32)>,
-    eligible: Option<&Eligible>,
-) -> Result<Option<(AdmittedChild, Option<Eligible>)>, Trap> {
+    emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
+) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
     let Some((mut child, window)) =
         admit_detached_child(host, pm, s, false, source, spawner, unit)?
     else {
         return Ok(None);
     };
-    let inherits = match child.program {
-        ChildProgram::Spawner(0, _) => eligible.cloned(),
-        _ => None,
-    };
-    let back = inherits.as_ref().and_then(|_| window.flat_backing());
+    let tierup = emit(&child);
+    let back = tierup.as_ref().and_then(|_| window.flat_backing());
     child.mem = Some(window.build(back, &mut child.host)?);
-    Ok(Some((child, inherits)))
+    Ok(Some((child, tierup)))
 }
 
 /// Compile a module `host` granted, for a child: through the host's memo when its embedder handed it
@@ -5242,6 +5261,7 @@ impl<'p> Vcpu<'p> {
                     dst,
                     results,
                     mapped,
+                    ..
                 }) => {
                     self.pending_tierup = Some((dst, results));
                     return VcpuEvent::TierUp { func, argv, mapped };
@@ -5674,60 +5694,45 @@ impl<'p> Vcpu<'p> {
     /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]) and install it into
     /// this vCPU's domain ([`jit_install`]): the **shared** [`Domain`] for a root, so every
     /// vCPU/Worker can `call.dyn` it, or a §14 child's own. An `Err` resolution traps, as does a unit
-    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst.
-    ///
-    /// Returns `Some(slot)` iff the unit was actually installed (the slot the guest received), else
-    /// `None` (trap / `-ENOSPC`). A wasm-tier host uses this to mirror the shared `Domain` slot into a
-    /// per-Worker `WebAssembly.Table` (§22 Model B2 cross-Worker) — funcrefs can't cross Workers, so
-    /// each Worker learns *which slot* an install filled and populates its own table. The `Domain`
-    /// itself stays wasm-agnostic; the slot→code-handle→emitted-wasm mapping lives in the host.
-    pub fn deliver_jit_install(
-        &mut self,
-        unit: Result<super::ResolvedJitUnit, Trap>,
-    ) -> Option<usize> {
+    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst. A
+    /// wasm-tier host mirrors the table into a per-Worker `WebAssembly.Table` (§22 Model B2
+    /// cross-Worker: funcrefs can't cross Workers) from [`Vcpu::slot_unit`].
+    pub fn deliver_jit_install(&mut self, unit: Result<super::ResolvedJitUnit, Trap>) {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
         };
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        jit_install(
-            unit,
-            &dom.source,
-            &dom.table,
-            None,
-            &mut self.vt.active,
-            dst,
-        )
-        .unwrap_or_else(|t| {
+        if let Err(t) = jit_install(unit, &dom.source, &dom.table, &mut self.vt.active, dst) {
             self.trap = Some(t);
-            None
-        })
+        }
     }
 
     /// Deliver the authority check for a `JitUninstall`: `Err` propagates as a trap; `Ok(())` clears the
     /// table `slot` ([`jit_uninstall`]: `0` on success, `EINVAL` for a real-func / out-of-range /
     /// already-empty slot).
-    ///
-    /// Returns `Some(slot)` iff a slot was actually cleared, so a wasm-tier host can null the matching
-    /// per-Worker `WebAssembly.Table` slot (the `deliver_jit_install` counterpart) — keeping each
-    /// Worker's mirror exact so a stale `call.dyn` traps.
-    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) -> Option<usize> {
+    pub fn deliver_jit_uninstall(&mut self, authorized: Result<(), Trap>) {
         let Some(PendingJit::Uninstall { slot, dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_uninstall with no pending uninstall");
         };
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let cleared = jit_uninstall(
-            authorized,
-            &dom.source,
-            &dom.table,
-            slot,
-            None,
-            &mut self.vt.active,
-            dst,
-        );
-        cleared.unwrap_or_else(|t| {
+        let active = &mut self.vt.active;
+        if let Err(t) = jit_uninstall(authorized, &dom.source, &dom.table, slot, active, dst) {
             self.trap = Some(t);
-            None
-        })
+        }
+    }
+
+    /// #1339 — the `(domain, unit)` installed at `slot` of this vCPU's dispatch table (`None` =
+    /// empty or one of the program's own functions): what a per-Worker `WebAssembly.Table` holds
+    /// there. The root's table is the one its threads share; a §14 child's is its own (#1296).
+    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
+        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
+        dom.table.slot_unit(slot as usize)
+    }
+
+    /// #1339 — the generation of this vCPU's dispatch table ([`Vcpu::slot_unit`]): it moves with
+    /// every install and uninstall, so a Worker rebuilds its mirror only when it changed.
+    pub fn table_gen(&self) -> u32 {
+        self.own_dom.as_ref().unwrap_or(&self.prog.dom).table.gen()
     }
 
     /// Deliver the resolved unit for a `JitInvoke` ([`Host::resolve_jit_unit`], as for
@@ -5823,17 +5828,10 @@ impl<'p> Vcpu<'p> {
     /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
     /// resolve the invoke as the interpreted path would, not be swallowed).
     ///
-    /// `mirror` (#1339) is the driver's dispatch-table mirror, lent for the duration of the bounce so
-    /// a §22 `Jit.install`/`uninstall` the callback reaches — a guest whose *emitted* frame defines
-    /// and dispatches units — moves it before the emitted frame resumes; the driver rebuilds its
-    /// table when the generation advances. `None` where there is no shared table to mirror (the
-    /// native embedding), and for a §14 child, whose installs stay in its own table (#1296).
-    pub fn bounce_call(
-        &mut self,
-        target: u32,
-        io: &mut [i64],
-        mirror: Option<JitMirror<'_>>,
-    ) -> Result<usize, Trap> {
+    /// A §22 `Jit.install`/`uninstall` the callback reaches (a guest whose *emitted* frame defines
+    /// and dispatches units) moves this vCPU's table, and so its generation ([`Vcpu::table_gen`]): a
+    /// driver mirroring the table rebuilds before the emitted frame resumes (#1339).
+    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
         step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let slot = (target as usize) & (dom.table.len() - 1);
@@ -5903,10 +5901,7 @@ impl<'p> Vcpu<'p> {
                 &mut self.mem,
                 &mut cell,
                 &mut fibers,
-                Some(BounceRunCtx {
-                    jit_mirror: mirror,
-                    park: None,
-                }),
+                Some(BounceRunCtx { park: None }),
                 None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
                 false,
             )?
@@ -7031,14 +7026,14 @@ fn debug_advance_fiber(
         // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
         Ok(Outcome::JitInstall { h, code, dst }) => {
             let unit = host.resolve_jit_unit(h, code);
-            match jit_install(unit, source, table, None, &mut vt.active, dst) {
+            match jit_install(unit, source, table, &mut vt.active, dst) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
         }
         Ok(Outcome::JitUninstall { h, slot, dst }) => {
             let authority = host.resolve_jit_domain(h).map(drop);
-            match jit_uninstall(authority, source, table, slot, None, &mut vt.active, dst) {
+            match jit_uninstall(authority, source, table, slot, &mut vt.active, dst) {
                 Ok(_) => FiberStep::Stepped,
                 Err(t) => FiberStep::Trapped(t),
             }
@@ -8538,7 +8533,7 @@ fn dbg_instantiate_detached(
         }
     };
     let Some((child, _)) =
-        admit_detached_in_process(owner, pm, spawn, source, spawner, unit, None)?
+        admit_detached_in_process(owner, pm, spawn, source, spawner, unit, |_| None)?
     else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
@@ -10853,14 +10848,16 @@ impl DispatchParks {
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible module-0
-    /// function. The host runs the emitted `f{func}` region and delivers its `n_results` results to
-    /// the absolute register slot `dst`. `argv` is the marshalled arguments (raw i64 slots).
-    /// `mapped` is the window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — the
-    /// host MUST write it to the emitted module's `"mapped"` global before invoking `f{func}`, so the
-    /// emitted bounds check admits exactly what the interpreter would (#717). Surfaced only when the
-    /// extent is scalar-representable; otherwise the call is interpreted (fail-closed decline).
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
+    /// function of program `module` ([`Vm::jit_module`]). The host runs the emitted `f{func}`
+    /// region and delivers its `n_results` results to the absolute register slot `dst`. `argv` is
+    /// the marshalled arguments (raw i64 slots). `mapped` is the window's scalar committed extent
+    /// at call entry ([`Mem::scalar_extent`]) — the host MUST write it to the emitted module's
+    /// `"mapped"` global before invoking `f{func}`, so the emitted bounds check admits exactly what
+    /// the interpreter would (#717). Surfaced only when the extent is scalar-representable;
+    /// otherwise the call is interpreted (fail-closed decline).
     TierUp {
+        module: u32,
         func: u32,
         argv: Box<[i64]>,
         dst: usize,
@@ -12334,44 +12331,12 @@ fn invoke_entry(source: &ModuleSource, module: usize, args: &[Value]) -> Result<
 /// The run-level context a **tier-up region** bounce threads into [`drive_nested`] (`None` for a
 /// `Jit.invoke`, whose registry is invoke-confined): its presence marks the drive's registry as the
 /// run's (#880 — a `cont.new` then keeps the registry's shadow-SP / freeze-metadata tables
-/// index-aligned), and, on the cooperative driver, it lends the B2 slot mirror (#1233) so a
-/// `Jit.install`/`uninstall` serviced inside the bounce keeps it exact.
+/// index-aligned).
 struct BounceRunCtx<'a> {
-    /// The coop driver's dispatch-table mirror. `None` on the single-vCPU path (its pump records the
-    /// mirror host-side, from surfaced install events — an install serviced inside one of *its*
-    /// bounces is not yet mirrored there) and for a §14 child (#1296: a child's installs stay in its
-    /// own table, never the root's mirror).
-    jit_mirror: Option<JitMirror<'a>>,
     /// #1896 — where a bounce out of a leaf whose host suspends its emitted frames
     /// ([`LeafOffer::parks`]) leaves a call that stops: its continuation, and what it stopped for.
     /// `None` for any other bounce, in which a park faults.
     park: Option<&'a mut Option<(Vm, Handoff)>>,
-}
-
-/// A wasm-JIT driver's dispatch-table mirror — the `slot → (domain, unit)` array and its generation
-/// — **lent** to a tier-up-region bounce so a §22 install serviced *inside* the bounce keeps the
-/// driver's table exact (#1233 on the cooperative driver, #1339 on the parallel one). Without it the
-/// mirror only moves at the pump's own install arm, and an install reached from an emitted frame
-/// leaves the driver rebuilding a stale table (the next emitted `call.dyn` traps → decline).
-///
-/// The cooperative driver lends [`CoopSched`]'s fields; the parallel driver lends its process-global
-/// mirror through [`Vcpu::bounce_call`] (its installs are shared across Workers, so the mirror must
-/// be too). A §14 child lends nothing: its installs stay in its own table (#1296).
-pub struct JitMirror<'a> {
-    /// `slot → (domain, unit)`; `None` = empty or natural-prefix.
-    pub units: &'a mut Vec<Option<(u32, u32)>>,
-    /// Bumped on every install/uninstall, so a driver rebuilds only when the mirror moved.
-    pub gen: &'a mut u32,
-}
-
-impl JitMirror<'_> {
-    /// `slot` now holds `unit` (`None`: it traps again); the driver re-syncs at the next generation.
-    fn set(&mut self, slot: usize, unit: Option<(u32, u32)>) {
-        if let Some(e) = self.units.get_mut(slot) {
-            *e = unit;
-        }
-        *self.gen = self.gen.wrapping_add(1);
-    }
 }
 
 /// What a nested drive ([`drive_nested`]) came back with.
@@ -12536,13 +12501,11 @@ fn drive_nested(
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
-                let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
-                jit_install(unit, source, table, mirror, &mut vt.active, dst)?;
+                jit_install(unit, source, table, &mut vt.active, dst)?;
             }
             Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
                 let authority = host.with(|p| p.resolve_jit_domain(h)).map(drop);
-                let mirror = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut());
-                jit_uninstall(authority, source, table, slot, mirror, &mut vt.active, dst)?;
+                jit_uninstall(authority, source, table, slot, &mut vt.active, dst)?;
             }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
@@ -12742,11 +12705,12 @@ enum VcpuStop {
     /// on quantum exhaust, so its behavior is unchanged.
     Preempted,
     Done(Vec<Value>),
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region on the
-    /// host, delivering its `n_results` results to absolute slot `dst` via `deliver_tierup`.
-    /// `mapped` is the entry-snapshot scalar committed extent the host must write to the emitted
-    /// `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region of
+    /// program `module` on the host, delivering its `n_results` results to absolute slot `dst` via
+    /// `deliver_tierup`. `mapped` is the entry-snapshot scalar committed extent the host must write
+    /// to the emitted `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
     TierUp {
+        module: u32,
         func: u32,
         argv: Box<[i64]>,
         dst: usize,
@@ -12972,6 +12936,7 @@ fn step_vcpu(
                 Trap::FiberFault,
             )?,
             Outcome::TierUp {
+                module,
                 func,
                 argv,
                 dst,
@@ -12979,6 +12944,7 @@ fn step_vcpu(
                 mapped,
             } => {
                 return Ok(VcpuStop::TierUp {
+                    module,
                     func,
                     argv,
                     dst,
@@ -13262,8 +13228,8 @@ fn live_tasks(tasks: &[TaskSlot]) -> usize {
 }
 
 /// Schedule an admitted §14/§5 child as a task of the cooperative executor over its own environment,
-/// registered as a child handle of task `ti`, and land the handle in `dst`. `tierup` is the run's
-/// eligibility bitmap and page-check flag, for a child that inherits them (see the confined arm).
+/// registered as a child handle of task `ti`, and land the handle in `dst`. `tierup` is the emit of
+/// the program it runs, for a child that tiers up (see the confined arm).
 /// `Err(ThreadFault)` on the vCPU-count bomb; the caller completes `ti` with it. A child refused here
 /// hands its window lease back to its spawner's powerbox in `host`, so a spawn refused after its
 /// admission charges nothing (#1975, #2006), as the oracle's undo does.
@@ -13276,7 +13242,7 @@ fn coop_start_child(
     child: AdmittedChild,
     entry: i64,
     dst: u32,
-    tierup: Option<(std::sync::Arc<[bool]>, bool)>,
+    tierup: Option<ProgramEmit>,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
     let room = live_tasks(tasks) < super::MAX_VCPUS;
@@ -13293,9 +13259,8 @@ fn coop_start_child(
             .lock_unpoisoned()
             .release_detached(lease)
     })?;
-    if let Some((eligible, page_checked)) = tierup {
-        vt.active.jit_eligible = Some(eligible);
-        vt.active.jit_page_checked = page_checked;
+    if let Some(e) = &tierup {
+        vt.active.tier_up(module, e);
     }
     let eidx = extra_envs.len();
     extra_envs.push(ChildEnv {
@@ -13848,10 +13813,11 @@ fn drive(
     r
 }
 
-/// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a module-0 task hit an
-/// eligible direct `Call` and the emitted region must run on the host (`TierUp`) before the paused
-/// task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a run-fatal trap
-/// (the root task trapped, or a driver operation failed) — mirroring the `Result` `drive` returns.
+/// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a task hit an eligible
+/// direct `Call` of its program and the emitted region must run on the host (`TierUp`) before the
+/// paused task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a
+/// run-fatal trap (the root task trapped, or a driver operation failed) — mirroring the `Result`
+/// `drive` returns.
 enum CoopStep {
     /// The root task returned; these are the run's results.
     Done(Vec<Value>),
@@ -14047,20 +14013,16 @@ struct SchedCore {
     clock: u64,
 }
 
-/// The cooperative pump's state for the host's emitted tier (#926): which module-0 calls tier up,
+/// The cooperative pump's state for the host's emitted tier (#926): which programs' calls tier up,
 /// the leaf emitter, the one outstanding host round-trip, the JIT table mirror and an emitted
 /// invoke's fiber registry. Inert on the native `drive`.
 #[derive(Default)]
 struct EmitTier {
-    /// #926 slice 2: wasm-JIT tier-up eligibility for this run's **module-0** tasks (the root and its
-    /// same-module `thread.spawn` descendants). `None` ⇒ everything interprets, exactly the native
-    /// `drive` (which never sets it). When set, each qualifying task's `Vm` carries it, so a direct
-    /// module-0 `Call` to an eligible function surfaces as [`CoopStep::TierUp`] instead of interpreting
-    /// the callee — the host runs the emitted `f{func}` and delivers the results back.
-    eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 paged tier-up: the eligible set is page-checked (the emitted region carries a per-access
-    /// page check), so an unrepresentable window surfaces with the reserved size instead of declining.
-    page_checked: bool,
+    /// #926 slice 2, #2248: what each program's tasks tier up into. A task running a program with
+    /// an emit carries it in its `Vm`, so a direct `Call` in that program to an eligible function
+    /// surfaces as [`CoopStep::TierUp`] instead of interpreting the callee — the host runs the
+    /// emitted `f{func}` and delivers the results back.
+    programs: ProgramEmits,
     /// #1896: the host's emitter for leaf images ([`TierUpConfig::leaf`]); `None` interprets them.
     leaf: Option<LeafEmitter>,
     /// The task currently paused on a surfaced tier-up, awaiting
@@ -14075,22 +14037,6 @@ struct EmitTier {
     /// tier-up and an invoke are never outstanding at once: each is one `pump` yield). `None` off
     /// the browser driver.
     pending_jit: Option<(usize, usize, Box<[ValType]>)>,
-    /// #926 slice 2f / #1233 — the driver-table **slot → unit-identity mirror** for the browser B2
-    /// coop driver: `slot_units[s]` is the `(domain, unit)` a guest `Jit.install`ed at dispatch slot
-    /// `s` (`None` = empty or a natural-prefix slot), recorded wherever an install is serviced so the
-    /// JS host can rebuild its `WebAssembly.Table`. Sized `1 << host.jit_table_log2()` — length 1 and
-    /// unused on the native `drive` (no shared table).
-    ///
-    /// The key is the **unit index, not the code handle**: a handle is guest-revocable and
-    /// `compile → install → release` is the ordinary pattern (the unit stays installed, only its
-    /// handle dies), so a mirror keyed on handles lost every released unit at the next table rebuild
-    /// and nulled a live slot (`IndirectCallToNull`, #1233). The unit index is append-only, so this
-    /// key never dies while the slot is filled.
-    slot_units: Vec<Option<(u32, u32)>>,
-    /// #1009: a generation counter bumped on each `Jit.install`/`Jit.uninstall` (the only `slot_units`
-    /// mutations) so the browser B2 driver rebuilds its `WebAssembly.Table` only when the mirror
-    /// changed — a dispatch-heavy card that never installs syncs the table once, not per tier-up.
-    table_gen: u32,
     /// #926 slice 2g — the **invoke-confined** fiber registry for a surfaced emitted `Jit.invoke`'s
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
@@ -14104,6 +14050,60 @@ struct EmitTier {
     /// #1954 — the root program's leaf start, when the host's emitter took the root image
     /// ([`root_leaf`]): the first pump tiers the root up at its entry instead of interpreting it.
     root_leaf: Option<LeafStart>,
+}
+
+/// Which programs of a run tier up, and into what (#926 slice 2, #2248): the run's own, and each
+/// granted module the host's [`ModuleEmitter`] emitted when a child first ran it. The host is asked
+/// once per module per run, so every child of a module shares its emit. Inert (no `root`) on the
+/// native `drive`.
+#[derive(Default)]
+struct ProgramEmits {
+    /// The run's own program's emit ([`TierUpConfig::root`]).
+    root: Option<ProgramEmit>,
+    /// The host's emitter for granted modules ([`TierUpConfig::modules`]).
+    modules: Option<ModuleEmitter>,
+    /// What it answered for each granted module offered so far, by program index.
+    granted: Vec<(u32, Option<ProgramEmit>)>,
+}
+
+impl ProgramEmits {
+    /// Program `module`'s emit: the run's own (`0`), or a granted module's the host emitted.
+    fn of(&self, module: u32) -> Option<&ProgramEmit> {
+        match module {
+            0 => self.root.as_ref(),
+            m => self
+                .granted
+                .iter()
+                .find(|&&(g, _)| g == m)
+                .and_then(|(_, e)| e.as_ref()),
+        }
+    }
+
+    /// The emit a child running `program` tiers up into ([`Self::of`]). A granted module no child
+    /// of the run has run yet is offered to the host's emitter first: the child's own module
+    /// (`host` is its powerbox), under the digest `source` compiled it by.
+    fn for_child(
+        &mut self,
+        program: &ChildProgram,
+        host: &Host,
+        source: &ModuleSource,
+    ) -> Option<ProgramEmit> {
+        let (ChildProgram::Spawner(m, _) | ChildProgram::Granted(m, _)) = program;
+        if let (ChildProgram::Granted(..), Some(emit)) = (program, &self.modules) {
+            if !self.granted.iter().any(|&(g, _)| g == *m) {
+                let offer = host.self_module().zip(source.digest_of(*m as usize));
+                let answer = offer.and_then(|(image, digest)| {
+                    emit(&ModuleOffer {
+                        module: *m,
+                        image: &image,
+                        digest,
+                    })
+                });
+                self.granted.push((*m, answer));
+            }
+        }
+        self.of(*m).cloned()
+    }
 }
 
 /// The cooperative multiplex scheduler's run-shared state, extracted from `drive` so that a future
@@ -14420,12 +14420,10 @@ fn settle_wakes(
 
 impl SchedCore {
     /// #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
-    /// call to an eligible function surfaces (`Vm::resume`'s `module == 0 && jit_eligible[callee]`
-    /// gate). `thread.spawn` children inherit the bitmap in the `Spawn` rule (same-module only).
-    fn arm_tierup(&mut self, eligible: &std::sync::Arc<[bool]>, page_checked: bool) {
-        let root = &mut self.tasks[0].vm.vt.active;
-        root.jit_eligible = Some(std::sync::Arc::clone(eligible));
-        root.jit_page_checked = page_checked;
+    /// call to an eligible function surfaces (`Vm::resume`'s `jit_module` gate). `thread.spawn`
+    /// children and child domains take their own program's emit in the stop rules (#2248).
+    fn arm_tierup(&mut self, emit: &ProgramEmit) {
+        self.tasks[0].vm.vt.active.tier_up(0, emit);
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
@@ -14543,10 +14541,10 @@ impl SchedCore {
 
 impl CoopSched {
     /// Build the initial scheduler state: the run's [`SchedCore`] (`drive`'s former preamble
-    /// verbatim, so its behaviour is unchanged) and the emitted tier's. `eligible` /
-    /// `page_checked` are the run's #926-slice-2 tier-up config: `None`/`false` (the native `drive`)
-    /// leaves everything interpreting; a `Some` bitmap makes the root's — and its same-module
-    /// `thread.spawn` descendants' — module-0 direct calls to eligible functions surface as tier-ups.
+    /// verbatim, so its behaviour is unchanged) and the emitted tier's. `tierup` is the run's #926
+    /// slice 2 config: `None` (the native `drive`) leaves everything interpreting; a config makes
+    /// each task's direct calls to the functions its program's emit makes eligible surface as
+    /// tier-ups.
     fn new(
         dom: &Domain,
         entry: FuncIdx,
@@ -14556,27 +14554,28 @@ impl CoopSched {
         host: &mut Host,
         tierup: Option<TierUpConfig>,
     ) -> Result<CoopSched, Trap> {
-        // `page_checked` is meaningful only with a bitmap, so it rides in the same `Option`.
-        let (eligible, page_checked, leaf) = tierup.map_or((None, false, None), |t| {
-            (Some(t.eligible), t.page_checked, t.leaf)
-        });
+        let (programs, leaf) = match tierup {
+            Some(t) => (
+                ProgramEmits {
+                    root: Some(t.root),
+                    modules: t.modules,
+                    granted: Vec::new(),
+                },
+                t.leaf,
+            ),
+            None => (ProgramEmits::default(), None),
+        };
         let mut core = SchedCore::new(dom, entry, args, fuel, mem.as_ref(), host)?;
-        if let Some(e) = &eligible {
-            core.arm_tierup(e, page_checked);
+        if let Some(e) = &programs.root {
+            core.arm_tierup(e);
         }
         Ok(CoopSched {
             core,
             emit: EmitTier {
-                eligible,
-                page_checked,
+                programs,
                 leaf,
                 pending_tierup: None,
                 pending_jit: None,
-                // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a
-                // `Jit.install`'s returned slot always indexes it. `1 << 0 == 1` and unused on the
-                // native `drive`.
-                slot_units: vec![None; 1usize << host.jit_table_log2()],
-                table_gen: 0,
                 // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
                 // bounces.
                 invoke_fibers: FiberTables::default(),
@@ -14589,17 +14588,17 @@ impl CoopSched {
         })
     }
 
-    /// Run the scheduler until it must pause — either the run finished ([`CoopStep::Done`]) or a task
-    /// hit an eligible module-0 call and its emitted region must run on the host ([`CoopStep::TierUp`],
-    /// resumed via [`deliver_tierup`](Self::deliver_tierup)). On the native `drive` (no eligibility),
-    /// tier-up never fires, so this runs the whole schedule and returns `Done` — behaviourally the
-    /// inline loop `drive` used to run. Each iteration services one runnable vCPU via `step_vcpu` and
-    /// settles wakes/teardown; a run-fatal trap is `Err(trap)`.
+    /// Run the scheduler until it must pause — either the run finished ([`CoopStep::Done`]) or a
+    /// task hit an eligible call of its program and its emitted region must run on the host
+    /// ([`CoopStep::TierUp`], resumed via [`deliver_tierup`](Self::deliver_tierup)). On the native
+    /// `drive` (no eligibility), tier-up never fires, so this runs the whole schedule and returns
+    /// `Done` — behaviourally the inline loop `drive` used to run. Each iteration services one
+    /// runnable vCPU via `step_vcpu` and settles wakes/teardown; a run-fatal trap is `Err(trap)`.
     ///
-    /// A run that ends (its root finished, or a trap ended it) ends every domain still live in it, as
-    /// the oracle's teardown reaps them (`teardown_run`): each detached child hands its window back
-    /// to the budget that paid for it, and each child domain what its window holds (#2006). Not a run
-    /// that froze: the cut carries them.
+    /// A run that ends (its root finished, or a trap ended it) ends every domain still live in it,
+    /// as the oracle's teardown reaps them (`teardown_run`): each detached child hands its window
+    /// back to the budget that paid for it, and each child domain what its window holds (#2006).
+    /// Not a run that froze: the cut carries them.
     fn pump(
         &mut self,
         dom: &Domain,
@@ -14971,7 +14970,6 @@ impl CoopSched {
                 } = *s;
                 let mut parked = None;
                 let meta = BounceRunCtx {
-                    jit_mirror: None, // a leaf's env is its own
                     park: Some(&mut parked),
                 };
                 let done = drive_nested(
@@ -15167,28 +15165,27 @@ impl SchedCore {
             ..
         } = self;
         let EmitTier {
-            eligible,
-            page_checked,
+            programs,
             leaf,
             pending_tierup,
             pending_jit,
-            slot_units,
-            table_gen,
             ..
         } = emit;
         match stop {
             Err(trap) => complete(tasks, ti, Err(trap)),
             Ok(VcpuStop::Preempted) => {}
             Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
-            // #926 slice 2 — wasm-JIT tier-up: this module-0 task hit a direct call to an eligible
-            // function (its `Vm` carries the run's bitmap). `step_vcpu` has already spilled the frame
-            // past the call, so the task is resumable with just the result slots filled. Stash the
-            // delivery target — `(task, dst, result types)` — and surface the region to the driver;
-            // `deliver_tierup` writes the emitted results back into `tasks[ti].vm.vt.active` and the next
-            // `pump` resumes the task. At most one tier-up is outstanding (we return here), so the
-            // single `pending_tierup` slot suffices — no per-task field needed. On the native driver
-            // no task is eligible, so this arm is never reached (the bitmap is `None`).
+            // #926 slice 2 — wasm-JIT tier-up: this task hit a direct call to an eligible function
+            // of `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
+            // already spilled the frame past the call, so the task is resumable with just the
+            // result slots filled. Stash the delivery target — `(task, dst, result types)` — and
+            // surface the region to the driver; `deliver_tierup` writes the emitted results back
+            // into `tasks[ti].vm.vt.active` and the next `pump` resumes the task. At most one
+            // tier-up is outstanding (we return here), so the single `pending_tierup` slot suffices
+            // — no per-task field needed. On the native driver no task is eligible, so this arm is
+            // never reached (no program has an emit).
             Ok(VcpuStop::TierUp {
+                module,
                 func,
                 argv,
                 dst,
@@ -15201,7 +15198,7 @@ impl SchedCore {
                 );
                 *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
                 return Some(CoopStep::TierUp {
-                    module: 0,
+                    module,
                     func,
                     argv,
                     mapped,
@@ -15816,32 +15813,27 @@ impl SchedCore {
                     complete(tasks, ti, Err(Trap::ThreadFault));
                     return None;
                 };
-                // #926 slice 2: a `thread.spawn` child running in **module 0** tiers up its own
-                // eligible calls too (the run's bitmap is per-module-0-function, shared across the
-                // root and its same-module threads). A child spawned in another module (a confined
-                // §22 unit spawning its own function) runs a different module, where the module-0
-                // bitmap does not apply — leave it interpreting.
+                // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
+                // the program it runs has an emit: the run's own, or a granted module's that a
+                // child domain runs. A thread in another program (a §22 unit spawning its own
+                // function) has none, and interprets.
                 //
                 // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
-                // inherit the bitmap exactly when that env's window is tier-up-servable — the
-                // driver answers every per-event read (`win` base, mapped extent, page state) for
-                // the pending task's env ([`CoopRun::pending_win`] and friends), so a §14
-                // confined child's thread now tiers up over its own carve. A window the driver
-                // cannot flatly address (a fork twin's `Paged` private copy on wasm) fails
-                // closed to the interpreter, which is always right.
-                if module == 0
-                    && tierup_servable(
-                        match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        },
-                        mem.as_ref(),
-                    )
+                // tier up exactly when that env's window is tier-up-servable — the driver answers
+                // every per-event read (`win` base, mapped extent, page state) for the pending
+                // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
+                // thread tiers up over its own carve. A window the driver cannot flatly address (a
+                // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
+                // is always right.
+                let window = match tasks[ti].env {
+                    None => mem.as_ref(),
+                    Some(k) => extra_envs[k].mem.as_ref(),
+                };
+                if let Some(e) = programs
+                    .of(module)
+                    .filter(|_| tierup_servable(window, mem.as_ref()))
                 {
-                    if let Some(e) = eligible.as_ref() {
-                        child.active.jit_eligible = Some(std::sync::Arc::clone(e));
-                        child.active.jit_page_checked = *page_checked;
-                    }
+                    child.active.tier_up(module, e);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
@@ -15891,22 +15883,20 @@ impl SchedCore {
                         return None;
                     }
                 };
-                // #816 env-routed tier-up: a same-module child runs the spawner's module, so the
-                // run's bitmap applies to it too — inherited when the child's window is servable
-                // (`nested_view` shares the parent backing, so a root-lineage carve always is; a
-                // fork twin's descendant is gated by its backing like the twin). The driver serves
-                // each of the child's tier-ups over its own carve via the pending-env routing
-                // (`CoopRun::pending_win`/`mem_map_info`); the emitted module's per-access live
-                // bound (elision off for instantiator-bearing modules, temen-wasm-jit
-                // `elide_bound`) confines them to the carve.
-                let tierup = match (&child.program, eligible.as_ref()) {
-                    (ChildProgram::Spawner(..), Some(e))
-                        if tierup_servable(child.mem.as_ref(), mem.as_ref()) =>
-                    {
-                        Some((std::sync::Arc::clone(e), *page_checked))
-                    }
-                    _ => None,
-                };
+                // #816 env-routed tier-up, #2248: the child tiers up the program it runs when that
+                // program has an emit — the spawner's own, or a granted module's, offered to the
+                // host the first time a child runs it — and its window is servable (`nested_view`
+                // shares the parent backing, so a root-lineage carve always is; a fork twin's
+                // descendant is gated by its backing like the twin). The driver serves each of the
+                // child's tier-ups over its own carve via the pending-env routing
+                // (`CoopRun::pending_win`/`mem_map_info`). The emitted module's per-access live
+                // bound confines them to the carve; an access whose bound the emitter elided stays
+                // inside the window the module was emitted for, which its carve is at least
+                // ([`ModuleOffer`]; elision is off for instantiator-bearing modules, temen-wasm-jit
+                // `elide_bound`).
+                let tierup = programs
+                    .for_child(&child.program, &child.host, &dom.source)
+                    .filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
                 let started =
                     coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
                 if let Err(t) = started {
@@ -15940,9 +15930,9 @@ impl SchedCore {
                     &dom.source,
                     spawner,
                     unit,
-                    eligible.as_ref(),
+                    |c| programs.for_child(&c.program, &c.host, &dom.source),
                 );
-                let (child, inherits) = match admitted {
+                let (child, tierup) = match admitted {
                     Ok(Some(c)) => c,
                     Ok(None) => {
                         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
@@ -15953,12 +15943,10 @@ impl SchedCore {
                         return None;
                     }
                 };
-                // #816 env-routed tier-up, as for a confined child: the child keeps the bitmap it
-                // inherits while the driver can address its window flatly, which only a failed
-                // flat allocation prevents.
-                let tierup = inherits
-                    .filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()))
-                    .map(|e| (e, *page_checked));
+                // #816 env-routed tier-up, as for a confined child: the child tiers up its
+                // program's emit while the driver can address its window flatly, which only a
+                // failed flat allocation prevents.
+                let tierup = tierup.filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
                 let started =
                     coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
                 if let Err(t) = started {
@@ -16032,13 +16020,8 @@ impl SchedCore {
                     .lock_unpoisoned()
                     .resolve_jit_unit(h, code);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
-                let mut mirror = JitMirror {
-                    units: slot_units,
-                    gen: table_gen,
-                };
-                let mirror = env.is_none().then_some(&mut mirror);
                 let active = &mut tasks[ti].vm.vt.active;
-                if let Err(t) = jit_install(unit, &dom.source, table, mirror, active, dst) {
+                if let Err(t) = jit_install(unit, &dom.source, table, active, dst) {
                     complete(tasks, ti, Err(t));
                     return None;
                 }
@@ -16050,14 +16033,8 @@ impl SchedCore {
                     .resolve_jit_domain(h)
                     .map(drop);
                 let table = env.map_or(&*dom.table, |k| &*extra_envs[k].table);
-                let mut mirror = JitMirror {
-                    units: slot_units,
-                    gen: table_gen,
-                };
-                let mirror = env.is_none().then_some(&mut mirror);
                 let active = &mut tasks[ti].vm.vt.active;
-                let cleared =
-                    jit_uninstall(authority, &dom.source, table, slot, mirror, active, dst);
+                let cleared = jit_uninstall(authority, &dom.source, table, slot, active, dst);
                 if let Err(t) = cleared {
                     complete(tasks, ti, Err(t));
                     return None;
@@ -16071,19 +16048,20 @@ impl SchedCore {
                 params,
                 results,
             }) => {
-                // #926 slice 2e — surface to the browser host when this run drives tier-up
-                // (`eligible` set) and the unit has **emitted wasm** with an all-scalar signature
+                // #926 slice 2e — surface to the browser host when this run drives tier-up (the
+                // root has an emit) and the unit has **emitted wasm** with an all-scalar signature
                 // over a representable window: the host runs the emitted `f0` and delivers the
                 // results back ([`deliver_jit_invoke_vals`]). Otherwise — the native `drive` (no
-                // `eligible`), an interpreter-only unit (no emitted wasm), a non-scalar signature,
-                // or an unrepresentable window — fall through to the interpreted service below,
-                // which is always correct (the fail-closed default the single-vCPU pump also uses).
+                // emit), an interpreter-only unit (no emitted wasm), a non-scalar signature, or an
+                // unrepresentable window — fall through to the interpreted service below, which is
+                // always correct (the fail-closed default the single-vCPU pump also uses).
                 let scalar = |t: &ValType| {
                     matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
                 };
                 // A §14 child's invoke is serviced interpreted below, against its own window
                 // and host (#1296); only the root's units surface to the emitted tier.
-                let emittable = eligible.is_some()
+                let root_emit = programs.root.as_ref();
+                let emittable = root_emit.is_some()
                     && tasks[ti].env.is_none()
                     && params.iter().all(scalar)
                     && results.iter().all(scalar);
@@ -16100,7 +16078,9 @@ impl SchedCore {
                     drop(g);
                     let mapped = match mem.as_ref() {
                         None => Some(0),
-                        Some(m) if *page_checked => Some(m.reserved_size()),
+                        Some(m) if root_emit.is_some_and(|e| e.page_checked) => {
+                            Some(m.reserved_size())
+                        }
                         Some(m) => m.scalar_extent(),
                     };
                     wasm.zip(mapped)
@@ -16168,21 +16148,46 @@ impl SchedCore {
     }
 }
 
-/// #926 slice 2 tier-up configuration for a cooperative run: the wasm-JIT eligibility bitmap plus
-/// whether it is page-checked (#750). Bundled rather than passed as two loose parameters because
-/// `page_checked` is meaningful only alongside a bitmap — a `None` config is "no tier-up", exactly the
-/// native `drive`. The bitmap is per **module-0** function; a direct call to an `eligible[f] == true`
-/// function surfaces as a tier-up on the root and any same-module `thread.spawn` descendant.
+/// #926 slice 2 tier-up configuration for a cooperative run — a `None` config is "no tier-up",
+/// exactly the native `drive`. A task tiers up the direct calls of the program it runs that the
+/// program's emit makes eligible: the run's own program's, and a granted module's that a child runs
+/// (#2248).
 pub struct TierUpConfig {
-    /// Per-module-0-function eligibility (index = function). `true` ⇒ a direct call tiers up.
-    pub eligible: std::sync::Arc<[bool]>,
-    /// #750 paged tier-up: the emitted region carries a per-access page check, so an unrepresentable
-    /// window surfaces with the reserved size instead of declining.
-    pub page_checked: bool,
+    /// The run's own program's emit (module 0): the root's, and any task's that runs the program.
+    pub root: ProgramEmit,
     /// #1896 — the host's emitter for **leaf images**: an image a process `execve`s that cannot park,
     /// or parks only in a stream call ([`image_parks`]), is offered to it, and runs whole on the
     /// emitted tier if it emits it. `None`: every exec'd image interprets.
     pub leaf: Option<LeafEmitter>,
+    /// #2248 — the host's emitter for a **granted module** a child runs: offered the module the
+    /// first time a child of the run runs it ([`ModuleOffer`]), it answers the module's emit.
+    /// `None`: a child running a granted module interprets.
+    pub modules: Option<ModuleEmitter>,
+}
+
+/// What the host emitted of a program for its tasks to tier up into (#926 slice 2).
+#[derive(Clone, Default)]
+pub struct ProgramEmit {
+    /// Per-function eligibility (index = function). `true` ⇒ a direct call tiers up.
+    pub eligible: std::sync::Arc<[bool]>,
+    /// #750 paged tier-up: the emitted region carries a per-access page check, so an
+    /// unrepresentable window surfaces with the reserved size instead of declining.
+    pub page_checked: bool,
+}
+
+/// The host's emitter for granted modules ([`TierUpConfig::modules`]). Offered one
+/// ([`ModuleOffer`]), it emits the module's functions for its children to tier up into, and answers
+/// which ([`ProgramEmit`]), or `None` to leave them interpreting.
+pub type ModuleEmitter = std::sync::Arc<dyn Fn(&ModuleOffer) -> Option<ProgramEmit> + Send + Sync>;
+
+/// A granted module the engine offers the host's emitter ([`ModuleEmitter`]), once per run.
+pub struct ModuleOffer<'a> {
+    /// The program index its children's [`CoopEvent::TierUp`]s name.
+    pub module: u32,
+    pub image: &'a Module,
+    /// The image's content digest ([`super::module_digest`]), so a host can keep what it emitted
+    /// for one across runs.
+    pub digest: [u8; 32],
 }
 
 /// The host's emitter for leaf images ([`TierUpConfig::leaf`]). Offered one ([`LeafOffer`]), it
@@ -16247,11 +16252,12 @@ pub enum CoopEvent {
     /// The run trapped (the root task, or a fatal driver fault).
     Trapped(Trap),
     /// A task paused to run `func` of program `module` emitted, with raw i64 arg slots `argv`: a
-    /// module-0 task on an eligible direct `Call` (`module` 0), or a process whose exec'd image is a
-    /// leaf the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
-    /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and calls
-    /// [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`]; for an entry, the delivery ends
-    /// the process as a return from its entry, or a trap in it, would.
+    /// task on an eligible direct `Call` of the program it runs — the run's own (`0`), or a granted
+    /// module a child runs ([`TierUpConfig::modules`]) — or a process whose exec'd image is a leaf
+    /// the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
+    /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and
+    /// calls [`CoopRun::deliver_tierup`] / [`CoopRun::deliver_tierup_trap`]; for an entry, the
+    /// delivery ends the process as a return from its entry, or a trap in it, would.
     TierUp {
         module: u32,
         func: u32,
@@ -16283,7 +16289,7 @@ pub enum CoopEvent {
 /// multiplexes every vCPU (root + `thread.spawn` descendants) on this one thread, and pauses to the
 /// host on each wasm-JIT tier-up ([`run`](Self::run) → [`CoopEvent::TierUp`] → run the emitted region
 /// → [`deliver_tierup`](Self::deliver_tierup) → `run` again), exactly the loop the native tests and
-/// the browser cdylib drive it with. With no eligibility bitmap it behaves as `drive`: `run` returns
+/// the browser cdylib drive it with. With no tier-up config it behaves as `drive`: `run` returns
 /// `Done`/`Trapped` in one call. (#926 slice 2.)
 pub struct CoopRun {
     dom: Domain,
@@ -16595,27 +16601,20 @@ impl CoopRun {
         }
     }
 
-    /// #926 slice 2f / #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`
-    /// (`None` = empty or natural-prefix): the browser B2 driver's slot mirror, from which it
-    /// rebuilds its `WebAssembly.Table` when the generation moves (a slot at or past the program's
-    /// `f{i}` prefix holds an installed unit's `f0`). Keyed on the unit index rather than the §22
-    /// code handle so it survives the guest's `Jit.release` of that handle — see
-    /// [`EmitTier::slot_units`].
+    /// #926 slice 2f / #1233 — the `(domain, unit)` installed at the root's dispatch-table `slot`
+    /// (`None` = empty or natural-prefix), from which the browser B2 driver rebuilds its
+    /// `WebAssembly.Table` when the generation moves (a slot at or past the program's `f{i}` prefix
+    /// holds an installed unit's `f0`). It names the unit rather than the §22 code handle, which the
+    /// guest may release once the unit is installed.
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        self.sched
-            .emit
-            .slot_units
-            .get(slot as usize)
-            .copied()
-            .flatten()
+        self.dom.table.slot_unit(slot as usize)
     }
 
-    /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
-    /// scheduler services. The browser B2 driver caches the generation it last synced its
-    /// `WebAssembly.Table` at and rebuilds only when this advances (the single-shot pump's
-    /// `temen_onramp_tierup_table_gen` twin).
+    /// #1009: the root's dispatch-table generation, which moves with every `Jit.install` and
+    /// `Jit.uninstall` into it. The browser B2 driver caches the generation it last synced its
+    /// `WebAssembly.Table` at and rebuilds only when this moves.
     pub fn table_gen(&self) -> u32 {
-        self.sched.emit.table_gen
+        self.dom.table.gen()
     }
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
@@ -16807,8 +16806,6 @@ impl CoopRun {
             emit:
                 EmitTier {
                     invoke_fibers,
-                    slot_units,
-                    table_gen,
                     pending_tierup,
                     ..
                 },
@@ -16834,11 +16831,6 @@ impl CoopRun {
                     meta: fiber_meta,
                 },
                 Some(BounceRunCtx {
-                    // #1233: an install serviced inside the bounce updates the ROOT's mirror.
-                    jit_mirror: Some(JitMirror {
-                        units: slot_units,
-                        gen: table_gen,
-                    }),
                     park: parks.then_some(&mut parked),
                 }),
             )
@@ -16878,11 +16870,7 @@ impl CoopRun {
                     &mut e.mem,
                     &mut cell,
                     &mut bounce_fibers,
-                    // The child's installs land in its own table (#1296), never the root's mirror.
-                    bounce_meta.map(|mut c| {
-                        c.jit_mirror = None;
-                        c
-                    }),
+                    bounce_meta,
                     target,
                     io,
                     beneath.as_ref(),
@@ -17269,8 +17257,8 @@ impl ThreadPlatform {
 /// one itself, where its task stopped.
 #[derive(Clone)]
 pub struct ThreadTier {
-    /// Per-module-0-function eligibility, as the pump's ([`TierUpConfig::eligible`]): a module-0
-    /// task's direct call to an eligible function runs on the emitted tier.
+    /// Per-module-0-function eligibility, as the pump's root emit ([`ProgramEmit::eligible`]): a
+    /// module-0 task's direct call to an eligible function runs on the emitted tier.
     pub eligible: std::sync::Arc<[bool]>,
     /// The size of a thread's env cell, the emitted code's per-thread scratch ([`TierUpCall::cell`]).
     pub cell_bytes: usize,
@@ -17388,12 +17376,16 @@ fn drive_threads(
     };
     let bell = host.external_wake();
     let platform = host.thread_platform();
-    let eligible = platform
-        .tier
-        .as_ref()
-        .map(|t| std::sync::Arc::clone(&t.eligible));
-    if let Some(e) = &eligible {
-        core.arm_tierup(e, false);
+    // The platform's tier emits the run's own program only: no granted module is offered.
+    let programs = ProgramEmits {
+        root: platform.tier.as_ref().map(|t| ProgramEmit {
+            eligible: std::sync::Arc::clone(&t.eligible),
+            page_checked: false,
+        }),
+        ..ProgramEmits::default()
+    };
+    if let Some(e) = &programs.root {
+        core.arm_tierup(e);
     }
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
@@ -17409,7 +17401,7 @@ fn drive_threads(
             live: 1, // the root's, on this thread
             panicked: false,
             emit: EmitTier {
-                eligible,
+                programs,
                 ..EmitTier::default()
             },
         }),
@@ -17572,14 +17564,18 @@ impl ThreadRun {
                 true, // the quantum is the thread's look at the run: a kill, or the run's end
             ) {
                 Ok(VcpuStop::TierUp {
+                    module,
                     func,
                     argv,
                     dst,
                     results,
                     mapped,
                 }) => {
-                    // Only a tier arms the eligibility a tier-up needs.
-                    let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+                    // Only a tier arms the eligibility a tier-up needs, and only for the run's own
+                    // program (`drive_threads`).
+                    let tier = (self.platform.tier.as_ref())
+                        .filter(|_| module == 0)
+                        .ok_or(Trap::Malformed)?;
                     let vals = self.tier_up(tier, cell, &mut fibers, ctx, func, &argv, mapped)?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
@@ -17622,10 +17618,7 @@ impl ThreadRun {
             ..
         } = ctx;
         let mut bounce = |target: u32, io: &mut [i64]| {
-            let run_level = BounceRunCtx {
-                jit_mirror: None,
-                park: None,
-            };
+            let run_level = BounceRunCtx { park: None };
             coop_bounce(
                 &self.dom.source,
                 table,
@@ -18530,11 +18523,16 @@ struct Vm {
     /// per-context SP word. The root's is context 0 (`ShadowArena::region_base(0)`); a fiber's its `slot + 1`. Set when
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
-    /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for module-0 functions only. Set
-    /// on the root Vm via [`Vcpu::with_jit_eligible`]; a direct `Call` in module 0 to an eligible
-    /// function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers, invoked units,
-    /// non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never a correctness gate.
+    /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for program `jit_module`'s
+    /// functions only. Set on the root Vm via [`Vcpu::with_jit_eligible`], and on a cooperative
+    /// task running a program with an emit ([`ProgramEmits`]); a direct `Call` in that program to
+    /// an eligible function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
+    /// invoked units, non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never
+    /// a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
+    /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
+    /// runs.
+    jit_module: usize,
     /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
@@ -18596,6 +18594,13 @@ fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
 }
 
 impl Vm {
+    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248).
+    fn tier_up(&mut self, module: u32, emit: &ProgramEmit) {
+        self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
+        self.jit_page_checked = emit.page_checked;
+        self.jit_module = module as usize;
+    }
+
     /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
     /// [`MAX_FRAMES`] and by the register file's own bound (#1958).
     fn open_frame(&mut self, need: usize) -> Result<(), Trap> {
@@ -18649,6 +18654,7 @@ impl Vm {
             setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_module: 0,
             jit_page_checked: false,
             serve_ticket: None,
             serve_count: 0,
@@ -19221,17 +19227,15 @@ impl Vm {
                     if module == 0 {
                         callprof::hit(callee);
                     }
-                    // wasm-JIT tier-up: a module-0 direct call to an eligible function surfaces to the
-                    // host, which runs the emitted region and delivers the results. `argv` is the raw
-                    // i64 arg slots; the host reads them per the callee's signature. Suspension-free by
-                    // construction (`mixed_ok`), so this is a plain "fast call": spill past the op and
-                    // resume with the results in `dst` (`deliver_tierup`), exactly like an interp call.
-                    if module == 0
-                        && self
-                            .jit_eligible
-                            .as_ref()
-                            .is_some_and(|e| e.get(callee).copied().unwrap_or(false))
-                    {
+                    // wasm-JIT tier-up: a direct call to an eligible function of the program this
+                    // Vm has an emit for surfaces to the host, which runs the emitted region and
+                    // delivers the results. `argv` is the raw i64 arg slots; the host reads them
+                    // per the callee's signature. Suspension-free by construction (`mixed_ok`), so
+                    // this is a plain "fast call": spill past the op and resume with the results in
+                    // `dst` (`deliver_tierup`), exactly like an interp call.
+                    if self.jit_eligible.as_ref().is_some_and(|e| {
+                        module == self.jit_module && e.get(callee).copied().unwrap_or(false)
+                    }) {
                         // #717 host sync: snapshot the window's scalar committed extent for the host
                         // to write into the emitted `"mapped"` global. A window whose page state is
                         // not representable by one bound (sparse grow, `Ro`/`Unmapped`/aliased pages)
@@ -19263,6 +19267,7 @@ impl Vm {
                             self.base = base;
                             self.pc = pc + 1;
                             return Ok(Outcome::TierUp {
+                                module: module as u32,
                                 func: callee as u32,
                                 argv,
                                 dst: *dst as usize,

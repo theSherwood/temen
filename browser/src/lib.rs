@@ -915,16 +915,8 @@ static PAR_RUN_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 static CODEGEN_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Bump the run generation. Call once, page-side, at the start of every powerbox publisher.
-///
-/// The §22 slot mirror ([`PAR_JIT_SLOT_UNIT`]) belongs to the run, so it starts empty here
-/// (#2259): the next run's host numbers its units afresh, and an entry the last run left would
-/// name another of them.
 fn par_run_gen_bump() {
     PAR_RUN_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    PAR_JIT_SLOT_UNIT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
 }
 
 /// RAII spin-lock over the codegen stashes: `Acquire` on lock, `Release` on unlock, so a stash the
@@ -1604,10 +1596,7 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
     let io = unsafe {
         core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
     };
-    // A §14 child's installs stay in its OWN dispatch table (#1296), so it lends no mirror —
-    // publishing them into the root's `PAR_JIT_SLOT_UNIT` would put the child's units in the parent's
-    // `call.dyn` slots. The root's twin is [`temen_par_root_call_interp`].
-    match v.inner.bounce_call(func, io, None) {
+    match v.inner.bounce_call(func, io) {
         Ok(_) => {
             if temen_par_inst_paged() == 1 {
                 inst_sync_pagestate(v);
@@ -1666,37 +1655,6 @@ pub extern "C" fn temen_par_inst_join(v: *mut ParVcpu, handle: i32) -> i64 {
 pub extern "C" fn temen_par_inst_end_join(v: *mut ParVcpu) {
     // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
     unsafe { (*v).inner.end_join() }
-}
-
-/// #1339 — [`temen_par_inst_call_interp`]'s **root** twin: service one `env.call_interp(func, …)`
-/// bounce on the ROOT vCPU, lending the process-global §22 slot mirror for the duration. A guest
-/// whose *emitted* frame defines and dispatches units (Forth's outer interpreter) reaches
-/// `Jit.install`/`uninstall` inside the bounce; the engine services it (`drive_nested`, #1233) and
-/// writes the mirror through, so the Worker rebuilds an exact table before the emitted frame resumes
-/// — the coop driver's post-bounce `syncTableSync` twin. The Worker picks this entry point by role
-/// (`role === 'root'`), so a child can never reach the root mirror by accident.
-#[no_mangle]
-pub extern "C" fn temen_par_root_call_interp(v: *mut ParVcpu, func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: `v` is a live root `ParVcpu` owned by this Worker; the host passes the env scratch, at
-    // least `XCALL_MAX_SLOTS` 8-aligned i64 slots wide (`temen_wasmjit_env_bytes`).
-    let v = unsafe { &mut *v };
-    let io = unsafe {
-        core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
-    };
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    let mirror = bytecode::JitMirror {
-        units: &mut units,
-        gen: &mut gen,
-    };
-    match v.inner.bounce_call(func, io, Some(mirror)) {
-        Ok(_) => {
-            if temen_par_inst_paged() == 1 {
-                inst_sync_pagestate(v);
-            }
-            0
-        }
-        Err(_) => 1,
-    }
 }
 
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
@@ -1898,65 +1856,9 @@ fn par_resolve_unit_rt(
 > {
     // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
     let (funcs, types, (cd, cu)) = h.resolve_jit_unit(handle, code)?;
-    // #1339: `(cd, cu)` rides back for the slot mirror (the handle is revocable, the index is not).
+    // #1339: `(cd, cu)` rides back for an install, which records it in the table (the handle is
+    // revocable, the unit is not).
     Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu), (cd, cu))) // #1301: a thawed unit re-emits here
-}
-
-/// §22 **Model B2 cross-Worker** mirror registry: `slot → the `(domain, unit)` installed there` (or
-/// `None` empty), shared across every Worker (one arena / one set of statics behind the shared
-/// memory). The shared interpreter `Domain` dispatch table is atomics-in-memory but has no
-/// slot→emitted-wasm link; this records it wherever an `install`/`uninstall` is serviced so a Worker
-/// can rebuild its own `WebAssembly.Table` from `(slot → unit → temen_par_jit_unit_wasm_by_id)`.
-/// Sized lazily to the grant reservation `1 << PAR_JIT_TABLE_LOG2`, and emptied when a run is
-/// published ([`par_run_gen_bump`]): its units are its host's.
-///
-/// #1339: the key is the **unit index, not the code handle** — the coop driver's
-/// `CoopSched::slot_units` twin, and for the same reason: a handle is guest-revocable and
-/// `compile → install → release` is the ordinary pattern, so a handle-keyed mirror lost every
-/// released unit at the next table rebuild and nulled a live slot (`IndirectCallToNull`).
-static PAR_JIT_SLOT_UNIT: std::sync::Mutex<Vec<Option<(u32, u32)>>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// #1339: the generation of [`PAR_JIT_SLOT_UNIT`], bumped on every install/uninstall so a Worker
-/// rebuilds its table only when the mirror moved (the coop driver's `table_gen` twin). A `u32` behind
-/// the same lock as the mirror, so a Worker that reads both sees a consistent pair.
-static PAR_JIT_TABLE_GEN: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
-
-/// The locked halves of the par slot mirror, held for the lifetime of a [`bytecode::JitMirror`]
-/// borrowed from them (see [`par_jit_mirror_guards`]).
-type ParJitMirrorGuards = (
-    std::sync::MutexGuard<'static, Vec<Option<(u32, u32)>>>,
-    std::sync::MutexGuard<'static, u32>,
-);
-
-/// Lock the process-global par mirror, sized to the grant reservation, as a [`bytecode::JitMirror`]
-/// the engine can write through — the lending shape [`bytecode::Vcpu::bounce_call`] takes so a §22
-/// install reached from an *emitted* frame moves the mirror before that frame resumes (#1339).
-/// The two guards must outlive the borrow, so the caller holds them.
-fn par_jit_mirror_guards() -> ParJitMirrorGuards {
-    let mut units = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-    let need = 1usize << PAR_JIT_TABLE_LOG2;
-    if units.len() < need {
-        units.resize(need, None);
-    }
-    let gen = PAR_JIT_TABLE_GEN.lock().unwrap_or_else(|e| e.into_inner());
-    (units, gen)
-}
-
-fn par_jit_slot_record(slot: usize, unit: (u32, u32)) {
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    if let Some(e) = units.get_mut(slot) {
-        *e = Some(unit);
-    }
-    *gen = gen.wrapping_add(1);
-}
-
-fn par_jit_slot_clear(slot: usize) {
-    let (mut units, mut gen) = par_jit_mirror_guards();
-    if let Some(e) = units.get_mut(slot) {
-        *e = None;
-    }
-    *gen = gen.wrapping_add(1);
 }
 
 /// When on, the runtime-`Jit.compile` emitter emits **Model B2** units (importing the shared reserved
@@ -1983,27 +1885,25 @@ pub extern "C" fn temen_par_jit_table_log2() -> u32 {
     PAR_JIT_TABLE_LOG2 as u32
 }
 
-/// #1339 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
-/// `domain << 32 | unit` (`-1` empty): the mirror map a Worker reads to rebuild its per-Worker
+/// #1339 — the `(domain, unit)` installed at `slot` of `v`'s dispatch table, packed
+/// `domain << 32 | unit` (`-1` empty): what a Worker reads to rebuild its per-Worker
 /// `WebAssembly.Table` (§22 B2 cross-Worker), and the key it fetches the slot's emitted wasm by
-/// ([`temen_par_jit_unit_wasm_by_id_len`]). The `temen_coop_slot_unit` twin: keyed on the unit
-/// index rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
+/// ([`temen_par_jit_unit_wasm_by_id_len`]). The `temen_coop_slot_unit` twin: it names the unit
+/// rather than the guest-revocable code handle, so a released-after-install unit still rebuilds.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_slot_unit(slot: u32) -> i64 {
-    let v = PAR_JIT_SLOT_UNIT.lock().unwrap_or_else(|e| e.into_inner());
-    v.get(slot as usize)
-        .copied()
-        .flatten()
-        .map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
+pub extern "C" fn temen_par_jit_slot_unit(v: *mut ParVcpu, slot: u32) -> i64 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.slot_unit(slot) }.map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
 }
 
-/// #1339 — the generation of the slot mirror, bumped on each §22 install/uninstall (the coop driver's
-/// `temen_coop_table_gen` twin). A Worker caches the generation it last rebuilt its `WebAssembly.Table`
-/// at and rebuilds only when this advances — including after a bounce, whose callback may have
-/// installed from an emitted frame.
+/// #1339 — the generation of `v`'s dispatch table, which moves with every §22 install and uninstall
+/// (the coop driver's `temen_coop_table_gen` twin). A Worker caches the generation it last rebuilt
+/// its `WebAssembly.Table` at and rebuilds only when this moves — including after a bounce, whose
+/// callback may have installed from an emitted frame.
 #[no_mangle]
-pub extern "C" fn temen_par_jit_table_gen() -> u32 {
-    *PAR_JIT_TABLE_GEN.lock().unwrap_or_else(|e| e.into_inner())
+pub extern "C" fn temen_par_jit_table_gen(v: *mut ParVcpu) -> u32 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    unsafe { (*v).inner.table_gen() }
 }
 
 /// #1347: the run program's function count — the dispatch table's **natural prefix** (`slot i <
@@ -2612,9 +2512,9 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             bytecode::VcpuEvent::JitInstall { handle, code } => {
                 // Resolve the unit via whichever powerbox this run holds — fixed-unit (`par_pb`) or
                 // runtime-compile (`par_jit_rt`). Both surface a `JitInstall` event; the runtime path
-                // was previously unwired here (it would trap). The filled slot is recorded per code
-                // handle so each Worker can mirror the shared `Domain` into its own `WebAssembly.Table`
-                // (§22 Model B2 cross-Worker — funcrefs can't cross Workers).
+                // was previously unwired here (it would trap). Each Worker mirrors the shared
+                // `Domain`'s table into its own `WebAssembly.Table` (§22 Model B2 cross-Worker —
+                // funcrefs can't cross Workers), from `temen_par_jit_slot_unit`.
                 let resolved = if let Some(pb) = par_pb() {
                     pb.host.resolve_jit_unit(handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
@@ -2623,13 +2523,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 } else {
                     return PAR_TRAP;
                 };
-                let unit_id = resolved.as_ref().ok().map(|&(_, _, id)| id);
-                if let Some(slot) = v.inner.deliver_jit_install(resolved) {
-                    // #1339: mirror the unit identity, not the (revocable) code handle.
-                    if let Some(id) = unit_id {
-                        par_jit_slot_record(slot, id);
-                    }
-                }
+                v.inner.deliver_jit_install(resolved);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
                 let authorized = if let Some(pb) = par_pb() {
@@ -2640,9 +2534,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 } else {
                     return PAR_TRAP;
                 };
-                if let Some(slot) = v.inner.deliver_jit_uninstall(authorized) {
-                    par_jit_slot_clear(slot); // keep each Worker's table mirror exact (stale call traps)
-                }
+                v.inner.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke {
                 handle,
@@ -8415,9 +8307,12 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
-        eligible: std::sync::Arc::clone(&wc.eligible),
-        page_checked: wc.paged,
+        root: bytecode::ProgramEmit {
+            eligible: std::sync::Arc::clone(&wc.eligible),
+            page_checked: wc.paged,
+        },
         leaf: None,
+        modules: None,
     };
     // The resumable twin of the warm interp path's `run_over_grown`: the image bytes already
     // restored (no data seed), the captured page map re-established (`seed_pages`) so the grown heap
@@ -9096,9 +8991,9 @@ pub extern "C" fn temen_link_run(
     stdin_len: usize,
 ) -> i64 {
     let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
-        Some(m) => m,
-        None => {
-            unsafe { LAST_STATUS = STATUS_DECODE_ERR };
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the library {e}")));
             return 0;
         }
     };
@@ -9166,9 +9061,12 @@ const LINK_SETS_MAX: usize = 4;
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    let Some(mut module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
-        set(STATUS_DECODE_ERR);
-        return -1;
+    let mut module = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the library {e}")));
+            return -1;
+        }
     };
     if let Some(debug) = module.debug_info.as_mut() {
         debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
@@ -9242,13 +9140,52 @@ fn link_slice(p: *const u8, n: usize) -> &'static [u8] {
 
 /// A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start with a
 /// NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect; a resolved
-/// runnable module is a degenerate unit and loads fine), text rides the parser.
-fn link_load_unit(bytes: &[u8]) -> Option<temen_ir::Module> {
+/// runnable module is a degenerate unit and loads fine), text rides the parser. The error says why the
+/// bytes don't load, for a link entry to report (#2297).
+fn link_load_unit(bytes: &[u8]) -> Result<temen_ir::Module, String> {
     if temen_encode::wire::is_module_blob(bytes) {
-        temen_encode::decode_unit(bytes).ok()
+        temen_encode::decode_unit(bytes).map_err(|e| format!("does not decode: {e:?}"))
     } else {
-        temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+        let text = core::str::from_utf8(bytes)
+            .map_err(|_| "is neither an encoded unit nor UTF-8 text".to_string())?;
+        temen_text::parse_module(text).map_err(|e| format!("does not parse: {e}"))
     }
+}
+
+/// Why a link entry failed: the `STATUS_*` it reports in [`temen_status`], and the reason, which the
+/// entry leaves on the stderr slot ([`temen_stderr_ptr`]/[`temen_stderr_len`]) — "multiple definition
+/// of `strlen`" where the status alone says only that the link was refused (#2297).
+#[derive(Debug)]
+pub struct LinkFailure {
+    pub status: i32,
+    pub message: String,
+}
+
+impl LinkFailure {
+    fn unsupported(message: impl Into<String>) -> Self {
+        LinkFailure {
+            status: STATUS_UNSUPPORTED,
+            message: message.into(),
+        }
+    }
+
+    fn decode(message: impl Into<String>) -> Self {
+        LinkFailure {
+            status: STATUS_DECODE_ERR,
+            message: message.into(),
+        }
+    }
+}
+
+/// Report a failed link entry: its status in [`temen_status`] and its reason on the stderr slot.
+/// Returns the status, for the entry to hand back in its own convention.
+fn link_failed(f: LinkFailure) -> i32 {
+    // SAFETY: single-threaded wasm; the slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(ERR), f.message.into_bytes());
+        LAST_STATUS = f.status;
+    }
+    f.status
 }
 
 fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> {
@@ -9277,19 +9214,16 @@ pub extern "C" fn temen_link_text(
     entry_ptr: *const u8,
     entry_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the entry name is not UTF-8"));
     };
-    let Some(lib) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the library {e}"))),
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     let lib_exports = link_lib_exports(&lib);
     let unit = temen_ir::LinkUnitRef {
@@ -9302,11 +9236,13 @@ pub extern "C" fn temen_link_text(
         Ok(m) => {
             let text = temen_text::print_module(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes()) };
-            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes());
+                LAST_STATUS = STATUS_OK;
+            }
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9505,16 +9441,12 @@ pub extern "C" fn temen_link_child_libs(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the child's name is not UTF-8"));
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     match resident_link(
         handle_slice(handles_ptr, handles_len),
@@ -9524,10 +9456,10 @@ pub extern "C" fn temen_link_child_libs(
     ) {
         Ok((m, _)) => {
             stage_child_program(name, m);
-            set(STATUS_OK);
+            unsafe { LAST_STATUS = STATUS_OK };
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9578,7 +9510,7 @@ pub extern "C" fn temen_module_imports(ptr: *const u8, len: usize) -> i32 {
         set(s);
         0
     };
-    let Some(m) = link_load_unit(link_slice(ptr, len)) else {
+    let Ok(m) = link_load_unit(link_slice(ptr, len)) else {
         return refuse(STATUS_DECODE_ERR);
     };
     if m.imports
@@ -9630,26 +9562,24 @@ fn link_lib_stash(
     entry_len: usize,
     render: impl FnOnce(&temen_ir::Module) -> Vec<u8>,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the entry name is not UTF-8"));
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     match resident_link(handles, &program, entry, false) {
         Ok((m, _)) => {
             let bytes = render(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
-            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), bytes);
+                LAST_STATUS = STATUS_OK;
+            }
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9694,7 +9624,7 @@ pub fn link_program(
     lib: temen_ir::LinkUnitRef<'_>,
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_multi(&[lib], program, entry)
 }
 
@@ -9713,7 +9643,7 @@ pub fn link_program_multi(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_as(libs, program, entry, false)
 }
 
@@ -9725,18 +9655,18 @@ pub fn link_child_program_multi(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_as(libs, program, entry, true)
 }
 
 /// The link behind [`link_program_multi`] and [`link_child_program_multi`]: `child` picks the
-/// bootstrap.
+/// bootstrap. Every link entry goes through here, so this is where a failure gets its reason (#2297).
 fn link_program_as(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
     child: bool,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     let mut prog_exports = link_lib_exports(program);
     // **Enter at the program unit's own `_start`, not at `main`** (#1536). The frontend's bootstrap is
     // the only thing that knows how to call *this* `main`: chibicc threads a data-stack pointer as an
@@ -9766,7 +9696,8 @@ fn link_program_as(
         data_exports: &program.data_exports,
         live: None,
     });
-    let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
+    let mut linked = temen_ir::link_with_manifest_ref(&units)
+        .map_err(|e| LinkFailure::unsupported(e.to_string()))?;
     // The frontend bootstrap when the program unit had one, else `entry` itself — a hand-written unit
     // with no `_start` still gets the old behaviour, a synthesized call to its entry.
     let boot = if has_prog_start {
@@ -9774,7 +9705,9 @@ fn link_program_as(
     } else {
         entry
     };
-    let entry_idx = linked.resolve_export(boot).ok_or(STATUS_UNSUPPORTED)?;
+    let entry_idx = linked
+        .resolve_export(boot)
+        .ok_or_else(|| LinkFailure::unsupported(format!("no `{boot}` to enter")))?;
     // A *library* unit's bootstrap is not this program's entry, and `synth_manifest_start` refuses a
     // module that already exports `_start`.
     linked.exports.retain(|e| e.name != PROG_START_ALIAS);
@@ -9807,12 +9740,14 @@ fn link_program_as(
     } else {
         temen_ir::synth_manifest_start(linked, entry_idx, true)
     }
-    .map_err(|_| STATUS_UNSUPPORTED)?;
+    .map_err(|e| LinkFailure::unsupported(format!("cannot enter the program: {e}")))?;
     // Verify before handing it on: a program that references an undefined proc links to an
     // unresolvable manifest import / out-of-range target, which would otherwise fault deep in the
     // engine. Reject it cleanly so a typo can't take down the playground's wasm instance.
-    if temen_verify::verify_module(&module).is_err() {
-        return Err(STATUS_UNSUPPORTED);
+    if let Err(e) = temen_verify::verify_module(&module) {
+        return Err(LinkFailure::unsupported(format!(
+            "the linked program does not verify: {e:?}"
+        )));
     }
     Ok(module)
 }
@@ -9834,14 +9769,14 @@ pub fn link_run_units(
     };
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),
-        Err(status) => PbOutcome {
+        Err(f) => PbOutcome {
             trap: None,
             fault_addr: None,
-            status,
+            status: f.status,
             value: 0,
             exit_code: 0,
             stdout: Vec::new(),
-            stderr: Vec::new(),
+            stderr: f.message.into_bytes(),
             framebuffer: None,
         },
     }
@@ -9859,36 +9794,32 @@ fn link_run_stash(
     entry_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
-    link: impl FnOnce(&temen_ir::Module, &str) -> Result<(temen_ir::Module, Option<Memo>), i32>,
+    link: impl FnOnce(&temen_ir::Module, &str) -> Result<(temen_ir::Module, Option<Memo>), LinkFailure>,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
-        Ok(s) => s,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+    let Ok(entry_name) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        link_failed(LinkFailure::decode("the entry name is not UTF-8"));
+        return 0;
     };
     let stdin = link_slice(stdin_ptr, stdin_len);
     let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
-        Some(m) => m,
-        None => {
-            set(STATUS_DECODE_ERR);
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the program unit {e}")));
             return 0;
         }
     };
     let (module, memo) = match link(&program, entry_name) {
         Ok(linked) => linked,
-        Err(status) => {
-            set(status);
+        Err(f) => {
+            link_failed(f);
             return 0;
         }
     };
 
     let out = onramp_run(&module, stdin, &run_env(), None, true, memo);
-    set(out.status);
     // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
     unsafe {
+        LAST_STATUS = out.status;
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
@@ -9961,8 +9892,10 @@ fn resident_link(
     program: &temen_ir::Module,
     entry: &str,
     child: bool,
-) -> Result<(temen_ir::Module, &'static LinkSet), i32> {
-    let set = link_set(handles).ok_or(STATUS_UNSUPPORTED)?;
+) -> Result<(temen_ir::Module, &'static LinkSet), LinkFailure> {
+    let closed =
+        || LinkFailure::unsupported(format!("a library handle in {handles:?} is not open"));
+    let set = link_set(handles).ok_or_else(closed)?;
     let linked = match &set.base {
         Some((base, exports)) => {
             let live = base_live(base, exports, program);
@@ -9975,7 +9908,7 @@ fn resident_link(
             link_program_as(&[unit], program, entry, child)
         }
         None => {
-            let units = resident_units(handles).ok_or(STATUS_UNSUPPORTED)?;
+            let units = resident_units(handles).ok_or_else(closed)?;
             link_program_as(&units, program, entry, child)
         }
     };
@@ -13910,11 +13843,12 @@ struct CoopTierupRun {
     back: Option<std::sync::Arc<temen_interp::Region>>,
     /// #1896 — a nimony build's session: its personality. `None` for every other run.
     nim: Option<nimony::NimSession>,
-    /// #1896/#1954 — the leaf images this run emitted, by program: a nim build's exec'd processes, or
-    /// (program `0`) a [`temen_coop_open`] run's whole root program.
-    leaves: Leaves,
-    /// The program the pending TIERUP runs: a leaf image, or (`0` with no root leaf) this run's own
-    /// region emit.
+    /// #1896/#1954/#2248 — the programs this run emitted besides its own region emit, by program:
+    /// the leaf images of a nim build's exec'd processes, or (program `0`) a [`temen_coop_open`]
+    /// run's whole root program; and the granted modules its children ran.
+    programs: Programs,
+    /// The program the pending TIERUP runs: one of `programs`, or (`0` with no root leaf) this
+    /// run's own region emit.
     module: u32,
     /// #1954: the host-completed cap names declared at open, in order — a parked request names its
     /// cap by index into this list ([`COOP_RUN_CAP_PARK`]).
@@ -13943,10 +13877,10 @@ struct CoopTierupRun {
     jit_param_types: Vec<u8>,
     jit_result_types: Vec<u8>,
     /// #926 slice 2f — the B2 driver-table state (the twin of `TierupRun`'s). `sigs[i]` is program
-    /// function `i`'s signature (the shim generator's source for a slot in the natural prefix); the
-    /// slot→code mirror itself lives on the engine's `CoopSched` (read via [`bytecode::CoopRun::slot_code`],
-    /// since coop `Jit.install` happens inside the pump). `shim_wasm`/`jit_wasm_by_handle` each hold the
-    /// last generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
+    /// function `i`'s signature (the shim generator's source for a slot in the natural prefix); what
+    /// each other slot holds is the run's own dispatch table (read via
+    /// [`bytecode::CoopRun::slot_unit`]). `shim_wasm`/`jit_wasm_by_handle` each hold the last
+    /// generated bounce-shim / by-handle unit-wasm, valid until the next call of its accessor.
     sigs: Vec<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)>,
     shim_wasm: Vec<u8>,
     jit_wasm_by_handle: Option<std::sync::Arc<[u8]>>,
@@ -13975,44 +13909,52 @@ struct CoopTierupRun {
     spill: Vec<u64>,
 }
 
-/// #2087 — what an emitted leaf image is: its image's content digest and how it was emitted. Equal
-/// keys emit equal wasm, so a later session reuses one ([`EmittedCache`]), and a driver keys its compiled
-/// module by it ([`temen_coop_leaf_key`]).
+/// #2087 — what a program a run emitted is: its image's content digest and how it was emitted, as a
+/// leaf image run whole from its entry (#1896) or as a granted module's functions for its children
+/// to tier up into (#2248). Equal keys emit equal wasm, so a later session reuses a leaf
+/// ([`EmittedCache`]), and a driver keys its compiled module by it ([`temen_coop_program_key`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct LeafKey {
+pub(crate) struct EmitKey {
     digest: [u8; 32],
+    /// The function a leaf image runs whole from; `0` for a granted module.
     entry: u32,
+    /// A leaf image, not a granted module.
+    leaf: bool,
     parks: bool,
     paged: bool,
     shared: bool,
 }
 
-const LEAF_KEY_LEN: usize = 37;
+const EMIT_KEY_LEN: usize = 37;
 
-impl LeafKey {
+impl EmitKey {
     /// The digest, the entry (LE), then a byte of flags.
-    fn bytes(&self) -> [u8; LEAF_KEY_LEN] {
-        let mut b = [0; LEAF_KEY_LEN];
+    fn bytes(&self) -> [u8; EMIT_KEY_LEN] {
+        let mut b = [0; EMIT_KEY_LEN];
         b[..32].copy_from_slice(&self.digest);
         b[32..36].copy_from_slice(&self.entry.to_le_bytes());
-        b[36] = self.parks as u8 | (self.paged as u8) << 1 | (self.shared as u8) << 2;
+        b[36] = self.parks as u8
+            | (self.paged as u8) << 1
+            | (self.shared as u8) << 2
+            | (self.leaf as u8) << 3;
         b
     }
 }
 
-/// A leaf image the emitter took: its emitted wasm, and its key.
+/// A program the run emitted: its wasm, and its key.
 #[derive(Clone)]
-pub(crate) struct Leaf {
+pub(crate) struct Emitted {
     wasm: std::sync::Arc<[u8]>,
-    key: LeafKey,
+    key: EmitKey,
 }
 
-/// The leaf images a run offered, by program index; `None` for an image the emitter declined (it
-/// runs interpreted).
-pub(crate) type Leaves =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<Leaf>>>>;
+/// The programs a run emitted besides its own region emit, by program index: the leaf images it
+/// offered, and the granted modules its children ran; `None` for one the emitter declined (it runs
+/// interpreted).
+pub(crate) type Programs =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<Emitted>>>>;
 
-type EmittedMap = std::collections::HashMap<LeafKey, Option<std::sync::Arc<[u8]>>>;
+type EmittedMap = std::collections::HashMap<EmitKey, Option<std::sync::Arc<[u8]>>>;
 
 /// #2087 — emitted leaf images across sessions, by key: a nim build emits the same tools every
 /// build. It holds what this session used and what the last one did, so an image no session has used
@@ -14032,7 +13974,7 @@ impl EmittedCache {
     /// The image for `key`, made by `emit` only when neither this session nor the last made it.
     fn get(
         &mut self,
-        key: LeafKey,
+        key: EmitKey,
         emit: impl FnOnce() -> Option<std::sync::Arc<[u8]>>,
     ) -> Option<std::sync::Arc<[u8]>> {
         if let Some(wasm) = self.used.get(&key) {
@@ -14060,7 +14002,11 @@ static EMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// memory or not, or reuse what an earlier session emitted for it (#2087). An image that is not
 /// wasm-drivable (it could suspend a frame) runs interpreted, and so does one that can park when the
 /// host cannot suspend its emitted frames (`suspends`).
-pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> bytecode::LeafEmitter {
+pub(crate) fn leaf_emitter(
+    leaves: Programs,
+    suspends: bool,
+    shared: bool,
+) -> bytecode::LeafEmitter {
     emitted().get_or_insert_with(Default::default).rotate();
     std::sync::Arc::new(move |o: &bytecode::LeafOffer| {
         if o.parks && !suspends {
@@ -14070,9 +14016,10 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             return false;
         };
         let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
-            let key = LeafKey {
+            let key = EmitKey {
                 digest: o.digest,
                 entry: o.entry,
+                leaf: true,
                 parks: o.parks,
                 paged: o.paged,
                 shared,
@@ -14080,7 +14027,7 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             let wasm = emitted()
                 .get_or_insert_with(Default::default)
                 .get(key, || emit_leaf(o, shared))?;
-            Some(Leaf { wasm, key })
+            Some(Emitted { wasm, key })
         });
         leaf.is_some()
     })
@@ -14116,7 +14063,7 @@ impl CoopTierupRun {
             run,
             back: None,
             nim: None,
-            leaves: Leaves::default(),
+            programs: Programs::default(),
             module: 0,
             caps: Vec::new(),
             requests: temen_interp::CapRequests::default(),
@@ -14147,23 +14094,24 @@ impl CoopTierupRun {
     }
 
     /// #1896 — a nimony build's session over `run`: its personality and the leaves its emitter fills.
-    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession, leaves: Leaves) -> Self {
+    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession, programs: Programs) -> Self {
         CoopTierupRun {
             nim: Some(nim),
-            leaves,
+            programs,
             ..CoopTierupRun::over(run)
         }
     }
 
-    /// Leaf image `module`, as the emitter took it.
-    fn leaf(&self, module: u32) -> Option<Leaf> {
-        self.leaves.lock().ok()?.get(&module).cloned().flatten()
+    /// Program `module`, as an emitter took it.
+    fn program(&self, module: u32) -> Option<Emitted> {
+        self.programs.lock().ok()?.get(&module).cloned().flatten()
     }
 
-    /// Whether the pending event's program carries the page check (#1009): a leaf image's own mode
-    /// (#1896), else this run's own emit's.
+    /// Whether the pending event's program carries the page check (#1009): a leaf image's or a
+    /// granted module's own mode (#1896, #2248), else this run's own emit's.
     fn event_paged(&self) -> bool {
-        self.leaf(self.module).map_or(self.paged, |l| l.key.paged)
+        self.program(self.module)
+            .map_or(self.paged, |p| p.key.paged)
     }
 
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
@@ -14322,20 +14270,7 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
     // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
     // below) are untouched.
-    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
-    let emittable_leaf: Vec<bool> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    let eligible: Vec<bool> = m
-        .funcs
-        .iter()
-        .zip(&emittable_leaf)
-        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
-        .collect();
+    let (emittable_leaf, eligible) = tierup_eligible(&m, &emit);
     // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
     // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
     // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
@@ -14359,6 +14294,78 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     })
 }
 
+/// The functions of `m` a coop run tiers up into, given what its emit emitted (`emit`): first those
+/// emitted with an all-`i64` signature, the emittable leaves; then those of them over the tier-up
+/// size floor (#1026), the eligible ones.
+fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> (Vec<bool>, Vec<bool>) {
+    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
+    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+    let emittable_leaf: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
+        .collect();
+    let eligible = m
+        .funcs
+        .iter()
+        .zip(&emittable_leaf)
+        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
+        .collect();
+    (emittable_leaf, eligible)
+}
+
+/// #2248 — a session's emitter for the granted modules its children run: it emits a module's
+/// functions for its children to tier up into ([`emit_module`]), and keeps the wasm under the
+/// module's program index in `programs`, where the driver finds it
+/// ([`temen_coop_program_wasm_ptr`]).
+pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::ModuleEmitter {
+    std::sync::Arc::new(move |o: &bytecode::ModuleOffer| {
+        let (wasm, emit) = emit_module(o.image, shared)?;
+        let key = EmitKey {
+            digest: o.digest,
+            entry: 0,
+            leaf: false,
+            parks: false,
+            paged: emit.page_checked,
+            shared,
+        };
+        let mut programs = programs.lock().ok()?;
+        programs.insert(o.module, Some(Emitted { wasm, key }));
+        Some(emit)
+    })
+}
+
+/// Emit granted module `m`'s functions for its children to tier up into, or decline it. Eligible as
+/// in the run's own emit ([`coop_emit_for`]), bouncing over the live window as it does, and paged
+/// by the same rule, with two differences:
+/// - **Its own table.** The driver's shared table mirrors the run's own dispatch table, not a
+///   child's (#2273), so a function that `call.dyn`s is emitted only when the whole module is,
+///   through a table of the module's own functions (`compile_module_tierup_live`). Such a module
+///   has no cap op, so it can install no unit.
+/// - **Its own window.** It is emitted against the window it declares, which every window its
+///   children run in is at least ([`bytecode::ModuleOffer`]). An access the emitter proves inside
+///   that window skips its bound check, which a larger emit window would not make sound.
+fn emit_module(
+    m: &temen_ir::Module,
+    shared: bool,
+) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
+    m.memory?;
+    let paged = m.data.iter().any(|d| d.readonly)
+        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+    let (wasm, emit) =
+        temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;
+    let (_, eligible) = tierup_eligible(m, &emit);
+    eligible.contains(&true).then(|| {
+        let emit = bytecode::ProgramEmit {
+            eligible: eligible.into(),
+            page_checked: paged,
+        };
+        (wasm.into(), emit)
+    })
+}
+
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
 pub const COOP_LEAF_OFF: i32 = 0;
 /// `temen_coop_open`'s `mode` (#1954): run the whole root program as one emitted leaf when it can
@@ -14377,21 +14384,21 @@ pub const COOP_NO_REGIONS: i32 = 4;
 /// on refusal (decode error, an op outside the engine subset, nothing for the emitted tier to run,
 /// or a window the host allocator refused). Idempotent open: closes any prior run first.
 ///
-/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and reserved
-/// at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the declared window
-/// commits real memory instead of `-EINVAL`ing. Growing reallocates and can move the window, so the
-/// driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`] after every bounce and
-/// publish the base to each emitted instance's `"win"` global.
+/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and
+/// reserved at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the
+/// declared window commits real memory instead of `-EINVAL`ing. Growing reallocates and can move
+/// the window, so the driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`]
+/// after every bounce and publish the base to each emitted instance's `"win"` global.
 ///
 /// #1954: `[caps_ptr, caps_len)` names the **host-completed caps** the embedder services, UTF-8
 /// separated by `\n` (empty for none); a call to one parks the run ([`COOP_RUN_CAP_PARK`]) until
 /// [`temen_coop_deliver_cap`] answers it. `mode` is a leaf mode ([`COOP_LEAF_OFF`],
 /// [`COOP_LEAF_ROOT`], [`COOP_LEAF_SUSPENDS`]), optionally with [`COOP_NO_REGIONS`]. A leaf mode
-/// offers the root program to run whole as an emitted leaf: when the emitter takes it, the TIERUP of
-/// program `0` is the leaf's ([`temen_coop_leaf_wasm_ptr`]) and the run has no region emit; when it
-/// doesn't, the run is the region run it would have been — or, with [`COOP_NO_REGIONS`], the
-/// interpreted run (whose window opens at the declared size: nothing emitted masks against it). A
-/// JS host may leave the trailing three out (they read as zero).
+/// offers the root program to run whole as an emitted leaf: when the emitter takes it, the TIERUP
+/// of program `0` is the leaf's ([`temen_coop_program_wasm_ptr`]) and the run has no region emit;
+/// when it doesn't, the run is the region run it would have been — or, with [`COOP_NO_REGIONS`],
+/// the interpreted run (whose window opens at the declared size: nothing emitted masks against it).
+/// A JS host may leave the trailing three out (they read as zero).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)] // the FFI open takes each input as a (ptr, len) pair
 pub extern "C" fn temen_coop_open(
@@ -14486,15 +14493,15 @@ pub extern "C" fn temen_coop_open(
     if leaf != COOP_LEAF_OFF && emits {
         let mut m = m0.clone();
         temen_wasm_jit::outline_cap_calls(&mut m);
-        let leaves = Leaves::default();
+        let leaves = Programs::default();
         let tierup = bytecode::TierUpConfig {
-            eligible: std::sync::Arc::from([]),
-            page_checked: false,
+            root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf_emitter(
                 leaves.clone(),
                 leaf & COOP_LEAF_SUSPENDS != 0,
                 shared != 0,
             )),
+            modules: None,
         };
         let (host, frame) = host_for(&m);
         match open_run(&m, host, Some(tierup)) {
@@ -14505,7 +14512,7 @@ pub extern "C" fn temen_coop_open(
             {
                 return install(CoopTierupRun {
                     back: Some(back.clone()),
-                    leaves,
+                    programs: leaves,
                     caps: caps.clone(),
                     requests: requests.clone(),
                     frame,
@@ -14580,12 +14587,18 @@ pub extern "C" fn temen_coop_open(
     if jit_importer && all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
+    // #2248: the granted modules this run's children run are emitted as it meets them.
+    let programs = Programs::default();
     let tierup = bytecode::TierUpConfig {
-        eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
-        // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
-        page_checked: paged,
+        root: bytecode::ProgramEmit {
+            eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
+            // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
+            // carries the fidelity `scalar_extent` cannot (matching the pump's
+            // `with_jit_page_checked`).
+            page_checked: paged,
+        },
         leaf: None,
+        modules: Some(module_emitter(programs.clone(), shared != 0)),
     };
     let run = match open_run(&m, host, Some(tierup)) {
         Some(Ok(r)) => r,
@@ -14600,6 +14613,7 @@ pub extern "C" fn temen_coop_open(
     };
     install(CoopTierupRun {
         back: Some(back.clone()),
+        programs,
         caps: caps.clone(),
         requests: requests.clone(),
         emitted_wasm: wasm.into(),
@@ -14903,53 +14917,64 @@ pub extern "C" fn temen_coop_task() -> i32 {
         .map_or(-1, |t| t as i32)
 }
 
-/// #1896: the program the pending TIERUP's `func` is in — a leaf image the run emitted
-/// ([`temen_coop_leaf_wasm_ptr`]: a nimony build's exec'd process, or program `0`, a root program
-/// run whole, #1954), else `0`, this run's own region emit ([`temen_coop_wasm_ptr`]). A driver tells
-/// them apart by [`temen_coop_leaf_wasm_len`].
+/// #1896: the program the pending TIERUP's `func` is in — one the run emitted on its own
+/// ([`temen_coop_program_wasm_ptr`]: a leaf image, a nimony build's exec'd process or program `0`,
+/// a root program run whole, #1954; or a granted module a child runs, #2248), else `0`, this run's
+/// own region emit ([`temen_coop_wasm_ptr`]). A driver tells them apart by
+/// [`temen_coop_program_wasm_len`], and a leaf by [`temen_coop_program_leaf`].
 #[no_mangle]
 pub extern "C" fn temen_coop_module() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
 }
 
-/// #1896: the emitted wasm of leaf image `module` (`null` when there is none). The bytes live as long
-/// as the session.
+/// #1896: the emitted wasm of program `module`, a leaf image or a granted module (`null` when the
+/// run emitted none for it). The bytes live as long as the session.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
+pub extern "C" fn temen_coop_program_wasm_ptr(module: u32) -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map_or(core::ptr::null(), |l| l.wasm.as_ptr())
+        .and_then(|s| s.program(module))
+        .map_or(core::ptr::null(), |p| p.wasm.as_ptr())
 }
 
-/// #1896: the byte length of [`temen_coop_leaf_wasm_ptr`]'s wasm.
+/// #1896: the byte length of [`temen_coop_program_wasm_ptr`]'s wasm.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
+pub extern "C" fn temen_coop_program_wasm_len(module: u32) -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map_or(0, |l| l.wasm.len())
+        .and_then(|s| s.program(module))
+        .map_or(0, |p| p.wasm.len())
 }
 
-/// The key [`temen_coop_leaf_key`] read last.
-static mut LEAF_KEY: [u8; LEAF_KEY_LEN] = [0; LEAF_KEY_LEN];
-
-/// #2087: leaf image `module`'s key ([`LeafKey`]): its length, `0` when there is no such image. The
-/// bytes are at [`temen_coop_leaf_key_ptr`] until the next call. Equal keys are equal emitted wasm, so
-/// a driver keys its compiled module by it, and a later build finds that without reading or hashing
-/// the image's bytes.
+/// #2248: whether program `module` is a leaf image (`1`), run whole from its entry and suspended
+/// where a call in it parks, rather than a granted module, whose functions its children tier up
+/// into as the run's own (`0`, also when the run emitted none for it).
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_key(module: u32) -> usize {
+pub extern "C" fn temen_coop_program_leaf(module: u32) -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.program(module))
+        .is_some_and(|p| p.key.leaf) as i32
+}
+
+/// The key [`temen_coop_program_key`] read last.
+static mut PROGRAM_KEY: [u8; EMIT_KEY_LEN] = [0; EMIT_KEY_LEN];
+
+/// #2087: program `module`'s key ([`EmitKey`]): its length, `0` when the run emitted none for it.
+/// The bytes are at [`temen_coop_program_key_ptr`] until the next call. Equal keys are equal
+/// emitted wasm, so a driver keys its compiled module by it, and a later build finds that without
+/// reading or hashing the image's bytes.
+#[no_mangle]
+pub extern "C" fn temen_coop_program_key(module: u32) -> usize {
     let key = unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map(|l| l.key.bytes());
+        .and_then(|s| s.program(module))
+        .map(|p| p.key.bytes());
     // SAFETY: single-threaded wasm; the slot is written only here.
-    unsafe { *core::ptr::addr_of_mut!(LEAF_KEY) = key.unwrap_or([0; LEAF_KEY_LEN]) };
-    key.map_or(0, |_| LEAF_KEY_LEN)
+    unsafe { *core::ptr::addr_of_mut!(PROGRAM_KEY) = key.unwrap_or([0; EMIT_KEY_LEN]) };
+    key.map_or(0, |_| EMIT_KEY_LEN)
 }
 
-/// #2087: where [`temen_coop_leaf_key`] put the key.
+/// #2087: where [`temen_coop_program_key`] put the key.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_key_ptr() -> *const u8 {
-    core::ptr::addr_of!(LEAF_KEY) as *const u8
+pub extern "C" fn temen_coop_program_key_ptr() -> *const u8 {
+    core::ptr::addr_of!(PROGRAM_KEY) as *const u8
 }
 
 /// #2087: how many leaf images this engine has emitted rather than reused: what a driver's tests count
@@ -14963,10 +14988,11 @@ pub extern "C" fn temen_coop_leaf_emits() -> u32 {
 mod emitted_cache_tests {
     use super::*;
 
-    fn key(n: u8) -> LeafKey {
-        LeafKey {
+    fn key(n: u8) -> EmitKey {
+        EmitKey {
             digest: [n; 32],
             entry: 0,
+            leaf: true,
             parks: false,
             paged: false,
             shared: true,
@@ -14979,7 +15005,7 @@ mod emitted_cache_tests {
     fn an_image_is_emitted_once_while_sessions_use_it() {
         let mut c = EmittedCache::default();
         let emits = std::cell::Cell::new(0);
-        let get = |c: &mut EmittedCache, k: LeafKey, made: bool| {
+        let get = |c: &mut EmittedCache, k: EmitKey, made: bool| {
             c.get(k, || {
                 emits.set(emits.get() + 1);
                 made.then(|| std::sync::Arc::from(&b"wasm"[..]))
@@ -15039,9 +15065,8 @@ pub extern "C" fn temen_coop_pagestate_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.pagestate.len())
 }
 
-/// #1009: the dispatch-table generation — bumped on each §22 install/uninstall the coop scheduler
-/// services. The driver rebuilds its `WebAssembly.Table` only when this advances (the pump's
-/// advances (a §22 install/uninstall).
+/// #1009: the root's dispatch-table generation, which moves with every §22 install and uninstall
+/// into it. The driver rebuilds its `WebAssembly.Table` only when this moves.
 #[no_mangle]
 pub extern "C" fn temen_coop_table_gen() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.run.table_gen())
@@ -15379,8 +15404,8 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
 /// #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
 /// `domain << 32 | unit` (`-1` empty/natural): the key the host caches an installed slot's emitted
 /// unit by, and fetches its wasm through ([`temen_coop_jit_wasm_by_slot_len`]). Unlike the code
-/// handle ([`temen_coop_slot_code`]) it survives the guest's `Jit.release` of that handle — the
-/// ordinary compile → install → release pattern leaves the unit installed with no live handle.
+/// handle it survives the guest's `Jit.release` of that handle — the ordinary compile → install →
+/// release pattern leaves the unit installed with no live handle.
 #[no_mangle]
 pub extern "C" fn temen_coop_slot_unit(slot: u32) -> i64 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(-1, |s| {
@@ -15391,8 +15416,8 @@ pub extern "C" fn temen_coop_slot_unit(slot: u32) -> i64 {
 }
 
 /// Emitted-wasm length for the unit installed at dispatch-table `slot` (`0` if the slot is empty or
-/// the unit is interpreter-only) — the table rebuild's fetch, resolved through the engine's own slot
-/// mirror rather than the guest's (revocable) code handle, so a released-after-install unit still
+/// the unit is interpreter-only) — the table rebuild's fetch, resolved through the run's dispatch
+/// table rather than the guest's (revocable) code handle, so a released-after-install unit still
 /// rebuilds (#1233). Bytes via [`temen_coop_jit_wasm_by_handle_ptr`] (the shared buffer), valid
 /// until the next call of either accessor.
 #[no_mangle]
@@ -15424,7 +15449,7 @@ pub extern "C" fn temen_coop_shim_wasm(slot: u32) -> usize {
     let sig = if (slot as usize) < s.sigs.len() {
         Some(s.sigs[slot as usize].clone())
     } else {
-        // #1339: resolve the occupant through the slot mirror's `(domain, unit)`, never the §22 code
+        // #1339: resolve the occupant through the table's `(domain, unit)`, never the §22 code
         // handle — the guest's `release` right after `install` would otherwise leave an installed
         // interpreter-only unit with no shim, i.e. a null slot that traps the next emitted `call.dyn`.
         s.run.slot_unit(slot).and_then(|(cd, cu)| {
@@ -16188,9 +16213,9 @@ int main(void) {
         let caps = vec!["ping".to_string()];
         grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)));
         let tierup = leaf.map(|leaf| bytecode::TierUpConfig {
-            eligible: Arc::from([]),
-            page_checked: false,
+            root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf),
+            modules: None,
         });
         // 16 MiB: room for the libc's heap, and within the cap every platform backs flat.
         let reserved = m.memory.expect("a window").size_log2.max(24);

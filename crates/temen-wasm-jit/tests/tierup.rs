@@ -8,7 +8,8 @@
 
 use temen_interp::{bytecode, Trap, Value};
 use temen_wasm_jit::{
-    compile_module_tierup, compile_module_tierup_b2, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+    compile_module_tierup, compile_module_tierup_b2, compile_module_tierup_live, TRAP_MEMORY_FAULT,
+    TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -503,6 +504,84 @@ fn the_futex_gate_does_not_narrow_the_888_widening() {
         cap_widened,
         vec![false, true, false],
         "cap callee: f1 still emits — the #888 widening is intact"
+    );
+}
+
+/// #2248 — [`compile_module_tierup_live`], the cooperative driver's emit for a granted module a
+/// child runs. Its host bounces over the live window, as B2's does, so the cross-tier set widens:
+/// f1, pure compute calling the cap helper f2, emits. Its dispatch is the module's own, since the
+/// driver's shared table mirrors only the run's own program (#2273), so an indirect caller keeps
+/// the local table's rule: f3 `call.dyn`s and the module is not wholly in subset, so f3 stays
+/// interpreted where B2 emits it.
+const LIVE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  return v0
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vi = i32.wrap_i64 v0
+  vr = call.dyn (i64) -> (i64) vi (v0)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn the_live_emit_widens_but_keeps_its_own_dispatch() {
+    let m = build(LIVE);
+    let (_, local) = compile_module_tierup(&m, false).expect("local tier-up emit");
+    let (_, b2) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
+    let (_, live) = compile_module_tierup_live(&m, false, None).expect("live tier-up emit");
+    let (_, paged) = compile_module_tierup_live(&m, false, Some(12)).expect("paged live emit");
+    assert_eq!(
+        local,
+        vec![false, false, false, false],
+        "local: f1 cascades off"
+    );
+    assert_eq!(
+        b2,
+        vec![false, true, false, true],
+        "B2: f1 and the indirect caller emit"
+    );
+    assert_eq!(
+        live,
+        vec![false, true, false, false],
+        "live: f1 emits, the indirect caller stays interpreted"
+    );
+    assert_eq!(paged, live, "paged, the same set");
+    // The #1370 gate holds too: a callee a bounce cannot complete is no cross-tier leaf.
+    let (_, futex) =
+        compile_module_tierup_live(&build(FUTEX_CALLEE), false, None).expect("live emit");
+    assert_eq!(
+        futex,
+        vec![false, false, false],
+        "a futex callee: f1 cascades off"
     );
 }
 
