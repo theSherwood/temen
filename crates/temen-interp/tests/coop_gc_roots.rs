@@ -12,6 +12,9 @@
 //! spilled. Without a spill stack the bounce cannot see everything live below it, so the op must fail
 //! closed rather than under-report (GC.md §3.2 licenses over-approximation only).
 
+#[path = "support/coop.rs"]
+mod coop;
+
 use temen_interp::bytecode::TierUpConfig;
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_text::parse_module;
@@ -58,10 +61,9 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
         page_checked: false,
         leaf: None,
     };
-    let mut run =
-        bytecode::CoopRun::new(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))
-            .expect("supported")
-            .expect("entry in range");
+    let mut run = coop::coop_run(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))
+        .expect("supported")
+        .expect("entry in range");
     loop {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return Ok(vals),

@@ -2291,6 +2291,10 @@ fn main() {
             "live_caller",
             include_str!("../../crates/temen-interp/tests/fixtures/live_caller.temt"),
         ),
+        (
+            "root_leaves_a_spinner",
+            include_str!("../../crates/temen-interp/tests/fixtures/root_leaves_a_spinner.temt"),
+        ),
     ] {
         let (m, _) = emit(name, src);
         // #2219: the live caller spawns func 1's child image, which the page grants as the run's
