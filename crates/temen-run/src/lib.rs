@@ -44,6 +44,9 @@ pub use temen_interp::Value;
 // Re-export the mem-hook instrumentation stats so [`Instance::mem_hook_stats`] consumers need not
 // also depend on `temen-opt`.
 pub use temen_opt::instrument::MemHookStats;
+mod descriptors;
+pub use descriptors::raise_descriptor_limit;
+use descriptors::Descriptor;
 pub mod exec;
 pub mod fs;
 mod jit_proc;
@@ -4803,8 +4806,9 @@ unsafe fn mapped_atomic(
 struct ShmBacking {
     fd: std::os::fd::OwnedFd,
     ptr: *mut u8,
-    cap: usize, // page-rounded mapping length (the fd size)
-    len: usize, // logical region size the guest sees
+    cap: usize,        // page-rounded mapping length (the fd size)
+    len: usize,        // logical region size the guest sees
+    _held: Descriptor, // #2306 — `fd`'s share of the process's descriptors
 }
 
 // SAFETY: `ptr` is a `MAP_SHARED` mapping of `fd` — a process-wide shared object, not thread-local.
@@ -4817,7 +4821,7 @@ unsafe impl Sync for ShmBacking {}
 
 #[cfg(unix)]
 impl ShmBacking {
-    fn new(len: usize) -> std::io::Result<ShmBacking> {
+    fn new(len: usize, held: Descriptor) -> std::io::Result<ShmBacking> {
         use std::os::fd::AsRawFd;
         let page = host_page_size() as usize;
         let cap = len.max(1).div_ceil(page) * page;
@@ -4841,6 +4845,7 @@ impl ShmBacking {
             ptr: p as *mut u8,
             cap,
             len,
+            _held: held,
         })
     }
 }
@@ -4884,9 +4889,13 @@ impl Drop for ShmBacking {
 
 /// Create a §13 `SharedRegion` backing over a fresh `len`-byte OS shared-memory object — install it
 /// with [`temen_interp::Host::grant_shared_region_backed`] so the JIT can `mmap` it for real aliasing.
+/// #2306 — the guest-minted region's factory too ([`temen_interp::Host::set_region_factory`]), so
+/// it never panics: `Err` is the errno, `-EMFILE` past the process's descriptors ([`Descriptor`]),
+/// or what the OS refused.
 #[cfg(unix)]
-pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::sync::Arc::new(ShmBacking::new(len).expect("create shared region"))
+pub fn new_shared_region(len: usize) -> Result<RegionBacking, i64> {
+    let backing = ShmBacking::new(len, Descriptor::take()?).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// A §13 `SharedRegion` backing over a **real host file** (not a fresh memfd) — the bridge that makes
@@ -4903,6 +4912,7 @@ struct FileBacking {
     ptr: *mut u8,
     cap: usize, // page-rounded mapping length (≤ the file size, so no access faults past EOF)
     len: usize, // logical region size the guest sees
+    _held: Descriptor, // #2306 — `file`'s share of the process's descriptors
 }
 
 // SAFETY: identical rationale to `ShmBacking` — `ptr` is a `MAP_SHARED` mapping of a process-wide
@@ -4915,7 +4925,7 @@ unsafe impl Sync for FileBacking {}
 
 #[cfg(unix)]
 impl FileBacking {
-    fn new(file: std::fs::File, len: usize) -> std::io::Result<FileBacking> {
+    fn new(file: std::fs::File, len: usize, held: Descriptor) -> std::io::Result<FileBacking> {
         use std::os::fd::AsRawFd;
         let page = host_page_size() as usize;
         let cap = len.max(1).div_ceil(page) * page;
@@ -4944,6 +4954,7 @@ impl FileBacking {
             ptr: p as *mut u8,
             cap,
             len,
+            _held: held,
         })
     }
 
@@ -5006,9 +5017,16 @@ impl Drop for FileBacking {
 /// zero-copy file-mmap bridge (MMAP_CAPABILITY.md §4b). Install it with
 /// [`temen_interp::Host::grant_shared_region_backed`] and the guest maps it with the built-in
 /// `SharedRegion.map`, aliasing the real file into its window. Unix only for now.
+///
+/// The backing holds its **own** descriptor, a dup of `file`'s, so it outlives the caller's and
+/// both share one page cache. #2306 — that descriptor is one of the process's ([`Descriptor`]):
+/// `Err` is the errno, `-EMFILE` past them, or what the OS refused.
 #[cfg(unix)]
-pub fn new_file_region(file: std::fs::File, len: usize) -> std::io::Result<RegionBacking> {
-    Ok(std::sync::Arc::new(FileBacking::new(file, len)?))
+pub fn new_file_region(file: &std::fs::File, len: usize) -> Result<RegionBacking, i64> {
+    let held = Descriptor::take()?;
+    let dup = file.try_clone().map_err(|e| fs::io_errno(&e))?;
+    let backing = FileBacking::new(dup, len, held).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// A §13 `SharedRegion` backing over a Windows **pagefile-backed section** (`CreateFileMappingW` with
@@ -5021,7 +5039,8 @@ pub fn new_file_region(file: std::fs::File, len: usize) -> std::io::Result<Regio
 struct WinShmBacking {
     section: windows_sys::Win32::Foundation::HANDLE,
     ptr: *mut u8,
-    len: usize, // logical region size the guest sees
+    len: usize,        // logical region size the guest sees
+    _held: Descriptor, // #2306 — `section`'s share of the process's descriptors (unbounded here)
 }
 
 // SAFETY: `ptr`/`section` name a process-wide file mapping, not thread-local state. A §13 region is
@@ -5034,7 +5053,7 @@ unsafe impl Sync for WinShmBacking {}
 
 #[cfg(windows)]
 impl WinShmBacking {
-    fn new(len: usize) -> std::io::Result<WinShmBacking> {
+    fn new(len: usize, held: Descriptor) -> std::io::Result<WinShmBacking> {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
@@ -5068,6 +5087,7 @@ impl WinShmBacking {
             section,
             ptr: view.Value as *mut u8,
             len,
+            _held: held,
         })
     }
 }
@@ -5116,9 +5136,11 @@ impl Drop for WinShmBacking {
 
 /// Create a §13 `SharedRegion` backing over a fresh `len`-byte Windows section — install it with
 /// [`temen_interp::Host::grant_shared_region_backed`] so the JIT can alias it via `MapViewOfFile3`.
+/// #2306 — `Err` is the errno, as on unix.
 #[cfg(windows)]
-pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::sync::Arc::new(WinShmBacking::new(len).expect("create shared region"))
+pub fn new_shared_region(len: usize) -> Result<RegionBacking, i64> {
+    let backing = WinShmBacking::new(len, Descriptor::take()?).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).
@@ -8665,7 +8687,7 @@ mod file_region_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let backing = new_file_region(file, 8192).expect("map file region");
+        let backing = new_file_region(&file, 8192).expect("map file region");
 
         // 1. The file's existing bytes are visible through the alias (no copy-in, no staleness).
         let seen: Vec<u8> = (0..8).map(|i| backing.read_byte(i)).collect();
@@ -8731,7 +8753,7 @@ mod file_region_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let backing = new_file_region(file, 4096).expect("map file region");
+        let backing = new_file_region(&file, 4096).expect("map file region");
         // The whole region is addressable (reads return the zero-fill, not a fault).
         assert_eq!(backing.read_byte(0), 0);
         assert_eq!(backing.read_byte(4095), 0);

@@ -36,6 +36,8 @@ use temen_run::{
 use temen_verify::verify_module;
 
 fn main() {
+    // #2306 — as many descriptors for the guests' pool as the host allows.
+    temen_run::raise_descriptor_limit();
     if let Err(e) = try_main() {
         eprintln!("temen-run: {e}");
         process::exit(1);

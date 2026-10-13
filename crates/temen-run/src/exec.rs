@@ -14,6 +14,7 @@
 pub use temen_exec::*;
 use temen_ir::errno::*; // the one shared negative-errno table (#905)
 
+use crate::Descriptor;
 use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -206,6 +207,12 @@ fn host_dispatch(
 /// Run `argv` to completion with `stdin` fed to it; capture both output streams and collapse
 /// the wait status the POSIX-shell way.
 fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
+    // #2306 — the three pipes to the child are this process's descriptors while it runs.
+    let _held = [
+        Descriptor::take()?,
+        Descriptor::take()?,
+        Descriptor::take()?,
+    ];
     let mut child = Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())

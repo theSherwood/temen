@@ -9,7 +9,7 @@ const N: u64 = 100_000;
 
 #[test]
 fn concurrent_fetch_adds_lose_nothing() {
-    let r = temen_run::new_shared_region(4096);
+    let r = temen_run::new_shared_region(4096).expect("a region");
     let add = |r: Arc<dyn SharedBacking>| {
         std::thread::spawn(move || {
             for _ in 0..N {
@@ -25,7 +25,7 @@ fn concurrent_fetch_adds_lose_nothing() {
 
 #[test]
 fn a_load_never_sees_half_of_a_store() {
-    let r = temen_run::new_shared_region(4096);
+    let r = temen_run::new_shared_region(4096).expect("a region");
     let w = {
         let r = r.clone();
         std::thread::spawn(move || {
@@ -44,7 +44,7 @@ fn a_load_never_sees_half_of_a_store() {
 
 #[test]
 fn narrow_widths_and_refusals() {
-    let r = temen_run::new_shared_region(4096);
+    let r = temen_run::new_shared_region(4096).expect("a region");
     // A 4-byte store keeps to its 4 bytes, and its old value comes back zero-extended.
     r.atomic(16, 8, &mut |_| Some(u64::MAX));
     assert_eq!(r.atomic(16, 4, &mut |_| Some(7)), 0xffff_ffff);

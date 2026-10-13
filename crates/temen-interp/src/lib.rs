@@ -19870,7 +19870,8 @@ impl SharedBacking for VecBacking {
 
 /// #2111 — a region the run's domains made (a guest's `create_region` or a file mapping, or a thaw's
 /// rebuild): its backing, charged to `node` and every ancestor for as long as it lives — its `bytes`
-/// of `channel`, and (#2268) the mapping the host holds of it ([`region_cost`]). The charge rides the
+/// of `channel`, and (#2268, #2306) the mapping the host holds of it and that mapping's address space
+/// ([`region_cost`]). The charge rides the
 /// shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go of it last
 /// refunds the node that paid. A domain lets go of its regions when it ends
 /// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
@@ -19881,9 +19882,10 @@ struct ChargedRegion {
 }
 
 /// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
-/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it.
-fn region_cost(bytes: u64) -> [(usize, u64); 2] {
-    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1)]
+/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it, whose
+/// `size` (#2306) is address space the process's pool of it counts ([`RESERVED_POOL`]).
+fn region_cost(bytes: u64, size: u64) -> [(usize, u64); 3] {
+    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1), (RESERVED, size)]
 }
 
 impl SharedBacking for ChargedRegion {
@@ -19912,9 +19914,10 @@ impl SharedBacking for ChargedRegion {
 
 impl Drop for ChargedRegion {
     fn drop(&mut self) {
-        self.node
-            .tree
-            .refund_set(self.node.node, &region_cost(self.bytes));
+        self.node.tree.refund_set(
+            self.node.node,
+            &region_cost(self.bytes, self.backing.size()),
+        );
     }
 }
 
@@ -20571,10 +20574,10 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2305 — how much address space the windows of this process's guests may reserve between them:
-/// 64 TiB, half of what a 47-bit host gives a process, so the host's own mappings keep the other
-/// half. Every window reserves its whole mask domain up front, 128 GiB by default
-/// ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
+/// #2305 — how much address space the windows of this process's guests may reserve between them,
+/// and (#2306) the host's mappings of their regions: 64 TiB, half of what a 47-bit host gives a
+/// process, so the host's own mappings keep the other half. Every window reserves its whole mask
+/// domain up front, 128 GiB by default ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
 /// only be refused where it is built, which differs by engine (the interpreter falls back to a
 /// heap-backed window, the JIT cannot); so every domain's window is held against this at its
 /// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
@@ -20586,18 +20589,25 @@ pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
 };
 
 /// #2268, #2305 — what every run in this process holds between them of a resource the process has a
-/// fixed amount of: its OS mappings ([`maps_pool`]) or its address space ([`RESERVED_POOL`]).
-struct Pool(AtomicU64);
+/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`RESERVED_POOL`]), or
+/// (#2306, `temen-run`'s) its file descriptors.
+#[derive(Debug, Default)]
+pub struct Pool(AtomicU64);
 
 /// #2268 — what every run holds of [`maps_pool`].
-static MAPS_IN_USE: Pool = Pool(AtomicU64::new(0));
-/// #2305 — what every run's windows hold of [`RESERVED_POOL`].
-static RESERVED_IN_USE: Pool = Pool(AtomicU64::new(0));
+static MAPS_IN_USE: Pool = Pool::new();
+/// #2305 — what every run's windows and regions hold of [`RESERVED_POOL`].
+static RESERVED_IN_USE: Pool = Pool::new();
 
 impl Pool {
+    /// A pool nothing holds any of yet.
+    pub const fn new() -> Pool {
+        Pool(AtomicU64::new(0))
+    }
+
     /// Take `n` for a charge: `false`, taking nothing, when that would hold more than `size`
     /// (`check`). A [`Fits::Forced`] charge takes it regardless.
-    fn take(&self, n: u64, size: u64, check: bool) -> bool {
+    pub fn take(&self, n: u64, size: u64, check: bool) -> bool {
         n == 0
             || self.update(|used| {
                 let now = used.saturating_add(n);
@@ -20606,7 +20616,7 @@ impl Pool {
     }
 
     /// Hand `n` back.
-    fn give(&self, n: u64) {
+    pub fn give(&self, n: u64) {
         self.update(|used| Some(used.saturating_sub(n)));
     }
 
@@ -23173,12 +23183,11 @@ fn translate_cap_slots(
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
     /// #2268 — the region a capability maps a file as (§4b) is the guest's: its mapping is charged
-    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives.
+    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives. #2306 — so
+    /// is the address space the host maps it over, the whole file.
     fn grant_region(&mut self, backing: RegionBacking) -> i32 {
-        if !self
-            .budgets
-            .add(self.own_budget, &region_cost(0), Fits::All)
-        {
+        let cost = region_cost(0, backing.size());
+        if !self.budgets.add(self.own_budget, &cost, Fits::All) {
             return ENOMEM as i32;
         }
         let backing: RegionBacking = Arc::new(ChargedRegion {
@@ -23769,7 +23778,7 @@ pub struct Host {
     /// `None` (the default) mints the pure-Rust reference [`VecBacking`]; a flat-window embedder
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
-    region_factory: Option<fn(usize) -> RegionBacking>,
+    region_factory: Option<fn(usize) -> Result<RegionBacking, i64>>,
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
@@ -27253,25 +27262,51 @@ impl Host {
         })
     }
 
-    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
-    /// embedder's factory, as a guest mint uses, else the heap. #2111 — charged to this domain's
-    /// node whatever its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a
-    /// freeze carries no node's `channel` use.
-    pub fn rebuild_region(&self, bytes: &[u8]) -> RegionBacking {
-        let backing = match self.region_factory {
-            Some(f) => f(bytes.len()),
-            None => Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))),
-        };
+    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: a backing
+    /// as a guest mint gets one ([`Self::new_region`]). #2111 — charged to this domain's node whatever
+    /// its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a freeze carries
+    /// no node's `channel` use. #2306 — `Err`, the errno, when no backing can be had: the thaw
+    /// refuses, rather than run without the region.
+    pub fn rebuild_region(&self, bytes: &[u8]) -> Result<RegionBacking, i64> {
+        Ok(self.refill_region(self.new_region(bytes.len())?, bytes))
+    }
+
+    /// #2306 — a debugger moment's region, as [`Self::rebuild_region`] makes it, else on the heap: a
+    /// moment is the interpreter's, which any backing serves, so a seek is never refused for want of
+    /// an OS object.
+    pub(crate) fn rebuild_moment_region(&self, bytes: &[u8]) -> RegionBacking {
+        let backing = self
+            .new_region(bytes.len())
+            .unwrap_or_else(|_| Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))));
+        self.refill_region(backing, bytes)
+    }
+
+    /// `backing` holding `bytes`, charged to this domain's node past any ceiling ([`ChargedRegion`]).
+    fn refill_region(&self, backing: RegionBacking, bytes: &[u8]) -> RegionBacking {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        let cost = region_cost(bytes.len() as u64);
+        let cost = region_cost(bytes.len() as u64, backing.size());
         self.budgets.add(self.own_budget, &cost, Fits::Forced);
         Arc::new(ChargedRegion {
             backing,
             node: self.own_node(),
             bytes: bytes.len() as u64,
         })
+    }
+
+    /// #2306 — a fresh, zeroed backing of `len` bytes for a §13 region: the embedder's factory (OS
+    /// shared memory under the JIT, [`Self::set_region_factory`]), else the heap. `Err`, the errno,
+    /// when the one it uses refuses: the OS, the process's descriptor pool, or an allocation the host
+    /// cannot make. Never a panic: a guest's mint reaches it.
+    fn new_region(&self, len: usize) -> Result<RegionBacking, i64> {
+        if let Some(f) = self.region_factory {
+            return f(len);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+        bytes.resize(len, 0);
+        Ok(Arc::new(VecBacking(Mutex::new(bytes))))
     }
 
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
@@ -30934,7 +30969,9 @@ impl Host {
     /// §13/§14). A flat-window embedder passes an OS-shared-memory factory (e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints; without one, mints use
     /// the pure-Rust reference [`VecBacking`] (fine for the interpreter, unmappable by the JIT).
-    pub fn set_region_factory(&mut self, f: fn(usize) -> RegionBacking) {
+    /// #2306 — a factory refuses with the errno the guest gets, e.g. `-EMFILE` past the process's
+    /// descriptors: a guest's mint reaches it, so it must never panic.
+    pub fn set_region_factory(&mut self, f: fn(usize) -> Result<RegionBacking, i64>) {
         self.region_factory = Some(f);
     }
 
@@ -33141,15 +33178,18 @@ impl Host {
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return Ok(vec![EINVAL]);
                     }
-                    if !self
-                        .budgets
-                        .add(self.own_budget, &region_cost(len as u64), Fits::All)
-                    {
+                    let cost = region_cost(len as u64, len as u64);
+                    if !self.budgets.add(self.own_budget, &cost, Fits::All) {
                         return Ok(vec![ENOMEM]);
                     }
-                    let backing = match self.region_factory {
-                        Some(f) => f(len as usize),
-                        None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
+                    // #2306 — a backing the host cannot make is the guest's errno, its charge
+                    // handed back.
+                    let backing = match self.new_region(len as usize) {
+                        Ok(backing) => backing,
+                        Err(errno) => {
+                            self.budgets.refund_set(self.own_budget, &cost);
+                            return Ok(vec![errno]);
+                        }
                     };
                     let backing: RegionBacking = Arc::new(ChargedRegion {
                         backing,
@@ -37327,7 +37367,7 @@ mod region_charge_tests {
     #[test]
     fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
         let (parent, node, mut child, _) = child(-1);
-        let id = child.adopt_region(child.rebuild_region(&[7; 64]));
+        let id = child.adopt_region(child.rebuild_region(&[7; 64]).expect("rebuilt"));
         assert_eq!(child.regions[id as usize].read_byte(63), 7);
         assert_eq!(used(&parent, node), 64);
         child.release_memory();

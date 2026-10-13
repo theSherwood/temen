@@ -71,6 +71,7 @@
 //! from the C `fopen` mode string. Buffers/paths are window-relative; an out-of-window range is
 //! `-EFAULT` (fail-closed, never a host-side OOB).
 
+use crate::Descriptor;
 use crate::HostCap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -150,6 +151,7 @@ struct HostOpen {
     file: std::fs::File,
     readable: bool,
     writable: bool,
+    _held: Descriptor, // #2306 — `file`'s share of the process's descriptors
 }
 
 /// A live `mmap` over the real fs: the guest buffer `[base, base+len)` is bound to the open file at
@@ -213,6 +215,11 @@ impl HostFsState {
                 }
                 oo.truncate(flags & O_TRUNC != 0)
                     .create(flags & O_CREATE != 0);
+                // #2306 — the open file holds one of the process's descriptors while it is open.
+                let held = match Descriptor::take() {
+                    Ok(held) => held,
+                    Err(errno) => return errno,
+                };
                 let file = match oo.open(&path) {
                     Ok(f) => f,
                     Err(e) => return io_errno(&e),
@@ -221,6 +228,7 @@ impl HostFsState {
                     file,
                     readable: flags & O_READ != 0,
                     writable: flags & (O_WRITE | O_APPEND) != 0,
+                    _held: held,
                 };
                 let fd = alloc_fd(&mut self.open);
                 self.open[fd] = Some(o);
@@ -455,19 +463,15 @@ impl HostFsState {
                 let Some(Some(o)) = self.open.get(fd as usize) else {
                     return EBADF;
                 };
-                // Give the backing its **own** fd (dup) over the same OS file, so it outlives the
+                // The backing holds its **own** fd (a dup) over the same OS file, so it outlives the
                 // guest's fd and both share one page cache — the map and the fs cap's pread/pwrite/
                 // fsync stay coherent. Unix only for now (the `FileBacking` is `#[cfg(unix)]`);
                 // elsewhere the op is unavailable and the guest shim falls back to copy-in.
                 #[cfg(unix)]
                 {
-                    let dup = match o.file.try_clone() {
-                        Ok(f) => f,
-                        Err(e) => return io_errno(&e),
-                    };
-                    match crate::new_file_region(dup, len as usize) {
+                    match crate::new_file_region(&o.file, len as usize) {
                         Ok(backing) => minter.grant_region(backing) as i64,
-                        Err(e) => io_errno(&e),
+                        Err(errno) => errno,
                     }
                 }
                 #[cfg(not(unix))]
@@ -627,7 +631,7 @@ fn host_stat_bytes(md: &std::fs::Metadata) -> [u8; STATBUF_LEN] {
 /// and 66 on macOS, and Windows codes are not errno at all. So canonicalize through the portable
 /// `io::ErrorKind` (the shared `temen_ir::errno` table), falling back to the negated raw errno (the
 /// canonical value on Linux, the differential's reference host) for kinds without a fixed mapping.
-fn io_errno(e: &std::io::Error) -> i64 {
+pub(crate) fn io_errno(e: &std::io::Error) -> i64 {
     use std::io::ErrorKind;
     match e.kind() {
         ErrorKind::NotFound => ENOENT,
