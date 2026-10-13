@@ -9,7 +9,7 @@
 //!
 //! This pins the *scale* the pre-size blocked: a child declaring 1 MiB grows to the full 256 MiB carve
 //! in four `vm_map`s and touches the deepest page of every grown chunk. The wasmi driver plays
-//! `driveJitRun` (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the
+//! `driveDetachedRun` (`env.call_interp` → `run_cross_tier`, re-pointing `"mapped"` after each bounce); the
 //! oracle is the interpreter over the same carve with starter caps spanning it — the committed-declared,
 //! carve-growing window the op-13 step's interpreter fallback starts its child over
 //! (`PendingChild::start` with `committed_log2`). Value parity, four bounces, and a `"mapped"`
@@ -122,7 +122,7 @@ struct Drv {
     bounces: u32,
 }
 
-/// Drive the run's emitted `f0` on wasmi — `driveJitRun`'s role: `env.call_interp` runs the outlined
+/// Drive the run's emitted `f0` on wasmi — `driveDetachedRun`'s role: `env.call_interp` runs the outlined
 /// leaf on the interpreter (`run_cross_tier`) and re-points `"mapped"` at the grown extent after each
 /// bounce (`syncGlobals()`). Returns the value, the bounce count, and the final `"mapped"` high-water.
 fn drive(

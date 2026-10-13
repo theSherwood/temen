@@ -1118,8 +1118,8 @@ block 0 (vas: i64) {{
 // `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15` — the mini driver's
 // buddy-half carve) whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
 // read-only; `f0` reads K back through the `Ro` page → 40 + 1 + 75 = 116. On the op-13 JIT loop it emits
-// PAGED and runs on `driveJitRun` with the page-state table re-synced after the bounce. "K" sits at 16 KiB,
-// just above the NULL guard the single-shot bounce seeds; the browser's software page is 4 KiB.
+// PAGED and runs on `driveDetachedRun` with the page-state table re-synced after the bounce. "K" sits
+// at 16 KiB, above the NULL guard the single-shot bounce seeds; the browser's software page is 4 KiB.
 const OP13_PAGED_CHILD: &str = r#"memory 15
 data 16384 "K"
 func (i64, i64) -> (i64) {

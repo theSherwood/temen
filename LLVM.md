@@ -3037,7 +3037,7 @@ Slices, smallest meaningful first (do **not** aim at clang first):
 - **LLVM builds `-fno-exceptions -fno-rtti` by default** (`LLVM_ENABLE_EH/RTTI` off) — it lands on the
   exact C++ subset slice AG proved (classes, vtables, templates→monomorphized, global ctors). The
   on-ramp has *no* EH path, and LLVM needs none.
-- **The window reserves `1 << 40` (1 TiB), lazily paged** (`DEFAULT_RESERVED_LOG2`) — address-space
+- **The window reserves `1 << 37` (128 GiB), lazily paged** (`DEFAULT_RESERVED_LOG2`) — address-space
   scale is not the blocker; the heap grows to gigabytes through the `Memory` cap.
 - **APFloat** is LLVM's own arbitrary-precision float — self-contained, no libm dependency for the hard
   numerics.

@@ -10,7 +10,7 @@
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
 import { foreignImports } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
-import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, nimToolchain, nimCompileRun } from './wasmjit-module.js';
+import { runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, nimToolchain, nimCompileRun } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -74,18 +74,13 @@ async function evalWarm(source, jit) {
   const stdinBytes = source ? new TextEncoder().encode(source) : null;
   if (jit) {
     try {
-      const status = await runWarmJit(ex, memory, stdinBytes, `${warmUrl}#eval`, 1);
+      // `eval_run` on the pump over the restored image (#1414 S4-3c): whole as a leaf when the emitter
+      // takes it, else with its eligible regions emitted. driveCoopTierupRun stages the result in the
+      // same run-value/stdout slots as the interpreter.
+      const status = await runWarmCoop(ex, memory, stdinBytes, `${warmUrl}#coop`, 1);
       return { tier: 'warm+JIT', status, value: Number(ex.temen_run_value()), stdout: readStdout(), stderr: readStderr() };
     } catch {
-      // whole-program decline / trap → the cooperative tier-up drive (#816 item 4): a page-managing
-      // eval (grows/protects during the eval, so it isn't WasmDriven) still runs its eligible pure
-      // leaves on emitted wasm. driveCoopTierupRun stages the result in the same run-value/stdout slots.
-    }
-    try {
-      const status = await runWarmCoop(ex, memory, stdinBytes, `${warmUrl}#coop`, 1);
-      return { tier: 'warm-coop', status, value: Number(ex.temen_run_value()), stdout: readStdout(), stderr: readStderr() };
-    } catch {
-      // coop decline / trap → fall through to the warm interpreter (always correct, just unaccelerated)
+      // decline / trap → fall through to the warm interpreter (always correct, just unaccelerated)
     }
   }
   let stdinP = 0;
@@ -155,7 +150,7 @@ self.onmessage = async (e) => {
         // skipped when `primeJit` is false (a card whose warm+JIT declines, e.g. Tcl).
         if (msg.primeJit !== false && !jitPrimePromise) {
           jitPrimePromise = interpWarmPromise
-            .then(() => primeWarmJit(ex, memory, `${warmUrl}#eval`, 1))
+            .then(() => primeWarmJit(ex, memory, `${warmUrl}#coop`, 1))
             .catch(() => false)
             .finally(() => { jitPrimed = true; });
         }
@@ -169,7 +164,7 @@ self.onmessage = async (e) => {
       }
       // Wait for the relevant background warm-up so this Run reuses it (and never races the session): a
       // wasm-JIT Run waits for the JIT pre-compile; a warm-interp Run waits for the dry interp pre-run.
-      if (msg.jit) { if (jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmJit falls back */ } } }
+      if (msg.jit) { if (jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmCoop falls back */ } } }
       else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
       // Live-stream the eval's stdout to the page (#1142): the tee on the warm host (both tiers) fires
       // `stdout_chunk`, relayed here for the duration of the eval.

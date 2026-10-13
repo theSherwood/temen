@@ -1081,8 +1081,17 @@ the Phase-1 core loop.
 
 ## 4. Memory model  [SETTLED] (some details PARKED)
 
-- Each domain gets a large **reserved virtual-address window** (e.g. 2^40,
-  host-configurable). Guest pointers are **offsets into the window**.
+- Each domain gets a large **reserved virtual-address window** (2^37 = 128 GiB
+  by default, host-configurable). Guest pointers are **offsets into the window**.
+  A window spends the process's address space whatever it commits, so every
+  domain's window is held against a **process-wide pool** of it (64 TiB, half a
+  47-bit host's: 512 default windows) at its admission, on every engine alike, as
+  its mappings are held against the pool of those (#2268). One the pool cannot
+  hold is **refused there, never a host panic** (#2305): a run ends with
+  `ThreadFault` before it starts, a detached spawn answers `-EINVAL`, a fork or
+  spawn `-EAGAIN`. When other mappings fill the address space first, the JIT
+  refuses the window's build the same way, and the interpreter falls back to a
+  heap-backed window.
 - Real **demand-paged virtual memory via the host's MMU**: `map` / `unmap` /
   `protect`, file-backed mappings, guard pages, and COW are **host
   capabilities**, implemented with `mmap` / `mprotect` / `userfaultfd`.
@@ -1145,7 +1154,7 @@ the Phase-1 core loop.
   differential-tested in isolation against the interpreter and native.
 
 **Guard sizing & the 64-bit framing (clarification).** The window is a *64-bit*
-address space (e.g. 2^40 above); there is **no 32-bit index type** as in wasm32,
+address space (e.g. 2^37 above); there is **no 32-bit index type** as in wasm32,
 so the guard region behind the window does **not** need to span 2^32. It only has
 to cover the largest *immediate offset + access width* the bounded case will trust
 without re-proving the full base bound (pages-to-MiB of reach), because the base
@@ -2274,7 +2283,7 @@ default above still stands for every handle-gated capability.
 - Power-of-two, aligned sub-windows → a buddy-style carve of the parent window. *(The carve and the
   VA-subdivision tradeoff below go with the sub-window placement — retiring, 2026-09-29.)*
 - Deep nesting subdivides VA: a real **window-size vs. nesting-depth** tradeoff
-  (a 2^40 window nests many levels, but it is finite).
+  (a 2^37 window nests many levels, but it is finite).
 - "Zero slowdown" = zero *marginal, steady-state* cost for pass-through caps and
   already-mapped memory at any depth. You pay one crossing per *interposed*
   capability op and per *virtualized* fault — the best achievable, and the same
@@ -2346,7 +2355,7 @@ never emitted either (a remapping `call.cap` is not in-subset). `tierup_grow_win
 `jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
 unsynced divergences pinned as negative tests. The **page-state** axis is carried by the paged entry.
 What keeps an emitted access inside its window is the bounds check itself, not the `& MASK` clamp:
-the clamp is to the 2^40 reservation, and on the browser's wasm32 the module's memory is the
+the clamp is to the 2^37 reservation, and on the browser's wasm32 the module's memory is the
 embedder's whole linear memory. So the check is exactly `temen_mask::Window::checked` for **any**
 value a host writes to `"mapped"` (`mapped < offset + width` traps; nothing wraps), and a host never
 writes more than the window's backing holds — a wrong but backed live size is then a trap-parity
@@ -3918,7 +3927,7 @@ as open-ended, not a byproduct of the build.
   const RO data, `malloc`/`free` over `map`, Phase-2 C subset — **§3d**. Remaining:
   toolchain/linking (MVP = whole-program single module) is trivial under §3d.
 - ✅ **Concrete window params (Phase 3):** resolved — a *large* reserved window
-  (`2^40`) with guest-controlled growth + kernel demand paging, host-page default
+  (`2^37`) with guest-controlled growth + kernel demand paging, host-page default
   (page size queried at runtime, not pinned), final-effective-address masking,
   guard-page detect-and-kill, and real `map`/`unmap`/`protect`/`page_size` — **§4 / §3e**.
 - ✅ **Minimal MVP capability set:** `Stream` (stdio), `Exit`, `Clock`, `Memory`

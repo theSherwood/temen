@@ -12,7 +12,7 @@
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
 | `child` | 1 | 1 | 0 |
-| `coop` | 60 | 50 | 0 |
+| `coop` | 62 | 52 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 5 | 5 | 1 |
@@ -27,7 +27,7 @@
 | `module` | 3 | 0 | 0 |
 | `nim` | 5 | 5 | 0 |
 | `notes` | 2 | 2 | 0 |
-| `onramp` | 65 | 54 | 0 |
+| `onramp` | 64 | 53 | 0 |
 | `op13jit` | 9 | 9 | 0 |
 | `par` | 74 | 74 | 2 |
 | `parse` | 3 | 3 | 0 |
@@ -35,7 +35,7 @@
 | `prep` | 1 | 1 | 0 |
 | `run` | 19 | 18 | 0 |
 | `run0` | 1 | 1 | 0 |
-| `selfhost` | 2 | 2 | 0 |
+| `selfhost` | 1 | 1 | 0 |
 | `set` | 1 | 1 | 0 |
 | `snapshot` | 2 | 2 | 0 |
 | `status` | 1 | 1 | 0 |
@@ -134,6 +134,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_module`
 - `temen_coop_nfuncs`
 - `temen_coop_open`
+- `temen_coop_open_fs`
+- `temen_coop_open_selfhost_fs`
 - `temen_coop_paged`
 - `temen_coop_pagestate_len` — *unreferenced*
 - `temen_coop_pagestate_ptr`
@@ -285,7 +287,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_jit_run_env_bytes`
 - `temen_onramp_jit_run_finish`
 - `temen_onramp_jit_run_mapped`
-- `temen_onramp_jit_run_open_fs`
 - `temen_onramp_jit_run_pagestate_len`
 - `temen_onramp_jit_run_pagestate_ptr`
 - `temen_onramp_jit_run_report`
@@ -466,7 +467,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `selfhost`
 
 - `temen_selfhost_emit_object_fs`
-- `temen_selfhost_jit_emit_object_fs`
 
 ### `set`
 

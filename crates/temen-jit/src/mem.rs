@@ -63,17 +63,14 @@ unsafe impl Send for GuestWindow {}
 
 impl GuestWindow {
     /// Reserve `reserved` bytes (page-rounded) + a guard page as inaccessible, then commit the
-    /// `mapped` backed prefix read/write. `reserved` is raised to at least `mapped`.
+    /// `mapped` backed prefix read/write. `reserved` is raised to at least `mapped`. `None`, holding
+    /// nothing, when the OS gives neither: the address space has no room for the reservation, or the
+    /// commit is refused. Every caller refuses then (#2305) — a run ends with `ThreadFault` before it
+    /// starts, a spawn answers `-EINVAL`, a fork `-EAGAIN` — and none fails the host.
     ///
     /// For the inaccessible tail's fault boundary to agree with the interpreter's byte-exact
     /// `mapped` bound, `mapped` must be page-aligned whenever `reserved > mapped` — true for any
     /// `size_log2 >= 12`, which every caller of the decoupled form satisfies.
-    pub(crate) fn new(mapped: usize, reserved: usize) -> GuestWindow {
-        Self::try_new(mapped, reserved).expect("temen-jit: window reserve failed")
-    }
-
-    /// [`Self::new`], or `None` when the address space has no room for the reservation — what a
-    /// caller that can refuse (a fork: `-EAGAIN`) builds with instead of failing the host.
     pub(crate) fn try_new(mapped: usize, reserved: usize) -> Option<GuestWindow> {
         if mapped == 0 {
             return Some(GuestWindow {
@@ -92,14 +89,15 @@ impl GuestWindow {
         if base.is_null() {
             return None;
         }
-        // SAFETY: commit the backed prefix `[0, rw)` read/write; the tail + guard stay inaccessible
-        // so any access past `mapped` faults.
-        unsafe { commit_rw_or_panic(base, rw) };
-        Some(GuestWindow {
+        // Owned from here: a refused commit drops it, releasing the reservation.
+        let window = GuestWindow {
             base,
             mapped,
             total,
-        })
+        };
+        // SAFETY: commit the backed prefix `[0, rw)` read/write; the tail + guard stay inaccessible
+        // so any access past `mapped` faults.
+        unsafe { pal::commit_rw(base, rw) }.then_some(window)
     }
 
     /// The logical (backed) window `[0, mapped)`, readable/writable (freshly committed pages are
@@ -267,8 +265,9 @@ impl GuestWindow {
     /// An inaccessible page may still hold bytes (a `protect(none)` keeps them; only an `unmap`
     /// zeroes), so each is read through a brief read-write window on `self` and put straight back:
     /// the caller guarantees nothing runs on this window meanwhile (its only vCPU is unwound). Every
-    /// other page of `self` is left exactly as it was. `None` when the address space has no room for
-    /// the duplicate's reservation.
+    /// other page of `self` is left exactly as it was. `None`, `self` as it was, when the OS cannot
+    /// give the duplicate (#2305): no room for its reservation, a page it cannot commit or protect, or
+    /// an inaccessible page of `self` it cannot open for the read.
     ///
     /// # Safety
     /// No guest code runs on `self` during the call, and `prots` indexes only pages inside its
@@ -280,27 +279,43 @@ impl GuestWindow {
         }
         let page = pal::page_size();
         let prefix = round_up(self.mapped, page);
-        let hidden = |p: usize| prots.get(&p) == Some(&Prot::None);
-        // Open the inaccessible pages (prefix and committed tail) for the read.
-        for (&p, _) in prots.iter().filter(|&(&p, _)| hidden(p)) {
-            pal::protect(self.base.add(p * page), page, Prot::Rw);
-        }
+        let at = |w: &GuestWindow, p: usize| w.base.add(p * page);
+        // Open the inaccessible pages (prefix and committed tail) for the read — every one, or none
+        // is read: a page still closed would fault the host.
+        let mut opened = Vec::new();
+        let open = prots
+            .iter()
+            .filter(|&(_, &prot)| prot == Prot::None)
+            .all(|(&p, _)| {
+                let ok = pal::protect(at(self, p), page, Prot::Rw);
+                opened.extend(ok.then_some(p));
+                ok
+            });
         // The backed prefix in one copy; then each committed tail page, committed in the twin first.
-        std::ptr::copy_nonoverlapping(self.base, twin.base, prefix);
-        for (&p, _) in prots.range(prefix / page..) {
-            commit_rw_or_panic(twin.base.add(p * page), page);
-            std::ptr::copy_nonoverlapping(self.base.add(p * page), twin.base.add(p * page), page);
+        let copied = open && {
+            std::ptr::copy_nonoverlapping(self.base, twin.base, prefix);
+            prots.range(prefix / page..).all(|(&p, _)| {
+                let ok = pal::commit_rw(at(&twin, p), page);
+                if ok {
+                    std::ptr::copy_nonoverlapping(at(self, p), at(&twin, p), page);
+                }
+                ok
+            })
+        };
+        // Put `self` back. Closing a page it opened only merges what the opening split, so the OS
+        // has no cause to refuse it.
+        for p in opened {
+            pal::protect(at(self, p), page, Prot::None);
         }
-        // Put `self` back, and give the twin the same protections.
-        for (&p, &prot) in prots {
-            if hidden(p) {
-                pal::protect(self.base.add(p * page), page, Prot::None);
-            }
-            if prot != Prot::Rw {
-                pal::protect(twin.base.add(p * page), page, prot);
-            }
-        }
-        Some(twin)
+        // Give the twin the same protections: one it cannot take refuses the fork, as a twin that
+        // could write a page its page map forbids would be wrong.
+        let protected = || {
+            prots
+                .iter()
+                .filter(|&(_, &prot)| prot != Prot::Rw)
+                .all(|(&p, &prot)| pal::protect(at(&twin, p), page, prot))
+        };
+        (copied && protected()).then_some(twin)
     }
 
     /// The address range a fault must land in to be attributed to this window (the whole
@@ -1381,7 +1396,7 @@ mod tests {
     #[test]
     fn pal_guard_catches_tail_fault_not_in_window() {
         // 64 KiB committed inside a 1 MiB reservation: offset 0 is live, 512 KiB is in the tail.
-        let win = GuestWindow::new(64 << 10, 1 << 20);
+        let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
         assert!(
             !guarded(&win, read_at_0),
             "an in-window read must complete without a guard fault"
@@ -1431,8 +1446,8 @@ mod tests {
     #[cfg(all(windows, target_arch = "x86_64"))]
     #[test]
     fn a_guard_fault_with_a_wild_frame_pointer_is_caught_not_fatal() {
-        let win = GuestWindow::new(64 << 10, 1 << 20);
-        let elsewhere = GuestWindow::new(64 << 10, 1 << 20);
+        let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
+        let elsewhere = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
         WILD_RBP.store(
             elsewhere.base() as usize + (512 << 10),
             std::sync::atomic::Ordering::Relaxed,
@@ -1499,7 +1514,7 @@ mod tests {
     /// A plain Rust caller of a guarded call, entered from the test's asm below.
     #[cfg(all(windows, target_arch = "x86_64"))]
     extern "C" fn guarded_clobber() {
-        let win = GuestWindow::new(64 << 10, 1 << 20);
+        let win = GuestWindow::try_new(64 << 10, 1 << 20).expect("window");
         CLOBBER_CAUGHT.store(
             guarded(&win, clobber_then_fault),
             std::sync::atomic::Ordering::Relaxed,
@@ -1582,7 +1597,7 @@ mod tests {
 
     #[test]
     fn pal_window_is_writable_and_released() {
-        let mut win = GuestWindow::new(8 << 10, 64 << 10);
+        let mut win = GuestWindow::try_new(8 << 10, 64 << 10).expect("window");
         let w = win.rw_mut();
         w[0] = 0xAB;
         w[(8 << 10) - 1] = 0xCD;

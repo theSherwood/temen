@@ -1,11 +1,11 @@
 // Chromium smoke for the **snapshot worker** (WASM_AOT.md warm+JIT · issues #804/#805). Drives the real
 // page: each warm card (QuickJS, Lua, Tcl) runs its snapshot on a dedicated Worker (own engine + memory),
 // pre-warmed off the main thread; each Run is a message round-trip. Asserts every warm card runs
-// end-to-end on its warm tiers — warm-snapshot (toggle off) and, with the toggle on, the accelerated
-// cascade warm+JIT → warm-coop (#816: a whole-program-declining card like Lua accelerates on
-// warm-coop instead of falling to the interpreter) — that the work went *through the worker* (not a
-// silent main-thread fallback — `globalThis.__snapshotWorkerRuns` increments), and that fresh-per-Run
-// isolation holds. One worker per module means both cards stay warm at once.
+// end-to-end on its warm tiers — warm-snapshot (toggle off) and, with the toggle on, warm+JIT: the pump
+// runs the eval whole as a leaf, or with its regions emitted where the emitter declines it whole (#816,
+// #1414 S4-3c) — that the work went *through the worker* (not a silent main-thread fallback —
+// `globalThis.__snapshotWorkerRuns` increments), and that fresh-per-Run isolation holds. One worker per
+// module means both cards stay warm at once.
 //
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   node snapshot-worker-test.mjs
@@ -33,13 +33,11 @@ const CARDS = [
     leakClean: (out) => out.includes('clean') && !out.includes('4242'),
   },
   {
-    // Lua reaches lua_pcall's setjmp, so its `eval_run` routes to InterpDriven (#1081) and the
-    // WHOLE-PROGRAM warm+JIT declines (an emitted `luaV_execute` on a Lua-error longjmp path couldn't
-    // unwind — a correctness guard). Since #816's default flip it doesn't fall all the way to the warm
-    // interpreter: the cascade catches it on **warm-coop** — the interpreter still owns the eval (and
-    // its setjmp/longjmp), only eligible PURE leaves run on emitted wasm, so the longjmp concern can't
-    // arise. `jitDeclines` thus means "whole-program declines ⇒ runs on warm-coop", not warm-interp.
-    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.temen', jitDeclines: true,
+    // Lua reaches lua_pcall's setjmp, so the emitter declines its `eval_run` whole (InterpDriven,
+    // #1081: an emitted `luaV_execute` on a Lua-error longjmp path couldn't unwind). The pump runs the
+    // eval with its regions emitted instead (#816, #1414 S4-3c): the interpreter owns the eval and its
+    // setjmp/longjmp, and only eligible PURE leaves run on emitted wasm.
+    name: 'Lua (5.4.7 — write & run)', asset: 'lua_snapshot.temen',
     plain: ['print("hi", 6 * 7)\n', 'hi\t42'],
     heavy: ['local s=0; for i=1,200000 do s=s+i end; print("sum", s)\n', 'sum\t20000100000'],
     leakSet: 'leaked = 4242; print("set", leaked)\n',
@@ -86,10 +84,11 @@ try {
     };
   };
 
-  // Prewarm pre-compiles the warm+JIT `eval_run` off the main thread, so the FIRST wasm-JIT Run is a
-  // cache hit rather than paying the ~12.7 MB `WebAssembly.compile`. Before running anything, wait for
-  // each card's worker to finish pre-compiling and assert it compiled exactly once with no eval yet
-  // (compiles=1, hits=0) — i.e. the compile happened during pre-warm, not on the first Run.
+  // Prewarm pre-compiles the warm+JIT emit off the main thread (the leaf, or the regions where the
+  // emitter declines `eval_run` whole), so the FIRST wasm-JIT Run is a cache hit rather than paying the
+  // `WebAssembly.compile`. Before running anything, wait for each card's worker to finish pre-compiling
+  // and assert it compiled exactly once with no eval yet (compiles=1, hits=0) — i.e. the compile
+  // happened during pre-warm, not on the first Run.
   const statsOf = (c) => page.evaluate((u) => globalThis.__snapshotClient?.stats(u), `./assets/${c.asset}`);
   for (const c of CARDS) {
     if (c.noJit) continue; // warm-snapshot-only cards (Tcl) don't pre-compile a JIT
@@ -100,18 +99,9 @@ try {
       if (st && st.ok && st.jitPrimed) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    if (c.jitDeclines) {
-      // Whole-program warm+JIT declines (setjmp-rooted eval_run → InterpDriven, #1081): the prime
-      // found nothing wasm-drivable to compile, so compiles stays 0 at prewarm time — the eval will
-      // accelerate on warm-coop (leaves) at Run time, which emits its own leaves then (compiles→1).
-      st && st.ok && st.jitPrimed && st.compiles === 0
-        ? ok(`${tag}: whole-program warm+JIT declines (setjmp, #1081) — prewarm compiled nothing (compiles=0); eval will run on warm-coop`)
-        : fail(`${tag}: expected a warm+JIT decline (jitPrimed, compiles=0): ${JSON.stringify(st)}`);
-    } else {
-      st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
-        ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
-        : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
-    }
+    st && st.ok && st.jitPrimed && st.compiles === 1 && st.hits === 0
+      ? ok(`${tag}: prewarm pre-compiled warm+JIT (compiles=1, hits=0 before any Run → first JIT Run is a cache hit)`)
+      : fail(`${tag}: prewarm did NOT prime the JIT compile: ${JSON.stringify(st)}`);
   }
 
   for (const c of CARDS) {
@@ -132,13 +122,9 @@ try {
       await setSrc(c, c.heavy[0]);
       before = await workerRuns();
       r = await run(c);
-      // A whole-program-declining card ticks the toggle and the cascade catches it on warm-coop
-      // (#816): eligible leaves on emitted wasm, correct output, still on the worker — labeled
-      // warm-coop rather than warm+JIT. A non-declining card runs the whole eval on warm+JIT.
-      const wantTier = c.jitDeclines ? 'warm-coop' : 'warm+JIT';
-      if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes(wantTier)) ok(`${tag}: ${c.jitDeclines ? 'warm+JIT declines → warm-coop' : 'warm+JIT'} on the worker → ${JSON.stringify(r.stdout.trim())}`);
+      if (r.state === 'done' && r.stdout.includes(c.heavy[1]) && r.label.includes('warm+JIT')) ok(`${tag}: warm+JIT on the worker → ${JSON.stringify(r.stdout.trim())}`);
       else fail(`${tag} warm+JIT: state=${r.state} label=${r.label} stdout=${JSON.stringify(r.stdout)}`);
-      (await workerRuns()) > before ? ok(`${tag}: ${c.jitDeclines ? 'warm+JIT toggle Run' : 'warm+JIT'} ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
+      (await workerRuns()) > before ? ok(`${tag}: warm+JIT ran on the worker (counter +1)`) : fail(`${tag}: warm+JIT did NOT run on the worker`);
     }
 
     // fresh-per-Run isolation: a global in one Run must not leak into the next (snapshot restored each Run).
@@ -158,12 +144,6 @@ try {
     const st = await statsOf(c);
     if (c.noJit) {
       st && st.ok && st.compiles === 0 ? ok(`${tag}: warm-snapshot-only — no JIT compiled (compiles=0)`) : fail(`${tag}: unexpected JIT compile: ${JSON.stringify(st)}`);
-    } else if (c.jitDeclines) {
-      // Whole-program warm+JIT never compiled (it declines), but warm-coop emitted the eval's leaves
-      // once and reused them across the toggle-on Runs (#816): compiles=1 (the coop emit), hits≥1.
-      st && st.ok && st.compiles === 1 && st.hits >= 1
-        ? ok(`${tag}: warm+JIT declines → warm-coop emitted leaves once and reused them (compiles=1, hits=${st.hits})`)
-        : fail(`${tag}: expected the warm-coop leaf emit (compiles=1, hits≥1): ${JSON.stringify(st)}`);
     } else {
       st && st.ok && st.compiles === 1 && st.hits >= 1
         ? ok(`${tag}: warm+JIT Run reused the pre-compiled instance (compiles=1, hits=${st.hits})`)

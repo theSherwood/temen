@@ -8,7 +8,7 @@
 import { loadEngine, makeRunner, readParStdout } from './par.js';
 import { openJitReactor } from './wasmjit-reactor.js';
 import {
-  runJitModule, runWarmJit, runWarmCoop, runJitCompiler, runJitSelfhost, nimToolchain, nimCompileRun,
+  runJitModule, runWarmCoop, runJitCompiler, runJitSelfhost, nimToolchain, nimCompileRun,
 } from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
 import { createDapClient } from './dap.js';
@@ -1847,7 +1847,7 @@ SELECT n, a AS fib FROM fib;
     jit: true, // tick "wasm-JIT" for the **warm+JIT** tier (WASM_AOT.md): `eval_run` emitted to wasm and
     // run over the restored warm image — init stays paid-once, the eval runs near-native (the win is
     // compute-heavy JS; a trivial program is already ~instant on warm-interp). `runModule` routes a warm
-    // card's JIT toggle to `runWarmJit` (not the cold `_start` path). See LLVM.md "Active target — QuickJS".
+    // card's JIT toggle to `runWarmCoop` (not the cold `_start` path). See LLVM.md "Active target — QuickJS".
     editable: true,
     lang: 'js',
     url: './assets/qjs_snapshot.temen',
@@ -2707,19 +2707,19 @@ async function runModule(c) {
   if (status === undefined && useJit && ex.warm) {
     try {
       // Warm+JIT (WASM_AOT.md): evaluate the user's code on emitted wasm **over the restored warm image**
-      // — the QuickJS runtime init stays paid-once (the snapshot), and the eval itself runs near-native.
-      // The warm session must be open first (temen_warm_jit_open emits `eval_run` from it); a decline/trap
-      // throws → we fall back to the interpreter warm path below. The compiled Module is cached under a
-      // key distinct from the cold `_start` module (a different emit rooted at `eval_run`).
+      // — the runtime init stays paid-once (the snapshot), and the eval runs on the pump: whole as a leaf
+      // when the emitter takes `eval_run`, else with its eligible regions emitted (#1414 S4-3c). A
+      // decline/trap throws → we fall back to the interpreter warm path below. The compiled Module is
+      // cached under a key distinct from the cold `_start` module (a different emit rooted at `eval_run`).
       const needOpen = warmSessionUrl !== ex.url;
       if (needOpen) setState(c, 'running', 'warming up runtime (first Run)…');
       if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
-      status = await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
+      status = await runWarmCoop(eng.ex, eng.memory, stdinBytes, `${ex.url}#coop`);
       rv = Number(eng.ex.temen_run_value());
       stdout = readModuleStdout();
       tier = 'warm+JIT';
     } catch (e) {
-      logTo(c, `warm-JIT unavailable (${e.message}); falling back to the warm interpreter`);
+      logTo(c, `warm+JIT unavailable (${e.message}); falling back to the warm interpreter`);
       runNote(rec, { jitFallbackReason: e.message });
       status = undefined;
     }
@@ -2743,8 +2743,8 @@ async function runModule(c) {
     }
     if (status === undefined) {
       try {
-        // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
-        // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
+        // Run on the emitted tier (the pump: the root whole as a leaf, else its regions); the run's end leaves
+        // stdout/exit/value in the shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
         // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
         // result matches on both tiers (a trap throws → we fall back to the interpreter below).
         // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the
@@ -2758,24 +2758,6 @@ async function runModule(c) {
         runNote(rec, { jitFallbackReason: e.message });
         status = undefined;
       }
-    }
-  }
-  if (status === undefined && useJit && ex.warm) {
-    try {
-      // Warm+JIT declined/trapped (a page-managing eval that grows/protects during eval) → the
-      // cooperative tier-up drive (#816 item 4): eligible pure leaves run on emitted wasm over the
-      // restored warm image, the interpreter owns the eval. A decline/trap throws → the warm
-      // interpreter below. Same run-value/stdout slots as the other tiers. (Main-thread fallback when
-      // the snapshot worker missed; the worker's evalWarm runs this same cascade.)
-      if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
-      status = await runWarmCoop(eng.ex, eng.memory, stdinBytes, `${ex.url}#coop`);
-      rv = Number(eng.ex.temen_run_value());
-      stdout = readModuleStdout();
-      tier = 'warm-coop';
-    } catch (e) {
-      logTo(c, `warm-coop unavailable (${e.message}); falling back to the warm interpreter`);
-      runNote(rec, { coopFallbackReason: e.message });
-      status = undefined;
     }
   }
   if (status === undefined && ex.warm) {
@@ -4342,26 +4324,26 @@ async function proveModuleParity(c) {
     // Yield a paint so "proving…" lands before the synchronous interpreter run blocks the thread.
     await new Promise((r) => setTimeout(r, 30));
     // A warm card runs the two **warm** tiers, so prove those agree: warm-interp (`temen_warm_eval`) ≡
-    // warm+JIT (`runWarmJit`), both evaluating over the same restored snapshot.
+    // warm+JIT (`runWarmCoop`: `eval_run` on the pump, whole or in regions), both evaluating over the same
+    // restored snapshot.
     if (ex.warm) {
       if (!ensureWarmSession(bytes, ex.url)) throw new Error('warm session unavailable for this module');
       const interpOut = warmEval(stdinBytes).stdout;
       let warmJitOut;
       try {
-        await runWarmJit(eng.ex, eng.memory, stdinBytes, `${ex.url}#eval`);
+        await runWarmCoop(eng.ex, eng.memory, stdinBytes, `${ex.url}#coop`);
         warmJitOut = readModuleStdout();
       } catch (e) {
-        // A setjmp-rooted guest (e.g. Lua's `lua_pcall`) routes `eval_run` to InterpDriven (#1081), so
-        // `temen_warm_jit_open` declines with STATUS_UNSUPPORTED (2) and this guest has only one warm
-        // tier — the warm interpreter, which already ran above. That's the documented fallback, not a
-        // failure: report the single-tier result rather than erroring the card.
+        // A guest with nothing for the emitted tier (status 2) has only one warm tier — the warm
+        // interpreter, which already ran above. That's the documented fallback, not a failure: report
+        // the single-tier result rather than erroring the card.
         if (eng.ex.temen_status() === 2) {
-          setState(c, 'done', `✓ warm-interp only — warm+JIT declined for this guest (setjmp-rooted, ${interpOut.length}B stdout)`);
-          logTo(c, `parity: warm+JIT declined (eval_run → InterpDriven, #1081); warm interpreter carries this guest`);
+          setState(c, 'done', `✓ warm-interp only — nothing for the emitted tier in this guest (${interpOut.length}B stdout)`);
+          logTo(c, `parity: warm+JIT declined; the warm interpreter carries this guest`);
           return;
         }
         setState(c, 'error', `✗ warm+JIT unavailable: ${e.message}`);
-        logTo(c, `parity: warm-JIT emit failed: ${e.message}`);
+        logTo(c, `parity: warm+JIT failed: ${e.message}`);
         return;
       }
       if (interpOut === warmJitOut) {

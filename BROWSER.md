@@ -515,7 +515,7 @@ rather than owning a private copy, and the resident table used to drop those sym
 
 **The card, as wired.** `web/play.js` opens both units once per page (`openPgUnits`) and compiles with
 `flags = -g | CHIBICC_PROGRAM_UNIT` — the second bit on `temen_run_onramp_fs` /
-`temen_onramp_jit_run_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. A missing
+`temen_coop_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. A missing
 asset, or a stale one that `temen_link_lib_open` declines, fails the run and names
 `scripts/rebuild-assets.sh`: there is no whole-program fallback, since a program compiled without a link
 step has no heap. Measured in the *wasm* engine by
@@ -1180,10 +1180,11 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
    #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a
    page-op child **paged** (`compile_jit_paged` → `compile_module_reactor_paged`; `JitOnrampRun`
-   rebuilds the page-state table after each bounce and `driveJitRun` re-points `"pagestate"`/`"mapped"`,
-   the child's real starter `AddressSpace` handle reaching the emitted entry) — the same paged emit
-   serves a root on-ramp guest that `unmap`s/`protect`s (`browser/tests/jit_paged_onramp.rs`, the wasmi
-   twin of `driveJitRun`; `browser-op13jit-e2e-test.mjs` in real Chromium). A child the emit still
+   rebuilds the page-state table after each bounce and `driveDetachedRun` re-points
+   `"pagestate"`/`"mapped"`, the child's real starter `AddressSpace` handle reaching the emitted entry) —
+   the same paged emit serves a root on-ramp guest that `unmap`s/`protect`s
+   (`browser/tests/jit_paged_onramp.rs`, the wasmi twin of that single-shot driver;
+   `browser-op13jit-e2e-test.mjs` in real Chromium). A child the emit still
    declines (`SharedRegion` aliasing, fibers) runs on the interpreter over the same carve and marshaled
    powerbox instead of trapping the driver (`op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
    marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,

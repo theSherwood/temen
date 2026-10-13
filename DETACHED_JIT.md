@@ -57,7 +57,7 @@ child in its own address space.** In temen that structure already has a name.
 |---|---|---|
 | `instantiate_detached(minter, module, grants_ptr, grants_n, entry, size_log2, quota)` — Instantiator **op 15** | `crates/temen-interp/src/lib.rs` ~11811 | **Built** (interpreter) |
 | `WindowMinter` cap (`cap_id` 15), embedder-granted, byte quota, `window_minter_take` at each mint | `lib.rs` 16256, 20950–20975 | **Built** |
-| Detached child = **fresh reservation + guard exactly like a root run's**: `Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)` — so it `vm_map`-grows into a 2^40 reservation, natively | `lib.rs` ~11900 | **Built** |
+| Detached child = **fresh reservation + guard exactly like a root run's**: `Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)` — so it `vm_map`-grows into a 2^37 reservation, natively | `lib.rs` ~11900 | **Built** |
 | Detached window size must equal the module's declared (`mod_ok = memory_log2 == size_log2`, §14 transparency) | `lib.rs` ~11889 | **Built** |
 | Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
 | op 15 optional trailing `(args_ptr, args_len)` — the spawn-time args payload copied to the child's `module_args_base()` (#1286) | `lib.rs` op-15 arm; `bytecode.rs` `Op::InstantiateDetached` | **Built** (both engines) |
@@ -129,7 +129,7 @@ import is a **fresh** `WebAssembly.Memory` created for it, not the engine's shar
   construction**, not by mask. `"mapped"` is **still required**: the memory's page count is
   ≥ the committed extent (64 KiB grow granularity; `mapped` may sit mid-page), so dropping
   the bound would admit reads of uncommitted zero pages the interpreter faults on — an
-  INVARIANT #9 trap-parity divergence. The `& MASK` (2^40 − 1, already vestigial on wasm32)
+  INVARIANT #9 trap-parity divergence. The `& MASK` (2^37 − 1, already vestigial on wasm32)
   becomes pure defense-in-depth and may be dropped later; not in this slice.
 - **Emit reuse**: because the emit is position-independent (S1), a cached child compile serves
   detached children unchanged (`OP13_CHILD_EMIT` keys on the module hash only; `env.memory` is
@@ -311,7 +311,7 @@ most parents never write it.
 A default must fail safe. Detached does; nested does not. Detached-by-default also makes
 attestation the honest norm ("no ancestor holds read authority" is a checkable runtime fact)
 and sidesteps the partition trap everywhere — the browser first, but a native parent spawning
-thousands of children or a few multi-GiB ones partitions its 1 TiB too.
+thousands of children or a few multi-GiB ones partitions its 128 GiB too.
 
 **Where the cost actually lives — decouple two decisions.** The blast-radius sweep (§6) shows
 that *hosting op 15 on the JIT tiers* (§3) is additive and renegotiates **no** invariant, while
@@ -358,7 +358,7 @@ Both spawns exist on every tier with **platform-independent semantics**:
 | Spawn | Semantics | Data plane | Growth bound | Native | wasm-JIT |
 |---|---|---|---|---|---|
 | nested (op 13) | shares parent's address space | zero-copy alias | parent's reservation | sub-range of parent mmap | sub-range of the shared `Memory` |
-| detached (op 15) | own address space | copy at the cap boundary | its own reservation | own mmap (1 TiB lazy) | own `WebAssembly.Memory` |
+| detached (op 15) | own address space | copy at the cap boundary | its own reservation | own mmap (128 GiB lazy) | own `WebAssembly.Memory` |
 
 The dev's question is purely semantic — *do these children need to alias each other's
 memory?* — and the answer is the same on every platform. The one asymmetry that survives is

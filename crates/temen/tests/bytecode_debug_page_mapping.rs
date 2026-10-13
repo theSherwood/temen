@@ -17,7 +17,7 @@ use temen_interp::bytecode::{self, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, Value};
 use temen_text::parse_module;
 
-// A `memory 17` (128 KiB mapped, 1 TiB reserved) root granted an `AddressSpace` over `[0, 1 MiB)`, so it
+// A `memory 17` (128 KiB mapped, 128 GiB reserved) root granted an `AddressSpace` over `[0, 1 MiB)`, so it
 // can manage pages inside — including growing a page just past the 128 KiB prefix. All spans are 16 KiB
 // (a whole multiple of every host page size), so each op lands on clean page boundaries on any host.
 //

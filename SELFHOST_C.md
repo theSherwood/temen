@@ -282,7 +282,9 @@ compiler bug is a clean error, never an escape.
    export) that grants the same headless memfs powerbox the bytecode `onramp_fs_exec` does (shared
    `chibicc_card_image` + `chibicc_card_argv`, which honours the same `-g` debug-info flag) and seeds argv
    at `POWERBOX_ARGS_BASE`, plus the `runJitCompiler` JS driver (a sibling of `runJitModule`). **No
-   substrate / TCB change** — the emitter, the interpreter, and the powerbox are all untouched. Gated by:
+   substrate / TCB change** — the emitter, the interpreter, and the powerbox are all untouched.
+   *(Retired by #1414 S4-3b: the card's compile is now a pump open, `temen_coop_open_fs`, which runs
+   chibicc's root whole as a leaf, page-checked over its read-only data.)* Gated by:
    - `browser/tests/chibicc_jit.rs` — a native `wasmi` differential (the `jit_module.rs` pattern): the
      JIT-emitted IR is **byte-identical** to the interpreter oracle (`onramp_fs_exec`), and the emitted
      program then parses + runs to its expected stdout.
@@ -607,7 +609,9 @@ compiler bug is a clean error, never an escape.
    sources + the ~96-file glibc header closure `chibicc.h` pulls + `selfhost_prelude.h`, built by
    `browser/build-selfhost-assets.mjs` via `chibicc -M`) on an `fs` cap and runs
    `temen_selfhost_jit_emit_object_fs` (a 128 MiB window — `codegen_ir.c`'s ~1.2 MB output overruns the
-   single-file card's 32 MiB and traps `unreachable` mid-emit; measured) with a bytecode fallback. The
+   single-file card's 32 MiB and traps `unreachable` mid-emit; measured) with a bytecode fallback.
+   *(#1414 S4-3b: now `temen_coop_open_selfhost_fs` on the pump, whose window grows as the compile
+   needs.)* The
    emitted object is **byte-identical to native `chibicc --emit-object`**, gated in real Chromium
    (`browser-play-editor-test.mjs`: compiles `tokenize.c` in-browser, diffs the object against the native
    binary, and the card's "Prove interp ≡ JIT" shows both tiers byte-identical), plus a native
