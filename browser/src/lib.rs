@@ -3813,7 +3813,7 @@ fn grant_onramp_caps(
     // `self.covers`, `export.handle` and `call.import.dyn` fail closed here but not under the CLI,
     // and the unconditional NULL guard (#1094, INVARIANTS #13) is never recorded. #1234 needs it for
     // a third reason: a §14 **same-module** child's import manifest *is* this module's, and the
-    // spawn arms fetch it through `Host::module_imports(SELF_MODULE)`.
+    // spawn arms bind it from the self module.
     host.set_self_module(&std::sync::Arc::new(m.clone()));
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
     // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
@@ -4547,11 +4547,7 @@ fn posix_host_build(
         .collect();
     host.set_import_bindings(bindings);
     for (cm, paths) in run.commands {
-        let ch = host.grant_prepared(cm);
-        let wl = cm.module().memory.map_or(0, |mc| mc.size_log2);
-        for path in paths {
-            posix.register_executable(path, ch, wl);
-        }
+        posix.grant_executable(&mut host, cm, paths);
     }
     if run.loader {
         host.set_module_validator(temen_interp::module_blob_validator);

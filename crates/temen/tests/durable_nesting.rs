@@ -561,7 +561,7 @@ fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
 }
 
 /// The per-child R5 identity gate: thawing a separate-module artifact **without** re-granting the
-/// child's module (or with a *different* module) fails closed — `module_by_digest` finds no match,
+/// child's module (or with a *different* module) fails closed — `tables_by_digest` finds no match,
 /// so the parent's re-executed `join` traps rather than mis-running a wrong module in the carve.
 #[test]
 fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {

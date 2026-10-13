@@ -478,7 +478,7 @@ pub fn digest256(bytes: &[u8]) -> [u8; 32] {
 }
 
 pub fn encode_module(m: &Module) -> Vec<u8> {
-    encode_impl(m, false)
+    encode_impl(m, Dialect::Module)
 }
 
 /// Encode a **link unit** (object dialect, header flag bit 0): a pre-link module that may carry
@@ -486,10 +486,33 @@ pub fn encode_module(m: &Module) -> Vec<u8> {
 /// `link` resolves away. The binary twin of a pre-link text unit. Objects are re-read only by
 /// [`decode_unit`]; the runnable path ([`decode_module`]) rejects them at the header.
 pub fn encode_unit(m: &Module) -> Vec<u8> {
-    encode_impl(m, true)
+    encode_impl(m, Dialect::Object)
 }
 
-fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
+/// Encode the **identity** of a module: its runnable encoding ([`encode_module`]) without what does
+/// not affect what it runs: its imports (already resolved), its debug info, and the link-only
+/// metadata (relocations, the thread-local template, data exports). Everything else rides it: the
+/// code, the memory and data image, which data bytes are function indices (#1830: an analysis of its
+/// indirect calls relies on them), the exports, the interface offers and the type section. A module
+/// and its debug-stripped re-grant encode the same. This is what the §4 module-identity digest hashes
+/// (`temen_interp::module_digest`). It encodes from `m` in place, without a stripped copy (#1883).
+pub fn encode_module_identity(m: &Module) -> Vec<u8> {
+    encode_impl(m, Dialect::Identity)
+}
+
+/// Which sections an encoding writes ([`encode_impl`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    /// A runnable module ([`encode_module`]).
+    Module,
+    /// A link unit ([`encode_unit`]).
+    Object,
+    /// A module's identity ([`encode_module_identity`]).
+    Identity,
+}
+
+fn encode_impl(m: &Module, dialect: Dialect) -> Vec<u8> {
+    let object = dialect == Dialect::Object;
     let mut out = Vec::new();
     // The unified TEMEN wire header (WIRE.md): the object dialect is its own `kind`, not a flag.
     wire::write_header(
@@ -564,7 +587,7 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
                 }
             }
         }
-    } else {
+    } else if dialect == Dialect::Module {
         assert!(
             m.data_ptrs.is_empty(),
             "data.ptr relocations are object-dialect; resolve via link before encode_module"
@@ -579,7 +602,7 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
             write_uleb(&mut out, r.at);
             write_str(&mut out, &r.name);
         }
-    } else {
+    } else if dialect == Dialect::Module {
         assert!(
             m.data_funcrefs.is_empty(),
             "data.funcref relocations are object-dialect; resolve via link before encode_module"
@@ -595,7 +618,7 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
             write_uleb(&mut out, d.bytes.len() as u64);
             out.extend_from_slice(&d.bytes);
         }
-    } else {
+    } else if dialect == Dialect::Module {
         assert!(
             m.tls.is_empty(),
             "a thread-local template is object-dialect; place it via link before encode_module"
@@ -605,8 +628,12 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     // import-free module (every prior frontend's output, and any unit whose symbols were already
     // resolved) writes a single `0` here. A non-empty section is a unit shipped with **unresolved**
     // symbols, for a loader to bind by name (DESIGN.md §22 host-assisted resolve).
-    write_uleb(&mut out, m.imports.len() as u64);
-    for imp in &m.imports {
+    let imports: &[Import] = match dialect {
+        Dialect::Identity => &[],
+        Dialect::Module | Dialect::Object => &m.imports,
+    };
+    write_uleb(&mut out, imports.len() as u64);
+    for imp in imports {
         // v8: one name string (dotted namespacing by convention), then the shape reference —
         // tag byte (0 = func, 1 = interface) + uleb type-section index. Signatures live in the
         // type section; the wire never duplicates them.
@@ -689,7 +716,11 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     // Optional strippable debug section (DEBUGGING.md §6/§2a). Written only when present, so a
     // module without debug info encodes byte-identically to before (snapshot digests, round-trip
     // fixtures): the decoder treats "no bytes after the funcs" as no debug info.
-    if let Some(di) = &m.debug_info {
+    if let Some(di) = m
+        .debug_info
+        .as_ref()
+        .filter(|_| dialect != Dialect::Identity)
+    {
         encode_debug_info(&mut out, di);
     }
     out
@@ -3556,6 +3587,72 @@ mod debug_tests {
             bytes_dbg.starts_with(&bytes_none),
             "debug section is appended after a byte-identical prefix"
         );
+    }
+
+    /// #1883 — the identity encoding is the runnable encoding of the module with its imports, debug
+    /// info and link-only metadata stripped: byte for byte what the module-identity digest hashed
+    /// when it encoded a stripped copy. Snapshot artifacts carry that digest, so it must not move.
+    #[test]
+    fn identity_is_the_stripped_module_encoding() {
+        let mut m = module(Some(sample_debug()));
+        m.memory = Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        });
+        m.data = vec![Data {
+            offset: 8,
+            readonly: true,
+            bytes: vec![1, 2, 3, 4],
+        }];
+        m.data_funcref_slots = vec![8];
+        m.types = vec![temen_ir::TypeEntry::Func(temen_ir::FuncType {
+            params: vec![],
+            results: vec![],
+        })];
+        m.imports = vec![Import {
+            name: "stderr".into(),
+            shape: temen_ir::ImportShape::Func(0),
+            mode: temen_ir::ImportMode::Required,
+        }];
+        m.funcs.push(Func {
+            params: vec![],
+            results: vec![],
+            blocks: vec![Block {
+                params: vec![],
+                insts: vec![],
+                term: Terminator::Return(vec![]),
+            }],
+        });
+        m.exports = vec![Export {
+            name: "_start".into(),
+            func: 0,
+        }];
+        // What only a link unit carries: an identity ignores it, as the stripped copy dropped it.
+        m.data_exports = vec![DataExport {
+            name: "g".into(),
+            offset: 8,
+            tls: false,
+        }];
+        m.tls = vec![Data {
+            offset: 0,
+            readonly: false,
+            bytes: vec![7; 4],
+        }];
+        m.data_ptrs = vec![DataPtr {
+            at: 8,
+            target: DataPtrTarget::SelfOff(0),
+            tls: false,
+        }];
+        let stripped = Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            tls: Vec::new(),
+            imports: Vec::new(),
+            data_exports: Vec::new(),
+            debug_info: None,
+            ..m.clone()
+        };
+        assert_eq!(encode_module_identity(&m), encode_module(&stripped));
     }
 
     #[test]

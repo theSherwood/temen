@@ -1873,6 +1873,22 @@ impl Posix {
             .register_executable(path, command);
     }
 
+    /// Grant `module` on `host` and register it as a filesystem executable at each of `paths`
+    /// ([`Self::register_executable`]): one command of a run's command registry. It is granted once,
+    /// however many paths name it, so every path runs the one copy of its code (#1883).
+    pub fn grant_executable<S: AsRef<str>>(
+        &self,
+        host: &mut temen_interp::Host,
+        module: &temen_interp::PreparedModule,
+        paths: &[S],
+    ) {
+        let handle = host.grant_prepared(module);
+        let win_log2 = module.module().memory.map_or(0, |mc| mc.size_log2);
+        for path in paths {
+            self.register_executable(path.as_ref(), handle, win_log2);
+        }
+    }
+
     /// Register a filesystem executable the embedder implements natively ([`HostCommand`]), with the
     /// presentation [`Self::register_executable`] gives a module: a file at `path` with the exec
     /// bit. A process that execs `path` runs `command` instead of replacing its image. It suits a
@@ -7234,6 +7250,32 @@ block 0 (vph: i32) {\n\
             "write to a closed fd 1 is EBADF"
         );
         assert_eq!(st.close(&[1]), EBADF, "double close is EBADF");
+    }
+
+    /// #1883 — a command is granted once, however many paths name it: every path runs that grant.
+    #[test]
+    fn an_executable_is_granted_once_at_every_path() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let m = temen_text::parse_module(
+            "memory 16\nfunc () -> () {\nblock 0 () {\n  return\n  }\n}\n",
+        )
+        .expect("parse");
+        let paths = ["/work/bin/c", "/bin/c"];
+        posix.grant_executable(&mut host, &temen_interp::PreparedModule::new(m), &paths);
+        let w = posix.world.lock().unwrap();
+        let handles: Vec<i32> = paths
+            .iter()
+            .map(|p| match w.commands.iter().find(|(n, _)| n == p) {
+                Some((_, Command::Module { handle, win_log2 })) => {
+                    assert_eq!(*win_log2, 16, "{p} runs in the module's declared window");
+                    *handle
+                }
+                _ => panic!("{p} is not a registered module"),
+            })
+            .collect();
+        assert_eq!(handles[0], handles[1], "one grant behind both paths");
+        assert!(w.executables.contains("/bin/c") && w.executables.contains("/work/bin/c"));
     }
 
     /// #1768 — `execve` changes nothing the exec replaces until an engine COMMITS the image-replace.

@@ -1746,7 +1746,7 @@ fn granted_program(
 ) -> Result<ChildProgram, Trap> {
     let i = source
         .unit_of(&g.digest, || {
-            compile_granted(host, &g.funcs, &g.types, g.shadow)
+            compile_granted(host, &g.module.funcs, &g.module.types, g.shadow())
         })
         .ok_or(Trap::Malformed)?;
     let p = source.get(i).ok_or(Trap::Malformed)?;
@@ -1858,7 +1858,7 @@ fn admit_confined_child(
     spawner: &Vm,
     s: ConfinedSpawn,
 ) -> Result<Option<AdmittedChild>, Trap> {
-    // The program, and for a separate module its declared window, data segments and module.
+    // The program, and for a separate module the module: its declared window and data segments.
     let (program, granted) = match s.module {
         None => {
             let (m, p) = spawner_module(source, spawner).ok_or(Trap::Malformed)?;
@@ -1867,12 +1867,7 @@ fn admit_confined_child(
         Some(mh) => {
             let g = host.resolve_module(mh)?;
             let program = granted_program(host, source, g)?;
-            let granted = (
-                g.memory_log2,
-                g.data.clone(),
-                std::sync::Arc::clone(&g.module),
-            );
-            (program, Some(granted))
+            (program, Some(std::sync::Arc::clone(&g.module)))
         }
     };
     let sig = match &program {
@@ -1893,9 +1888,10 @@ fn admit_confined_child(
     // A separate module's carve is at least its declared memory (FORK.md §8.6 / #773: the span above
     // it is heap room an allocating phase grows into via `vm_map`; §2 still confines every access
     // to the carve).
-    let mod_ok = granted
-        .as_ref()
-        .is_none_or(|(ml, _, _)| ml.is_some_and(|ml| ml <= s.size_log2 as u8));
+    let mod_ok = granted.as_ref().is_none_or(|gm| {
+        gm.memory
+            .is_some_and(|mc| mc.size_log2 <= s.size_log2 as u8)
+    });
     if !ok_entry || !fits || !mod_ok {
         return Ok(None);
     }
@@ -1904,10 +1900,10 @@ fn admit_confined_child(
     // A module's data segments land in the carve now, as if the child wrote them (the verifier
     // bounded them to its declared window). `readonly` is not enforced for a nested child —
     // intra-domain self-corruption is a §1 non-goal — as on the tree-walker.
-    if let (Some((_, data, _)), Some(m)) = (&granted, pm) {
-        m.write_segments(base, data, child_size);
+    if let (Some(gm), Some(m)) = (&granted, pm) {
+        m.write_segments(base, &gm.data, child_size);
     }
-    let module = granted.as_ref().map(|(_, _, m)| m);
+    let module = granted.as_ref();
     let Some((mut child_host, cinst, cas)) =
         confined_child_host(host, pm, s.grants, child_size, module)?
     else {
@@ -1985,12 +1981,10 @@ fn confined_child_host(
         }
         None => {
             child_host.set_self_module_opt(host.self_module.clone());
-            let im = child_host.module_imports(super::SELF_MODULE);
-            let ty = child_host.module_types(super::SELF_MODULE);
-            match (grants, im, ty) {
-                (Some(_), Some(im), Some(ty)) => {
-                    child_host.bind_same_module_manifest(&im, &ty).is_ok()
-                }
+            match (grants, &host.self_module) {
+                (Some(_), Some(sm)) => child_host
+                    .bind_same_module_manifest(&sm.imports, &sm.types)
+                    .is_ok(),
                 _ => true,
             }
         }
@@ -2049,7 +2043,8 @@ fn thread_task(
 struct FreshWindow {
     size_log2: u8,
     shadow: Option<super::ShadowArena>,
-    data: std::sync::Arc<[temen_ir::Data]>,
+    /// The module the child runs: its data segments seed the window.
+    module: std::sync::Arc<Module>,
     payload: Vec<u8>,
 }
 
@@ -2067,7 +2062,7 @@ impl FreshWindow {
             mapped_log2: self.size_log2,
             shadow: self.shadow,
             back,
-            data: &self.data,
+            data: &self.module.data,
             null_guard: temen_ir::module_null_guard(),
             ..WindowSpec::default()
         });
@@ -2131,7 +2126,7 @@ fn admit_detached_child(
     // domain's program does too when the frame runs the program rather than a unit.
     let runs_spawner =
         s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
-    let (program, cmem_log2, cdata, cmodule, cshadow, cdurable) = {
+    let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_spawn_module(s.module, unit)?;
         let program = match spawner {
             Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
@@ -2139,10 +2134,9 @@ fn admit_detached_child(
         };
         (
             program,
-            g.memory_log2,
-            g.data.clone(),
+            g.memory_log2(),
             std::sync::Arc::clone(&g.module),
-            g.shadow,
+            g.shadow(),
             g.durable,
         )
     };
@@ -2246,7 +2240,7 @@ fn admit_detached_child(
     let window = FreshWindow {
         size_log2: size_log2 as u8,
         shadow: cshadow,
-        data: cdata,
+        module: cmodule,
         payload,
     };
     Ok(Some((child, window)))
@@ -10703,7 +10697,11 @@ fn exec_image_build(
     let cm = dom
         .source
         .unit_of(&command.0.digest, || {
-            compile_module(&command.0.funcs, &command.0.types, command.0.shadow)
+            compile_module(
+                &command.0.module.funcs,
+                &command.0.module.types,
+                command.0.shadow(),
+            )
         })
         .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
@@ -10751,7 +10749,7 @@ fn exec_image_build(
     let args = personality.then(|| img.host.exec_commit_args()).flatten();
     let win = m.exec_window(
         back,
-        &img.data,
+        &img.module.data,
         temen_ir::module_null_guard(),
         args.as_deref(),
     );

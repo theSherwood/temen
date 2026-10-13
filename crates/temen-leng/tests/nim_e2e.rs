@@ -2648,6 +2648,14 @@ fn nim_unmapping_a_file_gives_its_pages_back() {
 #[path = "../../temen/tests/support/chibicc.rs"]
 mod chibicc_mod;
 
+/// A command for [`temen_run::ExecGrants::commands`]: `m`, executable at `path`.
+fn command(path: &str, m: &temen_ir::Module) -> (temen_interp::PreparedModule, Vec<String>) {
+    (
+        temen_interp::PreparedModule::new(m.clone()),
+        vec![path.to_string()],
+    )
+}
+
 /// The POSIX build of `demos/shell` — the `/bin/sh` a nim program's `execShellCmd` execs (#1662) —
 /// compiled by the in-tree chibicc exactly as `nim_selfhost_lane --sh` expects it.
 fn posix_sh() -> temen_ir::Module {
@@ -2768,10 +2776,7 @@ fn nim_shells_out_through_the_posix_sh() {
             make,
             &["parent".to_string()],
             &temen_run::ExecGrants {
-                commands: &[
-                    ("/bin/sh".to_string(), sh.clone()),
-                    ("bin/child".to_string(), child.clone()),
-                ],
+                commands: &[command("/bin/sh", &sh), command("bin/child", &child)],
                 built: false,
             },
             engine,
@@ -2865,10 +2870,7 @@ fn a_nim_process_that_polls_its_child_sleeps() {
             make,
             &["parent".to_string()],
             &temen_run::ExecGrants {
-                commands: &[
-                    ("/bin/sh".to_string(), sh.clone()),
-                    ("bin/child".to_string(), child.clone()),
-                ],
+                commands: &[command("/bin/sh", &sh), command("bin/child", &child)],
                 built: false,
             },
             engine,
@@ -2959,9 +2961,9 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
             &["parent".to_string()],
             &temen_run::ExecGrants {
                 commands: &[
-                    ("/bin/sh".to_string(), sh.clone()),
-                    ("bin/child".to_string(), child.clone()),
-                    ("bin/grower".to_string(), grower.clone()),
+                    command("/bin/sh", &sh),
+                    command("bin/child", &child),
+                    command("bin/grower", &grower),
                 ],
                 built: false,
             },
@@ -3033,10 +3035,7 @@ fn nim_reads_a_commands_output_through_execcmdex() {
             make,
             &["parent".to_string()],
             &temen_run::ExecGrants {
-                commands: &[
-                    ("/bin/sh".to_string(), sh.clone()),
-                    ("bin/child".to_string(), child.clone()),
-                ],
+                commands: &[command("/bin/sh", &sh), command("bin/child", &child)],
                 built: false,
             },
             engine,
@@ -3111,7 +3110,7 @@ fn nim_forks_and_execs_a_nim_program() {
             make,
             &["parent".to_string()],
             &temen_run::ExecGrants {
-                commands: &[("/bin/child".to_string(), child.clone())],
+                commands: &[command("/bin/child", &child)],
                 built: false,
             },
             engine,

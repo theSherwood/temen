@@ -46,6 +46,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use temen_interp::PreparedModule;
 
 fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     let mut stack = vec![dir.to_path_buf()];
@@ -419,8 +420,10 @@ fn main() {
     // walk finds a bare name.
     let hexer = phase(&hexer_p, "hexer");
     let nimony = phase(&nimony_p, "nimony");
-    let mut commands: Vec<(String, temen_ir::Module)> =
-        vec![("/bin/sh".to_string(), command_module(&sh_ir, "/bin/sh"))];
+    let mut commands: Vec<(PreparedModule, Vec<String>)> = vec![(
+        PreparedModule::new(command_module(&sh_ir, "/bin/sh")),
+        vec!["/bin/sh".to_string()],
+    )];
     for (name, m) in [
         // The driver is a command too: a compile-time evaluation builds its program with it (#763).
         ("nimony", nimony.clone()),
@@ -430,8 +433,8 @@ fn main() {
         ("hexer", hexer.clone()),
         ("temen-link", phase(&link_p, "temen-link")),
     ] {
-        commands.push((format!("{dir}/bin/{name}"), m.clone()));
-        commands.push((format!("/bin/{name}"), m));
+        let paths = vec![format!("{dir}/bin/{name}"), format!("/bin/{name}")];
+        commands.push((PreparedModule::new(m), paths));
     }
 
     // One personality for every process: one memfs, one fd table, one stdout.
