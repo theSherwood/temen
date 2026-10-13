@@ -5346,9 +5346,11 @@ fn pong(x: i64) -> i64 {
     2 * x + 1
 }
 
-/// What a tier-up session's run did: its value and stdout, and the events it took.
+/// What a tier-up session's run did: how it ended, its value and stdout, and the events it took.
 #[derive(Debug, PartialEq)]
 struct CapRun {
+    /// [`STATUS_OK`], or [`STATUS_TRAP`] with the trap's name in `temen_trap_*`.
+    status: i32,
     value: i64,
     stdout: Vec<u8>,
     parks: usize,
@@ -5474,6 +5476,7 @@ fn drive_declared(
     }
     let mut d = CoopB2Driver::new();
     let mut run = CapRun {
+        status: 0,
         value: 0,
         stdout: Vec::new(),
         parks: 0,
@@ -5488,7 +5491,7 @@ fn drive_declared(
             None => temen_coop_run(),
         };
         // A sliced run hands back each return's output; an unsliced one all of it at the end.
-        if budget.is_some() || ev == COOP_RUN_DONE {
+        if budget.is_some() || matches!(ev, COOP_RUN_DONE | COOP_RUN_TRAP) {
             let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
             if !p.is_null() && n > 0 {
                 // SAFETY: the stash stays live until the next call that replaces it.
@@ -5525,12 +5528,12 @@ fn drive_declared(
                 pauses += 1;
                 assert!(pauses < 1_000_000, "runaway slices");
             }
-            COOP_RUN_DONE => break,
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
     assert!(held.is_none(), "the leaf ended");
-    assert_eq!(temen_status(), STATUS_OK);
+    run.status = temen_status();
     run.value = temen_coop_value();
     temen_coop_close();
     Some((run, pauses))
@@ -5550,6 +5553,7 @@ fn coop_root_leaf_parks_on_declared_caps_and_matches_interpreted() {
     let bytes = ping_guest(N);
     let sum: i64 = (0..N).map(pong).sum();
     let want = |tierups, resumes| CapRun {
+        status: STATUS_OK,
         value: sum,
         stdout: sum.to_le_bytes().to_vec(),
         parks: N as usize,
@@ -5675,6 +5679,47 @@ export 0 func "_start" 0
     }
 }
 
+/// **A root leaf traps a store to its read-only data, as the interpreter does** (#2302). The
+/// whole-program tier this replaces for a module run emitted such a root without the page check and
+/// ran on past the store. The guest writes over its read-only segment and reads it back: interpreted
+/// and as a leaf, the run ends `MemoryFault`, and the leaf tiers up once.
+#[test]
+fn coop_root_leaf_traps_a_store_to_readonly_data() {
+    let _g = ffi_guard();
+    let src = r#"memory 16
+data ro 34816 "abcdefgh"
+func () -> (i64) {
+block 0 () {
+  va = i64.const 34816
+  vb = i64.const 106
+  i64.store va vb
+  vx = i64.load va
+  return vx
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let mut answer = |cap: &str, _: &[i64]| -> i64 { panic!("no caps: {cap}") };
+    for (mode, tierups) in [(COOP_NO_REGIONS, 0), (COOP_LEAF_ROOT | COOP_NO_REGIONS, 1)] {
+        let (run, _) = drive_declared(&bytes, &[], mode, None, &mut answer).expect("opens");
+        assert_eq!(
+            (run.status, run.tierups),
+            (STATUS_TRAP, tierups),
+            "mode {mode}"
+        );
+        // SAFETY: the end-of-run trap-name slot, read before anything else runs.
+        let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+        assert_eq!(
+            std::str::from_utf8(trap).unwrap(),
+            "MemoryFault",
+            "mode {mode}"
+        );
+    }
+}
+
 /// A chibicc C program that asks the embedder through two declared caps: `ping` for each of 300
 /// values (printing as it goes) and `show` for a window read — c_interpret's graphics shape
 /// (`fb_present` names its pixels by address).
@@ -5743,6 +5788,7 @@ fn coop_root_leaf_runs_a_chibicc_program_with_declared_caps() {
     };
     let caps = ["ping", "show"];
     let want = |tierups, resumes| CapRun {
+        status: STATUS_OK,
         value: 90000 % 97,
         stdout: b"i 0 s 1\ni 100 s 10201\ni 200 s 40401\nsum 90000 show 36\n".to_vec(),
         parks: 301,

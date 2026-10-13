@@ -5,10 +5,11 @@
 // `temen_onramp_jit_run_finish` captures stdout/stderr/exit into the shared slots — read them via the
 // usual `temen_stdout_*` / `temen_exit_code` accessors, exactly like the interpreter `temen_run_onramp` path.
 //
-// Two openers share the same drive loop: `runJitModule` feeds the guest from stdin (Lua/SQLite/hello),
-// `runJitCompiler` feeds it from a seeded memfs + argv (the chibicc card: `/in.c` + `/include/*.h`).
-// Both return the run status (0 = returned, 5 = exited) or throw if `_start` isn't emittable (the caller
-// falls back to the interpreter). Synchronous guest work; only the initial `WebAssembly.compile` is async.
+// `runJitCompiler` and `runJitSelfhost` feed the guest from a seeded memfs + argv (the chibicc card:
+// `/in.c` + `/include/*.h`) and drive this loop. Both return the run status (0 = returned, 5 = exited)
+// or throw if `_start` isn't emittable (the caller falls back to the interpreter). Synchronous guest
+// work; only the initial `WebAssembly.compile` is async. `runJitModule` runs a stdin guest on the pump
+// instead (`driveCoopTierupRun`, #1414 S4-3a).
 
 import {
   cacheGet, cachePut, jitCacheStats, moduleCacheClear, JIT_MODULE_CACHE_MAX, driveCoopTierupRun,
@@ -71,7 +72,8 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 
 // Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
 // + instantiated against the cdylib's shared `memory`, reused across Runs) and call `f0(win, env, ...slots)`
-// once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open*`) already.
+// once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open_fs` or
+// `temen_selfhost_jit_emit_object_fs`) already.
 // `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
 // instance are reused across Runs (see `cachedInstanceF0`).
 export async function driveJitRun(ex, memory, cacheKey) {
@@ -342,10 +344,17 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
   return { status, exit, stdout, stderr, built, ...counts };
 }
 
-// Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
+// `temen_coop_open`'s `mode`: offer the root program to run whole on emitted wasm, as a leaf.
+const COOP_LEAF_ROOT = 1;
+
+// Run an on-ramp module whose input is **stdin** (Lua, SQLite, hello, a compiled C program) on the
+// emitted tier, on the pump (#1414 S4-3a). One open decides how: when the emitter takes the root, it
+// runs whole on emitted wasm, as a leaf; when it doesn't (it can park, or it leaves the emitter's
+// subset), the interpreter drives `_start` and eligible regions run emitted. Returns the run status
+// (0 = returned, 5 = exited). Throws when nothing is emittable or the run traps; the caller then runs
+// the guest on the interpreter.
 export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey, shared = 1) {
   const u8 = () => new Uint8Array(memory.buffer);
-  // Hand the module (+ optional stdin) to the cdylib: decode, outline, grant powerbox, emit `_start`.
   const modP = Number(ex.temen_alloc(moduleBytes.length));
   u8().set(moduleBytes, modP);
   let stdinP = 0;
@@ -358,26 +367,13 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // (cross-origin-isolated threads build); a plain single-threaded host (e.g. the JACL playground's
   // non-threads cdylib) passes 0 — a shared-mode emit LinkErrors against a non-shared memory. Same
   // knob as `runWarmCoop`.
-  const opened = ex.temen_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, shared);
-  // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams,
-  // `thread.spawn`s, hosts fibers, …): try the **cooperative** tier-up driver before giving the
-  // buffers up — its scheduler multiplexes every vCPU of the run on this one wasm thread, the
-  // interpreter drives `_start`, eligible pure leaves run on emitted wasm, and a `vm_jit_*` guest's
-  // runtime-compiled §22 units run emitted too (#835). This is the ONE fallback tier (#1026: the
-  // single-vCPU pump it used to try first was a strict subset, and slower). Refused (nothing
-  // emittable ever) → fall through to the throw and the caller's plain-interpreter fallback.
-  let coop = false;
-  if (opened !== 0 && ex.temen_coop_open &&
-      ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, shared) === 0) {
-    coop = true;
-  }
+  const opened = ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, shared, 0, 0, COOP_LEAF_ROOT);
   ex.temen_dealloc(modP, moduleBytes.length);
   if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
-  if (coop) return driveCoopTierupRun(ex, memory, { cacheKey });
   if (opened !== 0) {
-    throw new Error(`JIT module open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
+    throw new Error(`JIT module open failed: status ${ex.temen_status()} (2 = nothing emittable)`);
   }
-  return driveJitRun(ex, memory, cacheKey);
+  return driveCoopTierupRun(ex, memory, { cacheKey });
 }
 
 // Run the warm session's `eval_run` on the **warm+JIT** tier (WASM_AOT.md warm+JIT). The warm snapshot

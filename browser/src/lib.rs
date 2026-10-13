@@ -6506,22 +6506,11 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over an **owned** window (heap-backed, pointer-stable for the run).
-    /// `win_log2` is a **minimum** — the window is grown to the module's declared `size_log2` when
-    /// larger (Lua declares 64 MiB), so the allocated window always equals the size the emitter masks
-    /// to; a smaller allocation would fault any access into the module's upper address range.
-    pub fn open_owned_run(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        stdin: Vec<u8>,
-    ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with(m, win_log2, shared_memory, RunInput::Stdin(stdin), None)
-    }
-
-    /// Like [`open_owned_run`](Self::open_owned_run), but the guest reads its input from a seeded
-    /// **memfs** `image` (mounted on the `fs` cap) with `argv` seeded at `POWERBOX_ARGS_BASE` — the
-    /// single-shot JIT twin of [`onramp_fs_exec`]. This is the chibicc-in-the-browser card's fast tier:
+    /// Open a single-shot JIT run over an **owned** window (heap-backed, pointer-stable for the run)
+    /// whose guest reads its input from a seeded **memfs** `image` (mounted on the `fs` cap) with
+    /// `argv` seeded at `POWERBOX_ARGS_BASE` — the single-shot JIT twin of [`onramp_fs_exec`]. `win_log2`
+    /// is a **minimum** — the window is grown to the module's declared `size_log2` when larger, so the
+    /// allocated window always equals the size the emitter masks to. This is the chibicc-in-the-browser card's fast tier:
     /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits TEMEN-IR text on stdout. `cached` is `m`'s emit
     /// for `shared_memory` from an earlier run ([`JitOnrampRun::emit_for_run`]), which the card keeps
     /// with the compiler (#1144); `None` emits here.
@@ -10965,7 +10954,7 @@ pub extern "C" fn temen_onramp_jit_close() {
     unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
 }
 
-// ---- single-shot module wasm-JIT run (Lua/SQLite on emitted wasm) — the run-to-completion twin ------
+// ---- single-shot module wasm-JIT run (the chibicc cards on emitted wasm) — the run-to-completion twin --
 //
 // The module-demo analogue of the reactor FFI above: the whole program is func 0 (`_start`), emitted and
 // run once as `f0(win, env, ...slots)`. The page compiles [`temen_onramp_jit_run_wasm_ptr`]/`_len`,
@@ -10973,61 +10962,15 @@ pub extern "C" fn temen_onramp_jit_close() {
 // calls `f0` with [`temen_onramp_jit_run_win_ptr`] + the [`temen_onramp_jit_run_slot`] handles, then
 // [`temen_onramp_jit_run_finish`] captures stdout/stderr/exit into the shared `OUT`/`ERR`/`EXIT_CODE`.
 
-/// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open`]; single-threaded wasm.
+/// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open_fs`] or
+/// [`temen_selfhost_jit_emit_object_fs`]; single-threaded wasm.
 static mut JIT_RUN: Option<JitOnrampRun> = None;
 
-/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap. The **single-shot**
-/// tier still sizes this up front: its backing is fixed, so a `vm_map` past it is admitted by the
-/// reservation and then declined at the first emitted access (#1153, invariant 9). The cooperative
-/// tier uses this only as its window's *initial* size — there the backing grows (#1312).
+/// The single-shot run's fixed window log2 — 32 MiB, holding the chibicc card's compile. The
+/// **single-shot** tier still sizes this up front: its backing is fixed, so a `vm_map` past it is
+/// admitted by the reservation and then declined at the first emitted access (#1153, invariant 9). The
+/// cooperative tier uses this only as its window's *initial* size — there the backing grows (#1312).
 const JIT_RUN_WIN_LOG2: u8 = 25;
-
-/// Open a **single-shot wasm-JIT run** over the on-ramp module at `[mod_ptr, mod_len)` (Lua/SQLite/hello):
-/// resolve imports, outline cap-calls, grant the powerbox (seeding stdin from `[stdin_ptr, stdin_len)`),
-/// materialize `.data`, and emit rooted at `_start`. Returns `0`, else a negative `STATUS_*` (also set in
-/// [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start` isn't emittable (the page falls back to
-/// [`temen_run_onramp`]). Replaces any prior run. Drive it with the `temen_onramp_jit_run_*` exports below.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_run_open(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    stdin_ptr: *const u8,
-    stdin_len: usize,
-    shared: i32,
-) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: same host guarantee for the stdin range.
-        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
-    };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
-        }
-    };
-    // `shared != 0` ⇒ the emitted module imports a **shared** memory (the threads/cross-origin-isolated
-    // build); `0` for the plain single-threaded build (e.g. GitHub Pages, no COOP/COEP), where the host
-    // instantiates the emitted module against a non-shared `WebAssembly.Memory`. The flag must match the
-    // memory the host actually provides — a mismatch fails instantiation.
-    match JitOnrampRun::open_owned_run(&m, JIT_RUN_WIN_LOG2, shared != 0, stdin) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
-}
 
 /// Open a **single-shot wasm-JIT run** of the chibicc compiler card: decode the compiler module at
 /// `[mod_ptr, mod_len)`, assemble the same memfs [`temen_run_onramp_fs`] does (the user's source at
