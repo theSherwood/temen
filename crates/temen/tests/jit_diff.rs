@@ -1335,6 +1335,89 @@ fn jit_cap_shared_region_aliases_differential() {
     );
 }
 
+/// #1707 — a §3e op that ends a §13 alias ends it on the JIT as on the interpreter: the page is the
+/// window's own from then on, and the region keeps its bytes for every other mapping of it. The guest
+/// aliases the region at A and B and stores `MARKER` through A, then ends A's alias two ways — a
+/// `Memory.map` over it, and (re-aliased) a `Memory.protect(none)` followed by a `map` — writing
+/// through A after each. B, which still aliases the region, must read `MARKER` both times, and A must
+/// read zero right after the `map`. The JIT used to zero the region through A and keep writing it.
+#[cfg(any(unix, windows))]
+#[test]
+fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
+    use core::ffi::c_void;
+    use temen_interp::{run_capture_reserved_with_host, Host, Value};
+    use temen_jit::compile_and_run_capture_reserved_with_host;
+
+    const MARKER: i64 = 0x0123_4567_89ab_cdefu64 as i64;
+    let src = format!(
+        "memory 18\n\
+         func (i32, i32) -> (i64, i64, i64) {{\n\
+         block 0 (vr: i32, vm: i32) {{\n\
+         \x20 vg = call.cap 4 3 () -> (i64) vr ()\n\
+         \x20 v0 = i64.const 0\n\
+         \x20 vrw = i32.const 3\n\
+         \x20 vnone = i32.const 0\n\
+         \x20 va = i64.const 65536\n\
+         \x20 vb = i64.add va vg\n\
+         \x20 m1 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vrw)\n\
+         \x20 m2 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (vb, v0, vg, vrw)\n\
+         \x20 vk = i64.const {MARKER}\n\
+         \x20 i64.store va vk\n\
+         \x20 m3 = call.cap 5 0 (i64, i64, i32) -> (i64) vm (va, vg, vrw)\n\
+         \x20 r1 = i64.load va\n\
+         \x20 vx = i64.const 17\n\
+         \x20 i64.store va vx\n\
+         \x20 r2 = i64.load vb\n\
+         \x20 m4 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vrw)\n\
+         \x20 m5 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (va, vg, vnone)\n\
+         \x20 m6 = call.cap 5 0 (i64, i64, i32) -> (i64) vm (va, vg, vrw)\n\
+         \x20 vy = i64.const 34\n\
+         \x20 i64.store va vy\n\
+         \x20 r3 = i64.load vb\n\
+         \x20 return r1 r2 r3\n\
+           }}\n\
+         }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    // Region ≥ the largest granule (64 KiB on Windows), mapped whole at both offsets.
+    let region_len = 1usize << 16;
+    let mut hi = Host::new();
+    let mut hj = Host::new();
+    let ri = hi.grant_shared_region(region_len);
+    let rj = hj.grant_shared_region_backed(temen_run::new_shared_region(region_len));
+    let (mi, mj) = (hi.grant_memory(), hj.grant_memory());
+    assert_eq!((ri, mi), (rj, mj), "grants are deterministic");
+
+    let init = vec![0u8; 1 << 18];
+    let mut fuel = 1_000_000u64;
+    let args = [Value::I32(ri), Value::I32(mi)];
+    let (interp, imem) = run_capture_reserved_with_host(&m, 0, &args, &mut fuel, &init, 0, &mut hi);
+    let (jit, jmem) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[rj as i64, mj as i64],
+        &init,
+        0,
+        temen_run::cap_thunk,
+        &mut hj as *mut Host as *mut c_void,
+    )
+    .expect("jit compiles");
+
+    let want = [0, MARKER, MARKER];
+    assert_eq!(
+        interp.expect("interp runs"),
+        want.map(Value::I64).to_vec(),
+        "interp: a fresh page at A, and B keeps the region's bytes"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &want),
+        "jit: a fresh page at A, and B keeps the region's bytes: {jit:?}"
+    );
+    assert_eq!(imem, jmem, "interp/JIT windows diverge");
+}
+
 // ---- call.cap: the JIT dispatches through a host thunk to the interpreter's Host ----
 //
 // This module's broad Memory-cap differential is still unix-gated; the cross-platform `_with_host`
