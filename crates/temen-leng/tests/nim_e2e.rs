@@ -50,15 +50,12 @@ fn which(bin: &str, path: &str) -> bool {
 /// Leng as `(stem, x_nif_text)` — the main program plus the `system` module (and any deps). The
 /// stem is the `.x.nif` basename, exactly the qualifier `temen-leng` links symbols under.
 fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
-    // A per-source directory (hash of the program) so tests running in parallel never share a
-    // `nimcache` — each `nimony c` gets its own throwaway tree.
-    let tag = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        source.hash(&mut h);
-        h.finish()
-    };
-    let dir = std::env::temp_dir().join(format!("temen_nim_e2e_{}_{tag:016x}", std::process::id()));
+    // A directory per call, so tests running in parallel never share a `nimcache`: each `nimony c`
+    // gets its own throwaway tree. It was one per source, and two tests that compile the same
+    // program removed and rebuilt one tree under each other.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("temen_nim_e2e_{}_{call}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mk tempdir");
     let src = dir.join("prog.nim");
