@@ -3041,6 +3041,7 @@ pub fn compile_module_tierup_caps(
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
         false,
+        false,
     )
 }
 
@@ -3088,6 +3089,7 @@ pub fn compile_module_tierup_b2(
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
         gc_spill,
+        true,
     )
 }
 
@@ -3110,6 +3112,7 @@ pub fn compile_module_tierup_b2_budgeted(
         None,
         module_budget,
         false,
+        true,
     )
 }
 
@@ -3140,6 +3143,7 @@ pub fn compile_module_tierup_b2_paged(
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
         gc_spill,
+        true,
     )
 }
 
@@ -3171,6 +3175,7 @@ pub fn compile_module_tierup_paged(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
+        false,
         false,
     )
 }
@@ -3204,6 +3209,32 @@ pub fn compile_module_tierup_nullguard(
         Some(guard),
         MAX_EST_EMITTED_MODULE_BYTES,
         false,
+        false,
+    )
+}
+
+/// #2248 — [`compile_module_tierup`] for a host that services `env.call_interp` over the run's
+/// **live** window, powerbox and fuel, as the cooperative driver does for every task: the
+/// cross-tier set is [`compile_module_tierup_b2`]'s widened one (any [`marshallable_sig`] function
+/// a bounce can complete), while dispatch stays the module's own: a function that `call.dyn`s emits
+/// only when the whole module does, through a table of the module's own functions. For a granted
+/// module a child of a cooperative run runs, whose dispatch table the driver's shared table does
+/// not mirror (#2273). `page_log2` emits it paged, as [`compile_module_tierup_paged`] does.
+pub fn compile_module_tierup_live(
+    m: &Module,
+    shared_memory: bool,
+    page_log2: Option<u8>,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_tierup_inner(
+        m,
+        shared_memory,
+        false,
+        page_log2,
+        None,
+        None,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        false,
+        true,
     )
 }
 
@@ -3217,6 +3248,7 @@ fn compile_module_tierup_inner(
     null_guard: Option<u64>,
     module_budget: usize,
     gc_spill: bool,
+    live_bounce: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
     // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
@@ -3304,12 +3336,13 @@ fn compile_module_tierup_inner(
     };
     // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
-    //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
-    //     memory-free, call-free, cap-free — because the leaf-only drivers run a bounce over a
-    //     *throwaway* window (a memory-touching leaf would diverge from the shared one).
-    //   * **shared reserved table** (#888, B2 mode — `compile_module_tierup_b2`): the reactor's
-    //     `cross` set — **any** [`marshallable_sig`] non-in-subset function. This mode's host
-    //     services `env.call_interp` over the run's **LIVE** window/powerbox/fuel (the pump's
+    //   * **a throwaway window** (`!live_bounce`): the strict [`interp_leaf`] set — memory-free,
+    //     call-free, cap-free — because the leaf-only drivers run a bounce over a *throwaway*
+    //     window (a memory-touching leaf would diverge from the shared one).
+    //   * **the live window** (`live_bounce`: #888's B2 mode, `compile_module_tierup_b2`, and a
+    //     cooperative run's granted module, `compile_module_tierup_live`, #2248): the reactor's
+    //     `cross` set — **any** [`marshallable_sig`] non-in-subset function. This host services
+    //     `env.call_interp` over the run's **LIVE** window/powerbox/fuel (the pump's
     //     `temen_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
     //     [`compile_module_reactor`]'s contract, so a cross-tier callee may touch memory, make
     //     calls, and cap-call. Widening here collapses the fixpoint cascade below: an in-subset
@@ -3323,7 +3356,7 @@ fn compile_module_tierup_inner(
     let leaf: Vec<bool> = (0..n)
         .map(|i| {
             !in_subset[i]
-                && if reserved_table_log2.is_some() {
+                && if live_bounce {
                     marshallable_sig(&m.funcs[i]) && serviceable[i]
                 } else {
                     interp_leaf(&m.funcs[i])

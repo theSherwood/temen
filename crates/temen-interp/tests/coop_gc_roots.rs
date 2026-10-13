@@ -15,7 +15,7 @@
 #[path = "support/coop.rs"]
 mod coop;
 
-use temen_interp::bytecode::TierUpConfig;
+use temen_interp::bytecode::{ProgramEmit, TierUpConfig};
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_text::parse_module;
 
@@ -57,9 +57,12 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
     let m = parse_module(SRC).unwrap();
     temen_verify::verify_module(&m).expect("verify");
     let tierup = TierUpConfig {
-        eligible: std::sync::Arc::from(vec![false, true, false]),
-        page_checked: false,
+        root: ProgramEmit {
+            eligible: std::sync::Arc::from(vec![false, true, false]),
+            page_checked: false,
+        },
         leaf: None,
+        modules: None,
     };
     let mut run = coop::coop_run(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))
         .expect("supported")

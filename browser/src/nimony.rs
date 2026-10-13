@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use temen_interp::bytecode::{CoopEvent, CoopRun, Footprint, LeafEmitter, LeafOffer, TierUpConfig};
+use temen_interp::bytecode::{
+    CoopEvent, CoopRun, Footprint, LeafEmitter, LeafOffer, ProgramEmit, TierUpConfig,
+};
 use temen_interp::{PreparedModule, Trap};
 use temen_ir::Module;
 
@@ -85,9 +87,9 @@ pub fn nim_open(
     }
     // No function of the driver tiers up: it spawns and waits, and a tiered-up function cannot park.
     let tierup = leaf.map(|leaf| TierUpConfig {
-        eligible: Arc::from([]),
-        page_checked: false,
+        root: ProgramEmit::default(),
         leaf: Some(leaf),
+        modules: None,
     });
     let run = CoopRun::new_reserved(
         driver,
@@ -237,7 +239,7 @@ fn native_link(argv: &[String], files: &mut dyn temen_posix::CommandFiles) -> i3
 
 /// #1896 — a nimony build open as a cooperative tier-up session ([`temen_nim_open`]): the
 /// personality whose memfs holds the tree. The leaf images the build emitted are the session's
-/// ([`crate::Leaves`]).
+/// ([`crate::Programs`]).
 pub(crate) struct NimSession {
     posix: temen_posix::Posix,
 }
@@ -449,7 +451,7 @@ pub unsafe extern "C" fn temen_nim_open(
         let mut argv: Vec<&[u8]> = argv.split(|&b| b == 0).collect();
         argv.pop();
         let cwd = core::str::from_utf8(cwd).map_err(|_| STATUS_DECODE_ERR)?;
-        let leaves = crate::Leaves::default();
+        let leaves = crate::Programs::default();
         // A nim build runs on the threads cdylib, over shared memory.
         let emit = crate::leaf_emitter(Arc::clone(&leaves), suspend != 0, true);
         let (run, posix) = nim_open(
