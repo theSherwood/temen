@@ -507,6 +507,27 @@ fn link_selected_with_extra(
     manifest: bool,
     synth_start: bool,
 ) -> Result<Module, LengError> {
+    link_lowered(
+        &lower_selected(units, synth_start)?,
+        &extra,
+        manifest,
+        synth_start,
+    )
+}
+
+/// **Lower** units for a link: translate each one's Leng to an object, against the pools the whole
+/// set shares (below), and pair each with its export tables as a [`temen_ir::LinkUnit`], after the
+/// powerbox `_start` ([`synth_start_unit`]) when `synth_start` is set. [`link_lowered`] links the
+/// result.
+///
+/// The lowering is all but the whole cost of a link, and nothing linked beside the units changes
+/// it. So a link that binds the same units twice lowers them once (#1790): the nim link's first pass,
+/// which only discovers the system calls the compute shim leaves ([`nim_compute_exports`]), and its
+/// real link share one lowering.
+fn lower_selected(
+    units: &[(&str, &str, Select)],
+    synth_start: bool,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
     // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
     // module), and a field can *be* an object another unit defines — and both are resolved at
@@ -701,7 +722,7 @@ fn link_selected_with_extra(
             )?))
         })
         .collect::<Result<_, LengError>>()?;
-    let mut link_units = Vec::with_capacity(objects.len() + extra.len() + 1);
+    let mut link_units = Vec::with_capacity(objects.len() + 1);
     // The powerbox `_start` links **first** so it is function 0 (the manifest entry shape), and so
     // the linker's single-pass funcref baking numbers the program's `data.funcref` initializers
     // above it — no fragile post-link index shift. See [`synth_start_unit`].
@@ -723,16 +744,35 @@ fn link_selected_with_extra(
             data_exports,
         });
     }
-    link_units.extend(extra);
+    Ok(link_units)
+}
+
+/// Link units [`lower_selected`] lowered, with `extra` after them: pre-built runtime units whose
+/// exports resolve the lowered units' unbound imports. Both are borrowed, so one lowering serves
+/// any number of links.
+///
+/// `synth_start` must be what the units were lowered with: a powerbox program, whose shadow arena
+/// and heap words are placed once the merged window is known.
+fn link_lowered(
+    lowered: &[temen_ir::LinkUnit],
+    extra: &[temen_ir::LinkUnit],
+    manifest: bool,
+    synth_start: bool,
+) -> Result<Module, LengError> {
+    let link_units: Vec<temen_ir::LinkUnitRef> = lowered
+        .iter()
+        .chain(extra)
+        .map(temen_ir::LinkUnitRef::from)
+        .collect();
     // `manifest`: retain any import **no unit exports** (the raw-syscall leaves — `write`/`read`/
     // `_exit`, spelled by their nim symbol) in the merged manifest instead of failing the link, so
     // the host binds them at instantiation (NIM.md W3: "raw syscalls → unresolved named imports the
     // POSIX personality resolves at load"). The fail-closed `link` is the default (a whole-program
     // link whose every leaf resolves to the pure-IR runtime shim).
     let linked = if manifest {
-        temen_ir::link_with_manifest(&link_units)
+        temen_ir::link_with_manifest_ref(&link_units)
     } else {
-        temen_ir::link(&link_units)
+        temen_ir::link_ref(&link_units)
     };
     let mut linked = linked.map_err(|e| LengError::Malformed(format!("link failed: {e:?}")))?;
     // A synth-`_start` module is a powerbox program: declare its durable shadow arena, then seed its
@@ -886,11 +926,17 @@ pub fn link_whole_powerbox_manifest(
     units: &[WholeModule],
     runtime: Vec<temen_ir::LinkUnit>,
 ) -> Result<Module, LengError> {
+    link_lowered(&lower_program(units)?, &runtime, true, true)
+}
+
+/// A nim program's whole units, lowered for its link ([`lower_selected`]) after a powerbox `_start`:
+/// what [`link_whole_powerbox_manifest`] links, and what both of the nim link's passes share.
+fn lower_program(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     let sel: Vec<(&str, &str, Select)> = units
         .iter()
         .map(|u| (u.stem, u.src, Select::Whole))
         .collect();
-    link_selected_with_extra(&sel, runtime, true, true)
+    lower_selected(&sel, true)
 }
 
 /// The **pure-compute C bottom edge** as TEMEN-text funcs — nimony's `memcpy`/`memcmp`/`memset`,
@@ -1850,11 +1896,12 @@ impl Edge<'_> {
 /// Link a nim program's units into one module on the bottom edge `edge`: the runtime
 /// [`nim_runtime`] builds for it, plus the prebuilt guest libc's units ([`nim_libc_units`]) when
 /// `libc` is given (`snprintf`, `strtod` and libm, which no hand-written shim carries; without them
-/// those stay unbound manifest imports). They link with [`link_whole_powerbox_manifest`] in
-/// [`link_order`], and the program ships through [`temen_opt::optimize_linked`] (its tiniest callees
-/// inlined, each function cleaned up without folding floats, its blocks in reverse postorder). Every
-/// caller links through this, so a phase built on the host and a program built in-guest by the
-/// self-hosted lane are one link.
+/// those stay unbound manifest imports). The units are lowered once, in [`link_order`]
+/// ([`lower_program`]): the runtime's discovery pass and the link itself both link that lowering,
+/// which is all but the whole cost of a link (#1790). The program ships through
+/// [`temen_opt::optimize_linked`] (its tiniest callees inlined, each function cleaned up without
+/// folding floats, its blocks in reverse postorder). Every caller links through this, so a phase
+/// built on the host and a program built in-guest by the self-hosted lane are one link.
 ///
 /// The result is a powerbox entry (`_start` at func 0). Its manifest is the edge's (the personality's
 /// ops, or the host's capabilities), plus the core's memory ops its heap grows with. Re-verify it like
@@ -1871,11 +1918,13 @@ pub fn link_nim(
     debug: bool,
 ) -> Result<Module, LengError> {
     let units = &link_order(units);
-    let mut runtime = nim_runtime(units, edge)?;
+    // One lowering for both passes (#1790): the runtime's discovery link and this one.
+    let program = lower_program(units)?;
+    let mut runtime = runtime_for(units, &program, edge)?;
     if let Some(libc) = libc {
         runtime.extend(nim_libc_units(libc, units)?);
     }
-    let mut m = link_whole_powerbox_manifest(units, runtime)?;
+    let mut m = link_lowered(&program, &runtime, true, true)?;
     if !debug {
         m.debug_info = None;
     }
@@ -1913,9 +1962,10 @@ fn link_order<'a>(units: &[WholeModule<'a>]) -> Vec<WholeModule<'a>> {
 /// on the units' order, only on which leaves and system calls the program references, so one build
 /// serves every permutation.
 ///
-/// Two link passes. Pass 1 links the compute shim alone ([`nim_compute_exports`]), so the system
-/// calls survive as retained imports: their nim names (`sysWrite.0.` …) are not known until link.
-/// Then the edge takes what it serves:
+/// Two link passes over one lowering of the units ([`lower_program`], shared with [`link_nim`]'s own
+/// link, #1790). Pass 1 links them against the compute shim alone ([`nim_compute_exports`]), so the
+/// system calls survive as retained imports: their nim names (`sysWrite.0.` …) are not known until
+/// link. Then the edge takes what it serves:
 ///
 /// - The leaves [`Edge::takes`] names leave the compute shim, whose versions of them are stubs:
 ///   `quit` returns, a panic's message is dropped, and there is no file, process or working
@@ -1927,7 +1977,17 @@ pub fn nim_runtime(
     units: &[WholeModule],
     edge: Edge,
 ) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let (mut compute_exports, m1) = nim_compute_exports(units)?;
+    runtime_for(units, &lower_program(units)?, edge)
+}
+
+/// [`nim_runtime`] over `program`, the units already lowered ([`lower_program`]), so the link that
+/// follows lowers nothing again.
+fn runtime_for(
+    units: &[WholeModule],
+    program: &[temen_ir::LinkUnit],
+    edge: Edge,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let (mut compute_exports, m1) = nim_compute_exports(units, program)?;
     // The shapes the edge serves its withheld leaves at, captured before the shim loses them: a
     // withheld leaf is no longer a shim export, and it is not a pass-1 import either (pass 1 bound
     // it to the shim), so this is the only place its nim-side signature is still visible.
@@ -1996,7 +2056,7 @@ fn caps_runtime(
 /// **retained imports**, for a caller to bind by name. Same discovery, same table as [`nim_runtime`]:
 /// one route through the compute bottom edge.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
-    let mut exports = nim_compute_exports(units)?.0;
+    let mut exports = nim_compute_exports(units, &lower_program(units)?)?.0;
     exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
     compute_shim_unit(exports)
 }
@@ -2658,16 +2718,19 @@ fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, 
 
 /// Which [`COMPUTE_LEAVES`] rows `units` actually reference, plus the **pass-1 link** they were
 /// discovered against (whose surviving imports are the true syscalls — what the caller binds next).
-fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Module), LengError> {
+/// `program` is `units` lowered ([`lower_program`]): pass 1 links it, and the caller links it again.
+fn nim_compute_exports(
+    units: &[WholeModule],
+    program: &[temen_ir::LinkUnit],
+) -> Result<(Vec<(String, u32)>, Module), LengError> {
     // The compute shim must know which leaf names to export; discover them from the `system` unit's
-    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
-    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
+    // imports, in its lowered object (every pure-compute leaf originates there). The program's units
+    // follow its powerbox `_start` ([`lower_program`]).
     let sys = units
         .iter()
-        .find(|u| u.stem.starts_with("sysv"))
+        .position(|u| u.stem.starts_with("sysv"))
         .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
-    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
-        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
+    let sys_obj = &program[1 + sys].module;
     let mut compute_exports: Vec<(String, u32)> = Vec::new();
     let widen = |m: &Module, exports: &mut Vec<(String, u32)>| {
         for imp in &m.imports {
@@ -2678,11 +2741,15 @@ fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Mod
             }
         }
     };
-    widen(&sys_obj, &mut compute_exports);
+    widen(sys_obj, &mut compute_exports);
 
     // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
-    let m1 =
-        link_whole_powerbox_manifest(units, vec![compute_shim_unit(compute_exports.clone())?])?;
+    let m1 = link_lowered(
+        program,
+        &[compute_shim_unit(compute_exports.clone())?],
+        true,
+        true,
+    )?;
 
     // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
     // above finds every leaf that module declares, but a leaf declared by *another* stdlib module

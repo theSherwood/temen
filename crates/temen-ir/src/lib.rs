@@ -5415,6 +5415,12 @@ pub fn link_with_manifest_ref(units: &[LinkUnitRef<'_>]) -> Result<Module, LinkE
     link_impl(units, true)
 }
 
+/// [`link`] over **borrowed** units ([`LinkUnitRef`]), as [`link_with_manifest_ref`] is to
+/// [`link_with_manifest`].
+pub fn link_ref(units: &[LinkUnitRef<'_>]) -> Result<Module, LinkError> {
+    link_impl(units, false)
+}
+
 /// **Lay library units out once** (#1373): [`link_with_manifest_ref`] over them alone, as a base
 /// that every program linked against the same libraries starts from as unit 0. Linking the base and
 /// a program gives the module linking the libraries and the program together would: the base sits at
