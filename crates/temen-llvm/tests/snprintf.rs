@@ -6,7 +6,7 @@
 //! destination buffer.
 
 use std::process::Command;
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 /// Compile `src` (a `main` program returning a byte) to bitcode + a native exe, translate it, and run
 /// it through the powerbox on `backend`; assert the result equals the native exit code. Skips cleanly
@@ -52,13 +52,6 @@ fn check(name: &str, src: &str) {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

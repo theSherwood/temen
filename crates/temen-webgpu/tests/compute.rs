@@ -42,13 +42,6 @@ fn demo_webgpu_compute() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate webgpu demo bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

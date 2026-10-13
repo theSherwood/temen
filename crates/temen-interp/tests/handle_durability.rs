@@ -12,7 +12,9 @@
 //! across a restore ⇒ every guest-held handle stays valid. (The full freeze→serialize→
 //! restore→thaw run lands with the snapshot-codec slice that wires this to the window image.)
 
-use temen_interp::{cap_id, DurableBinding, DurableHandle, Host, NonDurableKind, StreamRole};
+use temen_interp::{
+    cap_id, DurableBinding, DurableHandle, Host, Lease, NonDurableKind, StreamRole, WINDOW_RUNS,
+};
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
 /// captured set is byte-for-byte identical — slot, generation, type_id, and binding all pinned.
@@ -377,8 +379,12 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
         b.restore_durable_named(&named)
             .expect("the registrar serves it");
         b.restore_durable_handles(&handles);
-        let budget = b.grant_budget(-1, 1 << 20, -1);
-        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, budget, -1);
+        let lease = Lease {
+            budget: b.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 16,
+            runs: WINDOW_RUNS,
+        };
+        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, lease, -1);
         assert_eq!(
             child.is_some(),
             forkable,

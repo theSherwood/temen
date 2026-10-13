@@ -887,10 +887,11 @@ pub type GrantNamedChildBuilder = unsafe extern "C" fn(
 ) -> i32;
 
 /// The host callback for **`instantiate_detached`** (Instantiator op 15): [`GrantNamedChildBuilder`]'s
-/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: `budget`, the handle it
-/// charged for the child's window, which becomes the child's `"budget"`, and `lane`, the lane it
-/// reserved, which the child is stamped with. The thunk passes both from one spawn to the next hook,
-/// so a second vCPU's spawn between the two cannot hand this child its budget or lane (#1972).
+/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: the `(budget, bytes, runs)`
+/// lease it charged for the child's window, whose budget becomes the child's `"budget"` and whose
+/// runs the child's window is paid for up to (#2268), and `lane`, the lane it reserved, which the
+/// child is stamped with. The thunk passes both from one spawn to the next hook, so a second vCPU's
+/// spawn between the two cannot hand this child its budget or lane (#1972).
 ///
 /// # Safety
 /// As [`GrantNamedChildBuilder`].
@@ -902,6 +903,8 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     grants_n: u64,
     child_size: u64,
     budget: i32,
+    bytes: u64,
+    runs: u64,
     lane: i64,
     out: *mut GrantChild,
     trap_out: *mut i64,
@@ -954,8 +957,9 @@ pub struct BudgetTaken {
 
 /// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
 /// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
-/// Σ and charge `bytes` (the child's declared window) and the child's first vCPU to that budget, or
-/// none of them. Returns the lane it
+/// Σ and charge `bytes` (the child's declared window), the child's first vCPU, and the mappings its
+/// domain and window will hold — `runs` bounds the window's runs of page state
+/// (`temen_ir::window_runs_bound`, #2268) — to that budget, or none of them. Returns the lane it
 /// reserved (`-1` = unbounded), which the build then stamps on the child
 /// ([`GrantDetachedChildBuilder`]), or [`ADMIT_REFUSED`] for a forged/wrong-type handle or no room:
 /// the spawn refuses probeably (`-EINVAL`), charging nothing.
@@ -963,7 +967,7 @@ pub struct BudgetTaken {
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`).
 pub type BudgetMemTaker =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i64;
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64, runs: u64) -> i64;
 
 /// A [`BudgetMemTaker`]'s refusal. Never a lane: a lane is `-1` (unbounded) or non-negative.
 pub const ADMIT_REFUSED: i64 = i64::MIN;
@@ -973,9 +977,9 @@ pub const ADMIT_REFUSED: i64 = i64::MIN;
 /// task finish with the lane the child was stamped with (`-1` = unbounded, a no-op).
 pub type LaneGiver = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, lane: i64);
 
-/// #1587, #1877 — settle what a [`BudgetMemTaker`] admitted: the window's `bytes` and the child's
-/// first vCPU go back to `budget` on the parent, at the child's end or when its spawn fails *after*
-/// the take. The OS-thread spawn is the one refusal on the detached path that happens after the
+/// #1587, #1877 — settle what a [`BudgetMemTaker`] admitted over `(budget, bytes, runs)`: the
+/// window's bytes, the child's first vCPU and its mappings go back to `budget` on the parent, at the
+/// child's end or when its spawn fails *after* the take. The OS-thread spawn is the one refusal on the detached path that happens after the
 /// commit, so without this a guest that trips it leaks its allowance per attempt. At the child's end
 /// `child` is its powerbox (a [`GrantChild::ctx`]), and what its window grew goes back too (#1909);
 /// null for a child that never ran.
@@ -984,6 +988,7 @@ pub type BudgetMemGiver = unsafe extern "C" fn(
     child: *mut core::ffi::c_void,
     budget: i32,
     bytes: u64,
+    runs: u64,
 );
 
 /// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
@@ -1016,18 +1021,25 @@ pub type PremapStage = unsafe extern "C" fn(
     child_off: u64,
 ) -> i32;
 
-/// Op-15 **pre-map apply**, on the child thread once its window exists: alias the staged region onto
-/// the window `[base, base+mapped)` (inside `reserved`) — the interpreter's `Host::apply_premap`
-/// through the host's own window backend, i.e. the same `map_region` the child's `SharedRegion.map`
-/// would take. Nonzero on success; `0` ⇒ the child never runs (a `CapFault` outcome).
+/// The embedder's hook over a fresh window once it is seeded and protected, before its guest runs: a
+/// root's ([`CompiledModule::set_window_ready`]) and a detached child's (the nursery's, on the child
+/// thread). `ro` lists the `[start, end)` byte ranges its `readonly` data segments made read-only, for
+/// the embedder's page map to record as the interpreter's own does (#2268); then an op-15 pre-map, or
+/// a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside `reserved`) — the
+/// interpreter's `Host::apply_premap` through the host's own window backend, i.e. the same
+/// `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's guest never
+/// runs (a child's `CapFault` outcome, a root's failed run).
 ///
 /// # Safety
-/// `child_ctx` is the child powerbox; `[base, base+reserved)` its live reservation.
-pub type PremapApply = unsafe extern "C" fn(
-    child_ctx: *mut core::ffi::c_void,
+/// `ctx` is the window's powerbox; `[base, base+reserved)` its live reservation; `ro` points at `n_ro`
+/// ranges (any pointer when `n_ro` is `0`).
+pub type WindowReady = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
     base: *mut u8,
     mapped: u64,
     reserved: u64,
+    ro: *const [u64; 2],
+    n_ro: usize,
 ) -> i32;
 
 /// #1944 slice 3 — a detached child's own budget node (the budget that paid for its window), read off
@@ -1052,11 +1064,12 @@ pub struct GrantChildHooks {
     pub budget_mem_give: BudgetMemGiver,
     /// D66 — return a reaped detached child's lane (see [`LaneGiver`]).
     pub lane_give: LaneGiver,
-    /// Op-15 pre-mapped region — the three host sides of one child-side `map` (see [`PremapAdmit`],
-    /// [`PremapStage`], [`PremapApply`]).
+    /// Op-15 pre-mapped region — the host sides of one child-side `map` (see [`PremapAdmit`],
+    /// [`PremapStage`]), the last applied as the child's window starts ([`WindowReady`], which every
+    /// detached child's window is handed to).
     pub premap_admit: PremapAdmit,
     pub premap_stage: PremapStage,
-    pub premap_apply: PremapApply,
+    pub premap_apply: WindowReady,
     /// #1854 — [`HighWater`] over a **child** powerbox (always the shared form): how far a durable
     /// detached child grew its window, so a freeze's capture of it reaches its grown pages, as the
     /// root's does.
@@ -2005,9 +2018,9 @@ pub struct CapturedSeed {
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
     /// #1971 — the lease its window was charged under, as the spawn filed it: the parent's handle on
-    /// the budget that paid, and the bytes it paid. Handed back when the thawed child ends. `None`
-    /// when the parent holds no handle on that budget.
-    pub window: Option<(i32, u64)>,
+    /// the budget that paid, the bytes it paid, and the bound on its runs (#2268). Handed back when
+    /// the thawed child ends. `None` when the parent holds no handle on that budget.
+    pub window: Option<(i32, u64, u64)>,
     /// #2010 — its own children, re-created in its nursery before it runs.
     pub children: Vec<DetachedSeed>,
     /// Its [`DetachedCapture::residue`], re-created before its root runs: its fibers re-seeded in its
@@ -2937,7 +2950,7 @@ pub struct CompiledModule {
     high_water: Option<(HighWater, *mut core::ffi::c_void)>,
     /// #2025 — the embedder's hook over a fresh root window, before the guest runs
     /// ([`Self::set_window_ready`]).
-    window_ready: Option<(PremapApply, *mut core::ffi::c_void)>,
+    window_ready: Option<(WindowReady, *mut core::ffi::c_void)>,
     /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
     /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
     fork_hook: Option<ForkHook>,
@@ -4424,10 +4437,10 @@ impl CompiledModule {
     }
 
     /// #2025 — run `hook` over each fresh root window once it is seeded and protected, before the
-    /// guest runs: a durable thaw's §13 pages are aliased back onto their regions there, as a
-    /// child's op-15 pre-map is ([`PremapApply`], with `ctx` the root's powerbox). `0` from it fails
-    /// the run.
-    pub fn set_window_ready(&mut self, hook: Option<(PremapApply, *mut core::ffi::c_void)>) {
+    /// guest runs ([`WindowReady`], with `ctx` the root's powerbox): the embedder's page map records
+    /// the read-only data pages (#2268), and a durable thaw's §13 pages are aliased back onto their
+    /// regions, as a child's op-15 pre-map is. `0` from it fails the run.
+    pub fn set_window_ready(&mut self, hook: Option<(WindowReady, *mut core::ffi::c_void)>) {
         self.window_ready = hook;
     }
 
@@ -4601,6 +4614,8 @@ impl CompiledModule {
             // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
             // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
             // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
+            // The ranges made read-only, for the embedder's page map (`window_ready` below).
+            let mut ro: Vec<[u64; 2]> = Vec::new();
             if let Some(size_log2) = t.mem_size_log2 {
                 let size = 1u64 << size_log2;
                 let rw = window.rw_mut();
@@ -4622,6 +4637,7 @@ impl CompiledModule {
                     let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
                     if hi > lo {
                         window.protect_ro(t.sub_base + lo, hi - lo);
+                        ro.push([t.sub_base + lo, t.sub_base + hi]);
                     }
                 }
             }
@@ -4651,6 +4667,8 @@ impl CompiledModule {
                     window.base(),
                     t.win_mapped as u64,
                     t.win_reserved as u64,
+                    ro.as_ptr(),
+                    ro.len(),
                 ) == 0
                 {
                     return Err(JitError::Unsupported(

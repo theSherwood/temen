@@ -171,10 +171,11 @@ pub mod cap_id {
     /// through the same masked `GuestMem` the built-in ops use (authority-TCB, not escape-TCB).
     pub const HOST_PROC: u32 = 13;
     /// §15 / PROCESS.md §5 `Budget` — a node of the run's budget tree (#1944): per dimension (`0`
-    /// fuel, `1` mem, `2` spawn, `3` channel, `4` lane) a **ceiling** on the node's whole subtree, §15's
-    /// "every meterable resource is a capability with a quota" promoted to an object. A use charges
-    /// the paying node and every ancestor, all or nothing. op 0 `split(fuel, mem, spawn[, channel[,
-    /// lane]]) -> sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
+    /// fuel, `1` mem, `2` spawn, `3` channel, `4` lane, `5` maps — the host's OS memory mappings,
+    /// #2268) a **ceiling** on the node's whole subtree, §15's "every meterable resource is a
+    /// capability with a quota" promoted to an object. A use charges the paying node and every
+    /// ancestor, all or nothing. op 0 `split(fuel, mem, spawn[, channel[, lane[, maps]]]) ->
+    /// sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
     /// unbounded on its own), deducting nothing. op 1 `read(field) -> room | -EINVAL`: the room left
     /// along the chain — the §15 monitoring readout. op 2 `transfer(dst, fuel, mem, spawn) -> 0 |
     /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's.
@@ -4006,6 +4007,23 @@ pub const MAX_FIBERS: usize = 1 << 24;
 /// engine charges it for each fiber `cont.new` makes, whatever the fiber's real footprint there (an
 /// interpreter's continuation is smaller), so a budget reads the same on every engine.
 pub const FIBER_STACK: u64 = 1 << 18;
+
+/// #2268 — the runs of page state every fresh window counts as, whatever its geometry: a NULL guard,
+/// the declared prefix, the reserved tail. A window's runs are its mappings where it is real hardware
+/// (the JIT's), and every engine counts them alike (`Budget.maps`).
+pub const WINDOW_RUNS: u64 = 3;
+
+/// #2268 — the most runs of page state a fresh window of a module whose data is `data` starts with:
+/// [`WINDOW_RUNS`], and two more for each `readonly` segment, which splits the declared prefix around
+/// its pages, and for an op-15 pre-map (`premap`), which aliases a region into it. A detached child's
+/// admission reserves its window's mappings by it before the window is built, on every engine alike.
+pub fn window_runs_bound(data: &[Data], premap: bool) -> u64 {
+    let ro = data
+        .iter()
+        .filter(|d| d.readonly && !d.bytes.is_empty())
+        .count() as u64;
+    WINDOW_RUNS + 2 * (ro + u64::from(premap))
+}
 
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
 /// `ThreadFault` past it. Every engine bounds the run's *concurrently live* vCPUs, the root among

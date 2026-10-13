@@ -170,9 +170,9 @@ fn a_fork_twin_charges_its_parents_nodes() {
 #[test]
 fn concurrent_charges_never_overdraw_a_shared_ancestor() {
     let tree = Arc::new(BudgetTree::default());
-    let root = tree.mint(None, [-1, 1000, -1, -1, -1], [0; BUDGET_DIMS]);
+    let root = tree.mint(None, [-1, 1000, -1, -1, -1, -1], [0; BUDGET_DIMS]);
     let kids: Vec<u32> = (0..4)
-        .map(|_| tree.split(root, [-1, 600, -1, -1], -1).expect("split"))
+        .map(|_| tree.split(root, [-1, 600, -1, -1, -1, -1]).expect("split"))
         .collect();
     let admitted: usize = std::thread::scope(|s| {
         let runs: Vec<_> = kids
@@ -208,7 +208,14 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
         .cap_dispatch_slots(cap_id::BUDGET, 0, root, &[100, -1, -1], None)
         .expect("split")[0] as i32;
     let mut child = Host::new();
-    h.give_child_budget(node, &mut child);
+    h.give_child_budget(
+        Lease {
+            budget: node,
+            bytes: 0,
+            runs: WINDOW_RUNS,
+        },
+        &mut child,
+    );
     let src = child.own_node();
     assert_eq!(src.draw(), Some(50), "half the chain's room");
     assert_eq!(fuel_room(&mut h, node), 50);
@@ -244,7 +251,7 @@ fn fuel_is_drawn_in_chunks_charged_to_every_level_and_refunded_unburned() {
 fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() {
     let mut h = Host::new();
     assert_eq!(h.own_node().draw(), None, "no activation yet: unbounded");
-    let mut fuel = Fuel::drawn(h.begin_activation(10, RootWindow::default()));
+    let mut fuel = Fuel::drawn(h.begin_activation(10, RootWindow::default()).expect("room"));
     for _ in 0..4 {
         fuel.burn().expect("room left");
     }
@@ -254,7 +261,7 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
         6,
         "read back once the vCPU handed back its rest"
     );
-    let src = h.begin_activation(10, RootWindow::default());
+    let src = h.begin_activation(10, RootWindow::default()).expect("room");
     assert_eq!(
         h.fuel_left(),
         10,
@@ -278,7 +285,7 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
 fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
     let mut h = Host::new();
     let b = h.grant_budget(-1, -1, -1);
-    let mut root = Fuel::drawn(h.begin_activation(10, RootWindow::default()));
+    let mut root = Fuel::drawn(h.begin_activation(10, RootWindow::default()).expect("room"));
     root.burn().expect("room left"); // draws 5 of the activation's 10
     assert_eq!(
         fuel_room(&mut h, b),
@@ -291,7 +298,14 @@ fn a_guest_does_not_see_the_activation_limit_that_bounds_its_draws() {
     assert_eq!(fuel_room(&mut h, sub), -1, "nor does it clamp a split");
 
     let mut child = Host::new();
-    h.give_child_budget(sub, &mut child);
+    h.give_child_budget(
+        Lease {
+            budget: sub,
+            bytes: 0,
+            runs: WINDOW_RUNS,
+        },
+        &mut child,
+    );
     let mut fuel = Fuel::drawn(child.own_node());
     for _ in 0..5 {
         fuel.burn().expect("the activation's room");

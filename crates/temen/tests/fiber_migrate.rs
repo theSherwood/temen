@@ -227,7 +227,7 @@ block 0 (vsp: i64, varg: i64) {
     let m = module(src);
     let run_granted = |fibers: i64| -> Result<Vec<Value>, Trap> {
         let mut host = Host::new();
-        host.set_grant(fibers * temen_ir::FIBER_STACK as i64, -1, -1);
+        host.set_grant(fibers * temen_ir::FIBER_STACK as i64, -1, -1, -1);
         let mut fuel = 10_000_000u64;
         run_with_host(&m, 0, &[], &mut fuel, &mut host)
     };

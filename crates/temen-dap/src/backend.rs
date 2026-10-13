@@ -143,6 +143,7 @@ fn build_run(
                 i64::try_from(mem).unwrap_or(-1),
                 DEFAULT_CHANNEL as i64,
                 DEFAULT_SPAWN as i64,
+                -1, // `maps`: the default grant, unbounded (#2268)
             );
         }
         if block_stdin {

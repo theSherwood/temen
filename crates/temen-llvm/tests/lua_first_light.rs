@@ -6,7 +6,7 @@
 //! returns 456. This guards the whole stack the milestone rests on: the varargs ABI, the synthesized
 //! libc batch, exact `ldexp`, and the cross-block `<N x i1>` mask fix.
 
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 /// The script's expected result (`fib(10)=55` + `sum(i*i,1..10)=385` + `#"lua language"=12` +
 /// `counter()`'s 4th call `=4`).
@@ -20,13 +20,6 @@ fn run(backend: Backend) -> Outcome {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua core bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

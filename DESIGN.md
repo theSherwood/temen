@@ -2481,7 +2481,9 @@ child's grants is exactly the party positioned to observe their use.
   a parent over its own children via the lifecycle capability).
 - **The root is the embedder's child (#2113).** The embedder grants a run the
   ceilings of the run's own budget node (`temen_run::Limits`: fuel, `mem`,
-  `channel`, `spawn`; large defaults when it names none), and the root is charged
+  `channel`, `spawn`, `maps`; when it names none, modest defaults, since a default must
+  not let a guest crash its host: 4 GiB of `mem` and of `channel`, and the process's own
+  pool of mappings), and the root is charged
   to that node as a child is to its budget: its window and main vCPU, then all it
   makes. No code can use more than the grant above it (INVARIANTS #3).
 

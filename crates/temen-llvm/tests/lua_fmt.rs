@@ -11,7 +11,7 @@
 //! floats to the on-ramp's correctly-rounded bignum dtoa via `__vm_fmt_{fix,sci,gen}` (recognized in
 //! `lower_vm_builtin`). The result is byte-identical to native `string.format`.
 
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 /// The exact stdout of a native build of the same core + libraries + guest snprintf + script.
 /// (Written with `concat!` so the leading spaces on the `row` lines survive — a `\`-continuation
@@ -36,13 +36,6 @@ fn stdout_of(backend: Backend) -> Vec<u8> {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua string.format bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

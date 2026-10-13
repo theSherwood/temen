@@ -34,6 +34,7 @@ fn run(bc: &str, backend: Backend) -> temen_run::Run {
             mem: None,
             channel: None,
             spawn: None,
+            maps: None,
         },
         stdin: vec![],
         memory_size_log2: None,

@@ -196,9 +196,9 @@ fn try_main() -> Result<(), String> {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis);
-        // #2113 — the root's grant (CLI policy): `TEMEN_FUEL`, `TEMEN_MEM`, `TEMEN_CHANNEL` and
-        // `TEMEN_SPAWN` bound the run, a fiber or thread bomb included; each unset is the default
-        // grant.
+        // #2113 — the root's grant (CLI policy): `TEMEN_FUEL`, `TEMEN_MEM`, `TEMEN_CHANNEL`,
+        // `TEMEN_SPAWN` and `TEMEN_MAPS` bound the run, a fiber or thread bomb included; each unset
+        // is the default grant.
         let env_u64 = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<u64>().ok());
         let limits = Limits {
             fuel: env_u64("TEMEN_FUEL"),
@@ -206,6 +206,7 @@ fn try_main() -> Result<(), String> {
             mem: env_u64("TEMEN_MEM"),
             channel: env_u64("TEMEN_CHANNEL"),
             spawn: env_u64("TEMEN_SPAWN"),
+            maps: env_u64("TEMEN_MAPS"),
         };
         // The guest's `argv`: when the user passes `-- <args>`, the input file name is `argv[0]`
         // and the post-`--` tokens follow. When *no* `--` args are given, pass an empty vector so the
@@ -382,9 +383,9 @@ fn print_usage() {
          \n  --interactive  the guest reads the real stdin a line at a time and its stdout\n\
          \n                 streams live (a REPL guest is live); the default on a terminal\n\
          \n  env: TEMEN_DEADLINE_MS (kill a runaway guest after N ms),\n\
-         \n       TEMEN_FUEL / TEMEN_MEM / TEMEN_CHANNEL / TEMEN_SPAWN (the run's grant: fuel,\n\
-         \n       bytes of memory and of pipe buffers, live vCPUs with the root's own; each unset\n\
-         \n       is the default).\n\
+         \n       TEMEN_FUEL / TEMEN_MEM / TEMEN_CHANNEL / TEMEN_SPAWN / TEMEN_MAPS (the run's\n\
+         \n       grant: fuel, bytes of memory and of pipe buffers, live vCPUs with the root's own,\n\
+         \n       the host's OS mappings; each unset is the default).\n\
          \n\
          \nlink (D-LINK): statically link units into one runnable module.\n\
          \n  temen-run --link <unit.temt|.temeno|.temen>... [-o OUT.temen | --emit-text]\n\

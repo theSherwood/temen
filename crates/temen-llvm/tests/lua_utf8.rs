@@ -13,7 +13,7 @@
 //! `luaL_requiref`'d library, the only path reachable on the on-ramp (no filesystem / dynamic loader
 //! for the file and C-library searchers). See the fixtures README.
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(
@@ -23,13 +23,6 @@ fn run(backend: Backend) -> temen_run::Run {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua utf8.lua bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

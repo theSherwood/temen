@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 const FRAMES: u32 = 120;
 
@@ -133,13 +133,6 @@ fn assert_matches_native(backend: Backend) {
     };
     for (label, stdin) in [("rom", rom), ("tal", tal)] {
         let config = RunConfig {
-            limits: Limits {
-                fuel: None,
-                deadline: None,
-                mem: None,
-                channel: None,
-                spawn: None,
-            },
             stdin,
             memory_size_log2: None,
             args: vec![],

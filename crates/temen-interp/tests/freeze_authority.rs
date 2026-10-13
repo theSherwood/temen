@@ -10,7 +10,16 @@
 //! survives freeze/thaw through the value-typed re-grant path, and can be asked. These pin the three
 //! properties that makes true.
 
-use temen_interp::{cap_id, FreezeScope, Host};
+use temen_interp::{cap_id, FreezeScope, Host, Lease, WINDOW_RUNS};
+
+/// A 64 KiB detached window's lease on `budget`.
+fn window(budget: i32) -> Lease {
+    Lease {
+        budget,
+        bytes: 1 << 16,
+        runs: WINDOW_RUNS,
+    }
+}
 
 /// Authority over a range covers anything **inside** it — the same containment `AddressSpace` and
 /// `Instantiator` sub-ranges use, and what lets one grant over an instantiator's range cover every
@@ -210,7 +219,12 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
     });
     let budget = parent.grant_budget(-1, 1 << 20, -1);
     let (mut child, _, _) = parent
-        .spawn_detached_child(&[("freeze".to_string(), progeny)], 1 << 16, budget, -1)
+        .spawn_detached_child(
+            &[("freeze".to_string(), progeny)],
+            1 << 16,
+            window(budget),
+            -1,
+        )
         .expect("detached-progeny authority re-grants");
     assert!(child.holds_freeze_authority(FreezeScope::DetachedProgeny));
     assert!(
@@ -221,21 +235,26 @@ fn detached_progeny_authority_is_handed_down_by_grant() {
         .resolve_cap_name("budget")
         .expect("the child's budget");
     assert!(
-        child.admit_detached_spawn(own, 1 << 16).is_some(),
+        child.admit_detached_spawn(window(own)).is_some(),
         "so the durable child may spawn detached children of its own"
     );
 
     let (mut bare, _, _) = parent
-        .spawn_detached_child(&[], 1 << 16, budget, -1)
+        .spawn_detached_child(&[], 1 << 16, window(budget), -1)
         .expect("spawn");
     let own = bare.resolve_cap_name("budget").expect("the child's budget");
     assert!(
-        bare.admit_detached_spawn(own, 1 << 16).is_none(),
+        bare.admit_detached_spawn(window(own)).is_none(),
         "without the grant it holds none, and its detached spawn is refused"
     );
     assert!(
         parent
-            .spawn_detached_child(&[("freeze".to_string(), carve)], 1 << 16, budget, -1)
+            .spawn_detached_child(
+                &[("freeze".to_string(), carve)],
+                1 << 16,
+                window(budget),
+                -1
+            )
             .is_none(),
         "the carve form is never handed down"
     );

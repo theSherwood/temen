@@ -125,6 +125,7 @@ typedef struct {
   uint64_t mem;     /* the run's grant of memory bytes: windows, fiber stacks, regions (0 = default) */
   uint64_t channel; /* the run's grant of pipe-buffer bytes (0 = default) */
   uint64_t spawn;   /* the run's grant of live vCPUs (0 = default) */
+  uint64_t maps;    /* the run's grant of OS memory mappings (0 = default) */
   const uint8_t *stdin_bytes; /* guest stdin (NULL/0 = empty) */
   size_t stdin_len;
   uint8_t memory_size_log2; /* window override (if memory_set) */

@@ -186,6 +186,7 @@ fn run_config_threads_fuel_and_memory() {
             mem: 0,
             channel: 0,
             spawn: 0,
+            maps: 0,
             stdin: ptr::null(),
             stdin_len: 0,
             memory_size_log2: 0,

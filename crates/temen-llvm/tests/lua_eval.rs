@@ -10,7 +10,7 @@
 //! `io.write`/`os.date`/`coroutine` all work; file I/O (`io.open`) degrades gracefully to `nil` since
 //! this run grants no `fs` capability — see the `hc` guard in `lua_files_stdio.c`.
 
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 /// A small script covering what a first-time user reaches for across the editor's libraries: `print`,
 /// `string.format` (runtime format — the `lua_fmt` guest snprintf), `table.sort`/`concat`, `io.write`
@@ -37,13 +37,6 @@ fn stdout_of(backend: Backend) -> Vec<u8> {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua eval bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: SCRIPT.as_bytes().to_vec(), // the guest reads its program off stdin
         memory_size_log2: None,
         args: vec![],

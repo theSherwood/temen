@@ -592,10 +592,12 @@ pub struct TemenRunConfig {
     pub deadline_ms: u64,
     pub deadline_set: i32,
     /// #2113 — the run's root grant (`0` ⇒ the default grant): its bytes of memory (windows, fiber
-    /// stacks, regions), its bytes of pipe buffers, and its live vCPUs. Past `INT64_MAX`: no limit.
+    /// stacks, regions), its bytes of pipe buffers, its live vCPUs, and (#2268) the OS memory
+    /// mappings it may cause. Past `INT64_MAX`: no limit.
     pub mem: u64,
     pub channel: u64,
     pub spawn: u64,
+    pub maps: u64,
     /// Guest stdin bytes (`NULL`/`0` ⇒ empty).
     pub stdin: *const u8,
     pub stdin_len: usize,
@@ -624,6 +626,7 @@ unsafe fn run_config(c: *const TemenRunConfig) -> RunConfig {
             mem: (c.mem != 0).then_some(c.mem),
             channel: (c.channel != 0).then_some(c.channel),
             spawn: (c.spawn != 0).then_some(c.spawn),
+            maps: (c.maps != 0).then_some(c.maps),
         },
         stdin,
         memory_size_log2: (c.memory_set != 0).then_some(c.memory_size_log2),

@@ -51,9 +51,9 @@ use temen_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, LentFuel,
-    LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, Reg, RootWindow, Trap, Value, VarValue,
-    WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, Lease,
+    LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, Reg, RootWindow, Trap, Value,
+    VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -1786,10 +1786,10 @@ struct AdmittedChild {
     /// that paid for its window; a carve child keeps its fixed allowance (the record's budget, or the
     /// op's quota, capped at what its parent can still burn).
     fuel: Fuel,
-    /// A detached child's window lease `(budget, bytes)`: `Budget.mem` accounts live windows
-    /// (INVARIANTS #3, 2026-09-29), so the driver gives these bytes back to the spawner's budget when
-    /// the child ends. `None` for a confined (carve) child, which spends no `Budget.mem`.
-    lease: Option<(i32, u64)>,
+    /// A detached child's window lease: `Budget` accounts live windows (INVARIANTS #3, 2026-09-29),
+    /// so the driver gives what it holds back to the spawner's budget when the child ends. `None` for
+    /// a confined (carve) child, which spends no `Budget.mem`.
+    lease: Option<Lease>,
 }
 
 /// An [`AdmittedChild`] ready to schedule ([`AdmittedChild::build`]): its program landed in the run's
@@ -1801,7 +1801,7 @@ struct BuiltChild {
     mem: Option<Mem>,
     host: Host,
     fuel: Fuel,
-    lease: Option<(i32, u64)>,
+    lease: Option<Lease>,
 }
 
 impl AdmittedChild {
@@ -1810,12 +1810,7 @@ impl AdmittedChild {
     /// entry its program cannot start at. A refused child hands its window lease to `refund`, its
     /// spawner's budget, so a spawn refused after its admission charges nothing (#1975, #2006), as the
     /// oracle's undo does.
-    fn build(
-        self,
-        entry: i64,
-        room: bool,
-        refund: impl FnOnce(i32, u64),
-    ) -> Result<BuiltChild, Trap> {
+    fn build(self, entry: i64, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
         let AdmittedChild {
             mem,
             host,
@@ -1843,8 +1838,11 @@ impl AdmittedChild {
                 lease,
             }),
             Err(t) => {
-                if let Some((budget, bytes)) = lease {
-                    refund(budget, bytes);
+                // #2268 — its window, if built, started: what it held of `maps` goes back too.
+                let mut host = host;
+                host.release_memory();
+                if let Some(lease) = lease {
+                    refund(lease);
                 }
                 Err(t)
             }
@@ -2063,7 +2061,7 @@ struct FreshWindow {
 impl FreshWindow {
     /// Build the window over `back` (`None`: a reservation of the engine's own) the way the
     /// tree-walker builds it ([`Mem::from_spec`]), and alias in the pre-mapped region the child's
-    /// powerbox `host` carries.
+    /// powerbox `host` carries: the window has started ([`Host::start_window`]).
     fn build(
         &self,
         back: Option<std::sync::Arc<super::Region>>,
@@ -2084,6 +2082,7 @@ impl FreshWindow {
         if host.apply_premap(&mut mem) < 0 {
             return Err(Trap::Malformed);
         }
+        host.start_window(mem.window_runs());
         Ok(mem)
     }
 
@@ -2197,7 +2196,12 @@ fn admit_detached_child(
     if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || !durable_ok {
         return Ok(None);
     }
-    let Some(lane) = host.admit_detached_spawn(s.budget, child_size) else {
+    let lease = Lease {
+        budget: s.budget,
+        bytes: child_size,
+        runs: super::window_runs_bound(&cmodule.data, s.premap.is_some()),
+    };
+    let Some(lane) = host.admit_detached_spawn(lease) else {
         return Ok(None);
     };
     // #1975 — every exit from here that builds no child hands back what the admission took.
@@ -2211,14 +2215,14 @@ fn admit_detached_child(
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
     // #1944 — the budget that paid for the window is the child's own.
-    host.give_child_budget(s.budget, &mut child_host);
+    host.give_child_budget(lease, &mut child_host);
     for (name, gh) in &glist {
         let _ = host.grant_entry_into_child(cell.as_ref(), name, *gh, &mut child_host);
     }
     // The pre-mapped region rides the child's powerbox; the window build aliases it in.
     if let Some((r, o)) = s.premap {
         if !host.stage_premap(r, o, &mut child_host) {
-            host.undo_detached_spawn(s.budget, child_size, lane);
+            host.undo_detached_spawn(lease, lane);
             return Err(Trap::Malformed);
         }
     }
@@ -2231,7 +2235,7 @@ fn admit_detached_child(
         child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
     };
     if bound.is_err() {
-        host.undo_detached_spawn(s.budget, child_size, lane);
+        host.undo_detached_spawn(lease, lane);
         return Ok(None);
     }
     // D66 — single-spawn lane parity with the tree-walker: this engine's detached children do not yet
@@ -2247,7 +2251,7 @@ fn admit_detached_child(
         program,
         args,
         fuel,
-        lease: Some((s.budget, child_size)),
+        lease: Some(lease),
     };
     let window = FreshWindow {
         size_log2: size_log2 as u8,
@@ -3392,7 +3396,10 @@ pub fn compile_and_run_with_host_traced(
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     // #1944 slice 3 — an activation of `host`: the root draws its fuel from the host's own node.
-    let mut vfuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let Some(node) = host.begin_activation(*fuel, RootWindow::of(mem.as_ref())) else {
+        return Some((Err(Trap::ThreadFault), Vec::new(), None));
+    };
+    let mut vfuel = Fuel::drawn(node);
     let r = loop {
         match vm.resume(
             &dom.source,
@@ -3813,7 +3820,8 @@ impl SharedProgram {
             mm
         });
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
+        let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         Ok(CoopRun {
             dom,
@@ -4517,8 +4525,8 @@ pub struct Vcpu<'p> {
     /// ([`deliver_child`](Self::deliver_child)). A join resolves its handle by the oracle's rule
     /// ([`super::take_child`]) and spends it, so every host answers a bad join alike (#1728, #1736).
     children: Vec<Option<VcpuChild>>,
-    /// The just-admitted detached spawn's window lease `(budget, bytes)`, filed with its child.
-    pending_lease: Option<(i32, u64)>,
+    /// The just-admitted detached spawn's window lease, filed with its child.
+    pending_lease: Option<Lease>,
     /// #2001 — the just-spawned thread's `spawn` on this vCPU's domain node, filed with its child.
     pending_live: LiveVcpu,
     /// #2113 — how a host-built vCPU starts its fuel at its first [`run`](Self::run). `None` for a
@@ -4537,7 +4545,7 @@ pub struct Vcpu<'p> {
 /// to the budget.
 struct VcpuChild {
     token: u64,
-    lease: Option<(i32, u64)>,
+    lease: Option<Lease>,
     live: LiveVcpu,
     /// The outcome a `wait` (op 18) received for this child, which returned: its `join` takes it.
     ended: Option<Result<Vec<Value>, Trap>>,
@@ -5085,17 +5093,23 @@ impl<'p> Vcpu<'p> {
             let start = |h: &mut Host| match opens {
                 // Fuel unification: a fresh run's entry costs one fuel, as on every driver.
                 Opens::Root(window) => (h.begin_activation(DEFAULT_FUEL, window), !thaws(h, mem)),
-                Opens::Thread => (h.own_node(), false),
+                Opens::Thread => (Some(h.own_node()), false),
             };
             let (node, entry) = match self.shared_host {
                 Some(m) => start(&mut m.lock_unpoisoned()),
                 None => start(&mut self.host),
             };
-            self.fuel = Fuel::drawn(node);
-            if entry {
-                if let Err(t) = self.fuel.burn() {
-                    self.trap = Some(t);
+            match node {
+                Some(node) => {
+                    self.fuel = Fuel::drawn(node);
+                    if entry {
+                        if let Err(t) = self.fuel.burn() {
+                            self.trap = Some(t);
+                        }
+                    }
                 }
+                // #2268 — a run the process has no room for does not start: its main vCPU is refused.
+                None => self.trap = Some(Trap::ThreadFault),
             }
         }
         let ev = self.run_to_event();
@@ -5601,8 +5615,8 @@ impl<'p> Vcpu<'p> {
         let Some(VcpuChild { lease, live, .. }) = self.joining.take() else {
             return;
         };
-        if let Some((budget, bytes)) = lease {
-            self.release_detached(budget, bytes);
+        if let Some(lease) = lease {
+            self.release_detached(lease);
         }
         drop(live);
     }
@@ -5659,10 +5673,10 @@ impl<'p> Vcpu<'p> {
     }
 
     /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
-    fn release_detached(&mut self, budget: i32, bytes: u64) {
+    fn release_detached(&mut self, lease: Lease) {
         match self.shared_host {
-            Some(m) => m.lock_unpoisoned().release_detached(budget, bytes),
-            None => self.host.release_detached(budget, bytes),
+            Some(m) => m.lock_unpoisoned().release_detached(lease),
+            None => self.host.release_detached(lease),
         }
     }
 
@@ -7593,10 +7607,10 @@ fn dbg_refund_ended_windows(
 ) {
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
-            if let Some((env, budget, bytes)) = t.lease.take() {
+            if let Some((env, lease)) = t.lease.take() {
                 match env {
-                    None => host.release_detached(budget, bytes),
-                    Some(k) => envs[k].host.release_detached(budget, bytes),
+                    None => host.release_detached(lease),
+                    Some(k) => envs[k].host.release_detached(lease),
                 }
                 if let Some(k) = t.env {
                     envs[k].host.release_memory();
@@ -7661,7 +7675,7 @@ fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
     !tasks
         .iter()
         .filter(live)
-        .any(|t| t.env == Some(k) || matches!(t.lease, Some((Some(e), _, _)) if e == k))
+        .any(|t| t.env == Some(k) || matches!(t.lease, Some((Some(e), _)) if e == k))
         && !envs.iter().enumerate().any(|(i, e)| {
             matches!(e.place, EnvPlace::Detached { spawner: Some(sp) } if sp == k)
                 && tasks.iter().filter(live).any(|t| t.env == Some(i))
@@ -7684,7 +7698,7 @@ struct DbgTaskSnapshot {
     env: Option<usize>,
     state: TaskState,
     at_bp: bool,
-    lease: Option<(Option<usize>, i32, u64)>,
+    lease: Option<(Option<usize>, Lease)>,
     /// #2001 — the task is a live thread holding a `spawn`, which a restore charges again.
     live: bool,
 }
@@ -8508,9 +8522,9 @@ fn dbg_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |budget, bytes| match spawner {
-        None => host.release_detached(budget, bytes),
-        Some(k) => extra_envs[k].host.release_detached(budget, bytes),
+    } = child.build(entry, room, |lease| match spawner {
+        None => host.release_detached(lease),
+        Some(k) => extra_envs[k].host.release_detached(lease),
     })?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
@@ -8527,7 +8541,7 @@ fn dbg_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
+        lease: lease.map(|lease| (spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -8892,9 +8906,9 @@ impl ScheduledDebugRun {
         let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
-        // lends its fuel per resume.
+        // lends its fuel per resume. #2268 — a run the process has no room for is not debugged here.
         let mut host = host;
-        let _ = host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()));
+        host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()))?;
         Some(ScheduledDebugRun {
             source,
             table,
@@ -10826,8 +10840,9 @@ fn exec_image_build(
     // `exec_image` released the old image's own pipe ends (the fork-inherited ones the exec did not
     // carry). Empty for a command that inherited no CorePipe ends (the rung-1/2a case); non-empty
     // ends need the pipe-EOF wake the cooperative engine does not yet drive — a later rung.
-    // Build the command's natural table + activation over its unit.
-    let child_host = img.host;
+    // Build the command's natural table + activation over its unit. #2268 — its window has started.
+    let mut child_host = img.host;
+    child_host.start_window(win.window_runs());
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
     let new_vt = entry_task(&cunit, cm, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
@@ -13317,10 +13332,10 @@ fn coop_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |budget, bytes| {
+    } = child.build(entry, room, |lease| {
         task_host(root, extra_envs, spawner)
             .lock_unpoisoned()
-            .release_detached(budget, bytes)
+            .release_detached(lease)
     })?;
     if let Some(e) = &tierup {
         vt.active.tier_up(module, e);
@@ -13338,7 +13353,7 @@ fn coop_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|(budget, bytes)| (spawner, budget, bytes)),
+        lease: lease.map(|lease| (spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -13365,7 +13380,7 @@ struct TaskSlot {
     /// A detached child's window lease `(spawner env, budget, bytes)`, on the child's root task:
     /// once the task is `Done`, or the run is, the scheduler returns the bytes to the spawner's budget
     /// ([`refund_ended_windows`]).
-    lease: Option<(Option<usize>, i32, u64)>,
+    lease: Option<(Option<usize>, Lease)>,
     /// #2001 — the task's `spawn` on its domain's node, handed back when it completes
     /// ([`complete`]). None on the root and on a §14/§5 child's root (a detached child's lease
     /// holds its charge).
@@ -13437,10 +13452,10 @@ fn refund_ended_windows(
 ) {
     for t in tasks.iter_mut() {
         if run_ended || matches!(t.state, TaskState::Done(_)) {
-            if let Some((env, budget, bytes)) = t.lease.take() {
+            if let Some((env, lease)) = t.lease.take() {
                 task_host(root, envs, env)
                     .lock_unpoisoned()
-                    .release_detached(budget, bytes);
+                    .release_detached(lease);
             }
         }
     }
@@ -13839,7 +13854,8 @@ fn drive(
 ) -> Result<Vec<Value>, Trap> {
     // #1944 slice 3 — an activation of `host`: the root and its threads draw from the host's own
     // node, and `fuel` reads back the room left once every task has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let node = host.begin_activation(*fuel, RootWindow::of(mem.as_ref()));
+    let mut root_fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
     // #744 — the root's powerbox sits in a cell for the run, as every child's does, so a child can
     // call back into it through a self-serve grant. The run hands it back at the end.
     let root = std::mem::take(host).into_cell();
@@ -16506,7 +16522,8 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
+        let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         sched.emit.root_leaf = root_leaf;
         Ok(CoopRun {
@@ -16538,7 +16555,10 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
+            return Some(Err(Trap::ThreadFault));
+        };
+        let mut fuel = Fuel::drawn(node);
         let mut sched =
             match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup) {
                 Ok(s) => s,
@@ -17078,11 +17098,14 @@ mod dbg_domain_end_tests {
         const WINDOW: u64 = 1 << 16;
         let mut parent = Host::new();
         let budget = parent.grant_budget(-1, -1, -1);
-        parent
-            .admit_detached_spawn(budget, WINDOW)
-            .expect("admitted");
+        let lease = Lease {
+            budget,
+            bytes: WINDOW,
+            runs: super::super::WINDOW_RUNS,
+        };
+        parent.admit_detached_spawn(lease).expect("admitted");
         let mut child = Host::new();
-        parent.give_child_budget(budget, &mut child);
+        parent.give_child_budget(lease, &mut child);
         let mut fibers = FiberTables::default();
         fibers.fibers.push(FiberState::Pending {
             funcref: 0,
@@ -17107,7 +17130,7 @@ mod dbg_domain_end_tests {
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
         let done = || TaskState::Done(Ok(Vec::new()));
         let mut tasks = vec![task(done()), task(TaskState::Runnable)];
-        tasks[0].lease = Some((None, budget, WINDOW));
+        tasks[0].lease = Some((None, lease));
         dbg_refund_ended_windows(&mut tasks, &mut parent, &mut envs, false);
         assert_eq!(
             envs[0].fibers.fibers.len(),
@@ -17150,14 +17173,19 @@ mod live_cap_tests {
     fn admitted() -> (Host, AdmittedChild) {
         let mut host = Host::new();
         let budget = host.grant_budget(-1, -1, -1);
-        host.admit_detached_spawn(budget, WINDOW).expect("admitted");
+        let lease = Lease {
+            budget,
+            bytes: WINDOW,
+            runs: super::super::WINDOW_RUNS,
+        };
+        host.admit_detached_spawn(lease).expect("admitted");
         let child = AdmittedChild {
             mem: None,
             host: Host::new(),
             program: ChildProgram::Spawner(0, std::sync::Arc::new(unit())),
             args: Vec::new(),
             fuel: Fuel::fixed(0),
-            lease: Some((budget, WINDOW)),
+            lease: Some(lease),
         };
         assert_eq!(held(&host), (WINDOW as i64, 1), "the admission's charge");
         (host, child)
@@ -17487,7 +17515,10 @@ fn drive_threads(
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     // #1944 slice 3 — an activation of `host`: every thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let Some(node) = host.begin_activation(*fuel, RootWindow::of(mem.as_ref())) else {
+        return (Err(Trap::ThreadFault), mem);
+    };
+    let mut root_fuel = Fuel::drawn(node);
     let mut core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
         Ok(core) => core,
         Err(t) => {

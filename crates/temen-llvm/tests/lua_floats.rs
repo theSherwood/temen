@@ -22,7 +22,7 @@
 //!
 //! Reproduce the fixture: see the fixtures README §"Regenerating (floats)".
 
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 /// `(int)((3.14 + sqrt(2) + (10.5 % 3.0) + 1500.25) * 1000.0)` — pinned against a native build.
 const EXPECT: i32 = 1506304;
@@ -35,13 +35,6 @@ fn run(backend: Backend) -> Outcome {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua+floats bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

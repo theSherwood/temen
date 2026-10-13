@@ -119,7 +119,7 @@ not from micro-optimizing hot code. Default to:
 
 ## Process
 
-**Always open a PR whenever you have changes** — every branch with commits gets a PR, no exceptions. Open it as soon as you have changes rather than waiting for the work to feel finished. If you have multiple slices queued to implement, you can put them on the same PR until the PR exceeds 1000 loc. When you complete slices after opening a PR, check for merge conflicts and address them.
+**Always open a PR whenever you have changes** — every branch with commits gets a PR, no exceptions. Open it as soon as you have changes rather than waiting for the work to feel finished. Don't make tiny PRs: if you have more slices queued, put them on the same PR. Around 1000 lines is a size to grow toward, not a limit. When you complete slices after opening a PR, check for merge conflicts and address them.
 
 **Step back before you call a PR ready.** A PR opens early. Before you ask for review or merge, review the whole PR from above, not line by line:
 

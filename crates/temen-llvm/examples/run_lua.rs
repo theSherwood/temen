@@ -1,7 +1,7 @@
 //! Throwaway: translate a `.ll` and run it through the powerbox on the **tree-walker** (Memory
 //! granted), printing the outcome. Validates Lua first light — `main` runs a pure-compute script and
 //! returns the result. Pass `jit`/`bytecode` as a 2nd arg to pick another backend.
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 fn main() {
     let path = std::env::args()
@@ -15,13 +15,6 @@ fn main() {
     let t = temen_llvm::translate_ll_path(&path).expect("translate");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
