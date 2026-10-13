@@ -448,7 +448,8 @@ plumbing. Five workstreams, roughly independent:
     [`crates/temen-leng/tests/nim_diff/MATRIX.md`](crates/temen-leng/tests/nim_diff/MATRIX.md), over
     the differential corpus: a row per feature, each case built by native nimony and diffed byte for
     byte against the same build linked as `temen-link` links it and run on each of Temen's engines,
-    each gap with its issue, and the constructs nimony itself rejects. A toolchain-free test keeps it in step with the corpus. Rows
+    on both of Nim's bottom edges (POSIX and capabilities), each gap with its issue, and the
+    constructs nimony itself rejects. A toolchain-free test keeps it in step with the corpus. Rows
     that took translator work: method **dynamic dispatch** (#979: the `Rtti` vtable's `mt` method
     table is materialized as funcref relocs); **exceptions** (#980: hexer lowers `raise`/`try`/
     `except` to nimony's **error-flag model**, where a can-raise proc returns an `(ErrorCode, value)`
@@ -761,6 +762,16 @@ every nim program links (`POWERBOX_COMPUTE_SHIM`, each leaf routed by `COMPUTE_L
 (→ a byte shuffle / `clz`/`ctz`) and the atomics (→ the IR's atomics, #2202). The first unit of this
 kind, `bottom_edge_runtime()`, served the same leaves under their C names until the shim superseded it,
 and is deleted. The syscalls stay on the POSIX seam, and the heap grows through the Memory cap.
+
+**Two bottom edges, one link (#2282).** Below the compute shim a program's system calls reach one of
+two edges, a parameter of the one link (`temen_leng::link_nim`, `Edge`). The **POSIX edge** forwards
+them to a `temen_posix` personality: files, processes, pipes and a working directory, for a POSIX-like
+host. nimony's own build links there (`temen-link`). The **capability edge** gives a program the host's
+streams for fd 0, 1 and 2 and its `exit`, and nothing ambient: files, processes and the environment
+fail closed on the shim's stubs, so nim raises `IOError` or `OSError`. It is for a host with no
+POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it; `nim_hello` is its demo.
+The two share the compute shim, the heap hook and the guest libc, whose streams and exit each edge
+serves. The corpus runs every case on both.
 
 **Two paths to the near-term milestone (run one real program):**
 

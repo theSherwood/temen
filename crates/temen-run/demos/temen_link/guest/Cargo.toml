@@ -2,7 +2,7 @@
 # self-hosted lane's driver plans it (`nimony t`, patches/nimony/temen-backend.patch) and nifmake execs
 # it through `/bin/sh`: `temen-link -o:<out.temen> <main.c.nif> <dep.c.nif>...`. It reads and writes
 # through the POSIX personality's own imports (`__px_*`, the vocabulary nim programs speak), links with
-# `temen_leng::link_nim_posix` — the same call the host makes — and writes the encoded module. Built
+# `temen_leng::link_nim` — the same call the host makes — and writes the encoded module. Built
 # from source by the lane (build.sh, the LLVM on-ramp). Not escape-TCB: its output is re-verified.
 [package]
 name = "temen-link-guest"

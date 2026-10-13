@@ -1,7 +1,7 @@
 //! **The committed `nim_hello.temen` playground asset, run in-sandbox** (NIM.md — the "run real Nim"
 //! card). A real Nim program (`demos/nim_hello/hello.nim` — `write(stdout, "hello, temen\n")`) compiled
-//! all the way to a runnable powerbox module: `nimony c` → `temen_leng::link_nim_powerbox` (the nim→
-//! powerbox bottom-edge bridge) → verified + `encode_module`. Built by
+//! all the way to a runnable powerbox module: `nimony c` → `temen_leng::link_nim` on the capability
+//! edge (the host's streams and exit, nothing ambient) → verified + `encode_module`. Built by
 //! `cargo run -p temen-run --example build_nim_hello_temen` (needs the nimony toolchain), shipped
 //! prebuilt under `browser/web/assets/` — the same bytes the playground card loads.
 //!
@@ -37,5 +37,27 @@ fn committed_asset_prints_hello() {
     assert_eq!(
         run.stdout, b"hello, temen\n",
         "real Nim program prints via the powerbox"
+    );
+}
+
+/// The asset is the **capability edge**'s demo, so its manifest is that edge's: the program's exit,
+/// its three streams, and the core's memory ops its heap grows with. A program on the POSIX edge would
+/// import the personality's `__px_*` ops instead, which the playground's powerbox does not grant.
+#[test]
+fn committed_asset_is_built_on_the_capability_edge() {
+    let module = temen_encode::decode_module(ASSET).expect("decode nim_hello.temen");
+    let mut manifest: Vec<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
+    manifest.sort_unstable();
+    assert_eq!(
+        manifest,
+        [
+            "exit",
+            "stderr",
+            "stream_read",
+            "stream_write",
+            "vm_map",
+            "vm_page_size"
+        ],
+        "rebuild the asset with `ONLY=nim_hello bash scripts/rebuild-assets.sh`"
     );
 }

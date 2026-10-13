@@ -1,11 +1,12 @@
-//! `temen-link -o:<out.temen> [--libc:<path>] <main.c.nif> <dep.c.nif>...` — link a nim program's
-//! modules into one POSIX-personality Temen module, in-guest (#1609).
+//! `temen-link -o:<out.temen> [-g] [--edge:posix|caps] [--libc:<path>] <main.c.nif> <dep.c.nif>...` —
+//! link a nim program's modules into one Temen module, in-guest (#1609): on the POSIX edge, as nimony's
+//! own build links, unless `--edge:caps` asks for the capability edge.
 //!
 //! nimony's Temen backend (`nimony t`) plans this as the one whole-program node after DCE, in the
 //! place `lengc` + `cc` + the linker take in the C backend; nifmake execs it through `/bin/sh`. Every
 //! input is one module's DCE'd Leng (`<stem>.c.nif`). The command is [`temen_leng::link_command`],
-//! which an embedder may also serve natively: it links with [`temen_leng::link_nim_posix`], the call
-//! the host makes, against the personality's vocabulary ([`temen_posix_abi::vtable`]).
+//! which an embedder may also serve natively: it links with [`temen_leng::link_nim`], the call the
+//! host makes, against the personality's vocabulary ([`temen_posix_abi::vtable`]).
 //!
 //! It reaches the world only through the personality's imports (`__px_*`, #1668), so it binds in an
 //! exec'd powerbox exactly like the nim programs around it.

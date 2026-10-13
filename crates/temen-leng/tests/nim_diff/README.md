@@ -2,10 +2,11 @@
 
 Each `.nim` file here is built once by native `nimony c --run` and run natively. The same build's
 Leng then runs on Temen the way a user's build does: the program's `.c.nif` (what is left after its
-dead-code pass, the files `nimony t` hands `temen-link`), linked as `temen-link` links them, run
-under the POSIX personality on each of Temen's engines (the tree-walker, bytecode and the JIT). Each
-engine's output is diffed byte for byte against native's by `nim_differential_corpus` in
-`../nim_e2e.rs`.
+dead-code pass, the files `nimony t` hands `temen-link`), linked as `temen-link` links them. It is
+linked on both of Nim's bottom edges, POSIX (run under the POSIX personality) and capabilities (run
+on the bare powerbox), and run on each of Temen's engines (the tree-walker, bytecode and the JIT).
+Each engine's output on each edge is diffed byte for byte against native's by
+`nim_differential_corpus` in `../nim_e2e.rs`.
 
 **Adding a case is adding a file**, and naming it in a row of [`MATRIX.md`](MATRIX.md), the
 feature→status matrix the corpus backs (#956). There is no expected value to write down: the native
@@ -32,8 +33,8 @@ happened not to look.
 ## `known_gaps/`
 
 Programs that are **expected** to diverge, each naming the issue in its header comment. They are
-still compiled and run every time: a gap that quietly starts working on every engine is reported as
-a failure, with instructions to promote the file into the main corpus and close its issue. The
+still compiled and run every time: a gap that quietly starts working on every engine and edge is
+reported as a failure, with instructions to promote the file into the main corpus and close its issue. The
 directory *is* the expectation — there is no per-case enum to keep in sync.
 
 Put a case here only when the divergence is understood and tracked. An unexplained diff belongs in

@@ -211,7 +211,7 @@ fn program_units(posix: &temen_posix::Posix, cache: &str, main: &str) -> Vec<(St
 }
 
 /// The module `temen-link` wrote in-guest must be the one the host links from the same `.c.nif`s
-/// with the same call ([`temen_leng::link_nim_posix`]) — byte for byte, encoded.
+/// with the same call ([`temen_leng::link_nim`] on the POSIX edge) — byte for byte, encoded.
 fn expect_host_link(
     posix: &temen_posix::Posix,
     cache: &str,
@@ -225,8 +225,13 @@ fn expect_host_link(
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let (names, sigs) = temen_posix::cap_vtable();
-    let host = temen_leng::link_nim_posix(&units, (&names, &sigs), libc, false)
-        .unwrap_or_else(|e| panic!("the host link: {e}"));
+    let host = temen_leng::link_nim(
+        &units,
+        temen_leng::Edge::Posix((&names, &sigs)),
+        libc,
+        false,
+    )
+    .unwrap_or_else(|e| panic!("the host link: {e}"));
     assert!(
         temen_encode::encode_module(&host) == linked,
         "temen-link's module differs from the host's link of the same {} modules",
