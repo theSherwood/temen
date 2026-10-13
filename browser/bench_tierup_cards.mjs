@@ -1,7 +1,8 @@
-// #839: bench the single-shot tier-up path vs the plain bytecode path, per card, with event
-// counts — the "measure what the pump buys or costs" task. For each (card, workload) it runs:
+// #839: bench the tier-up path vs the plain bytecode path, per card, with event counts — the
+// "measure what the pump buys or costs" task. For each (card, workload) it runs:
 //   1. plain bytecode:  temen_run_onramp
-//   2. the playground path: runJitModule (whole-program JIT → tier-up pump → coop, as play.js)
+//   2. the playground path: runJitModule (the pump: the root whole as a leaf when the emitter takes
+//      it, else emitted regions under the interpreter — #1414 S4-3a)
 // asserting stdout parity, and reporting wall-clock plus TIERUP/JIT_INVOKE/bounce counts (counted
 // through a Proxy over the cdylib exports — zero engine changes). Cold (first Run, includes the
 // open's emit + WebAssembly.compile) and warm (best of N, Module cached) are reported separately,
@@ -32,7 +33,7 @@ const readStdout = () => dec.decode(u8().slice(
 // temen_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
 // #1026 slice 4: the production leaf tier-up size floor (temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES).
 const DEFAULT_FLOOR = 4096;
-let forcePump = false;
+let forceRegions = false;
 const counts = { tierups: 0, invokes: 0, bounces: 0, path: 'interp' };
 const resetCounts = () => { counts.tierups = 0; counts.invokes = 0; counts.bounces = 0; counts.path = 'interp'; };
 const exCounted = Object.fromEntries(Object.entries(Object.getOwnPropertyDescriptors(ex)).map(([k, d]) => {
@@ -41,16 +42,15 @@ const exCounted = Object.fromEntries(Object.entries(Object.getOwnPropertyDescrip
   if (k === 'temen_coop_func') return [k, (...a) => { counts.tierups++; return v(...a); }];
   if (k === 'temen_coop_jit_wasm_ptr') return [k, (...a) => { counts.invokes++; return v(...a); }];
   if (k === 'temen_coop_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
-  if (k === 'temen_onramp_jit_run_call_interp') return [k, (...a) => { counts.bounces++; return v(...a); }];
-  if (k === 'temen_onramp_jit_run_open')
+  if (k === 'temen_coop_program_leaf')
+    return [k, (...a) => { const r = v(...a); if (r !== 0) counts.path = 'leaf'; return r; }];
+  if (k === 'temen_coop_open')
     return [k, (...a) => {
-      if (forcePump) return -2; // pretend "_start not emittable" so runJitModule falls to coop
-      const r = v(...a);
-      if (r === 0) counts.path = 'whole-program';
+      // `forceRegions`: the root not offered whole (leaf mode off), so the regions run.
+      const r = forceRegions ? v(...a.slice(0, 7), 0) : v(...a);
+      if (r === 0) counts.path = 'regions';
       return r;
     }];
-  if (k === 'temen_coop_open')
-    return [k, (...a) => { const r = v(...a); if (r === 0) counts.path = 'coop'; return r; }];
   return [k, v];
 }));
 
@@ -122,30 +122,30 @@ for (const [name, rel, workload] of cards) {
     `${name}: bytecode best ${bBest.toFixed(1)}ms | auto cold ${cold.ms.toFixed(1)}ms, warm best ${warmBest.toFixed(1)}ms ` +
     `(${(bBest / warmBest).toFixed(2)}x) | path ${warm.path} | tierups ${warm.tierups} invokes ${warm.invokes} bounces ${warm.bounces} | ${parity}`,
   );
-  // The #839 column proper: the coop fallback tier forced (what a guest gets when the whole-program
-  // emit refuses), same workload. #1026 slice 4 A/B: sweep the leaf tier-up size floor — `0` = the
-  // old "leaves on" (every emittable leaf tiers up), the production default = "leaves off" for
-  // dispatch leaves. Both must stay parity=OK (the floor changes which tier runs, never the result).
-  forcePump = true;
+  // The #839 column proper: the region run forced (what a guest gets when the emitter declines its
+  // root), same workload. #1026 slice 4 A/B: sweep the leaf tier-up size floor — `0` = the old
+  // "leaves on" (every emittable leaf tiers up), the production default = "leaves off" for dispatch
+  // leaves. Both must stay parity=OK (the floor changes which tier runs, never the result).
+  forceRegions = true;
   for (const [label, floor] of [['leaves-on', 0], ['default', DEFAULT_FLOOR], ['leaves-off', 1 << 30]]) {
     try {
       ex.temen_coop_set_tierup_floor(floor);
-      const pcold = await pumpRun(modBytes, stdin, `bench#${name}#coop#${label}`);
+      const pcold = await pumpRun(modBytes, stdin, `bench#${name}#regions#${label}`);
       let pBest = Infinity, pw;
       for (let i = 0; i < N; i++) {
         ex.temen_coop_set_tierup_floor(floor);
-        const r = await pumpRun(modBytes, stdin, `bench#${name}#coop#${label}`);
+        const r = await pumpRun(modBytes, stdin, `bench#${name}#regions#${label}`);
         if (r.ms < pBest) { pBest = r.ms; pw = r; }
       }
       const pparity = pw.out === b[0].out && pw.st === b[0].st ? 'parity=OK' : 'parity=MISMATCH';
       console.log(
-        `${name}: coop-forced [${label} floor=${floor}] cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
+        `${name}: regions-forced [${label} floor=${floor}] cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
         `(${(bBest / pBest).toFixed(2)}x) | path ${pw.path} | tierups ${pw.tierups} invokes ${pw.invokes} bounces ${pw.bounces} | ${pparity}`,
       );
     } catch (e) {
-      console.log(`${name}: coop-forced [${label}] REFUSED/failed (${e.message})`);
+      console.log(`${name}: regions-forced [${label}] REFUSED/failed (${e.message})`);
     }
   }
   ex.temen_coop_set_tierup_floor(DEFAULT_FLOOR);
-  forcePump = false;
+  forceRegions = false;
 }

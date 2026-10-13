@@ -1287,7 +1287,9 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    the reactor, `_start` is **not** pre-run on the interpreter; the `.data`/`.rodata` are materialized up
    front (emitted `_start` seeds only the heap), and the window is sized to the module's **declared**
    `size_log2` (Lua declares 64 MiB — a smaller allocation faults any access into its upper range). FFI:
-   `temen_onramp_jit_run_open` + the `temen_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`. Proven
+   `temen_onramp_jit_run_open` + the `temen_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`.
+   *(Retired for module runs by #1414 S4-3a: `runJitModule` opens on the pump, which runs the root whole
+   as a leaf — `temen_coop_open` with `COOP_LEAF_ROOT` — and checks read-only data, #2302.)* Proven
    **byte-identical** to the interpreter (`temen_run_onramp`) for hello_c / Lua / SQLite by the native
    `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
    giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8

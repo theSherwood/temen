@@ -1,15 +1,15 @@
-//! **#1038 engine-survival pin**: an over-budget module through the whole-program open must leave
-//! the engine ALIVE. Pre-#1038, `temen_onramp_jit_run_open` on a large-enough module (the shipped
-//! Postgres, 119 MiB estimated emit) ran out of linear memory *inside* `emit_module` and hit Rust's
-//! OOM `unreachable`, aborting the whole cdylib instance — the fallback chain never ran, and every
-//! later call was dead. Now the reactor declines on the `est_emitted_size` module total before
-//! allocating; this pins the observable contract: the open returns a clean `UNSUPPORTED`, the
-//! status accessor still works, the tier-up fallback still admits the guest (with a degraded emit
-//! set), and a subsequent small-module open on the same instance succeeds.
+//! **#1038 engine-survival pin**: an over-budget module offered whole to the emitter must leave the
+//! engine ALIVE. Pre-#1038, the whole-program open on a large-enough module (the shipped Postgres,
+//! 119 MiB estimated emit) ran out of linear memory *inside* `emit_module` and hit Rust's OOM
+//! `unreachable`, aborting the whole cdylib instance — the fallback chain never ran, and every later
+//! call was dead. Now the emitter declines on the `est_emitted_size` module total before allocating.
+//! A module run offers its root to the emitter in the pump's one open (#1414 S4-3a), so this pins
+//! the contract there: the open declines the root and admits the guest anyway (with a degraded
+//! region emit), and a later small module on the same instance runs whole as a leaf.
 
 use temen_browser::{
-    temen_coop_close, temen_coop_open, temen_onramp_jit_run_close, temen_onramp_jit_run_open,
-    temen_status, STATUS_UNSUPPORTED,
+    temen_coop_close, temen_coop_open, temen_coop_program_wasm_len, temen_coop_wasm_len,
+    COOP_LEAF_ROOT,
 };
 use temen_ir::{Block, Export, Func, Inst, LoadOp, Memory, Module, Terminator, ValType};
 
@@ -71,33 +71,29 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
 
 #[test]
 fn over_budget_open_declines_and_the_engine_survives() {
+    let open = |bytes: &[u8]| {
+        temen_coop_open(
+            bytes.as_ptr(),
+            bytes.len(),
+            core::ptr::null(),
+            0,
+            0,
+            core::ptr::null(),
+            0,
+            COOP_LEAF_ROOT,
+        )
+    };
     let big = temen_encode::encode_module(&wide_module(20, 48_000));
-    // 1. The whole-program open DECLINES (pre-#1038 this OOM-aborted the instance here).
-    let opened = temen_onramp_jit_run_open(big.as_ptr(), big.len(), core::ptr::null(), 0, 0);
+    // 1. The root is declined whole (pre-#1038 this OOM-aborted the instance), and the open still
+    // admits the guest: the interpreter drives it, with the region emit degraded to fit.
+    assert_eq!(open(&big), 0, "the over-budget guest is admitted");
     assert_eq!(
-        opened, -STATUS_UNSUPPORTED,
-        "over-budget whole-program emit must refuse cleanly, not abort"
-    );
-    // 2. The engine is alive: the status accessor works…
-    assert_eq!(temen_status(), STATUS_UNSUPPORTED);
-    // …the tier-up fallback still ADMITS the same guest (its emit set degraded to fit — the chain
-    // the playground actually takes)…
-    let coop = temen_coop_open(
-        big.as_ptr(),
-        big.len(),
-        core::ptr::null(),
-        0,
-        0,
-        core::ptr::null(),
-        0,
-        0,
-    );
-    assert_eq!(
-        coop, 0,
-        "the fallback tier serves the guest with a degraded emit set"
+        (temen_coop_program_wasm_len(0), temen_coop_wasm_len() > 0),
+        (0, true),
+        "no leaf; a region emit"
     );
     temen_coop_close();
-    // …and a fresh small-module open on the same instance succeeds.
+    // 2. The engine is alive: a small module on the same instance runs whole as a leaf.
     let small_src = r#"memory 16
 func () -> (i64) {
 block 0 () {
@@ -112,12 +108,10 @@ export 0 func "_start" 0
         temen_verify::verify_module(&m).expect("verify");
         temen_encode::encode_module(&m)
     };
-    let opened = temen_onramp_jit_run_open(small.as_ptr(), small.len(), core::ptr::null(), 0, 0);
-    assert_eq!(
-        opened,
-        0,
-        "the engine still opens after the decline (status {})",
-        temen_status()
+    assert_eq!(open(&small), 0, "the engine still opens after the decline");
+    assert!(
+        temen_coop_program_wasm_len(0) > 0,
+        "the small root runs whole"
     );
-    temen_onramp_jit_run_close();
+    temen_coop_close();
 }
