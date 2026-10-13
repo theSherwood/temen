@@ -1882,3 +1882,76 @@ fn elision_boundary_sweep() {
         }
     }
 }
+
+/// Values whose live ranges are disjoint share a local (#2281): a block of thousands of short-lived
+/// values needs a handful of locals, not one each. V8's baseline compiler walks every local at every
+/// merge, so a nimsem function of 1,049 locals took 202 ms to compile, 40 KB of code. The block also
+/// holds a value live across all of it, results nothing reads, and selects whose operands die at
+/// them, and must still match the interpreter on both lowerings.
+#[test]
+fn a_long_block_reuses_its_locals() {
+    let mut src = String::from("func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  v1 = i64.const 7\n");
+    let (mut prev, mut next) = (0, 2);
+    for k in 0..2000 {
+        let op = ["i64.add", "i64.mul", "i64.xor"][k % 3];
+        src += &format!("  v{next} = {op} v{prev} v1\n");
+        (prev, next) = (next, next + 1);
+        if k % 7 == 0 {
+            src += &format!("  v{next} = i64.const {k}\n"); // read by nothing
+            next += 1;
+        }
+        if k % 11 == 0 {
+            src += &format!("  v{next} = i64.lt_s v{prev} v0\n");
+            src += &format!("  v{} = select v{next} v{prev} v1\n", next + 1);
+            (prev, next) = (next + 1, next + 2);
+        }
+    }
+    src += &format!("  v{next} = i64.add v{prev} v0\n  return v{next}\n}}\n}}\n");
+    diff("long_block", &src, ARGS, FUEL);
+    let m = parse("long_block", &src);
+    for wasm in [
+        compile_module(&m),
+        with_dispatcher_only(|| compile_module(&m)),
+    ] {
+        let locals = max_declared_locals(&wasm.expect("emits"));
+        assert!(locals < 32, "{locals} locals for a block of {next} values");
+    }
+}
+
+/// The most locals any function body of `wasm` declares.
+fn max_declared_locals(wasm: &[u8]) -> u64 {
+    fn uleb(b: &[u8], i: &mut usize) -> u64 {
+        let (mut r, mut s) = (0u64, 0);
+        loop {
+            let x = b[*i];
+            *i += 1;
+            r |= u64::from(x & 0x7f) << s;
+            s += 7;
+            if x < 0x80 {
+                return r;
+            }
+        }
+    }
+    let (mut i, mut most) = (8, 0);
+    while i < wasm.len() {
+        let id = wasm[i];
+        i += 1;
+        let end = uleb(wasm, &mut i) as usize + i;
+        if id == 10 {
+            let mut j = i;
+            for _ in 0..uleb(wasm, &mut j) {
+                let body_end = uleb(wasm, &mut j) as usize + j;
+                let mut k = j;
+                let mut locals = 0;
+                for _ in 0..uleb(wasm, &mut k) {
+                    locals += uleb(wasm, &mut k);
+                    k += 1; // the group's type
+                }
+                most = most.max(locals);
+                j = body_end;
+            }
+        }
+        i = end;
+    }
+    most
+}
