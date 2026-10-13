@@ -319,7 +319,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     let mut b = Host::new();
     let seen: CapLog = Default::default();
     let log = std::sync::Arc::clone(&seen);
-    b.set_named_cap_registrar(Box::new(move |name, state| {
+    b.set_named_cap_registrar(Box::new(move |name, state, _payer| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         // Re-seed the fresh handler from the captured state — this is the provider reading back
         // exactly the bytes it wrote at freeze.
@@ -369,7 +369,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
 
     for forkable in [true, false] {
         let mut b = Host::new();
-        b.set_named_cap_registrar(Box::new(move |_name, _state| {
+        b.set_named_cap_registrar(Box::new(move |_name, _state, _payer| {
             Some(temen_interp::NamedCapGrant {
                 handler: answer(),
                 fork: forkable.then(factory),
@@ -424,7 +424,7 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
 
     // A registrar that serves a *different* name refuses this one rather than substituting.
     let mut picky = Host::new();
-    picky.set_named_cap_registrar(Box::new(|name, _state| {
+    picky.set_named_cap_registrar(Box::new(|name, _state, _payer| {
         (name == "display").then(|| temen_interp::NamedCapGrant {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![0])),
             fork: None,

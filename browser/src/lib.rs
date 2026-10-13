@@ -3832,8 +3832,8 @@ impl OnrampCaps {
     /// counterpart (#1697).
     fn registrar(&self) -> temen_interp::NamedCapRegistrar {
         let caps = self.clone();
-        Box::new(move |name, state| {
-            if let Some(g) = temen_fs::regrant_vm_fs(name, state) {
+        Box::new(move |name, state, payer| {
+            if let Some(g) = temen_fs::regrant_vm_fs(name, state, payer) {
                 return Some(g);
             }
             let handler = caps.handler(name)?;
@@ -4972,6 +4972,7 @@ fn pg_setup(
     // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
+    fs_handle.bind(&host.own_node()); // #2306 — the run pays for the data dir it is handed and grows
     let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so

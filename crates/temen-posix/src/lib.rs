@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{
-    cap_id, CapState, ForkedProc, GuestMem, Host, HostProc, HostProcFork, NamedCapGrant, OpParks,
-    SignalSource, Trap,
+    cap_id, CapState, ForkedProc, GuestMem, Host, HostBuffer, HostCharge, HostProc, HostProcFork,
+    NamedCapGrant, NodeRef, OpParks, SignalSource, Trap, TABLE_ENTRY,
 };
 use temen_ir::ResolvedCap;
 
@@ -598,10 +598,32 @@ fn lossy_strings(v: &[Vec<u8>]) -> Vec<String> {
         .collect()
 }
 
+/// A memfs file: its bytes, charged to the personality's payer as they grow (#2306), and its write
+/// stamp.
 #[derive(Default)]
 struct MemFile {
-    bytes: Vec<u8>,
+    bytes: HostBuffer,
     mtime: i64,
+}
+
+/// #2306 — the most descriptors one process holds: Linux's default soft `RLIMIT_NOFILE`. A `dup2`
+/// or `F_DUPFD` past it is refused, as an `open` that would need one is (`-EMFILE`), so a guest's
+/// descriptor numbers never size the host's table.
+const FD_MAX: usize = 1024;
+
+/// #2306 — the most connections a listener holds unaccepted: Linux's `SOMAXCONN`. A loopback
+/// `connect` past them is refused (`-ECONNREFUSED`).
+const SOMAXCONN: usize = 4096;
+
+/// #2306 — the most one `read` of a delegate-backed socket asks the embedder for.
+const RECV_CHUNK: usize = 64 << 10;
+
+/// #2306 — what `names` cost the host as a table entry each ([`TABLE_ENTRY`]).
+fn names_cost<'a>(names: impl IntoIterator<Item = &'a String>) -> u64 {
+    names
+        .into_iter()
+        .map(|n| TABLE_ENTRY + n.len() as u64)
+        .sum()
 }
 
 /// What a registered command runs.
@@ -684,8 +706,9 @@ struct OpenFile {
 
 /// A shared, in-personality **pipe buffer** — a byte FIFO both ends of a `pipe()` hold via `Arc`.
 /// Non-blocking: a `read` on an empty buffer returns `0` (EOF). A pipe a process waits on is a core
-/// pipe ([`OP_PIPE_ADOPT`]); this type gives the fd surface its buffering.
-type PipeBuf = Arc<Mutex<VecDeque<u8>>>;
+/// pipe ([`OP_PIPE_ADOPT`]); this type gives the fd surface its buffering. #2306: what it holds is
+/// charged to the personality's payer, and a write it has no room for is `-ENOMEM`.
+type PipeBuf = Arc<Mutex<HostBuffer>>;
 
 // ---- net (POSIX.md §5a): the memnet + the embedder delegate ------------------------------------
 
@@ -813,10 +836,15 @@ struct MemListener {
 }
 
 /// Build a connected memnet pair for `client_addr → server_addr`: two FIFOs wired crosswise, with
-/// each side's write-liveness flag observed by the other. Returns `(client_end, server_end)`.
-fn mem_pair(client_addr: NetAddr, server_addr: NetAddr) -> (MemSock, MemSock) {
-    let c2s: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
-    let s2c: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+/// each side's write-liveness flag observed by the other, charged to `payer` (#2306). Returns
+/// `(client_end, server_end)`.
+fn mem_pair(
+    client_addr: NetAddr,
+    server_addr: NetAddr,
+    payer: Option<NodeRef>,
+) -> (MemSock, MemSock) {
+    let c2s: PipeBuf = Arc::new(Mutex::new(HostBuffer::new(payer.clone())));
+    let s2c: PipeBuf = Arc::new(Mutex::new(HostBuffer::new(payer)));
     let client_wclosed = Arc::new(AtomicBool::new(false));
     let server_wclosed = Arc::new(AtomicBool::new(false));
     let client = MemSock {
@@ -920,10 +948,28 @@ impl FdEntry {
 
 /// One open directory stream: the immediate child names under the opened path, snapshotted at
 /// `opendir` (so a concurrent `open`/`unlink` during iteration doesn't perturb it — POSIX permits
-/// either), plus the `readdir` cursor.
+/// either), plus the `readdir` cursor. #2306: the snapshot is charged to the personality's payer,
+/// a [`TABLE_ENTRY`] and its name each, until it is closed.
 struct DirStream {
     entries: Vec<String>,
     pos: usize,
+    held: HostCharge,
+}
+
+impl DirStream {
+    /// A stream over `entries`, charged to `payer` past any ceiling: one that existed before (a
+    /// restore's, a fork twin's copy of its parent's).
+    fn forced(entries: Vec<String>, pos: usize, payer: Option<&NodeRef>) -> DirStream {
+        let mut held = HostCharge::new(payer.cloned());
+        held.force(TABLE_ENTRY + names_cost(&entries));
+        DirStream { entries, pos, held }
+    }
+}
+
+impl Clone for DirStream {
+    fn clone(&self) -> DirStream {
+        DirStream::forced(self.entries.clone(), self.pos, self.held.payer())
+    }
 }
 
 /// The allocator's alignment (bytes). 16 covers `max_align_t` (doubles / SIMD) so a `malloc`'d buffer
@@ -985,22 +1031,22 @@ impl Terminal {
 /// [`Posix::raise_signal`]) may lock its `Proc` alone but must never then take the world lock.
 /// Open-file descriptions ([`OpenFile`]) nest innermost: World → Proc → description.
 struct World {
-    stdout: Vec<u8>,
+    stdout: HostBuffer,
     /// The **interleaved terminal transcript** (the interactive differential harness, #802 rung 3):
     /// when armed ([`Posix::enable_transcript`]) every byte that would reach a real terminal — fd-1
     /// writes, fd-2 writes (bash's prompt), and the line discipline's echo — is ALSO appended here,
     /// in arrival order, so a `bash -i` session can be compared byte-for-byte with native bash
     /// driven under a pty (whose master stream is exactly this interleaving). `None` = off (the
     /// separate `stdout`/`stderr` captures are unchanged either way).
-    transcript: Option<Vec<u8>>,
+    transcript: Option<HostBuffer>,
     /// When set, fd-1 writes go **here** instead of [`World::stdout`], and [`Posix::stdout`] reads it
     /// back. This unifies the shell's own output with a spawned child's: the embedder points it at the
     /// `Host`'s shared stdout sink (`Host::shared_stdout`), the same buffer a re-granted `Stream` writes
     /// to, so the shell's `write(1, …)` and the command's `write(1, …)` interleave in one stream
     /// (STAGE1.md §5). `None` keeps the self-contained captured-`Vec` behaviour (unchanged for every
     /// existing embedder).
-    stdout_sink: Option<Arc<Mutex<Vec<u8>>>>,
-    stderr: Vec<u8>,
+    stdout_sink: Option<Arc<Mutex<HostBuffer>>>,
+    stderr: HostBuffer,
     /// Preloaded standard input; `read(0, …)` drains it from `stdin_pos`. World-shared: the stdin
     /// **description** (bytes + offset) is one open file description all processes' fd-0 sentinels
     /// point at — POSIX fork shares the offset.
@@ -1110,6 +1156,11 @@ struct World {
     /// tag-redirects to `input_handle` (the #972 park/EINTR/EOF path). Output echo goes to the
     /// stdout sink. The discipline is pure personality policy (INVARIANTS 4/12).
     terminal: Option<Terminal>,
+    /// #2306 — what the memfs's names cost ([`World::tables_cost`]), charged to the personality's
+    /// payer: the domain it was granted to ([`Posix::bind`]), who pays for its files' bytes, its
+    /// pipes' and sockets' queues, its captured output and its directory streams too. Until then,
+    /// nobody: a personality an embedder holds for itself.
+    tables: HostCharge,
 }
 
 impl World {
@@ -1145,21 +1196,89 @@ impl World {
     }
 
     /// Replace `path`'s contents, stamping it with the next tick of the write clock. Creating a
-    /// file and truncating one are both writes, so both come here.
+    /// file and truncating one are both writes, so both come here. #2306: the bytes are charged to
+    /// the payer past any ceiling — the embedder's, or nothing at all from a guest — and so is a name
+    /// it creates; [`Self::file_create`] is the guest's refusable way to make one.
     fn file_put(&mut self, path: String, bytes: Vec<u8>) {
+        if !self.files.contains_key(&path) {
+            self.tables
+                .force(self.tables.bytes() + TABLE_ENTRY + path.len() as u64);
+        }
         self.fs_clock += 1;
         let mtime = self.fs_clock;
+        let bytes = HostBuffer::forced(self.payer(), bytes);
         self.files.insert(path, MemFile { bytes, mtime });
     }
 
-    /// `path`'s bytes for in-place mutation, stamped with the next tick. Creates the file if absent.
-    /// Only call it when the caller is about to write: it restamps unconditionally.
-    fn file_mut(&mut self, path: &str) -> &mut Vec<u8> {
+    /// #2306 — make `path` an empty file, as `O_CREAT`/`O_TRUNC` does: `false`, with nothing
+    /// changed, when the payer has no room for a name it creates.
+    fn file_create(&mut self, path: String) -> bool {
+        if !self.files.contains_key(&path) && !self.table(&path) {
+            return false;
+        }
         self.fs_clock += 1;
         let mtime = self.fs_clock;
-        let f = self.files.entry(path.to_string()).or_default();
+        let bytes = HostBuffer::new(self.payer());
+        self.files.insert(path, MemFile { bytes, mtime });
+        true
+    }
+
+    /// `path`'s bytes for in-place mutation, stamped with the next tick: `None` when it is absent
+    /// and the payer has no room for its name. Creates the file if absent. Only call it when the
+    /// caller is about to write: it restamps unconditionally.
+    fn file_mut(&mut self, path: &str) -> Option<&mut HostBuffer> {
+        if !self.files.contains_key(path) && !self.file_create(path.to_string()) {
+            return None;
+        }
+        self.fs_clock += 1;
+        let mtime = self.fs_clock;
+        let f = self.files.get_mut(path).expect("just made");
         f.mtime = mtime;
-        &mut f.bytes
+        Some(&mut f.bytes)
+    }
+
+    /// #2306 — remove `path`'s name, handing back what it cost: its file, if one was there.
+    fn file_remove(&mut self, path: &str) -> Option<MemFile> {
+        let f = self.files.remove(path)?;
+        self.untable(path);
+        Some(f)
+    }
+
+    /// #2306 — charge the name `name`: `false`, charging nothing, when the payer has no room.
+    fn table(&mut self, name: &str) -> bool {
+        self.grow_tables(TABLE_ENTRY + name.len() as u64)
+    }
+
+    /// #2306 — hand back the cost of the name `name`.
+    fn untable(&mut self, name: &str) {
+        let n = TABLE_ENTRY + name.len() as u64;
+        self.tables.resize(self.tables.bytes().saturating_sub(n));
+    }
+
+    /// #2306 — charge `n` more to [`Self::tables`]: `false`, charging nothing, when the payer has no
+    /// room.
+    fn grow_tables(&mut self, n: u64) -> bool {
+        self.tables.resize(self.tables.bytes() + n)
+    }
+
+    /// #2306 — append `data` to the captured stdout, or to the shared sink when one is set
+    /// ([`Posix::set_stdout_sink`]): `false` when its payer has no room for it.
+    fn put_stdout(&mut self, data: &[u8]) -> bool {
+        match &self.stdout_sink {
+            Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).push(data),
+            None => self.stdout.push(data),
+        }
+    }
+
+    /// #2306 — who pays for the personality's state.
+    fn payer(&self) -> Option<NodeRef> {
+        self.tables.payer().cloned()
+    }
+
+    /// #2306 — what the memfs's names cost: a [`TABLE_ENTRY`] and the name, for each file and each
+    /// empty directory. [`Self::tables`] holds it, kept current as each op changes them.
+    fn tables_cost(&self) -> u64 {
+        names_cost(self.files.keys()) + names_cost(&self.explicit_dirs)
     }
 
     /// `path`'s length, or 0 when it does not exist — the read half, which never stamps.
@@ -1421,7 +1540,7 @@ struct ProcessFiles<'c, 'a>(&'c mut Ctx<'a>);
 impl CommandFiles for ProcessFiles<'_, '_> {
     fn read(&mut self, path: &str) -> Option<Vec<u8>> {
         let file = self.0.resolve(path);
-        self.0.w.files.get(&file).map(|f| f.bytes.clone())
+        self.0.w.files.get(&file).map(|f| f.bytes.to_vec())
     }
 
     fn write(&mut self, path: &str, bytes: &[u8]) -> bool {
@@ -1462,13 +1581,49 @@ impl Posix {
         state::restore(&mut w, &mut p, bytes)
     }
 
-    /// #1894 — a personality rebuilt from a freeze's captured state, for a thaw's registrar: grant it
-    /// with [`named_grant`], then [`install`] its doors on the thawed host. The embedder re-applies its
-    /// own configuration (commands, sinks, delegates) as it did for the frozen run.
+    /// #1894 — a personality rebuilt from a freeze's captured state, for a thaw's registrar: bind it
+    /// to the node the registrar is handed ([`Posix::bind`]), grant it with [`named_grant`], then
+    /// [`install`] its doors on the thawed host. The embedder re-applies its own configuration
+    /// (commands, sinks, delegates) as it did for the frozen run.
     pub fn from_state(bytes: &[u8]) -> Result<Posix, StateError> {
         let posix = new_posix(0, 0, Vec::new());
         posix.restore_state(bytes)?;
         Ok(posix)
+    }
+
+    /// #2306 — make the domain whose node `payer` is pay for this personality: for all it holds now,
+    /// past any ceiling (an embedder's seeded files, or what a restore rebuilt, are the grantee's
+    /// from its grant on), and for what its guests grow it by, refused past a ceiling — `-ENOSPC`
+    /// from its memfs, `-ENOMEM` from its pipes, sockets and captured output. A personality pays to
+    /// the first domain it is bound to, as a memfs store does; every grant of it binds it.
+    pub fn bind(&self, payer: &NodeRef) {
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        if w.tables.payer().is_some() {
+            return;
+        }
+        w.tables.bind(payer);
+        let w = &mut *w;
+        let files = w.files.values_mut().map(|f| &mut f.bytes);
+        for buf in files
+            .chain([&mut w.stdout, &mut w.stderr])
+            .chain(&mut w.transcript)
+        {
+            buf.bind(payer);
+        }
+        let mut p = self.root.lock().unwrap_or_else(|e| e.into_inner());
+        for e in p.fds.iter().flatten() {
+            let queues = match e {
+                FdEntry::PipeRead(q) | FdEntry::PipeWrite(q) => vec![q],
+                FdEntry::NetSock(s) => vec![&s.rx, &s.tx],
+                _ => continue,
+            };
+            for q in queues {
+                q.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
+            }
+        }
+        for d in p.dirs.iter_mut().flatten() {
+            d.held.bind(payer);
+        }
     }
 
     /// The signal whose default action terminated this personality's root process, if one did
@@ -1484,8 +1639,8 @@ impl Posix {
     pub fn stdout(&self) -> Vec<u8> {
         let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         match &st.stdout_sink {
-            Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            None => st.stdout.clone(),
+            Some(sink) => sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec(),
+            None => st.stdout.to_vec(),
         }
     }
     /// Bytes the guest `write`-to-fd-2'd.
@@ -1494,7 +1649,7 @@ impl Posix {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .stderr
-            .clone()
+            .to_vec()
     }
 
     /// Arm the **interleaved terminal transcript** ([`World::transcript`]): from now on fd-1 writes,
@@ -1504,7 +1659,7 @@ impl Posix {
     pub fn enable_transcript(&self) {
         let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
         if w.transcript.is_none() {
-            w.transcript = Some(Vec::new());
+            w.transcript = Some(HostBuffer::new(w.payer()));
         }
     }
     /// The interleaved terminal transcript so far (empty when [`Posix::enable_transcript`] was never
@@ -1514,8 +1669,8 @@ impl Posix {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .transcript
-            .clone()
-            .unwrap_or_default()
+            .as_deref()
+            .map_or_else(Vec::new, <[u8]>::to_vec)
     }
 
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
@@ -1535,7 +1690,7 @@ impl Posix {
             .unwrap_or_else(|e| e.into_inner())
             .files
             .get(&rooted(path))
-            .map(|f| f.bytes.clone())
+            .map(|f| f.bytes.to_vec())
     }
 
     /// Every memfs path that currently exists, sorted — how an embedder/test sees what the guest
@@ -1573,10 +1728,19 @@ impl Posix {
         }
         let mut src = from.world.lock().unwrap_or_else(|e| e.into_inner());
         let mut dst = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        dst.files.extend(std::mem::take(&mut src.files));
+        // #2306 — what moves is paid for here from now on.
+        let payer = dst.payer();
+        for (path, mut f) in std::mem::take(&mut src.files) {
+            let bytes = HostBuffer::forced(payer.clone(), f.bytes.take());
+            let mtime = f.mtime;
+            dst.files.insert(path, MemFile { bytes, mtime });
+        }
         dst.explicit_dirs
             .extend(std::mem::take(&mut src.explicit_dirs));
         dst.fs_clock = dst.fs_clock.max(src.fs_clock);
+        let (left, moved) = (src.tables_cost(), dst.tables_cost());
+        src.tables.resize(left);
+        dst.tables.force(moved);
     }
 
     /// Remove a memfs file, as a host deletes one before running a tool there. Returns whether it
@@ -1585,8 +1749,7 @@ impl Posix {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .files
-            .remove(&rooted(path))
+            .file_remove(&rooted(path))
             .is_some()
     }
 
@@ -1596,7 +1759,7 @@ impl Posix {
     pub fn write_file_if_changed(&self, path: &str, bytes: &[u8]) -> bool {
         let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
         let path = rooted(path);
-        if w.files.get(&path).is_some_and(|f| f.bytes == bytes) {
+        if w.files.get(&path).is_some_and(|f| *f.bytes == *bytes) {
             return false;
         }
         w.file_put(path, bytes.to_vec());
@@ -1775,15 +1938,10 @@ impl Posix {
                     .store(0, std::sync::atomic::Ordering::SeqCst);
             }
             if !out.is_empty() {
-                match &w.stdout_sink {
-                    Some(sk) => sk
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .extend_from_slice(&out),
-                    None => w.stdout.extend_from_slice(&out),
-                }
+                // An echo the payer has no room for is dropped, as a full terminal drops input.
+                w.put_stdout(&out);
                 if let Some(t) = w.transcript.as_mut() {
-                    t.extend_from_slice(&out);
+                    t.push(&out);
                 }
             }
             let pipe = term.input_pipe;
@@ -1832,7 +1990,7 @@ impl Posix {
         }
     }
 
-    pub fn set_stdout_sink(&self, sink: Arc<Mutex<Vec<u8>>>) {
+    pub fn set_stdout_sink(&self, sink: Arc<Mutex<HostBuffer>>) {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2494,6 +2652,7 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
 
 pub fn grant(host: &mut Host, heap_base: u64, heap_end: u64, stdin: Vec<u8>) -> (i32, Posix) {
     let posix = new_posix(heap_base, heap_end, stdin);
+    posix.bind(&host.own_node());
     // FORK.md PR 5 / #863 — grant **forkable**: the factory clones the per-process side by POSIX's
     // rules ([`Proc::fork`]) and shares the [`World`], so a `fork()` twin gets its own fd table /
     // cwd / env / signal state over the shared memfs and open-file descriptions — real POSIX fork
@@ -2839,10 +2998,10 @@ fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
 /// [`cap`]; every process of the personality shares this one.
 fn new_world(stdin: Vec<u8>) -> World {
     World {
-        stdout: Vec::new(),
+        stdout: HostBuffer::default(),
         transcript: None,
         stdout_sink: None,
-        stderr: Vec::new(),
+        stderr: HostBuffer::default(),
         stdin,
         stdin_pos: 0,
         files: HashMap::new(),
@@ -2866,6 +3025,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         next_pid: 1000,
         last_fork_mint: None,
         fg_pgid: 1,
+        tables: HostCharge::default(),
     }
 }
 
@@ -3307,16 +3467,7 @@ impl Proc {
                     })
                     .collect()
             },
-            dirs: self
-                .dirs
-                .iter()
-                .map(|s| {
-                    s.as_ref().map(|d| DirStream {
-                        entries: d.entries.clone(),
-                        pos: d.pos,
-                    })
-                })
-                .collect(),
+            dirs: self.dirs.clone(),
             args: self.args.clone(),
             cwd: self.cwd.clone(),
             env: self.env.clone(),
@@ -3412,39 +3563,34 @@ impl Ctx<'_> {
         // The interleaved transcript (when armed) sees terminal-bound bytes in arrival order.
         if matches!(sink, Sink::Stdout | Sink::Stderr) {
             if let Some(t) = self.w.transcript.as_mut() {
-                t.extend_from_slice(data);
+                t.push(data);
             }
         }
-        match sink {
-            Sink::Stdout => match &self.w.stdout_sink {
-                Some(s) => s
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(data),
-                None => self.w.stdout.extend_from_slice(data),
-            },
-            Sink::Stderr => self.w.stderr.extend_from_slice(data),
+        // #2306 — what a write leaves buffered is charged to the personality's payer: a write it has
+        // no room for is `-ENOMEM`.
+        let fits = match sink {
+            Sink::Stdout => self.w.put_stdout(data),
+            Sink::Stderr => self.w.stderr.push(data),
             Sink::File => return self.file_write(fd as usize, data),
-            Sink::Pipe(p) => p
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(data.iter().copied()),
-            // A memnet write appends to the peer-facing FIFO (unbounded); a shut-down write side
-            // is `-EPIPE`, matching a closed peer.
+            Sink::Pipe(p) => p.lock().unwrap_or_else(|e| e.into_inner()).push(data),
+            // A memnet write appends to the peer-facing FIFO; a shut-down write side is `-EPIPE`,
+            // matching a closed peer.
             Sink::Net(s) => {
                 if s.write_token.closed.load(Ordering::Acquire) {
                     return EPIPE;
                 }
-                s.tx.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend(data.iter().copied());
+                s.tx.lock().unwrap_or_else(|e| e.into_inner()).push(data)
             }
             Sink::NetDelegate(d) => {
                 return d.lock().unwrap_or_else(|e| e.into_inner()).send(data);
             }
             Sink::Bad => return EBADF,
+        };
+        if fits {
+            data.len() as i64
+        } else {
+            ENOMEM
         }
-        data.len() as i64
     }
 
     /// `read(fd, buf, len) -> n | -errno`: the `Stdin` sentinel drains preloaded stdin; a `File` fd reads
@@ -3519,8 +3665,9 @@ impl Ctx<'_> {
             },
             Src::Pipe(p) => {
                 let mut g = p.lock().unwrap_or_else(|e| e.into_inner());
-                let n = len.min(g.len());
-                g.drain(..n).collect()
+                let chunk = g[..len.min(g.len())].to_vec();
+                g.consume(chunk.len());
+                chunk
             }
             // Memnet read: drain what's buffered; on empty, EOF (`0`) once the peer's write side is
             // gone or our read side is shut, else `-EAGAIN` (blocking would deadlock a cooperative
@@ -3530,16 +3677,19 @@ impl Ctx<'_> {
                     Vec::new()
                 } else {
                     let mut g = s.rx.lock().unwrap_or_else(|e| e.into_inner());
-                    let n = len.min(g.len());
-                    if n == 0 && !s.peer_write_closed.load(Ordering::Acquire) {
+                    let chunk = g[..len.min(g.len())].to_vec();
+                    if chunk.is_empty() && !s.peer_write_closed.load(Ordering::Acquire) {
                         return Ok(vec![EAGAIN]);
                     }
-                    g.drain(..n).collect()
+                    g.consume(chunk.len());
+                    chunk
                 }
             }
-            // A delegate-backed recv may block host-side (the embedder owns the real I/O).
+            // A delegate-backed recv may block host-side (the embedder owns the real I/O). #2306:
+            // at most a [`RECV_CHUNK`] at a time — a short read, as a socket's may be — so the
+            // guest's length never sizes the host's buffer.
             Src::NetDelegate(d) => {
-                let mut tmp = vec![0u8; len];
+                let mut tmp = vec![0u8; len.min(RECV_CHUNK)];
                 let n = d.lock().unwrap_or_else(|e| e.into_inner()).recv(&mut tmp);
                 if n < 0 {
                     return Ok(vec![n]);
@@ -3590,11 +3740,15 @@ impl Ctx<'_> {
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
+        if self.free_fd(0).is_none() {
+            return Ok(vec![EMFILE]); // before the open creates or truncates anything
+        }
         // Creating a file and truncating one are both writes, and only those two: opening an
         // existing file for reading must not restamp its mtime, or every `stat` would report the
-        // last *reader* instead of the last writer.
-        if !exists || flags & O_TRUNC != 0 {
-            self.w.file_put(path.clone(), Vec::new());
+        // last *reader* instead of the last writer. #2306: a name the payer has no room for is
+        // refused, as a full disk refuses one.
+        if (!exists || flags & O_TRUNC != 0) && !self.w.file_create(path.clone()) {
+            return Ok(vec![ENOSPC]);
         }
         let pos = if flags & O_APPEND != 0 {
             self.w.file_len(&path)
@@ -3703,16 +3857,17 @@ impl Ctx<'_> {
         let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
         let size = self.w.file_len(&of.path) as i64;
         let newpos = match whence {
-            SEEK_SET => offset,
-            SEEK_CUR => of.pos as i64 + offset,
-            SEEK_END => size + offset,
+            SEEK_SET => Some(offset),
+            SEEK_CUR => (of.pos as i64).checked_add(offset),
+            SEEK_END => size.checked_add(offset),
             _ => return EINVAL,
         };
-        if newpos < 0 {
+        // Before the start, past what an offset holds, or past what this host can address.
+        let Some(pos) = newpos.and_then(|p| usize::try_from(p).ok()) else {
             return EINVAL;
-        }
-        of.pos = newpos as usize;
-        newpos
+        };
+        of.pos = pos;
+        pos as i64
     }
 
     /// `pipe(fds_ptr) -> 0 | -errno`: create an in-personality byte FIFO and store the read and write fds
@@ -3721,9 +3876,16 @@ impl Ctx<'_> {
     fn pipe(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
         let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
-        let buf: PipeBuf = Arc::new(Mutex::new(VecDeque::new()));
+        let buf: PipeBuf = Arc::new(Mutex::new(HostBuffer::new(self.w.payer())));
         let rfd = self.alloc_fd(FdEntry::PipeRead(Arc::clone(&buf)));
+        if rfd < 0 {
+            return Ok(vec![rfd]);
+        }
         let wfd = self.alloc_fd(FdEntry::PipeWrite(buf));
+        if wfd < 0 {
+            self.p.fds[rfd as usize] = None;
+            return Ok(vec![wfd]);
+        }
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&(rfd as i32).to_le_bytes());
         out.extend_from_slice(&(wfd as i32).to_le_bytes());
@@ -3841,7 +4003,7 @@ impl Ctx<'_> {
         let Some(entry) = self.fd(oldfd) else {
             return EBADF;
         };
-        if newfd < 0 {
+        if !(0..FD_MAX as i64).contains(&newfd) {
             return EBADF;
         }
         if oldfd == newfd {
@@ -3879,9 +4041,10 @@ impl Ctx<'_> {
             return EBADF;
         };
         match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC if !(0..FD_MAX as i64).contains(&arg) => EINVAL,
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 let dup = entry.dup_clone();
-                self.alloc_fd_from(dup, arg.max(0) as usize)
+                self.alloc_fd_from(dup, arg as usize)
             }
             F_GETFD | F_GETFL | F_SETFD | F_SETFL => 0,
             _ => EINVAL,
@@ -4555,7 +4718,7 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         };
         let path = self.resolve(&path);
-        Ok(vec![if self.w.files.remove(&path).is_some() {
+        Ok(vec![if self.w.file_remove(&path).is_some() {
             0
         } else {
             ENOENT
@@ -4589,6 +4752,9 @@ impl Ctx<'_> {
         if !self.is_dir(parent) {
             return Ok(vec![ENOENT]);
         }
+        if !self.w.table(&norm) {
+            return Ok(vec![ENOSPC]); // #2306 — no room for the name
+        }
         self.w.explicit_dirs.insert(norm);
         Ok(vec![0])
     }
@@ -4618,7 +4784,9 @@ impl Ctx<'_> {
         if !self.dir_children(&norm).is_empty() {
             return Ok(vec![ENOTEMPTY]);
         }
-        self.w.explicit_dirs.remove(&norm);
+        if self.w.explicit_dirs.remove(&norm) {
+            self.w.untable(&norm);
+        }
         Ok(vec![0])
     }
 
@@ -4640,9 +4808,25 @@ impl Ctx<'_> {
         let old_n = self.resolve(old.trim_end_matches('/'));
         let new_n = self.resolve(new.trim_end_matches('/'));
         // File fast path: move the bytes, shadowing any explicit dir marker at the destination.
-        if let Some(v) = self.w.files.remove(&old_n) {
+        // #2306 — the entry is charged for its new name, all of it or none: a longer name costs
+        // more, and a file or marker the rename replaces hands back its own entry.
+        if self.w.files.contains_key(&old_n) {
+            let come = TABLE_ENTRY + new_n.len() as u64;
+            let replaced = (new_n != old_n && self.w.files.contains_key(&new_n)) as u64
+                + self.w.explicit_dirs.contains(&new_n) as u64;
+            let gone = TABLE_ENTRY + old_n.len() as u64 + replaced * come;
+            if come > gone && !self.w.grow_tables(come - gone) {
+                return Ok(vec![ENOSPC]);
+            }
+            let v = self.w.files.remove(&old_n).expect("checked above");
             self.w.files.insert(new_n.clone(), v);
             self.w.explicit_dirs.remove(&new_n);
+            let names = self
+                .w
+                .tables
+                .bytes()
+                .saturating_sub(gone.saturating_sub(come));
+            self.w.tables.resize(names);
             return Ok(vec![0]);
         }
         // Directory: re-key every file and explicit subdir under `old_n`, plus the marker itself.
@@ -4656,10 +4840,6 @@ impl Ctx<'_> {
                 .filter(|k| k.starts_with(&op))
                 .cloned()
                 .collect();
-            for k in moved {
-                let v = self.w.files.remove(&k).unwrap();
-                self.w.files.insert(format!("{np}{}", &k[op.len()..]), v);
-            }
             let dirs: Vec<String> = self
                 .w
                 .explicit_dirs
@@ -4667,6 +4847,16 @@ impl Ctx<'_> {
                 .filter(|d| d.as_str() == old_n || d.starts_with(&op))
                 .cloned()
                 .collect();
+            // #2306 — charged first for every name growing by the difference, then settled to what
+            // the names cost once moved.
+            let longer = new_n.len().saturating_sub(old_n.len()) * (moved.len() + dirs.len());
+            if !self.w.grow_tables(longer as u64) {
+                return Ok(vec![ENOSPC]);
+            }
+            for k in moved {
+                let v = self.w.files.remove(&k).unwrap();
+                self.w.files.insert(format!("{np}{}", &k[op.len()..]), v);
+            }
             for d in dirs {
                 self.w.explicit_dirs.remove(&d);
                 let nd = if d == old_n {
@@ -4676,6 +4866,8 @@ impl Ctx<'_> {
                 };
                 self.w.explicit_dirs.insert(nd);
             }
+            let names = self.w.tables_cost();
+            self.w.tables.resize(names);
             return Ok(vec![0]);
         }
         Ok(vec![ENOENT])
@@ -4684,14 +4876,13 @@ impl Ctx<'_> {
     // ---- net ops (POSIX.md §5a) — the `net` capability's dispatch targets ----------------------
 
     /// The next free ephemeral port (49152..), skipping bound listeners; wraps within the range.
-    fn net_alloc_ephemeral(&mut self) -> u16 {
-        loop {
+    fn net_alloc_ephemeral(&mut self) -> Option<u16> {
+        // #2306 — `None` once listeners hold every port of the range, rather than circling it.
+        (49152..=u16::MAX).find_map(|_| {
             let p = self.w.net_next_port;
             self.w.net_next_port = if p == u16::MAX { 49152 } else { p + 1 };
-            if !self.w.net_listeners.contains_key(&p) {
-                return p;
-            }
-        }
+            (!self.w.net_listeners.contains_key(&p)).then_some(p)
+        })
     }
 
     /// Write an address blob to the caller's out-buffer when one was supplied (`out != 0`); a buffer
@@ -4735,15 +4926,24 @@ impl Ctx<'_> {
             let Some(q) = self.w.net_listeners.get(&dst.port).map(Arc::clone) else {
                 return Ok(vec![ECONNREFUSED]);
             };
-            let src = NetAddr::loopback(self.net_alloc_ephemeral());
-            let (client, server) = mem_pair(src, dst);
-            q.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back(server);
+            // #2306 — a listener's backlog is bounded, as Linux's is.
+            if q.lock().unwrap_or_else(|e| e.into_inner()).len() >= SOMAXCONN {
+                return Ok(vec![ECONNREFUSED]);
+            }
+            let Some(port) = self.net_alloc_ephemeral() else {
+                return Ok(vec![EAGAIN]);
+            };
+            let (client, server) = mem_pair(NetAddr::loopback(port), dst, self.w.payer());
             if let Err(e) = Self::net_write_addr(mem, out, cap, &client.local)? {
                 return Ok(vec![e]);
             }
-            return Ok(vec![self.alloc_fd(FdEntry::NetSock(client))]);
+            let fd = self.alloc_fd(FdEntry::NetSock(client));
+            if fd >= 0 {
+                q.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(server);
+            }
+            return Ok(vec![fd]);
         }
         let Some(d) = self.w.net_delegate.as_mut() else {
             return Ok(vec![ECONNREFUSED]);
@@ -4785,7 +4985,10 @@ impl Ctx<'_> {
             return Ok(vec![EACCES]);
         }
         let port = if req.port == 0 {
-            self.net_alloc_ephemeral()
+            match self.net_alloc_ephemeral() {
+                Some(port) => port,
+                None => return Ok(vec![EADDRINUSE]),
+            }
         } else if self.w.net_listeners.contains_key(&req.port) {
             return Ok(vec![EADDRINUSE]);
         } else {
@@ -4796,11 +4999,14 @@ impl Ctx<'_> {
             return Ok(vec![e]);
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
-        self.w.net_listeners.insert(port, Arc::clone(&pending));
-        Ok(vec![self.alloc_fd(FdEntry::NetListener(MemListener {
+        let fd = self.alloc_fd(FdEntry::NetListener(MemListener {
             addr: bound,
-            pending,
-        }))])
+            pending: Arc::clone(&pending),
+        }));
+        if fd >= 0 {
+            self.w.net_listeners.insert(port, pending);
+        }
+        Ok(vec![fd])
     }
 
     /// `accept(fd, peer_out, cap) -> fd | -EAGAIN | -errno`: pop the next pending memnet connection
@@ -4820,6 +5026,9 @@ impl Ctx<'_> {
             Some(_) => return Ok(vec![ENOTSOCK]),
             None => return Ok(vec![EBADF]),
         };
+        if self.free_fd(0).is_none() {
+            return Ok(vec![EMFILE]); // the connection stays queued, as Linux leaves it
+        }
         let Some(sock) = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
             return Ok(vec![EAGAIN]);
         };
@@ -5050,7 +5259,16 @@ impl Ctx<'_> {
             return Ok(vec![ENOENT]);
         }
         let entries = self.dir_children(&path);
-        let stream = DirStream { entries, pos: 0 };
+        // #2306 — the snapshot is charged until it is closed.
+        let mut held = HostCharge::new(self.w.payer());
+        if !held.resize(TABLE_ENTRY + names_cost(&entries)) {
+            return Ok(vec![ENOSPC]);
+        }
+        let stream = DirStream {
+            entries,
+            pos: 0,
+            held,
+        };
         let idx = match self.p.dirs.iter().position(Option::is_none) {
             Some(i) => {
                 self.p.dirs[i] = Some(stream);
@@ -5210,7 +5428,7 @@ impl Ctx<'_> {
             }
         } else if let Some(f) = self.w.files.get(&file) {
             let wl = temen_encode::module_window_log2(&f.bytes).ok_or(EACCES)?;
-            (ExecTarget::Image(f.bytes.as_slice().into()), wl)
+            (ExecTarget::Image(f.bytes[..].into()), wl)
         } else {
             return Err(ENOENT);
         };
@@ -5478,21 +5696,21 @@ impl Ctx<'_> {
     }
 
     /// Allocate the lowest free fd `>= min` for `entry` (the `F_DUPFD`/`dup2` "at or above" contract),
-    /// extending the table if needed.
+    /// extending the table if needed: `-EMFILE` when every fd from `min` below [`FD_MAX`] is taken.
     fn alloc_fd_from(&mut self, entry: FdEntry, min: usize) -> i64 {
-        while self.p.fds.len() < min {
-            self.p.fds.push(None);
+        let Some(i) = self.free_fd(min) else {
+            return EMFILE;
+        };
+        if self.p.fds.len() <= i {
+            self.p.fds.resize_with(i + 1, || None);
         }
-        match (min..self.p.fds.len()).find(|&i| self.p.fds[i].is_none()) {
-            Some(i) => {
-                self.p.fds[i] = Some(entry);
-                i as i64
-            }
-            None => {
-                self.p.fds.push(Some(entry));
-                (self.p.fds.len() - 1) as i64
-            }
-        }
+        self.p.fds[i] = Some(entry);
+        i as i64
+    }
+
+    /// The lowest free fd `>= min` below [`FD_MAX`], if there is one (#2306).
+    fn free_fd(&self, min: usize) -> Option<usize> {
+        (min..FD_MAX).find(|&i| self.p.fds.get(i).is_none_or(Option::is_none))
     }
 
     /// Write `data` into fd `fd`'s memfs file at its offset (extending with zeros if the offset is
@@ -5506,14 +5724,15 @@ impl Ctx<'_> {
         if !of.writable {
             return EBADF;
         }
-        let pos = of.pos;
-        let file = self.w.file_mut(&of.path);
-        let end = pos + data.len();
-        if file.len() < end {
-            file.resize(end, 0);
+        // #2306 — a file the personality's payer has no room to grow refuses the write, as a full
+        // disk would; so does a name it would recreate.
+        let Some(file) = self.w.file_mut(&of.path) else {
+            return ENOSPC;
+        };
+        if !file.write_at(of.pos as u64, data) {
+            return ENOSPC;
         }
-        file[pos..end].copy_from_slice(data);
-        of.pos = end;
+        of.pos += data.len();
         data.len() as i64
     }
 
@@ -5530,10 +5749,10 @@ impl Ctx<'_> {
             .w
             .files
             .get(&of.path)
-            .map(|f| f.bytes.as_slice())
+            .map(|f| &f.bytes[..])
             .unwrap_or(&[]);
         let n = len.min(file.len().saturating_sub(pos));
-        let chunk = file[pos..pos + n].to_vec();
+        let chunk = file.get(pos..pos + n).unwrap_or_default().to_vec();
         of.pos = pos + n;
         Ok(chunk)
     }
@@ -8718,5 +8937,143 @@ block 0 () {\n\
             "jit: must match interp, got {jo:?}"
         );
         assert_eq!(jposix.stdout(), b"hi", "jit: stdout must match interp");
+    }
+
+    /// #2306 — a personality bound to a host whose `channel` ceiling is `ceiling`, and the host.
+    fn bound(ceiling: i64) -> (Posix, Host) {
+        let mut host = Host::new();
+        host.set_grant(-1, ceiling, -1, -1);
+        let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
+        posix.bind(&host.own_node());
+        (posix, host)
+    }
+
+    /// #2306 — growth the personality's payer has no room for is an errno, whichever store asks:
+    /// `-ENOSPC` from the memfs (a far seek and a one-byte write used to allocate the whole gap),
+    /// `-ENOMEM` from a pipe and from the captured stdout. What the stores hold is handed back as
+    /// they go.
+    #[test]
+    fn growth_past_the_payers_ceiling_is_an_errno() {
+        let (posix, host) = bound(1 << 20);
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        {
+            ctx!(posix, w_g, p_g, st);
+            let fd = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
+            assert!(fd >= 0);
+            assert_eq!(st.lseek(&[fd, 1 << 40, SEEK_SET]), 1 << 40);
+            let write = |st: &mut Ctx, fd, mem: &mut temen_interp::WindowMem| {
+                st.write(&[fd, 0, 200], Some(mem)).unwrap()[0]
+            };
+            assert_eq!(write(&mut st, fd, &mut mem), ENOSPC, "a far write");
+            assert_eq!(
+                st.lseek(&[fd, i64::MAX, SEEK_CUR]),
+                EINVAL,
+                "past what an offset holds"
+            );
+            assert_eq!(
+                st.read(&[fd, 0, 8], Some(&mut mem)).unwrap()[0],
+                0,
+                "a read past the end"
+            );
+            assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap()[0], 0);
+            let w = i32::from_le_bytes(mem.read_bytes(104, 4).unwrap().try_into().unwrap());
+            let queued = std::iter::repeat_with(|| write(&mut st, w as i64, &mut mem))
+                .take_while(|&n| n == 200)
+                .count();
+            assert!(queued > 100, "{queued} writes fit");
+            assert_eq!(
+                write(&mut st, w as i64, &mut mem),
+                ENOMEM,
+                "a pipe with no room left"
+            );
+            assert_eq!(write(&mut st, 1, &mut mem), ENOMEM, "and stdout with none");
+        }
+        assert!(host.channel_used() > 0);
+        drop(posix);
+        assert_eq!(
+            host.channel_used(),
+            0,
+            "gone, the personality holds nothing"
+        );
+    }
+
+    /// #2306 — a process's descriptors stay below [`FD_MAX`]: a `dup2` or `F_DUPFD` past it is
+    /// refused, so a guest's fd number never sizes the host's table, and an op that needs a
+    /// descriptor when none is left is `-EMFILE`, having made nothing (a pipe both ends or none).
+    #[test]
+    fn descriptor_numbers_are_bounded() {
+        let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![0u8; 256];
+        win[0..2].copy_from_slice(b"/f");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(st.dup2(&[1, i64::MAX]), EBADF);
+        assert_eq!(st.dup2(&[1, FD_MAX as i64]), EBADF);
+        assert_eq!(st.dup2(&[1, FD_MAX as i64 - 1]), FD_MAX as i64 - 1);
+        assert_eq!(st.fcntl(&[1, F_DUPFD, 1 << 40]), EINVAL);
+        while st.dup(&[1]) >= 0 {}
+        assert_eq!(st.p.fds.len(), FD_MAX, "the table stops at the bound");
+        assert_eq!(st.dup(&[1]), EMFILE);
+        assert_eq!(
+            st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0],
+            EMFILE
+        );
+        assert!(
+            !st.w.files.contains_key("/f"),
+            "the refused open made no file"
+        );
+        st.p.fds[FD_MAX - 2] = None;
+        assert_eq!(st.pipe(&[100], Some(&mut mem)).unwrap()[0], EMFILE);
+        assert!(
+            st.p.fds[FD_MAX - 2].is_none(),
+            "a pipe is both ends or none"
+        );
+    }
+
+    /// #2306 — every memfs name and directory stream is an entry the payer pays for: the
+    /// personality keeps what it charges equal to what it holds as names come and go, and refuses
+    /// a name it has no room for.
+    #[test]
+    fn names_are_charged_as_they_change() {
+        let (posix, host) = bound(5 * TABLE_ENTRY as i64);
+        let mut win = vec![0u8; 256];
+        win[..24].copy_from_slice(b"/d/d/a/d/bb/e/d/zzzzzzzz");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        let check = |posix: &Posix| {
+            let w = posix.world.lock().unwrap();
+            assert_eq!(w.tables.bytes(), w.tables_cost(), "charged as held");
+        };
+        {
+            ctx!(posix, w_g, p_g, st);
+            assert_eq!(st.mkdir(&[0, 2, 0], Some(&mut mem)).unwrap()[0], 0);
+            let a = st
+                .open(&[2, 4, O_CREAT | O_WRONLY], Some(&mut mem))
+                .unwrap()[0];
+            assert!(a >= 0);
+            assert_eq!(
+                st.rename(&[2, 4, 6, 5], Some(&mut mem)).unwrap()[0],
+                0,
+                "/d/a → /d/bb"
+            );
+            let dir = st.opendir(&[0, 2], Some(&mut mem)).unwrap()[0];
+            assert!(dir >= 0);
+            assert_eq!(
+                st.rename(&[0, 2, 11, 2], Some(&mut mem)).unwrap()[0],
+                0,
+                "/d → /e"
+            );
+            let long = st
+                .open(&[13, 11, O_CREAT | O_WRONLY], Some(&mut mem))
+                .unwrap()[0];
+            assert_eq!(long, ENOSPC, "a name with no room left: {long}");
+            assert_eq!(st.closedir(&[dir]), 0);
+        }
+        check(&posix);
+        let used = host.channel_used();
+        assert!(used > 0);
+        drop(posix);
+        assert_eq!(host.channel_used(), 0);
     }
 }

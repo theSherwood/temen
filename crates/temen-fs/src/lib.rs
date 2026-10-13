@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
-use temen_interp::{GuestMem, HostProc};
+use temen_interp::{GuestMem, HostBuffer, HostCharge, HostProc, NodeRef};
 use temen_ir::errno::*;
 
 pub const FS_OPEN: u32 = 0;
@@ -157,10 +157,50 @@ pub fn alloc_fd<T>(open: &mut Vec<Option<T>>) -> usize {
     }
 }
 
+/// #2306 — a file's bytes, shared by its name and every descriptor and mapping over it, charged to
+/// the store's payer as the guest grows them.
+type FileData = Arc<Mutex<HostBuffer>>;
+
+/// #2306 — what one entry of a store's tables costs: each name, open descriptor, `opendir` snapshot
+/// entry and mapping a guest holds ([`MemFsState::tables`]).
+const ENTRY: u64 = temen_interp::TABLE_ENTRY;
+
+/// #2306 — what `names` cost the host as a table entry each ([`ENTRY`]).
+fn names_cost(names: &[String]) -> u64 {
+    names.iter().map(|n| ENTRY + n.len() as u64).sum()
+}
+
+/// The length of a copy between a file and a guest buffer that is made a piece at a time, so a
+/// range as large as the guest's window never costs the host more than this (#2306).
+pub const COPY_CHUNK: usize = 64 << 10;
+
+/// #2306 — write `len` bytes into the guest at `buf`, a [`COPY_CHUNK`] at a time, each piece zeroed
+/// and then filled by `fill(offset into the copy, piece)`: a copy as large as the guest's window
+/// never costs the host more than one piece. `false` at the first piece outside the window.
+pub fn copy_to_guest(
+    mem: &mut dyn GuestMem,
+    buf: u64,
+    len: u64,
+    mut fill: impl FnMut(u64, &mut [u8]),
+) -> bool {
+    let mut piece = vec![0u8; len.min(COPY_CHUNK as u64) as usize];
+    let mut at = 0;
+    while at < len {
+        let n = (len - at).min(COPY_CHUNK as u64) as usize;
+        piece[..n].fill(0);
+        fill(at, &mut piece[..n]);
+        if mem.write_bytes(buf + at, &piece[..n]).is_none() {
+            return false;
+        }
+        at += n as u64;
+    }
+    true
+}
+
 /// One open file: a shared byte buffer (kept alive independently of the name table, so a `remove`
 /// of an open file behaves POSIX-like — the data survives until the last close) + cursor + mode.
 struct MemOpen {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: FileData,
     pos: usize,
     readable: bool,
     writable: bool,
@@ -208,29 +248,26 @@ impl CrashCtl {
 struct MemMapping {
     base: u64,
     len: u64,
-    data: Arc<Mutex<Vec<u8>>>,
+    data: FileData,
     file_off: u64,
 }
 
 impl MemMapping {
     /// Copy the whole mapping from the guest window back into its file, growing the file if the
-    /// mapping reaches past its end. Nothing to copy without a window, or if the range can't be read.
-    fn write_back(&self, mem: Option<&dyn GuestMem>) {
+    /// mapping reaches past its end: `false` when the file cannot grow to hold it (#2306). Nothing
+    /// to copy without a window, or if the range can't be read.
+    fn write_back(&self, mem: Option<&dyn GuestMem>) -> bool {
         let Some(bytes) = mem.and_then(|m| m.read_bytes(self.base, self.len)) else {
-            return;
+            return true;
         };
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (self.file_off + self.len) as usize;
-        if end > d.len() {
-            d.resize(end, 0);
-        }
-        d[self.file_off as usize..end].copy_from_slice(&bytes);
+        d.write_at(self.file_off, &bytes)
     }
 }
 
 #[derive(Default)]
 struct MemFsState {
-    files: HashMap<String, Arc<Mutex<Vec<u8>>>>,
+    files: HashMap<String, FileData>,
     /// Explicitly-`mkdir`'d directories (normalized keys). A path is *also* treated as a directory
     /// when it is a strict prefix of an existing file key, so `initdb`-style trees created purely by
     /// writing files still walk correctly; `dirs` records the empty ones a walk would otherwise miss.
@@ -241,6 +278,10 @@ struct MemFsState {
     maps: Vec<MemMapping>,
     /// `Some` only on the `mem_fs_crashy` variant (test-only crash injection); `None` on `mem_fs`.
     crash: Option<CrashCtl>,
+    /// #2306 — what the store's tables cost ([`Self::tables_cost`]), charged to the store's payer,
+    /// who pays for its files' bytes too: the domain the store was first granted to
+    /// ([`MemFsHandle::bind`]). Until then, nobody: a store an embedder holds for itself.
+    tables: HostCharge,
 }
 
 /// Normalize a vetted relative path to a canonical key: drop `.`/empty segments, join with `/`.
@@ -304,7 +345,7 @@ impl MemFsState {
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    v.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    v.lock().unwrap_or_else(|e| e.into_inner()).to_vec(),
                 )
             })
             .collect();
@@ -323,6 +364,55 @@ impl MemFsState {
     }
 }
 
+/// #2306 — what the store holds of its payer's budget.
+impl MemFsState {
+    /// What the store's tables cost, an [`ENTRY`] each and their names: its file and directory
+    /// names, open descriptors, `opendir` snapshots and mappings. [`Self::tables`] holds it, kept
+    /// current as each op changes them.
+    fn tables_cost(&self) -> u64 {
+        let named = |k: &String| ENTRY + k.len() as u64;
+        let open = self.open.iter().flatten().count() + self.maps.len();
+        self.files.keys().map(named).sum::<u64>()
+            + self.dirs.iter().map(named).sum::<u64>()
+            + ENTRY * open as u64
+            + self
+                .opendirs
+                .iter()
+                .flatten()
+                .map(|names| ENTRY + names_cost(names))
+                .sum::<u64>()
+    }
+
+    /// Charge `n` more to [`Self::tables`]: `false`, charging nothing, when the payer has no room.
+    fn grow_tables(&mut self, n: u64) -> bool {
+        self.tables.resize(self.tables.bytes() + n)
+    }
+
+    /// Hand `n` back from [`Self::tables`].
+    fn shrink_tables(&mut self, n: u64) {
+        self.tables.resize(self.tables.bytes().saturating_sub(n));
+    }
+
+    /// A new, empty file's bytes, charged to the store's payer as they grow.
+    fn new_file(&self) -> FileData {
+        Arc::new(Mutex::new(HostBuffer::new(self.tables.payer().cloned())))
+    }
+
+    /// Charge `payer` for everything the store holds, past any ceiling, and for what it grows by
+    /// from now on, if the store has no payer yet ([`MemFsHandle::bind`]).
+    fn bind(&mut self, payer: &NodeRef) {
+        if self.tables.payer().is_some() {
+            return;
+        }
+        self.tables.bind(payer);
+        let opens = self.open.iter().flatten().map(|o| &o.data);
+        let mapped = self.maps.iter().map(|m| &m.data);
+        for data in self.files.values().chain(opens).chain(mapped) {
+            data.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
+        }
+    }
+}
+
 /// The [`MemFsHandle::capture_state`] layout version; any other refuses to decode.
 const STATE_VERSION: u8 = 1;
 
@@ -335,9 +425,9 @@ impl MemFsState {
     fn encode(&self) -> Vec<u8> {
         let mut bufs: Vec<Vec<u8>> = Vec::new();
         let mut ids: HashMap<usize, u32> = HashMap::new();
-        let mut id = |a: &Arc<Mutex<Vec<u8>>>| -> u32 {
+        let mut id = |a: &FileData| -> u32 {
             *ids.entry(Arc::as_ptr(a) as usize).or_insert_with(|| {
-                bufs.push(a.lock().unwrap_or_else(|e| e.into_inner()).clone());
+                bufs.push(a.lock().unwrap_or_else(|e| e.into_inner()).to_vec());
                 (bufs.len() - 1) as u32
             })
         };
@@ -349,7 +439,7 @@ impl MemFsState {
             o.extend_from_slice(s.as_bytes());
         };
 
-        let mut files: Vec<(&String, &Arc<Mutex<Vec<u8>>>)> = self.files.iter().collect();
+        let mut files: Vec<(&String, &FileData)> = self.files.iter().collect();
         files.sort_by(|a, b| a.0.cmp(b.0));
         put_u32(&mut out, files.len());
         for (path, data) in files {
@@ -411,6 +501,7 @@ impl MemFsState {
 
     /// The inverse of [`encode`](Self::encode). Fail-closed: a wrong version, a truncated field, a
     /// buffer id past the table or trailing bytes refuse the whole store rather than yield part of it.
+    /// The store has no payer until it is bound to one ([`Self::bind`]).
     fn decode(bytes: &[u8]) -> Result<MemFsState, String> {
         struct Rd<'a>(&'a [u8]);
         impl<'a> Rd<'a> {
@@ -494,7 +585,10 @@ impl MemFsState {
         let mut bufs = Vec::new();
         for _ in 0..r.u32()? {
             let n = r.len()?;
-            bufs.push(Arc::new(Mutex::new(r.take(n)?.to_vec())));
+            bufs.push(Arc::new(Mutex::new(HostBuffer::forced(
+                None,
+                r.take(n)?.to_vec(),
+            ))));
         }
         if !r.0.is_empty() {
             return Err("memfs state: trailing bytes".into());
@@ -504,7 +598,7 @@ impl MemFsState {
                 .cloned()
                 .ok_or_else(|| "memfs state: buffer id out of range".to_string())
         };
-        Ok(MemFsState {
+        let mut st = MemFsState {
             files: files
                 .into_iter()
                 .map(|(p, i)| Ok((p, buf(i)?)))
@@ -538,7 +632,10 @@ impl MemFsState {
                 })
                 .collect::<Result<_, String>>()?,
             crash,
-        })
+            tables: HostCharge::default(),
+        };
+        st.tables.force(st.tables_cost());
+        Ok(st)
     }
 
     fn handle(&mut self, op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>) -> i64 {
@@ -551,38 +648,35 @@ impl MemFsState {
                     Err(e) => return e,
                 };
                 let flags = a(2);
-                let data = match self.files.get(&path) {
+                let existing = self.files.get(&path).cloned();
+                // A **read-only** open of an explicitly-tracked directory (`mkdir`'d or seeded) — e.g.
+                // Postgres `fsync`s directories at checkpoint via `open(dir, O_RDONLY)` + `fsync`.
+                // Return a read-only fd over an empty buffer: `sync`/`close` succeed, reads yield EOF,
+                // writes are refused (matches a real directory fd). Narrow by design: only a read-only
+                // open (a write/create never resolves to a dir), and only `dirs` (not the `""` root or
+                // a mere file-key prefix), so an ordinary `open(name, "w")` that happens to prefix
+                // another file still creates a file.
+                let write_intent = flags & (O_CREATE | O_WRITE | O_APPEND | O_TRUNC) != 0;
+                let dir = existing.is_none() && !write_intent && self.dirs.contains(&path);
+                let create = existing.is_none() && !dir;
+                if create && flags & O_CREATE == 0 {
+                    return ENOENT;
+                }
+                // #2306 — the descriptor is an entry of the store's tables, and so is a name it creates.
+                let named = if create { ENTRY + path.len() as u64 } else { 0 };
+                if !self.grow_tables(ENTRY + named) {
+                    return ENOSPC;
+                }
+                let data = match existing {
                     Some(d) => {
                         if flags & O_TRUNC != 0 {
-                            d.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                            d.lock().unwrap_or_else(|e| e.into_inner()).resize(0);
                         }
-                        d.clone()
+                        d
                     }
+                    None if dir => self.new_file(),
                     None => {
-                        // A **read-only** open of an explicitly-tracked directory (`mkdir`'d or seeded)
-                        // — e.g. Postgres `fsync`s directories at checkpoint via `open(dir, O_RDONLY)` +
-                        // `fsync`. Return a read-only fd over an empty buffer: `sync`/`close` succeed,
-                        // reads yield EOF, writes are refused (matches a real directory fd). Narrow by
-                        // design: only a read-only open (a write/create never resolves to a dir), and
-                        // only `dirs` (not the `""` root or a mere file-key prefix), so an ordinary
-                        // `open(name, "w")` that happens to prefix another file still creates a file.
-                        let write_intent = flags & (O_CREATE | O_WRITE | O_APPEND | O_TRUNC) != 0;
-                        if !write_intent && self.dirs.contains(&path) {
-                            let o = MemOpen {
-                                data: Arc::new(Mutex::new(Vec::new())),
-                                pos: 0,
-                                readable: true,
-                                writable: false,
-                                append: false,
-                            };
-                            let fd = alloc_fd(&mut self.open);
-                            self.open[fd] = Some(o);
-                            return fd as i64;
-                        }
-                        if flags & O_CREATE == 0 {
-                            return ENOENT;
-                        }
-                        let d = Arc::new(Mutex::new(Vec::new()));
+                        let d = self.new_file();
                         self.files.insert(path, d.clone());
                         d
                     }
@@ -590,7 +684,7 @@ impl MemFsState {
                 let o = MemOpen {
                     data,
                     pos: 0,
-                    readable: flags & O_READ != 0,
+                    readable: dir || flags & O_READ != 0,
                     writable: flags & (O_WRITE | O_APPEND) != 0,
                     append: flags & O_APPEND != 0,
                 };
@@ -649,16 +743,13 @@ impl MemFsState {
                 if o.append {
                     o.pos = data.len();
                 }
-                if o.pos > data.len() {
-                    data.resize(o.pos, 0); // POSIX: writing past EOF zero-fills the gap
+                // POSIX: writing past EOF zero-fills the gap. #2306: a file the store's payer has
+                // no room to grow refuses the write, as a full disk would.
+                if !data.write_at(o.pos as u64, &bytes) {
+                    return ENOSPC;
                 }
-                let end = o.pos + bytes.len();
-                if end > data.len() {
-                    data.resize(end, 0);
-                }
-                data[o.pos..end].copy_from_slice(&bytes);
                 drop(data);
-                o.pos = end;
+                o.pos += bytes.len();
                 bytes.len() as i64
             }
             FS_SEEK => {
@@ -675,10 +766,10 @@ impl MemFsState {
                 let Some(new) = base.checked_add(a(2)) else {
                     return EINVAL;
                 };
-                if new < 0 {
-                    return EINVAL;
-                }
-                o.pos = new as usize;
+                let Ok(pos) = usize::try_from(new) else {
+                    return EINVAL; // before the start, or past what this host can address
+                };
+                o.pos = pos;
                 new
             }
             FS_CLOSE => {
@@ -688,6 +779,7 @@ impl MemFsState {
                 let Some(closed) = slot.take() else {
                     return EBADF;
                 };
+                self.shrink_tables(ENTRY);
                 // Copy the file's shared mappings back as its descriptor goes, so the file holds what
                 // the program wrote through them once it is done with the file — on a real system the
                 // writes are in the file by the time the process exits, mapping or not. The mappings
@@ -711,6 +803,7 @@ impl MemFsState {
                 if self.files.remove(&path).is_none() {
                     return ENOENT;
                 }
+                self.shrink_tables(ENTRY + path.len() as u64);
                 0
             }
             FS_RENAME => {
@@ -722,9 +815,19 @@ impl MemFsState {
                     Ok(p) => p,
                     Err(e) => return e,
                 };
-                let Some(d) = self.files.remove(&from) else {
+                if !self.files.contains_key(&from) {
                     return ENOENT;
-                };
+                }
+                // #2306 — the entry is charged for its new name, all of it or none: a longer name costs
+                // more, and a file the rename replaces hands back its own entry.
+                let come = ENTRY + to.len() as u64;
+                let replaced = from != to && self.files.contains_key(&to);
+                let gone = ENTRY + from.len() as u64 + if replaced { come } else { 0 };
+                if come > gone && !self.grow_tables(come - gone) {
+                    return ENOSPC;
+                }
+                self.shrink_tables(gone.saturating_sub(come));
+                let d = self.files.remove(&from).expect("checked above");
                 self.files.insert(to, d);
                 0
             }
@@ -742,11 +845,16 @@ impl MemFsState {
                 if len < 0 {
                     return EINVAL;
                 }
-                // POSIX: shrink discards, grow zero-fills; the cursor is untouched.
-                o.data
+                // POSIX: shrink discards, grow zero-fills; the cursor is untouched. #2306: growth the
+                // store's payer has no room for is refused.
+                if !o
+                    .data
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .resize(len as usize, 0);
+                    .resize(len as u64)
+                {
+                    return ENOSPC;
+                }
                 0
             }
             FS_SYNC => {
@@ -769,21 +877,25 @@ impl MemFsState {
                     return EBADF;
                 };
                 let data = o.data.clone();
-                // Copy the file region into the guest buffer (zero-fill past EOF, like a file-backed
-                // mmap of a hole).
-                let mut region = vec![0u8; len as usize];
-                {
-                    let d = data.lock().unwrap_or_else(|e| e.into_inner());
-                    let start = (foff as usize).min(d.len());
-                    let end = (foff as usize + len as usize).min(d.len());
-                    if end > start {
-                        region[..end - start].copy_from_slice(&d[start..end]);
-                    }
-                }
                 let Some(m) = mem.as_deref_mut() else {
                     return EFAULT;
                 };
-                if m.write_bytes(buf as u64, &region).is_none() {
+                // #2306 — the mapping is an entry of the store's tables.
+                if !self.grow_tables(ENTRY) {
+                    return ENOSPC;
+                }
+                // Copy the file region into the guest buffer (zero-fill past EOF, like a file-backed
+                // mmap of a hole).
+                let d = data.lock().unwrap_or_else(|e| e.into_inner());
+                let copied = copy_to_guest(m, buf as u64, len as u64, |at, piece| {
+                    let from =
+                        usize::try_from(foff as u64 + at).map_or(d.len(), |f| f.min(d.len()));
+                    let n = piece.len().min(d.len() - from);
+                    piece[..n].copy_from_slice(&d[from..from + n]);
+                });
+                drop(d);
+                if !copied {
+                    self.shrink_tables(ENTRY);
                     return EFAULT;
                 }
                 self.maps.push(MemMapping {
@@ -818,12 +930,13 @@ impl MemFsState {
                 if self.crash_barrier() {
                     return 0; // power-loss: this msync's bytes never reach the file
                 }
-                let mut d = data.lock().unwrap_or_else(|e| e.into_inner());
-                let end = file_pos as usize + n;
-                if end > d.len() {
-                    d.resize(end, 0);
+                if !data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .write_at(file_pos, &bytes)
+                {
+                    return ENOSPC;
                 }
-                d[file_pos as usize..end].copy_from_slice(&bytes);
                 0
             }
             FS_MUNMAP => {
@@ -835,8 +948,9 @@ impl MemFsState {
                     return EINVAL;
                 };
                 let map = self.maps.remove(idx);
-                if !self.crash_frozen() {
-                    map.write_back(mem.as_deref());
+                self.shrink_tables(ENTRY);
+                if !self.crash_frozen() && !map.write_back(mem.as_deref()) {
+                    return ENOSPC;
                 }
                 0
             }
@@ -882,6 +996,9 @@ impl MemFsState {
                 if key.is_empty() || self.is_dir(&key) || self.files.contains_key(&key) {
                     return EEXIST;
                 }
+                if !self.grow_tables(ENTRY + key.len() as u64) {
+                    return ENOSPC;
+                }
                 self.dirs.insert(key);
                 0
             }
@@ -902,6 +1019,7 @@ impl MemFsState {
                 if !self.dirs.remove(&key) {
                     return ENOENT; // an implicit (non-empty) dir has no explicit entry to remove
                 }
+                self.shrink_tables(ENTRY + key.len() as u64);
                 0
             }
             FS_OPENDIR => {
@@ -917,10 +1035,18 @@ impl MemFsState {
                 }
                 let mut kids = self.children_of(&key);
                 kids.reverse(); // pop() yields them in sorted order
-                let dh = self.opendirs.iter().position(|s| s.is_none()).unwrap_or({
-                    self.opendirs.push(None);
-                    self.opendirs.len() - 1
-                });
+                                // #2306 — the snapshot is the guest's until it closes it: an entry, and one per name.
+                if !self.grow_tables(ENTRY + names_cost(&kids)) {
+                    return ENOSPC;
+                }
+                let dh = self
+                    .opendirs
+                    .iter()
+                    .position(|s| s.is_none())
+                    .unwrap_or_else(|| {
+                        self.opendirs.push(None);
+                        self.opendirs.len() - 1
+                    });
                 self.opendirs[dh] = Some(kids);
                 dh as i64
             }
@@ -936,6 +1062,7 @@ impl MemFsState {
                     entries.push(name); // leave the walk where it was
                     return EINVAL;
                 }
+                self.shrink_tables(names_cost(std::slice::from_ref(&name)));
                 let Some(m) = mem else {
                     return EFAULT;
                 };
@@ -946,12 +1073,11 @@ impl MemFsState {
                 }
             }
             FS_CLOSEDIR => {
-                let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
+                let Some(Some(names)) = self.opendirs.get_mut(a(0) as usize).map(Option::take)
+                else {
                     return EBADF;
                 };
-                if slot.take().is_none() {
-                    return EBADF;
-                }
+                self.shrink_tables(ENTRY + names_cost(&names));
                 0
             }
             _ => EINVAL,
@@ -993,16 +1119,28 @@ impl MemFsHandle {
     pub fn seeded(files: &[(String, Vec<u8>)], dirs: &[String]) -> MemFsHandle {
         let mut st = MemFsState::default();
         for (p, data) in files {
-            st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
+            let data = HostBuffer::forced(None, data.clone());
+            st.files.insert(norm(p), Arc::new(Mutex::new(data)));
         }
         for d in dirs {
             st.dirs.insert(norm(d));
         }
+        st.tables.force(st.tables_cost());
         MemFsHandle(Arc::new(Mutex::new(st)))
     }
 
+    /// #2306 — make the domain whose node `payer` is pay for this store: for all it holds now, past
+    /// any ceiling (a seed, or what a restore rebuilt, is the grantee's from its grant on), and for
+    /// what its guests grow it by, refused past a ceiling with `-ENOSPC`. A store pays to the first
+    /// domain it is bound to: one shared between domains (a phase pipeline's, or a §14 child's
+    /// re-grant) is paid for by the domain it was granted to first. Every grant of a store binds it.
+    pub fn bind(&self, payer: &NodeRef) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
+    }
+
     /// A store rebuilt from a [`capture_state`](Self::capture_state) — what a thaw's registrar mints
-    /// for a `vm_fs`/`fs` the artifact names. `Err` on bytes this version cannot fully read.
+    /// for a `vm_fs`/`fs` the artifact names, and binds to the thawing domain ([`Self::bind`]).
+    /// `Err` on bytes this version cannot fully read.
     pub fn from_state(bytes: &[u8]) -> Result<MemFsHandle, String> {
         Ok(MemFsHandle(Arc::new(Mutex::new(MemFsState::decode(
             bytes,
@@ -1022,8 +1160,12 @@ impl MemFsHandle {
     /// so every handler already granted over it sees the restored store. `Err` (and the store left
     /// as it was) on bytes this version cannot fully read.
     pub fn restore_state(&self, bytes: &[u8]) -> Result<(), String> {
-        let restored = MemFsState::decode(bytes)?;
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        let mut restored = MemFsState::decode(bytes)?;
+        let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(payer) = st.tables.payer() {
+            restored.bind(payer);
+        }
+        *st = restored;
         Ok(())
     }
 
@@ -1091,7 +1233,8 @@ pub fn mem_fs_seeded_shared(
 /// returned [`MemFsHandle`] observes the same store (snapshot/seed it host-side). Granting this to a
 /// spawned *child* (vs. a top-level domain) is a separate, security-shaped decision — what fs
 /// authority a child inherits — and lives in the spawn path, not here. Each mint carries the
-/// store's [`MemFsHandle::cap_state`] (#1699).
+/// store's [`MemFsHandle::cap_state`] (#1699). The store has no payer until its embedder binds it to
+/// one ([`MemFsHandle::bind`], #2306).
 pub fn mem_fs_shared_factory(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
@@ -1118,6 +1261,7 @@ pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 
         Some((files, dirs)) => MemFsHandle::seeded(files, dirs),
         None => MemFsHandle::new(false),
     };
+    fs.bind(&host.own_node());
     let h = host.grant_host_proc_forkable(vm_fs_handler(&fs), vm_fs_fork(&fs), fs.cap_state());
     host.register_cap_name("vm_fs", h);
     h
@@ -1137,10 +1281,15 @@ pub fn vm_fs_image(host: &temen_interp::Host) -> Vec<u8> {
 /// rebuilding the store from the state the artifact carries, and refuses every other name. An
 /// embedder that grants `vm_fs` gives its registrar this too (first, or as its fallback), so what it
 /// grants a fresh run it can also thaw.
-pub fn regrant_vm_fs(name: &str, state: &[u8]) -> Option<temen_interp::NamedCapGrant> {
+pub fn regrant_vm_fs(
+    name: &str,
+    state: &[u8],
+    payer: &NodeRef,
+) -> Option<temen_interp::NamedCapGrant> {
     let fs = (name == "vm_fs")
         .then(|| MemFsHandle::from_state(state).ok())
         .flatten()?;
+    fs.bind(payer);
     Some(temen_interp::NamedCapGrant {
         handler: vm_fs_handler(&fs),
         fork: Some(vm_fs_fork(&fs)),
@@ -1407,6 +1556,146 @@ mod tests {
         mem.0[16] = b'!';
         assert_eq!(call(&mut fs, FS_MUNMAP, &[16], &mut mem), 0);
         assert_eq!(file(&store), b"!XYZ", "and again by the munmap");
+    }
+
+    /// #2306 — a store bound to a host whose `channel` ceiling is `ceiling`, its handler, and the host.
+    fn bound(ceiling: i64) -> (MemFsHandle, HostProc, temen_interp::Host) {
+        let mut host = temen_interp::Host::new();
+        host.set_grant(-1, ceiling, -1, -1);
+        let store = MemFsHandle::new(false);
+        store.bind(&host.own_node());
+        (store.clone(), store.handler(), host)
+    }
+
+    /// #2306, #2335 — growth the payer has no room for is `-ENOSPC`, whichever op asks for it, and
+    /// the store is left as it was: a far seek and a one-byte write used to allocate the whole gap
+    /// and abort the host. What the file and its entries hold is handed back as they go.
+    #[test]
+    fn growth_past_the_payers_ceiling_is_refused_with_enospc() {
+        let (_store, mut fs, host) = bound(1 << 20);
+        let mut mem = VecMem(vec![0u8; 8192]);
+        mem.0[0] = b'f';
+        let mut call = |op: u32, args: &[i64]| fs(op, args, Some(&mut mem), None).expect("op")[0];
+        let fd = call(FS_OPEN, &[0, 1, O_READ | O_WRITE | O_CREATE]);
+        assert!(fd >= 0);
+        assert_eq!(
+            host.channel_used(),
+            (2 * ENTRY + 1) as i64,
+            "its name and descriptor"
+        );
+        assert_eq!(call(FS_SEEK, &[fd, 0, 1 << 40]), 1 << 40);
+        assert_eq!(call(FS_WRITE, &[fd, 0, 1]), ENOSPC, "a far write");
+        assert_eq!(call(FS_TRUNCATE, &[fd, 1 << 62]), ENOSPC, "a far truncate");
+        assert_eq!(call(FS_TRUNCATE, &[fd, 4096]), 0, "one that fits");
+        assert_eq!(
+            call(FS_MMAP, &[fd, 1 << 40, 4096, 4096]),
+            0,
+            "a mapping past the end"
+        );
+        assert_eq!(
+            call(FS_MSYNC, &[4096, 4096]),
+            ENOSPC,
+            "cannot grow the file to it"
+        );
+        assert_eq!(call(FS_MUNMAP, &[4096]), ENOSPC, "nor can its last flush");
+        assert_eq!(
+            host.channel_used(),
+            (2 * ENTRY + 1 + 4096) as i64,
+            "the file is as it was"
+        );
+        assert_eq!(call(FS_CLOSE, &[fd]), 0);
+        assert_eq!(call(FS_REMOVE, &[0, 1]), 0);
+        assert_eq!(host.channel_used(), 0, "and gone, it holds nothing");
+    }
+
+    /// #2306 — every name, descriptor, listing and mapping is an entry the payer pays for, so their
+    /// number is bounded too, and the store keeps what it charges equal to what it holds.
+    #[test]
+    fn the_stores_tables_are_charged_as_they_change() {
+        let (store, mut fs, host) = bound(64 * ENTRY as i64);
+        let mut mem = VecMem(vec![0u8; 4096]);
+        mem.0[..6].copy_from_slice(b"d/f000");
+        let mut call = |op: u32, args: &[i64], mem: &mut VecMem| {
+            let r = fs(op, args, Some(mem), None).expect("op")[0];
+            let st = store.0.lock().unwrap();
+            assert_eq!(
+                st.tables.bytes(),
+                st.tables_cost(),
+                "charged as held after op {op}"
+            );
+            r
+        };
+        assert_eq!(call(FS_MKDIR, &[0, 1], &mut mem), 0);
+        let mut made = 0;
+        loop {
+            mem.0[3..6].copy_from_slice(format!("{made:03}").as_bytes());
+            match call(FS_OPEN, &[0, 6, O_WRITE | O_CREATE], &mut mem) {
+                fd if fd >= 0 => assert_eq!(call(FS_CLOSE, &[fd], &mut mem), 0),
+                e => {
+                    assert_eq!(e, ENOSPC, "the store's entries run out of room");
+                    break;
+                }
+            }
+            made += 1;
+        }
+        assert!(made > 10, "{made} files fit");
+        assert_eq!(
+            call(FS_OPENDIR, &[0, 1], &mut mem),
+            ENOSPC,
+            "so does a listing of them"
+        );
+        for i in 2..made {
+            mem.0[3..6].copy_from_slice(format!("{i:03}").as_bytes());
+            assert_eq!(call(FS_REMOVE, &[0, 6], &mut mem), 0);
+        }
+        let dh = call(FS_OPENDIR, &[0, 1], &mut mem);
+        assert!(dh >= 0, "until enough of them are gone: {dh}");
+        assert!(call(FS_READDIR, &[dh, 100, 64], &mut mem) > 0);
+        assert_eq!(call(FS_CLOSEDIR, &[dh], &mut mem), 0);
+        mem.0[..14].copy_from_slice(b"d/f000d/longer");
+        assert_eq!(call(FS_RENAME, &[0, 6, 6, 8], &mut mem), 0);
+        mem.0[..14].copy_from_slice(b"d/longerd/f001");
+        assert_eq!(
+            call(FS_RENAME, &[0, 8, 8, 6], &mut mem),
+            0,
+            "over another file"
+        );
+        let used = host.channel_used();
+        drop(store);
+        drop(fs);
+        assert!(used > 0);
+        assert_eq!(
+            host.channel_used(),
+            0,
+            "the store gone, its payer holds nothing"
+        );
+    }
+
+    /// #2306 — a store is paid for by the domain it is first bound to: everything it holds then, past
+    /// any ceiling, and what it grows by after. A restore in place keeps its payer.
+    #[test]
+    fn a_seeded_store_is_its_first_grantees_to_pay_for() {
+        let store = MemFsHandle::seeded(&[("f".into(), vec![1; 1000])], &["d".into()]);
+        let host = temen_interp::Host::new();
+        store.bind(&host.own_node());
+        let held = (1000 + 2 * ENTRY + 2) as i64;
+        assert_eq!(
+            host.channel_used(),
+            held,
+            "the seed's bytes and its two names"
+        );
+        let other = temen_interp::Host::new();
+        store.bind(&other.own_node());
+        assert_eq!((host.channel_used(), other.channel_used()), (held, 0));
+        let state = store.capture_state();
+        store.restore_state(&state).expect("restore");
+        assert_eq!(
+            host.channel_used(),
+            held,
+            "rebuilt, the same payer holds the same"
+        );
+        drop(store);
+        assert_eq!(host.channel_used(), 0);
     }
 
     /// A capture is all or nothing: bytes this version cannot fully read refuse the whole store.

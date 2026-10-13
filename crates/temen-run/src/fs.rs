@@ -75,7 +75,7 @@ use crate::Descriptor;
 use crate::HostCap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use temen_interp::{GuestMem, HostProc, RegionMinter};
+use temen_interp::{GuestMem, HostCharge, HostProc, NodeRef, RegionMinter, TABLE_ENTRY};
 
 // The shared fs-cap wire protocol, the in-memory backend, and the shippable data-image format live in
 // the wasm-safe `temen-fs` crate — so the browser cdylib can mount a `mem_fs` without the unix-only JIT
@@ -112,24 +112,11 @@ pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCa
 /// gets a fresh store, as [`HostCap::host_proc`] gives any `make`-built capability.
 fn mem_fs_cap(store: impl Fn() -> temen_fs::MemFsHandle + Send + Sync + 'static) -> HostCap {
     let store = std::sync::Arc::new(store);
-    let fork: temen_interp::HostProcFork = std::sync::Arc::new({
-        let store = std::sync::Arc::clone(&store);
-        move |_pid| {
-            let fs = store();
-            temen_interp::ForkedProc::shared(fs.handler(), fs.cap_state())
-        }
-    });
-    HostCap {
-        type_id: temen_interp::cap_id::HOST_PROC,
-        op: 0,
-        grant: std::sync::Arc::new(move |h, _| {
-            let fs = store();
-            h.grant_host_proc_forkable(fs.handler(), std::sync::Arc::clone(&fork), fs.cap_state())
-        }),
-        unbound: false,
-        offer: None,
-        iface: None,
-    }
+    HostCap::host_proc(0, move |payer| {
+        let fs = store();
+        fs.bind(payer);
+        (fs.handler(), fs.cap_state())
+    })
 }
 
 /// Walk a host directory into a [`mem_fs_seeded`] capability — every regular file's bytes keyed by its
@@ -145,6 +132,11 @@ pub fn mem_fs_from_host_dir(root: &Path) -> std::io::Result<HostCap> {
 pub fn mem_fs_from_archive(bytes: &[u8]) -> Result<HostCap, String> {
     let (files, dirs) = temen_fs::decode_image(bytes)?;
     Ok(mem_fs_seeded(files, dirs))
+}
+
+/// #2306 — what the names of an `opendir` snapshot cost, a [`TABLE_ENTRY`] each.
+fn listing_cost(names: &[String]) -> u64 {
+    names.iter().map(|n| TABLE_ENTRY + n.len() as u64).sum()
 }
 
 struct HostOpen {
@@ -172,9 +164,35 @@ struct HostFsState {
     maps: Vec<HostMapping>,
     /// `Some` only on the `host_fs_crashy` variant (test-only crash injection); `None` on `host_fs`.
     crash: Option<CrashCtl>,
+    /// #2306 — what the guest's `opendir` snapshots and mappings cost, a [`TABLE_ENTRY`] each and
+    /// their names, charged to the domain the capability was granted to. (Its open files are bounded
+    /// by the process's descriptors.)
+    tables: HostCharge,
 }
 
 impl HostFsState {
+    /// A fresh state over `root`, its tables charged to `payer`.
+    fn new(root: PathBuf, crash: Option<CrashCtl>, payer: &NodeRef) -> HostFsState {
+        HostFsState {
+            root,
+            open: Vec::new(),
+            opendirs: Vec::new(),
+            maps: Vec::new(),
+            crash,
+            tables: HostCharge::new(Some(payer.clone())),
+        }
+    }
+
+    /// Charge `n` more to [`Self::tables`]: `false`, charging nothing, when the payer has no room.
+    fn grow_tables(&mut self, n: u64) -> bool {
+        self.tables.resize(self.tables.bytes() + n)
+    }
+
+    /// Hand `n` back from [`Self::tables`].
+    fn shrink_tables(&mut self, n: u64) {
+        self.tables.resize(self.tables.bytes().saturating_sub(n));
+    }
+
     /// A durability barrier (`msync`/`sync`): `true` ⇒ drop this write (crashed or crashing now).
     fn crash_barrier(&mut self) -> bool {
         self.crash.as_mut().is_some_and(CrashCtl::barrier)
@@ -245,20 +263,34 @@ impl HostFsState {
                 if buf < 0 || !(0..=(1 << 30)).contains(&len) {
                     return EINVAL;
                 }
-                let mut tmp = vec![0u8; len as usize];
-                let n = match o.file.read(&mut tmp) {
-                    Ok(n) => n,
-                    Err(e) => return io_errno(&e),
+                if len == 0 {
+                    return 0;
+                }
+                let Some(m) = mem.as_deref_mut() else {
+                    return EFAULT;
                 };
-                if n > 0 {
-                    let Some(m) = mem.as_deref_mut() else {
-                        return EFAULT;
+                // #2306 — a piece at a time, so a read as large as the guest's window never costs
+                // the host more than a piece. A short read is the file's end (or a pipe's lull).
+                let mut piece = vec![0u8; (len as usize).min(COPY_CHUNK)];
+                let mut done = 0;
+                while done < len as usize {
+                    let want = (len as usize - done).min(piece.len());
+                    let n = match o.file.read(&mut piece[..want]) {
+                        Ok(n) => n,
+                        Err(_) if done > 0 => break,
+                        Err(e) => return io_errno(&e),
                     };
-                    if m.write_bytes(buf as u64, &tmp[..n]).is_none() {
+                    if m.write_bytes(buf as u64 + done as u64, &piece[..n])
+                        .is_none()
+                    {
                         return EFAULT;
                     }
+                    done += n;
+                    if n < want {
+                        break;
+                    }
                 }
-                n as i64
+                done as i64
             }
             FS_WRITE => {
                 if self.crash_frozen() {
@@ -370,24 +402,34 @@ impl HostFsState {
                 let Some(Some(o)) = self.open.get_mut(fd as usize) else {
                     return EBADF;
                 };
-                // Copy the file region into the guest buffer (zero-fill past EOF).
-                let mut region = vec![0u8; len as usize];
                 if o.file.seek(SeekFrom::Start(foff as u64)).is_err() {
                     return io_errno(&std::io::Error::last_os_error());
-                }
-                let mut got = 0usize;
-                while got < region.len() {
-                    match o.file.read(&mut region[got..]) {
-                        Ok(0) => break, // EOF — rest stays zero
-                        Ok(n) => got += n,
-                        Err(e) => return io_errno(&e),
-                    }
                 }
                 let Some(m) = mem.as_deref_mut() else {
                     return EFAULT;
                 };
-                if m.write_bytes(buf as u64, &region).is_none() {
+                // Copy the file region into the guest buffer (zero-fill past EOF), a piece at a time
+                // (#2306).
+                let (mut failed, mut eof) = (None, false);
+                let copied = copy_to_guest(m, buf as u64, len as u64, |_, piece| {
+                    let mut got = 0;
+                    while !eof && failed.is_none() && got < piece.len() {
+                        match o.file.read(&mut piece[got..]) {
+                            Ok(0) => eof = true, // EOF — the rest stays zero
+                            Ok(n) => got += n,
+                            Err(e) => failed = Some(io_errno(&e)),
+                        }
+                    }
+                });
+                if let Some(errno) = failed {
+                    return errno;
+                }
+                if !copied {
                     return EFAULT;
+                }
+                // #2306 — the mapping is an entry of the guest's tables.
+                if !self.grow_tables(TABLE_ENTRY) {
+                    return ENOSPC;
                 }
                 self.maps.push(HostMapping {
                     base: buf as u64,
@@ -438,6 +480,7 @@ impl HostFsState {
                     return EINVAL;
                 };
                 let map = self.maps.remove(idx);
+                self.shrink_tables(TABLE_ENTRY);
                 // Final flush of the whole mapping (self-contained munmap) — unless a crash froze the
                 // store, in which case a real munmap on a dead process would flush nothing.
                 if !self.crash_frozen() {
@@ -533,25 +576,40 @@ impl HostFsState {
                     Ok(r) => r,
                     Err(e) => return io_errno(&e),
                 };
-                let mut names = Vec::new();
+                // #2306 — the snapshot is the guest's until it closes it: an entry, and one per
+                // name, charged as each is read, so a directory the payer has no room to list is
+                // refused before it is all in memory.
+                if !self.grow_tables(TABLE_ENTRY) {
+                    return ENOSPC;
+                }
+                let mut names: Vec<String> = Vec::new();
                 for ent in rd {
-                    match ent {
-                        Ok(e) => {
-                            // Names are OS strings; a non-UTF-8 entry can't round-trip through the
-                            // guest's UTF-8 path protocol, so skip it (it was never nameable anyway).
-                            if let Some(s) = e.file_name().to_str() {
+                    let refused = match ent {
+                        // Names are OS strings; a non-UTF-8 entry can't round-trip through the guest's
+                        // UTF-8 path protocol, so skip it (it was never nameable anyway).
+                        Ok(e) => match e.file_name().to_str() {
+                            Some(s) if !self.grow_tables(TABLE_ENTRY + s.len() as u64) => ENOSPC,
+                            Some(s) => {
                                 names.push(s.to_string());
+                                continue;
                             }
-                        }
-                        Err(e) => return io_errno(&e),
-                    }
+                            None => continue,
+                        },
+                        Err(e) => io_errno(&e),
+                    };
+                    self.shrink_tables(TABLE_ENTRY + listing_cost(&names));
+                    return refused;
                 }
                 names.sort();
                 names.reverse(); // pop() yields sorted order
-                let dh = self.opendirs.iter().position(|s| s.is_none()).unwrap_or({
-                    self.opendirs.push(None);
-                    self.opendirs.len() - 1
-                });
+                let dh = self
+                    .opendirs
+                    .iter()
+                    .position(|s| s.is_none())
+                    .unwrap_or_else(|| {
+                        self.opendirs.push(None);
+                        self.opendirs.len() - 1
+                    });
                 self.opendirs[dh] = Some(names);
                 dh as i64
             }
@@ -567,6 +625,7 @@ impl HostFsState {
                     entries.push(name);
                     return EINVAL;
                 }
+                self.shrink_tables(TABLE_ENTRY + name.len() as u64);
                 let Some(m) = mem else {
                     return EFAULT;
                 };
@@ -577,12 +636,11 @@ impl HostFsState {
                 }
             }
             FS_CLOSEDIR => {
-                let Some(slot) = self.opendirs.get_mut(a(0) as usize) else {
+                let Some(Some(names)) = self.opendirs.get_mut(a(0) as usize).map(Option::take)
+                else {
                     return EBADF;
                 };
-                if slot.take().is_none() {
-                    return EBADF;
-                }
+                self.shrink_tables(TABLE_ENTRY + listing_cost(&names));
                 0
             }
             _ => EINVAL,
@@ -662,14 +720,8 @@ pub fn host_fs_crashy(root: PathBuf) -> HostCap {
 /// file into its window (zero-copy, page-cache coherent with the same file's `pread`/`pwrite`) instead
 /// of the copy-in emulation. The guest shim falls back to `FS_MMAP` when granted a plain `host_fs`.
 pub fn host_fs_mmap(root: PathBuf) -> HostCap {
-    HostCap::host_proc_region(0, move || {
-        let mut st = HostFsState {
-            root: root.clone(),
-            open: Vec::new(),
-            opendirs: Vec::new(),
-            maps: Vec::new(),
-            crash: None,
-        };
+    HostCap::host_proc_region(0, move |payer| {
+        let mut st = HostFsState::new(root.clone(), None, payer);
         let h = Box::new(
             move |op: u32,
                   args: &[i64],
@@ -684,14 +736,8 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
 }
 
 fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
-    HostCap::host_proc(0, move || {
-        let mut st = HostFsState {
-            root: root.clone(),
-            open: Vec::new(),
-            opendirs: Vec::new(),
-            maps: Vec::new(),
-            crash: crashy.then(CrashCtl::default),
-        };
+    HostCap::host_proc(0, move |payer| {
+        let mut st = HostFsState::new(root.clone(), crashy.then(CrashCtl::default), payer);
         let h = Box::new(
             move |op: u32,
                   args: &[i64],

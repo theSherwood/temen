@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, RegionBacking, RootWindow, StreamRole, Trap,
+    GuestMem, Host, HostProc, NodeRef, RegionBacking, RootWindow, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -6043,7 +6043,16 @@ pub fn nim_posix_imports(
     // The slot carries temen-posix's OWN fork factory rather than `HostCap::host_proc`'s
     // shared-state default, which re-mints a twin's handler over the **parent's** `Proc` — wrong
     // for a personality with real per-process state (the twin would write the parent's fd table).
-    let slot = SharedHostProc::new(move || (*make)(), temen_posix::cap_fork_factory(posix));
+    let slot = SharedHostProc::new(
+        {
+            let posix = posix.clone();
+            move |payer| {
+                posix.bind(payer); // #2306 — the domain it is granted to pays for its state
+                (*make)()
+            }
+        },
+        temen_posix::cap_fork_factory(posix),
+    );
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
@@ -7023,7 +7032,7 @@ struct OfferBinding {
 /// cheap `Arc` bump and shares the memo — clones of one slot are one slot.
 #[derive(Clone)]
 pub struct SharedHostProc {
-    make: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
+    make: Arc<dyn Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
     fork: temen_interp::HostProcFork,
     /// `(domain_id, handle)` per `Host` this slot has been granted on. A `Vec` because the count is
     /// one or two (interp, JIT) for the life of an `Imports`, and a linear scan says so.
@@ -7031,13 +7040,16 @@ pub struct SharedHostProc {
 }
 
 impl SharedHostProc {
-    /// A slot over `make` (the provider's handler factory, each mint with its [`CapState`], #1699)
-    /// and `fork` (its own fork factory — the per-process split a personality needs; see
-    /// [`HostCap::host_proc_forkable`]).
+    /// A slot over `make` (the provider's handler factory, each mint with its [`CapState`], #1699,
+    /// and paid for by the node it is handed, #2306) and `fork` (its own fork factory — the
+    /// per-process split a personality needs; see [`HostCap::host_proc_forkable`]).
     ///
     /// [`CapState`]: temen_interp::CapState
     pub fn new(
-        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState)
+            + Send
+            + Sync
+            + 'static,
         fork: temen_interp::HostProcFork,
     ) -> Self {
         Self {
@@ -7058,7 +7070,7 @@ impl SharedHostProc {
         if let Some((_, h)) = g.iter().find(|(d, _)| *d == dom) {
             return *h;
         }
-        let (f, state) = (self.make)();
+        let (f, state) = (self.make)(&host.own_node());
         let handle = host.grant_host_proc_forkable(f, Arc::clone(&self.fork), state);
         g.push((dom, handle));
         handle
@@ -7144,25 +7156,39 @@ impl HostCap {
     /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
     /// `(op, args, guest_mem) -> result slots | Trap`. Each mint comes with the provider's
     /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
-    /// where the handler is made.
+    /// where the handler is made. `make` is handed the node of the domain the capability is granted
+    /// to (#2306), which pays for the host memory a guest grows that state by
+    /// ([`temen_interp::HostCharge`]).
     pub fn host_proc(
         op: u32,
-        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
-        // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
-        // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider state
-        // (`ForkedProc::shared`), the right default for an arbitrary host cap whose state the
-        // runtime cannot split. A personality with real per-process state supplies its own factory
-        // via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`).
-        let fork: temen_interp::HostProcFork = Arc::new({
-            let make = Arc::clone(&make);
-            move |_pid| {
-                let (h, state) = make();
-                temen_interp::ForkedProc::shared(h, state)
-            }
-        });
-        Self::host_proc_forkable(op, move || make(), fork)
+        HostCap {
+            type_id: cap_id::HOST_PROC,
+            op,
+            grant: Arc::new(move |h, _| {
+                // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
+                // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider
+                // state (`ForkedProc::shared`), the right default for an arbitrary host cap whose
+                // state the runtime cannot split. A personality with real per-process state supplies
+                // its own factory via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`). What a twin
+                // mints is paid for by the grantee, as a child's re-grant is (#2306).
+                let payer = h.own_node();
+                let fork: temen_interp::HostProcFork = Arc::new({
+                    let (make, payer) = (Arc::clone(&make), payer.clone());
+                    move |_pid| {
+                        let (h, state) = make(&payer);
+                        temen_interp::ForkedProc::shared(h, state)
+                    }
+                });
+                let (f, state) = make(&payer);
+                h.grant_host_proc_forkable(f, fork, state)
+            }),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
     }
 
     /// [`HostCap::host_proc`] with a **provider-supplied fork factory** (#863): the factory decides
@@ -7171,14 +7197,14 @@ impl HostCap {
     /// re-mints through this factory (`Host::fork_powerbox`).
     pub fn host_proc_forkable(
         op: u32,
-        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
         fork: temen_interp::HostProcFork,
     ) -> HostCap {
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
             grant: Arc::new(move |h, _| {
-                let (f, state) = make();
+                let (f, state) = make(&h.own_node());
                 h.grant_host_proc_forkable(f, Arc::clone(&fork), state)
             }),
             unbound: false,
@@ -7207,14 +7233,16 @@ impl HostCap {
     /// like a plain `host_proc`.
     pub fn host_proc_region(
         op: u32,
-        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState)
+            + Send
+            + Sync
+            + 'static,
     ) -> HostCap {
-        let make = Arc::new(make);
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
             grant: Arc::new(move |h, _| {
-                let (f, state) = make();
+                let (f, state) = make(&h.own_node());
                 h.grant_host_proc_region(f, state)
             }),
             unbound: false,

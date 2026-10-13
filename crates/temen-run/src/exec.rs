@@ -16,17 +16,17 @@ use temen_ir::errno::*; // the one shared negative-errno table (#905)
 
 use crate::Descriptor;
 use crate::{Backend, HostCap, Instance, Limits, Outcome, RunConfig};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use temen_interp::{CapState, GuestMem, HostProc, Value};
+use temen_interp::{CapState, GuestMem, HostBuffer, HostProc, NodeRef, Value};
 
 /// The deterministic **scripted** backend as a [`HostCap`]: a `(argv-prefix → {stdout, stderr,
 /// exit})` table, no host processes. What differential tests and wasm/browser embedders grant.
 pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
     let make = temen_exec::scripted_exec_handler(table);
     // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move || (make(), CapState::Uncaptured))
+    HostCap::host_proc(0, move |payer| (make(payer), CapState::Uncaptured))
 }
 
 /// The **real subprocess** backend: spawn via the host, attenuated by an explicit program
@@ -39,7 +39,7 @@ pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
     let make = host_exec_handler(allow);
     // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move || (make(), CapState::Uncaptured))
+    HostCap::host_proc(0, move |payer| (make(payer), CapState::Uncaptured))
 }
 
 /// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
@@ -85,10 +85,10 @@ pub fn domain_exec_with_fs(programs: Vec<DomainProgram>, child_fs: HostCap) -> H
 fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) -> HostCap {
     let programs = Arc::new(programs);
     let child_fs = Arc::new(child_fs);
-    HostCap::host_proc(0, move || {
+    HostCap::host_proc(0, move |payer| {
         let programs = Arc::clone(&programs);
         let child_fs = Arc::clone(&child_fs);
-        let mut jobs = JobTable::default();
+        let mut jobs = JobTable::new(payer);
         let h = Box::new(
             move |op: u32,
                   args: &[i64],
@@ -154,22 +154,27 @@ fn domain_dispatch(
                     _ => 0,
                 }),
             };
-            jobs.push(Job {
-                stdout: run.stdout,
-                stderr: run.stderr,
-                out_pos: 0,
-                err_pos: 0,
-                exit,
-            })
+            match (jobs.output_of(&run.stdout), jobs.output_of(&run.stderr)) {
+                (Ok(stdout), Ok(stderr)) => jobs.push(Job {
+                    stdout,
+                    stderr,
+                    out_pos: 0,
+                    err_pos: 0,
+                    exit,
+                }),
+                _ => ENOMEM,
+            }
         }
         Err(_) => EINVAL, // the child trapped / ran out of fuel: a failed run, probeable
     }
 }
 
-fn host_exec_handler(allow: Arc<Vec<String>>) -> impl Fn() -> HostProc + Send + Sync + 'static {
-    move || {
+fn host_exec_handler(
+    allow: Arc<Vec<String>>,
+) -> impl Fn(&NodeRef) -> HostProc + Send + Sync + 'static {
+    move |payer| {
         let allow = Arc::clone(&allow);
-        let mut jobs = JobTable::default();
+        let mut jobs = JobTable::new(payer);
         Box::new(
             move |op: u32,
                   args: &[i64],
@@ -198,15 +203,35 @@ fn host_dispatch(
     if !allow.is_empty() && !allow.iter().any(|a| a == &argv[0]) {
         return EPERM; // outside the allowlist: refused, not a trap
     }
-    match spawn_blocking(&argv, &stdin) {
+    match spawn_blocking(&argv, &stdin, jobs) {
         Ok(job) => jobs.push(job),
         Err(e) => e,
     }
 }
 
+/// Read `from` to its end into `into`: `false`, having stopped, once `into`'s payer has no room for
+/// more (#2306). A read error ends the stream, as its end would.
+fn drain(from: Option<impl Read>, into: &mut HostBuffer) -> bool {
+    let Some(mut from) = from else {
+        return true;
+    };
+    let mut piece = [0u8; 8192];
+    loop {
+        match from.read(&mut piece) {
+            Ok(0) => return true,
+            Ok(n) if !into.push(&piece[..n]) => return false,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return true,
+        }
+    }
+}
+
 /// Run `argv` to completion with `stdin` fed to it; capture both output streams and collapse
-/// the wait status the POSIX-shell way.
-fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
+/// the wait status the POSIX-shell way. #2306: the output is charged as it arrives to the payer of
+/// `jobs`, and a child that writes more than it has room for is killed and its run refused
+/// (`-ENOMEM`).
+fn spawn_blocking(argv: &[String], stdin: &[u8], jobs: &JobTable) -> Result<Job, i64> {
     // #2306 — the three pipes to the child are this process's descriptors while it runs.
     let _held = [
         Descriptor::take()?,
@@ -227,12 +252,23 @@ fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
     if let Some(mut si) = child.stdin.take() {
         let _ = si.write_all(stdin);
     }
-    let out = child.wait_with_output().map_err(|_| EINVAL)?;
+    let (mut stdout, mut stderr) = (jobs.output(), jobs.output());
+    let err = child.stderr.take();
+    let reading = std::thread::spawn(move || (drain(err, &mut stderr), stderr));
+    let out_fits = drain(child.stdout.take(), &mut stdout);
+    if !out_fits {
+        let _ = child.kill();
+    }
+    let (err_fits, stderr) = reading.join().map_err(|_| EINVAL)?;
+    let status = child.wait().map_err(|_| EINVAL)?;
+    if !(out_fits && err_fits) {
+        return Err(ENOMEM);
+    }
     let exit = {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            match (out.status.code(), out.status.signal()) {
+            match (status.code(), status.signal()) {
                 (Some(c), _) => (c & 0xff) as i64,
                 (None, Some(sig)) => 128 + sig as i64,
                 (None, None) => EINVAL,
@@ -240,12 +276,12 @@ fn spawn_blocking(argv: &[String], stdin: &[u8]) -> Result<Job, i64> {
         }
         #[cfg(not(unix))]
         {
-            out.status.code().map_or(EINVAL, |c| c as i64)
+            status.code().map_or(EINVAL, |c| c as i64)
         }
     };
     Ok(Job {
-        stdout: out.stdout,
-        stderr: out.stderr,
+        stdout,
+        stderr,
         out_pos: 0,
         err_pos: 0,
         exit,

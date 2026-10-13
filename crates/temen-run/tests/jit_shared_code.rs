@@ -105,7 +105,7 @@ fn run_on(backend: Backend, cfg: &RunConfig) -> Outcome {
     let command = parse_module(COMMAND).expect("parse command");
     let cmd_wl = command.memory.expect("command window").size_log2;
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let slot = SharedHostProc::new(make, temen_posix::cap_fork_factory(&posix));
+    let slot = SharedHostProc::new(move |_| make(), temen_posix::cap_fork_factory(&posix));
     let cap = |op| HostCap::host_proc_shared(op, &slot);
     let imports = Imports::new()
         .provide("execve", cap(temen_posix::OP_EXECVE))

@@ -34,7 +34,7 @@ fn run_on(src: &str, head: bool, backend: Backend) -> Outcome {
     };
     let module = parse_module(&text).expect("parse guest");
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let slot = SharedHostProc::new(make, temen_posix::cap_fork_factory(&posix));
+    let slot = SharedHostProc::new(move |_| make(), temen_posix::cap_fork_factory(&posix));
     let imports = Imports::new()
         .provide(
             "fork",

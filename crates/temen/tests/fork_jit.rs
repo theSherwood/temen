@@ -218,7 +218,7 @@ fn run(bytecode: bool) -> (Vec<Value>, Vec<i64>) {
     } else {
         run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("oracle run")
     };
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     let mut words: Vec<i64> = bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))

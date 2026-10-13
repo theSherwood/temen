@@ -205,7 +205,7 @@ fn observe(
     let [s, c] =
         [1, 4].map(|f| host.grant_module(&temen_ir::child_image_at(m, f).expect("child image")));
     let r = run(m, &[inst, out, budget, s, c].map(Value::I32), &mut host)?;
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     Some((r, sorted_i64(&bytes)))
 }
 

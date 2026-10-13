@@ -2495,6 +2495,19 @@ child's grants is exactly the party positioned to observe their use.
   pool of mappings), and the root is charged
   to that node as a child is to its budget: its window and main vCPU, then all it
   makes. No code can use more than the grant above it (INVARIANTS #3).
+- **What a capability holds for its guest is metered too (#2306).** Host memory a
+  guest grows through a capability (a file's bytes; a pipe's, socket's or captured
+  stream's queue; a job's output; a table of names, descriptors, listings or
+  mappings) is `channel` of the node of the domain the capability's state was
+  granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
+  the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
+  re-granted the capability spends its grantor's. It is charged before it is
+  allocated, refused past a ceiling with the errno a full device gives
+  (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed
+  back as it shrinks or goes. File descriptors are the process's to share, as its
+  mappings and address space are: each one a guest causes holds a slot of a pool
+  over the soft `RLIMIT_NOFILE`, less a host reserve, while it is open, and one
+  past it is `-EMFILE`.
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +

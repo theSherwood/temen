@@ -105,7 +105,7 @@ fn exec_module_replaces_the_image_with_a_separate_command_module() {
 
     // The command wrote "EXEC" to the inherited stdout — a *separate module* did real I/O as the
     // caller's task.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(
         &bytes, b"EXEC",
         "the exec'd command wrote through the inherited stdout"
@@ -144,7 +144,7 @@ fn a_command_prepared_once_execs_from_every_host_it_is_granted_into() {
             vec![Value::I64(42)],
             "the command ran in the guest's place"
         );
-        let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
         assert_eq!(&bytes, b"EXEC", "and wrote through the inherited stdout");
     }
 }
@@ -188,7 +188,7 @@ fn exec_module_image_replaces_on_the_bytecode_engine() {
         vec![Value::I64(42)],
         "the bytecode engine image-replaced and returned the command's 42, not the guest's 99"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(
         &bytes, b"EXEC",
         "the exec'd command wrote through the inherited stdout on the bytecode engine"
@@ -229,7 +229,7 @@ fn exec_module_folds_to_the_oracle_on_the_fast_path() {
         vec![Value::I64(42)],
         "the fast path folds the exec module to the oracle and image-replaces (42), not -EINVAL"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(
         &bytes, b"EXEC",
         "the folded run did the real image-replace + I/O"
@@ -267,7 +267,7 @@ fn a_failed_exec_module_returns_einval_and_leaves_the_caller_running() {
         vec![Value::I64(99)],
         "a refused exec returns to the caller, which falls through to its sentinel (99)"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert!(
         bytes.is_empty(),
         "a refused exec ran no command, so nothing was written"
@@ -306,7 +306,7 @@ fn a_failed_exec_module_on_the_bytecode_engine_leaves_the_caller_running() {
         vec![Value::I64(99)],
         "a refused exec on the bytecode engine returns to the caller's sentinel (99)"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert!(
         bytes.is_empty(),
         "a refused exec ran no command, so nothing was written"

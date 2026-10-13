@@ -1025,7 +1025,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
     let slot = SharedHostProc::new(
         {
             let make = Arc::clone(&make);
-            move || (*make)()
+            move |_: &temen_interp::NodeRef| (*make)()
         },
         temen_posix::cap_fork_factory(&posix),
     );
@@ -1034,7 +1034,7 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Grant::OneEntry => HostCap::host_proc_shared(op, &slot),
         Grant::EntryPerOp => {
             let make = Arc::clone(&make);
-            HostCap::host_proc_forkable(op, move || (*make)(), Arc::clone(&per_op_fork))
+            HostCap::host_proc_forkable(op, move |_| (*make)(), Arc::clone(&per_op_fork))
         }
     };
     let imports = Imports::new()
