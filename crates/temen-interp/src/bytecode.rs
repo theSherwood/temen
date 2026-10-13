@@ -4408,11 +4408,11 @@ pub enum VcpuEvent {
     /// writes it). The single-threaded-embedder twin of the pool's inline wait; the
     /// `StdinPark`/`push_stdin` shape generalized to any cap.
     CapPending { id: u64, dst: u32 },
-    /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
-    /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
-    /// The read did **not** complete (nothing written, pc un-advanced); the host pushes more bytes with
-    /// [`Vcpu::push_stdin`] and calls [`run`](Vcpu::run) again, which re-issues the same read — now
-    /// satisfied. No `deliver_*` is needed (unlike the other events, this one carries no pending dst).
+    /// **Blocking stdin park** (a persistent interactive session): the guest `read` a `Stream{In}` cap
+    /// whose buffer is exhausted, under [`Host::set_stdin_blocking`]. The read did **not** complete
+    /// (nothing written, pc un-advanced); the host pushes more bytes with [`Vcpu::push_stdin`] and calls
+    /// [`run`](Vcpu::run) again, which re-issues the same read — now satisfied. No `deliver_*` is needed
+    /// (unlike the other events, this one carries no pending dst).
     StdinPark,
 }
 
@@ -4714,11 +4714,11 @@ impl<'p> Vcpu<'p> {
 
     /// Like [`new_root_with_powerbox`](Vcpu::new_root_with_powerbox), but over an **engine-backed
     /// reservation** (`Mem::with_reservation`) instead of an external `Arc<Region>` — the resumable twin
-    /// of [`compile_and_run_capture_reserved_with_host`], which reserves the same way. This is the
-    /// persistent-backend seam (the browser Postgres console): a single owned-host vCPU that grows its
-    /// heap into the `reserved_log2` tail and stays alive across [`run`](Vcpu::run) parks, so blocking
-    /// stdin ([`set_stdin_blocking`](Vcpu::set_stdin_blocking)) can suspend it between queries. Uses the
-    /// same `DEFAULT_RESERVED_LOG2`-scale window a one-shot `--single` boot uses; pass that.
+    /// of [`compile_and_run_capture_reserved_with_host`], which reserves the same way. This is a
+    /// persistent-backend seam: a single owned-host vCPU that grows its heap into the `reserved_log2`
+    /// tail and stays alive across [`run`](Vcpu::run) parks, so blocking stdin
+    /// ([`set_stdin_blocking`](Vcpu::set_stdin_blocking)) can suspend it between queries. Uses the same
+    /// `DEFAULT_RESERVED_LOG2`-scale window a one-shot `--single` boot uses; pass that.
     pub fn new_root_reserved_with_powerbox(
         prog: &'p VcpuProgram,
         func: u32,
@@ -5032,10 +5032,10 @@ impl<'p> Vcpu<'p> {
         self.mem.take()
     }
 
-    /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session — the
-    /// browser Postgres console). A `read` on an exhausted stdin buffer then surfaces
-    /// [`VcpuEvent::StdinPark`] instead of returning EOF; feed more input with [`push_stdin`](Vcpu::push_stdin)
-    /// and call [`run`](Vcpu::run) again. Only meaningful for an owned-host vCPU (not `with_shared_host`).
+    /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session). A
+    /// `read` on an exhausted stdin buffer then surfaces [`VcpuEvent::StdinPark`] instead of returning
+    /// EOF; feed more input with [`push_stdin`](Vcpu::push_stdin) and call [`run`](Vcpu::run) again.
+    /// Only meaningful for an owned-host vCPU (not `with_shared_host`).
     pub fn set_stdin_blocking(&mut self, on: bool) {
         self.host.set_stdin_blocking(on);
     }

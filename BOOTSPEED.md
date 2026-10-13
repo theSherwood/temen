@@ -125,9 +125,11 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
 - **✅ Persistent interactive session — per-query boot eliminated.** The playground now runs Postgres as
   a *live* backend (`temen_pg_open`/`_query`/`_close`), not a fresh boot per query. The enabling mechanism
   is a **blocking-stdin park** in the interpreter: with `Host::set_stdin_blocking`, a `read` on an
-  exhausted stdin buffer suspends the resumable `bytecode::Vcpu` (`VcpuEvent::StdinPark`) instead of
-  returning EOF (which makes `--single` exit), so the backend parks at its `backend>` prompt; the host
-  pushes the next query and resumes. Measured in Chromium: the **first** query pays the ~9–13 s boot, but
+  exhausted stdin buffer parks the reader instead of returning EOF (which makes `--single` exit), so the
+  backend parks at its `backend>` prompt; the host pushes the next query and resumes. The session runs
+  on the pump's suspend/resume driver (`CoopRun::set_suspend_on_idle`, which returns
+  `CoopEvent::Idle` at the park), as the bash card's does (#1414 S4-2; it was the resumable
+  `bytecode::Vcpu` before). Measured in Chromium: the **first** query pays the ~9–13 s boot, but
   every query after runs in **~30–120 ms** and **state persists** across them (a `CREATE TABLE` is still
   there for the next `SELECT`) — a real `psql`-style session. This closes the *per-query* boot cost; the
   **one** remaining latency is the first boot, whose lever is snapshot/restore of the post-boot state

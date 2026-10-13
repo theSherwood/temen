@@ -5,8 +5,8 @@
 
 use temen_browser::{
     temen_link_lib_close, temen_link_lib_open, temen_link_run, temen_link_run_lib,
-    temen_link_text_libs, temen_status, temen_stderr_len, temen_stderr_ptr, STATUS_DECODE_ERR,
-    STATUS_UNSUPPORTED,
+    temen_link_text_libs, temen_run_value, temen_status, temen_stderr_len, temen_stderr_ptr,
+    STATUS_DECODE_ERR, STATUS_UNSUPPORTED,
 };
 use temen_ir::{Block, Export, Func, Inst, LinkUnitRef, Memory, Module, Terminator, ValType};
 
@@ -206,4 +206,38 @@ fn a_refused_link_names_the_reason() {
             format!("a library handle in [{h}] is not open")
         )
     );
+}
+
+/// A refused link reports nothing of the run before it (#1414 S4-1): the value is the refused run's,
+/// not the last program's, and the reason is on stderr.
+#[test]
+fn a_refused_link_reports_nothing_of_the_last_run() {
+    let _exports = ffi::lock();
+    let lib = temen_text::print_module(&unit(7));
+    let h = temen_link_lib_open(lib.as_ptr(), lib.len());
+    assert!(h >= 0, "the library opens");
+    let entry = b"run";
+    let run = |prog: &[u8]| {
+        temen_link_run_lib(
+            h,
+            prog.as_ptr(),
+            prog.len(),
+            entry.as_ptr(),
+            entry.len(),
+            core::ptr::null(),
+            0,
+        );
+        (temen_status(), temen_run_value(), stderr())
+    };
+    let prog = temen_text::print_module(&unit(42));
+    assert_eq!(run(prog.as_bytes()), (0, 42, String::new()));
+    assert_eq!(
+        run(b"\xff\xfe"),
+        (
+            STATUS_DECODE_ERR,
+            0,
+            "the program unit is neither an encoded unit nor UTF-8 text".to_string()
+        )
+    );
+    temen_link_lib_close(h);
 }
