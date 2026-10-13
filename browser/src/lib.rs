@@ -394,7 +394,7 @@ pub extern "C" fn run_fork() -> i64 {
     };
     // The original resumed past the fork with reply_orig (100), and the shared sink carries BOTH
     // replies — proof the twin ran over its private window + duplicated powerbox.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     let mut vals: Vec<i64> = bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
