@@ -398,9 +398,9 @@ fn obs(b: &mut impl Debuggee, t: u64) -> (u64, String, Vec<u8>) {
     b.seek(t);
     let clock = b.clock();
     let stack = b
-        .backtrace()
+        .frame_pcs()
         .iter()
-        .map(|f| format!("{}:{}:{}:{}", f.pc.module, f.pc.func, f.pc.block, f.pc.inst))
+        .map(|pc| format!("{}:{}:{}:{}", pc.module, pc.func, pc.block, pc.inst))
         .collect::<Vec<_>>()
         .join("|");
     let mem = b.read_window(16384, 4).unwrap_or_default();
@@ -545,9 +545,9 @@ fn obs_sched(b: &mut BytecodeBackend, t: u64) -> (u64, usize, Option<u64>, Vec<u
     for &tid in &threads {
         b.select_task(tid);
         let s = b
-            .backtrace()
+            .frame_pcs()
             .iter()
-            .map(|f| format!("{}:{}:{}:{}", f.pc.module, f.pc.func, f.pc.block, f.pc.inst))
+            .map(|pc| format!("{}:{}:{}:{}", pc.module, pc.func, pc.block, pc.inst))
             .collect::<Vec<_>>()
             .join(",");
         stacks.push(format!("{tid}=[{s}]"));

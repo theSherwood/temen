@@ -28,8 +28,8 @@ use temen_interp::MemEvent;
 
 use crate::json::Json;
 use temen_interp::{
-    CapTape, FrameInfo, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap,
-    Value, VarValue, WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
+    CapTape, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap, Value, VarValue,
+    WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
 };
 use temen_ir::{FuncIdx, Module};
 
@@ -203,7 +203,10 @@ pub trait Debuggee {
     }
 
     // --- inspection ------------------------------------------------------------------------------
-    fn backtrace(&self) -> Vec<FrameInfo>;
+    /// The pc of every frame on the focused thread's stack, innermost first. A frame's DAP index is
+    /// its position here, and [`source_loc`](Debuggee::source_loc) resolves just the frames a request
+    /// shows, so a deep stack costs only a pc walk (#2304).
+    fn frame_pcs(&self) -> Vec<IrPc>;
     fn func_name(&self, func: FuncIdx) -> Option<&str>;
     fn source_loc(&self, pc: IrPc) -> Option<SourceLoc>;
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue>;
@@ -395,8 +398,8 @@ impl Debuggee for Inspector {
     ) -> Option<WatchId> {
         Inspector::set_value_watchpoint(self, frame_from_top, name, kind)
     }
-    fn backtrace(&self) -> Vec<FrameInfo> {
-        Inspector::backtrace(self)
+    fn frame_pcs(&self) -> Vec<IrPc> {
+        Inspector::frame_pcs(self)
     }
     fn func_name(&self, func: FuncIdx) -> Option<&str> {
         Inspector::func_name(self, func)
@@ -1209,20 +1212,11 @@ impl Debuggee for BytecodeBackend {
         self.apply_watches();
         Some(id)
     }
-    fn backtrace(&self) -> Vec<FrameInfo> {
-        let mut out = Vec::new();
+    fn frame_pcs(&self) -> Vec<IrPc> {
         // The focused thread's stack (`select_task`'s pick; the sole thread of a spawn-free guest).
-        for d in 0..self.run.depth() {
-            if let Some(pc) = self.run.frame_pc(d) {
-                let source = temen_interp::source_loc(&self.module, pc);
-                out.push(FrameInfo {
-                    pc,
-                    vals: Vec::new(), // unused by DapServer (it reads via read_var)
-                    source,
-                });
-            }
-        }
-        out
+        (0..self.run.depth())
+            .filter_map(|d| self.run.frame_pc(d))
+            .collect()
     }
     fn func_name(&self, func: FuncIdx) -> Option<&str> {
         temen_interp::func_name(&self.module, func)

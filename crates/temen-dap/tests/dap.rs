@@ -1989,3 +1989,154 @@ fn dap_set_breakpoints_replaces_only_its_own_source() {
         );
     }
 }
+
+// `down(n)` recurses to its base case: line 4 is the recursive call, line 3 the base case, and `n` is
+// block 1's parameter. A breakpoint on the base case stops `n + 1` frames deep.
+const RECURSE_DBG: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  br_if v0 1(v0) 2()
+}
+block 1 (v1: i32) {
+  v2 = i32.const -1
+  v3 = i32.add v1 v2
+  v4 = call 0 (v3)
+  return v4
+}
+block 2 () {
+  v5 = i32.const 0
+  return v5
+  }
+}
+
+debug.file 0 "down.c"
+debug.fname 0 "down"
+debug.loc 0 1 0 0 4 3
+debug.loc 0 2 0 0 3 3
+debug.var 0 "n" ssa 0 "int"
+"#;
+
+/// One `stackTrace` request on thread 1 with `window`'s arguments: each returned frame's
+/// `(name, line, id)`, and the response's `totalFrames`.
+fn stack_window(
+    s: &mut DapServer,
+    seq: i64,
+    window: Vec<(&str, Json)>,
+) -> (Vec<(String, i64, i64)>, i64) {
+    let mut args = vec![("threadId", Json::i(1))];
+    args.extend(window);
+    let out = s.handle(&req(seq, "stackTrace", Json::obj(args)));
+    let body = response(&out).get("body").unwrap();
+    let int = |f: &Json, k: &str| f.get(k).unwrap().as_i64().unwrap();
+    let frames = body
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            let name = f.get("name").unwrap().as_str().unwrap().to_string();
+            (name, int(f, "line"), int(f, "id"))
+        })
+        .collect();
+    (frames, int(body, "totalFrames"))
+}
+
+/// #2304: `stackTrace` returns the window `startFrame`/`levels` asks for, numbers its frames by depth,
+/// and keeps `totalFrames` the whole stack; a windowed frame's id reads that frame's locals. Before,
+/// every request resolved and returned the whole stack, which on a runaway recursion took seconds.
+#[test]
+fn dap_stack_trace_returns_the_requested_window() {
+    const N: i64 = 40;
+    for engine in [None, Some("bytecode")] {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut launch = vec![
+            ("programText", Json::s(RECURSE_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(N)])),
+        ];
+        if let Some(e) = engine {
+            launch.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(launch)));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("down.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(3))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+
+        // No window: the whole stack, innermost first — the base case, then every pending call.
+        let (all, total) = stack_window(&mut s, 5, vec![]);
+        let shape: Vec<(String, i64)> = all.iter().map(|(n, l, _)| (n.clone(), *l)).collect();
+        let want: Vec<(String, i64)> = (0..=N)
+            .map(|k| (format!("#{k} down"), if k == 0 { 3 } else { 4 }))
+            .collect();
+        assert_eq!(shape, want, "{engine:?}: the whole stack");
+        assert_eq!(total, N + 1, "{engine:?}: totalFrames");
+        let names = |frames: &[(String, i64, i64)]| -> Vec<String> {
+            frames.iter().map(|(n, _, _)| n.clone()).collect()
+        };
+
+        // `levels` alone: the innermost frames.
+        let (top, t) = stack_window(&mut s, 6, vec![("levels", Json::i(5))]);
+        assert_eq!(names(&top), names(&all[..5]), "{engine:?}: levels 5");
+        assert_eq!(t, total, "{engine:?}: levels keeps totalFrames");
+        // A window at the bottom, cut short by the stack's end.
+        let window = vec![("startFrame", Json::i(total - 3)), ("levels", Json::i(10))];
+        let (bottom, t) = stack_window(&mut s, 7, window);
+        assert_eq!(
+            names(&bottom),
+            names(&all[all.len() - 3..]),
+            "{engine:?}: bottom"
+        );
+        assert_eq!(t, total, "{engine:?}: startFrame keeps totalFrames");
+        // Past the end: nothing, and `levels: 0` means the rest of the stack.
+        let (past, _) = stack_window(&mut s, 8, vec![("startFrame", Json::i(total + 5))]);
+        assert!(past.is_empty(), "{engine:?}: past the end");
+        let (rest, _) = stack_window(&mut s, 9, vec![("levels", Json::i(0))]);
+        assert_eq!(names(&rest), names(&all), "{engine:?}: levels 0");
+
+        // A frame fetched on its own is still that frame: frame #7 is `down(7)`.
+        let window = vec![("startFrame", Json::i(7)), ("levels", Json::i(1))];
+        let (one, _) = stack_window(&mut s, 10, window);
+        assert_eq!(names(&one), ["#7 down"], "{engine:?}: frame 7 alone");
+        let out = s.handle(&req(
+            11,
+            "scopes",
+            Json::obj(vec![("frameId", Json::i(one[0].2))]),
+        ));
+        let scope = &response(&out)
+            .get("body")
+            .unwrap()
+            .get("scopes")
+            .unwrap()
+            .as_array()
+            .unwrap()[0];
+        let vref = scope.get("variablesReference").unwrap().as_i64().unwrap();
+        let out = s.handle(&req(
+            12,
+            "variables",
+            Json::obj(vec![("variablesReference", Json::i(vref))]),
+        ));
+        let vars = response(&out)
+            .get("body")
+            .unwrap()
+            .get("variables")
+            .unwrap();
+        let n = vars
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v.get("name").unwrap().as_str() == Some("n"))
+            .map(|v| v.get("value").unwrap().as_str().unwrap().to_string());
+        assert_eq!(n.as_deref(), Some("7"), "{engine:?}: frame 7's n");
+    }
+}

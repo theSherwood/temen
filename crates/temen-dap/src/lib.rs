@@ -124,8 +124,8 @@ impl Session {
         let Some(cond) = self.conditions.get(&pc) else {
             return true; // unconditional
         };
-        let func = match self.inspector.backtrace().first() {
-            Some(f) => f.pc.func,
+        let func = match self.inspector.frame_pcs().first() {
+            Some(pc) => pc.func,
             None => return true,
         };
         let resolve = |name: &str| self.resolve_var(0, func, name);
@@ -643,7 +643,7 @@ impl DapServer {
             .or_else(|| session.frame_refs.first().copied())?;
         let session = self.session.as_mut()?;
         session.inspector.select_task(tid);
-        let func = session.inspector.backtrace().get(frame_idx)?.pc.func;
+        let func = session.inspector.frame_pcs().get(frame_idx)?.func;
         // Prefer a window-range watch (an addressable var).
         if let Some((addr, len)) = self.session.as_ref()?.resolve_watch(frame_idx, func, name) {
             return Some(format!("{addr}:{len}"));
@@ -755,42 +755,50 @@ impl DapServer {
     fn on_stack_trace(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
         // Focus the requested thread, then report *its* stack (multithreaded DAP). In a
         // single-threaded run `select_task` is a no-op and the sole vCPU is used.
-        let thread_id = args
-            .and_then(|a| a.get("threadId"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1);
-        let tid = thread_id.max(1) as u64 - 1;
+        let arg = |key: &str| args.and_then(|a| a.get(key)).and_then(|v| v.as_i64());
+        let tid = arg("threadId").unwrap_or(1).max(1) as u64 - 1;
         let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
         session.inspector.select_task(tid);
-        let frames = session.inspector.backtrace();
+        // Only the requested window (`startFrame`, and `levels` frames from it; absent or 0 = the rest
+        // of the stack) is resolved to names and lines: a runaway recursion is ~100k frames deep, and
+        // a client showing twenty of them shouldn't pay for the rest (#2304).
+        let pcs = session.inspector.frame_pcs();
+        let start = usize::try_from(arg("startFrame").unwrap_or(0))
+            .unwrap_or(0)
+            .min(pcs.len());
+        let end = match usize::try_from(arg("levels").unwrap_or(0)) {
+            Ok(n) if n > 0 => start.saturating_add(n).min(pcs.len()),
+            _ => pcs.len(),
+        };
         let mut out = Vec::new();
-        for f in frames.iter() {
+        for (index, &pc) in pcs.iter().enumerate().take(end).skip(start) {
             // Assign a `frameId` that records (thread, frame index) so `variables` reads the right
             // thread's frame even after the client switches threads.
             let frame_id = session.frame_refs.len();
-            session.frame_refs.push((tid, out.len()));
+            session.frame_refs.push((tid, index));
             // Frame name: the `-g` function name (`compute`) when present, else `func{N}`. So the
             // VS Code call stack reads `#0 compute`, not `#0 func0`.
             let fname = session
                 .inspector
-                .func_name(f.pc.func)
+                .func_name(pc.func)
                 .map(str::to_owned)
-                .unwrap_or_else(|| format!("func{}", f.pc.func));
+                .unwrap_or_else(|| format!("func{}", pc.func));
+            let source = session.inspector.source_loc(pc);
             let mut fields = vec![
                 ("id", Json::i(frame_id as i64)),
-                ("name", Json::s(format!("#{} {fname}", out.len()))),
+                ("name", Json::s(format!("#{index} {fname}"))),
                 (
                     "line",
-                    Json::i(f.source.as_ref().map(|s| s.line as i64).unwrap_or(0)),
+                    Json::i(source.as_ref().map(|s| s.line as i64).unwrap_or(0)),
                 ),
                 (
                     "column",
-                    Json::i(f.source.as_ref().map(|s| s.col as i64).unwrap_or(0)),
+                    Json::i(source.as_ref().map(|s| s.col as i64).unwrap_or(0)),
                 ),
             ];
-            if let Some(src) = &f.source {
+            if let Some(src) = &source {
                 fields.push((
                     "source",
                     Json::obj(vec![
@@ -806,12 +814,11 @@ impl DapServer {
                     .collect(),
             ));
         }
-        let total = out.len() as i64;
         (
             true,
             Json::obj(vec![
                 ("stackFrames", Json::Arr(out)),
-                ("totalFrames", Json::i(total)),
+                ("totalFrames", Json::i(pcs.len() as i64)),
             ]),
             vec![],
         )
@@ -934,13 +941,11 @@ impl DapServer {
             .and_then(|r| session.frame_refs.get(r as usize))?;
         let debug = session.debug.as_ref()?;
         session.inspector.select_task(tid);
-        let frames = session.inspector.backtrace();
-        let frame = frames.get(frame_idx)?;
+        let pc = *session.inspector.frame_pcs().get(frame_idx)?;
         // The stopped source line drives lexical-scope resolution of shadowed names (§6).
-        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
+        let line = session.inspector.source_loc(pc).map(|s| s.line);
         let in_scope = |v: &VarInfo| {
-            (v.func == frame.pc.func || v.func == temen_ir::GLOBAL_SCOPE)
-                && scope_covers(v.scope, line)
+            (v.func == pc.func || v.func == temen_ir::GLOBAL_SCOPE) && scope_covers(v.scope, line)
         };
         // The innermost (largest scope start) in-scope declaration of `name` — the one to show.
         let best_for = |name: &str| {
@@ -962,7 +967,7 @@ impl DapServer {
                     return None;
                 }
                 best_for(&v.name).map(|b| {
-                    let is_local = b.func == frame.pc.func;
+                    let is_local = b.func == pc.func;
                     (
                         b.name.clone(),
                         b.ty.clone(),
@@ -1220,12 +1225,11 @@ impl DapServer {
         session.inspector.select_task(tid);
         // The var's byte width for a memory-located write, resolved like the Variables pane: the
         // innermost in-scope declaration's scalar width.
-        let frames = session.inspector.backtrace();
-        let Some(frame) = frames.get(frame_idx) else {
+        let Some(&pc) = session.inspector.frame_pcs().get(frame_idx) else {
             return fail;
         };
-        let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
-        let func = frame.pc.func;
+        let line = session.inspector.source_loc(pc).map(|s| s.line);
+        let func = pc.func;
         let Some((ty_name, type_id)) = session.debug.as_ref().and_then(|debug| {
             debug
                 .vars
@@ -1614,10 +1618,10 @@ impl DapServer {
     /// line step passes them like any unmapped op instead of stopping there.
     fn current_source_line(&self) -> Option<(String, u32)> {
         let s = self.session.as_ref()?;
+        let pc = *s.inspector.frame_pcs().first()?;
         s.inspector
-            .backtrace()
-            .first()
-            .and_then(|f| f.source.as_ref().map(|src| (src.file.clone(), src.line)))
+            .source_loc(pc)
+            .map(|src| (src.file, src.line))
             .filter(|&(_, line)| line != 0)
     }
 
@@ -1700,7 +1704,7 @@ impl DapServer {
     fn frame_depth(&self) -> usize {
         self.session
             .as_ref()
-            .map_or(0, |s| s.inspector.backtrace().len())
+            .map_or(0, |s| s.inspector.frame_pcs().len())
     }
 
     /// The time-travel coordinate: the global scheduler `turn` when multithreaded, the op `clock`
@@ -1790,8 +1794,12 @@ impl DapServer {
         };
         session.inspector.select_task(tid); // focus the requested thread, then read it immutably
         let session = self.session.as_ref().unwrap();
-        let frames = session.inspector.backtrace();
-        let Some(func) = frames.get(frame_idx).map(|f| f.pc.func) else {
+        let Some(func) = session
+            .inspector
+            .frame_pcs()
+            .get(frame_idx)
+            .map(|pc| pc.func)
+        else {
             return fail;
         };
 

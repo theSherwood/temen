@@ -2013,6 +2013,16 @@ impl Inspector {
         .unwrap_or_default()
     }
 
+    /// The pc of every frame on the focused thread's stack, innermost first: [`backtrace`] without the
+    /// per-frame values and source lookups, for a caller that resolves only the frames it shows (the
+    /// DAP `stackTrace` window, #2304).
+    ///
+    /// [`backtrace`]: Inspector::backtrace
+    pub fn frame_pcs(&self) -> Vec<IrPc> {
+        self.with_focused(|v| frames_to_pcs(&v.frames))
+            .unwrap_or_default()
+    }
+
     /// The source location of an [`IrPc`], if the module carries debug info (DEBUGGING.md §6/W4).
     /// Locations are recorded per statement, so this uses **nearest-preceding** within the same
     /// `(func, block)` — the op's row is the last `debug.loc` at or before it (DWARF line-table
