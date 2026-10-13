@@ -8307,9 +8307,12 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
-        eligible: std::sync::Arc::clone(&wc.eligible),
-        page_checked: wc.paged,
+        root: bytecode::ProgramEmit {
+            eligible: std::sync::Arc::clone(&wc.eligible),
+            page_checked: wc.paged,
+        },
         leaf: None,
+        modules: None,
     };
     // The resumable twin of the warm interp path's `run_over_grown`: the image bytes already
     // restored (no data seed), the captured page map re-established (`seed_pages`) so the grown heap
@@ -13802,11 +13805,12 @@ struct CoopTierupRun {
     back: Option<std::sync::Arc<temen_interp::Region>>,
     /// #1896 — a nimony build's session: its personality. `None` for every other run.
     nim: Option<nimony::NimSession>,
-    /// #1896/#1954 — the leaf images this run emitted, by program: a nim build's exec'd processes, or
-    /// (program `0`) a [`temen_coop_open`] run's whole root program.
-    leaves: Leaves,
-    /// The program the pending TIERUP runs: a leaf image, or (`0` with no root leaf) this run's own
-    /// region emit.
+    /// #1896/#1954/#2248 — the programs this run emitted besides its own region emit, by program:
+    /// the leaf images of a nim build's exec'd processes, or (program `0`) a [`temen_coop_open`]
+    /// run's whole root program; and the granted modules its children ran.
+    programs: Programs,
+    /// The program the pending TIERUP runs: one of `programs`, or (`0` with no root leaf) this
+    /// run's own region emit.
     module: u32,
     /// #1954: the host-completed cap names declared at open, in order — a parked request names its
     /// cap by index into this list ([`COOP_RUN_CAP_PARK`]).
@@ -13867,44 +13871,52 @@ struct CoopTierupRun {
     spill: Vec<u64>,
 }
 
-/// #2087 — what an emitted leaf image is: its image's content digest and how it was emitted. Equal
-/// keys emit equal wasm, so a later session reuses one ([`EmittedCache`]), and a driver keys its compiled
-/// module by it ([`temen_coop_leaf_key`]).
+/// #2087 — what a program a run emitted is: its image's content digest and how it was emitted, as a
+/// leaf image run whole from its entry (#1896) or as a granted module's functions for its children
+/// to tier up into (#2248). Equal keys emit equal wasm, so a later session reuses a leaf
+/// ([`EmittedCache`]), and a driver keys its compiled module by it ([`temen_coop_program_key`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct LeafKey {
+pub(crate) struct EmitKey {
     digest: [u8; 32],
+    /// The function a leaf image runs whole from; `0` for a granted module.
     entry: u32,
+    /// A leaf image, not a granted module.
+    leaf: bool,
     parks: bool,
     paged: bool,
     shared: bool,
 }
 
-const LEAF_KEY_LEN: usize = 37;
+const EMIT_KEY_LEN: usize = 37;
 
-impl LeafKey {
+impl EmitKey {
     /// The digest, the entry (LE), then a byte of flags.
-    fn bytes(&self) -> [u8; LEAF_KEY_LEN] {
-        let mut b = [0; LEAF_KEY_LEN];
+    fn bytes(&self) -> [u8; EMIT_KEY_LEN] {
+        let mut b = [0; EMIT_KEY_LEN];
         b[..32].copy_from_slice(&self.digest);
         b[32..36].copy_from_slice(&self.entry.to_le_bytes());
-        b[36] = self.parks as u8 | (self.paged as u8) << 1 | (self.shared as u8) << 2;
+        b[36] = self.parks as u8
+            | (self.paged as u8) << 1
+            | (self.shared as u8) << 2
+            | (self.leaf as u8) << 3;
         b
     }
 }
 
-/// A leaf image the emitter took: its emitted wasm, and its key.
+/// A program the run emitted: its wasm, and its key.
 #[derive(Clone)]
-pub(crate) struct Leaf {
+pub(crate) struct Emitted {
     wasm: std::sync::Arc<[u8]>,
-    key: LeafKey,
+    key: EmitKey,
 }
 
-/// The leaf images a run offered, by program index; `None` for an image the emitter declined (it
-/// runs interpreted).
-pub(crate) type Leaves =
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<Leaf>>>>;
+/// The programs a run emitted besides its own region emit, by program index: the leaf images it
+/// offered, and the granted modules its children ran; `None` for one the emitter declined (it runs
+/// interpreted).
+pub(crate) type Programs =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<Emitted>>>>;
 
-type EmittedMap = std::collections::HashMap<LeafKey, Option<std::sync::Arc<[u8]>>>;
+type EmittedMap = std::collections::HashMap<EmitKey, Option<std::sync::Arc<[u8]>>>;
 
 /// #2087 — emitted leaf images across sessions, by key: a nim build emits the same tools every
 /// build. It holds what this session used and what the last one did, so an image no session has used
@@ -13924,7 +13936,7 @@ impl EmittedCache {
     /// The image for `key`, made by `emit` only when neither this session nor the last made it.
     fn get(
         &mut self,
-        key: LeafKey,
+        key: EmitKey,
         emit: impl FnOnce() -> Option<std::sync::Arc<[u8]>>,
     ) -> Option<std::sync::Arc<[u8]>> {
         if let Some(wasm) = self.used.get(&key) {
@@ -13952,7 +13964,11 @@ static EMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// memory or not, or reuse what an earlier session emitted for it (#2087). An image that is not
 /// wasm-drivable (it could suspend a frame) runs interpreted, and so does one that can park when the
 /// host cannot suspend its emitted frames (`suspends`).
-pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> bytecode::LeafEmitter {
+pub(crate) fn leaf_emitter(
+    leaves: Programs,
+    suspends: bool,
+    shared: bool,
+) -> bytecode::LeafEmitter {
     emitted().get_or_insert_with(Default::default).rotate();
     std::sync::Arc::new(move |o: &bytecode::LeafOffer| {
         if o.parks && !suspends {
@@ -13962,9 +13978,10 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             return false;
         };
         let leaf = leaves.entry(o.module as u32).or_insert_with(|| {
-            let key = LeafKey {
+            let key = EmitKey {
                 digest: o.digest,
                 entry: o.entry,
+                leaf: true,
                 parks: o.parks,
                 paged: o.paged,
                 shared,
@@ -13972,7 +13989,7 @@ pub(crate) fn leaf_emitter(leaves: Leaves, suspends: bool, shared: bool) -> byte
             let wasm = emitted()
                 .get_or_insert_with(Default::default)
                 .get(key, || emit_leaf(o, shared))?;
-            Some(Leaf { wasm, key })
+            Some(Emitted { wasm, key })
         });
         leaf.is_some()
     })
@@ -14008,7 +14025,7 @@ impl CoopTierupRun {
             run,
             back: None,
             nim: None,
-            leaves: Leaves::default(),
+            programs: Programs::default(),
             module: 0,
             caps: Vec::new(),
             requests: temen_interp::CapRequests::default(),
@@ -14039,23 +14056,24 @@ impl CoopTierupRun {
     }
 
     /// #1896 — a nimony build's session over `run`: its personality and the leaves its emitter fills.
-    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession, leaves: Leaves) -> Self {
+    fn nim(run: bytecode::CoopRun, nim: nimony::NimSession, programs: Programs) -> Self {
         CoopTierupRun {
             nim: Some(nim),
-            leaves,
+            programs,
             ..CoopTierupRun::over(run)
         }
     }
 
-    /// Leaf image `module`, as the emitter took it.
-    fn leaf(&self, module: u32) -> Option<Leaf> {
-        self.leaves.lock().ok()?.get(&module).cloned().flatten()
+    /// Program `module`, as an emitter took it.
+    fn program(&self, module: u32) -> Option<Emitted> {
+        self.programs.lock().ok()?.get(&module).cloned().flatten()
     }
 
-    /// Whether the pending event's program carries the page check (#1009): a leaf image's own mode
-    /// (#1896), else this run's own emit's.
+    /// Whether the pending event's program carries the page check (#1009): a leaf image's or a
+    /// granted module's own mode (#1896, #2248), else this run's own emit's.
     fn event_paged(&self) -> bool {
-        self.leaf(self.module).map_or(self.paged, |l| l.key.paged)
+        self.program(self.module)
+            .map_or(self.paged, |p| p.key.paged)
     }
 
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
@@ -14214,20 +14232,7 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
     // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
     // below) are untouched.
-    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
-    let emittable_leaf: Vec<bool> = m
-        .funcs
-        .iter()
-        .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    let eligible: Vec<bool> = m
-        .funcs
-        .iter()
-        .zip(&emittable_leaf)
-        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
-        .collect();
+    let (emittable_leaf, eligible) = tierup_eligible(&m, &emit);
     // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
     // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
     // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
@@ -14251,6 +14256,78 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     })
 }
 
+/// The functions of `m` a coop run tiers up into, given what its emit emitted (`emit`): first those
+/// emitted with an all-`i64` signature, the emittable leaves; then those of them over the tier-up
+/// size floor (#1026), the eligible ones.
+fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> (Vec<bool>, Vec<bool>) {
+    let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
+    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
+    let emittable_leaf: Vec<bool> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
+        .collect();
+    let eligible = m
+        .funcs
+        .iter()
+        .zip(&emittable_leaf)
+        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
+        .collect();
+    (emittable_leaf, eligible)
+}
+
+/// #2248 — a session's emitter for the granted modules its children run: it emits a module's
+/// functions for its children to tier up into ([`emit_module`]), and keeps the wasm under the
+/// module's program index in `programs`, where the driver finds it
+/// ([`temen_coop_program_wasm_ptr`]).
+pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::ModuleEmitter {
+    std::sync::Arc::new(move |o: &bytecode::ModuleOffer| {
+        let (wasm, emit) = emit_module(o.image, shared)?;
+        let key = EmitKey {
+            digest: o.digest,
+            entry: 0,
+            leaf: false,
+            parks: false,
+            paged: emit.page_checked,
+            shared,
+        };
+        let mut programs = programs.lock().ok()?;
+        programs.insert(o.module, Some(Emitted { wasm, key }));
+        Some(emit)
+    })
+}
+
+/// Emit granted module `m`'s functions for its children to tier up into, or decline it. Eligible as
+/// in the run's own emit ([`coop_emit_for`]), bouncing over the live window as it does, and paged
+/// by the same rule, with two differences:
+/// - **Its own table.** The driver's shared table mirrors the run's own dispatch table, not a
+///   child's (#2273), so a function that `call.dyn`s is emitted only when the whole module is,
+///   through a table of the module's own functions (`compile_module_tierup_live`). Such a module
+///   has no cap op, so it can install no unit.
+/// - **Its own window.** It is emitted against the window it declares, which every window its
+///   children run in is at least ([`bytecode::ModuleOffer`]). An access the emitter proves inside
+///   that window skips its bound check, which a larger emit window would not make sound.
+fn emit_module(
+    m: &temen_ir::Module,
+    shared: bool,
+) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
+    m.memory?;
+    let paged = m.data.iter().any(|d| d.readonly)
+        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+    let (wasm, emit) =
+        temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;
+    let (_, eligible) = tierup_eligible(m, &emit);
+    eligible.contains(&true).then(|| {
+        let emit = bytecode::ProgramEmit {
+            eligible: eligible.into(),
+            page_checked: paged,
+        };
+        (wasm.into(), emit)
+    })
+}
+
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
 pub const COOP_LEAF_OFF: i32 = 0;
 /// `temen_coop_open`'s `mode` (#1954): run the whole root program as one emitted leaf when it can
@@ -14269,21 +14346,21 @@ pub const COOP_NO_REGIONS: i32 = 4;
 /// on refusal (decode error, an op outside the engine subset, nothing for the emitted tier to run,
 /// or a window the host allocator refused). Idempotent open: closes any prior run first.
 ///
-/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and reserved
-/// at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the declared window
-/// commits real memory instead of `-EINVAL`ing. Growing reallocates and can move the window, so the
-/// driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`] after every bounce and
-/// publish the base to each emitted instance's `"win"` global.
+/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and
+/// reserved at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the
+/// declared window commits real memory instead of `-EINVAL`ing. Growing reallocates and can move
+/// the window, so the driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`]
+/// after every bounce and publish the base to each emitted instance's `"win"` global.
 ///
 /// #1954: `[caps_ptr, caps_len)` names the **host-completed caps** the embedder services, UTF-8
 /// separated by `\n` (empty for none); a call to one parks the run ([`COOP_RUN_CAP_PARK`]) until
 /// [`temen_coop_deliver_cap`] answers it. `mode` is a leaf mode ([`COOP_LEAF_OFF`],
 /// [`COOP_LEAF_ROOT`], [`COOP_LEAF_SUSPENDS`]), optionally with [`COOP_NO_REGIONS`]. A leaf mode
-/// offers the root program to run whole as an emitted leaf: when the emitter takes it, the TIERUP of
-/// program `0` is the leaf's ([`temen_coop_leaf_wasm_ptr`]) and the run has no region emit; when it
-/// doesn't, the run is the region run it would have been — or, with [`COOP_NO_REGIONS`], the
-/// interpreted run (whose window opens at the declared size: nothing emitted masks against it). A
-/// JS host may leave the trailing three out (they read as zero).
+/// offers the root program to run whole as an emitted leaf: when the emitter takes it, the TIERUP
+/// of program `0` is the leaf's ([`temen_coop_program_wasm_ptr`]) and the run has no region emit;
+/// when it doesn't, the run is the region run it would have been — or, with [`COOP_NO_REGIONS`],
+/// the interpreted run (whose window opens at the declared size: nothing emitted masks against it).
+/// A JS host may leave the trailing three out (they read as zero).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)] // the FFI open takes each input as a (ptr, len) pair
 pub extern "C" fn temen_coop_open(
@@ -14378,15 +14455,15 @@ pub extern "C" fn temen_coop_open(
     if leaf != COOP_LEAF_OFF && emits {
         let mut m = m0.clone();
         temen_wasm_jit::outline_cap_calls(&mut m);
-        let leaves = Leaves::default();
+        let leaves = Programs::default();
         let tierup = bytecode::TierUpConfig {
-            eligible: std::sync::Arc::from([]),
-            page_checked: false,
+            root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf_emitter(
                 leaves.clone(),
                 leaf & COOP_LEAF_SUSPENDS != 0,
                 shared != 0,
             )),
+            modules: None,
         };
         let (host, frame) = host_for(&m);
         match open_run(&m, host, Some(tierup)) {
@@ -14397,7 +14474,7 @@ pub extern "C" fn temen_coop_open(
             {
                 return install(CoopTierupRun {
                     back: Some(back.clone()),
-                    leaves,
+                    programs: leaves,
                     caps: caps.clone(),
                     requests: requests.clone(),
                     frame,
@@ -14472,12 +14549,18 @@ pub extern "C" fn temen_coop_open(
     if jit_importer && all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
+    // #2248: the granted modules this run's children run are emitted as it meets them.
+    let programs = Programs::default();
     let tierup = bytecode::TierUpConfig {
-        eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
-        // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
-        page_checked: paged,
+        root: bytecode::ProgramEmit {
+            eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
+            // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
+            // carries the fidelity `scalar_extent` cannot (matching the pump's
+            // `with_jit_page_checked`).
+            page_checked: paged,
+        },
         leaf: None,
+        modules: Some(module_emitter(programs.clone(), shared != 0)),
     };
     let run = match open_run(&m, host, Some(tierup)) {
         Some(Ok(r)) => r,
@@ -14492,6 +14575,7 @@ pub extern "C" fn temen_coop_open(
     };
     install(CoopTierupRun {
         back: Some(back.clone()),
+        programs,
         caps: caps.clone(),
         requests: requests.clone(),
         emitted_wasm: wasm.into(),
@@ -14795,53 +14879,64 @@ pub extern "C" fn temen_coop_task() -> i32 {
         .map_or(-1, |t| t as i32)
 }
 
-/// #1896: the program the pending TIERUP's `func` is in — a leaf image the run emitted
-/// ([`temen_coop_leaf_wasm_ptr`]: a nimony build's exec'd process, or program `0`, a root program
-/// run whole, #1954), else `0`, this run's own region emit ([`temen_coop_wasm_ptr`]). A driver tells
-/// them apart by [`temen_coop_leaf_wasm_len`].
+/// #1896: the program the pending TIERUP's `func` is in — one the run emitted on its own
+/// ([`temen_coop_program_wasm_ptr`]: a leaf image, a nimony build's exec'd process or program `0`,
+/// a root program run whole, #1954; or a granted module a child runs, #2248), else `0`, this run's
+/// own region emit ([`temen_coop_wasm_ptr`]). A driver tells them apart by
+/// [`temen_coop_program_wasm_len`], and a leaf by [`temen_coop_program_leaf`].
 #[no_mangle]
 pub extern "C" fn temen_coop_module() -> u32 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.module)
 }
 
-/// #1896: the emitted wasm of leaf image `module` (`null` when there is none). The bytes live as long
-/// as the session.
+/// #1896: the emitted wasm of program `module`, a leaf image or a granted module (`null` when the
+/// run emitted none for it). The bytes live as long as the session.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_wasm_ptr(module: u32) -> *const u8 {
+pub extern "C" fn temen_coop_program_wasm_ptr(module: u32) -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map_or(core::ptr::null(), |l| l.wasm.as_ptr())
+        .and_then(|s| s.program(module))
+        .map_or(core::ptr::null(), |p| p.wasm.as_ptr())
 }
 
-/// #1896: the byte length of [`temen_coop_leaf_wasm_ptr`]'s wasm.
+/// #1896: the byte length of [`temen_coop_program_wasm_ptr`]'s wasm.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_wasm_len(module: u32) -> usize {
+pub extern "C" fn temen_coop_program_wasm_len(module: u32) -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map_or(0, |l| l.wasm.len())
+        .and_then(|s| s.program(module))
+        .map_or(0, |p| p.wasm.len())
 }
 
-/// The key [`temen_coop_leaf_key`] read last.
-static mut LEAF_KEY: [u8; LEAF_KEY_LEN] = [0; LEAF_KEY_LEN];
-
-/// #2087: leaf image `module`'s key ([`LeafKey`]): its length, `0` when there is no such image. The
-/// bytes are at [`temen_coop_leaf_key_ptr`] until the next call. Equal keys are equal emitted wasm, so
-/// a driver keys its compiled module by it, and a later build finds that without reading or hashing
-/// the image's bytes.
+/// #2248: whether program `module` is a leaf image (`1`), run whole from its entry and suspended
+/// where a call in it parks, rather than a granted module, whose functions its children tier up
+/// into as the run's own (`0`, also when the run emitted none for it).
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_key(module: u32) -> usize {
+pub extern "C" fn temen_coop_program_leaf(module: u32) -> i32 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
+        .and_then(|s| s.program(module))
+        .is_some_and(|p| p.key.leaf) as i32
+}
+
+/// The key [`temen_coop_program_key`] read last.
+static mut PROGRAM_KEY: [u8; EMIT_KEY_LEN] = [0; EMIT_KEY_LEN];
+
+/// #2087: program `module`'s key ([`EmitKey`]): its length, `0` when the run emitted none for it.
+/// The bytes are at [`temen_coop_program_key_ptr`] until the next call. Equal keys are equal
+/// emitted wasm, so a driver keys its compiled module by it, and a later build finds that without
+/// reading or hashing the image's bytes.
+#[no_mangle]
+pub extern "C" fn temen_coop_program_key(module: u32) -> usize {
     let key = unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }
-        .and_then(|s| s.leaf(module))
-        .map(|l| l.key.bytes());
+        .and_then(|s| s.program(module))
+        .map(|p| p.key.bytes());
     // SAFETY: single-threaded wasm; the slot is written only here.
-    unsafe { *core::ptr::addr_of_mut!(LEAF_KEY) = key.unwrap_or([0; LEAF_KEY_LEN]) };
-    key.map_or(0, |_| LEAF_KEY_LEN)
+    unsafe { *core::ptr::addr_of_mut!(PROGRAM_KEY) = key.unwrap_or([0; EMIT_KEY_LEN]) };
+    key.map_or(0, |_| EMIT_KEY_LEN)
 }
 
-/// #2087: where [`temen_coop_leaf_key`] put the key.
+/// #2087: where [`temen_coop_program_key`] put the key.
 #[no_mangle]
-pub extern "C" fn temen_coop_leaf_key_ptr() -> *const u8 {
-    core::ptr::addr_of!(LEAF_KEY) as *const u8
+pub extern "C" fn temen_coop_program_key_ptr() -> *const u8 {
+    core::ptr::addr_of!(PROGRAM_KEY) as *const u8
 }
 
 /// #2087: how many leaf images this engine has emitted rather than reused: what a driver's tests count
@@ -14855,10 +14950,11 @@ pub extern "C" fn temen_coop_leaf_emits() -> u32 {
 mod emitted_cache_tests {
     use super::*;
 
-    fn key(n: u8) -> LeafKey {
-        LeafKey {
+    fn key(n: u8) -> EmitKey {
+        EmitKey {
             digest: [n; 32],
             entry: 0,
+            leaf: true,
             parks: false,
             paged: false,
             shared: true,
@@ -14871,7 +14967,7 @@ mod emitted_cache_tests {
     fn an_image_is_emitted_once_while_sessions_use_it() {
         let mut c = EmittedCache::default();
         let emits = std::cell::Cell::new(0);
-        let get = |c: &mut EmittedCache, k: LeafKey, made: bool| {
+        let get = |c: &mut EmittedCache, k: EmitKey, made: bool| {
             c.get(k, || {
                 emits.set(emits.get() + 1);
                 made.then(|| std::sync::Arc::from(&b"wasm"[..]))
@@ -16079,9 +16175,9 @@ int main(void) {
         let caps = vec!["ping".to_string()];
         grant_onramp_caps(&mut host, m, None, Some((&caps, &requests)));
         let tierup = leaf.map(|leaf| bytecode::TierUpConfig {
-            eligible: Arc::from([]),
-            page_checked: false,
+            root: bytecode::ProgramEmit::default(),
             leaf: Some(leaf),
+            modules: None,
         });
         // 16 MiB: room for the libc's heap, and within the cap every platform backs flat.
         let reserved = m.memory.expect("a window").size_log2.max(24);

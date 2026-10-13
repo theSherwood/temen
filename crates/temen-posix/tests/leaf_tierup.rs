@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use temen_interp::bytecode::{CoopEvent, CoopRun, LeafOffer, TierUpConfig};
+use temen_interp::bytecode::{CoopEvent, CoopRun, LeafOffer, ProgramEmit, TierUpConfig};
 use temen_interp::{BoundImport, Host, Trap};
 
 /// `/bin/leaf`: writes `leaf` to `out.txt`, then exits 5. Its ops are file ops, so it cannot park.
@@ -205,12 +205,12 @@ fn run_tree(guest_text: &str, command: &str, leaf: bool) -> (Ending, Leaves) {
     let offered = Arc::new(Mutex::new(Vec::new()));
     let offers = Arc::clone(&offered);
     let tierup = leaf.then(|| TierUpConfig {
-        eligible: Arc::from([]),
-        page_checked: false,
+        root: ProgramEmit::default(),
         leaf: Some(Arc::new(move |o: &LeafOffer| {
             offers.lock().unwrap().push((o.paged, o.parks));
             true
         })),
+        modules: None,
     });
     let mut run = CoopRun::new_reserved(
         &guest,

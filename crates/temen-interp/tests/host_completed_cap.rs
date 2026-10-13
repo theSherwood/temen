@@ -23,7 +23,7 @@
 //! calls bounce into.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{self, CoopEvent, LeafOffer, TierUpConfig, VcpuEvent};
+use temen_interp::bytecode::{self, CoopEvent, LeafOffer, ProgramEmit, TierUpConfig, VcpuEvent};
 use temen_interp::{run_with_host, BoundImport, CapRequests, Host, OffloadOutcome, Trap, Value};
 
 /// Two `HOST_PROC` (iface 13) calls on one handle: op 0 with 5, op 1 with 7; the composite
@@ -536,12 +536,12 @@ type Offers = Arc<Mutex<Vec<(usize, u32, bool)>>>;
 fn leaf_config(offers: &Offers, take: bool) -> TierUpConfig {
     let offers = Arc::clone(offers);
     TierUpConfig {
-        eligible: Arc::from([]),
-        page_checked: false,
+        root: ProgramEmit::default(),
         leaf: Some(Arc::new(move |o: &LeafOffer| {
             offers.lock().unwrap().push((o.module, o.entry, o.parks));
             take
         })),
+        modules: None,
     }
 }
 
@@ -701,9 +701,12 @@ fn a_host_completed_call_in_a_tierup_region_declines() {
     let m = parse(REGION_PING);
     let (host, requests) = declared_ping(&m);
     let tierup = TierUpConfig {
-        eligible: Arc::from([false, true]),
-        page_checked: false,
+        root: ProgramEmit {
+            eligible: Arc::from([false, true]),
+            page_checked: false,
+        },
         leaf: None,
+        modules: None,
     };
     let ran = drive_leaf(coop_with(&m, host, Some(tierup)), &requests);
     assert_eq!(
