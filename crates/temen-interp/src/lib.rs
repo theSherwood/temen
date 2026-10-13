@@ -20549,10 +20549,12 @@ pub const FUEL_CHUNK: u64 = 1 << 16;
 /// #2113 — the fuel a run's root is granted for an activation when its embedder names none (owner,
 /// 2026-10-06: "just put large bounds on everything"). One value on every engine.
 pub const DEFAULT_FUEL: u64 = 1 << 40;
-/// #2113 — the root's `mem` grant when its embedder names none: 64 GiB.
-pub const DEFAULT_MEM: u64 = 64 << 30;
-/// #2113 — the root's `channel` grant when its embedder names none: 64 GiB.
-pub const DEFAULT_CHANNEL: u64 = 64 << 30;
+/// #2113 — the root's `mem` grant when its embedder names none: 4 GiB. A default must not let a guest
+/// crash its host (owner, #2268), and a host that runs guests has that much to give one. An embedder
+/// that means a run to have more grants it ([`Host::set_grant`]).
+pub const DEFAULT_MEM: u64 = 4 << 30;
+/// #2113 — the root's `channel` grant when its embedder names none: 4 GiB, as [`DEFAULT_MEM`].
+pub const DEFAULT_CHANNEL: u64 = 4 << 30;
 /// #2113 — the root's `spawn` grant when its embedder names none: [`MAX_VCPUS`] live vCPUs.
 pub const DEFAULT_SPAWN: u64 = MAX_VCPUS as u64;
 /// #2268 — the root's `maps` grant when its embedder names none: unbounded (`u64::MAX`, as an
