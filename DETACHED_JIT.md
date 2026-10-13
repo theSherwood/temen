@@ -505,8 +505,8 @@ stdout discarded) is the pattern to standardize on.
 **`temen-wasm-jit` codegen — unchanged.** `win` is param 0; `mapped` and `pagestate` are
 mutable globals; `env.memory` imports with min 0; `compile_module_nested*`, `emit_confine`,
 `emit_span_check`, `emit_page_check_one`, `emit_null_guard`, `emit_win_addr` all run unchanged
-with any `win`. The carve gates (`check_child_carve`, `child_carve_fits`, `_growable`) have
-zero production callers; their `mod_ok` half survives, their `fits` half is alias-only. The
+with any `win`. The carve gates (`check_child_carve`, `child_carve_fits`) had zero production
+callers and are deleted with the carve spawn (#1867). The
 `env.instantiate_module` bounce keeps its 9-arg shape (`grants_ptr` is always parent-relative;
 `off` is reinterpreted); changing arity would fork `module_uses_instantiate_module` and the
 conditional import-index arithmetic. The emit cache (`OP13_CHILD_EMIT`, `CachedEmit`,
