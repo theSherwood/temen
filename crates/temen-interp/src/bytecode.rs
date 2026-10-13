@@ -759,6 +759,8 @@ pub struct Compiled {
     serves_children: bool,
     /// The digest of the module this program was compiled from ([`Compiled::module_digest`]).
     digest: std::sync::OnceLock<[u8; 32]>,
+    /// What that module's code does that decides how it runs whole ([`Compiled::census`]).
+    census: std::sync::OnceLock<ImageCensus>,
 }
 
 impl Compiled {
@@ -767,6 +769,13 @@ impl Compiled {
     /// re-encode its module on every open (#1414 S4-3b: most of a chibicc open).
     fn module_digest(&self, m: &Module) -> [u8; 32] {
         *self.digest.get_or_init(|| super::module_digest(m))
+    }
+
+    /// The [`ImageCensus`] of `m`, the module this program was compiled from. Made on first use, as
+    /// the digest is, so a leaf offer over a kept program does not walk the module again (#1414
+    /// S4-4a: a reactor offers its `tick` every frame).
+    fn census(&self, m: &Module) -> &ImageCensus {
+        self.census.get_or_init(|| ImageCensus::of(m))
     }
 
     /// Total compiled **bytecode op count** across all functions — the structural-size measure of this
@@ -2630,6 +2639,7 @@ fn compile_module_with(
         debug: None,
         serves_children: false,
         digest: std::sync::OnceLock::new(),
+        census: std::sync::OnceLock::new(),
     })
 }
 
@@ -10716,16 +10726,18 @@ fn root_leaf(
     if host.is_durable() || mem.is_some_and(|w| w.flat_win_base().is_none()) {
         return None;
     }
-    let parks = match image_parks(host, m) {
+    let program = dom.source.primary();
+    let census = program.census(m);
+    let parks = match image_parks(host, m, census) {
         Parks::Never => false,
         Parks::Suspendably => true,
         Parks::Otherwise => return None,
     };
-    let paged = image_pages(host, m);
+    let paged = image_pages(host, census);
     let offer = LeafOffer {
         module: 0,
         image: m,
-        digest: dom.source.primary().module_digest(m),
+        digest: program.module_digest(m),
         entry,
         paged,
         parks,
@@ -10776,7 +10788,7 @@ struct LeafStart {
 /// reflection, `resolve`, `label`, attestation, fuel and pipe ops answer at once. An inline call on a
 /// host capability, whose handle is an operand, parks as any of the host's could
 /// ([`Host::host_procs_park`]; #1414 S4-3b: chibicc's in-memory file system never does).
-fn image_parks(host: &Host, m: &Module) -> Parks {
+fn image_parks(host: &Host, m: &Module, census: &ImageCensus) -> Parks {
     use super::OpParks;
     use temen_ir::cap_id::{ADDRESS_SPACE, EXIT, HOST_PROC, STREAM};
     let source = host.signal_poll().map(|(_, s)| s);
@@ -10806,49 +10818,11 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
             .unwrap_or(OpParks::Otherwise),
         _ => OpParks::Otherwise,
     };
-    // A call that parks other than in a stream call.
-    let may_park = |i: &Inst| match *i {
-        Inst::CapCall {
-            type_id: STREAM,
-            op,
-            ..
-        } => op > 2,
-        // A host capability parks as the host's can (`parks`, below).
-        Inst::CapCall {
-            type_id: ADDRESS_SPACE | HOST_PROC,
-            ..
-        } => false,
-        // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
-        // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`, `attest`,
-        // `provenance`, `fuel.remaining`, the `pipe` mint and `parallelism`. Its serve, fork, reap
-        // and exec ops park or need the caller's frames.
-        Inst::CapCall {
-            type_id: temen_ir::CAP_SELF_TYPE_ID,
-            op,
-            ..
-        } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=19),
-        Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
-        _ => false,
-    };
-    let stream_parks = |i: &Inst| match *i {
-        Inst::CapCall {
-            type_id: STREAM,
-            op,
-            ..
-        } => stream_op_parks(op),
-        _ => false,
-    };
     let import_streams = m
         .imports
         .iter()
         .zip(&host.import_bindings)
         .any(|(_, b)| !b.rebindable && b.type_id == STREAM && stream_op_parks(b.op));
-    let insts = || {
-        m.funcs
-            .iter()
-            .flat_map(|f| &f.blocks)
-            .flat_map(|b| &b.insts)
-    };
     let mut parks: Vec<OpParks> = m
         .imports
         .iter()
@@ -10857,7 +10831,7 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
         .collect();
     // An inline host-capability call parks as any of the host's could, and a personality could ask
     // any of them to.
-    if insts().any(|i| matches!(*i, Inst::CapCall { type_id, .. } if type_id == HOST_PROC)) {
+    if census.host_call {
         parks.push(match source {
             Some(_) => OpParks::Otherwise,
             None => host.host_procs_park(),
@@ -10865,20 +10839,100 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
     }
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
-        || m.funcs
-            .iter()
-            .any(temen_ir::Func::uses_concurrency_besides_wait)
-        || insts().any(may_park)
+        || census.concurrency
+        || census.parks
     {
         return Parks::Otherwise;
     }
     // #2050: past the check above, a futex op is a wait, which parks the process in its bounce.
-    let suspendable = parks.contains(&OpParks::OnChildren)
-        || parks.contains(&OpParks::OnHost)
-        || m.funcs.iter().any(temen_ir::Func::uses_futex);
-    match suspendable || import_streams || insts().any(stream_parks) {
+    let suspendable =
+        parks.contains(&OpParks::OnChildren) || parks.contains(&OpParks::OnHost) || census.futex;
+    let inline_streams =
+        (census.stream_read && stream_op_parks(0)) || (census.stream_write && stream_op_parks(1));
+    match suspendable || import_streams || inline_streams {
         true => Parks::Suspendably,
         false => Parks::Never,
+    }
+}
+
+/// What an image's code does that decides how it runs whole on the emitted tier: the instruction
+/// half of [`image_parks`] and [`image_pages`], whose host half is read per offer. One pass over the
+/// module, made once per program ([`Compiled::census`]).
+#[derive(Default)]
+struct ImageCensus {
+    /// An inline call on a host capability.
+    host_call: bool,
+    /// An inline call that may park other than in a stream call ([`ImageCensus::may_park`]).
+    parks: bool,
+    /// A function that uses concurrency besides a futex wait.
+    concurrency: bool,
+    /// A function that uses a futex op.
+    futex: bool,
+    /// An inline stream read (op 0); it parks where the host's stream can.
+    stream_read: bool,
+    /// An inline stream write (op 1); likewise.
+    stream_write: bool,
+    /// An inline address-space `map`, `unmap` or `protect`.
+    page_op: bool,
+    /// A read-only data segment with bytes.
+    ro_data: bool,
+}
+
+impl ImageCensus {
+    fn of(m: &Module) -> ImageCensus {
+        use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
+        let mut c = ImageCensus {
+            concurrency: m
+                .funcs
+                .iter()
+                .any(temen_ir::Func::uses_concurrency_besides_wait),
+            futex: m.funcs.iter().any(temen_ir::Func::uses_futex),
+            ro_data: m.data.iter().any(|d| d.readonly && !d.bytes.is_empty()),
+            ..ImageCensus::default()
+        };
+        for i in m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+        {
+            c.parks |= Self::may_park(i);
+            if let Inst::CapCall { type_id, op, .. } = *i {
+                c.host_call |= type_id == HOST_PROC;
+                c.stream_read |= type_id == STREAM && op == 0;
+                c.stream_write |= type_id == STREAM && op == 1;
+                c.page_op |= type_id == ADDRESS_SPACE && op <= 2;
+            }
+        }
+        c
+    }
+
+    /// A call that parks other than in a stream call.
+    fn may_park(i: &Inst) -> bool {
+        use temen_ir::cap_id::{ADDRESS_SPACE, HOST_PROC, STREAM};
+        match *i {
+            Inst::CapCall {
+                type_id: STREAM,
+                op,
+                ..
+            } => op > 2,
+            // A host capability parks as the host's can ([`image_parks`]).
+            Inst::CapCall {
+                type_id: ADDRESS_SPACE | HOST_PROC,
+                ..
+            } => false,
+            // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
+            // `type_id`, `covers`, `export.handle`, `list`, `schema`), `resolve`, `label`, `attest`,
+            // `provenance`, `fuel.remaining`, the `pipe` mint and `parallelism`. Its serve, fork,
+            // reap and exec ops park or need the caller's frames.
+            Inst::CapCall {
+                type_id: temen_ir::CAP_SELF_TYPE_ID,
+                op,
+                ..
+            } => !matches!(op & 0xFF, 0..=8 | 13 | 16..=19),
+            Inst::CapCall { .. } | Inst::CallImportDyn { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -10891,8 +10945,8 @@ enum Parks {
     Otherwise,
 }
 
-/// #1896 — can a process running image `m` change its **page state**: reach an address-space
-/// `map`, `unmap` or `protect`, inline or through an import? A map that leaves a hole, or a change
+/// #1896 — can a process running an image change its **page state**: reach an address-space
+/// `map`, `unmap` or `protect`, inline ([`ImageCensus::page_op`]) or through an import? A map that leaves a hole, or a change
 /// of protection, takes its window past what one bound describes ([`Mem::scalar_extent`]), and an
 /// image that runs whole on the emitted tier cannot decline there: it checks every access against
 /// the page state instead ([`LeafStart::paged`]).
@@ -10901,15 +10955,13 @@ enum Parks {
 /// its pages `Ro` at instantiation (a C program's string literals, chibicc's rodata). Without this, a
 /// program with read-only data that never touched its page state — no `malloc`, no `printf` — was
 /// emitted unpaged, found no bound to run under, and ran interpreted (#2130).
-fn image_pages(host: &Host, m: &Module) -> bool {
-    let pages = |type_id, op| type_id == temen_ir::cap_id::ADDRESS_SPACE && op <= 2;
-    m.data.iter().any(|d| d.readonly && !d.bytes.is_empty())
-        || host.import_bindings.iter().any(|b| pages(b.type_id, b.op))
-        || m.funcs
+fn image_pages(host: &Host, census: &ImageCensus) -> bool {
+    census.ro_data
+        || census.page_op
+        || host
+            .import_bindings
             .iter()
-            .flat_map(|f| &f.blocks)
-            .flat_map(|b| &b.insts)
-            .any(|i| matches!(*i, Inst::CapCall { type_id, op, .. } if pages(type_id, op)))
+            .any(|b| b.type_id == temen_ir::cap_id::ADDRESS_SPACE && b.op <= 2)
 }
 
 /// Whether a vCPU is the bare root a fork duplicates faithfully (the oracle's `fork_vcpu` gate): no
@@ -11033,12 +11085,14 @@ fn exec_image_build(
     // it. Chosen only after the commit, and only where the image runs: without a flat backing it
     // runs interpreted.
     let leaf = leaf.and_then(|emit| {
-        let parks = match image_parks(&img.host, &img.module) {
+        let unit = dom.source.get(cm)?;
+        let census = unit.census(&img.module);
+        let parks = match image_parks(&img.host, &img.module, census) {
             Parks::Never => false,
             Parks::Suspendably => true,
             Parks::Otherwise => return None,
         };
-        let paged = image_pages(&img.host, &img.module);
+        let paged = image_pages(&img.host, census);
         let offer = LeafOffer {
             module: cm,
             image: &img.module,

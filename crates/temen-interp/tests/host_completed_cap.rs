@@ -790,6 +790,57 @@ fn a_root_writing_and_exiting_through_its_imports_is_offered() {
     );
 }
 
+/// A root that reads its stdin with an inline `call.cap` (stream op 0) rather than an import.
+const ROOT_INLINE_READ: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 1
+  vbuf = i64.const 16384
+  vn = i64.const 8
+  vr = call.cap 0 0 (i64, i64) -> (i64) vh (vbuf, vn)
+  return vr
+  }
+}
+"#;
+
+/// #1414 S4-4a — a kept program reads its image's code once, and each offer still asks the run's
+/// host. One program, compiled once and run over a host whose stdin cannot block, then over one
+/// whose can, then the first kind again, is offered `parks = false`, `true`, `false`: the inline
+/// read parks only on the blocking stdin.
+#[test]
+fn a_kept_programs_offers_ask_each_runs_host() {
+    let m = parse(ROOT_INLINE_READ);
+    let program = bytecode::compile_reserved(&m).expect("in subset");
+    let declared = m.memory.expect("a window").size_log2;
+    let offer = |stdin_blocking: bool| {
+        let offers: Offers = Arc::default();
+        let mut host = Host::new();
+        host.set_stdin_blocking(stdin_blocking);
+        let _ = bytecode::CoopRun::new_reserved_over_compiled(
+            &m,
+            Arc::clone(&program),
+            0,
+            &[],
+            FUEL,
+            host,
+            Some(leaf_config(&offers, false)),
+            &[],
+            declared,
+            None,
+        )
+        .expect("entry in range");
+        let seen = offers.lock().unwrap().clone();
+        seen
+    };
+    assert_eq!(offer(false), vec![(0, 0, false)]);
+    assert_eq!(
+        offer(true),
+        vec![(0, 0, true)],
+        "a blocking stdin read can park"
+    );
+    assert_eq!(offer(false), vec![(0, 0, false)], "and this host's cannot");
+}
+
 /// A self op that parks (`svc.wait`) keeps the root off the emitted tier: it is never offered.
 #[test]
 fn a_root_that_can_park_in_a_self_op_is_not_offered() {
