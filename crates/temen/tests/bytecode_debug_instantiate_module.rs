@@ -14,7 +14,7 @@
 mod rec;
 
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
-use temen_interp::{bytecode, run_with_host, Host, IrPc, Value};
+use temen_interp::{bytecode, run_with_host, Host, IrPc, Value, VarValue};
 use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
@@ -202,6 +202,59 @@ fn breakpoint_in_a_module_child_fires() {
         Some(child_module_first_op()),
         "child's frame (module 1)"
     );
+    assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(WANT)]));
+}
+
+/// #2239 — [`CHILD_SRC`]'s §6 info as its own source, `plugin.c`, would give it: the load at line
+/// 3, what follows the marker's store at line 5, and the loaded byte named `byte`.
+const PLUGIN_DEBUG: &str = r#"
+debug.file 0 "plugin.c"
+debug.fname 0 "plugin"
+debug.loc 0 0 0 0 3 3
+debug.loc 0 0 5 0 5 3
+debug.var 0 "byte" ssa 2 "unsigned char"
+"#;
+
+/// #2239 — a line of a granted module's own source binds when the run admits the module. Before the
+/// spawn no module of the run has `plugin.c`, so the lines resolve nowhere and stay where they are.
+/// Line 5 then binds in the child and stops it there, its frame read against the module's own §6
+/// info; line 4, without code in it, binds nowhere.
+#[test]
+fn a_line_of_a_childs_own_source_binds_when_the_run_admits_it() {
+    let child = parse_module(&format!("{CHILD_SRC}{PLUGIN_DEBUG}")).expect("parse child");
+    let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let m = parse_module(&src).expect("parse");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 128 << 10);
+    let mh = host.grant_module(&child);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let args = [inst, mh, budget].map(Value::I32);
+    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in subset");
+    assert_eq!(
+        r.set_line_breakpoints("plugin.c", vec![4, 5]),
+        vec![None, None],
+        "no module of the run has plugin.c yet"
+    );
+    let mut fuel = 5_000_000u64;
+    match r.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, reason } => {
+            assert_eq!(
+                (pc, reason),
+                (child_module_after_store(), SchedBreak::Breakpoint)
+            );
+        }
+        other => panic!("expected the child's line, got {other:?}"),
+    }
+    assert_eq!(
+        r.read_var(0, "byte", 4),
+        Some(VarValue::Value(Value::I32(86))),
+        "the byte the child loaded, read against its own info"
+    );
+    assert_eq!(
+        r.debug_info(1).map(|di| di.files.clone()),
+        Some(vec!["plugin.c".to_string()])
+    );
+    assert!(r.debug_info(0).is_none(), "the parent has no §6 info");
     assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(WANT)]));
 }
 

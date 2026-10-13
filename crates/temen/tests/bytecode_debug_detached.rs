@@ -1,13 +1,14 @@
-//! Reverse-debugging a run with a §5 **detached** child on the multi-vCPU scheduler (#1866). A carve
-//! child's window is a view of the root's, so its bytes ride the root's checkpoint image; a detached
-//! child's window is its own. A checkpoint carries that window's image and the child's powerbox
-//! (its handle table by the freeze's own capture, its inherited stdio aliased to the spawner's on
-//! restore), and the run's budget tree, which the child's spawn charged. The undo journal records
-//! none of a detached child's writes, so each of its anchors carries the child's window the same way
-//! (#2058); and stdio a child's re-grant promoted into a shared cell is captured and rewound there
-//! (#2055). A child of the debuggee's own program runs its spawner's unit, so breakpoints and §6
-//! debug info reach it (#2076), and a debugger edit while a child is focused lands in the child's
-//! window, live and on every replay (#2072).
+//! Reverse-debugging a run with a §5 **detached** child on the multi-vCPU scheduler (#1866). A
+//! carve child's window is a view of the root's, so its bytes ride the root's checkpoint image; a
+//! detached child's window is its own. A checkpoint carries that window's image and the child's
+//! powerbox (its handle table by the freeze's own capture, its inherited stdio aliased to the
+//! spawner's on restore), and the run's budget tree, which the child's spawn charged. The undo
+//! journal records none of a detached child's writes, so each of its anchors carries the child's
+//! window the same way (#2058); and stdio a child's re-grant promoted into a shared cell is
+//! captured and rewound there (#2055). A line breakpoint in the debuggee's program binds in a child
+//! image of it too, whose frames read against the image's own §6 debug info (#2239); a child of a
+//! child's own program runs that child's unit (#2076). A debugger edit while a child is focused
+//! lands in the child's window, live and on every replay (#2072).
 
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun, ScheduledWrite};
 use temen_interp::{Host, IrPc, StreamRole, Value, VarValue, WatchKind};
@@ -373,15 +374,17 @@ fn an_undo_truncates_output_a_child_promoted() {
     assert_eq!(finish(&mut r), want);
 }
 
-/// A root `(instantiator, budget) -> i64` that spawns a copy of itself (an op-17 v1 record, the
-/// spawner's own module) and joins it. The copy, func 1, adds 1 to a word of its own window 3000
-/// times and returns it, as [`LONG_CHILD`] does. The module's §6 debug info names that word `count`,
-/// a global, so a variable write resolves to it in whichever task is focused.
+/// A root `(instantiator, budget, module) -> i64` that spawns `module`, a child image of its own
+/// program (an op-17 v1 record at the image's entry, 0), and joins it. The image runs the program's
+/// func 1, which adds 1 to a word of its own window 3000 times and returns it, as [`LONG_CHILD`]
+/// does. The program's §6 debug info names that word `count`, a global, so a variable write
+/// resolves to it in whichever task is focused; it puts the root's return, past the join, at line 3
+/// of `count.c`, the head of the loop at line 7 and its compare at line 9.
 const SELF_ROOT: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (vi: i32, vbud: i32) {
+func (i32, i32, i32) -> (i64) {
+block 0 (vi: i32, vbud: i32, vmod: i32) {
   vz = i64.const 0
-  r0 = i64.const 4294967297
+  r0 = i64.const 1
   a0 = i64.const 17536
   i64.store a0 r0
   a1 = i64.const 17544
@@ -392,8 +395,8 @@ block 0 (vi: i32, vbud: i32) {
   vb64 = i64.extend_i32_u vbud
   v32 = i64.const 32
   vbs = i64.shl vb64 v32
-  vself = i64.const 4294967295
-  r3 = i64.or vbs vself
+  vm64 = i64.extend_i32_u vmod
+  r3 = i64.or vbs vm64
   a3 = i64.const 17560
   i64.store a3 r3
   a4 = i64.const 17568
@@ -406,8 +409,9 @@ block 0 (vi: i32, vbud: i32) {
   i64.store a7 vz
   a8 = i64.const 17600
   i64.store a8 vz
+  vnone = i64.const 4294967295
   a9 = i64.const 17608
-  i64.store a9 vself
+  i64.store a9 vnone
   a10 = i64.const 17616
   i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
@@ -439,27 +443,32 @@ block 2 () {
 }
 
 debug.file 0 "count.c"
+debug.loc 0 0 33 0 3 3
+debug.loc 1 1 0 0 7 3
+debug.loc 1 1 7 0 9 5
 debug.fname 0 "main"
 debug.fname 1 "child"
 debug.var global "count" fixed 20000 "long"
 "#;
 
-/// A run of [`SELF_ROOT`], with the journal armed or not.
+/// A run of [`SELF_ROOT`] granting its child image, with the journal armed or not.
 fn self_session(journal: bool) -> ScheduledDebugRun {
-    let m = std::sync::Arc::new(parse_module(SELF_ROOT).expect("parse the root"));
+    let m = parse_module(SELF_ROOT).expect("parse the root");
+    let image = temen_ir::child_image_at(&m, 1).expect("func 1 starts a child");
     let mut host = Host::new();
-    host.set_self_module(&m);
     let inst = host.grant_instantiator(0, 1 << 17);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    let args = [inst, budget].map(Value::I32);
+    let modh = host.grant_module(&image);
+    let args = [inst, budget, modh].map(Value::I32);
     let mut run = ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in subset");
     run.set_journal_armed(journal);
     run
 }
 
-/// The head of the child's loop in [`SELF_ROOT`], where each of its 3000 iterations starts.
+/// The head of the child's loop in [`SELF_ROOT`], where each of its 3000 iterations starts, in the
+/// child image: module 1, the first module the run admits.
 const LOOP_HEAD: IrPc = IrPc {
-    module: 0,
+    module: 1,
     func: 1,
     block: 1,
     inst: 0,
@@ -468,7 +477,7 @@ const LOOP_HEAD: IrPc = IrPc {
 /// Run `r` to the child's `n`th stop at [`LOOP_HEAD`], where the child is focused, and clear the
 /// breakpoint. Returns the turn it stopped at.
 fn stop_in_child(r: &mut ScheduledDebugRun, n: usize) -> u64 {
-    r.set_breakpoints(vec![LOOP_HEAD]);
+    r.set_line_breakpoints("count.c", vec![7]);
     let mut fuel = FUEL;
     for _ in 0..n {
         match r.run_until_stop(&mut fuel) {
@@ -477,7 +486,7 @@ fn stop_in_child(r: &mut ScheduledDebugRun, n: usize) -> u64 {
         }
     }
     assert_eq!(r.stopped_task(), Some(1), "the child stops there");
-    r.set_breakpoints(Vec::new());
+    r.set_line_breakpoints("count.c", Vec::new());
     r.op_turn()
 }
 
@@ -486,35 +495,76 @@ fn count(r: &ScheduledDebugRun) -> u64 {
     u64::from_le_bytes(r.read_window(20000, 8).unwrap().try_into().unwrap())
 }
 
-/// #2076 — a detached child of the debuggee's own program runs its spawner's unit, so a breakpoint
-/// in its code stops it, and its frames read the program's §6 debug info: a stop at each of its 3000
-/// iterations, each reading the count so far. A child that ran a second copy of the program, a unit
-/// of its own, never stopped, and its variables read as nothing.
+/// #2239 — a line of the program stops a child image of it: the line binds in the program, and
+/// again in the image when the run admits it, as a native debugger binds a breakpoint in a library
+/// it loads. The child stops at each of its 3000 iterations, its frames read against the image's
+/// own §6 debug info, each reading the count so far. A line on the loop's compare stops it too: the
+/// run compiles the image unfused, as it does the program, so no op of it is fused away. Bound in
+/// the program alone, the line never stopped the child, and its variables read as nothing.
 #[test]
 fn a_breakpoint_stops_a_child_of_its_own_program() {
-    let mut r = self_session(false);
-    r.set_breakpoints(vec![LOOP_HEAD]);
-    let mut fuel = FUEL;
-    let mut stops = 0u64;
-    let result = loop {
-        match r.run_until_stop(&mut fuel) {
-            SchedStop::Break { pc, .. } => {
-                assert_eq!((pc, r.stopped_task()), (LOOP_HEAD, Some(1)));
-                assert_eq!(
-                    r.read_var(0, "count", 8),
-                    Some(VarValue::Bytes(stops.to_le_bytes().to_vec())),
-                    "stop {stops}"
-                );
-                stops += 1;
+    for (line, inst) in [(7, 0), (9, 7)] {
+        let mut r = self_session(false);
+        assert_eq!(
+            r.set_line_breakpoints("/src/count.c", vec![line]),
+            vec![Some(line)],
+            "it binds in the program as soon as it is set"
+        );
+        let at = IrPc { inst, ..LOOP_HEAD };
+        let mut fuel = FUEL;
+        let mut stops = 0u64;
+        let result = loop {
+            match r.run_until_stop(&mut fuel) {
+                SchedStop::Break { pc, .. } => {
+                    assert_eq!((pc, r.stopped_task()), (at, Some(1)), "line {line}");
+                    let count = stops + u64::from(inst != 0);
+                    assert_eq!(
+                        r.read_var(0, "count", 8),
+                        Some(VarValue::Bytes(count.to_le_bytes().to_vec())),
+                        "line {line}, stop {stops}"
+                    );
+                    assert_eq!(
+                        r.debug_info(1).map(|di| di.func_names.len()),
+                        Some(1),
+                        "the image's own info: `child`, without the program's `main`"
+                    );
+                    stops += 1;
+                }
+                SchedStop::Finished(res) => break res,
+                other => panic!("unexpected stop {other:?}"),
             }
-            SchedStop::Finished(res) => break res,
-            other => panic!("unexpected stop {other:?}"),
-        }
+        };
+        assert_eq!(
+            (stops, format!("{result:?}")),
+            (3000, "Ok([I64(3000)])".into()),
+            "line {line}"
+        );
+    }
+}
+
+/// #2239 — a line resolves once and binds only where a module has code on it: the root's return,
+/// past the join, stops the root once and never the child image, whose function 0 is a bootstrap
+/// without that line. Resolved in each module on its own, the line snapped forward in the image to
+/// the head of its loop, and the child stopped there instead (the playground's detached card did).
+#[test]
+fn a_line_of_the_roots_own_code_never_stops_the_child() {
+    let mut r = self_session(false);
+    assert_eq!(r.set_line_breakpoints("count.c", vec![3]), vec![Some(3)]);
+    let mut fuel = FUEL;
+    let past_join = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 33,
     };
-    assert_eq!(
-        (stops, format!("{result:?}")),
-        (3000, "Ok([I64(3000)])".into())
-    );
+    match r.run_until_stop(&mut fuel) {
+        SchedStop::Break { pc, .. } => assert_eq!((pc, r.stopped_task()), (past_join, Some(0))),
+        other => panic!("unexpected stop {other:?}"),
+    }
+    match r.run_until_stop(&mut fuel) {
+        SchedStop::Finished(res) => assert_eq!(format!("{res:?}"), "Ok([I64(3000)])"),
+        other => panic!("only the root stops there: {other:?}"),
+    }
 }
 
 /// #2072 — a debugger write while the child is focused lands in the child's window, the one a read
@@ -611,8 +661,9 @@ fn a_childs_recorded_writes_replay_into_its_window() {
 }
 
 /// #2076 — the journal's pre-images are of the root's window alone. The child of [`SELF_ROOT`] runs
-/// module 0 too, but in its own window, which each anchor carries whole (#2058); recording its 3000
-/// stores against the root's window would hold pre-images of bytes nothing there wrote.
+/// the program's code too, but in its own window, which each anchor carries whole (#2058);
+/// recording its 3000 stores against the root's window would hold pre-images of bytes nothing there
+/// wrote.
 #[test]
 fn the_journal_records_only_the_root_windows_writes() {
     let mut ticked = self_session(true);
@@ -711,8 +762,8 @@ fn a_child_of_a_childs_own_program_rides_every_checkpoint() {
 }
 
 /// #2076 — the window watches and the access sink name the root's window. The child of
-/// [`SELF_ROOT`] runs module 0 too, but in its own window: a write watch on the word it counts in
-/// never stops it, and the sink sees none of its accesses, only the root's.
+/// [`SELF_ROOT`] runs the program's code too, but in its own window: a write watch on the word it
+/// counts in never stops it, and the sink sees none of its accesses, only the root's.
 #[test]
 fn window_watches_and_the_access_sink_see_the_roots_window_only() {
     let mut r = self_session(false);

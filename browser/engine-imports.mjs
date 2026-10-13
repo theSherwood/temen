@@ -34,6 +34,7 @@ export function engineImports(memory) {
       x2_spawn: () => -1,
       x2_now_ms: () => performance.timeOrigin + performance.now(),
       x2_tierup: () => -1,
+      x2_invoke: () => -1,
       js_cap_call: (slot, op, argsPtr, nArgs, mem) => {
         const h = globalThis.__temen_js_cap_call;
         return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;

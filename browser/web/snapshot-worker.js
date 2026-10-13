@@ -123,6 +123,7 @@ self.onmessage = async (e) => {
           x2_spawn: () => -1,
           x2_now_ms: () => performance.timeOrigin + performance.now(),
           x2_tierup: () => -1,
+          x2_invoke: () => -1,
           // The live-stdout tee (`temen_run_onramp_stream`): while a streaming Run is active, `chunkSink`
           // relays each write to the main thread; the worker's run stays synchronous, so the main thread
           // paints the chunks as they arrive (a Worker's postMessage delivers even while it computes).

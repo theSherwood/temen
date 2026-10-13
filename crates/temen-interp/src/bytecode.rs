@@ -749,6 +749,10 @@ pub struct Compiled {
     /// `len - 1` of the natural table (`next_power_of_two(n_funcs)`), used to mask a `ref.func`/fiber
     /// funcref to a module-local slot (the fiber/coroutine dispatch is module-0-natural).
     table_mask: usize,
+    /// What a debugger reads this program's frames against, when a debug run compiled it
+    /// ([`ModuleSource::debug`]): its §6 info and its per-block value layout. `None` elsewhere, and
+    /// for a §22 unit, whose frames are not source-inspectable (#2239).
+    debug: Option<std::sync::Arc<ModuleDebug>>,
 }
 
 impl Compiled {
@@ -863,6 +867,10 @@ impl SharedSlots {
 /// (so its table's module indices resolve) but carries its own [`SharedSlots`].
 struct ModuleSource {
     mods: std::sync::Mutex<Units>,
+    /// Whether the source serves a debug run ([`ScheduledDebugRun`]): every module it compiles for
+    /// a child or an exec is then unfused, so each IR instruction is a stop, and carries its frame
+    /// metadata, so a breakpoint binds in it and its frames read as module 0's do (#2239).
+    debug: bool,
 }
 
 /// A [`ModuleSource`]'s units, and the module each one was compiled from.
@@ -888,6 +896,7 @@ impl ModuleSource {
                 code: vec![primary],
                 by_digest: Vec::new(),
             }),
+            debug: false,
         }
     }
 
@@ -895,6 +904,11 @@ impl ModuleSource {
     /// refreshed on a miss. The lock acquire pairs with `install`'s push, so the snapshot sees it.
     fn snapshot(&self) -> Vec<std::sync::Arc<Compiled>> {
         self.mods.lock_unpoisoned().code.clone()
+    }
+
+    /// How many units the source holds (the primary and every one added since).
+    fn len(&self) -> usize {
+        self.mods.lock_unpoisoned().code.len()
     }
 
     /// The primary program (module 0).
@@ -1745,9 +1759,7 @@ fn granted_program(
     g: &super::ModuleGrant,
 ) -> Result<ChildProgram, Trap> {
     let i = source
-        .unit_of(&g.digest, || {
-            compile_granted(host, &g.module.funcs, &g.module.types, g.shadow())
-        })
+        .unit_of(&g.digest, || compile_granted(host, g, source.debug))
         .ok_or(Trap::Malformed)?;
     let p = source.get(i).ok_or(Trap::Malformed)?;
     Ok(ChildProgram::Granted(i as u32, p))
@@ -2272,18 +2284,25 @@ fn admit_detached_in_process(
     Ok(Some((child, tierup)))
 }
 
-/// Compile a module `host` granted, for a child: through the host's memo when its embedder handed it
-/// one ([`Host::set_compile_memo`]), else afresh. The same program either way.
-fn compile_granted(
-    host: &Host,
-    funcs: &[Func],
-    types: &[temen_ir::TypeEntry],
-    shadow: Option<super::ShadowArena>,
-) -> Option<Compiled> {
-    match host.compile_memo() {
-        Some(memo) => compile_module_memo(funcs, types, shadow, &mut memo.lock_unpoisoned()),
-        None => compile_module(funcs, types, shadow),
-    }
+/// Compile module `g` that `host` granted, for a child or an exec: through the host's memo when its
+/// embedder handed it one ([`Host::set_compile_memo`]), else afresh. The same program either way.
+/// For a `debug` run it is unfused and carries its frame metadata, as the run's own program does
+/// (#2239).
+fn compile_granted(host: &Host, g: &super::ModuleGrant, debug: bool) -> Option<Compiled> {
+    let (m, fuse) = (&g.module, !debug);
+    let mut c = match host.compile_memo() {
+        Some(memo) => compile_module_with(
+            &m.funcs,
+            &m.types,
+            fuse,
+            g.shadow(),
+            false,
+            Some(&mut memo.lock_unpoisoned()),
+        ),
+        None => compile_module_with(&m.funcs, &m.types, fuse, g.shadow(), false, None),
+    }?;
+    c.debug = debug.then(|| std::sync::Arc::new(ModuleDebug::build(m)));
+    Some(c)
 }
 
 pub fn compile_module(
@@ -2391,6 +2410,7 @@ fn compile_module_with(
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect(),
         table_mask,
+        debug: None,
     })
 }
 
@@ -6257,26 +6277,19 @@ pub fn ir_value_trace(
     }
 }
 
-/// Per-module §6 debug metadata a [`FrameReader`] resolves a source variable against: the `-g` info plus
-/// the per-`(func, block)` slot base and value types needed to read any live frame's values. Module 0's
-/// lives directly on the [`DebugRun`]/[`ScheduledDebugRun`]; a §14 **separate-module** child carries its
-/// own here (built from the granted `Module` at spawn, keyed by its pushed source index) so
-/// `read_var`/`var_addr`/`value_in_frame` resolve inside the child's body, not just module 0's.
-#[derive(Clone)]
+/// Per-module §6 debug metadata a [`FrameReader`] resolves a source variable against: the `-g` info
+/// plus the per-`(func, block)` slot base and value types needed to read any live frame's values. A
+/// debug run's units carry it ([`Compiled::debug`]): its own program's, and each granted module's a
+/// child or an exec runs (#2239), so a frame in any of them reads as module 0's does.
 struct ModuleDebug {
-    /// The child's index in the shared [`ModuleSource`] (`>= 1`) — matched against a frame's module so a
-    /// frame outside this child (e.g. an installed §22 unit) isn't misread against these tables.
-    module: usize,
-    debug: Option<DebugInfo>,
+    debug: Option<std::sync::Arc<DebugInfo>>,
     fn_block_base: Vec<Vec<u32>>,
     fn_block_types: Vec<Vec<Vec<ValType>>>,
 }
 
 impl ModuleDebug {
-    /// Build the per-`(func, block)` slot base + value types + §6 debug info for module `m`, pushed to the
-    /// shared source at index `module`. Mirrors the module-0 computation in [`ScheduledDebugRun::new_with_host`], so
-    /// a separate-module child is inspected exactly as the primary program is.
-    fn build(m: &Module, module: usize) -> ModuleDebug {
+    /// Build the per-`(func, block)` slot base + value types + §6 debug info for module `m`.
+    fn build(m: &Module) -> ModuleDebug {
         let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
         let mut fn_block_base = Vec::with_capacity(m.funcs.len());
         let mut fn_block_types = Vec::with_capacity(m.funcs.len());
@@ -6299,11 +6312,62 @@ impl ModuleDebug {
             ));
         }
         ModuleDebug {
-            module,
-            debug: m.debug_info.clone(),
+            debug: m.debug_info.clone().map(std::sync::Arc::new),
             fn_block_base,
             fn_block_types,
         }
+    }
+}
+
+/// Source-line breakpoints ([`ScheduledDebugRun::set_line_breakpoints`]), bound in every module of
+/// the run with §6 debug info: its own program, and each module a child or an exec runs, the first
+/// time an op of the module comes up for the check, as a native debugger binds a breakpoint in each
+/// library it loads (#2239).
+#[derive(Default)]
+struct LineBreakpoints {
+    /// The lines to stop at, by source file: each as it resolved when it was set.
+    files: Vec<(String, Vec<u32>)>,
+    /// The ops they bound at, in modules `0..modules`.
+    pcs: Vec<super::IrPc>,
+    /// How many of the run's modules, from 0, the lines are bound in.
+    modules: usize,
+}
+
+impl LineBreakpoints {
+    /// Whether a line bound at `pc`, binding the lines in the modules up to `pc`'s first if they
+    /// are not yet. As cheap per op as an exact breakpoint's check once they are.
+    #[inline]
+    fn hit(&mut self, source: &ModuleSource, pc: super::IrPc) -> bool {
+        if self.files.is_empty() {
+            return false;
+        }
+        if pc.module as usize >= self.modules {
+            self.bind_through(source, pc.module as usize);
+        }
+        self.pcs.contains(&pc)
+    }
+
+    /// Bind the lines in modules `self.modules..=last`, each at its first op in the module that is
+    /// on the line itself: a module without code on it does not snap it on to a line of its own.
+    fn bind_through(&mut self, source: &ModuleSource, last: usize) {
+        for m in self.modules..=last {
+            let Some(di) = source.get(m).and_then(|c| c.debug.as_ref()?.debug.clone()) else {
+                continue;
+            };
+            for (f, lines) in &self.files {
+                let bound = lines.iter().filter_map(|&l| {
+                    super::bind_line(&di, m as u32, f, l).filter(|&(at, _)| at == l)
+                });
+                self.pcs.extend(bound.map(|(_, pc)| pc));
+            }
+        }
+        self.modules = last + 1;
+    }
+
+    /// Forget every binding: the lines changed, or the run's units did.
+    fn unbind(&mut self) {
+        self.pcs.clear();
+        self.modules = 0;
     }
 }
 
@@ -7069,23 +7133,15 @@ fn debug_advance_fiber(
     }
 }
 
-/// A read-only inspection view over **one vCPU's** reified state (`vm`) plus the module's §6 debug
-/// metadata. This is the frame-reading engine behind [`ScheduledDebugRun`]'s inspection (every task's
-/// `Vm`, and a coroutine child's): given any task's `Vm`, it resolves backtrace frames, block-local
-/// SSA values, and named source variables identically — so a thread selected mid-stop (`select_task`)
-/// reads its own stack through the exact same code the single-vCPU path uses.
+/// A read-only inspection view over **one vCPU's** reified state (`vm`), each frame read against
+/// its module's §6 debug metadata ([`Compiled::debug`]). This is the frame-reading engine behind
+/// [`ScheduledDebugRun`]'s inspection: given any task's `Vm`, it resolves backtrace frames,
+/// block-local SSA values, and named source variables identically — so a thread selected mid-stop
+/// (`select_task`) reads its own stack through the exact same code the single-vCPU path uses.
 struct FrameReader<'a> {
     vm: &'a Vm,
     source: &'a ModuleSource,
     mem: &'a Option<Mem>,
-    debug: Option<&'a DebugInfo>,
-    fn_block_base: &'a [Vec<u32>],
-    fn_block_types: &'a [Vec<Vec<ValType>>],
-    /// The active §14 **separate-module** coroutine's own §6 metadata (module index `>= 1`), set while
-    /// stepping inside its body — so a frame in the child resolves against the child's funcs. `None` when
-    /// the active continuation is module 0 (the parent or a same-module coroutine), where the module-0
-    /// fields above apply. See [`FrameReader::md_for`].
-    coro_debug: Option<&'a ModuleDebug>,
     /// The thread has returned. Its `Vm` still rests on the final `return` op — a stop position
     /// since #1713 — so without this a finished run would report that `return` as a live frame. (A
     /// thread that *trapped* keeps its frames: they are where it crashed.)
@@ -7220,9 +7276,6 @@ fn apply_due_writes(
     source: &ModuleSource,
     mem: &mut Option<Mem>,
     envs: &mut [DbgEnv],
-    debug: Option<&DebugInfo>,
-    fn_block_base: &[Vec<u32>],
-    fn_block_types: &[Vec<Vec<ValType>>],
     journal: &mut super::journal::Journal,
 ) {
     while *cursor < writes.len() && writes[*cursor].0 < turn {
@@ -7251,10 +7304,6 @@ fn apply_due_writes(
                                 None => &*mem,
                                 Some(k) => &envs[k].mem,
                             },
-                            debug,
-                            fn_block_base,
-                            fn_block_types,
-                            coro_debug: None,
                             finished: matches!(t.state, TaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
@@ -7283,24 +7332,11 @@ impl<'a> FrameReader<'a> {
         self.vm.stack.len() + 1
     }
 
-    /// The `(§6 debug, per-block slot base, per-block value types)` to read a frame in `module` against:
-    /// module 0's from the session fields, or an active separate-module coroutine's own. `None` for any
-    /// other module (e.g. an installed §22 unit whose frames carry no debug tables here) — such a frame is
-    /// not source-inspectable, matching the pre-slice module-0 gate.
-    #[allow(clippy::type_complexity)]
-    fn md_for(
-        &self,
-        module: usize,
-    ) -> Option<(
-        Option<&'a DebugInfo>,
-        &'a [Vec<u32>],
-        &'a [Vec<Vec<ValType>>],
-    )> {
-        if module == 0 {
-            return Some((self.debug, self.fn_block_base, self.fn_block_types));
-        }
-        let md = self.coro_debug?;
-        (md.module == module).then_some((md.debug.as_ref(), &md.fn_block_base, &md.fn_block_types))
+    /// The metadata to read a frame in `module` against: the unit's own ([`Compiled::debug`]), for
+    /// the run's program and every module a child or an exec runs (#2239). `None` for an installed
+    /// §22 unit, whose frames are not source-inspectable.
+    fn md_for(&self, module: usize) -> Option<std::sync::Arc<ModuleDebug>> {
+        self.source.get(module)?.debug.clone()
     }
 
     /// The `(module, func, block, inst, window base)` of the frame `depth` levels from the top (0 =
@@ -7342,9 +7378,9 @@ impl<'a> FrameReader<'a> {
     /// module (module 0's, or an active separate-module coroutine's own).
     fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
         let (module, func, block, _inst, base) = self.frame_at(depth)?;
-        let (_, fn_block_base, fn_block_types) = self.md_for(module)?;
-        let off = *fn_block_base.get(func)?.get(block)? as usize;
-        let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
+        let md = self.md_for(module)?;
+        let off = *md.fn_block_base.get(func)?.get(block)? as usize;
+        let ty = *md.fn_block_types.get(func)?.get(block)?.get(idx)?;
         Some(self.vm.regs[base + off + idx].to_value(ty))
     }
 
@@ -7353,11 +7389,12 @@ impl<'a> FrameReader<'a> {
     /// memory-located var — the write-side mirror of [`FrameReader::read_var`]'s resolution.
     fn write_target(&self, depth: usize, name: &str) -> Option<WriteTarget> {
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        let (di, fn_block_base, fn_block_types) = self.md_for(module)?;
+        let md = self.md_for(module)?;
+        let di = md.debug.as_ref();
         let var = super::pick_var(di?, func as FuncIdx, name, block, inst)?;
-        let off = *fn_block_base.get(func)?.get(block)? as usize;
+        let off = *md.fn_block_base.get(func)?.get(block)? as usize;
         let slot = |idx: usize| -> Option<WriteTarget> {
-            let ty = *fn_block_types.get(func)?.get(block)?.get(idx)?;
+            let ty = *md.fn_block_types.get(func)?.get(block)?.get(idx)?;
             Some(WriteTarget::Ssa {
                 reg: base + off + idx,
                 ty,
@@ -7392,7 +7429,8 @@ impl<'a> FrameReader<'a> {
     /// separate-module coroutine's own. `None` if unresolvable here.
     fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        let di = self.md_for(module)?.0?;
+        let md = self.md_for(module)?;
+        let di = md.debug.as_ref()?;
         let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
         let window_read = |addr: u64| -> Option<VarValue> {
             Some(VarValue::Bytes(
@@ -7431,7 +7469,8 @@ impl<'a> FrameReader<'a> {
     /// frame's module's §6 info (module 0's, or an active separate-module coroutine's own).
     fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        let di = self.md_for(module)?.0?;
+        let md = self.md_for(module)?;
+        let di = md.debug.as_ref()?;
         let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
         match &var.loc {
             VarLoc::Ssa { .. } | VarLoc::SsaList(_) => None,
@@ -7458,7 +7497,8 @@ impl<'a> FrameReader<'a> {
     /// address instead), an unknown name, or a var not live at this frame's pc.
     fn value_watch_target(&self, depth: usize, name: &str) -> Option<(u32, super::ValueSite, Reg)> {
         let (module, func, block, inst, base) = self.frame_at(depth)?;
-        let di = self.md_for(module)?.0?;
+        let md = self.md_for(module)?;
+        let di = md.debug.as_ref()?;
         let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
         let (site, idx) = match &var.loc {
             VarLoc::Ssa { value } => (super::ValueSite::Single(*value), *value as usize),
@@ -7472,7 +7512,7 @@ impl<'a> FrameReader<'a> {
             | VarLoc::Fixed { .. }
             | VarLoc::Tls { .. } => return None,
         };
-        let off = *self.md_for(module)?.1.get(func)?.get(block)? as usize;
+        let off = *md.fn_block_base.get(func)?.get(block)? as usize;
         let last = *self.vm.regs.get(base + off + idx)?;
         Some((func as u32, site, last))
     }
@@ -7777,13 +7817,15 @@ pub struct ScheduledDebugRun {
     /// one can be resumed on another — D57). Each §14 child has its own ([`DbgEnv::fibers`]). Rebuilt
     /// deterministically on a reverse `seek` replay.
     fibers: FiberTables,
-    fn_block_base: Vec<Vec<u32>>,
-    fn_block_types: Vec<Vec<Vec<ValType>>>,
-    debug: Option<DebugInfo>,
+    /// Module 0's frame metadata, the same as its unit's ([`Compiled::debug`]), for the per-op
+    /// paths that read only the root's ops: the watches, the access sink and the journal.
+    root_md: std::sync::Arc<ModuleDebug>,
     /// The IR functions, for computing the effective address of the op about to run when a watchpoint
     /// is armed (`watch_hit_before`). `Arc` so a reverse `seek` rebuild is cheap.
     funcs: std::sync::Arc<[Func]>,
     breakpoints: Vec<super::IrPc>,
+    /// The source-line breakpoints, beside the exact ops in `breakpoints` (#2239).
+    line_bps: LineBreakpoints,
     /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
     /// common case, so the per-op `access_of` computation is skipped entirely.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
@@ -8839,14 +8881,14 @@ impl ScheduledDebugRun {
         host: Host,
     ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
-        let ModuleDebug {
-            fn_block_base,
-            fn_block_types,
-            ..
-        } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: debug stepping (Slice 5a)
+        let root_md = std::sync::Arc::new(ModuleDebug::build(m));
+        // Unfused: debug stepping (Slice 5a).
+        let mut c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?;
+        c.debug = Some(std::sync::Arc::clone(&root_md));
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
-        let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
+        let mut source = ModuleSource::over(std::sync::Arc::new(c));
+        source.debug = true;
+        let source = std::sync::Arc::new(source);
         let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
@@ -8861,11 +8903,10 @@ impl ScheduledDebugRun {
             tasks: vec![TaskSlot::new(vt, None, LiveVcpu::none())],
             extra_envs: Vec::new(),
             fibers: FiberTables::default(),
-            fn_block_base,
-            fn_block_types,
-            debug: m.debug_info.clone(),
+            root_md,
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
+            line_bps: LineBreakpoints::default(),
             watchpoints: Vec::new(),
             journal: super::journal::Journal::new(),
             journal_policy: super::journal::JournalPolicy::default(),
@@ -8909,6 +8950,55 @@ impl ScheduledDebugRun {
     /// Replace the run-shared breakpoint set (fires in whichever thread reaches a pc in it).
     pub fn set_breakpoints(&mut self, bps: Vec<super::IrPc>) {
         self.breakpoints = bps;
+    }
+
+    /// Replace source `file`'s line breakpoints with `lines` (#2239). Each resolves once, to the
+    /// nearest line at or after it with code in a module the run has admitted
+    /// ([`bind_line`](super::bind_line)), and binds at that line in every module of the run whose
+    /// §6 debug info has code on it: the run's own program, and each module a child or an exec
+    /// runs, as the run admits it. So a line of the program stops a child image of it too, and a
+    /// line of a child's own source stops that child. A line no admitted module resolves binds
+    /// where it is. Fires in whichever thread reaches it, as `set_breakpoints`' ops do. Returns,
+    /// per line, the line it resolved to, or `None`.
+    pub fn set_line_breakpoints(&mut self, file: &str, lines: Vec<u32>) -> Vec<Option<u32>> {
+        let resolved: Vec<Option<u32>> = lines
+            .iter()
+            .map(|&l| {
+                (0..self.source.len())
+                    .filter_map(|m| {
+                        let c = self.source.get(m)?;
+                        let di = c.debug.as_ref()?.debug.as_ref()?;
+                        super::bind_line(di, m as u32, file, l).map(|(at, _)| at)
+                    })
+                    .min()
+            })
+            .collect();
+        let bps = &mut self.line_bps;
+        bps.files.retain(|(f, _)| f != file);
+        bps.unbind();
+        if !lines.is_empty() {
+            let at = lines.iter().zip(&resolved).map(|(&l, r)| r.unwrap_or(l));
+            bps.files.push((file.to_string(), at.collect()));
+        }
+        resolved
+    }
+
+    /// Whether the run stops at `pc` for a breakpoint: one of `set_breakpoints`' ops, or an op a
+    /// line breakpoint bound at.
+    pub fn is_breakpoint(&mut self, pc: super::IrPc) -> bool {
+        self.breakpoints.contains(&pc) || self.line_bps.hit(&self.source, pc)
+    }
+
+    /// The §6 debug info of module `module` of the run: its own program's (`0`), or that of a
+    /// module a child or an exec runs (#2239). `None` for a module without it, or an installed §22
+    /// unit.
+    pub fn debug_info(&self, module: u32) -> Option<std::sync::Arc<DebugInfo>> {
+        self.source
+            .get(module as usize)?
+            .debug
+            .as_ref()?
+            .debug
+            .clone()
     }
 
     /// Replace the run-shared **watchpoints** (DEBUGGING.md W2, cross-thread): each `(addr, len, kind)`
@@ -9106,9 +9196,6 @@ impl ScheduledDebugRun {
             extra_envs,
             tasks,
             turn,
-            fn_block_base,
-            fn_block_types,
-            debug,
             journal,
             scheduled_writes,
             write_cursor,
@@ -9122,9 +9209,6 @@ impl ScheduledDebugRun {
             source,
             mem,
             extra_envs,
-            debug.as_ref(),
-            fn_block_base,
-            fn_block_types,
             journal,
         );
     }
@@ -9235,6 +9319,7 @@ impl ScheduledDebugRun {
             fibers,
             funcs,
             breakpoints,
+            line_bps,
             watchpoints,
             value_watches,
             journal,
@@ -9249,15 +9334,14 @@ impl ScheduledDebugRun {
             scheduled_writes,
             write_cursor,
             last_watch,
-            fn_block_base,
-            fn_block_types,
-            debug,
+            root_md,
             stopped,
             focus,
             turn,
             clock,
             ..
         } = self;
+        let fn_block_base = &root_md.fn_block_base;
         *stopped = None;
         // #1366: admit host-completed punts on this run's host, so an offloadable cap the embedder
         // services asynchronously parks the thread (`CapParked`) instead of being waited inline.
@@ -9352,7 +9436,9 @@ impl ScheduledDebugRun {
                 let hit = {
                     let cur_vm = tasks[ti].vm.vt.debug_active();
                     match cur_vm.cur_ir_pc(source) {
-                        Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
+                        Some(pc) if breakpoints.contains(&pc) || line_bps.hit(source, pc) => {
+                            Some((pc, None))
+                        }
                         // A window-range watch (cross-thread) stops *before* the access; a value
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
                         // Both name the root's window, which a task in a child's window does not
@@ -9423,9 +9509,6 @@ impl ScheduledDebugRun {
                 source,
                 mem,
                 extra_envs,
-                debug.as_ref(),
-                fn_block_base,
-                fn_block_types,
                 journal,
             );
             // The sink observes the root's window only (#2076), as the journal below does.
@@ -9606,9 +9689,7 @@ impl ScheduledDebugRun {
             turn,
             clock,
             funcs,
-            fn_block_base,
-            fn_block_types,
-            debug,
+            root_md,
             journal,
             journal_policy,
             access_sink,
@@ -9621,6 +9702,7 @@ impl ScheduledDebugRun {
             write_cursor,
             ..
         } = self;
+        let fn_block_base = &root_md.fn_block_base;
         host.completions().allow_host_completed(); // #1366: see `drive`
                                                    // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
                                                    // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
@@ -9655,9 +9737,6 @@ impl ScheduledDebugRun {
             source,
             mem,
             extra_envs,
-            debug.as_ref(),
-            fn_block_base,
-            fn_block_types,
             journal,
         );
         if let (Some(sink), None) = (access_sink.as_mut(), tasks[ti].env) {
@@ -9982,6 +10061,8 @@ impl ScheduledDebugRun {
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
         self.source.reset_extra(&c.extra_units);
+        // The units past the restored ones are gone, and a later spawn adds its module afresh.
+        self.line_bps.unbind();
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and carve
         // windows are `nested_view`s over the shared window (their bytes — shared via the backing
         // region — are already correct); each table is rebuilt over the child's own module. A
@@ -10110,13 +10191,6 @@ impl ScheduledDebugRun {
             vm,
             source: &self.source,
             mem: self.task_mem(self.focus),
-            debug: self.debug.as_ref(),
-            fn_block_base: &self.fn_block_base,
-            fn_block_types: &self.fn_block_types,
-            // A separate-module coroutine on the scheduled engine carries its own §6 metadata (built at
-            // spawn); a same-module one leaves it `None` (its frames are module 0, read against the fields
-            // above).
-            coro_debug: None,
             finished: matches!(self.tasks[self.focus].state, TaskState::Done(Ok(_))),
         }
     }
@@ -10697,11 +10771,7 @@ fn exec_image_build(
     let cm = dom
         .source
         .unit_of(&command.0.digest, || {
-            compile_module(
-                &command.0.module.funcs,
-                &command.0.module.types,
-                command.0.shadow(),
-            )
+            compile_granted(cur_host, &command.0, dom.source.debug)
         })
         .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
@@ -16069,8 +16139,11 @@ impl SchedCore {
                         // #1301
                     });
                     drop(g);
+                    // #1414 B6-3: emitted code addresses the window as one flat span, so a window
+                    // backed without one runs the unit interpreted.
                     let mapped = match mem.as_ref() {
                         None => Some(0),
+                        Some(m) if m.flat_win_base().is_none() => None,
                         Some(m) if root_emit.is_some_and(|e| e.page_checked) => {
                             Some(m.reserved_size())
                         }
@@ -17210,7 +17283,7 @@ struct ThreadRun {
     bell: Option<std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>>,
     ended: std::sync::Condvar,
     /// Whether the run is over ([`Threads::over`]), for emitted code to read without the lock
-    /// ([`TierUpCall::over`]).
+    /// ([`EmittedCall::over`]).
     over: std::sync::atomic::AtomicBool,
 }
 
@@ -17239,41 +17312,105 @@ impl ThreadPlatform {
 }
 
 /// The emitted tier on the parallel driver (#1414 B6-3): which calls tier up, and how a thread runs
-/// one itself, where its task stopped.
+/// emitted code itself, where its task stopped — a tier-up, or a §22 invoke of a unit with emitted
+/// wasm.
 #[derive(Clone)]
 pub struct ThreadTier {
     /// Per-module-0-function eligibility, as the pump's root emit ([`ProgramEmit::eligible`]): a
     /// module-0 task's direct call to an eligible function runs on the emitted tier.
     pub eligible: std::sync::Arc<[bool]>,
-    /// The size of a thread's env cell, the emitted code's per-thread scratch ([`TierUpCall::cell`]).
-    pub cell_bytes: usize,
-    /// Run one tier-up, on the calling thread. Once the run is over ([`TierUpCall::over`]) it
-    /// returns by the emitted code's next fuel check, whatever it returns: the run waits for its
-    /// thread.
-    pub run: fn(&mut TierUpCall<'_>) -> Result<(), Trap>,
+    /// Run one call on the emitted tier, on the calling thread. Once the run is over
+    /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
+    /// returns: the run waits for its thread.
+    pub run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
 }
 
-/// One tier-up a thread runs ([`ThreadTier::run`]): module-0 function `func` on the emitted tier,
-/// over its task's window.
-pub struct TierUpCall<'a> {
-    pub func: u32,
+/// What a call on the emitted tier runs ([`EmittedCall::target`]).
+pub enum EmittedTarget<'a> {
+    /// Function `func` of the run's tier-up module: a direct call to it tiered up.
+    Region(u32),
+    /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
+    /// and the types the argument and result slots carry.
+    Unit {
+        code: i32,
+        wasm: &'a std::sync::Arc<[u8]>,
+        params: &'a [ValType],
+        results: &'a [ValType],
+    },
+}
+
+/// One call a thread runs on the emitted tier ([`ThreadTier::run`]), over its task's window and
+/// dispatch table.
+pub struct EmittedCall<'a> {
+    pub target: EmittedTarget<'a>,
     /// The arguments, as raw i64 slots.
     pub argv: &'a [i64],
     /// The window's committed extent, the emitted `"mapped"` global (#717).
     pub mapped: u64,
     /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
     pub win: *const u8,
-    /// This thread's env cell ([`ThreadTier::cell_bytes`]), zeroed when the thread made it.
-    pub cell: *mut u8,
     /// Set once the run is over. Emitted code still running then stops at its next fuel check.
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
+    table: &'a SharedSlots,
+    host: &'a std::sync::Mutex<super::Host>,
+    now: &'a std::cell::Cell<u64>,
 }
 
-/// A call out of a tier-up's emitted code back into the interpreter (`env.call_interp`): function
+impl EmittedCall<'_> {
+    /// The generation of the task's dispatch table: it moves with every install and uninstall, so
+    /// a host that mirrors the table in emitted code rebuilds only when it changed.
+    pub fn table_gen(&self) -> u32 {
+        self.table.gen()
+    }
+
+    /// The `(domain, unit)` installed at `slot` of the task's dispatch table (`None` = empty, or one
+    /// of the program's own functions).
+    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
+        self.table.slot_unit(slot as usize)
+    }
+
+    /// `unit`'s emitted wasm, emitted now if it has not been yet; `None` for a unit the host's
+    /// emitter refuses, which stays on the interpreter.
+    pub fn unit_wasm(&self, unit: (u32, u32)) -> Option<std::sync::Arc<[u8]>> {
+        self.host
+            .lock_unpoisoned()
+            .jit_unit_wasm_or_emit(unit.0, unit.1)
+    }
+
+    /// The parameter and result types of `unit`'s entry.
+    pub fn unit_sig(&self, unit: (u32, u32)) -> Option<(Vec<ValType>, Vec<ValType>)> {
+        let funcs = self.host.lock_unpoisoned().jit_unit_funcs(unit.0, unit.1)?;
+        funcs.first().map(|f| (f.params.clone(), f.results.clone()))
+    }
+
+    /// The window's committed extent now, which a bounce may have grown ([`EmittedCall::mapped`]
+    /// is the call's).
+    pub fn mapped_now(&self) -> u64 {
+        self.now.get()
+    }
+}
+
+/// A §22 invoke the rules surfaced to run on the emitted tier ([`CoopStep::JitInvoke`]): its task's
+/// thread runs it before it steps the task on ([`ThreadRun::invoke`]).
+struct SurfacedInvoke {
+    code: i32,
+    wasm: std::sync::Arc<[u8]>,
+    argv: Box<[i64]>,
+    params: Box<[ValType]>,
+    results: Box<[ValType]>,
+    /// The register the first result lands in.
+    dst: usize,
+    mapped: u64,
+}
+
+/// A task a stop made, with the window view and fuel hand its new thread starts with.
+type NewTask = (usize, Option<Mem>, Fuel);
+
+/// A call out of emitted code back into the interpreter (`env.call_interp`): function
 /// `target` of the task's dispatch table, its arguments in `io` and its results written back over
 /// them, run over the task's live window and powerbox. Returns how many results it wrote.
 pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
@@ -17455,8 +17592,9 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     let mut look = true;
     // The task's VM while its thread steps it; the slot holds this empty one meanwhile.
     let mut vm: Box<TaskVm> = Box::default();
-    // The thread's env cell for the emitted tier ([`TierUpCall::cell`]), made at its first tier-up.
-    let mut cell = None;
+    // A §22 invoke the rules surfaced at the task's last stop, which the thread runs on the emitted
+    // tier before it steps the task on.
+    let mut invoke = None;
     'run: loop {
         loop {
             if g.over.is_some() {
@@ -17487,7 +17625,12 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             durable: false,
             host: HostCell::Shared(&host),
         };
-        let stop = run.step(&mut vm, env, &mut ctx, &mut cell);
+        let stop = match invoke.take() {
+            Some(inv) => run
+                .invoke(&mut vm, &mut ctx, inv)
+                .and_then(|()| run.step(&mut vm, env, &mut ctx)),
+            None => run.step(&mut vm, env, &mut ctx),
+        };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
             _ => None,
@@ -17503,7 +17646,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         }
         exec = matches!(stop, Ok(VcpuStop::Exec { .. }));
         look = matches!(stop, Ok(VcpuStop::Preempted));
-        let made = run.apply(&mut g, ti, stop, exits);
+        let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
+        invoke = surfaced;
         if !made.is_empty() {
             release(g);
             for (j, mem, fuel) in made {
@@ -17535,7 +17679,6 @@ impl ThreadRun {
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
-        cell: &mut Option<Box<[u64]>>,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
         for _ in 0..TIERUP_LOOK {
@@ -17561,7 +17704,8 @@ impl ThreadRun {
                     let tier = (self.platform.tier.as_ref())
                         .filter(|_| module == 0)
                         .ok_or(Trap::Malformed)?;
-                    let vals = self.tier_up(tier, cell, &mut fibers, ctx, func, &argv, mapped)?;
+                    let target = EmittedTarget::Region(func);
+                    let vals = self.emitted(tier, &mut fibers, true, ctx, target, &argv, mapped)?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
@@ -17574,58 +17718,86 @@ impl ThreadRun {
         Ok(VcpuStop::Preempted)
     }
 
-    /// Run one tier-up on this thread ([`ThreadTier::run`]), over the task's window and the
-    /// thread's env cell. Its calls back into the interpreter run over the task's live window,
-    /// powerbox and table, with their fibers in the run's registry, as the pump's do.
+    /// Run the §22 invoke `inv` the rules surfaced at the task's last stop on this thread's emitted
+    /// tier ([`ThreadTier::run`]), and hand its results to the task as the interpreted invoke would.
+    /// Its calls back into the interpreter share a registry of their own, whose fibers die with the
+    /// invoke, as `run_invoke`'s do.
+    fn invoke(&self, vm: &mut TaskVm, ctx: &mut RunCtx, inv: SurfacedInvoke) -> Result<(), Trap> {
+        let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+        let mut fibers = FiberTables::default();
+        let target = EmittedTarget::Unit {
+            code: inv.code,
+            wasm: &inv.wasm,
+            params: &inv.params,
+            results: &inv.results,
+        };
+        let mut cell = fibers.cell();
+        let vals = self.emitted(tier, &mut cell, false, ctx, target, &inv.argv, inv.mapped)?;
+        // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
+        if vals.len() < inv.results.len() {
+            return Err(Trap::Malformed);
+        }
+        set_slot_results(&mut vm.vt.active, inv.dst as u32, &inv.results, vals);
+        Ok(())
+    }
+
+    /// Run one call on this thread's emitted tier ([`ThreadTier::run`]): `target`, over the task's
+    /// window and dispatch table. Its calls back into the interpreter run over the task's live
+    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up
+    /// (`run_level`), as the pump's are, or an invoke's own.
     #[allow(clippy::too_many_arguments)]
-    fn tier_up(
+    fn emitted(
         &self,
         tier: &ThreadTier,
-        cell: &mut Option<Box<[u64]>>,
         fibers: &mut FiberCell,
+        run_level: bool,
         ctx: &mut RunCtx,
-        func: u32,
+        target: EmittedTarget<'_>,
         argv: &[i64],
         mapped: u64,
     ) -> Result<Vec<i64>, Trap> {
-        // Words, so the scratch is 8-aligned.
-        let cell = cell.get_or_insert_with(|| vec![0; tier.cell_bytes.div_ceil(8)].into());
-        // A tier-up surfaces only over a window with a flat span, or none at all.
+        // Emitted code runs only over a window with a flat span, or none at all.
         let win = match ctx.mem.as_ref() {
             None => std::ptr::null(),
             Some(m) => m.flat_win_base().ok_or(Trap::Malformed)?,
         };
+        let host = match &ctx.host {
+            HostCell::Shared(h) => *h,
+            HostCell::Excl(_) => return Err(Trap::Malformed),
+        };
+        let now = std::cell::Cell::new(mapped);
         let RunCtx {
-            table,
-            fuel,
-            mem,
-            host,
-            ..
+            table, fuel, mem, ..
         } = ctx;
+        let table: &SharedSlots = table;
         let mut bounce = |target: u32, io: &mut [i64]| {
-            let run_level = BounceRunCtx { park: None };
-            coop_bounce(
+            let ran = coop_bounce(
                 &self.dom.source,
                 table,
                 fuel,
                 mem,
-                host,
+                &mut HostCell::Shared(host),
                 fibers,
-                Some(run_level),
+                run_level.then_some(BounceRunCtx { park: None }),
                 target,
                 io,
                 None,
-            )
+            );
+            // The bounce may have grown the window, which the emitted code reads again after it.
+            now.set(mem.as_ref().map_or(0, |m| m.scalar_extent().unwrap_or(0)));
+            ran
         };
-        let mut call = TierUpCall {
-            func,
+        let mut call = EmittedCall {
+            target,
             argv,
             mapped,
             win,
-            cell: cell.as_mut_ptr().cast(),
             over: &self.over,
             results: Vec::new(),
             bounce: &mut bounce,
+            table,
+            host,
+            now: &now,
         };
         (tier.run)(&mut call).map(|()| call.results)
     }
@@ -17645,7 +17817,7 @@ impl ThreadRun {
     }
 
     /// End the run with `res`, unless it is over already. Every thread stops at its next look, and
-    /// emitted code at its next fuel check ([`TierUpCall::over`]).
+    /// emitted code at its next fuel check ([`EmittedCall::over`]).
     fn conclude(&self, g: &mut Threads, res: Result<Vec<Value>, Trap>) {
         if g.over.is_none() {
             g.over = Some(res);
@@ -17673,15 +17845,16 @@ impl ThreadRun {
 
     /// Apply task `ti`'s stop under the lock, as the pump does between steps: its rule, then the
     /// wake half ([`Self::settle`]). `exits` is how many children had ended when the step began
-    /// ([`Self::missed_wake`]). Returns the tasks the rule made, each with the window view and fuel
-    /// hand its thread starts with, for the caller to start once it lets go of the lock.
+    /// ([`Self::missed_wake`]). Returns the tasks the rule made, for the caller to start once it
+    /// lets go of the lock, and the §22 invoke it surfaced, for the task's thread to run
+    /// ([`Self::invoke`]).
     fn apply(
         &self,
         g: &mut Threads,
         ti: usize,
         stop: Result<VcpuStop, Trap>,
         exits: usize,
-    ) -> Vec<(usize, Option<Mem>, Fuel)> {
+    ) -> (Vec<NewTask>, Option<SurfacedInvoke>) {
         let was_awake: Vec<bool> = g.core.tasks.iter().map(awake).collect();
         let had = g.core.tasks.len();
         g.core.clock = self.now();
@@ -17693,17 +17866,40 @@ impl ThreadRun {
             ..
         } = &mut *g;
         // A thread runs its own task's tier-ups ([`ThreadRun::step`]), so no tier-up reaches the
-        // rules. What else could pause for a host is an emitted §22 invoke, which surfaces only for
-        // a host with a unit emitter; this executor's are given none yet (#1414 B6-3b), so one that
-        // surfaces anyway fails closed.
-        if core
-            .on_stop(emit, &self.dom, mem, &self.root, fuel, ti, stop)
-            .is_some()
-        {
-            debug_assert!(false, "executor 2 cannot run an emitted §22 invoke yet");
-            emit.pending_jit = None;
-            complete(&mut core.tasks, ti, Err(Trap::CapFault));
-        }
+        // rules. An emitted §22 invoke does, and goes back to the task's thread, which runs it
+        // ([`ThreadRun::invoke`]).
+        let invoke = match core.on_stop(emit, &self.dom, mem, &self.root, fuel, ti, stop) {
+            None => None,
+            Some(CoopStep::JitInvoke {
+                code,
+                wasm,
+                argv,
+                params,
+                results,
+                mapped,
+            }) => {
+                let (_, dst, _) = emit
+                    .pending_jit
+                    .take()
+                    .expect("a surfaced invoke is pending");
+                Some(SurfacedInvoke {
+                    code,
+                    wasm,
+                    argv,
+                    params,
+                    results,
+                    dst,
+                    mapped,
+                })
+            }
+            // Only a host with a leaf emitter surfaces anything else, and this executor's have none.
+            Some(_) => {
+                debug_assert!(false, "executor 2 surfaced a pause it cannot serve");
+                emit.pending_tierup = None;
+                complete(&mut core.tasks, ti, Err(Trap::CapFault));
+                None
+            }
+        };
         if self.missed_wake(&g.core, ti, exits) {
             g.core.tasks[ti].state = TaskState::Runnable;
         }
@@ -17717,7 +17913,7 @@ impl ThreadRun {
         // Each new task's thread counts in now, before it starts, so the run cannot end unseen.
         g.live += made.len();
         self.wake(g, &was_awake, Some(ti));
-        made
+        (made, invoke)
     }
 
     /// The wake half of a pump round, under the lock: the teardown, every wait the wall clock has
