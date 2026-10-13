@@ -104,12 +104,48 @@ block 0 (v0: i64) {
 }
 "#;
 
+/// How a session is built: over a module, over a program compiled once (a warm restore's), or as a
+/// reactor's call over its live window.
+#[derive(Clone, Copy, Debug)]
+enum Open {
+    Module,
+    Program,
+    Reactor,
+}
+
 /// The faulting address a session that faults at `addr` reports, read the way an embedder reads it.
-fn fault_of(addr: i64) -> Option<u64> {
+fn fault_of(open: Open, addr: i64) -> Option<u64> {
     let m = parse_module(LOAD_AT).expect("parse");
-    let mut r = CoopRun::new(&m, 0, &[Value::I64(addr)], u64::MAX, Host::new(), None)
-        .expect("in the bytecode subset")
-        .expect("builds");
+    let args = [Value::I64(addr)];
+    let mut r = match open {
+        Open::Module => CoopRun::new(&m, 0, &args, u64::MAX, Host::new(), None)
+            .expect("in the bytecode subset")
+            .expect("builds"),
+        Open::Program => {
+            let page = temen_interp::host_page_size();
+            let back =
+                temen_interp::Region::owned_zeroed(1 << 17, page).expect("a 128 KiB backing");
+            let prots = temen_interp::PageMap::from_entries(page, 0, &[]).expect("no entries");
+            bytecode::SharedProgram::compile(&m)
+                .expect("in the bytecode subset")
+                .coop_run_over_grown(
+                    0,
+                    &args,
+                    u64::MAX,
+                    Host::new(),
+                    None,
+                    back.into(),
+                    17,
+                    &prots,
+                    None,
+                )
+                .expect("builds")
+        }
+        Open::Reactor => bytecode::Reactor::open(&m)
+            .expect("in the bytecode subset")
+            .coop_call(0, &args, u64::MAX, Host::new(), None, None)
+            .expect("builds"),
+    };
     assert!(matches!(
         r.run_for(1 << 20),
         CoopEvent::Trapped(temen_interp::Trap::MemoryFault)
@@ -117,12 +153,15 @@ fn fault_of(addr: i64) -> Option<u64> {
     temen_interp::last_capture_fault_addr()
 }
 
-/// Each session reports its **own** faulting address. The slot is per run, but only one of the
-/// session constructors cleared it, and a fault keeps the first address recorded, so a second
-/// session's segfault named the first one's address (c_interpret's Release run showed a NULL
-/// dereference at the address of the stack overflow before it).
+/// Each session reports its **own** faulting address, however it was built. The slot is per run,
+/// but only one of the session constructors cleared it, and a fault keeps the first address
+/// recorded, so a second session's segfault named the first one's address (c_interpret's Release
+/// run showed a NULL dereference at the address of the stack overflow before it). A warm restore's
+/// session still did, until every session was built through one tail (#1414 S4-4b).
 #[test]
 fn a_session_reports_its_own_fault_address_not_the_last_sessions() {
-    assert_eq!(fault_of(8), Some(8));
-    assert_eq!(fault_of(16), Some(16));
+    for open in [Open::Module, Open::Program, Open::Reactor] {
+        assert_eq!(fault_of(Open::Module, 8), Some(8));
+        assert_eq!(fault_of(open, 16), Some(16), "{open:?}");
+    }
 }

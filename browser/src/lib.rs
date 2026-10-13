@@ -5688,17 +5688,19 @@ pub extern "C" fn temen_pg_close() {
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
 /// Doom rides), the browser twin of `temen-run`'s reactor `Session`. Instantiate once: run `_start`
 /// (func 0) to stash the granted handles and run the C initializer, then call the guest's exported
-/// `tick` once per host-driven frame. State (globals/BSS within the 256 KiB `SNAP_CAP` window)
-/// **persists** between frames via the snapshot round-trip. Each `tick` presents a frame through the
-/// `display` capability (captured into `frame`) and drains input through the `keyboard` capability
-/// (`keys`, fed by the host). Single-threaded; the guest keeps its per-frame state in globals/BSS (a
-/// grown `malloc` heap above the window is **not** persisted yet — the same slice-1 reactor scope as
-/// `temen-run`, and the reason Doom itself needs the heap-persistence follow-on).
+/// `tick` once per host-driven frame. The guest's window — globals, BSS and the `vm_map`-grown heap —
+/// stays live between frames, and so does the powerbox. Each `tick` presents a frame through the
+/// `display` capability (captured into `frame`) and drains input through the `keyboard` and `mouse`
+/// capabilities (fed by the host).
+///
+/// Every call into the guest is a resumable **pump run** (#1414 S4-4): the run the emitted tier's
+/// driver pumps, over the reactor's live window, which the run borrows and hands back when it ends.
 pub struct OnrampReactor {
-    /// The persistent single-vCPU instance — its guest window (globals, BSS, **and** the grown heap)
-    /// stays live between frames, so heavy-heap guests (Life, eventually Doom) keep their state.
+    /// The compiled program and its live window, over a flat backing that grows as the guest maps.
     inst: bytecode::Reactor,
-    host: Host,
+    /// The powerbox, kept across frames. A frame's run holds it while it runs. `None` after a call
+    /// that could not start, whose window and powerbox went with it: there is nothing left to call.
+    host: Option<Host>,
     /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
     entry_sp: u64,
     tick: temen_ir::FuncIdx,
@@ -5707,6 +5709,16 @@ pub struct OnrampReactor {
     caps: OnrampCaps,
     /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
     last_trap: Option<String>,
+}
+
+/// A reactor's compiled program and window over `m`. The window's backing is flat and grows as the
+/// guest maps past it, which is what emitted code can address (#1414 S4-4). It opens at the declared
+/// size, or at `len` when that is longer: a save-state's image, which the restore then fills.
+fn reactor_instance(m: &temen_ir::Module, len: u64) -> Option<bytecode::Reactor> {
+    let declared = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let page = temen_interp::host_page_size();
+    let back = temen_interp::Region::growable(declared.max(len).max(page), page)?;
+    bytecode::Reactor::open_over(m, std::sync::Arc::new(back))
 }
 
 impl OnrampReactor {
@@ -5742,23 +5754,19 @@ impl OnrampReactor {
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
         let caps = grant_onramp_caps(&mut host, m, fs, None);
-        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
-        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
-        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
-        // then persists for every `tick`.
-        let mut fuel = DEFAULT_FUEL;
-        match inst.call(0, &[], &mut fuel, &mut host) {
-            Ok(_) => {}
-            Err(_) => return Err(STATUS_TRAP),
-        }
-        Ok(OnrampReactor {
-            inst,
-            host,
+        let mut r = OnrampReactor {
+            inst: reactor_instance(m, 0).ok_or(STATUS_UNSUPPORTED)?,
+            host: Some(host),
             entry_sp,
             tick,
             caps,
             last_trap: None,
-        })
+        };
+        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
+        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
+        // then persists for every `tick`.
+        r.call(0, &[]).map_err(|_| STATUS_TRAP)?;
+        Ok(r)
     }
 
     /// Freeze this reactor into a **§12 artifact** — a save-state (#1458). Everything the guest is,
@@ -5782,12 +5790,11 @@ impl OnrampReactor {
         &self,
         module: &temen_ir::Module,
     ) -> Result<Vec<u8>, temen_snapshot::FreezeError> {
-        let layout = self
-            .inst
-            .window_layout()
-            .ok_or(temen_snapshot::FreezeError::WindowGeometry(0))?;
+        let (Some(layout), Some(host)) = (self.inst.window_layout(), self.host.as_ref()) else {
+            return Err(temen_snapshot::FreezeError::WindowGeometry(0));
+        };
         let reserved_log2 = self.inst.window_reserved_log2().unwrap_or(0);
-        temen_snapshot::freeze_layout(module, &layout, reserved_log2, &self.host)
+        temen_snapshot::freeze_layout(module, &layout, reserved_log2, host)
     }
 
     /// Rebuild a reactor from a [`freeze`](Self::freeze) artifact: the guest resumes at the frame it
@@ -5820,13 +5827,13 @@ impl OnrampReactor {
         let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
-        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
+        let mut inst = reactor_instance(m, layout.byte_len() as u64).ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout, &host) {
             return Err(STATUS_UNSUPPORTED);
         }
         Ok(OnrampReactor {
             inst,
-            host,
+            host: Some(host),
             entry_sp,
             tick,
             caps,
@@ -5834,15 +5841,33 @@ impl OnrampReactor {
         })
     }
 
+    /// One call into the guest — `_start` at open, `tick` each frame — as a pump run over the live
+    /// window, driven here to its end. Nothing but its end surfaces: the run has no emitted tier and
+    /// no slices, so any other event fails the call closed.
+    fn call(&mut self, func: temen_ir::FuncIdx, args: &[Value]) -> Result<Vec<Value>, Trap> {
+        let host = self.host.take().ok_or(Trap::ThreadFault)?;
+        let mut run = self
+            .inst
+            .coop_call(func, args, DEFAULT_FUEL, host, None, None)?;
+        let ended = match run.run() {
+            bytecode::CoopEvent::Done(vals) => Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => Err(t),
+            // No capability of the reactor's completes on the host, so nothing could answer a park:
+            // it is declined, as a run to completion declines it.
+            bytecode::CoopEvent::CapPark { .. } => Err(Trap::CapFault),
+            _ => Err(Trap::ThreadFault),
+        };
+        self.host = Some(self.inst.end_coop_call(&mut run));
+        ended
+    }
+
     /// Run one frame: call the guest's `tick` on the **live** window (all prior-frame state — globals,
-    /// BSS, heap — intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT`
-    /// = the guest called `Exit`; `STATUS_TRAP` = a trap. The presented frame (if any) is read via
+    /// BSS, heap — intact), returning `(status, stdout)`: what the guest wrote since the last frame
+    /// (the first frame's carries `_start`'s). `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
+    /// called `Exit`; `STATUS_TRAP` = a trap. The presented frame (if any) is read via
     /// [`take_frame`](Self::take_frame).
     pub fn frame(&mut self) -> (i32, Vec<u8>) {
-        let stdout_before = self.host.stdout.len();
-        let args = [Value::I64(self.entry_sp as i64)];
-        let mut fuel = DEFAULT_FUEL;
-        let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
+        let status = match self.call(self.tick, &[Value::I64(self.entry_sp as i64)]) {
             Ok(_) => STATUS_OK,
             Err(Trap::Exit(_)) => STATUS_EXIT,
             Err(t) => {
@@ -5850,8 +5875,8 @@ impl OnrampReactor {
                 STATUS_TRAP
             }
         };
-        let delta = self.host.stdout[stdout_before..].to_vec();
-        (status, delta)
+        let stdout = self.host.as_mut().map(|h| h.take_stdout());
+        (status, stdout.unwrap_or_default())
     }
 
     /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
@@ -5881,10 +5906,8 @@ impl OnrampReactor {
     /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
     /// fiction).
     pub fn moment(&self) -> Result<Moment, Refusal> {
-        Moment::capture(
-            self.inst.window_layout().ok_or(Refusal::NoWindow)?,
-            &self.host,
-        )
+        let host = self.host.as_ref().ok_or(Refusal::NoWindow)?;
+        Moment::capture(self.inst.window_layout().ok_or(Refusal::NoWindow)?, host)
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5895,10 +5918,13 @@ impl OnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &Moment) -> bool {
-        if !self.inst.restore_window(&moment.layout(), &self.host) {
+        let Some(host) = self.host.as_mut() else {
+            return false;
+        };
+        if !self.inst.restore_window(&moment.layout(), host) {
             return false;
         }
-        moment.restore_host(&mut self.host);
+        moment.restore_host(host);
         true
     }
 }
