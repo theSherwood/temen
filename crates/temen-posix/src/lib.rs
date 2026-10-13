@@ -181,7 +181,7 @@ pub const OP_EXEC_RESOLVE: u32 = 53;
 /// running, as POSIX requires: `-ENOENT` for nothing at the path, `-EACCES` for a file that is not
 /// a program or a built program without a loader, `-ENOEXEC` for one whose bytes do not decode and
 /// verify, `-E2BIG` when argv+envp overflow the args region or the image's window exceeds the
-/// caller's (**checked and refused, never truncated**), `-EFAULT` for an unreadable pointer,
+/// caller's reservation (**checked and refused, never truncated**), `-EFAULT` for an unreadable pointer,
 /// `-EINVAL` for a non-UTF-8 path or an image-replace the engine refuses, `-ENOSYS` on a route with
 /// no request door (a fiber, the explorer).
 ///
@@ -220,7 +220,7 @@ pub const OP_WAIT4: u32 = 61;
 ///
 /// The new process is a fork twin in all but its image: its pid is a core `TaskId` its parent reaps
 /// with [`OP_WAIT4`], it inherits what [`Proc::fork`] gives a twin, and its program starts at its
-/// entry in a fresh window of the caller's geometry, as an `execve` would start it. The op resolves
+/// entry in a fresh window of its declared memory, as an `execve` would start it. The op resolves
 /// and stages, then asks through [`temen_interp::ParkEvent::SpawnSelf`]; the engine mints the
 /// process and builds its image with the one exec builder. A program the engine cannot start once
 /// the process exists (its bytes do not verify, or it imports what nothing serves) makes a child
@@ -5289,10 +5289,9 @@ impl Ctx<'_> {
             let argv = read_guest_cstr_vec(mem, argv_ptr).ok_or(EFAULT)?;
             return Ok(Staged::Host(run, lossy_strings(&argv)));
         }
-        // The §14 window ceiling, checked and refused rather than truncated: the image runs in a
-        // window of THIS window's geometry, so a command declaring more memory than the caller has
-        // cannot run. `window_size` is the documented bound `exec_module` admits against; the core
-        // re-checks against the backed prefix and fails closed if that is stricter.
+        // The window ceiling, checked and refused rather than truncated: the image runs in a window
+        // of its declared memory inside THIS window's reservation (#2332), so a command declaring
+        // more memory than that cannot run. `window_size` is the bound `exec_image` admits against.
         let win = mem.window_size();
         if win == 0 || cmd_wl >= 64 || (1u64 << cmd_wl) > win {
             return Err(E2BIG);

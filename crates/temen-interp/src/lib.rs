@@ -5607,8 +5607,8 @@ enum Step {
 /// FORK.md §8.6 — the ready payload of an `exec_module` (`execve`) image-replace. Everything fallible
 /// (module resolve, grant regrant, import bind) is done in the eval loop — where a refusal is a clean
 /// `-EINVAL` that leaves the caller running — so `dispatch`'s rebuild is **infallible**: it only
-/// builds the command's image in a fresh window of the caller's geometry and swaps the vCPU to a fresh
-/// one running the command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
+/// builds the command's image in a fresh window of its declared memory (#2332) and swaps the vCPU to
+/// a fresh one running the command, keeping the `TaskId`/fuel. `host` is the command's ready powerbox (inherited caps
 /// regranted by name, its own imports bound, its module registered as the self module).
 /// #801 exec ABI — the powerbox **args region** `[base, end)`: the caller packs `{argc:i32,
 /// envc:i32}` at its base and NUL-packed argv/envp strings after, immediately before
@@ -5635,8 +5635,8 @@ pub struct ExecImage {
     pub entry: u64,
     /// The entry's arguments: the starter handles its shape takes (none for a powerbox `_start`).
     pub entry_args: Vec<i64>,
-    /// The backed prefix of the window the command runs in: the caller's (the image-replace keeps
-    /// the caller's window geometry).
+    /// The backed prefix of the window the command runs in: its declared memory (#2332), in the
+    /// caller's reservation.
     pub child_size: u64,
     /// The pipes the old image's released ends left with no writers / no readers: a scheduler
     /// wakes their readers (EOF) / writers (`-EPIPE`).
@@ -5644,6 +5644,8 @@ pub struct ExecImage {
 }
 
 struct ExecReq {
+    /// The backed prefix of the image's window: its declared memory ([`ExecImage::child_size`]).
+    window: u64,
     funcs: Arc<[Func]>,
     types: Arc<[temen_ir::TypeEntry]>,
     /// The command module: its data segments seed the new window.
@@ -5663,9 +5665,9 @@ struct ExecReq {
 }
 
 impl ExecReq {
-    /// The vCPU that runs this image as task `id`, in a fresh window of `caller`'s geometry
-    /// ([`Mem::exec_window`]): an exec's, whose caller's window is then released, or a spawned
-    /// process's, whose caller's window is untouched.
+    /// The vCPU that runs this image as task `id`, in a fresh window of its declared memory in
+    /// `caller`'s reservation ([`Mem::exec_window`]): an exec's, whose caller's window is then
+    /// released, or a spawned process's, whose caller's window is untouched.
     #[allow(clippy::too_many_arguments)]
     fn into_vcpu(
         self,
@@ -5681,9 +5683,10 @@ impl ExecReq {
         // `IndirectCallType` from a table slot that was only ever padding).
         let dt = Arc::new(DomainTable::new(&self.funcs, 0));
         let mem = caller.map(|m| {
-            let back = m.twin_backing(m.window.reserved());
+            let back = m.twin_backing(self.window, m.window.reserved());
             m.exec_window(
                 back,
+                self.window,
                 &self.module.data,
                 self.null_guard,
                 self.args.as_deref(),
@@ -7417,8 +7420,8 @@ impl Scheduler {
     /// [`Self::fork_vcpu`] mints a twin — the same capacity gate, pid space and burn rule, reapable
     /// by its parent alone — with nothing of the caller copied. Its powerbox is the caller's
     /// duplicate with the spawn's staged state committed ([`Host::spawn_powerbox`]), and its image
-    /// is built there as `Step::Exec`'s is ([`admit_exec`]), in a fresh window of the caller's
-    /// geometry. The caller is re-admitted with the pid, or `-EAGAIN` when no process could be
+    /// is built there as `Step::Exec`'s is ([`admit_exec`]), in a fresh window of its declared
+    /// memory. The caller is re-admitted with the pid, or `-EAGAIN` when no process could be
     /// minted; a process whose image cannot be built exits as it is born ([`Host::spawn_failed`]).
     fn spawn_vcpu(self: &Arc<Self>, v: Box<VCpu>, req: SpawnReq) {
         let SpawnReq { cmd, plan } = req;
@@ -9881,13 +9884,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // keeping its `TaskId` + fuel, then loop back to run it (like the page-fault fast lane, no
             // run-queue round trip). All fallible work was done in the eval loop; this is infallible.
             Step::Exec(req) => {
-                // The command's image, in a fresh window of the caller's geometry: an exec replaces
+                // The command's image, in a fresh window of its declared memory: an exec replaces
                 // the address space, and the caller's window is released with it.
                 let caller = v.mem.take();
                 let fuel = std::mem::replace(&mut v.fuel, Fuel::fixed(0));
                 let (depth, id, sched_ref) = (v.depth, v.id, v.sched.clone());
                 // #2001 — the process's budget charges carry over: its `spawn`, and a detached
-                // child's window lease (the fresh window has the caller's geometry).
+                // child's window lease, which pays for what it paid for (`Host::exec_image`).
                 let live = std::mem::replace(&mut v.live, LiveVcpu::none());
                 let lease = v.window_lease.take();
                 *v = req.into_vcpu(caller.as_ref(), fuel, depth, id, sched_ref);
@@ -13250,7 +13253,7 @@ fn build_exec_req(
 ) -> Result<Box<ExecReq>, i64> {
     // The tree-walker's own gates: a durable domain's subtree must stay snapshottable, and only a
     // clean root context (no serve handler / fibers) can be replaced. Everything else — the command,
-    // its entry, the window fit (the caller's backed prefix), the grants — is the one rule every
+    // its entry, the window fit (the caller's reservation), the grants — is the one rule every
     // engine admits by, `Host::exec_module` + `Host::exec_image`. Anything refused is a probeable
     // errno that leaves the caller running (POSIX `execve` returns only on failure).
     if durable || !clean_root {
@@ -13282,18 +13285,12 @@ fn admit_exec(
     let (command, img) = {
         let mut h = host.lock_unpoisoned();
         let command = h.exec_module(cmd)?;
-        let img = h.exec_image(
-            &command,
-            &grants,
-            entry,
-            size_log2,
-            m.window.mapped(),
-            m.window.reserved(),
-        )?;
+        let img = h.exec_image(&command, &grants, entry, size_log2, m.window.reserved())?;
         (command, img)
     };
     let (funcs, types) = command.0.tables();
     let req = Box::new(ExecReq {
+        window: img.child_size,
         null_guard: temen_ir::module_null_guard(),
         funcs,
         types,
@@ -16233,8 +16230,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 // hand `dispatch` an [`Inner::Exec`] to rebuild this vCPU as the command. On success it
                 // never returns; on any refusal it pushes a probeable `-EINVAL` and falls through (the
                 // guest's continuation survives — POSIX `execve` returns only on failure). Increment 1:
-                // reuses the caller's window (command memory must equal it), non-durable domains only,
-                // and only from a clean root computation (no serve handler / active fibers).
+                // non-durable domains only, and only from a clean root computation (no serve handler /
+                // active fibers).
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_EXEC,
@@ -20164,8 +20161,8 @@ pub trait GuestMem {
     fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()>;
 
     /// The logical window size in bytes — `[0, window_size)` is this domain's confinement bound
-    /// (invariant 2). FORK.md §8.6 / #773: `exec_module` reuses the caller's window, so it admits a
-    /// command whose declared memory **fits** this size (a larger window is a safe superset). The
+    /// (invariant 2), its reservation. FORK.md §8.6: an exec admits a command whose declared memory
+    /// **fits** this size, and runs it in a window of that memory inside it (#773, #2332). The
     /// default `0` means "unknown / no window" — a domain that can't host an exec.
     fn window_size(&self) -> u64 {
         0
@@ -23696,8 +23693,13 @@ pub struct Host {
     /// ancestor and handed back with its growth: a run's root's, from when an activation opens
     /// ([`Host::begin_activation`], #2113), a fork twin's copy of its parent's window, a spawned
     /// process's fresh one ([`Host::process_powerbox`]). `0` for a detached child, whose window its
-    /// admission lease pays for. An exec keeps it, as the image's window is the caller's size.
+    /// admission lease pays for. An exec moves it to the image's window ([`Host::exec_image`], #2332).
     own_window: u64,
+    /// #2332 — the bytes of this domain's window its admission lease pays for ([`Lease::bytes`]): a
+    /// detached child's declared window, which its spawner holds until the child ends. `0` for every
+    /// other domain, whose [`Self::own_window`] pays for all of its window. An exec pays for its
+    /// image's window less this.
+    leased: u64,
     /// #2113 — whether `own_budget` holds the one `spawn` of a run's root main vCPU, charged when an
     /// activation opens ([`Host::begin_activation`]) and handed back with the window. A detached
     /// child's first vCPU rides its admission lease instead.
@@ -24693,6 +24695,7 @@ impl Host {
             own_budget: BudgetTree::RUN_NODE,
             grown: 0,
             own_window: 0,
+            leased: 0,
             main_vcpu: false,
             runs: WINDOW_RUNS,
             paid_runs: WINDOW_RUNS,
@@ -27889,7 +27892,7 @@ impl Host {
         };
         let held = [(BUDGET_MAPS, lease.maps()), (RESERVED, lease.reserved())];
         self.budgets.add(node, &held, Fits::Forced);
-        child.paid_runs = lease.runs;
+        (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
         Some(lease)
     }
 
@@ -27911,7 +27914,7 @@ impl Host {
         if let Some(node) = self.budget_node(lease.budget) {
             child.budgets = Arc::clone(&self.budgets);
             child.own_budget = node;
-            child.paid_runs = lease.runs;
+            (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
             if let Some(h) = child.try_grant(cap_id::BUDGET, Binding::Budget(node)) {
                 child.cap_names.insert(0, ("budget".to_string(), h));
             }
@@ -32012,11 +32015,19 @@ impl Host {
     /// FORK.md §8.6 / #1768 — **admit and build** an `execve` image-replace: the one rule every engine
     /// admits an exec by, and the one place its new powerbox is built. The command `m`
     /// ([`Self::exec_module`]) is entered at `entry`, which must be a shape a §14 child may enter by
-    /// ([`bytecode::child_entry_ok`]); its declared memory must fit `window_mapped`, the caller's
-    /// **backed prefix** (the image-replace runs where the caller did, and pages past the backed prefix
-    /// have no backing); and every inherited grant must be regrantable. Then the fresh powerbox is
-    /// built ([`Self::spawn_child_powerbox`]) and the process state carried into it
+    /// ([`bytecode::child_entry_ok`]); its declared memory must fit `window_reserved`, the
+    /// reservation the image runs in; and every inherited grant must be regrantable. Then the fresh
+    /// powerbox is built ([`Self::spawn_child_powerbox`]) and the process state carried into it
     /// ([`Self::exec_carry`]).
+    ///
+    /// The image runs in a window of its **declared memory** ([`ExecImage::child_size`]), as a §14
+    /// child does (INVARIANTS #13), whatever the size of the caller's: a program gets the window it
+    /// was linked for however it was started, and its heap grows past it with `vm_map` as it would
+    /// have as a root. A process tree whose processes all took its root's window zeroed that much for
+    /// each one, whatever it ran (#2332). So a shell in a small window execs a large program, and the
+    /// domain pays for the image's window, less what its admission lease pays ([`Self::leased`]): an
+    /// image larger than the window it replaces charges the difference first, all or nothing, and one
+    /// smaller hands the difference back. `size_log2` stays an advisory hint, as since #773.
     ///
     /// The new image attests what the caller did (PROCESS.md §6): an exec replaces the image, not
     /// the domain, so the placement and the ancestors' rights over it are the caller's. A
@@ -32031,8 +32042,9 @@ impl Host {
     /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
     ///
     /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
-    /// `-E2BIG` for a command whose declared window does not fit the caller's, `-ENOMEM` for one whose
-    /// window's runs of page state its budget has no `maps` for (#2268), `-EINVAL` otherwise.
+    /// `-E2BIG` for a command whose declared window does not fit the reservation, `-ENOMEM` for one
+    /// whose window, or its runs of page state (#2268), its budget has no room for, `-EINVAL`
+    /// otherwise.
     /// `Ok` is the commit point: the caller's powerbox has handed its personality to the new image,
     /// so the engine must now replace the image. The engine-specific gates (a durable domain, a
     /// context that cannot be replaced — a fiber, a serve handler, sibling threads) are the caller's
@@ -32043,7 +32055,6 @@ impl Host {
         grants: &[(String, i32)],
         entry: u64,
         size_log2: i64,
-        window_mapped: u64,
         window_reserved: u64,
     ) -> Result<ExecImage, i64> {
         let g = &m.0;
@@ -32051,35 +32062,34 @@ impl Host {
         let arity = bytecode::child_entry_ok(&f.params, &f.results)
             .then_some(f.params.len())
             .ok_or(EINVAL)?;
-        let win_log2 = window_mapped
-            .is_power_of_two()
-            .then(|| window_mapped.trailing_zeros() as u8)
-            .ok_or(EINVAL)?;
         let memory_log2 = g.memory_log2().ok_or(EINVAL)?;
         if !(0..64).contains(&size_log2)
             || !window_reserved.is_power_of_two()
-            || window_reserved < window_mapped
             || !grants.iter().all(|(_, h)| self.can_regrant(*h))
         {
             return Err(EINVAL);
         }
-        if memory_log2 > win_log2 {
-            return Err(E2BIG);
-        }
+        let child_size = 1u64
+            .checked_shl(memory_log2.into())
+            .filter(|&size| size <= window_reserved)
+            .ok_or(E2BIG)?;
         // #2268 — the image's window may start with more runs of page state than the caller's holds
-        // `maps` for: what the image's bound needs past those is charged first, all or nothing, and
-        // handed back if a later step refuses.
+        // `maps` for, and (#2332) be larger than the window the domain pays for: what the image needs
+        // past those is charged first, all or nothing, and handed back if a later step refuses.
         let runs = window_runs_bound(&g.module.data, false);
         let need = runs.saturating_sub(self.paid_runs);
-        let more = need.saturating_sub(self.maps);
-        if more > 0 && !self.budgets.charge(self.own_budget, BUDGET_MAPS, more) {
+        let window = child_size.saturating_sub(self.leased);
+        let more = [
+            (BUDGET_MAPS, need.saturating_sub(self.maps)),
+            (BUDGET_MEM, window.saturating_sub(self.own_window)),
+        ];
+        if !self.budgets.add(self.own_budget, &more, Fits::All) {
             return Err(ENOMEM);
         }
         let refused = |h: &Host| {
-            h.budgets.refund(h.own_budget, BUDGET_MAPS, more);
+            h.budgets.refund_set(h.own_budget, &more);
             EINVAL
         };
-        let child_size = 1u64 << win_log2;
         let Some((mut host, ci, ca)) =
             self.spawn_child_powerbox(grants, window_reserved, self.attestation, None, None)
         else {
@@ -32101,9 +32111,15 @@ impl Host {
         if carried.is_err() {
             return Err(refused(self));
         }
-        // #2106 — committed: the window is the caller's size, so a declared window the domain paid
-        // for itself stays paid for, as a root's main vCPU stays charged (#2113).
-        host.own_window = std::mem::take(&mut self.own_window);
+        // #2106, #2332 — committed: the domain pays for the image's window now, as a root's main vCPU
+        // stays charged (#2113). What it needed past the caller's was charged above; what the
+        // caller's held past it goes back. A lease goes on paying for what it paid for.
+        let paid = std::mem::take(&mut self.own_window);
+        if paid > window {
+            self.budgets
+                .refund(self.own_budget, BUDGET_MEM, paid - window);
+        }
+        (host.own_window, host.leased) = (window, self.leased);
         host.main_vcpu = std::mem::take(&mut self.main_vcpu);
         // #2268 — and so is the domain's own share of the host's mappings, and its window's: what the
         // caller's held, settled to the image's bound, and to the runs its window starts with once it
@@ -34394,7 +34410,7 @@ impl Mem {
             reserved_log2: reserved.trailing_zeros() as u8,
             mapped_log2: mapped.trailing_zeros() as u8,
             shadow: Some(self.shadow),
-            back: Some(Arc::new(self.twin_backing(reserved))),
+            back: Some(Arc::new(self.twin_backing(mapped, reserved))),
             seed: &self.window_snapshot(),
             ..WindowSpec::default()
         });
@@ -34423,13 +34439,15 @@ impl Mem {
         Some(twin)
     }
 
-    /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing. Emitted
-    /// `win + addr` code can serve the twin's window only over a flat backing; otherwise the tier-up
-    /// `tierup_servable` gate strips its bitmap and it interprets.
+    /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing, or an exec'd
+    /// image's ([`Mem::exec_window`]), whose backed prefix is `mapped` bytes: the twin's is my
+    /// window's, the image's its declared memory (#2332). Emitted `win + addr` code can serve the
+    /// window only over a flat backing; otherwise the tier-up `tierup_servable` gate strips its
+    /// bitmap and it interprets.
     /// - When my backing grows in place ([`Region::Growable`]: a cooperative tier-up run's root
-    ///   window, or a detached child's in such a run, #2102), the twin's does too, sized to my
-    ///   window, on every target. Only a run with a single owner builds one, and the twin is in
-    ///   that run.
+    ///   window, or a detached child's in such a run, #2102), the new one does too, `mapped` bytes,
+    ///   on every target. Only a run with a single owner builds one, and the new window is in that
+    ///   run.
     /// - Otherwise [`Region::new`]: a lazy `mmap` on unix, but off unix the non-flat `Sparse`
     ///   table. When that comes back non-flat, this (my) window is itself flat-addressable (the
     ///   browser's `Region::shared` window over the cdylib's linear memory), and the reservation is
@@ -34437,9 +34455,9 @@ impl Mem {
     ///   **owned flat** buffer instead ([`twin_backing_from`](Mem::twin_backing_from)).
     ///
     /// Fail-soft: an allocation failure keeps the default, and the twin then stays interpreted.
-    fn twin_backing(&self, reserved: u64) -> Region {
+    fn twin_backing(&self, mapped: u64, reserved: u64) -> Region {
         if matches!(*self.back, Region::Growable(_)) {
-            if let Some(grows) = Region::growable(self.window.mapped(), self.page) {
+            if let Some(grows) = Region::growable(mapped, self.page) {
                 return grows;
             }
         }
@@ -34785,8 +34803,9 @@ impl Mem {
     }
 
     /// FORK.md §8.6 — the window an `execve` replaces this one with. An exec replaces the address
-    /// space: the new image gets this window's geometry (its reservation, its backed prefix and its
-    /// shadow arena) over `back`, a fresh backing, and nothing else of this window. The caller's bytes
+    /// space: the new image gets this window's reservation and shadow arena, a backed prefix of
+    /// `mapped` bytes (its declared memory, [`ExecImage::child_size`], #2332) over `back`, a fresh
+    /// backing, and nothing else of this window. The caller's bytes
     /// past the image, the pages it `vm_map`ped in the reserved tail and its page protections stay
     /// behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance. Nor
     /// is the caller's window zeroed or copied, which for a compiler's forked child was most of what
@@ -34795,23 +34814,26 @@ impl Mem {
     /// The image arrives as a fresh instantiation's does ([`Mem::from_spec`], #1737): its data
     /// segments written, the `readonly` ones RO, behind the NULL guard (#1094: a null dereference in
     /// an exec'd program faults where the same program loaded fresh faults, and where its emitted
-    /// twin, whose guard compare is baked, faults too, #1896). Admission bounds the image's declared
-    /// window by this one's backed prefix, so every segment lands inside it. One region carries over, the **args region** `[null_guard + EXEC_ARGS_BASE,
+    /// twin, whose guard compare is baked, faults too, #1896). The verifier bounds the image's data
+    /// segments by its declared memory, so every one lands inside its window. One region carries over, the **args region** `[null_guard + EXEC_ARGS_BASE,
     /// null_guard + EXEC_ARGS_END)`: the caller packs `{argc, envc}` and its NUL-packed argv/envp there
     /// right before `exec_module`, and the command's child-entry runtime reads them there (the #801
     /// exec ABI). A personality exec's committed argv (`args`, #1768) is written last, over it.
     fn exec_window(
         &self,
         back: Region,
+        mapped: u64,
         data: &[temen_ir::Data],
         null_guard: u64,
         args: Option<&[u8]>,
     ) -> Mem {
-        let (reserved, mapped) = (self.window.reserved(), self.window.mapped());
+        let reserved = self.window.reserved();
         // The args region rides in as the image's seed, as a host's args blob does for a fresh
         // instantiation: under the data segments, so a segment laid over the region keeps its bytes.
         let args_base = null_guard + EXEC_ARGS_BASE;
-        let args_end = (null_guard + EXEC_ARGS_END).min(mapped);
+        let args_end = (null_guard + EXEC_ARGS_END)
+            .min(mapped)
+            .min(self.window.mapped());
         let mut seed = Vec::new();
         if let Some(carried) = self
             .read_window(args_base, args_end.saturating_sub(args_base) as usize)
@@ -36960,7 +36982,7 @@ mod growth_tests {
         parent.give_child_budget(
             Lease {
                 budget,
-                bytes: 0,
+                bytes: WINDOW,
                 runs: WINDOW_RUNS,
             },
             &mut child,
@@ -36981,10 +37003,11 @@ mod growth_tests {
         host.budgets.used(node, BUDGET_MEM)
     }
 
-    fn command(host: &mut Host) -> ExecModule {
-        let cmd = temen_text::parse_module(
-            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
-        )
+    /// A command declaring `memory_log2`.
+    fn command(host: &mut Host, memory_log2: u8) -> ExecModule {
+        let cmd = temen_text::parse_module(&format!(
+            "memory {memory_log2}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  return v0\n  }}\n}}\n"
+        ))
         .expect("parse");
         let mh = host.grant_module(&cmd);
         host.exec_module(ExecCmd::Granted(mh)).expect("resolves")
@@ -37051,9 +37074,9 @@ mod growth_tests {
     #[test]
     fn an_exec_hands_back_the_growth_of_the_image_it_replaces() {
         let (parent, node, mut child, ..) = grown_child(2 * GROWTH as i64);
-        let command = command(&mut child);
+        let command = command(&mut child, 16);
         let image = child
-            .exec_image(&command, &[], 0, 0, WINDOW, 1 << 20)
+            .exec_image(&command, &[], 0, 0, 1 << 20)
             .expect("admits");
         assert_eq!(
             used(&parent, node),
@@ -37067,9 +37090,9 @@ mod growth_tests {
     fn an_exec_keeps_paying_for_the_window_a_process_paid_for() {
         let (parent, node, child, ..) = grown_child((WINDOW + 2 * GROWTH) as i64);
         let mut twin = child.fork_powerbox(7, WINDOW).expect("the copy fits");
-        let command = command(&mut twin);
+        let command = command(&mut twin, 16);
         let mut image = twin
-            .exec_image(&command, &[], 0, 0, WINDOW, 1 << 20)
+            .exec_image(&command, &[], 0, 0, 1 << 20)
             .expect("admits");
         assert_eq!(
             used(&parent, node),
@@ -37081,6 +37104,82 @@ mod growth_tests {
             used(&parent, node),
             GROWTH as i64,
             "the image's end hands the window back"
+        );
+    }
+
+    /// #2332 — an image larger than the window it replaces runs in the window it declares: the domain
+    /// pays for the difference at the exec, and the image's end hands the whole window back.
+    #[test]
+    fn an_exec_pays_for_an_image_larger_than_its_callers_window() {
+        let (parent, node, child, ..) = grown_child((5 * WINDOW + 2 * GROWTH) as i64);
+        let mut twin = child.fork_powerbox(7, WINDOW).expect("the copy fits");
+        let command = command(&mut twin, 18);
+        let mut image = twin
+            .exec_image(&command, &[], 0, 0, 1 << 20)
+            .expect("admits");
+        assert_eq!(
+            image.child_size,
+            4 * WINDOW,
+            "the window the command declares"
+        );
+        assert_eq!(
+            used(&parent, node),
+            (4 * WINDOW + GROWTH) as i64,
+            "the image's window is charged, and the copy's growth is back"
+        );
+        image.host.release_memory();
+        assert_eq!(used(&parent, node), GROWTH as i64);
+    }
+
+    /// #2332 — an exec whose image needs more window than its budget has room for is refused before
+    /// anything changes, and a command larger than the reservation is `-E2BIG`.
+    #[test]
+    fn an_exec_the_budget_has_no_room_for_changes_nothing() {
+        let (parent, node, child, ..) = grown_child((2 * WINDOW + 2 * GROWTH) as i64);
+        let mut twin = child.fork_powerbox(7, WINDOW).expect("the copy fits");
+        let before = used(&parent, node);
+        let large = command(&mut twin, 18);
+        assert_eq!(
+            twin.exec_image(&large, &[], 0, 0, 1 << 20).err(),
+            Some(ENOMEM)
+        );
+        let huge = command(&mut twin, 21);
+        assert_eq!(
+            twin.exec_image(&huge, &[], 0, 0, 1 << 20).err(),
+            Some(E2BIG)
+        );
+        assert_eq!(used(&parent, node), before, "nothing charged");
+        let fits = command(&mut twin, 16);
+        let image = twin.exec_image(&fits, &[], 0, 0, 1 << 20).expect("admits");
+        assert_eq!(
+            used(&parent, node),
+            (WINDOW + GROWTH) as i64,
+            "the caller's window was still the domain's to hand to the image"
+        );
+        drop(image);
+    }
+
+    /// #2332 — an image runs in the window it declares, however large its caller's: the domain keeps
+    /// paying for that much, and what the caller's window held past it goes back.
+    #[test]
+    fn an_exec_pays_for_the_window_its_image_declares() {
+        let (parent, node, child, ..) = grown_child((4 * WINDOW + 2 * GROWTH) as i64);
+        let mut twin = child.fork_powerbox(7, 4 * WINDOW).expect("the copy fits");
+        let command = command(&mut twin, 16);
+        let mut image = twin
+            .exec_image(&command, &[], 0, 0, 1 << 20)
+            .expect("admits");
+        assert_eq!(image.child_size, WINDOW, "the window the command declares");
+        assert_eq!(
+            used(&parent, node),
+            (WINDOW + GROWTH) as i64,
+            "the caller's window past the image's is back, with the copy's growth"
+        );
+        image.host.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            GROWTH as i64,
+            "the image's end hands its window back"
         );
     }
 
@@ -37200,7 +37299,7 @@ mod exec_maps_tests {
         let mut child = Host::new();
         let lease = Lease {
             budget,
-            bytes: 0,
+            bytes: 1 << 16,
             runs: WINDOW_RUNS,
         };
         parent.give_child_budget(lease, &mut child);
@@ -37218,7 +37317,7 @@ mod exec_maps_tests {
         .expect("parse");
         let mh = host.grant_module(&cmd);
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
-        host.exec_image(&command, &[], 0, 0, 1 << 16, 1 << 20)
+        host.exec_image(&command, &[], 0, 0, 1 << 20)
     }
 
     fn maps(host: &Host, node: u32) -> i64 {
@@ -37824,7 +37923,7 @@ mod fork_powerbox_tests {
         let mh = host.grant_module(&cmd);
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
         let mut image = host
-            .exec_image(&command, &[], 0, 0, 1 << 16, 1 << 16)
+            .exec_image(&command, &[], 0, 0, 1 << 16)
             .expect("admits");
         assert!(
             image.host.resolve(lh, cap_id::MODULE_LOADER).is_ok(),
@@ -37851,7 +37950,7 @@ mod fork_powerbox_tests {
         let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
         let (mapped, reserved) = (1u64 << 16, 1u64 << 20);
         let mut image = host
-            .exec_image(&command, &[], 0, 0, mapped, reserved)
+            .exec_image(&command, &[], 0, 0, reserved)
             .expect("admits");
         let space = image
             .host
@@ -38165,7 +38264,7 @@ mod mem_fork_tests {
             Arc::new(Region::growable(1 << 16, page).expect("64 KiB allocates")),
             None,
         );
-        let b = m.twin_backing(m.window.reserved());
+        let b = m.twin_backing(m.window.mapped(), m.window.reserved());
         assert!(
             b.raw_base().is_some() && b.can_grow(),
             "the twin's backing must be flat and grow in place"

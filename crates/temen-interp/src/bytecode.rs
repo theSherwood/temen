@@ -10592,8 +10592,8 @@ struct ExecBuilt {
 
 /// A personality `posix_spawn` (#1970) task `ti` asked for: mint a process as the fork arm mints a
 /// twin (its pid is its task index + 1, and its parent reaps it) and build its image as the exec arm
-/// builds one, in an env of its own: a fresh window of the caller's geometry, with nothing of the
-/// caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be minted,
+/// builds one, in an env of its own: a fresh window of the image's declared memory, with nothing of
+/// the caller copied. Answers the caller's result, the pid or `-EAGAIN` when no process could be minted,
 /// and the step that starts the child when its image is a leaf. A process whose image cannot be
 /// built still takes its task, done before it ran, so the settle retires it as it retires any
 /// process and no later process is handed its pid.
@@ -11042,8 +11042,8 @@ fn twin_task(parent: &Vm, dst: u32, reply: i64) -> VTask {
 /// given the exec'ing task's current `cur_host` (the old powerbox, drained here) and `cur_mem` (its
 /// window). Resolves + compiles the command, admits it (entry sig, command window `<=` the
 /// caller's), builds the command powerbox ([`Host::exec_image`] — the same build and personality
-/// carry the tree-walker uses), materializes the command image into a fresh window of
-/// the caller's geometry ([`Mem::exec_window`]; flat for a leaf image the host emitted), and pushes
+/// carry the tree-walker uses), materializes the command image into a fresh window of its declared
+/// memory ([`Mem::exec_window`]; flat for a leaf image the host emitted), and pushes
 /// the compiled command as a new domain unit. Returns the rebuilt process ([`ExecBuilt`]) for the
 /// caller to install where the task's `env` points; `Err(())` on any admissibility failure (the
 /// caller then writes a probeable `-EINVAL` and lets the task run on — POSIX: execve returns only
@@ -11076,19 +11076,12 @@ fn exec_image_build(
         .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
     // layout) from the caller window, then admit + build through the one rule every engine shares:
-    // the command's entry, its fit in the caller's backed prefix, the grants' regrantability, the
+    // the command's entry, its fit in the caller's reservation, the grants' regrantability, the
     // fresh powerbox and the personality carry.
     let m = cur_mem.ok_or(super::EINVAL)?;
     let grants = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))
         .map_err(|_| super::EINVAL)?;
-    let img = cur_host.exec_image(
-        &command,
-        &grants,
-        entry,
-        size_log2,
-        m.window.mapped(),
-        m.window.reserved(),
-    )?;
+    let img = cur_host.exec_image(&command, &grants, entry, size_log2, m.window.reserved())?;
     let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
     // #1896 — a leaf image the host emitted runs in a flat window, where emitted code can address
     // it. Chosen only after the commit, and only where the image runs: without a flat backing it
@@ -11112,15 +11105,16 @@ fn exec_image_build(
         };
         emit(&offer).then_some((paged, parks))
     });
-    let flat = leaf.and_then(|l| Some((super::Region::growable(m.window.mapped(), m.page)?, l)));
+    let flat = leaf.and_then(|l| Some((super::Region::growable(img.child_size, m.page)?, l)));
     let (back, leaf) = match flat {
         Some((back, l)) => (back, Some(l)),
-        None => (m.twin_backing(m.window.reserved()), None),
+        None => (m.twin_backing(img.child_size, m.window.reserved()), None),
     };
     // #1768 — a personality exec's staged argv lands only now, at the commit.
     let args = personality.then(|| img.host.exec_commit_args()).flatten();
     let win = m.exec_window(
         back,
+        img.child_size,
         &img.module.data,
         temen_ir::module_null_guard(),
         args.as_deref(),

@@ -1867,7 +1867,7 @@ fn c_a_blocking_pipe_read_across_fork_on_bytecode() {
     // Uses the #972 CorePipe (`PIPE_SHIM`: `pipe`/`read`/`write`/`close` over `__vm_*` with parking) —
     // bash's actual pipe path — not the personality `__px_pipe` (no writer-count blocking).
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n\
+        "{PIPE_SHIM}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static int fds[2];\n\
@@ -1928,7 +1928,7 @@ int main(void) {{\n\
 #[test]
 fn c_a_blocking_pipe_write_backpressure_across_fork_on_bytecode() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n\
+        "{PIPE_SHIM}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static int fds[2];\n\
@@ -1995,7 +1995,7 @@ int main(void) {{\n\
 #[test]
 fn c_a_parked_writer_epipes_when_the_reader_closes_on_bytecode() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n\
+        "{PIPE_SHIM}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_signal(int cap, long signum, long handler);\n\
@@ -3221,7 +3221,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -3280,7 +3280,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"mid\", 0 }};\n\
@@ -3320,7 +3320,7 @@ fn c_an_execd_image_can_exec_the_first_registered_command() {
 int main(void) { return 7; }
 "#;
     let mid = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"rc\", 0 }};\n\
@@ -3337,7 +3337,7 @@ int main(void) {{\n\
 }}\n"
     );
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"mid\", 0 }};\n\
@@ -3427,7 +3427,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"rc\", \"4\", 0 }};\n\
@@ -3466,7 +3466,7 @@ fn c_execvp_walks_path_and_the_errno_split_holds() {
 int main(void) { return 7; }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_stat(int cap, long path, long len, long buf);\n\
@@ -3525,7 +3525,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"px\", \"z\", 0 }};\n\
@@ -3572,18 +3572,17 @@ int main(int argc, char **argv) {
   return argc;
 }
 "#;
-    let src = format!(
-        "{WIN_PAD_17}\n\
+    let src = "\n\
 long __px_pspawn(int cap, long req);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_open(int cap, long path, long len, long flags);\n\
 long __px_read(int cap, long fd, long buf, long len);\n\
-static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static char *av[] = { \"px\", \"z\", 0 };\n\
 static long req[5];\n\
 static long act[8];\n\
 static int status;\n\
 static char buf[8];\n\
-int main(void) {{\n\
+int main(void) {\n\
   long fd = __px_open(0, (long)\"/out\", 4, 66);\n\
   if (fd < 0) return 1;\n\
   act[0] = 2; act[1] = fd; act[2] = 1; act[3] = 0;\n\
@@ -3597,8 +3596,8 @@ int main(void) {{\n\
   if (__px_read(0, rfd, (long)buf, 8) != 4) return 5;\n\
   if (buf[0] != 'C' || buf[3] != '!') return 6;\n\
   return 42;\n\
-}}\n"
-    );
+}\n"
+    .to_string();
     let stage = |host: &mut Host, posix: &Posix| stage_executable(host, posix, "/bin/px", CMD);
     for (driver, e) in [
         ("tree-walker", run_interp_setup(&src, stage)),
@@ -3626,22 +3625,21 @@ int main(void) {
   return 42;
 }
 "#;
-    let src = format!(
-        "{WIN_PAD_17}\n\
+    let src = "\n\
 long __px_pspawn(int cap, long req);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_write(int cap, long fd, long buf, long len);\n\
 static long req[5];\n\
 static int status;\n\
-int main(void) {{\n\
+int main(void) {\n\
   __px_write(0, 1, (long)\">>\", 2);\n\
   req[0] = (long)\"/bin/up\";\n\
   long pid = __px_pspawn(0, (long)req);\n\
   if (pid <= 0) return 100 - pid;\n\
   if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 3;\n\
   return (status >> 8) & 0xff;\n\
-}}\n"
-    );
+}\n"
+    .to_string();
     let stage = |host: &mut Host, posix: &Posix| stage_executable(host, posix, "/bin/up", CMD);
     for (driver, e) in [
         ("tree-walker", run_interp_setup(&src, stage)),
@@ -3666,16 +3664,12 @@ const SH_SHIM: &str = include_str!("../../temen-run/demos/shell/shim.c");
 const SH_RING: &str = include_str!("../../temen-run/demos/shell/ring.c");
 const SH_MAIN: &str = include_str!("../../temen-run/demos/shell/shell_main.c");
 
-/// A caller window big enough to exec the shell into: `exec_module` reuses the caller's window, so
-/// it admits a command only if the command's declared memory fits. The shell declares 2^22.
-const WIN_PAD_23: &str = "static char xs_win_pad23_[6000000];\n";
-
 /// A parent that forks, `execve`s `/bin/sh -c <script>` in the child, and reports the reaped status
 /// as `40 + code` — so a refused exec shows up as `40 + errno`, told apart from any exit the shell
 /// itself chose. Writing `alive` afterwards proves the caller survived either way.
 fn sh_caller(script: &str) -> String {
     format!(
-        "{WIN_PAD_23}\
+        "\
 long __px_execve(int cap, long path, long argv, long envp);\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
@@ -3894,27 +3888,26 @@ int main(int argc, char **argv) {
 }
 "#;
     // No `EXEC_C`: the guest declares the personality op and calls it directly.
-    let src = format!(
-        "{WIN_PAD_17}\
+    let src = "\
 long __px_execve(int cap, long path, long argv, long envp);\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
-static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static char *av[] = { \"px\", \"z\", 0 };\n\
 static int status;\n\
 static long pid; static long h;\n\
-int main(void) {{\n\
+int main(void) {\n\
   pid = __px_fork(0, 0);\n\
   if (pid < 0) return 1;\n\
-  if (pid == 0) {{\n\
+  if (pid == 0) {\n\
     __px_execve(0, (long)\"/bin/px\", (long)av, 0);\n\
     return 99;   /* only reached on refusal — execve does not return on success */\n\
-  }}\n\
+  }\n\
   h = __px_waitpid(0, pid, (long)&status, 0);\n\
   if (h != pid) return 2;\n\
   if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
   return 42;\n\
-}}\n"
-    );
+}\n"
+    .to_string();
     let e = run_interp_setup(&src, |host, posix| {
         stage_executable(host, posix, "/bin/px", CMD);
         posix.set_env("MARK", "y");
@@ -3940,12 +3933,11 @@ int main(void) {{\n\
 /// with it would be a trap where POSIX promises a return value.
 #[test]
 fn c_px_execve_op_refuses_probeably_and_the_caller_survives() {
-    let src = format!(
-        "{WIN_PAD_17}\
+    let src = "\
 long __px_execve(int cap, long path, long argv, long envp);\n\
 long __px_write(int cap, long fd, long buf, long len);\n\
-static char *av[] = {{ \"x\", 0 }};\n\
-int main(void) {{\n\
+static char *av[] = { \"x\", 0 };\n\
+int main(void) {\n\
   /* Nothing at the path at all. */\n\
   if (__px_execve(0, (long)\"/bin/nope\", (long)av, 0) != -2) return 1;\n\
   /* A real memfs file with no executable registration: present, but not a command. */\n\
@@ -3954,8 +3946,8 @@ int main(void) {{\n\
   if (__px_execve(0, (long)\"/bin/nope\", 0, 0) != -2) return 3;\n\
   __px_write(0, 1, (long)\"alive\", 5);\n\
   return 7;\n\
-}}\n"
-    );
+}\n"
+    .to_string();
     let e = run_interp_setup(&src, |_host, posix| {
         posix.write_file("/data.txt", b"not a command");
     });
@@ -3987,27 +3979,26 @@ int main(int argc, char **argv) {
   return argc;
 }
 "#;
-    let src = format!(
-        "{WIN_PAD_17}\
+    let src = "\
 long __px_execve(int cap, long path, long argv, long envp);\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
-static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static char *av[] = { \"px\", \"z\", 0 };\n\
 static int status;\n\
 static long pid; static long h;\n\
-int main(void) {{\n\
+int main(void) {\n\
   pid = __px_fork(0, 0);\n\
   if (pid < 0) return 1;\n\
-  if (pid == 0) {{\n\
+  if (pid == 0) {\n\
     __px_execve(0, (long)\"/bin/px\", (long)av, 0);\n\
     return 99;\n\
-  }}\n\
+  }\n\
   h = __px_waitpid(0, pid, (long)&status, 0);\n\
   if (h != pid) return 2;\n\
   if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
   return 42;\n\
-}}\n"
-    );
+}\n"
+    .to_string();
     let e = run_bytecode_setup(&src, |host, posix| {
         stage_executable(host, posix, "/bin/px", CMD);
     });
@@ -4033,7 +4024,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_write(int cap, long fd, long buf, long len);\n\
 long write2(long fd, void *b, long n) {{ return __px_write(0, fd, (long)b, n); }}\n\
 static char *av[] = {{ \"bad\", 0 }};\n\
@@ -4081,7 +4072,7 @@ int main(void) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -4162,7 +4153,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"s\", \"tail\", 0 }};\n\
@@ -4625,13 +4616,6 @@ int main(void) {{\n\
 
 const UTIL_C: &str = include_str!("../../temen-run/demos/posix_utils/util.c");
 
-/// Pads a witness DRIVER's window to ml >= 17: `exec` runs a command **in the caller's window**,
-/// so the caller's committed extent must fit the command's declared image — and the /bin tools
-/// (util.c + their statics) declare ml=17. Without the pad a small driver's exec is a clean
-/// `-EINVAL` refusal (the admissibility gate bounds by the committed extent), which is honest but
-/// not what these witnesses are for.
-const WIN_PAD_17: &str = "static char xs_win_pad_[65536];\n";
-
 /// Compile and register `/bin/<name>` for each requested tool. Staging only
 /// what a witness needs keeps the per-test chibicc cost proportional.
 fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
@@ -4795,7 +4779,7 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
 #[test]
 fn c_coreutils_pipeline_seq_head_wc() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -4891,7 +4875,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_sort_uniq_counts() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -4982,7 +4966,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_cut_fields_and_chars() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5065,7 +5049,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_tail_tac_rev_nl_fold() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5150,7 +5134,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_basename_dirname() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5233,7 +5217,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_fs_writes() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5347,7 +5331,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_recursive_rm_cp() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
@@ -5435,7 +5419,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_grep_matches_and_exit_codes() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5498,7 +5482,7 @@ int main(void) {{\n\
 #[test]
 fn c_coreutils_smoke_echo_cat_ls_pwd_true_false() {
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_dup2(int cap, long o, long n);\n\
@@ -5585,7 +5569,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
@@ -5631,7 +5615,7 @@ int main(int argc, char **argv) {
 }
 "#;
     let src = format!(
-        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+        "{PIPE_SHIM}\n{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 static char *av[] = {{ \"c\", \"x\", 0 }};\n\
@@ -5936,7 +5920,7 @@ int main(void){
 
 fn zexec_src() -> String {
     format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_signal(int cap, long signum, long handler);\n\
 long __px_sigaltstack(int cap, long sp, long size);\n\
 long __px_fork(int cap, long a);\n\
@@ -6022,7 +6006,7 @@ fn c_terminal_ctrl_z_stops_an_execd_foreground_command_and_the_shell_reports_it(
 
 fn zintr_src() -> String {
     format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_signal(int cap, long signum, long handler);\n\
 long __px_sigaltstack(int cap, long sp, long size);\n\
 long __px_fork(int cap, long a);\n\
@@ -6177,7 +6161,7 @@ fn c_a_stopped_job_wakes_a_shell_wait_without_async_sigchld() {
 
 fn zfg2_src() -> String {
     format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_signal(int cap, long signum, long handler);\n\
 long __px_sigaltstack(int cap, long sp, long size);\n\
 long __px_fork(int cap, long a);\n\
@@ -6267,8 +6251,7 @@ fn c_terminal_fg_resumes_a_stopped_execd_job_then_restops_it() {
 }
 
 fn mjobs_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6283,18 +6266,18 @@ static int status;\n\
 static long pa, pb;\n\
 static int fa[2]; static int fb[2];\n\
 static char buf[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
-static void wr1(int fd){{ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+static long rd1(int fd){ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }\n\
+static void wr1(int fd){ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }\n\
+int main(void){\n\
   int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
   int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
   pa = __px_fork(0,0);\n\
   if (pa < 0) return 1;\n\
-  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  if (pa == 0){ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 2;\n\
-  if (pb == 0){{ __px_setpgid(0,0,0); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,0); if (rd1(fb[0])<=0) return 91; return 9; }\n\
   __px_setpgid(0, pa, pa);\n\
   __px_setpgid(0, pb, pb);\n\
   /* stop BOTH background groups; the per-op stop poll parks each job stopped even though the stop\n\
@@ -6302,29 +6285,28 @@ int main(void){{\n\
   __px_kill(0, -pa, 20);\n\
   __px_kill(0, -pb, 20);\n\
   int sa=0, sb=0, k;\n\
-  for (k=0;k<2;k++){{\n\
-    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){{}}\n\
+  for (k=0;k<2;k++){\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){}\n\
     if (h < 0) return 100+k;\n\
     if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
     if (h==pa) sa++; else if (h==pb) sb++; else return 200+k;\n\
-  }}\n\
+  }\n\
   if (sa!=1 || sb!=1) return 300;\n\
   __px_kill(0,-pa,18); __px_kill(0,-pb,18);\n\
   wr1(fa[1]); wr1(fb[1]);\n\
   int ea=0, eb=0;\n\
-  for (k=0;k<2;k++){{\n\
-    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+  for (k=0;k<2;k++){\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){}\n\
     if (h < 0) return 4000 + (int)(-h);\n\
     if ((status & 0x7f) != 0) return 500 + (status & 0xffff);\n\
     int code = (status>>8)&0xff;\n\
-    if (h==pa){{ if(code!=7) return 601; ea++; }}\n\
-    else if (h==pb){{ if(code!=9) return 602; eb++; }}\n\
+    if (h==pa){ if(code!=7) return 601; ea++; }\n\
+    else if (h==pb){ if(code!=9) return 602; eb++; }\n\
     else return 603;\n\
-  }}\n\
+  }\n\
   if (ea!=1 || eb!=1) return 700;\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 // #798 multiple concurrent jobs — the personality carries SEVERAL jobs at once, each in its own
@@ -6394,8 +6376,7 @@ fn c_stop_continue_reap_dispatch_is_reorder_free_under_stress() {
 }
 
 fn pipejob_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6410,53 +6391,51 @@ static int status;\n\
 static long pa, pb;\n\
 static int fa[2]; static int fb[2];\n\
 static char buf[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
-static void wr1(int fd){{ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+static long rd1(int fd){ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }\n\
+static void wr1(int fd){ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }\n\
+int main(void){\n\
   int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
   int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
   pa = __px_fork(0,0);\n\
   if (pa < 0) return 1;\n\
-  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  if (pa == 0){ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 2;\n\
   /* the SECOND stage joins the FIRST's group: the pipeline is ONE job in one process group */\n\
-  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }\n\
   __px_setpgid(0, pa, pa);\n\
   __px_setpgid(0, pb, pa);\n\
   /* stop the WHOLE pipeline with one group signal — it must reach BOTH parked members. */\n\
   __px_kill(0, -pa, 20);\n\
   int sa=0, sb=0, k;\n\
-  for (k=0;k<2;k++){{\n\
-    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){{}}\n\
+  for (k=0;k<2;k++){\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){}\n\
     if (h < 0) return 100+k;\n\
     if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
     if (h==pa) sa++; else if (h==pb) sb++; else return 200+k;\n\
-  }}\n\
+  }\n\
   if (sa!=1 || sb!=1) return 300;\n\
   /* continue the whole group with one signal, feed both stages, reap both. */\n\
   __px_kill(0,-pa,18);\n\
   wr1(fa[1]); wr1(fb[1]);\n\
   int ea=0, eb=0;\n\
-  for (k=0;k<2;k++){{\n\
-    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+  for (k=0;k<2;k++){\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){}\n\
     if (h < 0) return 4000 + (int)(-h);\n\
     if ((status & 0x7f) != 0) return 500 + (status & 0xffff);\n\
     int code = (status>>8)&0xff;\n\
-    if (h==pa){{ if(code!=7) return 601; ea++; }}\n\
-    else if (h==pb){{ if(code!=9) return 602; eb++; }}\n\
+    if (h==pa){ if(code!=7) return 601; ea++; }\n\
+    else if (h==pb){ if(code!=9) return 602; eb++; }\n\
     else return 603;\n\
-  }}\n\
+  }\n\
   if (ea!=1 || eb!=1) return 700;\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 fn pipekill_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6469,32 +6448,31 @@ static int status;\n\
 static long pa, pb;\n\
 static int fa[2]; static int fb[2];\n\
 static char buf[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+static long rd1(int fd){ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }\n\
+int main(void){\n\
   int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
   int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
   pa = __px_fork(0,0);\n\
   if (pa < 0) return 1;\n\
-  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  if (pa == 0){ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 2;\n\
-  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }\n\
   __px_setpgid(0, pa, pa);\n\
   __px_setpgid(0, pb, pa);\n\
   /* ^C the whole pipeline: SIGINT (no handler ⇒ TERMINATE) must reach and kill BOTH parked members. */\n\
   __px_kill(0, -pa, 2);\n\
   int ka=0, kb=0, k;\n\
-  for (k=0;k<2;k++){{\n\
-    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+  for (k=0;k<2;k++){\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){}\n\
     if (h < 0) return 100+k;\n\
     if ((status & 0x7f) != 2) return 2000 + (status & 0xffff);  /* both WIFSIGNALED(SIGINT) */\n\
     if (h==pa) ka++; else if (h==pb) kb++; else return 200+k;\n\
-  }}\n\
+  }\n\
   if (ka!=1 || kb!=1) return 300;\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 // #798/#1262 pipeline terminate — ^C of a foreground pipeline must kill EVERY stage. Two twins share
@@ -6529,8 +6507,7 @@ fn c_foreground_pipeline_group_is_terminated_by_a_group_sigint() {
 }
 
 fn reapkill_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6545,33 +6522,32 @@ static long s, g;\n\
 static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
 static int fs[2];  /* subshell -> root sync pipe */\n\
 static char buf[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
-static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+static long rd1(int fd){ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }\n\
+static void wr1(int fd){ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }\n\
+int main(void){\n\
   int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
   int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
   s = __px_fork(0,0);\n\
   if (s < 0) return 1;\n\
-  if (s == 0){{\n\
+  if (s == 0){\n\
     /* the subshell: fork a grandchild that blocks forever, then PARK in waitpid on it. */\n\
     g = __px_fork(0,0);\n\
     if (g < 0) return 80;\n\
-    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    if (g == 0){ if (rd1(fb[0]) <= 0) return 81; return 5; }\n\
     wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
-    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){}\n\
     return 7;    /* only if g exits before we are killed */\n\
-  }}\n\
+  }\n\
   /* root: wait until the subshell is about to park, then KILL it while it blocks in waitpid. */\n\
   rd1(fs[0]);\n\
   __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid */\n\
   wr1(fb[1]);                  /* release the grandchild so its OS thread returns (no orphan hang) */\n\
-  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){}\n\
   if (h != s) return 100;\n\
   if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 // #1267 follow-up — terminate a twin PARKED in `waitpid` (a subshell blocked reaping its own child,
@@ -6612,8 +6588,7 @@ fn c_terminate_a_twin_parked_in_waitpid() {
 /// [`reapkill_src`] with the kill as the only way out: root releases the grandchild only *after*
 /// reaping the subshell, so nothing but the kill itself can wake the subshell's `waitpid` park.
 fn reapkill_only_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6628,31 +6603,30 @@ static long s, g;\n\
 static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
 static int fs[2];  /* subshell -> root sync pipe */\n\
 static char buf[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
-static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+static long rd1(int fd){ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }\n\
+static void wr1(int fd){ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }\n\
+int main(void){\n\
   int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
   int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
   s = __px_fork(0,0);\n\
   if (s < 0) return 1;\n\
-  if (s == 0){{\n\
+  if (s == 0){\n\
     g = __px_fork(0,0);\n\
     if (g < 0) return 80;\n\
-    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    if (g == 0){ if (rd1(fb[0]) <= 0) return 81; return 5; }\n\
     wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
-    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){}\n\
     return 7;    /* unreachable: g is released only after we are reaped */\n\
-  }}\n\
+  }\n\
   rd1(fs[0]);\n\
   __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid — the only wake there is */\n\
-  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){}\n\
   if (h != s) return 100;\n\
   if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
   wr1(fb[1]);                  /* only now release the grandchild, so its thread returns */\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 /// A twin parked in `waitpid` on a child that cannot exit first dies to a kill — on every driver.
@@ -6790,8 +6764,7 @@ fn c_terminal_ctrl_d_before_the_read_still_ends_it() {
 }
 
 fn ttin_bg_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_setpgid(int cap, long pid, long pgid);\n\
@@ -6800,18 +6773,17 @@ long __vm_read(int fd, void *buf, long len);\n\
 static int status;\n\
 static long pb;\n\
 static char b[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+int main(void){\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 1;\n\
-  if (pb == 0){{ __px_setpgid(0,0,0); long r; do {{ r=__px_read(0,0,(long)b,8); }} while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,0); long r; do { r=__px_read(0,0,(long)b,8); } while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }\n\
   __px_setpgid(0, pb, pb);\n\
-  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){}\n\
   if (h != pb) return 100;\n\
   if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
   return 5000 + ((status>>8)&0xff);\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 // #798/#1198 — a **background** process reading the controlling terminal is stopped by SIGTTIN. A
@@ -6841,7 +6813,7 @@ fn c_a_background_terminal_read_is_stopped_by_sigttin() {
 
 fn bgexec_src() -> String {
     format!(
-        "{WIN_PAD_17}{EXEC_C}\n\
+        "{EXEC_C}\n\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_setpgid(int cap, long pid, long pgid);\n\
@@ -6917,8 +6889,7 @@ fn c_a_execd_background_terminal_read_is_stopped_by_sigttin() {
 }
 
 fn ttou_bg_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_setpgid(int cap, long pid, long pgid);\n\
@@ -6926,18 +6897,18 @@ long __px_write(int cap, long fd, long buf, long len);\n\
 static int status;\n\
 static long pb;\n\
 static char msg[3];\n\
-int main(void){{\n\
+int main(void){\n\
   msg[0]='h'; msg[1]='i'; msg[2]='\\n';\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 1;\n\
-  if (pb == 0){{ __px_setpgid(0,0,0); __px_write(0,1,(long)msg,3); return 7; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,0); __px_write(0,1,(long)msg,3); return 7; }\n\
   __px_setpgid(0, pb, pb);\n\
-  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){}\n\
   if (h != pb) return 100;\n\
   if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
   return 5000 + ((status>>8)&0xff);\n\
-}}\n"
-    )
+}\n"
+    .to_string()
 }
 
 // #1198 — the TTOU counterpart to the SIGTTIN stop: a **background write** to the terminal must NOT
@@ -6966,8 +6937,7 @@ fn c_a_background_terminal_write_does_not_stop_without_tostop() {
 }
 
 fn bgcont_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
@@ -6977,15 +6947,15 @@ long __vm_read(int fd, void *buf, long len);\n\
 static int status;\n\
 static long pb;\n\
 static char b[8];\n\
-static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
-int main(void){{\n\
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }\n\
+int main(void){\n\
   pb = __px_fork(0,0);\n\
   if (pb < 0) return 1;\n\
-  if (pb == 0){{ __px_setpgid(0,0,0); long r; do {{ r=__px_read(0,0,(long)b,8); }} while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }}\n\
+  if (pb == 0){ __px_setpgid(0,0,0); long r; do { r=__px_read(0,0,(long)b,8); } while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }\n\
   __px_setpgid(0, pb, pb);\n\
   long h;\n\
   /* first stop: the background read raises SIGTTIN */\n\
-  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){}\n\
   if (h != pb) return 100;\n\
   if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
   if (((status>>8)&0xff) != 21) return 3000 + ((status>>8)&0xff);\n\
@@ -6994,12 +6964,11 @@ int main(void){{\n\
   /* second wait (WUNTRACED only): the resumed reader must re-issue its terminal read,\n\
      SIGTTIN-stop AGAIN, and NOT steal the line fed into the race window. A re-stop is\n\
      4021; a steal (the reader consumed the fed line and exited 7) is 5007. */\n\
-  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){}\n\
   if (h != pb) return 101;\n\
   if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
   return 5000 + ((status>>8)&0xff);\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 // #1198 tail — `bg` of a SIGTTIN-stopped terminal reader must RE-stop it, not steal the shell's
@@ -7033,26 +7002,25 @@ fn c_bg_of_a_stopped_terminal_reader_restops_without_stealing_input() {
 }
 
 fn killspin_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
 static int status;\n\
 static long pid;\n\
 static volatile long spin;\n\
-int main(void){{\n\
+int main(void){\n\
   pid = __px_fork(0,0);\n\
   if (pid < 0) return 1;\n\
-  if (pid == 0){{ while(spin == 0){{}} return 5; }}\n\
+  if (pid == 0){ while(spin == 0){} return 5; }\n\
   if (__px_kill(0, pid, 9) != 0) return 2;\n\
-  long h; while ((h = __px_waitpid(0, pid, (long)&status, 0)) == -4){{}}\n\
+  long h; while ((h = __px_waitpid(0, pid, (long)&status, 0)) == -4){}\n\
   if (h != pid) return 3;\n\
   if ((status & 0x7f) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
   if ((status & 0x7f) != 0) return 3000 + (status & 0x7f);\n\
   return 5000 + ((status>>8)&0xff);\n\
-}}\n"
-    )
+}\n"
+    .to_string()
 }
 
 // #1215 — the **default-action terminate** path across engines (invariant 14). A parent forks a
@@ -7092,31 +7060,30 @@ fn c_a_sigkill_terminates_a_running_child_and_waitpid_reports_the_signal() {
 }
 
 fn killstopped_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 long __px_kill(int cap, long pid, long sig);\n\
 long __px_sigcheck(int cap, long a);\n\
 static int status;\n\
 static long pid;\n\
-int main(void){{\n\
+int main(void){\n\
   pid = __px_fork(0,0);\n\
   if (pid < 0) return 1;\n\
-  if (pid == 0){{ while(__px_sigcheck(0,0) != 77){{}} return 5; }}\n\
+  if (pid == 0){ while(__px_sigcheck(0,0) != 77){} return 5; }\n\
   if (__px_kill(0, pid, 20) != 0) return 2;\n\
-  long h; while ((h=__px_waitpid(0, pid, (long)&status, 2)) == -4){{}}\n\
+  long h; while ((h=__px_waitpid(0, pid, (long)&status, 2)) == -4){}\n\
   if (h != pid) return 3;\n\
   if ((status & 0xff) != 0x7f) return 4;\n\
   if (((status>>8)&0xff) != 20) return 6;\n\
   if (__px_kill(0, pid, 9) != 0) return 7;\n\
-  while ((h=__px_waitpid(0, pid, (long)&status, 0)) == -4){{}}\n\
+  while ((h=__px_waitpid(0, pid, (long)&status, 0)) == -4){}\n\
   if (h != pid) return 8;\n\
   if ((status & 0x7f) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
   if ((status & 0x7f) != 0) return 3000 + (status & 0x7f);\n\
   return 5000 + ((status>>8)&0xff);\n\
-}}\n"
-    )
+}\n"
+    .to_string()
 }
 
 // #1215 — SIGKILL of a **stopped** child (the browser `kill -9 %n` of a `^Z`/`SIGTTIN`-stopped bg
@@ -7232,29 +7199,27 @@ int main(void) {{\n\
 /// main thread reaps as — not the `return 7` it never reached) and return 42. The tree-walker was
 /// the one driver that lost the exit; the bytecode drivers are pinned alongside as the differential.
 fn twin_thread_trap_src() -> String {
-    format!(
-        "{WIN_PAD_17}\
+    "\
 long __px_fork(int cap, long a);\n\
 long __px_waitpid(int cap, long pid, long status, long opts);\n\
 int  __vm_thread_spawn(long (*fn)(long), void *stack, long arg);\n\
 long __vm_thread_join(int h);\n\
 static int status;\n\
 static volatile long zero;\n\
-long boom(long arg){{ return 1 / zero; }}\n\
-int main(void){{\n\
+long boom(long arg){ return 1 / zero; }\n\
+int main(void){\n\
   long s = __px_fork(0,0);\n\
   if (s < 0) return 1;\n\
-  if (s == 0){{\n\
+  if (s == 0){\n\
     int t = __vm_thread_spawn(boom, (void *)0, 0);\n\
     __vm_thread_join(t);\n\
     return 7;    /* unreachable: the thread's trap tears this process down */\n\
-  }}\n\
-  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  }\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){}\n\
   if (h != s) return 100;\n\
   if (status != (128 << 8)) return 2000 + status;  /* the crash status 128, as a trap on main reaps */\n\
   return 42;\n\
-}}\n"
-    )
+}\n".to_string()
 }
 
 #[test]

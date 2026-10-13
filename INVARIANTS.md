@@ -98,7 +98,9 @@ process) is one `spawn` of the domain's node from when it is made until it ends,
 as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posix_spawn` return
 `-EAGAIN`) (#2001). A fork twin's copy of its parent's window and a spawned process's window are new
 windows, charged to `mem` of that node, the twin's with the growth it copies, before the process
-exists, and handed back when it ends; an exec keeps the charge (#2106, #2110). A thaw re-charges the
+exists, and handed back when it ends; an exec moves the charge to its image's window, the image's
+declared memory: what that needs past the caller's window is charged first, all or nothing, and what
+the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges the
 threads it re-creates. On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
 the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings

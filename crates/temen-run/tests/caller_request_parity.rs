@@ -193,9 +193,37 @@ block 2 () {\n\
   }\n\
 }\n";
 
-/// A 64 KiB command that reports what is at 96 KiB, past its own image, plus 7: `7` in a fresh
+/// A 64 KiB command that reports what is at 48 KiB, past its own image, plus 7: `7` in a fresh
 /// window, where nothing of the caller's carries over.
 const FRESH_COMMAND: &str = "memory 16\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  v1 = i64.const 49152\n\
+  v2 = i32.load8_u v1\n\
+  v3 = i64.extend_i32_u v2\n\
+  v4 = i64.const 7\n\
+  v5 = i64.add v3 v4\n\
+  return v5\n\
+  }\n\
+}\n";
+
+/// #2332 — a 256 KiB command that reports what is at 192 KiB, inside the window it declares but past
+/// its 128 KiB caller's, plus 7: `7`, in the window it declares.
+const LARGER_COMMAND: &str = "memory 18\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  v1 = i64.const 196608\n\
+  v2 = i32.load8_u v1\n\
+  v3 = i64.extend_i32_u v2\n\
+  v4 = i64.const 7\n\
+  v5 = i64.add v3 v4\n\
+  return v5\n\
+  }\n\
+}\n";
+
+/// #2332 — a 64 KiB command that reports what is at 96 KiB, past the window it declares but inside
+/// its 128 KiB caller's, plus 7. It runs in the window it declares, so the read faults.
+const PAST_COMMAND: &str = "memory 16\n\
 func (i64) -> (i64) {\n\
 block 0 (v0: i64) {\n\
   v1 = i64.const 98304\n\
@@ -260,7 +288,7 @@ enum Body {
     /// #1768 — `execve("/bin/c", ["x", "x", "x"], NULL)` into [`ARGC_COMMAND`]: the image-replace must
     /// deliver the argv the op staged, so the command returns `3`.
     ExecDeliversArgv,
-    /// Leave `90` at 96 KiB, then `execve("/bin/c", NULL, NULL)` into [`FRESH_COMMAND`]: the new
+    /// Leave `90` at 48 KiB, then `execve("/bin/c", NULL, NULL)` into [`FRESH_COMMAND`]: the new
     /// image's window is fresh, so the command returns `7`, not `97`.
     ExecStartsFresh,
     /// #1867 — [`Body::Exec`] by a caller attesting [`CALLER_ATTESTATION`], into [`ATTEST_COMMAND`]:
@@ -289,6 +317,15 @@ enum Body {
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
+    /// #2332 — [`Body::ForkExecReap`] into [`PAST_COMMAND`], whose read past its window faults: the
+    /// parent reaps a crash.
+    ForkExecPastWindow,
+    /// #2332 — [`Body::SpawnReap`] into [`PAST_COMMAND`].
+    SpawnPastWindow,
+    /// #2332 — [`Body::ForkExecReap`] into [`LARGER_COMMAND`], larger than its caller's window.
+    ForkExecLarger,
+    /// #2332 — [`Body::SpawnReap`] into [`LARGER_COMMAND`].
+    SpawnLarger,
     /// #763 — `execve("/bin/c", NULL, NULL)`, then `exit` with the errno it answered, negated: a
     /// refusal's *which* is part of the answer every row must agree on.
     ExecErrno,
@@ -705,19 +742,19 @@ fn guest(form: Form, body: Body) -> String {
              }}\n\
              export 0 func \"_start\" 0\n"
         ),
-        // `98304` is past the 64 KiB command's image and clear of this module's data and shadow.
+        // `49152` is past the 64 KiB command's image and clear of this module's data and shadow.
         Body::ExecStartsFresh => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
              \x20 vdummy = i32.const 0\n\
-             \x20 vmark = i64.const 98304\n\
+             \x20 vmark = i64.const 49152\n\
              \x20 v90 = i32.const 90\n\
              \x20 i32.store8 vmark v90\n\
              {exec}  }}\n\
              }}\n\
              export 0 func \"_start\" 0\n"
         ),
-        Body::ForkExecReap => format!(
+        Body::ForkExecReap | Body::ForkExecPastWindow | Body::ForkExecLarger => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
              \x20 vdummy = i32.const 0\n\
@@ -745,7 +782,11 @@ fn guest(form: Form, body: Body) -> String {
             form.call(3, "vkid, vst, vz2, vz2"),
             form.call(1, "vcode"),
         ),
-        Body::SpawnReap | Body::SpawnArgv | Body::SpawnAttests => {
+        Body::SpawnReap
+        | Body::SpawnArgv
+        | Body::SpawnAttests
+        | Body::SpawnPastWindow
+        | Body::SpawnLarger => {
             spawn_guest(form, body == Body::SpawnArgv)
         }
         Body::SpawnStdinEof => spawn_stdin_guest(form),
@@ -985,6 +1026,8 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, cmd: Cmd) -> Outc
         Body::ExecRefusedUntouched => UNSTARTABLE,
         Body::ExecDeliversArgv => ARGC_COMMAND,
         Body::ExecStartsFresh => FRESH_COMMAND,
+        Body::ForkExecPastWindow | Body::SpawnPastWindow => PAST_COMMAND,
+        Body::ForkExecLarger | Body::SpawnLarger => LARGER_COMMAND,
         Body::SpawnArgv => ARGC_COMMAND,
         Body::ExecAttests | Body::SpawnAttests => ATTEST_COMMAND,
         Body::SpawnStdinEof => STDIN_COMMAND,
@@ -1148,9 +1191,9 @@ fn an_execd_image_reads_the_argv_it_was_given_on_every_route() {
     );
 }
 
-/// An exec replaces the address space: the new image starts in a fresh window of the caller's
-/// geometry, so the bytes the caller left past the image stay behind. The JIT always started the
-/// image afresh; the interpreters built it in the caller's window until `Mem::exec_window`.
+/// An exec replaces the address space: the new image starts in a fresh window, so the bytes the
+/// caller left past the image stay behind. The JIT always started the image afresh; the
+/// interpreters built it in the caller's window until `Mem::exec_window`.
 #[test]
 fn an_execd_image_starts_in_a_fresh_window_on_every_route() {
     assert_parity(
@@ -1158,6 +1201,28 @@ fn an_execd_image_starts_in_a_fresh_window_on_every_route() {
         Cmd::Registered,
         Outcome::Returned(vec![Value::I64(7)]),
     );
+}
+
+/// #2332 — an exec'd or spawned image runs in the window it declares, however large its caller's,
+/// on every route: its read past that window faults, and the parent reaps the crash, `128`. Every
+/// engine used to run it in a window of its caller's size, where the read returned `7`.
+#[test]
+fn an_image_runs_in_the_window_it_declares_on_every_route() {
+    assert_parity(
+        Body::ForkExecPastWindow,
+        Cmd::Registered,
+        Outcome::Exited(128),
+    );
+    assert_parity(Body::SpawnPastWindow, Cmd::Registered, Outcome::Exited(128));
+}
+
+/// #2332 — and an image larger than its caller's window runs in the one it declares: a shell in a
+/// small window execs a large program. While an image took its caller's window, every engine refused
+/// it `-E2BIG`, and nothing noticed, because every process had its root's window.
+#[test]
+fn an_image_larger_than_its_callers_window_runs_on_every_route() {
+    assert_parity(Body::ForkExecLarger, Cmd::Registered, Outcome::Exited(7));
+    assert_parity(Body::SpawnLarger, Cmd::Registered, Outcome::Exited(7));
 }
 
 /// #1867 — an exec replaces the image, not the domain, so the new image attests what its caller did

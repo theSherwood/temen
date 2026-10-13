@@ -469,16 +469,16 @@ the real image-replace the multicall demo above stood in for. Mechanism: the eva
 fallible (resolve the command, regrant the inherited caps named in the grant list into a fresh
 powerbox, bind the command's imports, register its self module) — where a refusal is a clean `-EINVAL`
 that leaves the caller running (POSIX `execve` **returns only on failure**) — then hands `dispatch` an
-`Inner::Exec`/`Step::Exec`. `dispatch` builds the command's image in a fresh window of the caller's
-geometry (`Mem::exec_window`: the NULL guard armed, the args region carried over, the data segments
-written; nothing else of the caller's window, which is released) and swaps the vCPU to a fresh one
+`Inner::Exec`/`Step::Exec`. `dispatch` builds the command's image in a fresh window of its declared
+memory, in the caller's reservation (`Mem::exec_window`: the NULL guard armed, the args region carried
+over, the data segments written; nothing else of the caller's window, which is released) and swaps the vCPU to a fresh one
 (`VCpu::new`) running the command at its entry, then loops back to run it (no run-queue round trip, the page-fault-fast-lane shape). Proven by
 `temen-interp/tests/execve.rs`: a guest execs a separate command module that writes `"EXEC"` and exits
 `42`; the guest's post-`exec` `return 99` **never runs** (the image was truly replaced), and a bogus
 command handle returns `-EINVAL` with the caller still running. Interp only, like every fork test.
 
-*Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command runs in
-a window of the caller's geometry (its declared memory must **fit** it — see below); non-durable domains only (durable freeze/thaw
+*Increment-1 simplifications (all `-EINVAL`-refused, so nothing silently degrades):* the command's
+declared memory must **fit** the caller's reservation (see below); non-durable domains only (durable freeze/thaw
 image-swap is the deferred capstone); and only from a clean root computation (no serve handler / active
 fibers).
 
@@ -497,6 +497,16 @@ genuinely-too-small spawn surfaces observably rather than hanging. Proven by
 `c_fork.rs::a_shell_execs_a_command_with_a_large_bss_buffer`: a shell spawned into a 256 KiB window forks
 a child that execs a `memory 18` command; the command touches the far end of its 60 KB buffer (only
 reachable in the enlarged window) and writes from it, and the shell reaps its exit.
+
+*An exec runs in exactly the declared window (2026-10-13, #2332).* The command runs in a window of
+its own declared memory, not of the caller's size: a §14 child already does (INVARIANTS #13,
+2026-09-29), and a program gets the window it was linked for however it starts, its heap growing past
+it with `vm_map` as a root's would. A tree whose processes each took its root's window zeroed that much
+for every process it ran: a cold macro build on the nim card allocated 230 windows of 32 MiB, 7.2 GiB.
+So the fit is against the caller's **reservation**, which the image's window sits in, not against the
+caller's window: nimony runs nifmake (16 MiB) through `sh` (512 KiB). The domain's charge moves to the
+image's window (INVARIANTS #3): what it needs past the caller's is charged before the commit, all or
+nothing (`-ENOMEM`), and what the caller's held past it goes back.
 
 **Compiled-C `fork → execve → wait` with a *separate* command module. DONE (increment 2).**
 `c_fork.rs::a_compiled_c_program_runs_fork_execve_wait_with_a_separate_command` — an ordinary compiled-C
@@ -734,7 +744,7 @@ request, in the op's own lock scope (`SignalSource::spawn_take`), then:
 2. duplicates the caller's powerbox (`Host::spawn_powerbox`: `fork_powerbox`, whose personality
    factory registers the process) and commits the plan to it (`SignalSource::spawn_commit`);
 3. builds the image in that powerbox as an exec builds one (`Host::exec_image`), in a fresh window of
-   the caller's geometry, and starts it at its entry.
+   its declared memory, and starts it at its entry.
 
 The caller's call completes with the pid. Nothing unwinds, so the Cranelift JIT serves a spawn in
 place (no fork plan, no shadow arena), and a spawning program needs no fork instrumentation at all.

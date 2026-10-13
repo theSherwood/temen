@@ -50,7 +50,7 @@ block 0 (vinst: i32, vcmd: i64, vstream: i32) {
 
 /// The command: entry `(inst) -> status`. Resolves `"stdout"` by name (registered when `exec_module`
 /// regranted it), writes its `"EXEC"` data segment to it, and exits `42`. Its data segments are
-/// materialized into the caller's window by the image-replace, so `"EXEC"`/`"stdout"` are present.
+/// materialized into the image's fresh window by the image-replace, so `"EXEC"`/`"stdout"` are present.
 const CMD: &str = r#"
 memory 12
 data 100 "EXEC"
@@ -152,7 +152,7 @@ fn a_command_prepared_once_execs_from_every_host_it_is_granted_into() {
 /// #1080 — the **bytecode engine image-replaces natively** (no tree-walker fallback), the path the
 /// browser playground runs on (`bash_exec` → `compile_and_run_capture_reserved_with_host`). Run the
 /// same GUEST through the plain bytecode entry `compile_and_run_with_host`; it must resolve the
-/// command, regrant `stdout`, materialize the command's image into the caller's window, swap the
+/// command, regrant `stdout`, materialize the command's image into a fresh window, swap the
 /// activation, and return the command's `42` with `"EXEC"` in the sink — identical to the oracle.
 /// (Before #1080 the engine *declined* an exec-bearing module, which is why bash — statically
 /// carrying `exec_module` — could not run on the browser's bytecode tier.)
@@ -337,10 +337,10 @@ block 0 (vinst: i32, vcmd: i64) {
 }
 "#;
 
-/// A 32 KiB command: returns what is at 48 KiB, past its own image, times 1000, plus the byte in
+/// A 64 KiB command: returns what is at 48 KiB, past its own image, times 1000, plus the byte in
 /// the args region.
 const FRESH_CMD: &str = r#"
-memory 15
+memory 16
 func (i64) -> (i64) {
 block 0 (vinst: i64) {
   vs = i64.const 49152
@@ -357,9 +357,9 @@ block 0 (vinst: i64) {
 }
 "#;
 
-/// An exec replaces the address space: the command starts in a fresh window of the caller's
-/// geometry, so the caller's bytes past the command's image are gone (the command reads `0` where
-/// the caller left `90`), while the args region carries over (`65`). The tree-walker and the
+/// An exec replaces the address space: the command starts in a fresh window, so the caller's bytes
+/// past the command's image are gone (the command reads `0` where the caller left `90`), while the
+/// args region carries over (`65`). The tree-walker and the
 /// bytecode engine agree, as the Cranelift JIT, whose exec starts the image in a fresh instance,
 /// always has.
 #[test]

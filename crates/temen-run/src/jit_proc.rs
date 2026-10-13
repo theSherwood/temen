@@ -315,22 +315,16 @@ impl Tree {
             (drives_jit(&calls, host), plan)
         });
         let interrupt = self.interrupt_for(pid, plan.is_some());
-        let named = match program {
-            Program::Command {
-                digest, size_log2, ..
-            } => Some((*digest, *size_log2)),
-            Program::Embedder(m) if self.kept => Some((
-                temen_interp::module_digest(m),
-                m.memory.map_or(0, |mc| mc.size_log2),
-            )),
+        let digest = match program {
+            Program::Command { digest, .. } => Some(*digest),
+            Program::Embedder(m) if self.kept => Some(temen_interp::module_digest(m)),
             Program::Embedder(_) => None,
         };
-        let (cm, image) = match named {
+        let (cm, image) = match digest {
             // Shared code is compiled for a raw powerbox.
-            Some((digest, size_log2)) if !jit && !cc.is_locked() => {
+            Some(digest) if !jit && !cc.is_locked() => {
                 let key = CodeKey {
                     digest,
-                    size_log2,
                     entry,
                     polls: interrupt.is_some(),
                     fuel: self.fuel != 0,
@@ -451,7 +445,7 @@ impl Tree {
     /// the oracle's `spawn_vcpu`): mint its pid as [`Self::fork`] mints a twin's, commit the spawn's
     /// staged state to a duplicate of the caller's powerbox ([`Host::spawn_powerbox`]), build its
     /// image there as an exec builds one ([`Host::exec_image`]), and start it on its own thread, from
-    /// its entry, in a fresh window of the caller's geometry. Nothing of the caller is copied, so
+    /// its entry, in a fresh window of its declared memory. Nothing of the caller is copied, so
     /// nothing unwinds: the caller's call completes with the pid, or `-EAGAIN` when no process could
     /// be minted. A process whose image cannot be built exits as it is born
     /// ([`Host::spawn_failed`]).
@@ -479,7 +473,7 @@ impl Tree {
         };
         let built = twin
             .exec_module(cmd)
-            .and_then(|m| twin.exec_image(&m, &[], 0, 0, mapped, reserved));
+            .and_then(|m| twin.exec_image(&m, &[], 0, 0, reserved));
         let img = match built {
             Ok(img) => img,
             Err(_) => {
@@ -596,10 +590,10 @@ pub(crate) struct Image {
 struct CodeKey {
     /// The module's content digest ([`temen_interp::module_digest`]): the same code however it
     /// reached the start — a registered command, a program the tree built and promoted on each run of
-    /// it (#763), or the embedder's. Identity is structural (INVARIANTS #10).
+    /// it (#763), or the embedder's. Identity is structural (INVARIANTS #10). It covers the window
+    /// the module declares, which every program runs in (#2332) and whose confinement mask the code
+    /// bakes.
     digest: [u8; 32],
-    /// The window it runs in: the confinement mask is baked.
-    size_log2: u8,
     entry: FuncIdx,
     /// Whether the code polls the tree's kill-path cell.
     polls: bool,
@@ -656,11 +650,10 @@ impl std::fmt::Debug for JitCodeCache {
 pub(crate) enum Program<'a> {
     /// The embedder's program: the root's first image. No other process starts it.
     Embedder(&'a Module),
-    /// An `execve`'s command, from its grant, in a window of `size_log2`: the caller's backed prefix.
+    /// An `execve`'s command, from its grant, in the window it declares (#2332).
     Command {
         grant: Arc<Module>,
         digest: [u8; 32],
-        size_log2: u8,
     },
 }
 
@@ -821,8 +814,8 @@ unsafe fn run_process(
 }
 
 /// Where an image an exec or a spawn built ([`Host::exec_image`]) starts, and the powerbox it runs
-/// over: fresh, at its command's entry, in a window of the caller's backed prefix, with the argv the
-/// commit hands over (the personality's staged argv) in its args region.
+/// over: fresh, at its command's entry, in the window it declares, with the argv the commit hands
+/// over (the personality's staged argv) in its args region.
 fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
     let init = img.host.exec_commit_args().map(|blob| {
         let mut buf = vec![0u8; temen_ir::module_args_base() as usize];
@@ -833,7 +826,6 @@ fn image_start(img: temen_interp::ExecImage) -> (Start<'static>, Host) {
         program: Program::Command {
             grant: img.module,
             digest: img.digest,
-            size_log2: img.child_size.trailing_zeros() as u8,
         },
         entry: img.entry as FuncIdx,
         args: img.entry_args,
@@ -878,24 +870,7 @@ unsafe fn compile(
     interrupt: Option<*const AtomicU64>,
     tree: &Tree,
 ) -> Result<(CompiledModule, Option<Arc<Image>>), temen_jit::JitError> {
-    let sized;
-    let m = match program {
-        Program::Embedder(m) => *m,
-        // The command runs in a window the size of the caller's backed prefix, as on both
-        // interpreters, whose image-replace reuses the caller's window in place (a larger window than
-        // the command declares is a safe superset, masked to its actual size).
-        Program::Command {
-            grant, size_log2, ..
-        } => {
-            let mut m = (**grant).clone();
-            m.memory = m.memory.map(|mc| temen_ir::Memory {
-                size_log2: *size_log2,
-                ..mc
-            });
-            sized = m;
-            &sized
-        }
-    };
+    let m = program.module();
     let instrumented = plan.as_ref().and_then(|p| p.instrument(m, entry));
     let (code, at) = instrumented
         .as_ref()
@@ -1171,7 +1146,7 @@ pub(crate) unsafe fn serve_request(
                 Err(EINVAL)
             } else {
                 host.exec_module(cmd)
-                    .and_then(|m| host.exec_image(&m, &[], 0, 0, mapped, reserved))
+                    .and_then(|m| host.exec_image(&m, &[], 0, 0, reserved))
             };
             match admitted {
                 Ok(img) => {
