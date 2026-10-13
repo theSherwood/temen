@@ -1398,8 +1398,9 @@ int main(void) {
     desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
       "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
       "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
-      "against the real compiled `system` module, and the nim→powerbox bridge wired its bottom edge to " +
-      "the sandbox's caps (nimony's `write(fd,buf,len)` → the powerbox `write` stream). Click Run: the " +
+      "against the real compiled `system` module on Nim's **capability edge**, which gives the program " +
+      "the sandbox's streams and exit and nothing else (nimony's `write(1, buf, len)` → the powerbox " +
+      "stdout stream). Click Run: the " +
       "output below is the guest's **real stdout** — a Nim program printing on the Temen. (The Nim→Leng " +
       "front end runs at build time for now, unlike the `temen-leng` card below, which runs the translator " +
       "itself in your browser; committed `nim_hello.temen`, gated by `nim_hello_asset.rs`.)",

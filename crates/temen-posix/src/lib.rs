@@ -2065,7 +2065,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "pipe" => OP_PIPE,
         "pipe_adopt" => OP_PIPE_ADOPT,
         "exec_resolve" => OP_EXEC_RESOLVE,
-        // #1609 — the whole-`execve` leaf. `nim_posix_runtime` retains this name as an import
+        // #1609 — the whole-`execve` leaf. The nim link's POSIX edge retains this name as an import
         // instead of binding it to the compute shim's fail-closed stub, so a no-C nim program's
         // `execve` reaches the registry rather than returning `-1`.
         "execve" => OP_EXECVE,

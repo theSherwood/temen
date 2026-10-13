@@ -5,11 +5,13 @@ its status:
 
 - **✅**: the cases are in this directory. `nim_differential_corpus` (`../nim_e2e.rs`) builds each one
   with native nimony and links the same build as a user's would be linked: the program's `.c.nif`,
-  linked as `temen-link` links them, run under the POSIX personality. It runs that module on each of
-  Temen's engines (the tree-walker, bytecode and the JIT), and fails if any engine's output differs
-  from native's by a byte.
+  linked as `temen-link` links them. It links each on both of Nim's bottom edges: the POSIX edge, run
+  under the POSIX personality, and the capability edge, run on the bare powerbox. It runs each module
+  on each of Temen's engines (the tree-walker, bytecode and the JIT), and fails if any engine's output
+  on either edge differs from native's by a byte.
 - **❌ #N**: the case is in [`known_gaps/`](known_gaps/), its header names issue #N, and it still
-  diverges. The corpus fails when it matches on every engine, so the row and the issue get updated.
+  diverges. The corpus fails when it matches on every engine and edge, so the row and the issue get
+  updated.
 - **n/a**: nimony itself rejects the construct, so there is no native output to compare. The note
   gives nimony's error.
 
