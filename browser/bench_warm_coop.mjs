@@ -1,14 +1,11 @@
-// #816 (ledger follow-up): bench the **warm-coop** tier vs the **warm-interp** fallback on the
-// page-managing warm-snapshot cards (QuickJS, Tcl, …). The #816 machinery lets a page-managing warm
-// guest tier up its eligible pure leaves onto emitted wasm (`runWarmCoop`, item 4), but no playground
-// card routes to it — warm cards default to `temen_warm_eval` (the interpreter warm path). This
-// measures whether flipping that default pays: per card it opens ONE warm session
-// (`temen_warm_open`, init paid once) and then times repeated `eval_run`s of the same workload
+// #816 (ledger follow-up): bench the warm session's emitted tier (`runWarmCoop`, #816 item 4) vs the
+// interpreter warm path on the warm-snapshot cards (QuickJS, Tcl, …). Per card it opens ONE warm
+// session (`temen_warm_open`, init paid once) and then times repeated `eval_run`s of the same workload
 // through:
-//   1. warm-interp:  temen_warm_eval                       (today's default for a warm card)
-//   2. warm-coop:    runWarmCoop → driveCoopTierupRun      (#816 item 4 — leaves on emitted wasm)
-//   3. warm+JIT:     runWarmJit                            (WasmDriven whole-program — expected to
-//                                                           DECLINE a page-managing guest; reported)
+//   1. warm-interp:  temen_warm_eval                       (the interpreter warm path)
+//   2. warm-coop:    runWarmCoop → driveCoopTierupRun      (`eval_run` whole as the pump's leaf where
+//                                                           the emitter takes it, else its regions;
+//                                                           #1414 S4-3c)
 // asserting stdout/status parity against warm-interp, and reporting wall-clock (cold = first Run incl.
 // the leaves' emit + WebAssembly.compile; warm = best of N, module cached — the #753/#803 split) plus
 // TIERUP / JIT_INVOKE / bounce counts via a Proxy over the cdylib exports (zero engine changes). The
@@ -21,7 +18,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { runWarmCoop, runWarmJit } from './web/wasmjit-module.js';
+import { runWarmCoop } from './web/wasmjit-module.js';
 import { engineImports } from './engine-imports.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -113,11 +110,10 @@ const N = 4;
 // the guest's hot code has leaf-shaped work the coop tier can service (a pure interpreter dispatch
 // loop with no eligible leaves is itself a finding: warm-coop can't help it).
 const cards = [
-  // Pure compute (little allocation): the eval_run stays whole-program-emittable, so warm+JIT opens.
+  // Pure compute (little allocation).
   ['quickjs-compute', 'web/assets/qjs_snapshot.temen',
     'let s = 0; for (let i = 1; i <= 200000; i++) s = (s + i * 2654435761) % 1000003; print(s);\n'],
-  // Allocation-heavy (grows the guest heap DURING eval): probes whether an in-eval grow makes the
-  // WasmDriven warm+JIT open decline — the case where warm-coop is the only accelerated tier.
+  // Allocation-heavy (grows the guest heap DURING eval).
   ['quickjs-alloc', 'web/assets/qjs_snapshot.temen',
     'let a = []; for (let i = 0; i < 60000; i++) a.push((i * 2654435761) % 1000003); ' +
     'let s = 0; for (let i = 0; i < a.length; i++) s = (s + a[i]) % 1000003; print(s);\n'],
@@ -155,17 +151,6 @@ for (const [name, rel, workload] of cards) {
     coop = await timeAsync(() => warmCoopEval(stdin, `warmcoop#${name}`), N);
   } catch (e) { coopErr = e; }
 
-  // 3. warm+JIT (expected to decline a page-managing guest — reported either way).
-  process.stderr.write(`${name}: warm+JIT probe...\n`);
-  let jit = null, jitErr = null;
-  try {
-    jit = await timeAsync(async () => {
-      const t0 = performance.now();
-      const st = await runWarmJit(ex, memory, stdin, `warmjit#${name}`);
-      return { ms: performance.now() - t0, out: readStdout(), st };
-    }, N);
-  } catch (e) { jitErr = e; }
-
   // Report.
   console.log(`── ${name} ─────────────────────────────────────────────`);
   console.log(`  warm-interp : cold ${interp.cold.ms.toFixed(1)}ms  warm ${interp.warm.ms.toFixed(2)}ms  (baseline)  rv=${interp.warm.rv} st=${interp.warm.st}`);
@@ -175,13 +160,6 @@ for (const [name, rel, workload] of cards) {
     console.log(`  warm-coop   : cold ${coop.cold.ms.toFixed(1)}ms  warm ${coop.warm.ms.toFixed(2)}ms  (${speedup.toFixed(2)}x)  tierups=${coop.warm.tierups} invokes=${coop.warm.invokes} bounces=${coop.warm.bounces}  ${parity}`);
   } else {
     console.log(`  warm-coop   : DECLINED/failed (${coopErr.message})`);
-  }
-  if (jit) {
-    const parity = jit.warm.out === base && jit.warm.st === interp.warm.st ? 'parity=OK' : 'parity=MISMATCH';
-    const speedup = interp.warm.ms / jit.warm.ms;
-    console.log(`  warm+JIT    : cold ${jit.cold.ms.toFixed(1)}ms  warm ${jit.warm.ms.toFixed(2)}ms  (${speedup.toFixed(2)}x)  ${parity}`);
-  } else {
-    console.log(`  warm+JIT    : DECLINED (${jitErr.message.split('\n')[0]})  ← page-managing ⇒ warm-coop is the relevant tier`);
   }
   console.log('');
   ex.temen_warm_close();

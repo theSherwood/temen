@@ -3,7 +3,7 @@
 //! exported by its symbol name, so the real names ride in `m.exports` with no `-g` flag and no format
 //! change (#907). Precedence: a DWARF source name (a `-g` build's `debug_info.func_names`, the reserved
 //! level-2 rung, not exercised here) → the export symbol name → the guest index `gfN` (only for an
-//! unexported synthesized helper). So a V8 wasm stack trace / a `temen_warm_jit` decline names the culprit
+//! unexported synthesized helper). So a V8 wasm stack trace / an emitted run's decline names the culprit
 //! function instead of a bare `wasm-function[N]`. Without this, bisecting a 13 MB emit is guesswork.
 
 use temen_wasm_jit::compile_module;

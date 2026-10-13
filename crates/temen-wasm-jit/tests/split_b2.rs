@@ -9,10 +9,7 @@
 //! every K must equal both the interpreter oracle (INVARIANTS.md #9) and the unsplit `compile_module_b2`.
 
 use temen_interp::{run, Value};
-use temen_wasm_jit::{
-    compile_module_b2, compile_module_b2_split, compile_module_reactor_split,
-    compile_module_with_split,
-};
+use temen_wasm_jit::{compile_module_b2, compile_module_b2_split, compile_module_with_split};
 use wasmi::core::ValType;
 use wasmi::{
     Engine, FuncRef, Linker, Memory, MemoryType, Module as WModule, Store, Table, TableType, Val,
@@ -195,23 +192,6 @@ fn local_split_dispatch_loop_matches_interp() {
                 "local split k={k} != interp (n={n})"
             );
         }
-    }
-}
-
-/// #1120 Slice 2c — the **reactor** emit path (what warm+JIT uses) with the where-to-cut heuristic:
-/// `compile_module_reactor_split` auto-picks the largest reachable function (here func 0, the hot loop)
-/// and splits it. `min_bytes=0` + a tiny `target_group_bytes` force a maximal split; the result must
-/// still match the interpreter, exercising the production reactor path end to end (local table + call.dyn).
-#[test]
-fn reactor_split_dispatch_loop_matches_interp() {
-    let m = parse(DISPATCH_LOOP);
-    let (wasm, _emitted) = compile_module_reactor_split(&m, 0, false, 0, 1).expect("reactor split");
-    for &n in &[0i64, 1, 2, 3, 7, 20, 100] {
-        assert_eq!(
-            run_local(&wasm, n),
-            oracle(&m, n),
-            "reactor split != interp (n={n})"
-        );
     }
 }
 

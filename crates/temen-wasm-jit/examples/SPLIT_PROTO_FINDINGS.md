@@ -196,3 +196,13 @@ paths) while keeping the hot dispatch core monolithic — shrinking the function
 putting marshalling on the hot path. That needs per-block hotness (static heuristic or profile) and is a
 distinct, larger design. Otherwise the first-Run lever for QuickJS lies elsewhere (shrinking the emitted
 hot function, or making Liftoff→TurboFan of one big function faster), not in splitting it.
+
+## Retired with the warm+JIT route (#1414 S4-3c-2)
+
+The opt-in knob (`temen_warm_jit_set_split`, `?warmsplit=1`) reached only the single-shot warm+JIT
+route, which #1414 S4-3c replaced: warm evals run on the pump, QuickJS's `eval_run` whole as the root
+leaf from the page-checked leaf emitter. The knob, its reactor entry (`compile_module_reactor_split`,
+`pick_split_target`) and `browser/warm-jit-split-test.mjs` went with that route; they are in git
+history. The split emitter stays, with its tests (`plan_fn_split`, `compile_split_fn`,
+`compile_module_with_split`, `compile_module_b2_split`, `split_fn.rs`, `split_b2.rs`, `split_proto`).
+Further split work belongs in the leaf emitter, measured against the page-checked leaf (#1120).
