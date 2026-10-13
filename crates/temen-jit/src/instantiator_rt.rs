@@ -573,6 +573,9 @@ pub(crate) struct Nursery {
     /// op-13 separate-module children pass their own — a later slice). Computed from
     /// `m.impl_exports` at construction.
     pub(crate) serve_handlers: Box<[u32]>,
+    /// The module's own program, which a self child of its own code runs: empty when the module
+    /// names no `Instantiator`, as a nursery stood up for §22 units alone (#2312), whose self
+    /// children run their unit's program ([`UnitProg`]).
     funcs: std::sync::Arc<[Func]>,
     /// #922 — the parent module's type section, threaded into every same-module child compile so
     /// the child's interned `call.dyn` type indices resolve (a separate-module child resolves
