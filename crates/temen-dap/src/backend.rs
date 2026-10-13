@@ -27,11 +27,12 @@ use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
 
 use crate::json::Json;
+use std::sync::Arc;
 use temen_interp::{
     CapTape, FrameInfo, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap,
     Value, VarValue, WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
 };
-use temen_ir::{FuncIdx, Module};
+use temen_ir::{DebugInfo, FuncIdx, Module};
 
 /// #1366 slice (c) — the calls parked on a session's **declared host-completed caps** (`hostCaps`),
 /// keyed by completion id: filled by the procs' submit hooks, read by the DAP `stopped` event, cleared
@@ -183,6 +184,11 @@ pub trait Debuggee {
     // --- breakpoints / watchpoints ---------------------------------------------------------------
     fn set_breakpoint(&mut self, pc: IrPc);
     fn clear_breakpoint(&mut self, pc: IrPc) -> bool;
+    /// Replace source `file`'s line breakpoints with `lines`, each bound in every module the
+    /// backend debugs whose §6 info has code on it or after it ([`temen_interp::bind_line`]): the
+    /// program, and on the bytecode backend each module a child or an exec runs, as the run admits
+    /// it (#2239). Returns, per line, the line it bound at, or `None` while no module has it.
+    fn set_line_breakpoints(&mut self, file: &str, lines: Vec<u32>) -> Vec<Option<u32>>;
     /// `None` if the backend has no watchpoints (bytecode) — the server reports the data breakpoint
     /// unverified.
     fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId>;
@@ -204,8 +210,19 @@ pub trait Debuggee {
 
     // --- inspection ------------------------------------------------------------------------------
     fn backtrace(&self) -> Vec<FrameInfo>;
-    fn func_name(&self, func: FuncIdx) -> Option<&str>;
-    fn source_loc(&self, pc: IrPc) -> Option<SourceLoc>;
+    /// The §6 debug info of module `module`: the program's (`0`), or another module's the backend
+    /// debugs (#2239). `None` for a module without it.
+    fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>>;
+    /// The `-g` name of the function op `pc` is in, read against its module's debug info.
+    fn func_name(&self, pc: IrPc) -> Option<String> {
+        let di = self.debug_info(pc.module)?;
+        temen_interp::func_name_in(&di, pc.func).map(str::to_string)
+    }
+    /// The source position of op `pc`, read against its module's debug info.
+    fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
+        let di = self.debug_info(pc.module)?;
+        temen_interp::source_loc_in(&di, pc)
+    }
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue>;
     fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64>;
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap>;
@@ -381,6 +398,9 @@ impl Debuggee for Inspector {
     fn clear_breakpoint(&mut self, pc: IrPc) -> bool {
         Inspector::clear_breakpoint(self, pc)
     }
+    fn set_line_breakpoints(&mut self, file: &str, lines: Vec<u32>) -> Vec<Option<u32>> {
+        Inspector::set_line_breakpoints(self, file, lines)
+    }
     fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId> {
         Some(Inspector::set_watchpoint(self, addr, len, kind))
     }
@@ -398,11 +418,8 @@ impl Debuggee for Inspector {
     fn backtrace(&self) -> Vec<FrameInfo> {
         Inspector::backtrace(self)
     }
-    fn func_name(&self, func: FuncIdx) -> Option<&str> {
-        Inspector::func_name(self, func)
-    }
-    fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
-        Inspector::source_loc(self, pc)
+    fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>> {
+        Inspector::debug_info(self, module)
     }
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
         Inspector::read_var(self, frame_from_top, name, width)
@@ -467,6 +484,8 @@ pub struct BytecodeBackend {
     func: FuncIdx,
     args: Vec<Value>,
     breakpoints: Vec<IrPc>,
+    /// The source-line breakpoints by file, set on the run and on every rebuilt one (#2239).
+    line_bps: Vec<(String, Vec<u32>)>,
     /// Armed watchpoints with backend-owned stable ids (re-applied to the run after a `seek` rebuild).
     /// Cross-thread: a range fires in whichever thread touches it.
     watch_specs: Vec<(WatchId, u64, u64, WatchKind)>,
@@ -676,6 +695,7 @@ impl BytecodeBackend {
             func,
             args: args.to_vec(),
             breakpoints: Vec::new(),
+            line_bps: Vec::new(),
             watch_specs: Vec::new(),
             value_specs: Vec::new(),
             next_watch: 0,
@@ -785,7 +805,8 @@ impl BytecodeBackend {
         // again; arm the skip so a forward `continue` makes progress instead of re-reporting it. The
         // same thing `seek` does after its replay.
         if let Some(pc) = self.run.frame_pc(0) {
-            if self.breakpoints.contains(&pc) {
+            self.run.set_breakpoints(self.breakpoints.clone());
+            if self.run.is_breakpoint(pc) {
                 self.run.arm_breakpoint_skip();
             }
         }
@@ -817,6 +838,9 @@ impl BytecodeBackend {
         // own state, so the store follows the program to wherever the seek lands.
         run.map(|mut r| {
             r.set_journal_armed(self.journaling);
+            for (file, lines) in &self.line_bps {
+                r.set_line_breakpoints(file, lines.clone());
+            }
             r
         })
     }
@@ -939,7 +963,10 @@ impl BytecodeBackend {
             }
             probe.locate(); // focuses the thread that runs op `c`
             if let (Some(ti), Some(pc)) = (probe.stopped_task(), probe.frame_pc(0)) {
-                let sourced = temen_interp::source_loc(&self.module, pc).is_some();
+                let sourced = probe
+                    .debug_info(pc.module)
+                    .and_then(|di| temen_interp::source_loc_in(&di, pc))
+                    .is_some();
                 stoppable.push((c, ti as usize, probe.depth(), sourced));
             }
             if !probe.tick(&mut fuel) {
@@ -1152,7 +1179,7 @@ impl Debuggee for BytecodeBackend {
         // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
         // here makes progress instead of immediately re-reporting this stop.
         if let Some(pc) = run.frame_pc(0) {
-            if self.breakpoints.contains(&pc) {
+            if run.is_breakpoint(pc) {
                 run.arm_breakpoint_skip();
             }
         }
@@ -1174,6 +1201,13 @@ impl Debuggee for BytecodeBackend {
         let before = self.breakpoints.len();
         self.breakpoints.retain(|&b| b != pc);
         self.breakpoints.len() != before
+    }
+    fn set_line_breakpoints(&mut self, file: &str, lines: Vec<u32>) -> Vec<Option<u32>> {
+        self.line_bps.retain(|(f, _)| f != file);
+        if !lines.is_empty() {
+            self.line_bps.push((file.to_string(), lines.clone()));
+        }
+        self.run.set_line_breakpoints(file, lines)
     }
     // Data breakpoints: arm a window watchpoint (a backend-owned stable id, so it survives a `seek`).
     // Cross-thread: fires in whichever thread touches the range.
@@ -1214,7 +1248,7 @@ impl Debuggee for BytecodeBackend {
         // The focused thread's stack (`select_task`'s pick; the sole thread of a spawn-free guest).
         for d in 0..self.run.depth() {
             if let Some(pc) = self.run.frame_pc(d) {
-                let source = temen_interp::source_loc(&self.module, pc);
+                let source = Debuggee::source_loc(self, pc);
                 out.push(FrameInfo {
                     pc,
                     vals: Vec::new(), // unused by DapServer (it reads via read_var)
@@ -1224,11 +1258,8 @@ impl Debuggee for BytecodeBackend {
         }
         out
     }
-    fn func_name(&self, func: FuncIdx) -> Option<&str> {
-        temen_interp::func_name(&self.module, func)
-    }
-    fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
-        temen_interp::source_loc(&self.module, pc)
+    fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>> {
+        self.run.debug_info(module)
     }
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
         self.run.read_var(frame_from_top, name, width)
@@ -1411,18 +1442,22 @@ impl Debuggee for BytecodeBackend {
                         ("parent", Json::i(*parent as i64)),
                         ("task", Json::i(*task as i64)),
                     ]),
-                    // #1981: `func` is the function's name where the program's debug info has one
-                    // (module 0), else its index as text.
+                    // #1981: `func` is the function's name where its module's debug info has one,
+                    // else its index as text.
                     E::Call {
                         turn,
                         task,
                         module,
                         func,
                     } => {
-                        let name = (*module == 0)
-                            .then(|| temen_interp::func_name(&self.module, *func as FuncIdx))
-                            .flatten()
-                            .map_or_else(|| format!("#{func}"), str::to_string);
+                        let name = self
+                            .run
+                            .debug_info(*module as u32)
+                            .and_then(|di| {
+                                temen_interp::func_name_in(&di, *func as FuncIdx)
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_else(|| format!("#{func}"));
                         Json::obj(vec![
                             ("kind", Json::s("call")),
                             ("turn", Json::i(*turn as i64)),

@@ -12,7 +12,6 @@
 //! scripting a DAP conversation; [`run_stdio`] is the thin `Content-Length`-framed wire loop a real
 //! client connects to.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{Inspector, IrPc, Stop, StopReason, Trap, Value, VarValue, WatchId, WatchKind};
@@ -51,18 +50,9 @@ struct Session {
     /// The session's race model (#1987), fed by the access sink and the scheduler-event sink when
     /// the `launch` arg `raceDetect` armed one; read back by `races`. `None` = no model.
     race_model: Option<Arc<Mutex<races::RaceModel>>>,
-    debug: Option<DebugInfo>,
-    /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
-    /// binding source-line breakpoints. A terminator is a pc like any other (#1713), so a line whose
-    /// only code is `return x;` or a loop condition's branch binds.
-    line_index: BTreeMap<(u32, u32), IrPc>,
-    /// IR pcs currently set as breakpoints, each with the debug-info file it was set in, so
-    /// `setBreakpoints` can replace one source's set per the protocol and leave the others' armed.
-    breakpoints: Vec<(u32, IrPc)>,
-    /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
-    /// nonzero in the stopped frame for the breakpoint to actually stop (DEBUGGING.md W5). Absent ⇒
-    /// unconditional. Evaluated by [`expr::eval_int`] over the frame's source variables.
-    conditions: BTreeMap<IrPc, String>,
+    /// The source-line breakpoints `setBreakpoints` set, by file. The backend binds each in every
+    /// module it debugs with §6 info for its file (#2239), so a breakpoint is its line, not one op.
+    breakpoints: Vec<SourceBreakpoint>,
     /// DAP `frameId` → `(thread id, frame index)`, assigned during `stackTrace` and consumed by
     /// `scopes`/`variables`/`evaluate`, so a reference names a specific thread's frame (multithreaded
     /// DAP). Cleared whenever execution resumes (old frames become stale).
@@ -87,12 +77,31 @@ struct Session {
     stderr_shown: usize,
 }
 
+/// A source-line breakpoint as `setBreakpoints` asked for it (DEBUGGING.md W5): a line of a file,
+/// and a `condition`, an integer expression that must be nonzero in the stopped frame for it to
+/// stop (absent ⇒ unconditional; evaluated by [`expr::eval_int`] over the frame's source
+/// variables).
+struct SourceBreakpoint {
+    file: String,
+    /// The line it resolved to, which the backend binds in each module; the line asked for while
+    /// no module resolves it.
+    line: u32,
+    condition: Option<String>,
+}
+
 impl Session {
-    /// Resolve a source variable `name` (declared in function `func`) to an `i64`, in the frame
-    /// `frame_idx` levels up the focused thread — the binding the expression evaluator and
-    /// conditional breakpoints use. `None` if there is no such variable or its value isn't integral.
-    fn resolve_var(&self, frame_idx: usize, func: u32, name: &str) -> Option<i64> {
-        let debug = self.debug.as_ref()?;
+    /// The §6 debug info of the module `pc` is in: the program's, or a module a child runs (#2239).
+    fn debug_at(&self, pc: IrPc) -> Option<Arc<DebugInfo>> {
+        self.inspector.debug_info(pc.module)
+    }
+
+    /// Resolve a source variable `name` (declared in the function of `pc`) to an `i64`, in the
+    /// frame `frame_idx` levels up the focused thread, whose op `pc` is — the binding the
+    /// expression evaluator and conditional breakpoints use. `None` if there is no such variable or
+    /// its value isn't integral.
+    fn resolve_var(&self, frame_idx: usize, pc: IrPc, name: &str) -> Option<i64> {
+        let debug = self.debug_at(pc)?;
+        let func = pc.func;
         let var = debug
             .vars
             .iter()
@@ -101,13 +110,15 @@ impl Session {
         var_to_i64(&self.inspector.read_var(frame_idx, name, width)?)
     }
 
-    /// Resolve a source variable `name` (declared in `func`) to its `(window address, byte length)`
-    /// for a data watchpoint, in the frame `frame_idx` levels up the focused thread. `None` if the
-    /// name has no in-scope **memory** location (`var_addr` rejects a promoted SSA scalar) — honestly
-    /// unwatchable. Length comes from the variable's debug type (scalar width or full aggregate size).
-    fn resolve_watch(&self, frame_idx: usize, func: u32, name: &str) -> Option<(u64, u64)> {
+    /// Resolve a source variable `name` (declared in the function of `pc`) to its `(window address,
+    /// byte length)` for a data watchpoint, in the frame `frame_idx` levels up the focused thread,
+    /// whose op `pc` is. `None` if the name has no in-scope **memory** location (`var_addr` rejects
+    /// a promoted SSA scalar) — honestly unwatchable. Length comes from the variable's debug type
+    /// (scalar width or full aggregate size).
+    fn resolve_watch(&self, frame_idx: usize, pc: IrPc, name: &str) -> Option<(u64, u64)> {
         let addr = self.inspector.var_addr(frame_idx, name)?;
-        let debug = self.debug.as_ref()?;
+        let debug = self.debug_at(pc)?;
+        let func = pc.func;
         let var = debug
             .vars
             .iter()
@@ -120,19 +131,37 @@ impl Session {
     /// `condition` that evaluates nonzero in the stopped (innermost) frame. A malformed/unresolvable
     /// condition also fires (so the user notices rather than silently skipping). Shared by forward
     /// `continue` and reverse `reverseContinue` so both honor conditional breakpoints identically.
+    ///
+    /// The breakpoints that bound at `pc` are the lines whose binding in `pc`'s module is `pc`: a
+    /// stop fires if one of them has no condition, or a condition that holds.
     fn condition_holds(&self, pc: IrPc) -> bool {
-        let Some(cond) = self.conditions.get(&pc) else {
-            return true; // unconditional
+        let Some(debug) = self.debug_at(pc) else {
+            return true; // no line bound here: an exact op's breakpoint
         };
-        let func = match self.inspector.backtrace().first() {
-            Some(f) => f.pc.func,
+        let conds: Vec<Option<&str>> = self
+            .breakpoints
+            .iter()
+            .filter(|b| {
+                temen_interp::bind_line(&debug, pc.module, &b.file, b.line)
+                    .is_some_and(|(line, at)| line == b.line && at == pc)
+            })
+            .map(|b| b.condition.as_deref())
+            .collect();
+        if conds.is_empty() || conds.contains(&None) {
+            return true; // unconditional
+        }
+        let top = match self.inspector.backtrace().first() {
+            Some(f) => f.pc,
             None => return true,
         };
-        let resolve = |name: &str| self.resolve_var(0, func, name);
-        match expr::eval_int(cond, &resolve) {
-            Some(v) => v != 0,
-            None => true,
-        }
+        let resolve = |name: &str| self.resolve_var(0, top, name);
+        conds
+            .into_iter()
+            .flatten()
+            .any(|cond| match expr::eval_int(cond, &resolve) {
+                Some(v) => v != 0,
+                None => true,
+            })
     }
 }
 
@@ -150,6 +179,8 @@ enum StepKind {
 /// the focused thread and the absolute window address + structured type of the aggregate/array, so
 /// `variables` can read its members (DEBUGGING.md §6 structured `TypeRef`).
 struct Place {
+    /// The module whose type table `type_id` indexes: the frame's it was found in (#2239).
+    module: u32,
     tid: u64,
     addr: u64,
     type_id: TypeId,
@@ -320,8 +351,6 @@ impl DapServer {
             .and_then(|v| v.as_i64())
             .unwrap_or(1_000_000_000) as u64;
 
-        let debug = module.debug_info.clone();
-        let line_index = debug.as_ref().map(build_line_index).unwrap_or_default();
         // Execution mode (DEBUGGING.md Milestone B): `seed` ⇒ a fuzzed interleaving; `schedule`
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
@@ -517,10 +546,7 @@ impl DapServer {
             inspector,
             mem_model,
             race_model,
-            debug,
-            line_index,
             breakpoints: Vec::new(),
-            conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
             place_refs: Vec::new(),
             data_watch_ids: Vec::new(),
@@ -535,55 +561,48 @@ impl DapServer {
         let Some(session) = self.session.as_mut() else {
             return (false, Json::Null, vec![]);
         };
-        // Resolve the requested source to a debug-info file index (exact / suffix / basename).
+        // The requested source, which the backend matches to a module's debug-info file (exact /
+        // suffix / basename) in every module it debugs (#2239).
         let path = args
             .and_then(|a| a.get("source"))
             .and_then(|s| s.get("path").or_else(|| s.get("name")))
             .and_then(|p| p.as_str())
             .unwrap_or("");
-        let files = session.debug.as_ref().map(|d| &d.files);
-        let file_idx = files.and_then(|fs| match_file(fs, path));
-
-        // Per DAP, setBreakpoints *replaces this source's* breakpoints, and only this source's: a
-        // client sends one request per source, so clearing every source's left only the last one's
-        // armed while the earlier ones still read `verified` (#2295). A pc lies on one file's line,
-        // so the per-file sets are disjoint, and a path that names no file has none to clear.
-        session.breakpoints.retain(|&(file, pc)| {
-            if Some(file) != file_idx {
-                return true;
-            }
-            session.inspector.clear_breakpoint(pc);
-            session.conditions.remove(&pc);
-            false
-        });
-
         let requested = args
             .and_then(|a| a.get("breakpoints"))
             .and_then(|b| b.as_array())
             .map(|a| a.to_vec())
             .unwrap_or_default();
+        let lines: Vec<u32> = requested
+            .iter()
+            .map(|bp| bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32)
+            .collect();
+        // Per DAP, setBreakpoints *replaces this source's* breakpoints, and only this source's: a
+        // client sends one request per source (#2295).
+        let bound = session.inspector.set_line_breakpoints(path, lines.clone());
+        session.breakpoints.retain(|b| b.file != path);
         let mut out = Vec::new();
-        for bp in &requested {
-            let line = bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32;
-            let bound = file_idx
-                .and_then(|fi| resolve_line(&session.line_index, fi, line).map(|at| (fi, at)));
-            match bound {
-                Some((fi, (actual_line, pc))) => {
-                    session.inspector.set_breakpoint(pc);
-                    session.breakpoints.push((fi, pc));
-                    // A `condition` (an integer expression) only stops when it evaluates nonzero.
-                    if let Some(cond) = bp.get("condition").and_then(|c| c.as_str()) {
-                        if !cond.trim().is_empty() {
-                            session.conditions.insert(pc, cond.to_string());
-                        }
-                    }
-                    out.push(Json::obj(vec![
-                        ("verified", Json::Bool(true)),
-                        ("line", Json::i(actual_line as i64)),
-                    ]));
-                }
-                None => out.push(Json::obj(vec![("verified", Json::Bool(false))])),
-            }
+        for ((bp, line), at) in requested.iter().zip(lines).zip(bound) {
+            // A `condition` (an integer expression) only stops when it evaluates nonzero.
+            let condition = bp
+                .get("condition")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+                .map(str::to_string);
+            session.breakpoints.push(SourceBreakpoint {
+                file: path.to_string(),
+                line: at.unwrap_or(line),
+                condition,
+            });
+            // Verified once a module the run has admitted has code for it. One a child's module
+            // binds when the run admits it, and stops then.
+            out.push(match at {
+                Some(at) => Json::obj(vec![
+                    ("verified", Json::Bool(true)),
+                    ("line", Json::i(at as i64)),
+                ]),
+                None => Json::obj(vec![("verified", Json::Bool(false))]),
+            });
         }
         (
             true,
@@ -643,9 +662,9 @@ impl DapServer {
             .or_else(|| session.frame_refs.first().copied())?;
         let session = self.session.as_mut()?;
         session.inspector.select_task(tid);
-        let func = session.inspector.backtrace().get(frame_idx)?.pc.func;
+        let pc = session.inspector.backtrace().get(frame_idx)?.pc;
         // Prefer a window-range watch (an addressable var).
-        if let Some((addr, len)) = self.session.as_ref()?.resolve_watch(frame_idx, func, name) {
+        if let Some((addr, len)) = self.session.as_ref()?.resolve_watch(frame_idx, pc, name) {
             return Some(format!("{addr}:{len}"));
         }
         // Otherwise, an SSA-held scalar is readable but has no address — value-watch it (#1229).
@@ -775,8 +794,7 @@ impl DapServer {
             // VS Code call stack reads `#0 compute`, not `#0 func0`.
             let fname = session
                 .inspector
-                .func_name(f.pc.func)
-                .map(str::to_owned)
+                .func_name(f.pc)
                 .unwrap_or_else(|| format!("func{}", f.pc.func));
             let mut fields = vec![
                 ("id", Json::i(frame_id as i64)),
@@ -847,11 +865,11 @@ impl DapServer {
         let Some(session) = self.session.as_ref() else {
             return (false, Json::Null, vec![]);
         };
-        let Some(debug) = session.debug.as_ref() else {
+        let Some(debug) = session.inspector.debug_info(0) else {
             return (false, Json::Null, vec![]);
         };
-        // Snapshot (name, addr, width, type_id) first so the immutable `debug` borrow ends before
-        // reading the window. One entry per name (a global is declared once).
+        // Snapshot (name, addr, width, type_id) first, then read the window. One entry per name (a
+        // global is declared once).
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut globals: Vec<(String, u64, usize, Option<TypeId>)> = Vec::new();
         for v in debug
@@ -880,7 +898,7 @@ impl DapServer {
         for (name, addr, width, type_id) in globals {
             let value = match session.inspector.read_window(addr, width) {
                 Ok(bytes) => match type_id {
-                    Some(tid) => fmt_scalar(self.types(), tid, &bytes),
+                    Some(tid) => fmt_scalar(&debug.types, tid, &bytes),
                     None => le_sint(&bytes, width).to_string(),
                 },
                 Err(_) => "<unreadable>".to_string(),
@@ -932,10 +950,13 @@ impl DapServer {
         let &(tid, frame_idx) = vref
             .checked_sub(1)
             .and_then(|r| session.frame_refs.get(r as usize))?;
-        let debug = session.debug.as_ref()?;
         session.inspector.select_task(tid);
         let frames = session.inspector.backtrace();
         let frame = frames.get(frame_idx)?;
+        // The frame's module's own §6 info: a child's module has its own (#2239).
+        let module = frame.pc.module;
+        let debug = session.inspector.debug_info(module)?;
+        let types = &debug.types;
         // The stopped source line drives lexical-scope resolution of shadowed names (§6).
         let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
         let in_scope = |v: &VarInfo| {
@@ -951,7 +972,7 @@ impl DapServer {
                 .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
         };
         // Snapshot the in-scope locals, one per name (a shadowed name shows only its innermost
-        // visible declaration). `debug` borrow ends before we read/allocate.
+        // visible declaration).
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut vars: Vec<(String, String, VarLoc, Option<TypeId>, bool)> = debug
             .vars
@@ -990,27 +1011,24 @@ impl DapServer {
                     | VarLoc::Fixed { .. }
                     | VarLoc::Tls { .. }
             );
-            if let Some(tid_ref) = type_id.filter(|&t| is_mem && self.is_expandable(t)) {
+            if let Some(tid_ref) = type_id.filter(|&t| is_mem && is_expandable(types, t)) {
                 if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
-                    let summary = self.place_summary(base, tid_ref);
-                    let vr = self.alloc_place(tid, base, tid_ref);
+                    let summary = self.place_summary(types, base, tid_ref);
+                    let vr = self.alloc_place(module, tid, base, tid_ref);
                     out.push(var_json(&name, &summary, &ty, vr));
                     continue;
                 }
             }
             // Otherwise a scalar: read it and format through the structured type when present (so a
             // window `double`/pointer reads typed, not as raw bytes), else the raw value.
-            let width = scalar_width(self.types(), type_id, &ty);
+            let width = scalar_width(types, type_id, &ty);
             let session = self.session.as_ref()?;
             if let Some(val) = session.inspector.read_var(frame_idx, &name, width) {
                 // A pointer held in an SSA value is still followable: render its address like a
                 // window pointer's and expand it to its pointee through an rvalue place.
                 let ptr = match (&val, type_id) {
                     (VarValue::Value(Value::I64(p)), Some(t))
-                        if matches!(
-                            self.types().get(t as usize),
-                            Some(TypeDef::Pointer { .. })
-                        ) =>
+                        if matches!(types.get(t as usize), Some(TypeDef::Pointer { .. })) =>
                     {
                         Some((*p as u64, t))
                     }
@@ -1018,6 +1036,7 @@ impl DapServer {
                 };
                 if let Some((addr, type_id)) = ptr {
                     let vr = self.push_place(Place {
+                        module,
                         tid,
                         addr,
                         type_id,
@@ -1027,7 +1046,7 @@ impl DapServer {
                     continue;
                 }
                 let rendered = match (&val, type_id) {
-                    (VarValue::Bytes(b), Some(tid)) => fmt_scalar(self.types(), tid, b),
+                    (VarValue::Bytes(b), Some(tid)) => fmt_scalar(types, tid, b),
                     _ => fmt_var(&val),
                 };
                 out.push(var_json(&name, &rendered, &ty, 0));
@@ -1041,8 +1060,15 @@ impl DapServer {
     fn expand_place(&mut self, idx: usize) -> Option<Vec<Json>> {
         let session = self.session.as_ref()?;
         let place = session.place_refs.get(idx)?;
-        let (tid, base, type_id, rvalue) = (place.tid, place.addr, place.type_id, place.rvalue);
-        let types = session.debug.as_ref()?.types.clone();
+        let (module, tid, base, type_id, rvalue) = (
+            place.module,
+            place.tid,
+            place.addr,
+            place.type_id,
+            place.rvalue,
+        );
+        let debug = session.inspector.debug_info(module)?;
+        let types = &debug.types;
         self.session.as_mut()?.inspector.select_task(tid);
 
         // Build the (name, addr, type) of each member, then render — reading children below.
@@ -1054,7 +1080,7 @@ impl DapServer {
                 }
             }
             TypeDef::Array { elem, count, .. } => {
-                let stride = type_size(&types, *elem) as u64;
+                let stride = type_size(types, *elem) as u64;
                 for i in 0..*count as u64 {
                     members.push((format!("[{i}]"), base + i * stride, *elem));
                 }
@@ -1082,16 +1108,16 @@ impl DapServer {
 
         let mut out = Vec::new();
         for (name, addr, mty) in members {
-            let ty_name = type_render_name(&types, mty);
-            if self.is_expandable(mty) {
-                let summary = self.place_summary(addr, mty);
-                let vr = self.alloc_place(tid, addr, mty);
+            let ty_name = type_render_name(types, mty);
+            if is_expandable(types, mty) {
+                let summary = self.place_summary(types, addr, mty);
+                let vr = self.alloc_place(module, tid, addr, mty);
                 out.push(var_json(&name, &summary, &ty_name, vr));
             } else {
-                let size = type_size(&types, mty) as usize;
+                let size = type_size(types, mty) as usize;
                 let session = self.session.as_ref()?;
                 let value = match session.inspector.read_window(addr, size) {
-                    Ok(bytes) => fmt_scalar(&types, mty, &bytes),
+                    Ok(bytes) => fmt_scalar(types, mty, &bytes),
                     Err(_) => "<unreadable>".to_string(),
                 };
                 out.push(var_json(&name, &value, &ty_name, 0));
@@ -1100,19 +1126,10 @@ impl DapServer {
         Some(out)
     }
 
-    /// Does this type expand into children — a struct's fields, an array's elements, or a
-    /// pointer's pointee (`*p`)?
-    fn is_expandable(&self, type_id: TypeId) -> bool {
-        matches!(
-            self.types().get(type_id as usize),
-            Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. } | TypeDef::Pointer { .. })
-        )
-    }
-
-    /// The value summary shown next to an expandable variable: a struct/array uses the static
-    /// [`type_summary`]; a pointer shows its current address (read from the window).
-    fn place_summary(&self, addr: u64, type_id: TypeId) -> String {
-        let types = self.types();
+    /// The value summary shown next to an expandable variable of type `type_id` in `types`: a
+    /// struct/array uses the static [`type_summary`]; a pointer shows its current address (read
+    /// from the window).
+    fn place_summary(&self, types: &[TypeDef], addr: u64, type_id: TypeId) -> String {
         if matches!(types.get(type_id as usize), Some(TypeDef::Pointer { .. })) {
             return match self
                 .session
@@ -1126,18 +1143,11 @@ impl DapServer {
         type_summary(types, type_id)
     }
 
-    /// Borrow the structured type table (empty if no debug info).
-    fn types(&self) -> &[TypeDef] {
-        self.session
-            .as_ref()
-            .and_then(|s| s.debug.as_ref())
-            .map(|d| d.types.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Record an expandable `Place` and return its `variablesReference`.
-    fn alloc_place(&mut self, tid: u64, addr: u64, type_id: TypeId) -> i64 {
+    /// Record an expandable `Place` of module `module`'s type `type_id` and return its
+    /// `variablesReference`.
+    fn alloc_place(&mut self, module: u32, tid: u64, addr: u64, type_id: TypeId) -> i64 {
         self.push_place(Place {
+            module,
             tid,
             addr,
             type_id,
@@ -1226,21 +1236,22 @@ impl DapServer {
         };
         let line = session.inspector.source_loc(frame.pc).map(|s| s.line);
         let func = frame.pc.func;
-        let Some((ty_name, type_id)) = session.debug.as_ref().and_then(|debug| {
-            debug
-                .vars
-                .iter()
-                .filter(|v| {
-                    (v.func == func || v.func == temen_ir::GLOBAL_SCOPE)
-                        && scope_covers(v.scope, line)
-                        && v.name == name
-                })
-                .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
-                .map(|v| (v.ty.clone(), v.type_id))
-        }) else {
+        let Some(debug) = session.inspector.debug_info(frame.pc.module) else {
             return fail;
         };
-        let width = scalar_width(self.types(), type_id, &ty_name);
+        let Some(var) = debug
+            .vars
+            .iter()
+            .filter(|v| {
+                (v.func == func || v.func == temen_ir::GLOBAL_SCOPE)
+                    && scope_covers(v.scope, line)
+                    && v.name == name
+            })
+            .max_by_key(|v| v.scope.map_or(0u32, |(s, _)| s))
+        else {
+            return fail;
+        };
+        let width = scalar_width(&debug.types, var.type_id, &var.ty);
         let Some(session) = self.session.as_mut() else {
             return fail;
         };
@@ -1563,7 +1574,7 @@ impl DapServer {
                     s.inspector.select_task(t);
                 }
                 s.inspector.set_single_thread(single_thread);
-                s.debug.is_some()
+                s.inspector.debug_info(0).is_some()
             }
             None => return (false, Json::Null, vec![]),
         };
@@ -1633,7 +1644,7 @@ impl DapServer {
             == Some("instruction");
         let stop = match self.session.as_mut() {
             Some(s) if s.inspector.supports_reverse() => {
-                if by_op || s.debug.is_none() {
+                if by_op || s.inspector.debug_info(0).is_none() {
                     s.inspector.step_back()
                 } else {
                     self.step_back_source_line()
@@ -1791,12 +1802,15 @@ impl DapServer {
         session.inspector.select_task(tid); // focus the requested thread, then read it immutably
         let session = self.session.as_ref().unwrap();
         let frames = session.inspector.backtrace();
-        let Some(func) = frames.get(frame_idx).map(|f| f.pc.func) else {
+        let Some(pc) = frames.get(frame_idx).map(|f| f.pc) else {
             return fail;
         };
+        let func = pc.func;
+        // The frame's module's own §6 info: a child's module has its own (#2239).
+        let debug = session.inspector.debug_info(pc.module);
 
         // A bare known variable: return its declared type + formatted value (richer than a raw i64).
-        let bare = session.debug.as_ref().and_then(|d| {
+        let bare = debug.as_deref().and_then(|d| {
             d.vars
                 .iter()
                 .find(|v| (v.func == func || v.func == temen_ir::GLOBAL_SCOPE) && v.name == expr)
@@ -1825,7 +1839,7 @@ impl DapServer {
 
         // Otherwise evaluate as a C expression (arithmetic + member/index/arrow) over the frame's
         // variables, walking the structured types through the window.
-        let (types, vars) = match session.debug.as_ref() {
+        let (types, vars) = match debug.as_deref() {
             Some(d) => (d.types.as_slice(), d.vars.as_slice()),
             None => (&[][..], &[][..]),
         };
@@ -2125,46 +2139,6 @@ fn dap_reason(r: StopReason) -> &'static str {
     }
 }
 
-/// Build the `(file, line) → smallest IR pc` index used to bind source-line breakpoints. Every
-/// mapped op is a stop position on both engines — a block terminator (`inst == insts.len()`) too
-/// (#1713) — so every loc is indexed.
-fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
-    let mut idx: BTreeMap<(u32, u32), IrPc> = BTreeMap::new();
-    for l in &di.locs {
-        let pc = IrPc {
-            module: 0,
-            func: l.func,
-            block: l.block as usize,
-            inst: l.inst as usize,
-        };
-        idx.entry((l.file, l.line))
-            .and_modify(|e| {
-                if pc < *e {
-                    *e = pc;
-                }
-            })
-            .or_insert(pc);
-    }
-    idx
-}
-
-/// Bind a requested line to the nearest line at/after it that has code (so a breakpoint on a blank
-/// or comment line snaps forward, like a native debugger). Returns the actual line + its pc.
-fn resolve_line(idx: &BTreeMap<(u32, u32), IrPc>, file: u32, line: u32) -> Option<(u32, IrPc)> {
-    idx.range((file, line)..=(file, u32::MAX))
-        .next()
-        .map(|((_, l), pc)| (*l, *pc))
-}
-
-/// Match a DAP source path to a debug-info file index: exact, or the debug path is a suffix of it,
-/// or they share a basename (DAP paths are usually absolute; debug paths are often basenames).
-fn match_file(files: &[String], path: &str) -> Option<u32> {
-    files
-        .iter()
-        .position(|f| f == path || path.ends_with(f.as_str()) || basename(f) == basename(path))
-        .map(|i| i as u32)
-}
-
 fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
@@ -2266,6 +2240,15 @@ fn type_render_name(types: &[TypeDef], id: TypeId) -> String {
         ) => name.clone(),
         None => "?".to_string(),
     }
+}
+
+/// Does type `type_id` of `types` expand into children — a struct's fields, an array's elements, or
+/// a pointer's pointee (`*p`)?
+fn is_expandable(types: &[TypeDef], type_id: TypeId) -> bool {
+    matches!(
+        types.get(type_id as usize),
+        Some(TypeDef::Aggregate { .. } | TypeDef::Array { .. } | TypeDef::Pointer { .. })
+    )
 }
 
 /// A brief value summary shown next to an expandable variable (its members appear on expansion).
