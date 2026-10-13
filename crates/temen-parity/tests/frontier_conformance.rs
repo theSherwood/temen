@@ -305,19 +305,33 @@ fn a_cited_issue_is_a_hash_followed_by_a_number() {
     assert!(cites_an_issue("INVARIANTS #14 forbids parking this"));
 }
 
-/// **The `Module` durability row's conditional half (#1361).** The cell is `Conditional` because the
-/// answer depends on how the grant was minted, so the loop above cannot check it with one handle.
-/// Both directions, on one host, so the pin fails if either half drifts:
+/// **The `Module` durability row's conditional half (#1361, #2245).** The cell is `Conditional`
+/// because the answer depends on how the grant was minted, so the loop above cannot check it with one
+/// handle. Every direction, on one host, so the pin fails if any half drifts:
 ///
 /// - an **attested-freezable** grant (`grant_durable_module`) survives a drain and is captured,
 ///   named by its §4 content digest — the module bytes are D-scope and never ride the artifact;
+/// - so is the running program's **child image** (`grant_child_image`), which the restoring
+///   powerbox derives again;
 /// - a plain grant (`grant_module`) is still drained as `NonDurableKind::Module`.
 #[test]
-fn a_module_handle_is_durable_iff_the_grant_is_attested_freezable() {
+fn a_module_handle_is_durable_iff_the_restoring_host_grants_it_again() {
     let m = a_module();
+    // A program that spawns copies of itself: `m`'s function twice, the second its `_child`.
+    let mut program = m.clone();
+    program.exports.push(temen_ir::Export {
+        name: temen_ir::CHILD_EXPORT.into(),
+        func: 1,
+    });
+    program.funcs.insert(0, program.funcs[0].clone());
     let mut host = Host::new();
+    host.set_self_module(&std::sync::Arc::new(program));
     let plain = host.grant_module(&m);
     let freezable = host.grant_durable_module(&m);
+    host.grant_child_image();
+    let image = host
+        .resolve_cap_name("child")
+        .expect("the image is granted");
 
     // Before the drain, the un-attested grant is what makes a capture refuse.
     assert!(
@@ -342,13 +356,14 @@ fn a_module_handle_is_durable_iff_the_grant_is_attested_freezable() {
     let slots: Vec<u32> = captured.iter().map(|h| h.slot).collect();
     assert_eq!(
         slots,
-        vec![(freezable as u32) & 0xff],
-        "exactly the attested grant's slot survives; the drained one's is closed"
+        vec![(freezable as u32) & 0xff, (image as u32) & 0xff],
+        "exactly the attested grant's and the image's slots survive; the drained one's is closed"
     );
     assert!(
-        matches!(captured[0].binding, DurableBinding::Module { .. }),
-        "the attested grant is captured as a module binding, got {:?}",
-        captured[0].binding
+        captured
+            .iter()
+            .all(|h| matches!(h.binding, DurableBinding::Module { .. })),
+        "both are captured as module bindings, got {captured:?}"
     );
     assert_ne!(plain, freezable, "the two grants are distinct handles");
 }

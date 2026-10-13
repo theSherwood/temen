@@ -21363,10 +21363,13 @@ pub enum DurableBinding {
     /// rule a separate-module [`FrozenNested`] child already re-attaches by
     /// ([`Host::tables_by_digest`]), reused rather than duplicated.
     ///
-    /// A grant *without* the attestation stays non-durable ([`NonDurableKind::Module`]): a durable
-    /// domain may not instantiate one anyway (DURABILITY.md §4), so there is nothing a thaw could
-    /// usefully hand back. This is the same conditional shape [`Named`](Self::Named) has — durable
-    /// iff the grant carries a reconstruction rule the restoring host can act on.
+    /// #2245: the running program's child image ([`Host::grant_child_image`]) rides the same way,
+    /// unattested: it is a pure function of the program, so the restoring powerbox derives it
+    /// again.
+    ///
+    /// Any other grant stays non-durable ([`NonDurableKind::Module`]): the restoring host has no
+    /// rule to grant it again. This is the same conditional shape [`Named`](Self::Named) has —
+    /// durable iff the grant carries a reconstruction rule the restoring host can act on.
     ///
     /// Authority is unchanged: a digest is not authority. The thaw resolves it only against modules
     /// the **restoring** host chose to grant, so a moment cannot carry in code a host would not have
@@ -22392,7 +22395,8 @@ pub struct NamedCapRestoreError {
 }
 
 /// Why a thaw could not re-resolve a durable [`DurableBinding::Module`] handle (#1361): the
-/// restoring host holds no **durable** module grant whose §4 content digest matches. Fail-closed,
+/// restoring host holds no **durable** module grant whose §4 content digest matches, and its child
+/// image (#2245) is not that module either. Fail-closed,
 /// and carrying the digest, so an embedder can tell "I forgot to re-grant it" from "I re-granted a
 /// different build". The bytes never ride the artifact (D-scope), so re-granting the same module is
 /// the embedder's half of the contract, exactly as for a separate-module nested child.
@@ -23630,6 +23634,11 @@ pub struct Host {
     /// hashes its encoding: tens of milliseconds for a compiler, where only a spawn of the running
     /// program (`module = -1`) ever reads it.
     self_grant: std::sync::OnceLock<ModuleGrant>,
+    /// #2245 — the `modules` index of the running program's child image, once
+    /// [`Host::grant_child_image`] granted it. The image is a pure function of the program, so the
+    /// restoring powerbox grants it again and a handle to it rides a freeze
+    /// ([`Host::module_rides_freeze`]). Cleared when the running program changes.
+    child_image: Option<u32>,
     /// The domain's one shared service state for offers it reifies (`export.handle` — all of a
     /// domain's reified offers share it), created lazily on first reification.
     self_instance: Option<Arc<Mutex<ProviderState>>>,
@@ -24530,6 +24539,7 @@ impl Host {
             self_module: None,
             compile_memo: None,
             self_grant: std::sync::OnceLock::new(),
+            child_image: None,
             self_instance: None,
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
@@ -26709,15 +26719,14 @@ impl Host {
                 Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
                 // #2025: durable here; whether the cut holds every holder is the codec's check.
                 Binding::SharedRegion(region) => DurableBinding::SharedRegion { region },
-                // #1361: a module grant the granting host attested **freezable** (§4) is durable —
-                // named by its content digest, which the thaw resolves against the restoring host's
-                // re-granted modules (the same rule a separate-module nested child re-attaches by).
-                // An un-attested grant is still refused: a durable domain cannot instantiate one,
-                // so there is no authority for a thaw to reconstruct.
-                Binding::Module(id) => match self.modules.get(id as usize) {
-                    Some(g) if g.durable => DurableBinding::Module { digest: g.digest },
-                    _ => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                // #1361: a module grant the restoring host grants again is durable — named by its
+                // content digest, which the thaw resolves against the restoring host's grants (the
+                // same rule a separate-module nested child re-attaches by). Any other grant is
+                // still refused: there is nothing a thaw could re-pin it to.
+                Binding::Module(id) if self.module_rides_freeze(id) => DurableBinding::Module {
+                    digest: self.modules[id as usize].digest,
                 },
+                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
                 Binding::ModuleLoader => {
                     return Err(self.non_durable(slot, NonDurableKind::ModuleLoader))
                 }
@@ -26824,12 +26833,10 @@ impl Host {
                 | Binding::Budget(_)
                 // #2025: a region rides with its sharing group, so a drain keeps it.
                 | Binding::SharedRegion(_) => continue,
-                // #1361: the complement of `capture` above — an attested-freezable grant is
-                // durable and a drain keeps it; an un-attested one is still relinquished.
-                Binding::Module(id) => match self.modules.get(id as usize) {
-                    Some(g) if g.durable => continue,
-                    _ => NonDurableKind::Module,
-                },
+                // #1361: the complement of `capture` above — a grant that rides a freeze is kept;
+                // any other is still relinquished.
+                Binding::Module(id) if self.module_rides_freeze(id) => continue,
+                Binding::Module(_) => NonDurableKind::Module,
                 Binding::ModuleLoader => NonDurableKind::ModuleLoader,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
@@ -28711,9 +28718,11 @@ impl Host {
 
     /// Set (or clear) the running module — the one writer of [`Host::self_module`], so the grant
     /// [`SELF_MODULE`] resolves to ([`Host::resolve_module`]) is always the current module's (#1863:
-    /// a spawn record's `module = -1` means "my own program", on every tier).
+    /// a spawn record's `module = -1` means "my own program", on every tier). A child image granted
+    /// before is no longer this program's, so it stops riding a freeze.
     pub(crate) fn set_self_module_opt(&mut self, m: Option<Arc<Module>>) {
         self.self_grant = std::sync::OnceLock::new();
+        self.child_image = None;
         self.self_module = m;
     }
 
@@ -29504,7 +29513,7 @@ impl Host {
     /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
     /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
     /// them beside `"instantiator"` — one frontier (INVARIANTS #14) — to a guest that can spawn
-    /// detached ([`temen_ir::spawns_detached`]): least authority, and a `Module` grant is
+    /// detached ([`temen_ir::spawns_detached`]): least authority, and the `"module"` grant is
     /// non-durable, so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
     /// stays a subset of the guest's own reach: the child runs this guest's code, on this budget.
     ///
@@ -29527,11 +29536,11 @@ impl Host {
 
     /// Grant the by-name spawn set, each name at most once: `"module"` (this program, spawnable) for
     /// a guest that spawns by module handle (`by_module_handle`, [`temen_ir::spawns_by_module_handle`]
-    /// — an op-17 guest names itself as `-1`, and a `Module` grant is non-durable), `"child"` (this
-    /// program's [`temen_ir::child_image`]) for a guest that exports a `_child` entry, and `"budget"`
-    /// (one `win` of `Budget.mem`, which pays for a child's growth as well as its window, #1909). The
-    /// one-window ceiling is a grant tighter than the root's, which a guest sizes its child from
-    /// (owner, 2026-10-06, #2113).
+    /// — an op-17 guest names itself as `-1`, and the `"module"` grant is non-durable), `"child"`
+    /// (this program's [`temen_ir::child_image`]) for a guest that exports a `_child` entry, and
+    /// `"budget"` (one `win` of `Budget.mem`, which pays for a child's growth as well as its
+    /// window, #1909). The one-window ceiling is a grant tighter than the root's, which a guest
+    /// sizes its child from (owner, 2026-10-06, #2113).
     pub fn grant_detached_spawn_caps(&mut self, win: u64, by_module_handle: bool) {
         let Some(m) = self.self_module.clone() else {
             return;
@@ -29549,8 +29558,12 @@ impl Host {
 
     /// #2219: grant the running program's [`temen_ir::child_image`] as `"child"`, when it exports a
     /// `_child` entry and nothing holds the name yet. A program that spawns copies of itself declares
-    /// where they start, and spawns this image. Non-durable, as the `"module"` grant is: a durable
-    /// domain refuses it. A `_child` the image refuses is noted instead.
+    /// where they start, and spawns this image. A `_child` the image refuses is noted instead.
+    ///
+    /// #2245: the image is a pure function of the program, so a handle to it rides a freeze by its
+    /// digest, and the thaw re-pins it to the image the restoring powerbox grants again
+    /// ([`Host::module_rides_freeze`]). It is not attested freezable, so a durable domain still
+    /// cannot spawn it.
     pub fn grant_child_image(&mut self) {
         let Some(m) = self.self_module.clone() else {
             return;
@@ -29560,6 +29573,7 @@ impl Host {
         }
         match temen_ir::child_image(&m) {
             Some(Ok(image)) => {
+                self.child_image = Some(self.modules.len() as u32);
                 let child = self.grant_module_shared(Arc::new(image), false);
                 self.register_cap_name("child", child);
             }
@@ -29646,10 +29660,21 @@ impl Host {
             .map(|i| (i as u32, &self.modules[i]))
     }
 
-    /// The `modules` index a durable digest names — what a captured [`DurableBinding::Module`]
-    /// re-binds to on thaw.
+    /// Whether a handle to module grant `id` rides a freeze ([`DurableBinding::Module`]): the
+    /// restoring host grants the module again, so the handle can be re-pinned by its digest. The
+    /// embedder re-grants a module it attested freezable (#1361); the powerbox derives the running
+    /// program's child image again (#2245).
+    fn module_rides_freeze(&self, id: u32) -> bool {
+        self.child_image == Some(id) || self.modules.get(id as usize).is_some_and(|g| g.durable)
+    }
+
+    /// The `modules` index a captured [`DurableBinding::Module`] re-binds to on thaw: a durable
+    /// grant of that digest, else this program's child image when it is that module.
     fn module_id_by_digest(&self, digest: &[u8; 32]) -> Option<u32> {
-        self.grant_by_digest(digest).map(|(i, _)| i)
+        self.grant_by_digest(digest).map(|(i, _)| i).or_else(|| {
+            self.child_image
+                .filter(|&i| &self.modules[i as usize].digest == digest)
+        })
     }
 
     /// The function table and type section ([`ModuleGrant::tables`]) of the grant
@@ -30457,10 +30482,10 @@ impl Host {
         //   reference powerboxes pass one `win` to both calls. No instantiator, no grant.
         // - `"module"` is the **running module** ([`Host::set_self_module`]), i.e. this guest's own
         //   code, and `grant_detached_spawn_caps` no-ops with none registered.
-        // - **not durable**: a `Module` grant is non-durable (a freeze fails `NonDurableKind::Module`),
-        //   so granting it mid-run would silently make a snapshot-taking domain unfreezable. A durable
-        //   domain spawns detached only from an attested-freezable grant (#1501), which this is not,
-        //   so this forgoes nothing.
+        // - **not durable**: the `"module"` grant is non-durable (a freeze fails
+        //   `NonDurableKind::Module`), so granting it mid-run would silently make a snapshot-taking
+        //   domain unfreezable. A durable domain spawns detached only from an attested-freezable
+        //   grant (#1501), which this is not, so this forgoes nothing.
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.

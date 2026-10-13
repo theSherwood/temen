@@ -12,7 +12,8 @@
 //! only point that sees both the validated unit and the host (the injected validator is a bare
 //! `fn`), and it stays a strict subset of what the guest holds: a named `"instantiator"` must
 //! already be granted (its window sizes the budget), `"module"` is the guest's own code, and a
-//! durable domain is excluded (a `Module` grant is non-durable, and op 15 refuses there anyway).
+//! durable domain is excluded (the `"module"` grant is non-durable, and op 15 refuses there
+//! anyway).
 //!
 //! The blob validator is stubbed inline (the `invoke_fibers.rs` pattern), so this stays in the
 //! temen-interp suite with no Cranelift dependency.
