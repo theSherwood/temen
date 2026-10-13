@@ -4446,7 +4446,7 @@ fn warm_eval_grows_past_the_warm_window_on_both_tiers() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
 
     assert_eq!(
-        temen_warm_coop_open(0),
+        temen_warm_coop_open(0, COOP_LEAF_OFF),
         0,
         "warm-coop open (status {})",
         temen_status()
@@ -4525,12 +4525,16 @@ fn warm_coop_evals_a_page_managing_guest_with_leaf_tierup() {
 
     // Arm the warm-coop tier (idempotent: the second call reuses the cached emit).
     assert_eq!(
-        temen_warm_coop_open(0),
+        temen_warm_coop_open(0, COOP_LEAF_OFF),
         0,
         "warm-coop open (status {})",
         temen_status()
     );
-    assert_eq!(temen_warm_coop_open(0), 0, "idempotent re-open");
+    assert_eq!(
+        temen_warm_coop_open(0, COOP_LEAF_OFF),
+        0,
+        "idempotent re-open"
+    );
 
     // Two coop Runs: parity + tier-up + isolation (round 2 must see the same fresh state).
     for round in 0..2 {
@@ -4581,6 +4585,124 @@ fn warm_coop_evals_a_page_managing_guest_with_leaf_tierup() {
         0,
         "prepare after close must refuse"
     );
+}
+
+/// **A warm eval runs whole as a leaf** (#1414 S4-3c): with the root offered, the warm-coop open
+/// takes `eval_run` whole. The page-managing guest's eval cannot park, so the emitter takes it,
+/// page-checked over the rodata its warmup protected, and no region emit is made. Each Run restores
+/// the image and runs the eval emitted from its entry: one tier-up, the interpreter warm path's value
+/// and stdout, and the same fresh state on the second Run.
+#[test]
+fn warm_coop_runs_eval_run_whole_as_a_root_leaf() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&warm_coop_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    assert!(
+        temen_warm_open(bytes.as_ptr(), bytes.len()) > 0,
+        "warm open (status {})",
+        temen_status()
+    );
+    let v_interp = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(
+        (temen_status(), v_interp),
+        (STATUS_OK, 425035),
+        "interp warm eval"
+    );
+    // SAFETY: capture slots staged by the eval; this thread is the only accessor (FFI_LOCK).
+    let out_interp =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+
+    assert_eq!(temen_warm_coop_open(0, COOP_LEAF_ROOT), 0, "warm-coop open");
+    for round in 0..2 {
+        assert_eq!(
+            temen_warm_coop_prepare(core::ptr::null(), 0),
+            0,
+            "warm-coop prepare (round {round}, status {})",
+            temen_status()
+        );
+        assert!(
+            temen_coop_program_wasm_len(0) > 0 && temen_coop_wasm_len() == 0,
+            "eval_run runs whole as a leaf, with no region emit (round {round})"
+        );
+        let (run, _) = pump(&[], None, &mut |cap, _| panic!("no cap is declared: {cap}"));
+        assert_eq!(
+            (run.status, run.value, run.tierups),
+            (STATUS_OK, v_interp, 1),
+            "round {round}"
+        );
+        assert_eq!(run.stdout, out_interp, "stdout (round {round})");
+    }
+    assert_eq!(
+        temen_warm_eval(core::ptr::null(), 0),
+        v_interp,
+        "the interpreter warm path after the leaf Runs"
+    );
+    temen_warm_close();
+}
+
+/// **A warm leaf traps a store to the rodata its warmup protected** (#2302, #1414 S4-3c): each Run
+/// re-establishes the warm image's `Ro` page, the interpreter warm path traps the store, and the
+/// leaf, page-checked over that page, ends the run with the same `MemoryFault`. The warm+JIT tier
+/// emitted `eval_run` mask-only and ran on past it.
+#[test]
+fn warm_root_leaf_traps_a_store_to_protected_rodata() {
+    let _g = ffi_guard();
+    let (_, mem_h) = onramp_out_mem_handles();
+    let src = format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  va = i64.const 24584
+  vv = i64.const 777
+  i64.store va vv
+  vas = i32.const {mem_h}
+  voff = i64.const 24576
+  vlen = i64.const 4096
+  vro = i32.const 1
+  vp = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vro)
+  return vp
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  va = i64.const 24584
+  vb = i64.const 106
+  i64.store va vb
+  vx = i64.load va
+  return vx
+  }}
+}}
+export 0 func "warmup" 0
+export 1 func "eval_run" 1
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    assert!(
+        temen_warm_open(bytes.as_ptr(), bytes.len()) > 0,
+        "warm open (status {})",
+        temen_status()
+    );
+    temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(
+        temen_status(),
+        STATUS_TRAP,
+        "the interpreter warm path traps"
+    );
+    assert_eq!(temen_warm_coop_open(0, COOP_LEAF_ROOT), 0, "warm-coop open");
+    assert_eq!(temen_warm_coop_prepare(core::ptr::null(), 0), 0, "prepare");
+    assert!(
+        temen_coop_program_wasm_len(0) > 0,
+        "eval_run runs whole as a leaf"
+    );
+    let (run, _) = pump(&[], None, &mut |cap, _| panic!("no cap is declared: {cap}"));
+    assert_eq!((run.status, run.tierups), (STATUS_TRAP, 1));
+    // SAFETY: the end-of-run trap-name slot, read before anything else runs.
+    let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+    assert_eq!(std::str::from_utf8(trap).unwrap(), "MemoryFault");
+    temen_warm_close();
 }
 
 // ---- #1334: a `compile_linked` unit invoked mid-run on the cooperative tier ---------------------

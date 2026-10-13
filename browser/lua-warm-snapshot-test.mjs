@@ -1,10 +1,10 @@
 // V8 (Node) check of the **Lua warm-runtime snapshot** driver (issue #805), the Lua twin of
 // `warm-snapshot-test.mjs`. Drives the shipping engine FFI (`temen_warm_open`/`temen_warm_eval`) plus the
-// warm+JIT path (`runWarmJit`) over the committed `lua_snapshot.temen` (built from
-// `lua_snapshot_harness.c`), and asserts:
+// warm+JIT path (`runWarmCoop`: `eval_run` on the pump, whole or with its regions emitted) over the
+// committed `lua_snapshot.temen` (built from `lua_snapshot_harness.c`), and asserts:
 //   - warm `eval_run` over the restored snapshot matches the cold `_start` (`temen_run_onramp`) output
 //     byte-for-byte while skipping the Lua runtime rebuild,
-//   - warm+JIT (`eval_run` emitted to wasm) matches too,
+//   - warm+JIT matches too,
 //   - fresh-per-Run isolation holds (a global in one Run can't leak into the next).
 //
 //   node lua-warm-snapshot-test.mjs [temen_browser.wasm] [lua_snapshot.temen]
@@ -12,7 +12,7 @@
 // Exits 0 on success, 1 on any mismatch; SKIPs cleanly if the asset isn't built.
 import { readFileSync, existsSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
-import { runWarmJit } from './web/wasmjit-module.js';
+import { runWarmCoop } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/lua_snapshot.temen';
@@ -34,13 +34,13 @@ const modBytes = readFileSync(modPath);
 function cold(js) { const m = put(modBytes); const s = put(enc(js)); ex.temen_run_onramp(m.p, m.len, s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); m.free(); return { out, st }; }
 function warmInterp(js) { const s = put(enc(js)); ex.temen_warm_eval(s.p, s.len); const out = readStdout(); const st = ex.temen_status(); s.free(); return { out, st }; }
 // warm+JIT, degrading exactly as production (`play.js`) does: Lua's `eval_run` reaches `lua_pcall`'s
-// setjmp, so `compile_jit` routes it to `InterpDriven` (#1081) and `temen_warm_jit_open` declines
-// (`eval_run` not wasm-drivable). The engine's own doc contract for that decline is "the page then
-// evaluates via `temen_warm_eval`", so fall back to the warm interpreter and record which tier ran.
+// setjmp, so the emitter declines it whole (`InterpDriven`, #1081) and it runs with its eligible regions
+// emitted. Were the emitted tier to decline it outright (status 2), the page evaluates via
+// `temen_warm_eval`, so fall back to the warm interpreter and record which tier ran.
 let warmJitDeclined = false;
 async function warmJit(js) {
   try {
-    const st = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1);
+    const st = await runWarmCoop(ex, ex.memory ?? memory, enc(js), `${modPath}#coop`, 1);
     return { out: readStdout(), st, tier: 'jit' };
   } catch (e) {
     if (ex.temen_status() !== 2) throw e; // only STATUS_UNSUPPORTED is the drivability decline; re-raise real traps
@@ -90,7 +90,7 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
 ex.temen_warm_close();
 if (!allOk) fail('Lua warm snapshot parity/isolation mismatch');
 if (warmJitDeclined) {
-  console.log('\nnote: warm+JIT declined (Lua reaches lua_pcall\'s setjmp ⇒ InterpDriven, #1081); the warm+JIT');
-  console.log('      card falls back to the warm interpreter, exactly as production (play.js) does.');
+  console.log('\nnote: warm+JIT declined (status 2: nothing for the emitted tier); the warm+JIT card falls');
+  console.log('      back to the warm interpreter, exactly as production (play.js) does.');
 }
 console.log('\nOK: Lua warm snapshot — warm eval_run matches cold _start (interp + JIT) byte-for-byte, isolation holds');

@@ -349,20 +349,19 @@ export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
 }
 
 // Run the warm session's `eval_run` on the **warm-coop** tier (#816 item 4): the cooperative
-// tier-up drive over the restored warm image, for a page-managing / InterpDriven eval the
-// WasmDriven `runWarmJit` declines (its open throws). The engine emits the module's leaves + cap
-// wrappers once (cached in the warm session, like the warm+JIT emit; the compiled
-// `WebAssembly.Module` is cached across Runs under `cacheKey#coop`); each Run is prepare (restore
-// image + re-establish the captured page map + arm `eval_run` on the coop scheduler) + the standard
-// `driveCoopTierupRun` event loop — the interpreter owns the eval, eligible pure leaves run on
-// emitted wasm with the per-event `mapped`/page-state sync carrying the warm image's grown heap and
-// protected rodata. Assumes `temen_warm_open` already succeeded. Returns the run status; throws if
-// the module has nothing for the emitted tier or the run traps (the caller falls back to
+// tier-up drive over the restored warm image. `eval_run` is offered whole as a leaf first, as a cold
+// module's root is (#1414 S4-3c); when the emitter declines it (it can park, or a function leaves the
+// emitter's subset), the interpreter owns the eval and eligible pure leaves run on emitted wasm. The
+// engine outlines and compiles the module once per warm session, and the emits are kept (the compiled
+// `WebAssembly.Module` across Runs under `cacheKey`). Each Run is prepare (restore the image,
+// re-establish the captured page map, arm `eval_run` on the coop scheduler) + the standard
+// `driveCoopTierupRun` event loop. Assumes `temen_warm_open` already succeeded. Returns the run status;
+// throws if the eval has nothing for the emitted tier or the run traps (the caller falls back to
 // `temen_warm_eval`, the interpreter warm path).
 export async function runWarmCoop(ex, memory, stdinBytes, cacheKey, shared = 1) {
   const u8 = () => new Uint8Array(memory.buffer);
-  if (ex.temen_warm_coop_open(shared) !== 0) {
-    throw new Error(`warm-coop open failed: status ${ex.temen_status()} (2 = nothing emittable)`);
+  if (ex.temen_warm_coop_open(shared, COOP_LEAF_ROOT) !== 0) {
+    throw new Error(`warm-coop open failed: status ${ex.temen_status()}`);
   }
   let stdinP = 0;
   const stdinLen = stdinBytes ? stdinBytes.length : 0;
@@ -372,7 +371,7 @@ export async function runWarmCoop(ex, memory, stdinBytes, cacheKey, shared = 1) 
   }
   const prepared = ex.temen_warm_coop_prepare(stdinP, stdinLen);
   if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
-  if (prepared !== 0) throw new Error(`warm-coop prepare failed: status ${ex.temen_status()}`);
+  if (prepared !== 0) throw new Error(`warm-coop prepare failed: status ${ex.temen_status()} (2 = nothing emittable)`);
   return driveCoopTierupRun(ex, memory, { cacheKey });
 }
 
@@ -404,7 +403,7 @@ function warmJitTrapError(e) {
 }
 
 // **Pre-warm** the warm+JIT `eval_run` for `cacheKey` — emit + `WebAssembly.compile` + instantiate **and
-// dry-run it once** (empty input, over the restored image), so the first real `runWarmJit` is instant.
+// dry-run it once** (empty input, over the restored image), so the first real `runWarmCoop` is instant.
 // Called during pre-warm (off the main thread), so all of that cost is hidden.
 //
 // Why the dry run matters (and why compile+instantiate alone did not): V8 compiles a wasm module's
@@ -412,16 +411,16 @@ function warmJitTrapError(e) {
 // Module + instance still left the *first* `f0()` call paying ~1.5 s of function compilation on the
 // user's first Run (measured: run1 4.7 s vs run2 2.3 s even with the instance primed). Making one `f0`
 // call here forces that compilation now. Empty input is language-agnostic (QuickJS/Lua) and still enters
-// the interpreter, warming the hot functions; the next real Run does `temen_warm_jit_prepare` (restores the
-// image + resets the powerbox), so the dry run leaves no state and fresh-per-Run isolation holds.
+// the interpreter, warming the hot functions; the next real Run does `temen_warm_coop_prepare` (restores the
+// image + a fresh powerbox), so the dry run leaves no state and fresh-per-Run isolation holds.
 //
 // Best-effort: returns false if `eval_run` isn't wasm-drivable or the dry run traps (the card then just
 // uses warm-interp), true once compiled + warmed.
 export async function primeWarmJit(ex, memory, cacheKey, shared = 1) {
   try {
     // A full dry Run with no stdin: opens/emits `eval_run`, compiles + instantiates (cached under
-    // `cacheKey`), and — the point — makes the first `f0` call so V8 compiles the bodies now.
-    await runWarmJit(ex, memory, null, cacheKey, shared);
+    // `cacheKey`), and — the point — makes the first call so V8 compiles the bodies now.
+    await runWarmCoop(ex, memory, null, cacheKey, shared);
     return true;
   } catch {
     return false; // eval_run not emittable / trapped → card stays warm-interp
