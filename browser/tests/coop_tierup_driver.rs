@@ -3890,10 +3890,10 @@ block 0 (vx: i64) {
 
 // ---- #744: a parent serves its child's calls on the coop tier -----------------------------------
 
-/// The #744 guest (EXEC.md row 4) on the coop tier. `_start` resolves `"instantiator"` and
-/// `"budget"`, spawns a same-module child at f1 through the v1 record at 17408, granting it an
-/// `"exec"` capability backed by its own impl export (`GRANT_SERVE_LIVE_TAG`), serves one call with
-/// `svc.wait`, joins the child and returns `join*100 + served`. The child calls `exec.run(40, 2)`
+/// The #744 guest (EXEC.md row 4) on the coop tier. `_start` resolves `"instantiator"`, `"budget"`
+/// and `"child"`, spawns its child image (#2219: f1 is its `_child`) through the v1 record at 17408,
+/// granting it an `"exec"` capability backed by its own impl export (`GRANT_SERVE_LIVE_TAG`), serves
+/// one call with `svc.wait`, joins the child and returns `join*100 + served`. The child calls `exec.run(40, 2)`
 /// through the helper f3, then the leaf f4 on the reply. The handler f2 answers `f4(a) + b`. f4,
 /// `3x + 7`, tiers up twice: from the parent's handler and from the child. f3 is never emitted: its
 /// live call parks the child, and only the pump can park a task. Result: f4(f4(40) + 2) * 100 + 1 =
@@ -3902,13 +3902,14 @@ fn coop_serve_guest_text() -> String {
     let child = temen_ir::SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1(1)
+        ..temen_ir::SpawnRec::v1(0)
     };
     format!(
         r#"memory 17
 data 16384 "instantiator"
 data 16400 "budget"
 data 16416 "exec"
+data 16432 "child"
 {rec}type 0 func (i64, i64) -> (i64)
 type 1 interface {{ run: 0 }}
 export 0 interface "exec" 1 {{ run: 2 }}
@@ -3922,6 +3923,11 @@ block 0 () {{
   vb = self.resolve vbp vbl
   vba = i64.const {budget_at}
   i32.store vba vb
+  vcp = i64.const 16432
+  vcl = i64.const 5
+  vc = self.resolve vcp vcl
+  vma = i64.const {module_at}
+  i32.store vma vc
   vg = i64.const 16640
   vgn = i32.const 16416
   i32.store vg vgn
@@ -3984,9 +3990,11 @@ block 0 (vx: i64) {{
   }}
 }}
 export 0 func "_start" 0
+export 1 func "_child" 1
 "#,
         rec = rec::segment(17408, &child),
         budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + rec::MODULE_AT,
         tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
     )
 }
