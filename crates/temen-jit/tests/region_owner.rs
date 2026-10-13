@@ -1,7 +1,7 @@
 //! **#1608 — a futex-key registry purge forgets only its own run's pages.**
 //!
 //! Window virtual addresses are recycled between runs, and the teardown purge runs *after* the
-//! reservation is released, over the whole 1 TiB range. So a dying run could erase entries belonging
+//! reservation is released, over its whole range. So a dying run could erase entries belonging
 //! to whichever runs had since been handed those addresses — and then a waiter that had parked on
 //! `Region(..)` and a notifier reading the map afterwards compute different keys for the same
 //! address, the notify reaches nobody, and the run wedges with no error anywhere. Measured at 9 runs

@@ -16,7 +16,9 @@ mod rec;
 
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use detached::{grant_hooks, host, jit_on_reserved, module, parent_room_after_refusal};
+use detached::{
+    grant_hooks, host, interp_on_reserved, jit_on_reserved, module, parent_room_after_refusal,
+};
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChild, JitOutcome, TrapKind};
@@ -129,14 +131,7 @@ fn interp_result(
 
 /// [`interp_result`] over a host the caller keeps.
 fn interp_on(parent: &temen_ir::Module, host: &mut Host, h: [i32; 3]) -> Result<Vec<Value>, Trap> {
-    let mut fuel = 50_000_000u64;
-    run_with_host(
-        parent,
-        0,
-        &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
-        &mut fuel,
-        host,
-    )
+    interp_on_reserved(parent, host, h, temen_ir::DEFAULT_RESERVED_LOG2)
 }
 
 #[test]

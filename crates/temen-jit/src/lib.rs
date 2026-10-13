@@ -264,7 +264,8 @@ pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
-/// not committed memory; `2^40` matches `DESIGN.md` §4's host-configurable example. A real host
+/// not committed memory. `2^40` was the default until #2305 lowered it to 2^37 (`DESIGN.md` §4),
+/// so a window frozen under it still thaws at the reservation its artifact records. A real host
 /// chooses this per its VA budget; the reference just caps it so a fuzzed/oversized request
 /// can't ask for an absurd reservation.
 const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
@@ -6380,10 +6381,11 @@ fn compile_child_windowed(
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
     // it keeps the invariant local instead of relying on the cross-module parent-size cap). The
-    // reservation may exceed the committed cap (a root's lazy reservation), never the other way.
+    // reservation may exceed the committed cap (a root's lazy reservation), never the other way, and
+    // is capped as a root's is: a thawed child keeps the reservation its artifact records.
     if mapped_log2 > MAX_JIT_WINDOW_LOG2
         || reserved_log2 < mapped_log2
-        || reserved_log2 > temen_ir::DEFAULT_RESERVED_LOG2
+        || reserved_log2 > MAX_JIT_RESERVED_LOG2
     {
         return Err(JitError::Unsupported(
             "child window exceeds the reference JIT's max",

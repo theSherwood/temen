@@ -3784,13 +3784,15 @@ impl Memory {
 }
 
 /// The reference host's **default reservation policy** (§4): the size (`log2`) of the reserved
-/// virtual range a window's `mapped` bytes live inside. DESIGN §4 makes this host-configurable
-/// ("e.g. 2^40"); this is the default the reference `run`/`compile_and_run` entries apply when a
+/// virtual range a window's `mapped` bytes live inside, 128 GiB. DESIGN §4 makes this
+/// host-configurable; this is the default the reference `run`/`compile_and_run` entries apply when a
 /// caller doesn't pass one. It is *policy*, not verified semantics — both backends share this one
 /// constant so they stay in differential lockstep, and the masking unit (`temen-mask`) never
 /// hard-codes a reservation. The reserved range is `PROT_NONE` + lazily paged, so a large value
-/// costs virtual address space, not committed memory.
-pub const DEFAULT_RESERVED_LOG2: u8 = 40;
+/// costs virtual address space, not committed memory, but every window spends it: the process's
+/// pool of it (`temen_interp::RESERVED_POOL`, 64 TiB) holds 512 windows of this size (#2305). A
+/// guest maps nothing past it.
+pub const DEFAULT_RESERVED_LOG2: u8 = 37;
 
 /// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
 /// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the

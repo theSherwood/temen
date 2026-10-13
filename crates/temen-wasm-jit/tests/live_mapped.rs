@@ -12,7 +12,7 @@
 //! reproduces the old baked-constant behavior, pinned already by the full `differential.rs` suite.
 //!
 //! The check is the whole of escape safety here: the emitted module's memory is the embedder's linear
-//! memory and `& MASK` clamps only to the 2^40 reservation, so whatever `M` the host writes, the check
+//! memory and `& MASK` clamps only to the 2^37 reservation, so whatever `M` the host writes, the check
 //! must admit no more than `[0, M)` — including an `M` smaller than the access (the tests below
 //! drive `M` down to 0).
 

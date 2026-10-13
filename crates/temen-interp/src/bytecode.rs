@@ -3763,8 +3763,8 @@ impl SharedProgram {
                 // backing (an `Ro`/`Unmapped` hole, `Rw` past a hole, or pages committed past a fixed
                 // backing): then `0`, which admits nothing, so the emitted run's next access faults and
                 // the driver declines to the interpreter. (#1919: this fell back to the reservation — the
-                // whole backing while the backing was pre-sized to it, before #1153; since, 2^40 bytes
-                // of the embedder's memory past a backing that holds far less.)
+                // whole backing while the backing was pre-sized to it, before #1153; since, a whole
+                // reservation of the embedder's memory past a backing that holds far less.)
                 let mapped = m.scalar_extent().unwrap_or(0);
                 if info.3.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed

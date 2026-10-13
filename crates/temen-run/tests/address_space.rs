@@ -1,9 +1,11 @@
 //! #2305 — a window the address space has no room for is refused, never a host panic. Every window
-//! reserves `2^DEFAULT_RESERVED_LOG2` bytes (1 TiB) of the process's address space, so a process
-//! holds about 127 of them on a 47-bit host. Here the test holds the address space itself, leaving no
-//! gap a window fits in: a run on the JIT then ends with `ThreadFault` before it starts, and a detached
-//! spawn answers `-EINVAL`, its budget charged nothing. Once the address space is handed back, both
-//! go through. Its own binary: the address space is the process's.
+//! reserves `2^DEFAULT_RESERVED_LOG2` bytes (128 GiB) of the process's address space. The process's
+//! pool of it (`temen_interp::RESERVED_POOL`) refuses a window at its admission before the address
+//! space runs out, unless other mappings fill it first, which is what this test does: it holds the
+//! address space itself, leaving no gap a window fits in. A run on the JIT then ends with
+//! `ThreadFault` before it starts, and a detached spawn answers `-EINVAL`, its budget charged
+//! nothing. Once the address space is handed back, both go through. Its own binary: the address
+//! space is the process's.
 #![cfg(target_os = "linux")]
 
 #[path = "support/detached.rs"]

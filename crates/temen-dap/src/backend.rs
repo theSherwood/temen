@@ -138,7 +138,9 @@ fn build_run(
         let mut host = Host::new();
         grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
         if let Some(limit) = mem_limit {
-            let mem = RootWindow::fresh(module).declared.saturating_add(limit);
+            let mem = RootWindow::fresh(module, temen_ir::DEFAULT_RESERVED_LOG2)
+                .declared
+                .saturating_add(limit);
             host.set_grant(
                 i64::try_from(mem).unwrap_or(-1),
                 DEFAULT_CHANNEL as i64,

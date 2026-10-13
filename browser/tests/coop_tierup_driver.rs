@@ -1454,7 +1454,7 @@ fn assert_grow_case(name: &str, off: u64, len: u64, declared: u8, ro: bool, want
 }
 
 /// #1312 — the gap this issue is about: a `vm_map` whose end lands **past the coop run window**.
-/// The run window opens at `max(JIT_RUN_WIN_LOG2, declared)` = 32 MiB; the oracle reserves 2^40 and
+/// The run window opens at `max(JIT_RUN_WIN_LOG2, declared)` = 32 MiB; the oracle reserves 2^37 and
 /// grows, so all three shapes below succeed there. Before the growable backing they all trapped on
 /// the cooperative tier, with zero tier-ups (the fault landed in interpreted code, inside the
 /// allocator, before the hot leaf was ever reached).

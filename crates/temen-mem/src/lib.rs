@@ -240,7 +240,7 @@ impl Region {
 
     /// #1312: an owned flat buffer of `size` zero bytes that [`grow_to`](Region::grow_to) can
     /// **enlarge** — the backing a cooperative run's window uses so a guest allocator's `vm_map` can
-    /// commit past the declared window (the interpreter oracle reserves 2^40 and grows on demand; a
+    /// commit past the declared window (the interpreter oracle reserves 2^37 and grows on demand; a
     /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`; the whole allocation is
     /// addressable and zeroed, so a grow inside it costs nothing.
     ///
@@ -1354,8 +1354,8 @@ mod sparse {
     impl Sparse {
         /// The segment size, in bytes.
         pub const SEG: u64 = 1 << SEG_LOG2;
-        /// The largest `size` the top-level table can span (4 TiB). `Region::new`'s 2^40 on-ramp
-        /// reservation takes 4096 top-level entries, 32 KiB.
+        /// The largest `size` the top-level table can span (4 TiB). `Region::new`'s 2^37 on-ramp
+        /// reservation takes 512 top-level entries, 4 KiB.
         pub const MAX_SIZE: u64 = 1 << (L1_MAX_LOG2 + L2_LOG2 + SEG_LOG2);
 
         pub(super) fn new(size: u64) -> Option<Sparse> {

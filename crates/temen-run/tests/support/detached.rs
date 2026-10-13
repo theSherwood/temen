@@ -1,10 +1,11 @@
 //! The op-15 (`instantiate_detached`) fixtures more than one test binary drives: a parent that
-//! spawns a child detached, the host that grants it, and its run on the JIT. A binary that holds a
+//! spawns a child detached, the host that grants it, and its run on the tree-walker and the JIT. A binary that holds a
 //! process-wide resource (the address space, #2305) needs its own process, so it includes these by
 //! `#[path]` rather than copying them.
+#![allow(dead_code)] // each including binary uses a different subset
 
 use core::ffi::c_void;
-use temen_interp::Host;
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -84,4 +85,17 @@ pub fn jit_on_reserved(
     )
     .expect("jit run");
     jo
+}
+
+/// Run `parent` on the tree-walker over `host` and its `h` handles, its window reserving
+/// `2^reserved_log2` bytes.
+pub fn interp_on_reserved(
+    parent: &temen_ir::Module,
+    host: &mut Host,
+    h: [i32; 3],
+    reserved_log2: u8,
+) -> Result<Vec<Value>, Trap> {
+    let mut fuel = 50_000_000u64;
+    let args = [Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])];
+    run_capture_reserved_with_host(parent, 0, &args, &mut fuel, &[], reserved_log2, host).0
 }
