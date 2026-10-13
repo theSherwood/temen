@@ -1,9 +1,11 @@
 // V8 (Node) end-to-end check of the **warm+JIT** eval tier (WASM_AOT.md warm+JIT), driving the shipping
-// engine FFI the playground uses (`temen_warm_open` + `temen_warm_jit_*`) plus the browser driver
-// (`runWarmJit` from wasmjit-module.js). The interpreter warm path (`warm-snapshot-test.mjs`) already
-// proves eval_run-over-the-snapshot ≡ cold `_start`; this proves the **emitted-wasm** eval_run agrees
-// with the interpreter warm eval byte-for-byte, keeps fresh-per-Run isolation, and — the point of the
-// tier — accelerates a compute-heavy eval while init stays paid-once.
+// engine FFI the playground uses (`temen_warm_open` + `temen_warm_coop_*`) plus the browser driver
+// (`runWarmCoop` from wasmjit-module.js), which runs `eval_run` on the pump over the restored image —
+// whole as a leaf when the emitter takes it, as it does QuickJS's (#1414 S4-3c). The interpreter warm
+// path (`warm-snapshot-test.mjs`) already proves eval_run-over-the-snapshot ≡ cold `_start`; this
+// proves the **emitted-wasm** eval_run agrees with the interpreter warm eval byte-for-byte, keeps
+// fresh-per-Run isolation, and — the point of the tier — accelerates a compute-heavy eval while init
+// stays paid-once.
 //
 //   node warm-jit-test.mjs [temen_browser.wasm] [qjs_snapshot.temen]
 //
@@ -11,7 +13,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { engineImports } from './engine-imports.mjs';
-import { runWarmJit, primeWarmJit, jitCacheStats } from './web/wasmjit-module.js';
+import { runWarmCoop, primeWarmJit, jitCacheStats } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/qjs_snapshot.temen';
@@ -53,10 +55,10 @@ function warmInterp(js) {
   s.free();
   return { out, ms, status };
 }
-// WARM+JIT: restore the snapshot, then `eval_run` on emitted wasm (the whole runWarmJit round-trip).
+// WARM+JIT: restore the snapshot, then `eval_run` on emitted wasm (the whole runWarmCoop round-trip).
 async function warmJit(js) {
   const t = performance.now();
-  const status = await runWarmJit(ex, ex.memory ?? memory, enc(js), `${modPath}#eval`, 1);
+  const status = await runWarmCoop(ex, ex.memory ?? memory, enc(js), `${modPath}#coop`, 1);
   const ms = performance.now() - t;
   return { out: readStdout(), ms, status };
 }
@@ -92,9 +94,21 @@ let allOk = true;
 // ~1.5–2 s of function codegen (the live QuickJS card's first wasm-JIT Run was ~1.4 s "despite priming").
 {
   const t = performance.now();
-  const primed = await primeWarmJit(ex, ex.memory ?? memory, `${modPath}#eval`, 1);
+  const primed = await primeWarmJit(ex, ex.memory ?? memory, `${modPath}#coop`, 1);
   if (!primed) fail('primeWarmJit returned false (QuickJS eval_run should be wasm-emittable)');
-  console.error(`warm+JIT primed via primeWarmJit (compile + instantiate + dry f0 call): ${(performance.now() - t).toFixed(0)} ms (all off the main thread at pre-warm)`);
+  console.error(`warm+JIT primed via primeWarmJit (compile + instantiate + dry call): ${(performance.now() - t).toFixed(0)} ms (all off the main thread at pre-warm)`);
+}
+
+// #1414 S4-3c: QuickJS's `eval_run` runs whole on the pump, as a leaf with no region emit. Arm a Run and
+// close it unrun; the next Run restores the image again.
+{
+  const s = put(enc('1;\n'));
+  if (ex.temen_warm_coop_prepare(s.p, s.len) !== 0) fail(`temen_warm_coop_prepare: status ${ex.temen_status()}`);
+  s.free();
+  const leaf = Number(ex.temen_coop_program_wasm_len(0)) > 0 && Number(ex.temen_coop_wasm_len()) === 0;
+  ex.temen_coop_close();
+  allOk &&= leaf;
+  console.error(`eval_run on the pump: ${leaf ? 'whole, as a leaf' : 'NOT whole (a region emit)'}`);
 }
 
 // Regression guard for that exact bug: after `primeWarmJit`, the FIRST real Run must be about as fast as
@@ -109,7 +123,7 @@ let allOk = true;
   allOk &&= warmed;
   console.error(
     `prewarm codegen guard: first-Run=${r1.ms.toFixed(0)}ms second-Run=${r2.ms.toFixed(0)}ms — ` +
-    `${warmed ? 'OK — prime warmed V8; first Run pays no codegen spike' : 'REGRESSION: first Run paid function codegen (prime did not dry-call f0)'}`,
+    `${warmed ? 'OK — prime warmed V8; first Run pays no codegen spike' : 'REGRESSION: first Run paid function codegen (prime did not dry-call the eval)'}`,
   );
 }
 

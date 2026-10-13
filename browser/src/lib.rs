@@ -7668,21 +7668,34 @@ impl WarmSession {
     }
 }
 
-/// The per-session warm-coop cache (see [`WarmSession::coop`]): the [`coop_emit_for`] outputs with
-/// the wasm/eligibility in shared form (cloned per Run as cheap `Arc`s) plus the **outlined**
-/// module's [`SharedProgram`](bytecode::SharedProgram) — compiled once, so a per-eval
-/// [`temen_warm_coop_prepare`] is build-window + schedule, never a recompile or re-emit.
+/// The per-session warm-coop cache (see [`WarmSession::coop`]): the **outlined** module and its
+/// [`SharedProgram`](bytecode::SharedProgram), compiled once, so a per-eval
+/// [`temen_warm_coop_prepare`] is build-window + schedule, never a recompile. A root that runs whole
+/// as a leaf needs nothing more (its emit is kept by its digest, #2087); the region emit is made on
+/// the first eval whose root the emitter declines (#1414 S4-3c).
 struct WarmCoop {
     /// The outlined module (the one BOTH tiers use) — powerbox grants + shim `sigs` read it.
     m: temen_ir::Module,
+    prog: bytecode::SharedProgram,
+    shared: bool,
+    /// The [`temen_coop_open`] mode the session opened with: whether `eval_run` is offered whole.
+    mode: i32,
+    /// The emitter declined `eval_run` once. The offer turns on the image and the shape of the
+    /// eval's powerbox, which every eval of the session shares, so it is not made again.
+    leaf_declined: bool,
+    /// The region emit, made on the first eval whose root does not run whole.
+    regions: Option<WarmRegions>,
+}
+
+/// A warm session's region emit ([`WarmCoop::regions`]): the [`coop_emit_for`] outputs, with the
+/// wasm and eligibility in shared form (cloned per Run as cheap `Arc`s).
+struct WarmRegions {
     wasm: std::sync::Arc<[u8]>,
     eligible: std::sync::Arc<[bool]>,
     paged: bool,
     all_shimmable: bool,
     table_log2: u8,
     jit_importer: bool,
-    shared: bool,
-    prog: bytecode::SharedProgram,
     /// #1627: the emit is spill-instrumented (see [`CoopEmit::spill`]).
     spill: bool,
 }
@@ -8189,23 +8202,24 @@ pub extern "C" fn temen_warm_jit_finish() -> i32 {
 //
 // The warm+JIT tier above requires a `WasmDriven` `eval_run` — a **page-managing** eval (it
 // `vm_map`-grows, `protect`s, streams …) is `InterpDriven` and used to fall back to the pure
-// interpreter warm path. This tier runs such an eval on the **cooperative tier-up driver** (the one
-// fallback tier since #1026): [`temen_warm_coop_open`] emits the module's leaves + cap wrappers
-// once (cached in the session, like the warm+JIT emit), and each Run's
+// interpreter warm path. This tier runs an eval on the **cooperative tier-up driver**:
+// [`temen_warm_coop_open`] outlines and compiles the module once, and each Run's
 // [`temen_warm_coop_prepare`] restores the warm image, re-establishes the captured page map, and
 // arms a [`bytecode::CoopRun`] at `eval_run` over the session window — after which the host drives
 // the standard `temen_coop_*` event pump (`driveCoopTierupRun` in the browser; the wasmi harness
-// natively): the interpreter owns the eval, eligible pure leaves run on emitted wasm, and the
-// per-event `mapped`/page-state sync carries the warm image's grown heap + protected rodata
-// exactly as it does for a cold coop run.
+// natively). `eval_run` is offered whole as a leaf first (#1414 S4-3c), as a cold run's root is;
+// when the emitter declines it, the interpreter owns the eval and eligible pure leaves run on
+// emitted wasm, the per-event `mapped`/page-state sync carrying the warm image's grown heap +
+// protected rodata exactly as it does for a cold coop run.
 
-/// Emit the open warm session's module for the cooperative tier-up drive and cache it. Idempotent —
-/// a second call reuses the cache (`0`). `shared != 0` ⇒ the emitted module imports a shared
-/// memory, matching what the host instantiates it against. Returns `0`, else a negative `STATUS_*`
-/// (also in [`LAST_STATUS`]): `UNSUPPORTED` if no warm session is open or the module has nothing
-/// for the emitted tier (the page then evaluates via [`temen_warm_eval`]).
+/// Outline and compile the open warm session's module for the cooperative tier-up drive, and cache
+/// it. Idempotent — a second call reuses the cache (`0`). `shared != 0` ⇒ emitted code imports a
+/// shared memory, matching what the host instantiates it against; `mode` is [`temen_coop_open`]'s
+/// (a JS host that leaves it out offers no leaf). Returns `0`, else a negative `STATUS_*` (also in
+/// [`LAST_STATUS`]): `UNSUPPORTED` if no warm session is open or the module is outside the coop
+/// tier (the page then evaluates via [`temen_warm_eval`]).
 #[no_mangle]
-pub extern "C" fn temen_warm_coop_open(shared: i32) -> i32 {
+pub extern "C" fn temen_warm_coop_open(shared: i32, mode: i32) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session for this call.
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
@@ -8216,34 +8230,26 @@ pub extern "C" fn temen_warm_coop_open(shared: i32) -> i32 {
         set(STATUS_OK);
         return 0;
     }
-    // The run window is the session's mapped window — the emit's mask domain and the run
-    // reservation must agree on it (the coop driver convention, with `WARM_MAPPED_LOG2` playing
-    // `JIT_RUN_WIN_LOG2.max(declared)`; `temen_warm_open` already gated declared ≤ mapped).
-    let emit = match coop_emit_for(&s.module, shared != 0, WARM_MAPPED_LOG2) {
-        Ok(e) => e,
-        Err(status) => {
-            set(status);
-            return -status;
-        }
-    };
-    // Compile the OUTLINED module once (both tiers must run it — the emitted mask, the engine
+    if onramp_check(&s.module).is_err() || s.module.memory.is_none() {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    }
+    // Compile the OUTLINED module once (both tiers must run it — the emitted code, the engine
     // table, and the shims all number its functions). Outlining only appends, so `eval_fn` (and
     // the warm image the ORIGINAL module's warmup produced) stay valid.
-    let Some(prog) = bytecode::SharedProgram::compile(&emit.m) else {
+    let mut m = s.module.clone();
+    temen_wasm_jit::outline_cap_calls(&mut m);
+    let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
     s.coop = Some(Box::new(WarmCoop {
-        wasm: emit.wasm.into(),
-        eligible: emit.eligible.into(),
-        paged: emit.paged,
-        all_shimmable: emit.all_shimmable,
-        table_log2: emit.table_log2,
-        jit_importer: emit.jit_importer,
-        shared: shared != 0,
+        m,
         prog,
-        spill: emit.spill,
-        m: emit.m,
+        shared: shared != 0,
+        mode,
+        leaf_declined: false,
+        regions: None,
     }));
     set(STATUS_OK);
     0
@@ -8253,8 +8259,9 @@ pub extern "C" fn temen_warm_coop_open(shared: i32) -> i32 {
 /// stdin from `[stdin_ptr, stdin_len)`), replacing any open coop session. Call before each Run,
 /// then drive the standard `temen_coop_*` pump to `COOP_RUN_DONE`/`_TRAP` (the capture slots are
 /// staged there as usual; the session's heap high-water advances so the next restore zeroes what
-/// the eval dirtied). Returns `0`, else `-STATUS_*` (`UNSUPPORTED` without [`temen_warm_coop_open`];
-/// `TRAP` if scheduling the entry traps).
+/// the eval dirtied). Returns `0`, else `-STATUS_*` (`UNSUPPORTED` without [`temen_warm_coop_open`],
+/// or when `eval_run` runs neither whole nor with a region to tier up into; `TRAP` if scheduling
+/// the entry traps).
 #[no_mangle]
 pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -8264,36 +8271,119 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
     };
-    let Some(wc) = s.coop.as_deref() else {
+    if s.coop.is_none() {
         set(STATUS_UNSUPPORTED);
         return -STATUS_UNSUPPORTED;
-    };
+    }
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into —
     // byte-identical warm state each Run (identical to [`temen_warm_eval`]'s restore).
     s.restore_warm_window();
-    let mut host = Host::new();
-    host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
+    let stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
         // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let frame = grant_onramp_caps(&mut host, &wc.m, None, None).frame;
+    let wc = s.coop.as_deref_mut().expect("checked above");
+    let args = [Value::I64(s.entry_sp as i64)];
+    let host_for = |m: &temen_ir::Module| {
+        let mut host = Host::new();
+        host.stdin = stdin.clone();
+        let frame = grant_onramp_caps(&mut host, m, None, None).frame;
+        (host, frame)
+    };
+    // #1414 S4-3c: offer `eval_run` whole first, as `temen_coop_open` offers a cold root. When the
+    // emitter takes it, the eval runs emitted from its entry and needs no region emit.
+    let leaf = wc.mode & (COOP_LEAF_ROOT | COOP_LEAF_SUSPENDS);
+    if leaf != COOP_LEAF_OFF && !wc.leaf_declined {
+        let leaves = Programs::default();
+        let tierup = bytecode::TierUpConfig {
+            root: bytecode::ProgramEmit::default(),
+            leaf: Some(leaf_emitter(
+                leaves.clone(),
+                leaf & COOP_LEAF_SUSPENDS != 0,
+                wc.shared,
+            )),
+            modules: None,
+        };
+        let (host, frame) = host_for(&wc.m);
+        match wc.prog.coop_run_over_grown(
+            s.eval_fn,
+            &args,
+            DEFAULT_FUEL,
+            host,
+            Some(tierup),
+            s.back.clone(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            s.warm.page_map(),
+            Some(&wc.m),
+        ) {
+            Ok(run)
+                if leaves
+                    .lock()
+                    .is_ok_and(|l| matches!(l.get(&0), Some(Some(_)))) =>
+            {
+                // SAFETY: single-threaded wasm; the session is read back only via the coop
+                // exports, and `temen_warm_close` drops this run before freeing its window.
+                unsafe {
+                    *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
+                        back: Some(s.back.clone()),
+                        warm: true,
+                        programs: leaves,
+                        frame,
+                        ..CoopTierupRun::over(run)
+                    })
+                };
+                set(STATUS_OK);
+                return 0;
+            }
+            Err(_) => {
+                set(STATUS_TRAP);
+                return -STATUS_TRAP;
+            }
+            Ok(_) => wc.leaf_declined = true,
+        }
+    }
+    if wc.regions.is_none() {
+        // The run window is the session's mapped window — the emit's mask domain and the run
+        // reservation must agree on it (the coop driver convention, with `WARM_MAPPED_LOG2`
+        // playing `JIT_RUN_WIN_LOG2.max(declared)`; `temen_warm_open` already gated declared ≤
+        // mapped). The emit outlines the same module the same way, so its functions are `wc.m`'s.
+        match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2) {
+            Ok(e) => {
+                wc.regions = Some(WarmRegions {
+                    wasm: e.wasm.into(),
+                    eligible: e.eligible.into(),
+                    paged: e.paged,
+                    all_shimmable: e.all_shimmable,
+                    table_log2: e.table_log2,
+                    jit_importer: e.jit_importer,
+                    spill: e.spill,
+                })
+            }
+            Err(status) => {
+                set(status);
+                return -status;
+            }
+        }
+    }
+    let r = wc.regions.as_ref().expect("emitted above");
+    let (mut host, frame) = host_for(&wc.m);
     // The B2 table/unit-emitter arming, exactly as `temen_coop_open` (the emit was made with the
     // same `table_log2`/window, so the engine table and the emitted mask agree).
-    if wc.all_shimmable {
-        host.set_jit_table_log2(wc.table_log2);
+    if r.all_shimmable {
+        host.set_jit_table_log2(r.table_log2);
     }
     TIERUP_UNIT_SHARED.store(wc.shared, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(WARM_MAPPED_LOG2, std::sync::atomic::Ordering::Relaxed);
-    TIERUP_UNIT_TABLE_LOG2.store(wc.table_log2, std::sync::atomic::Ordering::Relaxed);
-    if wc.jit_importer && wc.all_shimmable {
+    TIERUP_UNIT_TABLE_LOG2.store(r.table_log2, std::sync::atomic::Ordering::Relaxed);
+    if r.jit_importer && r.all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
         root: bytecode::ProgramEmit {
-            eligible: std::sync::Arc::clone(&wc.eligible),
-            page_checked: wc.paged,
+            eligible: std::sync::Arc::clone(&r.eligible),
+            page_checked: r.paged,
         },
         leaf: None,
         modules: None,
@@ -8304,13 +8394,14 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     // window, so a compiler-guest whose heap outgrows 64 MiB grows it rather than trapping.
     let run = match wc.prog.coop_run_over_grown(
         s.eval_fn,
-        &[Value::I64(s.entry_sp as i64)],
+        &args,
         DEFAULT_FUEL,
         host,
         Some(tierup),
         s.back.clone(),
         temen_ir::DEFAULT_RESERVED_LOG2,
         s.warm.page_map(),
+        None,
     ) {
         Ok(r) => r,
         Err(_) => {
@@ -8319,13 +8410,12 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         }
     };
     // SAFETY: single-threaded wasm; the session is read back only via the coop exports. The window
-    // is the warm session's (shared `Region`, still fixed-size until slice 3) — `temen_warm_close`
-    // drops this run before freeing it.
+    // is the warm session's (shared `Region`) — `temen_warm_close` drops this run before freeing it.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             back: Some(s.back.clone()),
             warm: true,
-            emitted_wasm: std::sync::Arc::clone(&wc.wasm),
+            emitted_wasm: std::sync::Arc::clone(&r.wasm),
             sigs: wc
                 .m
                 .funcs
@@ -8333,8 +8423,8 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
                 .map(|f| (f.params.clone(), f.results.clone()))
                 .collect(),
             frame,
-            paged: wc.paged,
-            spill: spill_region(wc.spill),
+            paged: r.paged,
+            spill: spill_region(r.spill),
             ..CoopTierupRun::over(run)
         });
     }

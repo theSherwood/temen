@@ -205,6 +205,12 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   the interpreter owns the eval, eligible pure leaves run on emitted wasm, and the per-event
   `mapped`/page-state sync carries the warm image's grown heap and protected rodata
   (`browser/tests/coop_tierup_driver.rs::warm_coop_evals_a_page_managing_guest_with_leaf_tierup`).
+  **#1414 S4-3c:** the warm-coop open now offers `eval_run` whole first, as a cold run's root is
+  offered, so one open serves every warm eval: QuickJS's runs whole as the pump's leaf, page-checked
+  over its protected rodata (#2302), and an eval the emitter declines whole (Lua's and MicroPython's,
+  past a setjmp) runs with its regions emitted, the region emit made on the first such eval.
+  `runWarmCoop` is the page's one warm+JIT driver; `runWarmJit` and the single-shot warm emit retire
+  next (`warm_coop_runs_eval_run_whole_as_a_root_leaf`, `warm_root_leaf_traps_a_store_to_protected_rodata`).
 - **Measured native** (`crates/temen-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
   same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
   restore ~3.5 ms (memcpy the live prefix).

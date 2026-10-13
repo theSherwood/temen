@@ -1,11 +1,12 @@
 // V8 (Node) check of the **MicroPython warm-runtime snapshot** driver (PYTHON.md slice B, #1327) —
 // the MicroPython twin of `lua-warm-snapshot-test.mjs`. Drives the shipping engine FFI
-// (`temen_warm_open` / `temen_warm_eval`) plus the warm+JIT path (`runWarmJit`) over the committed
-// `micropython_snapshot.temen` (built from `micropython_snapshot.c`), and asserts:
+// (`temen_warm_open` / `temen_warm_eval`) plus the warm+JIT path (`runWarmCoop`: `eval_run` on the
+// pump, whole or with its regions emitted) over the committed `micropython_snapshot.temen` (built from
+// `micropython_snapshot.c`), and asserts:
 //   - warm `eval_run` over the restored snapshot matches the cold `_start` (`temen_run_onramp`) output
 //     byte-for-byte while skipping the MicroPython interpreter bring-up,
-//   - warm+JIT (`eval_run` emitted to wasm) matches too, or declines cleanly to warm-interp (as Lua/Tcl
-//     do — the nlr/`mp_embed_exec_str` setjmp routes `eval_run` to InterpDriven),
+//   - warm+JIT matches too (the nlr/`mp_embed_exec_str` setjmp keeps `eval_run` from running whole, so
+//     it runs with its regions emitted), or declines cleanly to warm-interp,
 //   - fresh-per-Run isolation holds (a global bound in one Run can't leak into the next).
 //
 //   node micropython-warm-snapshot-test.mjs [temen_browser.wasm] [micropython_snapshot.temen]
@@ -13,7 +14,7 @@
 // Exits 0 on success, 1 on any mismatch; SKIPs cleanly if the asset isn't built.
 import { readFileSync, existsSync } from 'node:fs';
 import { engineImports } from './engine-imports.mjs';
-import { runWarmJit } from './web/wasmjit-module.js';
+import { runWarmCoop } from './web/wasmjit-module.js';
 
 const wasmPath = process.argv[2] ?? 'target/wasm32-unknown-unknown/release/temen_browser.wasm';
 const modPath = process.argv[3] ?? 'web/assets/micropython_snapshot.temen';
@@ -38,7 +39,7 @@ function warmInterp(py) { const s = put(enc(py)); ex.temen_warm_eval(s.p, s.len)
 let warmJitDeclined = false;
 async function warmJit(py) {
   try {
-    const st = await runWarmJit(ex, ex.memory ?? memory, enc(py), `${modPath}#eval`, 1);
+    const st = await runWarmCoop(ex, ex.memory ?? memory, enc(py), `${modPath}#coop`, 1);
     return { out: readStdout(), st, tier: 'jit' };
   } catch (e) {
     if (ex.temen_status() !== 2) throw e; // only STATUS_UNSUPPORTED is the drivability decline; re-raise real traps
@@ -91,7 +92,7 @@ if (!isolated) { console.log(`  run1: ${JSON.stringify(r1.out)}`); console.log(`
 ex.temen_warm_close();
 if (!allOk) fail('MicroPython warm snapshot parity/isolation mismatch');
 if (warmJitDeclined) {
-  console.log('\nnote: warm+JIT declined (MicroPython eval_run reaches mp_embed_exec_str\'s nlr setjmp ⇒');
-  console.log('      InterpDriven); the warm card falls back to the warm interpreter, as production does.');
+  console.log('\nnote: warm+JIT declined (status 2: nothing for the emitted tier); the warm card falls back');
+  console.log('      to the warm interpreter, as production does.');
 }
 console.log('\nOK: MicroPython warm snapshot — warm eval_run matches cold _start byte-for-byte, isolation holds');

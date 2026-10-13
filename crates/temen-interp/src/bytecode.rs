@@ -4011,8 +4011,11 @@ impl SharedProgram {
     /// restored the warm image's bytes into `back`), the reservation is caller-chosen (clamp it to
     /// the backing, as everywhere), and the captured page-state `prots` are re-established without
     /// zeroing ([`Mem::seed_pages`]) — the same restore contract as `run_over_grown`. Read the
-    /// post-run page map off the finished run via [`CoopRun::mem_map_info`]. `Err` if `entry` is
-    /// out of range or scheduling traps.
+    /// post-run page map off the finished run via [`CoopRun::mem_map_info`]. `image` is the module
+    /// this program was compiled from: given it and a leaf emitter in `tierup`, the run offers its
+    /// entry as a root leaf ([`root_leaf`]), as a run over a module does, so a warm `eval_run` can
+    /// run whole on the emitted tier (#1414 S4-3c). `Err` if `entry` is out of range or scheduling
+    /// traps.
     #[allow(clippy::too_many_arguments)] // the warm-restore seam inherently threads more inputs
     pub fn coop_run_over_grown(
         &self,
@@ -4024,6 +4027,7 @@ impl SharedProgram {
         back: std::sync::Arc<super::Region>,
         reserved_log2: u8,
         prots: &super::PageMap,
+        image: Option<&Module>,
     ) -> Result<CoopRun, Trap> {
         if entry as usize >= self.n_funcs {
             return Err(Trap::Malformed);
@@ -4044,10 +4048,16 @@ impl SharedProgram {
             mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
+        let root_leaf = tierup
+            .as_ref()
+            .and_then(|t| t.leaf.as_ref())
+            .zip(image)
+            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
         let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
-        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        sched.emit.root_leaf = root_leaf;
         Ok(CoopRun {
             dom,
             mem,
@@ -10710,9 +10720,8 @@ fn leaf_step(
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
 /// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
-/// interpreted, as before. Both `CoopRun` constructors that hold the image ask it (`assemble`,
-/// `new_reserved_over_compiled`); a [`SharedProgram`] run (a warm restore) keeps only compiled code,
-/// so its root interprets — a tier it forgoes, not a behaviour it changes.
+/// interpreted, as before. Every `CoopRun` constructor that holds the image asks it (`assemble`,
+/// `new_reserved_over_compiled`, and a [`SharedProgram`] warm restore given its module, #1414 S4-3c).
 #[allow(clippy::too_many_arguments)]
 fn root_leaf(
     emit: &LeafEmitter,
