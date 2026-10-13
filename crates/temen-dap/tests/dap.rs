@@ -1859,3 +1859,133 @@ fn dap_data_breakpoint_fires_cross_thread() {
         Some(&Json::s("data breakpoint"))
     );
 }
+
+/// The loop of [`LOOP_SUM_DBG`] split across two sources: the loop body is `b.c:7`, the `return` is
+/// `a.c:3`, so one run stops in both files.
+const TWO_FILE_DBG: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i32, v3: i32) {
+  v4 = i32.add v3 v2
+  v5 = i32.const -1
+  v6 = i32.add v2 v5
+  br_if v6 1(v6, v4) 2(v4)
+}
+block 2 (v7: i32) {
+  return v7
+  }
+}
+
+debug.file 0 "a.c"
+debug.file 1 "b.c"
+debug.fname 0 "sum"
+debug.loc 0 1 0 1 7 5
+debug.loc 0 2 0 0 3 5
+"#;
+
+/// `setBreakpoints` replaces the breakpoints of the source it names and leaves every other source's
+/// armed (#2295). A client sends one request per source, so clearing them all kept only the last
+/// source's breakpoints while the earlier ones still read `verified`. Both engines, since the
+/// replacement is the session's, not the engine's.
+#[test]
+fn dap_set_breakpoints_replaces_only_its_own_source() {
+    // Launch, send one `setBreakpoints` per `(source, lines)`, then run to the end and report every
+    // stop as `file:line`.
+    let stops = |engine: Option<&str>, sets: &[(&str, &[i64])]| -> Vec<String> {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut launch = vec![
+            ("programText", Json::s(TWO_FILE_DBG)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![Json::i(3)])),
+        ];
+        if let Some(e) = engine {
+            launch.push(("engine", Json::s(e)));
+        }
+        let out = s.handle(&req(2, "launch", Json::obj(launch)));
+        assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+        let mut seq = 3;
+        for (path, lines) in sets {
+            let bps = lines
+                .iter()
+                .map(|&l| Json::obj(vec![("line", Json::i(l))]))
+                .collect();
+            let out = s.handle(&req(
+                seq,
+                "setBreakpoints",
+                Json::obj(vec![
+                    ("source", Json::obj(vec![("path", Json::s(*path))])),
+                    ("breakpoints", Json::Arr(bps)),
+                ]),
+            ));
+            seq += 1;
+            let bound = response(&out)
+                .get("body")
+                .unwrap()
+                .get("breakpoints")
+                .unwrap();
+            for bp in bound.as_array().unwrap() {
+                assert_eq!(
+                    bp.get("verified"),
+                    Some(&Json::Bool(true)),
+                    "{path}: every line binds"
+                );
+            }
+        }
+        let mut out = s.handle(&req(seq, "configurationDone", Json::obj(vec![])));
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            if event(&out, "stopped").is_none() {
+                break;
+            }
+            seq += 1;
+            let trace = s.handle(&req(
+                seq,
+                "stackTrace",
+                Json::obj(vec![("threadId", Json::i(1))]),
+            ));
+            let frames = response(&trace)
+                .get("body")
+                .unwrap()
+                .get("stackFrames")
+                .unwrap();
+            let top = &frames.as_array().unwrap()[0];
+            let file = top
+                .get("source")
+                .unwrap()
+                .get("name")
+                .unwrap()
+                .as_str()
+                .unwrap();
+            seen.push(format!(
+                "{file}:{}",
+                top.get("line").unwrap().as_i64().unwrap()
+            ));
+            seq += 1;
+            out = s.handle(&req(
+                seq,
+                "continue",
+                Json::obj(vec![("threadId", Json::i(1))]),
+            ));
+        }
+        seen
+    };
+    for engine in [None, Some("bytecode")] {
+        // Each source's own request leaves the other source armed: the loop body three times, then
+        // the return. Before #2295 the second request cleared `a.c`, so the run never stopped there.
+        assert_eq!(
+            stops(engine, &[("a.c", &[3]), ("b.c", &[7])]),
+            ["b.c:7", "b.c:7", "b.c:7", "a.c:3"],
+            "{engine:?}: both sources' breakpoints fire"
+        );
+        // Replacing one source's set with nothing clears that source alone.
+        assert_eq!(
+            stops(engine, &[("a.c", &[3]), ("b.c", &[7]), ("b.c", &[])]),
+            ["a.c:3"],
+            "{engine:?}: clearing b.c keeps a.c armed"
+        );
+    }
+}
