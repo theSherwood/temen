@@ -1372,11 +1372,21 @@ pub fn jit_cap_run(
     host.reset_cap_pages(init.page_map());
     // #1944 slice 3, #2113 — an activation of the run `host` roots, as `jit_run`'s: the default fuel,
     // and its window (with what `init` grew) and main vCPU charged to its node.
+    // #2268 — and what its window will hold of the process's mappings, reserved before the window is
+    // built: a fresh window's bound, and the runs a thaw's page map adds to it.
+    let fresh = RootWindow::fresh(m);
+    let restored = init
+        .page_map()
+        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
     let window = RootWindow {
         grown: init.page_map().grown_bytes(),
-        ..RootWindow::fresh(m)
+        runs: fresh.runs + restored.saturating_sub(temen_ir::WINDOW_RUNS),
+        ..fresh
     };
-    let node = host.begin_activation(temen_interp::DEFAULT_FUEL, window);
+    let Some(node) = host.begin_activation(temen_interp::DEFAULT_FUEL, window) else {
+        // A run the process has no room for does not start: its main vCPU is refused.
+        return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), init.clone()));
+    };
     let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));
     let fuel = root_fuel
         .as_deref_mut()
@@ -2239,8 +2249,11 @@ impl JitSession {
             let mut h = self.host.lock().unwrap_or_else(|e| e.into_inner());
             // #2113 — each prompt is an activation over a fresh window: the session's node pays for
             // it and its main vCPU, and its code draws the default fuel from it.
-            let node =
-                h.begin_activation(temen_interp::DEFAULT_FUEL, RootWindow::fresh(&self.base));
+            let window = RootWindow::fresh(&self.base);
+            let Some(node) = h.begin_activation(temen_interp::DEFAULT_FUEL, window) else {
+                // #2268 — a prompt the process has no room for does not start.
+                return Ok(JitOutcome::Trapped(TrapKind::ThreadFault));
+            };
             self.fuel.rearm(Some(Arc::new(HostNode(node))));
             h.set_jit_native_ctx(cm_ptr as usize);
         }
@@ -5528,10 +5541,13 @@ impl PowerboxProgram {
         self.inst.grant_caps(&mut self.host, self.win);
         // #2113 — the run's window and main vCPU, charged to its node, and the default fuel its code
         // draws from it, as `run_powerbox`'s.
-        let node = self.host.begin_activation(
-            temen_interp::DEFAULT_FUEL,
-            RootWindow::fresh(&self.inst.module),
-        );
+        let window = RootWindow::fresh(&self.inst.module);
+        let Some(node) = self
+            .host
+            .begin_activation(temen_interp::DEFAULT_FUEL, window)
+        else {
+            return Err(no_room_for_run());
+        };
         self.fuel.rearm(Some(Arc::new(HostNode(node))));
         // No argv/env buffer: the cached path serves the plain compute powerbox (stdin in, stdout
         // out), exactly like `run_powerbox`, which passes no args. `run_raw` seeds nothing extra.
@@ -6677,7 +6693,9 @@ fn jit_run(
     // the default grant's when it names none: the root's cell draws from the host's own node, which
     // pays for its window and main vCPU as an interpreter's does.
     limits.grant(host);
-    let node = host.begin_activation(limits.fuel(), RootWindow::fresh(m));
+    let Some(node) = host.begin_activation(limits.fuel(), RootWindow::fresh(m)) else {
+        return Err(no_room_for_run());
+    };
     let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));
     let fuel = root_fuel
         .as_deref_mut()
@@ -6729,6 +6747,15 @@ fn jit_run(
         ));
     }
     Ok((run.outcome, run.snapshot, results))
+}
+
+/// #2268 — a run whose activation the process's pool of mappings cannot hold
+/// ([`temen_interp::maps_pool`]): it never starts, its main vCPU refused, as every engine reports it.
+fn no_room_for_run() -> String {
+    format!(
+        "guest trapped ({:?}) — the process has no room for this run's mappings",
+        TrapKind::ThreadFault
+    )
 }
 
 /// Compile + run function 0 on the JIT under `limits` (the run-once powerbox entry, no snapshot),

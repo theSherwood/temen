@@ -3382,7 +3382,10 @@ pub fn compile_and_run_with_host_traced(
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
     // #1944 slice 3 — an activation of `host`: the root draws its fuel from the host's own node.
-    let mut vfuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let Some(node) = host.begin_activation(*fuel, RootWindow::of(mem.as_ref())) else {
+        return Some((Err(Trap::ThreadFault), Vec::new(), None));
+    };
+    let mut vfuel = Fuel::drawn(node);
     let r = loop {
         match vm.resume(
             &dom.source,
@@ -3803,7 +3806,8 @@ impl SharedProgram {
             mm
         });
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
+        let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         Ok(CoopRun {
             dom,
@@ -5075,17 +5079,23 @@ impl<'p> Vcpu<'p> {
             let start = |h: &mut Host| match opens {
                 // Fuel unification: a fresh run's entry costs one fuel, as on every driver.
                 Opens::Root(window) => (h.begin_activation(DEFAULT_FUEL, window), !thaws(h, mem)),
-                Opens::Thread => (h.own_node(), false),
+                Opens::Thread => (Some(h.own_node()), false),
             };
             let (node, entry) = match self.shared_host {
                 Some(m) => start(&mut m.lock_unpoisoned()),
                 None => start(&mut self.host),
             };
-            self.fuel = Fuel::drawn(node);
-            if entry {
-                if let Err(t) = self.fuel.burn() {
-                    self.trap = Some(t);
+            match node {
+                Some(node) => {
+                    self.fuel = Fuel::drawn(node);
+                    if entry {
+                        if let Err(t) = self.fuel.burn() {
+                            self.trap = Some(t);
+                        }
+                    }
                 }
+                // #2268 — a run the process has no room for does not start: its main vCPU is refused.
+                None => self.trap = Some(Trap::ThreadFault),
             }
         }
         let ev = self.run_to_event();
@@ -8860,9 +8870,9 @@ impl ScheduledDebugRun {
         let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
-        // lends its fuel per resume.
+        // lends its fuel per resume. #2268 — a run the process has no room for is not debugged here.
         let mut host = host;
-        let _ = host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()));
+        host.begin_activation(u64::MAX, RootWindow::of(mem.as_ref()))?;
         Some(ScheduledDebugRun {
             source,
             table,
@@ -13776,7 +13786,8 @@ fn drive(
 ) -> Result<Vec<Value>, Trap> {
     // #1944 slice 3 — an activation of `host`: the root and its threads draw from the host's own
     // node, and `fuel` reads back the room left once every task has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let node = host.begin_activation(*fuel, RootWindow::of(mem.as_ref()));
+    let mut root_fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
     // #744 — the root's powerbox sits in a cell for the run, as every child's does, so a child can
     // call back into it through a self-serve grant. The run hands it back at the end.
     let root = std::mem::take(host).into_cell();
@@ -16440,7 +16451,8 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
+        let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
         sched.emit.root_leaf = root_leaf;
         Ok(CoopRun {
@@ -16472,7 +16484,10 @@ impl CoopRun {
             .and_then(|t| t.leaf.as_ref())
             .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let mut fuel = Fuel::drawn(host.begin_activation(fuel, RootWindow::of(mem.as_ref())));
+        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
+            return Some(Err(Trap::ThreadFault));
+        };
+        let mut fuel = Fuel::drawn(node);
         let mut sched =
             match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup) {
                 Ok(s) => s,
@@ -17365,7 +17380,10 @@ fn drive_threads(
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     // #1944 slice 3 — an activation of `host`: every thread draws from the host's own node, and
     // `fuel` reads back the room left once each has handed back what it did not burn.
-    let mut root_fuel = Fuel::drawn(host.begin_activation(*fuel, RootWindow::of(mem.as_ref())));
+    let Some(node) = host.begin_activation(*fuel, RootWindow::of(mem.as_ref())) else {
+        return (Err(Trap::ThreadFault), mem);
+    };
+    let mut root_fuel = Fuel::drawn(node);
     let mut core = match SchedCore::new(&dom, entry, args, &mut root_fuel, mem.as_ref(), host) {
         Ok(core) => core,
         Err(t) => {
