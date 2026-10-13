@@ -1196,9 +1196,9 @@ impl World {
     }
 
     /// Replace `path`'s contents, stamping it with the next tick of the write clock. Creating a
-    /// file and truncating one are both writes, so both come here. #2306: the bytes are charged to
-    /// the payer past any ceiling — the embedder's, or nothing at all from a guest — and so is a name
-    /// it creates; [`Self::file_create`] is the guest's refusable way to make one.
+    /// file and truncating one are both writes, so both come here. #2306: the embedder's way (a
+    /// seeded file, a host command's output), so the bytes and a name it creates are charged to the
+    /// payer past any ceiling; a guest makes a file with [`Self::file_create`], which can refuse.
     fn file_put(&mut self, path: String, bytes: Vec<u8>) {
         if !self.files.contains_key(&path) {
             self.tables

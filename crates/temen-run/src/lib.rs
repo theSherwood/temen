@@ -7006,6 +7006,11 @@ struct OfferBinding {
     policy: temen_interp::OfferPolicy,
 }
 
+/// What makes a host capability's handler and its [`CapState`](temen_interp::CapState) (#1699) at
+/// a grant, handed the node of the domain it is granted to, which pays for what the guest grows its
+/// state by (#2306).
+type MakeHostProc = dyn Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync;
+
 /// #1645 — a **shared** `host_proc` slot: ONE powerbox entry serving many import slots.
 ///
 /// [`HostCap::host_proc`] and its forkable sibling grant a fresh entry per slot, which is right for
@@ -7032,7 +7037,7 @@ struct OfferBinding {
 /// cheap `Arc` bump and shares the memo — clones of one slot are one slot.
 #[derive(Clone)]
 pub struct SharedHostProc {
-    make: Arc<dyn Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
+    make: Arc<MakeHostProc>,
     fork: temen_interp::HostProcFork,
     /// `(domain_id, handle)` per `Host` this slot has been granted on. A `Vec` because the count is
     /// one or two (interp, JIT) for the life of an `Imports`, and a linear scan says so.

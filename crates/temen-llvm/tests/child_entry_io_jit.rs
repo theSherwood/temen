@@ -128,7 +128,7 @@ fn child_entry_write_binds_stdout_on_the_jit() {
     );
     let _ = Value::I64(0);
     assert_eq!(
-        &*sink.lock().unwrap(),
+        &sink.lock().unwrap()[..],
         b"hi",
         "the child-entry write bound to the re-granted stdout on the JIT"
     );
