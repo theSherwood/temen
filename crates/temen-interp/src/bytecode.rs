@@ -757,9 +757,18 @@ pub struct Compiled {
     /// ([`compile_module_for`]). A module a child or an exec runs in the same run is admitted the same
     /// way ([`compile_granted`], #2284).
     serves_children: bool,
+    /// The digest of the module this program was compiled from ([`Compiled::module_digest`]).
+    digest: std::sync::OnceLock<[u8; 32]>,
 }
 
 impl Compiled {
+    /// The digest of `m`, the module this program was compiled from ([`super::module_digest`]): a
+    /// root leaf's identity. Made on first use, so a run over a kept program (#1144) does not
+    /// re-encode its module on every open (#1414 S4-3b: most of a chibicc open).
+    fn module_digest(&self, m: &Module) -> [u8; 32] {
+        *self.digest.get_or_init(|| super::module_digest(m))
+    }
+
     /// Total compiled **bytecode op count** across all functions — the structural-size measure of this
     /// threaded register-VM program (the analogue of the JIT's emitted code bytes / the IR's
     /// instruction count). The engine is a `Vec<Op>` per function, not a serialized byte stream, so op
@@ -2620,6 +2629,7 @@ fn compile_module_with(
         table_mask,
         debug: None,
         serves_children: false,
+        digest: std::sync::OnceLock::new(),
     })
 }
 
@@ -10715,7 +10725,7 @@ fn root_leaf(
     let offer = LeafOffer {
         module: 0,
         image: m,
-        digest: super::module_digest(m),
+        digest: dom.source.primary().module_digest(m),
         entry,
         paged,
         parks,
@@ -10763,7 +10773,9 @@ struct LeafStart {
 /// can run whole too: an `exit` never parks; a stream import parks exactly as the same op inline; a
 /// synchronous host capability cannot park without a personality to ask it to; a declared
 /// host-completed cap parks on the embedder ([`super::OpParks::OnHost`]); and the self namespace's
-/// reflection, `resolve`, `label`, attestation, fuel and pipe ops answer at once.
+/// reflection, `resolve`, `label`, attestation, fuel and pipe ops answer at once. An inline call on a
+/// host capability, whose handle is an operand, parks as any of the host's could
+/// ([`Host::host_procs_park`]; #1414 S4-3b: chibicc's in-memory file system never does).
 fn image_parks(host: &Host, m: &Module) -> Parks {
     use super::OpParks;
     use temen_ir::cap_id::{ADDRESS_SPACE, EXIT, HOST_PROC, STREAM};
@@ -10801,8 +10813,9 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
             op,
             ..
         } => op > 2,
+        // A host capability parks as the host's can (`parks`, below).
         Inst::CapCall {
-            type_id: ADDRESS_SPACE,
+            type_id: ADDRESS_SPACE | HOST_PROC,
             ..
         } => false,
         // #1954: the self namespace's ops that answer at once — reflection (`count`, `get`,
@@ -10836,12 +10849,20 @@ fn image_parks(host: &Host, m: &Module) -> Parks {
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.insts)
     };
-    let parks: Vec<OpParks> = m
+    let mut parks: Vec<OpParks> = m
         .imports
         .iter()
         .zip(&host.import_bindings)
         .map(import_parks)
         .collect();
+    // An inline host-capability call parks as any of the host's could, and a personality could ask
+    // any of them to.
+    if insts().any(|i| matches!(*i, Inst::CapCall { type_id, .. } if type_id == HOST_PROC)) {
+        parks.push(match source {
+            Some(_) => OpParks::Otherwise,
+            None => host.host_procs_park(),
+        });
+    }
     if m.imports.len() != host.import_bindings.len()
         || parks.contains(&OpParks::Otherwise)
         || m.funcs
@@ -16695,12 +16716,15 @@ impl CoopRun {
             tierup,
             init_mem,
             reserved_log2,
+            None,
         ))
     }
 
     /// [`new_reserved`](Self::new_reserved) over an already-compiled program (the browser's cached
-    /// `bash.temen` compile, #1144): the `Domain` is `over_primary` on the shared `compiled`, so a
-    /// session open costs a window build + schedule, not a recompile of the whole shell.
+    /// `bash.temen` and `chibicc.temen` compiles, #1144): the `Domain` is `over_primary` on the shared
+    /// `compiled`, so an open costs a window build + schedule, not a recompile of the whole program.
+    /// The window is an engine-backed reservation, or built over the caller's `back` (as
+    /// [`new_over`](Self::new_over) builds it), which emitted code can address.
     #[allow(clippy::too_many_arguments)]
     pub fn new_reserved_over_compiled(
         m: &Module,
@@ -16712,6 +16736,7 @@ impl CoopRun {
         tierup: Option<TierUpConfig>,
         init_mem: &[u8],
         reserved_log2: u8,
+        back: Option<std::sync::Arc<super::Region>>,
     ) -> Result<CoopRun, Trap> {
         if entry as usize >= compiled.progs.len() {
             return Err(Trap::Malformed);
@@ -16719,7 +16744,7 @@ impl CoopRun {
         host.wire_park_door();
         clear_session_fault();
         let dom = Domain::over_primary(compiled, host.jit_table_log2());
-        let mut mem = Mem::root(m, reserved_log2, None, init_mem);
+        let mut mem = Mem::root(m, reserved_log2, back, init_mem);
         let root_leaf = tierup
             .as_ref()
             .and_then(|t| t.leaf.as_ref())

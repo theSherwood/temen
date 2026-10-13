@@ -28549,6 +28549,22 @@ impl Host {
         )
     }
 
+    /// #1414 S4-3b — how a call on **any** of this host's host capabilities can park: the rule for an
+    /// inline `call.cap` on one, whose handle is an operand. [`OpParks::Never`] when each answers
+    /// synchronously ([`host_proc_is_sync`](Self::host_proc_is_sync)), so only a personality could
+    /// park one; [`OpParks::OnHost`] when one is a declared host-completed cap
+    /// ([`parks_on_host`](Self::parks_on_host)); [`OpParks::Otherwise`] when one is offloadable.
+    pub fn host_procs_park(&self) -> OpParks {
+        let offloads = |e: &HostProcEntry| !e.on_host && !matches!(e.handler, ProcHandler::Sync(_));
+        if self.host_procs.iter().any(offloads) {
+            OpParks::Otherwise
+        } else if self.host_procs.iter().any(|e| e.on_host) {
+            OpParks::OnHost
+        } else {
+            OpParks::Never
+        }
+    }
+
     /// Push one [`HostProcEntry`] and grant a handle to it — the single registration path the three
     /// public `grant_host_proc*` faces share (CONSOLIDATION §7).
     fn grant_host_proc_entry(&mut self, entry: HostProcEntry) -> i32 {

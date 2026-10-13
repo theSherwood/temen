@@ -19,13 +19,14 @@ use temen_browser::{
     temen_coop_jit_result_types_len, temen_coop_jit_result_types_ptr,
     temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
-    temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
-    temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr, temen_coop_table_gen,
-    temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
-    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
-    temen_onramp_set_grant_instantiator, temen_run_value, temen_status, temen_stdout_len,
-    temen_stdout_ptr, temen_trap_len, temen_trap_ptr, temen_warm_close, temen_warm_coop_open,
+    temen_coop_open, temen_coop_open_fs, temen_coop_paged, temen_coop_pagestate_len,
+    temen_coop_pagestate_ptr, temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr,
+    temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr,
+    temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
+    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator,
+    temen_run_onramp_fs, temen_run_value, temen_status, temen_stdout_len, temen_stdout_ptr,
+    temen_trap_len, temen_trap_ptr, temen_warm_close, temen_warm_coop_open,
     temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, temen_wasmjit_spill_sp_off,
     COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
     STATUS_UNSUPPORTED,
@@ -5482,6 +5483,18 @@ fn drive_declared(
     if opened != 0 {
         return None;
     }
+    Some(pump(caps, budget, answer))
+}
+
+/// Pump the open tier-up session to its end ([`drive_declared`]'s loop, for any open): in
+/// `budget`-op slices when given, answering each park on a declared cap in `caps` with
+/// `answer(cap, args)`, running each TIERUP as a leaf would run and holding it where it parks.
+/// Returns the run and how many slices it paused at, and closes the session.
+fn pump(
+    caps: &[&str],
+    budget: Option<u64>,
+    answer: &mut dyn FnMut(&str, &[i64]) -> i64,
+) -> (CapRun, usize) {
     let mut d = CoopB2Driver::new();
     let mut run = CapRun {
         status: 0,
@@ -5544,7 +5557,7 @@ fn drive_declared(
     run.status = temen_status();
     run.value = temen_coop_value();
     temen_coop_close();
-    Some((run, pauses))
+    (run, pauses)
 }
 
 /// **The tier-up session runs a root whole as a leaf and parks it on declared caps** (#1954): with
@@ -5809,4 +5822,58 @@ fn coop_root_leaf_runs_a_chibicc_program_with_declared_caps() {
     let (sliced, _) =
         drive_declared(&bytes, &caps, COOP_LEAF_SUSPENDS, Some(1_000), &mut answer).expect("opens");
     assert_eq!(sliced, want(1, 301), "leaf, sliced");
+}
+
+/// **The chibicc card compiles on the pump** (#1414 S4-3b): `temen_coop_open_fs` opens chibicc over
+/// the card's memfs and argv with its root offered whole, and the emitter takes it: chibicc reaches
+/// its file system through inline host-capability calls, and the one host capability it can reach
+/// answers synchronously, so it cannot park. Run as a leaf, page-checked over its read-only data,
+/// the compile ends as the interpreter's (`temen_run_onramp_fs`) does, with the same IR. Asset-gated.
+#[test]
+fn coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf() {
+    let _g = ffi_guard();
+    let Ok(cc) = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/assets/chibicc.temen"
+    )) else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    // No `#include`: preprocessing `<stdio.h>` on wasmi takes minutes in a debug build.
+    let src =
+        b"int printf(const char *, ...);\nint main(void) { printf(\"%d\\n\", 6 * 7); return 0; }\n";
+    let stdout = || {
+        // SAFETY: the stash stays live until the next call that replaces it.
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec()
+    };
+    temen_run_onramp_fs(
+        cc.as_ptr(),
+        cc.len(),
+        core::ptr::null(),
+        0,
+        src.as_ptr(),
+        src.len(),
+        0,
+    );
+    let (status, ir) = (temen_status(), stdout());
+    assert!(ir.starts_with(b"memory "), "the interpreter compiled it");
+
+    let opened = temen_coop_open_fs(
+        cc.as_ptr(),
+        cc.len(),
+        core::ptr::null(),
+        0,
+        src.as_ptr(),
+        src.len(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "the emitter takes chibicc's root");
+    assert!(
+        temen_coop_paged() != 0,
+        "page-checked over its read-only data"
+    );
+    let (run, _) = pump(&[], None, &mut |cap, _| panic!("no cap is declared: {cap}"));
+    assert_eq!((run.status, run.tierups, run.parks), (status, 1, 0));
+    assert!(run.stdout == ir, "the same IR as the interpreter's compile");
 }

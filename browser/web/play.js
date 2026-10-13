@@ -2743,8 +2743,8 @@ async function runModule(c) {
     }
     if (status === undefined) {
       try {
-        // Emit `_start` and run it on wasm; temen_onramp_jit_run_finish captures stdout/exit/value into the
-        // shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
+        // Run on the emitted tier (the pump: the root whole as a leaf, else its regions); the run's end leaves
+        // stdout/exit/value in the shared slots (read back via the usual accessors, exactly like the interpreter path). `temen_run_value`
         // is the guest's returned result — the same value `temen_run_onramp` returns on the interpreter, so the
         // result matches on both tiers (a trap throws → we fall back to the interpreter below).
         // Cache the compiled Module across Runs keyed by the module's content-addressed URL — the

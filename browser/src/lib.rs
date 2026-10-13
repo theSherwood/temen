@@ -4526,10 +4526,17 @@ struct ProgramCache {
     /// Its bytecode program, compiled on the first run that needs one: a wasm-JIT run takes only the
     /// module. `None` inside for a module outside the bytecode subset.
     compiled: std::sync::OnceLock<Option<std::sync::Arc<temen_interp::bytecode::Compiled>>>,
-    /// Its wasm-JIT emit over a shared memory ([`JitOnrampRun::emit_for_run`]), made on the first
-    /// wasm-JIT run: what a run opens around besides its window and powerbox, which are its own.
-    emit: std::sync::OnceLock<Result<CachedEmit, i32>>,
+    /// Its root on the pump (#1414 S4-3b): the module with its cap calls outlined — the one module both
+    /// tiers number functions in — and that module's bytecode program, made on the first emitted run.
+    /// `None` inside for a module outside the bytecode subset.
+    outlined: std::sync::OnceLock<Option<Outlined>>,
 }
+
+/// A module with its cap calls outlined, and its bytecode program ([`ProgramCache::outlined`]).
+type Outlined = (
+    temen_ir::Module,
+    std::sync::Arc<temen_interp::bytecode::Compiled>,
+);
 static mut BASH_PROGRAM: Option<ProgramCache> = None;
 static mut CHIBICC_PROGRAM: Option<ProgramCache> = None;
 
@@ -4568,7 +4575,7 @@ fn cached_module(
             key,
             module: m,
             compiled: std::sync::OnceLock::new(),
-            emit: std::sync::OnceLock::new(),
+            outlined: std::sync::OnceLock::new(),
         });
     }
     slot.as_ref().ok_or(STATUS_UNSUPPORTED)
@@ -4595,14 +4602,84 @@ fn cached_program(
     Ok((&c.module, compiled))
 }
 
-/// A slot's module and its wasm-JIT emit over a shared memory (the play threads build), emitted on the
-/// slot's first wasm-JIT run. [`STATUS_UNSUPPORTED`] when the module does not emit.
-fn cached_emit(c: &'static ProgramCache) -> Result<(&'static temen_ir::Module, CachedEmit), i32> {
-    let emit = c
-        .emit
-        .get_or_init(|| JitOnrampRun::emit_for_run(&c.module, true))
-        .clone()?;
-    Ok((&c.module, emit))
+/// #1414 S4-3b — open a pump run of `c`'s program over the memfs `image` with `argv`, its root offered
+/// whole as a leaf (over a shared memory when `shared`, as [`temen_coop_open`]'s): the emitted twin of
+/// [`onramp_fs_run`], whose powerbox it builds ([`pg_setup`]). The slot keeps the outlined module and
+/// its program, and the leaf's emit is kept by its digest (#2087), so a later Run builds only the
+/// powerbox, the window and the schedule. Returns `0`, else a negative `STATUS_*` (also in
+/// [`LAST_STATUS`]): [`STATUS_UNSUPPORTED`] when the emitter declines the root, and the page then
+/// compiles on the interpreter.
+fn coop_open_fs(c: &'static ProgramCache, image: &[u8], argv: &[&[u8]], shared: bool) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    temen_coop_close();
+    let outlined = c.outlined.get_or_init(|| {
+        let mut m = c.module.clone();
+        temen_wasm_jit::outline_cap_calls(&mut m);
+        let compiled = bytecode::compile_reserved(&m)?;
+        Some((m, compiled))
+    });
+    let Some((m, compiled)) = outlined else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    let (host, init_mem, _fs) = match pg_setup(m, image, argv) {
+        Ok(setup) => setup,
+        Err(status) => {
+            set(status);
+            return -status;
+        }
+    };
+    // A growable window, as `temen_coop_open`'s (#1312): a `vm_map` grows it past its first size.
+    let declared = m.memory.map_or(0, |mc| mc.size_log2);
+    let first = 1u64 << JIT_RUN_WIN_LOG2.max(declared);
+    let Some(region) = temen_interp::Region::growable(first, temen_interp::host_page_size()) else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    let back = std::sync::Arc::new(region);
+    let leaves = Programs::default();
+    let tierup = bytecode::TierUpConfig {
+        root: bytecode::ProgramEmit::default(),
+        leaf: Some(leaf_emitter(leaves.clone(), false, shared)),
+        modules: None,
+    };
+    let run = bytecode::CoopRun::new_reserved_over_compiled(
+        m,
+        compiled.clone(),
+        0,
+        &[],
+        u64::MAX,
+        host,
+        Some(tierup),
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        Some(back.clone()),
+    );
+    let leaf = leaves
+        .lock()
+        .is_ok_and(|l| matches!(l.get(&0), Some(Some(_))));
+    match run {
+        Ok(run) if leaf => {
+            // SAFETY: single-threaded wasm; the session is read back only via the coop exports.
+            unsafe {
+                *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
+                    back: Some(back),
+                    programs: leaves,
+                    ..CoopTierupRun::over(run)
+                })
+            };
+            set(STATUS_OK);
+            0
+        }
+        Ok(_) => {
+            set(STATUS_UNSUPPORTED);
+            -STATUS_UNSUPPORTED
+        }
+        Err(_) => {
+            set(STATUS_TRAP);
+            -STATUS_TRAP
+        }
+    }
 }
 
 /// The bash card's [`cached_program`] slot.
@@ -5187,7 +5264,7 @@ pub fn playground_libc_tu() -> &'static str {
 /// header is read. A header rather than a `-D`: the committed `chibicc.temen` asset predates `-D`.
 pub const PG_DECLS_ONLY_ARGV: &[&[u8]] = &[b"-include", b"__pg_decls_only.h"];
 
-/// `flags` bit 0 on the chibicc card entries ([`temen_run_onramp_fs`], [`temen_onramp_jit_run_open_fs`]):
+/// `flags` bit 0 on the chibicc card entries ([`temen_run_onramp_fs`], [`temen_coop_open_fs`]):
 /// emit chibicc's `-g` **debug section**. Off by default — the `debug.*` waist is ~a third of the
 /// emitted IR, so a clean run compiles far less; set it only when the user opts into source-level
 /// debugging (the DAP panel maps C `file:line`/locals through it).
@@ -5202,7 +5279,7 @@ pub const CHIBICC_DEBUG_INFO: i32 = 1;
 pub const CHIBICC_PROGRAM_UNIT: i32 = 2;
 
 /// The chibicc card's argv (shared by the bytecode [`temen_run_onramp_fs`] and the JIT
-/// [`temen_onramp_jit_run_open_fs`]), selected by `flags` — [`CHIBICC_DEBUG_INFO`] and
+/// [`temen_coop_open_fs`]), selected by `flags` — [`CHIBICC_DEBUG_INFO`] and
 /// [`CHIBICC_PROGRAM_UNIT`].
 ///
 /// `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
@@ -5389,7 +5466,7 @@ pub extern "C" fn temen_run_onramp_fs(
 /// `temen_stdout_ptr`/`_len`. `[tu_ptr, tu_len)` is the memfs-relative TU path. Unlike
 /// [`temen_run_onramp_fs`] (which merges the playground libc + seeds `/in.c`), the image is passed
 /// **raw** — the self-host closure is self-contained. The wasm-JIT twin is
-/// [`temen_selfhost_jit_emit_object_fs`]. Sets [`temen_status`]/[`temen_exit_code`]; returns the guest result.
+/// [`temen_coop_open_selfhost_fs`]. Sets [`temen_status`]/[`temen_exit_code`]; returns the guest result.
 #[no_mangle]
 pub extern "C" fn temen_selfhost_emit_object_fs(
     mod_ptr: *const u8,
@@ -6506,37 +6583,6 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over an **owned** window (heap-backed, pointer-stable for the run)
-    /// whose guest reads its input from a seeded **memfs** `image` (mounted on the `fs` cap) with
-    /// `argv` seeded at `POWERBOX_ARGS_BASE` — the single-shot JIT twin of [`onramp_fs_exec`]. `win_log2`
-    /// is a **minimum** — the window is grown to the module's declared `size_log2` when larger, so the
-    /// allocated window always equals the size the emitter masks to. This is the chibicc-in-the-browser card's fast tier:
-    /// chibicc `fopen`s `/in.c` + `/include/*.h`, emits TEMEN-IR text on stdout. `cached` is `m`'s emit
-    /// for `shared_memory` from an earlier run ([`JitOnrampRun::emit_for_run`]), which the card keeps
-    /// with the compiler (#1144); `None` emits here.
-    #[allow(clippy::too_many_arguments)] // the run's input, plus the emit a caller kept
-    pub fn open_owned_run_fs(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        image: &[u8],
-        argv: &[&[u8]],
-        stdin: Vec<u8>,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with(
-            m,
-            win_log2,
-            shared_memory,
-            RunInput::Fs {
-                image: image.to_vec(),
-                argv: argv.iter().map(|a| a.to_vec()).collect(),
-                stdin,
-            },
-            cached,
-        )
-    }
-
     /// Open a single-shot JIT run over an **owned** (heap-backed) window with a **caller-provided granted
     /// `Host`** (#1025 Path 1 — the owned-window twin of [`open_shared_run_over_host`]). The run executes
     /// its emitted `_start` over `host` verbatim (an op-13 phase child's marshaled powerbox); `init_mem`
@@ -6640,8 +6686,8 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over a **caller-owned** window with a seeded memfs (the FFI twin of
-    /// [`open_owned_run_fs`](Self::open_owned_run_fs)).
+    /// Open a single-shot JIT run over a **caller-owned** window with a seeded memfs (the single-shot JIT
+    /// twin of [`onramp_fs_exec`]).
     ///
     /// # Safety
     /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
@@ -7890,8 +7936,9 @@ pub extern "C" fn temen_warm_close() {
 // cached in the [`WarmSession`] (a warm+JIT Run never re-pays the cdylib emit); only the powerbox host +
 // the window image are reset per Run, preserving the card's fresh-per-Run isolation. Cross-tier bounces
 // (`write`/`read`/`exit`) route to the run's interpreter over the same window, exactly as the single-shot
-// JIT run does. The JS driver mirrors `wasmjit-module.js`'s `driveJitRun`, but passes the entry `sp` as
-// the emitted `f0`'s third argument (an `i64` slot) and reuses the cached compiled Module across Runs.
+// JIT run does. The JS driver is the single-shot one (`wasmjit-module.js`'s `driveDetachedRun`), but
+// passes the entry `sp` as the emitted `f0`'s third argument (an `i64` slot) and reuses the cached
+// compiled Module across Runs.
 
 /// Borrow the open warm session's cached warm+JIT run, if built.
 fn warm_jit_ref() -> Option<&'static JitOnrampRun> {
@@ -8737,6 +8784,7 @@ pub extern "C" fn temen_bash_coop_open(
         None,
         &init_mem,
         BASH_RESERVED_LOG2,
+        None,
     ) {
         Ok(r) => r,
         Err(_) => return -2,
@@ -10954,7 +11002,7 @@ pub extern "C" fn temen_onramp_jit_close() {
     unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
 }
 
-// ---- single-shot module wasm-JIT run (the chibicc cards on emitted wasm) — the run-to-completion twin --
+// ---- single-shot module wasm-JIT run (an op-13 or detached child on emitted wasm) ---------------------
 //
 // The module-demo analogue of the reactor FFI above: the whole program is func 0 (`_start`), emitted and
 // run once as `f0(win, env, ...slots)`. The page compiles [`temen_onramp_jit_run_wasm_ptr`]/`_len`,
@@ -10962,28 +11010,23 @@ pub extern "C" fn temen_onramp_jit_close() {
 // calls `f0` with [`temen_onramp_jit_run_win_ptr`] + the [`temen_onramp_jit_run_slot`] handles, then
 // [`temen_onramp_jit_run_finish`] captures stdout/stderr/exit into the shared `OUT`/`ERR`/`EXIT_CODE`.
 
-/// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open_fs`] or
-/// [`temen_selfhost_jit_emit_object_fs`]; single-threaded wasm.
+/// The live single-shot JIT run: an op-13 child's ([`temen_op13jit_step`]) or a detached child's
+/// ([`temen_detached_jit_run_open`]). `None` until one opens; single-threaded wasm.
 static mut JIT_RUN: Option<JitOnrampRun> = None;
 
-/// The single-shot run's fixed window log2 — 32 MiB, holding the chibicc card's compile. The
-/// **single-shot** tier still sizes this up front: its backing is fixed, so a `vm_map` past it is
-/// admitted by the reservation and then declined at the first emitted access (#1153, invariant 9). The
-/// cooperative tier uses this only as its window's *initial* size — there the backing grows (#1312).
+/// A pump run's first window log2 — 32 MiB. Its backing grows on `vm_map` (#1312), so this is only
+/// where the window starts.
 const JIT_RUN_WIN_LOG2: u8 = 25;
 
-/// Open a **single-shot wasm-JIT run** of the chibicc compiler card: decode the compiler module at
-/// `[mod_ptr, mod_len)`, assemble the same memfs [`temen_run_onramp_fs`] does (the user's source at
-/// `/in.c`, the built-in libc headers + any caller headers under `/include`), and emit `_start` as
-/// wasm — so the browser runs chibicc's compile on the **wasm-JIT** instead of the bytecode
-/// interpreter (the compiler's `fopen`/`write`/`exit` bounce cross-tier). The fast twin of
-/// `temen_run_onramp_fs`; drive it with the same `temen_onramp_jit_run_*` exports (call
-/// [`temen_onramp_jit_run_finish`] for the emitted IR on `temen_stdout_ptr`). `debug_info != 0` compiles
-/// with `-g` (source-level debug section) — off by default, as in `temen_run_onramp_fs`. Returns `0`,
-/// else a negative `STATUS_*` (also in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if `_start`
-/// isn't emittable (the page falls back to [`temen_run_onramp_fs`]).
+/// **The chibicc card's compile on the emitted tier** (#1414 S4-3b): [`temen_run_onramp_fs`]'s compile
+/// — the same memfs and argv — run on the pump, chibicc's root whole as a leaf. Drive it with the
+/// `temen_coop_*` pump (`driveCoopTierupRun`); the emitted IR comes back on `temen_stdout_*` at its end.
+/// `shared` as [`temen_coop_open`]'s. Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`])
+/// — [`STATUS_UNSUPPORTED`] when the emitter declines chibicc's root (the page then compiles with
+/// [`temen_run_onramp_fs`]).
 #[no_mangle]
-pub extern "C" fn temen_onramp_jit_run_open_fs(
+#[allow(clippy::too_many_arguments)] // the card's inputs, plus the memory flag every coop open takes
+pub extern "C" fn temen_coop_open_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -10991,43 +11034,17 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
     src_ptr: *const u8,
     src_len: usize,
     flags: i32,
+    shared: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
-    // #1144 — the compiler is the same `chibicc.temen` every Run: decode, verify and emit it once.
-    let (m, emit) = match cached_module(chibicc_slot(), bytes).and_then(cached_emit) {
-        Ok(p) => p,
-        Err(status) => {
-            set(status);
-            return -status;
-        }
-    };
-    let image = match chibicc_card_image(img_ptr, img_len, src) {
-        Ok(image) => image,
-        Err(status) => {
-            set(status);
-            return -status;
-        }
-    };
-    let argv = chibicc_card_argv(flags);
-    // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampRun::open_owned_run_fs(
-        m,
-        JIT_RUN_WIN_LOG2,
-        true,
-        &image,
-        &argv,
-        Vec::new(),
-        Some(emit),
-    ) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
+    // #1144 — the compiler is the same `chibicc.temen` every Run: decode and verify it once.
+    let image = cached_module(chibicc_slot(), bytes)
+        .and_then(|c| Ok((c, chibicc_card_image(img_ptr, img_len, src)?)));
+    match image {
+        Ok((c, image)) => coop_open_fs(c, &image, &chibicc_card_argv(flags), shared != 0),
         Err(status) => {
             set(status);
             -status
@@ -11035,21 +11052,13 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
     }
 }
 
-/// The self-host card's window: **2^27 = 128 MiB**, larger than the single-file card's
-/// [`JIT_RUN_WIN_LOG2`] (32 MiB). chibicc's largest TU, `codegen_ir.c`, emits ~1.2 MB of IR and its
-/// compile working set overruns 32 MiB — the run traps `unreachable` mid-emit (measured). 128 MiB clears
-/// every cc1 TU (all byte-identical to native); the max-memory cap is 1 GiB, so this stays well within.
-const SELFHOST_WIN_LOG2: u8 = 27;
-
-/// **Self-host card — wasm-JIT tier** (the fast twin of [`temen_selfhost_emit_object_fs`]). Emit
-/// `chibicc.temen`'s `_start` to wasm and run it in `--emit-object` mode over one of chibicc's own cc1
-/// TUs (seeded from the raw closure image `[img_ptr, img_len)`, memfs-relative TU path
-/// `[tu_ptr, tu_len)`), so the browser compiles chibicc's own source on emitted wasm — every cc1 TU,
-/// giants included, in a few hundred ms (SELFHOST_C.md). Drives the same finish path as the shipping JIT
-/// card ([`temen_onramp_jit_run_finish`] → the object text on `temen_stdout_*`). Runs in a 128 MiB window
-/// ([`SELFHOST_WIN_LOG2`]). Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]).
+/// **The self-host card's compile on the emitted tier** (#1414 S4-3b): [`temen_selfhost_emit_object_fs`]'s
+/// compile of one of chibicc's own cc1 TUs — the same raw closure image and `--emit-object` argv — run on
+/// the pump, chibicc's root whole as a leaf. The window grows as the compile needs, the giant TUs
+/// included. Driven, and refused, as [`temen_coop_open_fs`] is, and `shared` is its.
 #[no_mangle]
-pub extern "C" fn temen_selfhost_jit_emit_object_fs(
+#[allow(clippy::too_many_arguments)] // as `temen_coop_open_fs`
+pub extern "C" fn temen_coop_open_selfhost_fs(
     mod_ptr: *const u8,
     mod_len: usize,
     img_ptr: *const u8,
@@ -11057,36 +11066,21 @@ pub extern "C" fn temen_selfhost_jit_emit_object_fs(
     tu_ptr: *const u8,
     tu_len: usize,
     debug_info: i32,
+    shared: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
     let tu = unsafe { core::slice::from_raw_parts(tu_ptr, tu_len) };
-    // The C card's compiler slot (#1144): decoded, verified and emitted once across the card's TUs.
-    let (m, emit) = match cached_module(chibicc_slot(), bytes).and_then(cached_emit) {
-        Ok(p) => p,
-        Err(status) => {
-            set(status);
-            return -status;
-        }
-    };
-    let argv = chibicc_selfhost_argv(tu, debug_info != 0);
-    match JitOnrampRun::open_owned_run_fs(
-        m,
-        SELFHOST_WIN_LOG2,
-        true,
-        image,
-        &argv,
-        Vec::new(),
-        Some(emit),
-    ) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the run is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
+    // The C card's compiler slot (#1144): one decode and verify across the card's TUs.
+    match cached_module(chibicc_slot(), bytes) {
+        Ok(c) => coop_open_fs(
+            c,
+            image,
+            &chibicc_selfhost_argv(tu, debug_info != 0),
+            shared != 0,
+        ),
         Err(status) => {
             set(status);
             -status
@@ -15590,7 +15584,7 @@ block 0 () {
     #[test]
     fn op13jit_loop_drives_a_nested_emitted_child_end_to_end() {
         // The JS-orchestrated op-13 loop's engine side, end-to-end: the driver marshals `fs` and stages the
-        // child; here we substitute JS's `driveJitRun` with the interpreter oracle (`run_cross_tier(0)` over
+        // child; here we substitute JS's `driveDetachedRun` with the interpreter oracle (`run_cross_tier(0)` over
         // the *staged* run — identical value to the emitted `f0` by tier parity, INVARIANTS §9), then
         // `_deliver` + resume. The driver returns the child's join result (41) and the marshaled fs ticked.
         assert_eq!(temen_op13jit_open(), STATUS_OK);

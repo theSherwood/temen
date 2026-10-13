@@ -21,7 +21,7 @@
 
 use temen_browser::{onramp_exec, JitOnrampRun, STATUS_EXIT, STATUS_OK, STATUS_UNSUPPORTED};
 
-const WIN_LOG2: u8 = 27; // 128 MiB — matches SELFHOST_WIN_LOG2 (the compiler + macro staging heap)
+const WIN_LOG2: u8 = 27; // 128 MiB (the compiler + macro staging heap)
 const WIN_SIZE: u64 = 1 << WIN_LOG2;
 
 // The tour's macro: a pure syntax-quote template. Expands `unless C {B}` → `[if C {} {B}]` → br_if.

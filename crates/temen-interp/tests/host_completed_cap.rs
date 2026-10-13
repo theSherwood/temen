@@ -798,3 +798,50 @@ fn a_root_that_can_park_in_a_self_op_is_not_offered() {
     let _ = coop_with(&m, Host::new(), Some(leaf_config(&offers, true)));
     assert!(offers.lock().unwrap().is_empty());
 }
+
+/// A root that calls a host capability inline: a `call.cap` whose handle `h` is an operand, as
+/// chibicc reaches its in-memory file system.
+fn root_host_call(h: i32) -> temen_ir::Module {
+    parse(&format!(
+        "memory 16
+func () -> (i64) {{
+block 0 () {{
+  vh = i32.const {h}
+  va = i64.const 5
+  vr = call.cap 13 0 (i64) -> (i64) vh (va)
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// An inline host-capability call parks as any of the host's host capabilities could (#1414 S4-3b).
+/// When each answers synchronously and no personality can ask one to park, the root cannot park:
+/// it is offered (`parks = false`) and runs whole. An offloadable capability's call can punt, so a
+/// host holding one keeps the root off the emitted tier.
+#[test]
+fn a_root_calling_a_host_capability_inline_is_offered_when_none_can_park() {
+    let mut host = Host::new();
+    let h = host.grant_host_proc(
+        Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 100])),
+        temen_interp::CapState::Stateless,
+    );
+    let m = root_host_call(h);
+    let offers: Offers = Arc::default();
+    let ran = drive_leaf(
+        coop_with(&m, host, Some(leaf_config(&offers, true))),
+        &CapRequests::default(),
+    );
+    assert_eq!(offers.lock().unwrap().clone(), vec![(0, 0, false)]);
+    assert_eq!((ran.end, ran.tierups), (Ok(vec![Value::I64(105)]), 1));
+
+    let (host, h) = pool_completed();
+    let m = root_host_call(h);
+    let offers: Offers = Arc::default();
+    let _ = coop_with(&m, host, Some(leaf_config(&offers, true)));
+    assert!(
+        offers.lock().unwrap().is_empty(),
+        "an offloadable capability's call can punt"
+    );
+}

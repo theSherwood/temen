@@ -135,7 +135,7 @@ fn jit_compile(chibicc: &temen_ir::Module, src: &str) -> String {
                 match outcome {
                     Ok(vals) => {
                         // #1153: re-sync the emitted `"mapped"` global to the (possibly `vm_map`-grown)
-                        // live extent after each bounce, exactly as `driveJitRun` does in the browser —
+                        // live extent after each bounce, exactly as `driveDetachedRun` does in the browser —
                         // chibicc declares a 2-MiB window and grows its heap past it, so without this the
                         // emitted store into a grown page traps against the stale declared bound.
                         let mapped = caller.data().as_ref().unwrap().mapped() as i64;
@@ -322,7 +322,7 @@ fn jit_run_module(m: &temen_ir::Module) -> (Vec<u8>, bool) {
                     .run_cross_tier(func as u32, &args);
                 match outcome {
                     Ok(vals) => {
-                        // #1153: re-sync the emitted `"mapped"` bound after each bounce (as `driveJitRun`).
+                        // #1153: re-sync the emitted `"mapped"` bound after each bounce (as `driveDetachedRun`).
                         let mapped = caller.data().as_ref().unwrap().mapped() as i64;
                         if let Some(wasmi::Extern::Global(g)) = caller.get_export("mapped") {
                             g.set(&mut caller, Val::I64(mapped)).ok();
