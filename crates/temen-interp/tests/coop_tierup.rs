@@ -21,6 +21,8 @@
 //! Fuel is **bounded** (not `u64::MAX`) so any regression surfaces as an `OutOfFuel` trap rather than a
 //! hang; the guests finish in well under the budget, so a bound never perturbs the differential.
 
+#[path = "support/coop.rs"]
+mod coop;
 #[path = "support/rec.rs"]
 mod rec;
 
@@ -83,7 +85,7 @@ fn coop_tierup_run(
         page_checked: false,
         leaf: None,
     };
-    let mut run = bytecode::CoopRun::new(m, 0, &[], FUEL, Host::new(), Some(tierup))
+    let mut run = coop::coop_run(m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
         .expect("entry in range");
     let mut tierups = 0u32;
@@ -274,7 +276,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
         page_checked: false,
         leaf: None,
     };
-    let mut run = bytecode::CoopRun::new(&m, 0, &[], FUEL, Host::new(), Some(tierup))
+    let mut run = coop::coop_run(&m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
         .expect("entry in range");
     let mut bounces = 0u32;
@@ -387,7 +389,7 @@ fn a_bounce_polls_a_fiber_the_pump_parked() {
         page_checked: false,
         leaf: None,
     };
-    let mut run = bytecode::CoopRun::new(&m, 0, &[], FUEL, Host::new(), Some(tierup))
+    let mut run = coop::coop_run(&m, 0, &[], FUEL, Host::new(), Some(tierup))
         .expect("supported")
         .expect("entry in range");
     let mut bounces = 0u32;
@@ -645,7 +647,7 @@ fn coop_tierup_child_env_tasks_tier_up() {
         let inst = host.grant_instantiator(0, 128 << 10);
         let budget = host.grant_budget(-1, 1 << 20, -1);
         let args = [Value::I32(inst), Value::I32(budget)];
-        let mut run = bytecode::CoopRun::new(&m, 0, &args, FUEL, host, tierup)
+        let mut run = coop::coop_run(&m, 0, &args, FUEL, host, tierup)
             .expect("supported")
             .expect("entry in range");
         let mut tierups = 0u32;
@@ -1212,7 +1214,11 @@ block 0 (vx: i64) {
     let prog = bytecode::SharedProgram::compile(&m).expect("in subset");
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true]);
     let run_with = |prots: &temen_interp::PageMap| -> (Result<Vec<Value>, Trap>, u32) {
-        let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
+        // Flat, as the warm session's window is: a tier-up over a window without a flat span runs
+        // interpreted (#1414 B6-3a), and `Region::new` is flat only where it is an `mmap`.
+        let back = std::sync::Arc::new(
+            temen_interp::Region::owned_zeroed(1 << 17, 4096).expect("a flat 128 KiB backing"),
+        );
         // "Restore the warm image": plant the marker bytes directly in the backing, exactly what
         // the warm session's memcpy restore does before arming the run.
         for (i, b) in MARKER.to_le_bytes().iter().enumerate() {
