@@ -361,14 +361,16 @@ pub(crate) enum ParkOn {
     Futex(Arc<crate::os_thread_rt::WaitCell>),
     /// #2010 — a `thread.join`: it also ends on the joiner's own freeze word, as a futex wait does.
     Thread,
-    /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
+    /// #2010 — an `Instantiator.join` (or `wait`): the joined child's end re-offers it.
     Child,
 }
 
 impl ParkOn {
     /// #1820 — a join counts itself in `Domain::parked` through the joined vCPU's completion cell
     /// (`Domain::join_park`), which the publisher settles before the joinee leaves `live`; the
-    /// executor must not count the task's park a second time.
+    /// executor must not count the task's park a second time. Counted as its vCPU's block, a join
+    /// must be one: a guest fiber's join parks every context up to its task (#2322,
+    /// [`fiber_resume`]), never the fiber alone.
     pub(crate) fn counts_itself(&self) -> bool {
         matches!(self, ParkOn::Thread | ParkOn::Child)
     }
@@ -1133,8 +1135,10 @@ pub(crate) unsafe extern "C" fn fiber_new(
 /// suspended on a guest `suspend`, 1 = returned, 3 = [`FIBER_PARKED`] — the fiber hit an event
 /// park (a `memory.wait` inside it), so it is set aside with `value` 0 and is **not** done; the
 /// resumer keeps running and re-polls with another `cont.resume`, §3.6 slice 5a) and returns the
-/// fiber's yielded/returned value. A forged / out-of-range / already-running / finished handle
-/// traps (`FiberFault`), matching the interpreter.
+/// fiber's yielded/returned value. A join's park is never reported (#2322): it blocks the whole
+/// vCPU, so this resume parks the resumer's own context with it and returns once the fiber moves
+/// on. A forged / out-of-range / already-running / finished handle traps (`FiberFault`), matching
+/// the interpreter.
 ///
 /// # Safety
 /// `status_out`/`trap_out` are live `*mut i64` cells. The running vCPU's runtime is [`CURRENT_RT`].
@@ -1240,81 +1244,116 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         let rt = &*rt;
         (rt.durable, rt.mem_base)
     };
-    // §12.8 4A.5: each context keeps its shadow-SP word in its **own** region, so the swap saves/loads
-    // *per-region* words (no shared `SHADOW_SP_OFF`) and re-points `durable.shadow_base` (the
-    // per-OS-thread register the instrumented IR reads) at the incoming context. The resumer's SP-word
-    // address is whatever is active now; the fiber's is its region base.
-    let resumer = if durable {
-        let rtm = &mut *rt;
-        let resumer = rtm.cur_shadow.take(); // the context being suspended (None = root)
-        let resumer_region = crate::durable_shadow::get();
-        let cur_sp = read_shadow_sp(mem_base, resumer_region);
-        match &resumer {
-            None => rtm.root_shadow_sp = cur_sp,
-            Some(rs) => rs.shadow_sp.store(cur_sp, Ordering::Relaxed),
-        }
-        let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
-        write_shadow_sp(
-            mem_base,
-            fiber_region,
-            slot.shadow_sp.load(Ordering::Relaxed),
-        );
-        crate::durable_shadow::seed(fiber_region);
-        // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`) into the
-        // fiber's own region word. The resume is sequential (the resumer waits on the resumee), so the
-        // globally-deepest frame's flip to `NORMAL` propagates back up through the switches — exactly as
-        // the former single global state word did. Mirrors the interp's `shadow_switch` carry.
-        let phase = *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *const i32);
-        // DURABILITY.md §13.4 step 4 (per-fiber thaw re-arm), the interp's `shadow_switch`: a fiber
-        // whose restored region still holds a frame (seeded frozen residue not yet rewound) re-enters
-        // `REWINDING` whatever the carried phase, or a first resume after the root's rewind finished
-        // would start it fresh and orphan its spilled frame (#1973: a fiber parked on a pipe).
-        let rewinding =
-            slot.shadow_sp.load(Ordering::Relaxed) > rtm.table.shadow.frame_base(slot_idx + 1);
-        *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *mut i32) =
-            if rewinding { STATE_REWINDING } else { phase };
-        rtm.cur_shadow = Some(Arc::clone(&slot));
-        Some((resumer, resumer_region))
-    } else {
-        None
-    };
-    // Per-fiber trap attribution (DEBUGGING.md §5 W3 / §23-D57): publish this fiber as the one running
-    // on this thread, so a trap inside the switch below is captured against *its* handle (the C
-    // `trap_capture` reads the current-fiber TLS at the trap instant), and restore the resumer (root or
-    // an outer fiber) when the resume returns. Stack-disciplined across nested resumes, mirroring the
-    // durable shadow-SP bracket above — so a migrated fiber is named by identity, not by thread.
-    let prev_fiber = temen_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
-    // §2b path B: the fiber's stack-limit is supplied as an ABI param at its entry (see `make_fiber`),
-    // not via a shared cell here — so it is per-vCPU by construction and needs no resume-seam bracket.
-    // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
-    // `*fib` exclusive to this vCPU. The same `temen-fiber` instruction sequence regardless of which
-    // thread the fiber last ran on (see the module header's 3c soundness argument).
-    // §3.6 slice 5a: record the slot this vCPU is switching into (the resumer-side parallel of
-    // the body's yielder push), so the futex thunk can park the RUNNING fiber; popped when the
-    // resume returns, on this same OS thread.
-    (*current()).active_slots.push(Arc::clone(&slot));
-    let st = (*fib).resume(arg as u64);
-    (*current()).active_slots.pop();
-    temen_set_current_fiber(prev_fiber);
-    // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
-    // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
-    if let Some((resumer, resumer_region)) = resumer {
-        let rtm = &mut *current();
-        let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
-        slot.shadow_sp
-            .store(read_shadow_sp(mem_base, fiber_region), Ordering::Relaxed);
-        let restore = match &resumer {
-            None => rtm.root_shadow_sp,
-            Some(rs) => rs.shadow_sp.load(Ordering::Relaxed),
+    // #2322 — one pass per residency of the fiber. A join inside it blocks this whole vCPU, as it
+    // does on every engine, so the pass ends early only to hand that park on (below); when the vCPU
+    // is resumed, the next pass switches into the fiber again. The claim stays this vCPU's
+    // throughout, as a running fiber's does.
+    let mut arg = arg;
+    let st = loop {
+        // §12.8 4A.5: each context keeps its shadow-SP word in its **own** region, so the swap
+        // saves/loads *per-region* words (no shared `SHADOW_SP_OFF`) and re-points
+        // `durable.shadow_base` (the per-OS-thread register the instrumented IR reads) at the
+        // incoming context. The resumer's SP-word address is whatever is active now; the fiber's is
+        // its region base.
+        let resumer = if durable {
+            let rtm = &mut *current();
+            let resumer = rtm.cur_shadow.take(); // the context being suspended (None = root)
+            let resumer_region = crate::durable_shadow::get();
+            let cur_sp = read_shadow_sp(mem_base, resumer_region);
+            match &resumer {
+                None => rtm.root_shadow_sp = cur_sp,
+                Some(rs) => rs.shadow_sp.store(cur_sp, Ordering::Relaxed),
+            }
+            let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
+            write_shadow_sp(
+                mem_base,
+                fiber_region,
+                slot.shadow_sp.load(Ordering::Relaxed),
+            );
+            crate::durable_shadow::seed(fiber_region);
+            // §12.8 concurrent-thaw stage 1: carry the active **thaw** phase (`REWINDING`/`NORMAL`)
+            // into the fiber's own region word. The resume is sequential (the resumer waits on the
+            // resumee), so the globally-deepest frame's flip to `NORMAL` propagates back up through
+            // the switches — exactly as the former single global state word did. Mirrors the
+            // interp's `shadow_switch` carry.
+            let phase = *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *const i32);
+            // DURABILITY.md §13.4 step 4 (per-fiber thaw re-arm), the interp's `shadow_switch`: a
+            // fiber whose restored region still holds a frame (seeded frozen residue not yet
+            // rewound) re-enters `REWINDING` whatever the carried phase, or a first resume after the
+            // root's rewind finished would start it fresh and orphan its spilled frame (#1973: a
+            // fiber parked on a pipe).
+            let rewinding =
+                slot.shadow_sp.load(Ordering::Relaxed) > rtm.table.shadow.frame_base(slot_idx + 1);
+            *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *mut i32) =
+                if rewinding { STATE_REWINDING } else { phase };
+            rtm.cur_shadow = Some(Arc::clone(&slot));
+            Some((resumer, resumer_region))
+        } else {
+            None
         };
-        write_shadow_sp(mem_base, resumer_region, restore);
-        crate::durable_shadow::seed(resumer_region);
-        // §12.8 concurrent-thaw stage 1: carry the thaw phase back to the resumer's word (the resumee
-        // flipped its own to `NORMAL` when its rewind completed — propagate that up). See the entry swap.
-        let phase = *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *const i32);
-        *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
-        rtm.cur_shadow = resumer;
-    }
+        // Per-fiber trap attribution (DEBUGGING.md §5 W3 / §23-D57): publish this fiber as the one
+        // running on this thread, so a trap inside the switch below is captured against *its* handle
+        // (the C `trap_capture` reads the current-fiber TLS at the trap instant), and restore the
+        // resumer (root or an outer fiber) when the resume returns. Stack-disciplined across nested
+        // resumes, mirroring the durable shadow-SP bracket above — so a migrated fiber is named by
+        // identity, not by thread.
+        let prev_fiber = temen_set_current_fiber(fiber_handle(slot_idx, slot.own.generation()));
+        // §2b path B: the fiber's stack-limit is supplied as an ABI param at its entry (see
+        // `make_fiber`), not via a shared cell here — so it is per-vCPU by construction and needs no
+        // resume-seam bracket.
+        // Phase 2: the switch (may reenter the runtime) — no lock or `&mut` held; the claim makes
+        // `*fib` exclusive to this vCPU. The same `temen-fiber` instruction sequence regardless of
+        // which thread the fiber last ran on (see the module header's 3c soundness argument).
+        // §3.6 slice 5a: record the slot this vCPU is switching into (the resumer-side parallel of
+        // the body's yielder push), so the futex thunk can park the RUNNING fiber; popped when the
+        // resume returns, on this same OS thread.
+        (*current()).active_slots.push(Arc::clone(&slot));
+        let st = (*fib).resume(arg as u64);
+        (*current()).active_slots.pop();
+        temen_set_current_fiber(prev_fiber);
+        // Exit swap: back in the resumer (possibly on a different OS thread — re-read the runtime).
+        // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region
+        // (+ register).
+        if let Some((resumer, resumer_region)) = resumer {
+            let rtm = &mut *current();
+            let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
+            slot.shadow_sp
+                .store(read_shadow_sp(mem_base, fiber_region), Ordering::Relaxed);
+            let restore = match &resumer {
+                None => rtm.root_shadow_sp,
+                Some(rs) => rs.shadow_sp.load(Ordering::Relaxed),
+            };
+            write_shadow_sp(mem_base, resumer_region, restore);
+            crate::durable_shadow::seed(resumer_region);
+            // §12.8 concurrent-thaw stage 1: carry the thaw phase back to the resumer's word (the
+            // resumee flipped its own to `NORMAL` when its rewind completed — propagate that up).
+            // See the entry swap.
+            let phase = *((mem_base + fiber_region + STATE_IN_REGION_OFF) as *const i32);
+            *((mem_base + resumer_region + STATE_IN_REGION_OFF) as *mut i32) = phase;
+            rtm.cur_shadow = resumer;
+        }
+        // #2322 — the fiber parked on a join (`ParkOn::counts_itself`). A join blocks its whole
+        // vCPU — the oracle parks the vCPU, the bytecode drivers the task, an OS vCPU its thread —
+        // and has counted it blocked (`Domain::join_park`), so the resumer must not run on, nor see
+        // `FIBER_PARKED`. Only a task's join event-parks (an OS vCPU blocks in place), so this
+        // resumer runs inside the task too: park its own context in turn with the same park, which
+        // hands it on to the next resumer up, until the task's platform slot parks the task and
+        // gives its lanes back. Each pass back down re-enters here and switches into the fiber,
+        // whose join re-checks.
+        if let State::Yielded(_) = st {
+            if slot.event_park.load(Ordering::Relaxed) {
+                let on = slot.parked_on();
+                if on.counts_itself() {
+                    if let Some(own) = current_fiber_slot() {
+                        fiber_event_park(&own, slot.took_park_deadline(), on);
+                        arg = 0; // a park's poll delivers nothing (`fiber_event_park`)
+                        continue;
+                    }
+                }
+            }
+        }
+        break st;
+    };
     // Phase 3: publish the fiber's new state (clearing the seam assert *before* republishing).
     match st {
         State::Yielded(v) => {

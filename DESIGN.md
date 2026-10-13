@@ -3714,16 +3714,17 @@ the lanes and the run-wide live count stay the run's (the child's domain names t
 deadlock predicate. Child code is shared across spawns, so the thread thunks find the task's domain
 through a thread-local seeded for each residency and on each of its vCPU threads, never a baked
 address. A `thread.join` or `cont.resume.block` at a task's root parks the *task* on its one event
-park rather than block a worker; from a guest fiber inside the task, which cannot park the task from
-its own stack, it fails closed (`ThreadFault`). A root that returns while its vCPUs run publishes its
-outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not at its
-root's return — and the task *retires*, keeping its window and powerbox until its last vCPU ends; run
-teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run under its
-freeze word (#2010): each reserves a shadow context in the child's window, so a freeze unwinds each
-into its own region, as the run's root's vCPUs unwind. Its fiber runtime is armed over that window
-too, and its capture flattens its fibers as a run's root's are (#2031). A root that unwound for a
-freeze has no outcome to publish, so its task retires without one, and the capture is taken once its
-last vCPU has unwound too (DURABILITY.md §4). Pins:
+park rather than block a worker; from a guest fiber inside the task it still fails closed
+(`ThreadFault`). An `Instantiator` join there parks the task through the fiber's resumers instead
+(#2322, below), a route these two could take too. A root that returns while its vCPUs run publishes
+its outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not
+at its root's return — and the task *retires*, keeping its window and powerbox until its last vCPU
+ends; run teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run
+under its freeze word (#2010): each reserves a shadow context in the child's window, so a freeze
+unwinds each into its own region, as the run's root's vCPUs unwind. Its fiber runtime is armed over
+that window too, and its capture flattens its fibers as a run's root's are (#2031). A root that
+unwound for a freeze has no outcome to publish, so its task retires without one, and the capture is
+taken once its last vCPU has unwound too (DURABILITY.md §4). Pins:
 `temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
 tiers (`forth_sandbox.rs`).
 
@@ -3734,17 +3735,23 @@ The child's powerbox is the host its `Instantiator` resolves against and the par
 through the family the embedder's `GrantChildHooks::as_parent` builds over it (a child powerbox is
 always the shared form). The executor, the futex domain and the kill cell stay the run's. A
 grandchild's task is gated on every lane up to the root's, as the oracle gates a vCPU on its whole
-chain. The child's root joins from a task, so its `join` parks the task, as `thread.join` does there;
-a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A parent's nursery holds its
-children's to the run's teardown, which releases what each one retains only after the executor has
-drained: a grandchild that outlives its parent still hands its lane and window back to the parent's
-host, and that retained ref is what keeps the host alive. A durable child's nursery is durable, so
-its children are, and a freeze reaches them through it (DURABILITY.md §4, "The JIT captures them
-too"). Still refused: a carve spawn from a detached child (`CapFault`; its task would write back into
-a window that can be freed first, and #1867 deletes carves). Pins:
+chain. The child joins from a task, so its `join` (and `wait`) parks the task, as `thread.join` does
+there; a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A join from a guest
+fiber parks the task too (#2322). A join blocks its whole vCPU on every engine — the oracle parks the
+vCPU, the bytecode drivers the task — and counts it blocked for the deadlock verdict, so the fiber's
+event park is not reported to its resumer as `FIBER_PARKED`: each resumer's `cont.resume` parks its
+own context with it in turn, up to the task's platform slot, and switches back in when the task is
+resumed. No resumer runs on, and the task holds no lane while it waits. An outcome already in is
+returned at once, from any stack. A parent's nursery holds its children's to the run's teardown,
+which releases what each one retains only after the executor has drained: a grandchild that outlives
+its parent still hands its lane and window back to the parent's host, and that retained ref is what
+keeps the host alive. A durable child's nursery is durable, so its children are, and a freeze
+reaches them through it (DURABILITY.md §4, "The JIT captures them too"). Still refused: a carve
+spawn from a detached child (`CapFault`; its task would write back into a window that can be freed
+first, and #1867 deletes carves). Pins:
 `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the chain),
-`temen/tests/instantiate_record.rs` on every backend, and `temen/tests/durable_detached_jit.rs`
-(durable).
+`temen/tests/instantiate_record.rs` on every backend, `temen/tests/fiber_join_child.rs` (a fiber's
+join, on every engine), and `temen/tests/durable_detached_jit.rs` (durable).
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
