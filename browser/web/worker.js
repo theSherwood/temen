@@ -9,6 +9,7 @@
 // (not the page) is the only place a browser permits a blocking `Atomics.wait`.
 
 import { foreignImports, registerForeign } from './foreign-mem.js';
+import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -33,7 +34,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime, tierupPaged, childMem, ticket, start } = e.data;
+    jitB2, jitRuntime, tierupPaged, childMem, ticket, start, seedLen } = e.data;
   // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
   // _inst_codegen, temen_par_child*), where the shared-memory races have bitten: a double-free in the
@@ -61,60 +62,107 @@ self.onmessage = async (e) => {
     return 0;
   };
   const x2_now_ms = () => performance.timeOrigin + performance.now();
-  // A tier-up of the thread's task (#1414 B6-3): `f{func}(win, cell, ...argv)` on this Worker's
-  // instance of the run's tier-up module, made at its first one, with `"mapped"` set; its results
-  // are written at `out`. Returns how many, or -(1 + the code the emitted code trapped with). Its
-  // `call_interp` reaches the task's interpreter through `temen_x2_call_interp`. The emitted code
-  // runs on a slice of fuel: each time it spends one, its `env.trap(OUT_OF_FUEL)` looks at the
-  // run's `over` byte and grants another unless the run is over, so a run that ends while this
-  // thread is in emitted code stops it within a slice. The emitted tier is not metered: the slice is
-  // only how often it looks.
+  // The thread's emitted tier (#1414 B6-3): the coop driver's (`emittedTier`), over the run's
+  // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
+  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set and
+  // writes its results at `out`, returning how many, or -(1 + the code the emitted code trapped
+  // with). The emitted code runs on a slice of fuel: each time it spends one it asks for another,
+  // which it gets unless the run's `over` byte is set, so a run that ends while this thread is in
+  // emitted code stops it within a slice. The emitted tier is not metered: the slice is only how
+  // often it looks.
   const X2_SLICE = 1n << 20n;
-  let x2Emitted = null, x2Trap = 0, x2Over = 0;
-  const x2_tierup = (func, argv, argc, win, mapped, cell, over, out) => {
-    if (x2Emitted === null) {
-      const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
-      const bytes = new Uint8Array(memory.buffer).slice(p, p + n);
-      x2Emitted = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
-        env: {
-          memory,
-          trap: (code) => {
-            if (code === 11 /* temen_ir::trap_code::OUT_OF_FUEL */ &&
-              Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0) {
-              x2Emitted.fuel.value = X2_SLICE;
-              return;
-            }
-            x2Trap = code;
-          },
-          call_interp: (f, a) => { if (ex.temen_x2_call_interp(f, a) !== 0) throw new Error('bounce trap'); },
-        },
-      }).exports;
-    }
+  let x2Tier = null, x2Over = 0, x2Win = 0, x2Mapped = 0n;
+  const x2Bytes = (len) => {
+    if (len === 0) return null;
+    const p = Number(ex.temen_x2_bytes_ptr());
+    return new Uint8Array(memory.buffer).slice(p, p + len);
+  };
+  const x2Enter = (win, mapped, over) => {
+    x2Win = win;
+    x2Mapped = mapped;
     x2Over = over;
-    x2Emitted.mapped.value = mapped;
-    x2Emitted.fuel.value = X2_SLICE;
+    if (x2Tier === null) {
+      x2Tier = emittedTier(ex, memory, {
+        tableLog2: () => ex.temen_x2_table_log2(),
+        nfuncs: () => ex.temen_x2_nfuncs(),
+        tableGen: () => ex.temen_x2_table_gen(),
+        slotUnit: (slot) => ex.temen_x2_slot_unit(slot),
+        slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
+        shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
+        callInterp: (target, argsPtr) => ex.temen_x2_call_interp(target, argsPtr),
+        paged: () => 0,
+        mapped: () => x2Mapped,
+        mappedNow: () => ex.temen_x2_mapped_now(),
+        pagestatePtr: () => 0,
+        winPtr: () => x2Win,
+        deliverFaultAddr: () => {},
+        spillBytes: () => 0,
+        spillPtr: () => 0,
+        fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
+      });
+      const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
+      if (n > 0) {
+        const bytes = new Uint8Array(memory.buffer).slice(p, p + n);
+        x2Tier.setProgram(new WebAssembly.Instance(new WebAssembly.Module(bytes), x2Tier.imports()).exports);
+      }
+    }
+    x2Tier.syncTableSync();
+    for (const g of x2Tier.mappedGlobals) g.value = mapped;
+    for (const g of x2Tier.fuelGlobals) g.value = X2_SLICE;
+    x2Tier.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
+    return x2Tier;
+  };
+  // Enter the tier (`enter` returns the emitted function and its arguments), call it, and write its
+  // results at `out` (`res` makes each a slot). Whatever throws comes back as the task's trap, never
+  // out of the Worker: the emitted code's own, or MALFORMED when the tier could not be entered.
+  const x2Call = (enter, out, res) => {
+    let f, args;
+    try {
+      [f, args] = enter();
+    } catch {
+      return -1 - 12; // temen_ir::trap_code::MALFORMED: e.g. a module that does not instantiate
+    }
+    try {
+      const ret = f(x2Win, x2Tier.envCell, ...args);
+      const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
+      const view = new BigInt64Array(memory.buffer); // the emitted code may have grown the memory
+      for (let i = 0; i < rets.length; i++) view[(out >>> 3) + i] = res(rets[i], i);
+      return rets.length;
+    } catch (e) {
+      return -1 - x2Tier.trapOf(e);
+    }
+  };
+  // A tier-up of the thread's task: `f{func}` of the run's tier-up module, its slots all i64.
+  const x2_tierup = (func, argv, argc, win, mapped, over, out) => x2Call(() => {
+    const tier = x2Enter(win, mapped, over);
     const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
     const args = [];
     for (let i = 0; i < argc; i++) args.push(view[at + i]);
-    x2Trap = 0;
-    try {
-      const ret = x2Emitted['f' + func](win, cell, ...args);
-      const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
-      const res = new BigInt64Array(memory.buffer); // the emitted code may have grown the memory
-      for (let i = 0; i < rets.length; i++) res[(out >>> 3) + i] = BigInt(rets[i]);
-      return rets.length;
-    } catch {
-      return -1 - x2Trap;
-    }
+    return [tier.program()['f' + func], args];
+  }, out, (r) => BigInt(r));
+  // A §22 invoke of the unit with code handle `code`: its emitted module's `f0`, instantiated once
+  // per Worker, its slots marshalled by the types at `types`.
+  const x2_invoke = (code, wasm, wasmLen, types, nparams, nresults, argv, win, mapped, over, out) => {
+    const tc = new Uint8Array(memory.buffer).slice(types, types + nparams + nresults);
+    return x2Call(() => {
+      const tier = x2Enter(win, mapped, over);
+      const unit = tier.unitForSync(code, new Uint8Array(memory.buffer).slice(wasm, wasm + wasmLen));
+      const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
+      const args = [];
+      for (let i = 0; i < nparams; i++) args.push(tierupJitArg(view[at + i], tc[i]));
+      return [unit['f0'], args];
+    }, out, (r, i) => tierupJitRes(r, tc[nparams + i]));
   };
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup } }));
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // #1414 B6 — the parallel driver: its run is one in-Rust call on the root's Worker, and each of its
   // threads a call on a Worker of its own (`x2_spawn` above). The root reports as a root vCPU does.
   if (role === 'x2root') {
-    const value = ex.temen_x2_start(gptr, glen, winSize, tierup ? 1 : 0);
+    // A runtime-compile guest reads its unit blobs from the window: the page staged them in `win`.
+    const value = ex.temen_x2_start(gptr, glen, winSize, tierup ? 1 : 0, win, seedLen);
+    if (x2Tier !== null) x2Tier.free(); // the root's thread ran its task here
     const status = ex.temen_status(); // lib.rs STATUS_*: 0 ok · 3 trap · 5 exit
     if (status === 0) {
       self.postMessage({ kind: 'done', value: value.toString() });
@@ -131,6 +179,7 @@ self.onmessage = async (e) => {
   }
   if (role === 'x2thread') {
     ex.temen_x2_thread(start);
+    if (x2Tier !== null) x2Tier.free();
     self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do
     return;
   }

@@ -394,10 +394,11 @@ pub fn run_fast(
 // of multithreaded guests is Milestone B (it rides the `Policy` scheduler seam — S4).
 // ===========================================================================================
 
-/// A program location (DEBUGGING.md S1): which op of which block of which function, in which
-/// module space (`0` = the guest's own program; `≥1` = an installed `Jit` unit, §22). This is the
-/// granularity breakpoints and backtraces use; mapping it to source is W4 (the §3a debug-info
-/// side-table), not yet built.
+/// A program location (DEBUGGING.md S1): which op of which block of which function, in which module
+/// space (`0` = the guest's own program; `≥1` = a unit the run added: an installed `Jit` unit, §22,
+/// or on the bytecode debugger a module a child or an exec runs, #2239). This is the granularity
+/// breakpoints and backtraces use; [`source_loc_in`] maps it to source, and [`bind_line`] maps a
+/// source line to it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct IrPc {
     pub module: u32,
@@ -567,6 +568,9 @@ struct ValueWatch {
 /// always uncontended.
 struct DebugShared {
     breakpoints: BTreeSet<IrPc>,
+    /// Source-line breakpoints by file, as the ops they bound at in the program
+    /// ([`Inspector::set_line_breakpoints`]).
+    line_breakpoints: Vec<(String, Vec<IrPc>)>,
     /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
     /// `access_of` computation entirely when none are armed (S4 cost gating).
     watchpoints: Vec<Watch>,
@@ -587,6 +591,7 @@ impl DebugShared {
     fn new() -> DebugShared {
         DebugShared {
             breakpoints: BTreeSet::new(),
+            line_breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             value_watches: Vec::new(),
             next_watch: 0,
@@ -745,7 +750,9 @@ impl DebugCtx {
             let mut sh = self.shared();
             if sh.suppress_stops {
                 None // scheduled-seek fast-forward: run past stops (clock still ticks below)
-            } else if sh.breakpoints.contains(&pc) {
+            } else if sh.breakpoints.contains(&pc)
+                || sh.line_breakpoints.iter().any(|(_, pcs)| pcs.contains(&pc))
+            {
                 Some(StopReason::Breakpoint)
             } else if let Some((addr, write)) = accesses.iter().find_map(|a| sh.watch_hit(*a)) {
                 Some(StopReason::Watchpoint { addr, write })
@@ -813,7 +820,7 @@ pub struct Inspector {
     /// The frontend-neutral debug-info waist (DEBUGGING.md §6), cloned from the module. `None` ⇒
     /// the debugger reports IR locations only ([`IrPc`]/SSA indices); present ⇒ it can resolve
     /// source locations and named variables.
-    debug_info: Option<DebugInfo>,
+    debug_info: Option<Arc<DebugInfo>>,
     /// The run-wide breakpoint/watchpoint state, shared with every driven vCPU (so a breakpoint
     /// fires in whichever thread reaches it — DEBUGGING.md Milestone B). The [`Inspector`] mutates
     /// it through `set_breakpoint`/`set_watchpoint`/`set_cap_call_stops`.
@@ -974,6 +981,9 @@ pub struct SourceLoc {
 /// The free counterpart of [`Inspector::source_loc`]; pairs with [`run_with_host_traced`] to render
 /// an interpreter trap-time backtrace to source (the symmetric analog of the JIT's `JitFrameLoc`).
 pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
+    if pc.module != 0 {
+        return None;
+    }
     source_loc_in(m.debug_info.as_ref()?, pc)
 }
 
@@ -982,19 +992,21 @@ pub fn source_loc(m: &Module, pc: IrPc) -> Option<SourceLoc> {
 /// render an interpreter trap-time backtrace with function names (the analog of the JIT's
 /// `JitFrameLoc::func_name`).
 pub fn func_name(m: &Module, func: FuncIdx) -> Option<&str> {
-    let di = m.debug_info.as_ref()?;
+    func_name_in(m.debug_info.as_ref()?, func)
+}
+
+/// [`func_name`] in the module `di` describes.
+pub fn func_name_in(di: &DebugInfo, func: FuncIdx) -> Option<&str> {
     di.func_names
         .iter()
         .find(|f| f.func == func)
         .map(|f| f.name.as_str())
 }
 
-/// The nearest-preceding-`loc` resolution shared by [`source_loc`] and [`Inspector::source_loc`]
-/// (DEBUGGING.md §6/W4 S2): the latest `loc` in `pc`'s block at or before `pc.inst`.
-fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
-    if pc.module != 0 {
-        return None;
-    }
+/// The source position of `pc`, an op of the module `di` describes (DEBUGGING.md §6/W4 S2): the
+/// latest `loc` in `pc`'s block at or before `pc.inst`. Shared by [`source_loc`],
+/// [`Inspector::source_loc`] and a debugger reading a frame of any module the run admitted (#2239).
+pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
     let l = di
         .locs
         .iter()
@@ -1006,6 +1018,38 @@ fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
         line: l.line,
         col: l.col,
     })
+}
+
+/// Where line `line` of source `file` binds in the module `di` describes, as module `module`: the
+/// first op of the nearest line at or after it with code, so a breakpoint on a blank or comment
+/// line snaps forward, as a native debugger's does. Every mapped op is a stop position on both
+/// engines, a block terminator (`inst == insts.len()`) too (#1713). `file` names one of the
+/// module's sources exactly, by a suffix, or by basename, as a debug client's absolute path names a
+/// `-g` basename. Returns the line it bound at and the op. A debugger binds each source-line
+/// breakpoint in every module with §6 info this way, as a native debugger binds one in a library it
+/// loads (#2239).
+pub fn bind_line(di: &DebugInfo, module: u32, file: &str, line: u32) -> Option<(u32, IrPc)> {
+    fn base(p: &str) -> &str {
+        p.rsplit(['/', '\\']).next().unwrap_or(p)
+    }
+    let fi = di
+        .files
+        .iter()
+        .position(|f| f == file || file.ends_with(f.as_str()) || base(f) == base(file))?
+        as u32;
+    di.locs
+        .iter()
+        .filter(|l| l.file == fi && l.line >= line)
+        .map(|l| {
+            let pc = IrPc {
+                module,
+                func: l.func,
+                block: l.block as usize,
+                inst: l.inst as usize,
+            };
+            (l.line, pc)
+        })
+        .min()
 }
 
 /// The value of a source variable ([`Inspector::read_var`]). A promoted scalar resolves to a live
@@ -1176,7 +1220,7 @@ impl Inspector {
             v: Some(root),
             sched: None,
             host,
-            debug_info: m.debug_info.clone(),
+            debug_info: m.debug_info.clone().map(Arc::new),
             shared,
             focus: None,
             seek_init: Some(SeekInit {
@@ -1326,7 +1370,7 @@ impl Inspector {
             v: None,
             sched: Some(sched),
             host,
-            debug_info: m.debug_info.clone(),
+            debug_info: m.debug_info.clone().map(Arc::new),
             shared,
             focus: None,
             seek_init: Some(SeekInit {
@@ -1773,6 +1817,34 @@ impl Inspector {
         self.shared().breakpoints.remove(&pc)
     }
 
+    /// Replace source `file`'s line breakpoints with `lines`, each bound in the program where its
+    /// §6 debug info has code on it or after it ([`bind_line`]). This engine debugs the program
+    /// alone: a unit of it is a §22 `Jit` unit, without §6 info, and a §14 child runs undebugged.
+    /// Returns, per line, the line it bound at, or `None`. The bytecode debugger binds in every
+    /// module it runs (#2239).
+    pub fn set_line_breakpoints(&mut self, file: &str, lines: Vec<u32>) -> Vec<Option<u32>> {
+        let bound: Vec<_> = lines
+            .iter()
+            .map(|&l| bind_line(self.debug_info.as_deref()?, 0, file, l))
+            .collect();
+        let mut sh = self.shared();
+        sh.line_breakpoints.retain(|(f, _)| f != file);
+        let pcs: Vec<IrPc> = bound.iter().flatten().map(|&(_, pc)| pc).collect();
+        if !pcs.is_empty() {
+            sh.line_breakpoints.push((file.to_string(), pcs));
+        }
+        bound.iter().map(|b| b.map(|(l, _)| l)).collect()
+    }
+
+    /// The §6 debug info of module `module` of the run: the program's (`0`). `None` for a unit, a
+    /// §22 `Jit` unit here, which has none.
+    pub fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>> {
+        if module != 0 {
+            return None;
+        }
+        self.debug_info.clone()
+    }
+
     /// Watch window range `[addr, addr+len)` for accesses of `kind`; the run pauses *before* the
     /// op that accesses it ([`StopReason::Watchpoint`]). Because the window is one contiguous buffer
     /// (DEBUGGING.md W2), this catches every code path — no per-op instrumentation needed. Returns a
@@ -2027,6 +2099,9 @@ impl Inspector {
     /// semantics). Only the guest's own program (module 0) has source; installed §22 units return
     /// `None`.
     pub fn source_loc(&self, pc: IrPc) -> Option<SourceLoc> {
+        if pc.module != 0 {
+            return None;
+        }
         source_loc_in(self.debug_info.as_ref()?, pc)
     }
 

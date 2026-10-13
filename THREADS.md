@@ -400,8 +400,12 @@ property, so in practice:
   thread runs its own task's tier-ups on its Worker's instance of the run's tier-up module
   (`ThreadTier`), over a flat window, without the lock. Emitted code runs on slices of fuel, and at
   the end of each it looks at the run's `over` flag, so the run's end stops emitted code still
-  running (B6-3a). The emitted §22 invoke and the B2 table (B6-3b) and
-  detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
+  running (B6-3a). A §22 invoke of a unit with emitted wasm runs the same way: the rules surface it
+  (`SchedCore::on_stop`, as on the cooperative pump), and the task's thread runs it on its Worker
+  before it steps the task on. Each Worker keeps the coop driver's emitted tier (`emittedTier`), so
+  its `WebAssembly.Table` follows the run's dispatch table by its generation and a unit's
+  `call.dyn` reaches what any thread installed (B6-3b). The coop emit for regions (paged included)
+  and detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
   driver (B6-4).
 
 ### Known wrinkles — all resolved in `4c-wasm`
