@@ -3090,14 +3090,17 @@ unsafe fn join_or_wait(
         }
     };
     drop(children);
-    // #1956 — a detached child's root joins from a task, so the thread that would block is an
-    // executor worker: it parks the task instead, as `thread.join` does there, and the executor gives
-    // the task's lanes back while it is parked. A guest fiber inside the task cannot park the task
-    // from its own stack, so it fails closed rather than hold a worker the joined child may need.
+    // #1956 — a detached child joins from a task, so the thread that would block is an executor
+    // worker: the join parks the task instead, as `thread.join` does there, and the executor gives
+    // the task's lanes back while it is parked. #2322 — from a guest fiber too: the fiber's event
+    // park blocks the whole task, as a join blocks its vCPU on every engine, so its resumer neither
+    // runs on nor sees `FIBER_PARKED` (`fiber_rt::fiber_resume` hands the park up to the task). An
+    // outcome already in is returned below without parking, on any stack.
     let task = if crate::fiber_rt::in_task() {
         match crate::fiber_rt::current_fiber_slot() {
-            Some(s) if s.is_platform() => Some(s),
-            _ => {
+            Some(s) => Some(s),
+            // Unreachable: a task runs on its platform slot, the first of the resumes this reads.
+            None => {
                 *trap_out = TrapKind::ThreadFault as i64;
                 return 0;
             }

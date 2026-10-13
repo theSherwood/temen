@@ -3649,6 +3649,19 @@ impl Func {
         })
     }
 
+    /// Whether this function names a function of its own module by index: `ref.func`, or the entry
+    /// of a `thread.spawn`. A §22 unit with such a function has its functions installed into the
+    /// domain's `call.dyn` table, so the index reaches the unit's function rather than module 0's
+    /// (DESIGN.md §22 "Unit-own funcrefs"). Every engine installs on this one test, so they fill the
+    /// same slots.
+    pub fn names_own_funcs(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|i| matches!(i, Inst::RefFunc { .. } | Inst::ThreadSpawn { .. }))
+        })
+    }
+
     /// Whether this function contains a fiber or thread **scheduling** op (`cont.*`, `suspend`,
     /// `thread.spawn`/`join`) — [`uses_concurrency`](Func::uses_concurrency) minus the futex ops
     /// (`atomic.wait`/`notify`). A §14 JIT child gets no per-child fiber/thread runtime (rejected),

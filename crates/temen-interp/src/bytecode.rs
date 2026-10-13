@@ -763,6 +763,18 @@ impl Compiled {
     pub fn op_count(&self) -> usize {
         self.progs.iter().map(|p| p.ops.len()).sum()
     }
+
+    /// Lower each `ref.func N` of this §22 unit to `slots[N]`, the `call.dyn` slot its function `N`
+    /// was installed into (DESIGN.md §22 "Unit-own funcrefs"): the constant the Cranelift JIT's
+    /// `define_extra` emits. `None` for an index with no slot, which a verified unit has not.
+    fn lower_own_funcrefs(&mut self, slots: &[usize]) -> Option<()> {
+        for op in self.progs.iter_mut().flat_map(|p| p.ops.iter_mut()) {
+            if let Op::RefFunc { func, .. } = op {
+                *func = *slots.get(*func as usize)? as u32;
+            }
+        }
+        Some(())
+    }
 }
 
 /// THREADS.md 4c-domain — a domain's `call.dyn` dispatch table, **shareable + installable across
@@ -839,16 +851,42 @@ impl SharedSlots {
         units.iter().find(|&&(k, _)| k == m).map(|&(_, id)| id)
     }
 
-    /// The `(table, unit)` installed at `slot` (#1233): `None` for an empty slot, one of the
-    /// domain's own functions, or a slot past the end. A host mirroring the table in emitted code
-    /// fetches each slot's emitted unit by it. It names the unit rather than the §22 code handle,
-    /// which the guest may release once the unit is installed.
+    /// The module unit `id` runs as in this domain, if it names its own functions and was installed
+    /// or invoked here ([`own_funcs_module`]). Such a unit is one module per domain; any other unit
+    /// is a module per install, which this is never asked about.
+    fn own_module(&self, id: (u32, u32)) -> Option<usize> {
+        let units = self.jit_units.lock_unpoisoned();
+        units.iter().find(|&&(_, u)| u == id).map(|&(k, _)| k)
+    }
+
+    /// The padding slots no install fills, in order. Read under the source lock, which every fill
+    /// and clear holds.
+    fn free_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                (s.load(std::sync::atomic::Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// The `(table, unit)` whose entry is installed at `slot` (#1233): `None` for an empty slot, one
+    /// of the domain's own functions, a slot past the end, or a slot holding another function of a
+    /// unit that names its own (DESIGN.md §22 "Unit-own funcrefs"). A host mirroring the table in
+    /// emitted code fetches each slot's emitted unit by it and puts that unit's entry there, so a
+    /// slot whose function is not the entry stays empty in the mirror, trapping, rather than calling
+    /// the entry. It names the unit rather than the §22 code handle, which the guest may release
+    /// once the unit is installed.
     fn slot_unit(&self, slot: usize) -> Option<(u32, u32)> {
         let ts = super::unpack_slot(
             self.slots
                 .get(slot)?
                 .load(std::sync::atomic::Ordering::Acquire),
         );
+        if ts.func != 0 {
+            return None;
+        }
         self.jit_unit(ts.module as usize)
     }
 
@@ -1172,7 +1210,8 @@ impl Domain {
 /// `CapFault`). The unit compiles to bytecode, `Malformed` if it uses an op outside the engine's
 /// coverage (the one place a guest-provided unit can outrun it, with no tree-walker fallback
 /// mid-run), and lands in the task's own `table`: a §14 child's installs stay out of its parent's
-/// `call.dyn` (#1296). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
+/// `call.dyn` (#1296). A unit that names its own functions installs them first, once
+/// ([`unit_module`]). The guest gets the slot at `active`'s `dst`, or `-ENOSPC` when the table is
 /// full. Returns the slot filled.
 fn jit_install(
     unit: Result<super::ResolvedJitUnit, Trap>,
@@ -1181,9 +1220,9 @@ fn jit_install(
     active: &mut Vm,
     dst: u32,
 ) -> Result<Option<usize>, Trap> {
-    let (funcs, types, id) = unit?;
-    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
-    let slot = jit_install_into(source, table, unit, id);
+    let unit = unit?;
+    let slot = unit_module(source, table, &unit)?
+        .and_then(|module| jit_install_into(source, table, module, unit.2));
     active.set(dst, Reg::from_i64(slot.map_or(super::ENOSPC, |s| s as i64)));
     Ok(slot)
 }
@@ -1211,22 +1250,24 @@ fn jit_uninstall(
 /// the op's `(jit, code)` pair, as for [`jit_install`]. The unit compiles (`Malformed` outside
 /// coverage); its entry (func 0) must take and return as many values as the call's code-stripped
 /// signature (`CapFault` otherwise); `argv` is marshalled through the i64-slot ABI. The unit is pushed
-/// to `source` as a transient module, and its module index and entry args returned: the driver runs
-/// it ([`run_invoke`]) or steps into it (the debugger), then hands its results back with
+/// to `source` as a transient module — or, when it names its own functions, runs as the module they
+/// were installed with ([`unit_module`]; `CapFault` when `table` has too few slots left for them,
+/// where the Cranelift JIT refused its compile) — and its module index and entry args returned: the
+/// driver runs it ([`run_invoke`]) or steps into it (the debugger), then hands its results back with
 /// [`set_slot_results`].
 fn jit_invoke_unit(
     unit: Result<super::ResolvedJitUnit, Trap>,
     source: &ModuleSource,
+    table: &SharedSlots,
     argv: &[i64],
     params: &[ValType],
     results: &[ValType],
 ) -> Result<(usize, Vec<Value>), Trap> {
-    let (funcs, types, _) = unit?;
-    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
-    let arity_ok = unit
-        .sigs
-        .first()
-        .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+    let unit = unit?;
+    let module = unit_module(source, table, &unit)?.ok_or(Trap::CapFault)?;
+    let arity_ok = unit.0.first().is_some_and(|entry| {
+        entry.params.len() == params.len() && entry.results.len() == results.len()
+    });
     if !arity_ok {
         return Err(Trap::CapFault);
     }
@@ -1235,7 +1276,81 @@ fn jit_invoke_unit(
         .zip(argv)
         .map(|(ty, s)| slot_to_val(*ty, *s))
         .collect();
-    Ok((source.push(unit), args))
+    let module = match module {
+        UnitModule::Fresh(unit) => source.push(unit),
+        UnitModule::Own(k) => k,
+    };
+    Ok((module, args))
+}
+
+/// The module a §22 unit runs as, for one install or invoke ([`unit_module`]).
+enum UnitModule {
+    /// The unit, compiled for this use and not yet in the shared source: an install appends it once
+    /// a slot is free for it ([`jit_install_into`]), an invoke as a transient module.
+    Fresh(Compiled),
+    /// The module a unit that names its own functions runs as in this domain ([`own_funcs_module`]).
+    Own(usize),
+}
+
+/// The module `unit` runs as for an install or invoke in this domain. A unit that names its own
+/// functions ([`super::unit_names_own_funcs`]) is one module per domain, its functions installed at
+/// its first use ([`own_funcs_module`]); `None` when too few slots are left for them. Any other unit
+/// compiles afresh each time. `Malformed` outside the engine's coverage.
+fn unit_module(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    unit: &super::ResolvedJitUnit,
+) -> Result<Option<UnitModule>, Trap> {
+    let (funcs, types, id) = unit;
+    if super::unit_names_own_funcs(funcs) {
+        return Ok(own_funcs_module(source, table, funcs, types, *id)?.map(UnitModule::Own));
+    }
+    let unit = compile_module(funcs, types, None).ok_or(Trap::Malformed)?;
+    Ok(Some(UnitModule::Fresh(unit)))
+}
+
+/// §22 "Unit-own funcrefs" (DESIGN.md): the module a unit that names its own functions runs as in
+/// this domain, made at its first install or invoke the way the Cranelift JIT's `define_extra` makes
+/// it at compile. Its function `i` fills a padding slot of `table`, the first free ones in order, and
+/// its `ref.func N` is lowered to the slot its function `N` fills, so a funcref the unit makes
+/// reaches its own function rather than module 0's; its `thread.spawn N` already resolves in the
+/// spawning frame's module. Every later install or invoke of the unit reuses the module and its
+/// slots, whatever was installed or uninstalled since, as the JIT fixes them at compile. `Ok(None)`
+/// when fewer slots are free than the unit has functions (nothing is filled); `Malformed` outside
+/// the engine's coverage. The compile runs outside the source lock; a racing install of the same
+/// unit keeps the module that landed first, as [`ModuleSource::unit_of`] does.
+fn own_funcs_module(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    id: (u32, u32),
+) -> Result<Option<usize>, Trap> {
+    use std::sync::atomic::Ordering;
+    if let Some(k) = table.own_module(id) {
+        return Ok(Some(k));
+    }
+    let mut unit = compile_module(funcs, types, None).ok_or(Trap::Malformed)?;
+    let mut mods = source.mods.lock_unpoisoned();
+    if let Some(k) = table.own_module(id) {
+        return Ok(Some(k));
+    }
+    let free: Vec<usize> = table.free_slots().take(funcs.len()).collect();
+    if free.len() < funcs.len() {
+        return Ok(None);
+    }
+    unit.lower_own_funcrefs(&free).ok_or(Trap::Malformed)?;
+    mods.code.push(std::sync::Arc::new(unit));
+    let module = mods.code.len() - 1;
+    table.jit_units.lock_unpoisoned().push((module, id));
+    for (func, &slot) in free.iter().enumerate() {
+        table.slots[slot].store(
+            super::pack_slot(module as u32, func as u32),
+            Ordering::Release,
+        );
+    }
+    table.gen.fetch_add(1, Ordering::AcqRel);
+    Ok(Some(module))
 }
 
 /// A §22 unit's results, as i64 slots, into the caller's `dst…`, retagged by the call's `results`
@@ -1251,30 +1366,32 @@ fn set_slot_results(
     }
 }
 
-/// `Jit.install`'s table half, under [`jit_install`]: append `unit` to the shared source and fill the
-/// first padding slot with `(module, 0)`, returning the slot — or `None` if the table is full (the
-/// unit is not appended). The whole op serializes under the source lock, and the slot store is
-/// `Release`, so a reader that observes the slot also observes the pushed unit. `id` is the unit's
-/// `(table, unit)` on the installing host, which the table records ([`SharedSlots::jit_unit`]).
+/// `Jit.install`'s table half, under [`jit_install`]: fill the first padding slot with `(module, 0)`,
+/// the entry of the module `unit` runs as, returning the slot — or `None` if the table is full. A
+/// fresh unit is appended to the shared source as a new module only once its slot is found; a unit
+/// that names its own functions already runs as one, and its entry fills one more slot of it. The
+/// whole op serializes under the source lock, and the slot store is `Release`, so a reader that
+/// observes the slot also observes the unit. `id` is the unit's `(table, unit)` on the installing
+/// host, which the table records for a new module ([`SharedSlots::jit_unit`]).
 fn jit_install_into(
     source: &ModuleSource,
     table: &SharedSlots,
-    unit: Compiled,
+    unit: UnitModule,
     id: (u32, u32),
 ) -> Option<usize> {
     use std::sync::atomic::Ordering;
     let mut mods = source.mods.lock_unpoisoned();
-    let slot = table
-        .slots
-        .iter()
-        .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == super::TABLE_EMPTY)?;
-    mods.code.push(std::sync::Arc::new(unit));
-    table
-        .jit_units
-        .lock_unpoisoned()
-        .push((mods.code.len() - 1, id));
-    let module = (mods.code.len() - 1) as u32;
-    table.slots[slot].store(super::pack_slot(module, 0), Ordering::Release);
+    let slot = table.free_slots().next()?;
+    let module = match unit {
+        UnitModule::Fresh(unit) => {
+            mods.code.push(std::sync::Arc::new(unit));
+            let module = mods.code.len() - 1;
+            table.jit_units.lock_unpoisoned().push((module, id));
+            module
+        }
+        UnitModule::Own(module) => module,
+    };
+    table.slots[slot].store(super::pack_slot(module as u32, 0), Ordering::Release);
     table.gen.fetch_add(1, Ordering::AcqRel);
     Some(slot)
 }
@@ -5790,8 +5907,8 @@ impl<'p> Vcpu<'p> {
             Some(s) => FiberRegRef::Shared(s),
             None => FiberRegRef::Owned(&self.fibers),
         };
-        let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
-            |(umod, args)| {
+        let ran = jit_invoke_unit(unit, &dom.source, &dom.table, &argv, &params, &results)
+            .and_then(|(umod, args)| {
                 run_invoke(
                     &dom.source,
                     &dom.table,
@@ -5802,8 +5919,7 @@ impl<'p> Vcpu<'p> {
                     &mut cell,
                     Some(&Beneath::task(&self.vt, parked)),
                 )
-            },
-        );
+            });
         match ran {
             Ok(vals) => set_slot_results(
                 &mut self.vt.active,
@@ -7118,7 +7234,7 @@ fn debug_advance_fiber(
             // `active_invoke` and the next advance steps the unit's first op, so a breakpoint fires
             // inside it and the backtrace descends into its module-≥1 frames.
             let unit = host.resolve_jit_unit(h, code);
-            match jit_invoke_unit(unit, source, &argv, &params, &results)
+            match jit_invoke_unit(unit, source, table, &argv, &params, &results)
                 .and_then(|(umod, args)| dbg_jit_step_into(vt, source, umod, &args, dst, results))
             {
                 Ok(()) => FiberStep::Stepped,
@@ -12601,7 +12717,7 @@ fn drive_nested(
                 results,
             } => {
                 let unit = host.with(|p| p.resolve_jit_unit(h, code));
-                let (umod, args) = jit_invoke_unit(unit, source, &argv, &params, &results)?;
+                let (umod, args) = jit_invoke_unit(unit, source, table, &argv, &params, &results)?;
                 // #1660: this drive is paused beneath the unit — hand it on, if our own view is whole.
                 let view = beneath.map(|b| b.with_drive(&vt.active, &vt.chain, fibers.view()));
                 let vals = run_invoke(source, table, umod, &args, fuel, mem, host, view.as_ref())?;
@@ -16200,8 +16316,8 @@ impl SchedCore {
                         (&**table, mem, &**host, FiberRegRef::Owned(&fibers.fibers))
                     }
                 };
-                let ran = jit_invoke_unit(unit, &dom.source, &argv, &params, &results).and_then(
-                    |(umod, args)| {
+                let ran = jit_invoke_unit(unit, &dom.source, table, &argv, &params, &results)
+                    .and_then(|(umod, args)| {
                         run_invoke(
                             &dom.source,
                             table,
@@ -16212,8 +16328,7 @@ impl SchedCore {
                             &mut HostCell::Shared(host),
                             Some(&Beneath::task(&tasks[ti].vm.vt, parked)),
                         )
-                    },
-                );
+                    });
                 match ran {
                     Ok(vals) => {
                         let slots = vals.into_iter().map(val_to_slot);
@@ -19188,6 +19303,8 @@ impl Vm {
                     pc += 1;
                 }
                 Op::RefFunc { dst, func } => {
+                    // `func` is the slot: a §22 unit's own function's was lowered to the slot it
+                    // fills when the unit was compiled for this domain (`own_funcs_module`).
                     r!(*dst) = Reg::from_i32(*func as i32);
                     pc += 1;
                 }

@@ -507,6 +507,110 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
     }
 }
 
+/// **A unit's own funcrefs across a freeze/thaw** (DESIGN.md §22 "Unit-own funcrefs", #2314). Func 0
+/// compiles and installs a unit, then runs it: the unit stores a closure over its own func 1 at
+/// `CLOSURE_AT` and returns it. Func 2, run over the thawed host, calls that closure. The install
+/// put the unit's two functions in the first padding slots, 3 and 4 (the program has three), and its
+/// entry in 5. The artifact records only the entry's slot, so the thaw installs the unit's functions
+/// again, in the first free slots: the same 3 and 4, as nothing was installed before the unit. The
+/// closure is still slot 4, the unit's func 1 (`x + 42`), on the tree-walker and on Cranelift alike.
+/// Func 1 has the unit's func 1's type and returns `x + 1000`, so a funcref naming module 0 answers
+/// 1005 rather than trapping, as the tree-walker's did before #2314.
+#[test]
+fn durable_jit_install_own_funcref_survives_freeze_thaw() {
+    const CLOSURE_AT: u64 = 0x10100; // above the shadow arena, below the blob
+    let unit = blob(&format!(
+        "memory 17 shadow 16448 65536\nfunc () -> (i32) {{\nblock 0 () {{\n  vf = ref.func 1\n  \
+         vp = i64.const {CLOSURE_AT}\n  i32.store vp vf\n  return vf\n  }}\n}}\n\
+         func (i64) -> (i64) {{\nblock 0 (vx: i64) {{\n  vk = i64.const 42\n  vr = i64.add vx vk\n  \
+         return vr\n  }}\n}}\n"
+    ));
+    // func 0 (jit, ptr, len) -> `slot | closure << 8`; func 1, the decoy; func 2 () -> closure(5).
+    let m = parse_module(&format!(
+        "memory 17 shadow 16448 65536\n\
+         func (i32, i64, i64) -> (i64) {{\nblock 0 (vjit: i32, vp: i64, vl: i64) {{\n  \
+         vc = call.cap 11 0 (i64, i64) -> (i64) vjit (vp, vl)\n  \
+         vs = call.cap 11 3 (i64) -> (i64) vjit (vc)\n  vsw = i32.wrap_i64 vs\n  \
+         vf = call.dyn () -> (i32) vsw ()\n  vfw = i64.extend_i32_u vf\n  v8 = i64.const 8\n  \
+         vt = i64.shl vfw v8\n  vr = i64.or vs vt\n  return vr\n  }}\n}}\n\
+         func (i64) -> (i64) {{\nblock 0 (vx: i64) {{\n  vk = i64.const 1000\n  vr = i64.add vx vk\n  \
+         return vr\n  }}\n}}\n\
+         func () -> (i64) {{\nblock 0 () {{\n  vp = i64.const {CLOSURE_AT}\n  vf = i32.load vp\n  \
+         vx = i64.const 5\n  vr = call.dyn (i64) -> (i64) vf (vx)\n  return vr\n  }}\n}}\n"
+    ))
+    .expect("parse installer/caller");
+    verify_module(&m).expect("verify");
+    let mut win = vec![0u8; WINDOW];
+    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+    let installed = 5 | (4 << 8); // the entry's slot, and the closure: func 1's slot
+
+    // Tree-walker: install and run, freeze, restore, call the closure.
+    let mut hd = Host::new();
+    let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+    let mut fuel = 5_000_000u64;
+    let (r, snap) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[
+            Value::I32(jd),
+            Value::I64(BLOB_OFF as i64),
+            Value::I64(unit.len() as i64),
+        ],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut hd,
+    );
+    assert_eq!(r.expect("install"), vec![Value::I64(installed)]);
+    let artifact = freeze(&m, &snap, &hd).expect("freeze");
+    let mut th = Host::new();
+    let window = restore(&artifact, &m, &mut th).expect("restore");
+    let mut fuel = 5_000_000u64;
+    let (r, _) = run_capture_reserved_with_host(&m, 2, &[], &mut fuel, &window, SIZE_LOG2, &mut th);
+    assert_eq!(
+        r.expect("thawed call"),
+        vec![Value::I64(47)],
+        "tree-walker: the thawed closure is the unit's own func 1"
+    );
+
+    // Cranelift: the same, natively on both sides of the freeze.
+    let mut hd = Host::new();
+    let jd = grant_jit(&mut hd, &m, TABLE_LOG2);
+    let (out, snap) = jit_cap_run(
+        &m,
+        0,
+        &[jd as i64, BLOB_OFF as i64, unit.len() as i64],
+        &MemLayout::image(win.to_vec()),
+        SIZE_LOG2,
+        TABLE_LOG2,
+        &mut hd,
+        None,
+    )
+    .expect("native install run");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[installed]),
+        "native install: {out:?}"
+    );
+    let artifact = freeze(&m, snap.bytes(), &hd).expect("freeze");
+    let mut th = Host::new();
+    let window = restore(&artifact, &m, &mut th).expect("restore");
+    let (out, _) = jit_cap_run(
+        &m,
+        2,
+        &[],
+        &MemLayout::image(window.to_vec()),
+        SIZE_LOG2,
+        TABLE_LOG2,
+        &mut th,
+        None,
+    )
+    .expect("native thaw call run");
+    assert!(
+        matches!(out, JitOutcome::Returned(ref s) if s == &[47]),
+        "Cranelift: the thawed closure is the unit's own func 1, got {out:?}"
+    );
+}
+
 /// **In-flight continuation across a freeze — the design's freezable path.** `Jit.invoke` is a
 /// *seam-free atomic leaf* by design (DESIGN.md §22 / CONSOLIDATION.md §11 — anything but a plain
 /// return is a CapFault, the fuzzed hinge), so it is never interrupted mid-flight: a freeze lands at

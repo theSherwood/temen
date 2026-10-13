@@ -3445,9 +3445,16 @@ fn drive_over_cell(
         // Install-durability (DURABILITY.md §12.5): re-apply the domain's captured B2 `install`
         // occupancy onto the fresh table, in install order, so a thawed `call.dyn` resolves. A
         // no-op for a fresh run (`jit_reapply` empty). `jit_table_log2` was restored from the
-        // artifact on thaw, so the padding these slots land in exists.
+        // artifact on thaw, so the padding these slots land in exists. A unit that names its own
+        // functions installs them again first, in the first free slots: the record holds only
+        // entries, so they land where they did only if they were the first free then too.
         for (slot, unit_funcs, unit_types, id) in &jit_reapply {
-            dt.install_at(*slot, Arc::clone(unit_funcs), Arc::clone(unit_types), *id);
+            dt.install(
+                Arc::clone(unit_funcs),
+                Arc::clone(unit_types),
+                *id,
+                Some(*slot),
+            );
         }
         let mut root = Box::new(VCpu::new(
             Arc::clone(&funcs),
@@ -4857,6 +4864,10 @@ struct DomainTable {
     /// unit). A frame of the module reports it when it spawns, so its `module = -1` names the unit's
     /// program ([`Host::resolve_spawn_module`], #2143).
     unit_ids: Mutex<Vec<Option<(u32, u32)>>>,
+    /// The slots each installed module's own functions fill, in lockstep with `units` (DESIGN.md §22
+    /// "Unit-own funcrefs", #2314): `ref.func N` run in the module yields slot `[N]`. `None` for a
+    /// unit that names none of its own functions, whose slots hold only its entry.
+    unit_ref_slots: Mutex<Vec<Option<Arc<[u32]>>>>,
 }
 
 impl DomainTable {
@@ -4883,6 +4894,7 @@ impl DomainTable {
             units: Mutex::new(Vec::new()),
             unit_types: Mutex::new(Vec::new()),
             unit_ids: Mutex::new(Vec::new()),
+            unit_ref_slots: Mutex::new(Vec::new()),
         }
     }
 
@@ -4906,6 +4918,7 @@ impl DomainTable {
             units: Mutex::new(self.units.lock_unpoisoned().clone()),
             unit_types: Mutex::new(self.unit_types.lock_unpoisoned().clone()),
             unit_ids: Mutex::new(self.unit_ids.lock_unpoisoned().clone()),
+            unit_ref_slots: Mutex::new(self.unit_ref_slots.lock_unpoisoned().clone()),
         }
     }
 
@@ -4914,109 +4927,131 @@ impl DomainTable {
         unpack_slot(self.slots[i].load(Ordering::Acquire))
     }
 
-    /// `Jit.install` (Model B2): append `unit` (module id = its 1-based index) and fill the first
-    /// padding slot, returning the slot. `None` if every reserved slot is full. Writers serialize
-    /// under the `units` lock (rare — only inside a synchronous `call.cap`, the guest suspended); the
-    /// slot store is `Release` so the pushed unit is visible to any reader that observes the slot.
+    /// `Jit.install` (Model B2): fill a padding slot with `unit`'s entry and return it — the first
+    /// free one, or `at`, the slot a captured install occupied (DURABILITY.md §12.5
+    /// install-durability: run setup re-applies a domain's installs onto its fresh table in their
+    /// original order, before any vCPU runs, so a `call.dyn` through the slot resolves after a
+    /// freeze/thaw). A unit that names its own functions runs as the module they were installed as
+    /// ([`Self::install_unit_funcs`]), so every install of it fills one more slot with that module's
+    /// entry, as the JIT's does; any other unit is appended as a new module (id = its 1-based index).
+    /// `None` when no slot is free, or too few for the unit's functions: nothing is appended then,
+    /// though the functions a first install placed stay placed, as the JIT's compile placed them. An
+    /// `at` out of range is skipped (a forged captured slot can only mis-dispatch within the guest's
+    /// own table — never escape — but stay defensive). Writers serialize under the `units` lock
+    /// (rare — inside a synchronous `call.cap`, the guest suspended, or at run setup); the slot store
+    /// is `Release`, so a reader that observes the slot also observes the unit.
     fn install(
         &self,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
         id: (u32, u32),
+        at: Option<u32>,
     ) -> Option<u32> {
+        if at.is_some_and(|s| s as usize >= self.slots.len()) {
+            return None;
+        }
         let mut units = self.units.lock_unpoisoned();
-        let slot = self
-            .slots
-            .iter()
-            .position(|s| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)?;
-        units.push(unit);
-        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
-        self.unit_ids.lock_unpoisoned().push(Some(id)); // lockstep (#2143)
-        let module = units.len() as u32; // module k ≡ units[k-1]
+        let own = if unit_names_own_funcs(&unit) {
+            let (module, _) = self.place_unit_funcs(&mut units, &unit, &unit_types, Some(id))?;
+            Some(module)
+        } else {
+            None
+        };
+        let slot = match at {
+            Some(s) => s as usize,
+            None => self.free_slots().next()?,
+        };
+        let module = match own {
+            Some(k) => k,
+            None => self.push_unit(&mut units, unit, unit_types, Some(id), None),
+        };
         self.slots[slot].store(pack_slot(module, 0), Ordering::Release);
         Some(slot as u32)
     }
 
-    /// Install `unit` at an **exact** slot (DURABILITY.md §12.5 install-durability): the reconstruct
-    /// twin of [`Self::install`], used to re-apply a domain's captured install occupancy onto a
-    /// freshly-built table at run start so a `call.dyn` through the slot resolves after a
-    /// freeze/thaw. Called in the guest's original install order, so the appended module ids stay
-    /// dense and each slot maps to its own re-applied unit. Out-of-range / real-function slots are a
-    /// no-op (a forged captured slot can only mis-dispatch within the guest's own table — never
-    /// escape — but stay defensive). Not on the concurrent hot path (run setup, before any vCPU).
-    fn install_at(
-        &self,
-        slot: u32,
-        unit: Arc<[Func]>,
-        unit_types: Arc<[temen_ir::TypeEntry]>,
-        id: (u32, u32),
-    ) {
-        let s = slot as usize;
-        if s >= self.slots.len() {
-            return;
-        }
-        let mut units = self.units.lock_unpoisoned();
-        units.push(unit);
-        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
-        self.unit_ids.lock_unpoisoned().push(Some(id)); // lockstep (#2143)
-        let module = units.len() as u32; // module k ≡ units[k-1]
-        self.slots[s].store(pack_slot(module, 0), Ordering::Release);
-    }
-
-    /// **Auto-install a unit's own functions** (DESIGN.md §22 "unit-own funcref", the interpreter
-    /// mirror of the JIT's `define_extra` auto-install). Append `unit` as module `k` and fill the
-    /// first `unit.len()` free padding slots — **one per function** — with `(k, i)`, returning the
-    /// slots (indexed by unit-local function index) so a `ref.func i` in the unit can resolve to its
-    /// own function `i`. `None` if fewer than `unit.len()` padding slots are free (matches the JIT's
-    /// fail-closed). Deterministic: the first free slots in order, so both backends pick the same set
-    /// from an identical table state. Serialized under the `units` lock like [`Self::install`].
+    /// **Install a unit's own functions** (DESIGN.md §22 "Unit-own funcrefs", the interpreter mirror
+    /// of the JIT's `define_extra`). The first time, append `unit` as module `k` and fill the first
+    /// `unit.len()` free padding slots — one per function — with `(k, i)`. Return `k` and the slots,
+    /// indexed by unit-local function index, so a `ref.func i` in the unit resolves to its own
+    /// function `i`. Later calls for the same unit (the same `Arc`) return what the first did,
+    /// whatever was installed or uninstalled since, as the JIT fixes a unit's slots when it compiles
+    /// it: repeat invokes, every install of the unit and every vCPU animating one `ref.func` offer
+    /// (CALLS.md 6a) share one set, and none leaks slots. `None` if fewer than `unit.len()` padding
+    /// slots are free, where the JIT's compile fails closed. Deterministic: the first free slots in
+    /// order, so both backends pick the same set from an identical table state. Serialized under the
+    /// `units` lock like [`Self::install`].
     fn install_unit_funcs(
         &self,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
         id: Option<(u32, u32)>,
-    ) -> Option<Vec<u32>> {
-        let n = unit.len();
+    ) -> Option<(u32, Arc<[u32]>)> {
         let mut units = self.units.lock_unpoisoned();
-        // CALLS.md 6a — dedup: a unit already installed (same `Arc`) reuses its slots. Repeat
-        // installs — multiple vCPUs animating one `ref.func` offer, repeat invokes of one unit —
-        // must not leak table slots. (A B2 `uninstall` of any slot voids the reuse: the recount
-        // below misses and a fresh install runs, exactly as before.)
-        if let Some(k) = units.iter().position(|u| Arc::ptr_eq(u, &unit)) {
-            let module = (k + 1) as u32;
-            let mut found: Vec<(u32, u32)> = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| {
-                    let v = s.load(Ordering::Relaxed);
-                    ((v >> 32) as u32 == module).then_some(((v & 0xffff_ffff) as u32, i as u32))
-                })
-                .collect();
-            if found.len() == n {
-                found.sort_by_key(|&(f, _)| f);
-                return Some(found.into_iter().map(|(_, slot)| slot).collect());
-            }
+        self.place_unit_funcs(&mut units, &unit, &unit_types, id)
+    }
+
+    /// [`Self::install_unit_funcs`] under the held `units` lock.
+    fn place_unit_funcs(
+        &self,
+        units: &mut Vec<Arc<[Func]>>,
+        unit: &Arc<[Func]>,
+        unit_types: &Arc<[temen_ir::TypeEntry]>,
+        id: Option<(u32, u32)>,
+    ) -> Option<(u32, Arc<[u32]>)> {
+        let placed = self.unit_ref_slots.lock_unpoisoned();
+        let found = units
+            .iter()
+            .zip(placed.iter())
+            .position(|(u, slots)| slots.is_some() && Arc::ptr_eq(u, unit))
+            .and_then(|k| Some((k as u32 + 1, placed[k].clone()?)));
+        drop(placed); // `push_unit` takes it again
+        if found.is_some() {
+            return found;
         }
-        let free: Vec<usize> = self
-            .slots
+        let n = unit.len();
+        let free: Vec<usize> = self.free_slots().take(n).collect();
+        if free.len() < n {
+            return None;
+        }
+        let slots: Arc<[u32]> = free.iter().map(|&s| s as u32).collect();
+        let module = self.push_unit(
+            units,
+            Arc::clone(unit),
+            Arc::clone(unit_types),
+            id,
+            Some(Arc::clone(&slots)),
+        );
+        for (func, &slot) in free.iter().enumerate() {
+            self.slots[slot].store(pack_slot(module, func as u32), Ordering::Release);
+        }
+        Some((module, slots))
+    }
+
+    /// Append `unit` as the next module, under the held `units` lock, with its siblings in lockstep,
+    /// and return its id (module `k` ≡ `units[k - 1]`).
+    fn push_unit(
+        &self,
+        units: &mut Vec<Arc<[Func]>>,
+        unit: Arc<[Func]>,
+        unit_types: Arc<[temen_ir::TypeEntry]>,
+        id: Option<(u32, u32)>,
+        ref_slots: Option<Arc<[u32]>>,
+    ) -> u32 {
+        units.push(unit);
+        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
+        self.unit_ids.lock_unpoisoned().push(id); // lockstep (#2143)
+        self.unit_ref_slots.lock_unpoisoned().push(ref_slots); // lockstep (#2314)
+        units.len() as u32
+    }
+
+    /// The padding slots no install fills, in order. Read under the `units` lock, which every fill
+    /// and clear holds.
+    fn free_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots
             .iter()
             .enumerate()
             .filter(|(_, s)| (s.load(Ordering::Relaxed) >> 32) as u32 == TABLE_EMPTY)
             .map(|(i, _)| i)
-            .take(n)
-            .collect();
-        if free.len() < n {
-            return None;
-        }
-        units.push(unit);
-        self.unit_types.lock_unpoisoned().push(unit_types); // lockstep (#922)
-        self.unit_ids.lock_unpoisoned().push(id); // lockstep (#2143)
-        let module = units.len() as u32; // module k ≡ units[k-1]
-        for (func, &slot) in free.iter().enumerate() {
-            self.slots[slot].store(pack_slot(module, func as u32), Ordering::Release);
-        }
-        Some(free.iter().map(|&s| s as u32).collect())
     }
 
     /// `Jit.uninstall` (Model B2 reclaim): clear an installed slot (`≥ n_real`, currently filled)
@@ -5046,6 +5081,10 @@ impl DomainTable {
         self.units.lock_unpoisoned().clone()
     }
 
+    fn unit_ref_slots_snapshot(&self) -> Vec<Option<Arc<[u32]>>> {
+        self.unit_ref_slots.lock_unpoisoned().clone()
+    }
+
     /// The host unit module `m` is (`unit_ids`): `None` for the primary program, the transient
     /// invoked unit, and an installed module no `Jit` table holds.
     fn unit_id(&self, m: u32) -> Option<(u32, u32)> {
@@ -5054,10 +5093,16 @@ impl DomainTable {
     }
 }
 
-/// Resolve module `m`'s functions for a running vCPU: module 0 is its primary program; `INVOKE_MODULE`
-/// is the transient unit a `Jit.invoke` is running (`invoked`); `k ≥ 1` is an installed unit in the
-/// Whether a unit takes any of its OWN functions' addresses (`ref.func`) — the trigger for the
-/// §22 unit-own-funcref auto-install (mirrors the JIT's `define_extra` detection).
+/// Whether a unit names any of its own functions by index (`ref.func`, a `thread.spawn` entry): the
+/// trigger for installing its functions ([`DomainTable::install_unit_funcs`]), the one every engine
+/// applies ([`Func::names_own_funcs`]).
+fn unit_names_own_funcs(funcs: &[Func]) -> bool {
+    funcs.iter().any(Func::names_own_funcs)
+}
+
+/// Whether an offer's handler unit takes any of its own functions' addresses (`ref.func`): the
+/// trigger for installing its functions when it is animated (CALLS.md 6a). Its `thread.spawn` needs
+/// no slot, and no other engine animates it, so it keeps this narrower test.
 fn unit_uses_ref_func(funcs: &[Func]) -> bool {
     funcs.iter().any(|f| {
         f.blocks
@@ -5066,6 +5111,25 @@ fn unit_uses_ref_func(funcs: &[Func]) -> bool {
     })
 }
 
+/// The slot installed module `m`'s own function `func` fills (DESIGN.md §22 "Unit-own funcrefs"): what
+/// `ref.func func` yields in a frame of the module. `local` is the run's lazily-synced clone of
+/// `dt.unit_ref_slots`, the sibling of [`resolve_module_types`]' cache. `None` for a module whose unit
+/// names none of its own functions.
+fn module_ref_slot(
+    local: &mut Vec<Option<Arc<[u32]>>>,
+    dt: &DomainTable,
+    m: u32,
+    func: u32,
+) -> Option<u32> {
+    let i = m.checked_sub(1)? as usize;
+    if i >= local.len() {
+        *local = dt.unit_ref_slots_snapshot(); // a unit installed since our last sync
+    }
+    local.get(i)?.as_deref()?.get(func as usize).copied()
+}
+
+/// Resolve module `m`'s functions for a running vCPU: module 0 is its primary program; `INVOKE_MODULE`
+/// is the transient unit a `Jit.invoke` is running (`invoked`); `k ≥ 1` is an installed unit in the
 /// shared [`DomainTable`]. `local_units` is the vCPU's lock-free clone of the shared installed units
 /// (a prefix); a miss (a unit installed since the last sync) refreshes it. Returns `None` for an
 /// out-of-range module (a forged/stale slot) → the caller traps.
@@ -12128,13 +12192,14 @@ struct VCpu {
     /// resolved as module [`INVOKE_MODULE`] — kept out of the shared `dt.units` so it is never
     /// installed/`call.dyn`-reachable and never collides with a concurrent install.
     invoked: Option<Arc<[Func]>>,
-    /// **Unit-own funcref remap** (DESIGN.md §22 "unit-own funcref"), the interpreter mirror of the
-    /// JIT's `ref_slots`. `Some` only for an invoke child whose unit takes its OWN functions'
-    /// addresses (`ref.func`): the unit's functions are auto-installed into `dt` at these
-    /// `call.dyn` slots (indexed by unit-local function index), and while running the invoked
-    /// unit (module [`INVOKE_MODULE`]) a `ref.func N` yields `invoked_ref_slots[N]` — the real shared
-    /// slot — instead of `N`, so it resolves to the unit's own function like the JIT does. `None`
-    /// when the unit takes no funcref (then `ref.func` is never executed).
+    /// **Unit-own funcref remap** (DESIGN.md §22 "Unit-own funcrefs"), the interpreter mirror of the
+    /// JIT's `ref_slots`, for the invoked unit. `Some` only for an invoke child (or an animated offer
+    /// handler) whose unit names its own functions: they are installed into `dt` at these `call.dyn`
+    /// slots (indexed by unit-local function index), and while running the invoked unit (module
+    /// [`INVOKE_MODULE`]) a `ref.func N` yields `invoked_ref_slots[N]` — the real shared slot —
+    /// instead of `N`, so it resolves to the unit's own function like the JIT does. An installed
+    /// unit's frames read the same slots from `dt` ([`module_ref_slot`]). `None` when the unit names
+    /// none of its own functions (then `ref.func` is never executed).
     invoked_ref_slots: Option<Vec<u32>>,
     /// **Debug seam** (DEBUGGING.md W2/S4): `Some` only when an [`Inspector`] drives this vCPU.
     /// `None` is the production hot path — the per-op hook in [`run_inner`] is gated on it, so an
@@ -12454,7 +12519,9 @@ impl VCpu {
     /// reaches the original program (new→old) *and* any already- **or later-** `install`ed units
     /// (new→new, incl. install-during-own-invocation), exactly as the JIT's invoked code dispatches
     /// through the live `fn_table`. The invoked unit runs as the transient [`INVOKE_MODULE`] (kept
-    /// out of `dt.units`, so it is never itself `call.dyn`-reachable).
+    /// out of `dt.units`, so it is never itself `call.dyn`-reachable). `invoked_ref_slots` are the
+    /// slots its own functions were installed into, when it names them (DESIGN.md §22 "Unit-own
+    /// funcrefs"; the caller installs them, refusing the invoke when the table has no room).
     #[allow(clippy::too_many_arguments)]
     fn new_invoke(
         parent: Arc<[Func]>,
@@ -12462,7 +12529,7 @@ impl VCpu {
         dt: Arc<DomainTable>,
         unit: Arc<[Func]>,
         unit_types: Arc<[temen_ir::TypeEntry]>,
-        unit_id: (u32, u32),
+        invoked_ref_slots: Option<Vec<u32>>,
         args: &[Value],
         mem: Option<Mem>,
         host: Arc<Mutex<Host>>,
@@ -12470,15 +12537,6 @@ impl VCpu {
         depth: u32,
         sched: SchedRef,
     ) -> VCpu {
-        // Unit-own funcref (DESIGN.md §22): if the unit takes its OWN functions' addresses,
-        // auto-install them into `dt` (function-granular) so `ref.func i` resolves to the unit's own
-        // func i — the interpreter mirror of the JIT's `define_extra` auto-install. `None` (no
-        // `ref.func`, or too few reserved slots) leaves `ref.func` unremapped, exactly like the JIT.
-        let invoked_ref_slots = if unit_uses_ref_func(&unit) {
-            dt.install_unit_funcs(unit.clone(), unit_types.clone(), Some(unit_id))
-        } else {
-            None
-        };
         VCpu {
             funcs: parent,
             types: parent_types,
@@ -13595,6 +13653,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut cur_types: Arc<[temen_ir::TypeEntry]> =
         resolve_module_types(&types, &mut local_unit_types, invoked_types, dt, cur_module)
             .ok_or(Trap::Malformed)?;
+    // §22 "Unit-own funcrefs": this run's lazily-synced clone of the slots each installed unit's own
+    // functions fill (the `dt.unit_ref_slots` sibling of `units`), read only by a unit's `ref.func`.
+    let mut local_unit_ref_slots: Vec<Option<Arc<[u32]>>> = Vec::new();
 
     // I48 — fiber slots whose current resume used `cont.resume.block`, so a park inside them
     // idles the vCPU (via `fiber_park!`) instead of unwinding `FIBER_PARKED` to the resumer.
@@ -13842,7 +13903,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             {
                                                 Some((_, s_)) => s_.clone(),
                                                 None => {
-                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone(), None);
+                                                    let s_ = dt.install_unit_funcs(entry_.funcs.clone(), entry_.types.clone(), None).map(|(_, s)| s.to_vec());
                                                     unit_ref_cache.push((key_, s_.clone()));
                                                     s_
                                                 }
@@ -14393,11 +14454,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         get(&frames[top].vals, *$args.first().ok_or(Trap::Malformed)?)?.i64() as i32;
                     let (unit_funcs, unit_types, (domain, cu)) =
                         host.lock_unpoisoned().resolve_jit_unit($h, ch)?;
-                    // Append the unit to the **shared** domain table (module id = its 1-based
-                    // index) and fill the next empty slot — visible at once to every vCPU of the
-                    // domain (DESIGN.md §22). The padding starts at `funcs.len()` on both backends,
-                    // so the first install lands at the same index the JIT's `install` returns.
-                    let res = match dt.install(unit_funcs, unit_types.clone(), (domain, cu)) {
+                    // Fill the next empty slot of the **shared** domain table with the unit's entry
+                    // — visible at once to every vCPU of the domain (DESIGN.md §22). A unit that
+                    // names its own functions installs them first, once ("Unit-own funcrefs"), as
+                    // the JIT's compile does. The padding starts at `funcs.len()` on both backends,
+                    // so the install lands at the same index the JIT's `install` returns.
+                    let res = match dt.install(unit_funcs, unit_types, (domain, cu), None) {
                         Some(slot) => {
                             // Record the occupancy on the domain so it survives the run (the table is
                             // a per-run transient) and rides a snapshot (DURABILITY.md §12.5).
@@ -14456,6 +14518,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let slot = get(&frames[top].vals, *a)?.i64();
                         child_args.push(slot_to_val(ty, slot));
                     }
+                    // A unit that names its own functions runs over the slots they were installed
+                    // into, its first use installing them (DESIGN.md §22 "Unit-own funcrefs"). With
+                    // too few slots left it cannot, where the JIT refused its compile: fail closed.
+                    let ref_slots = if unit_names_own_funcs(&unit_funcs) {
+                        let (_, slots) = dt
+                            .install_unit_funcs(
+                                Arc::clone(&unit_funcs),
+                                Arc::clone(&unit_types),
+                                Some(unit_id),
+                            )
+                            .ok_or(Trap::CapFault)?;
+                        Some(slots.to_vec())
+                    } else {
+                        None
+                    };
                     // Nested run over the SAME window/fuel/powerbox: move them into an
                     // inline-driven child vCPU (like a §14 coroutine, but sharing the window) and
                     // move them back whatever the outcome — the parent's snapshot/teardown still
@@ -14473,7 +14550,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Arc::clone(dt),
                         unit_funcs,
                         unit_types, // the invoked unit's type section (#922)
-                        unit_id,
+                        ref_slots,
                         &child_args,
                         child_mem,
                         Arc::clone(host),
@@ -17751,16 +17828,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     frames[top].vals.push(r);
                 }
                 Inst::RefFunc { func } => {
-                    // Unit-own funcref (DESIGN.md §22): while running an invoked unit that takes its
-                    // own functions' addresses, `ref.func N` yields the unit's auto-installed slot
-                    // (`invoked_ref_slots[N]`) — a real shared-table slot resolving to the unit's own
-                    // func N — instead of `N`, which would hit the parent's table. Module-0 (and
-                    // installed-unit) code has no remap: `ref.func N` is slot N verbatim, as the JIT.
-                    let idx = match invoked_ref_slots.as_deref() {
-                        Some(slots) if frames[top].module == INVOKE_MODULE => {
-                            *slots.get(*func as usize).unwrap_or(func)
-                        }
-                        _ => *func,
+                    // Unit-own funcref (DESIGN.md §22): a unit's `ref.func N` yields the slot its own
+                    // function N was installed into — the invoked unit's `invoked_ref_slots`, an
+                    // installed unit's own from `dt` — as the JIT lowers it to `ref_slots[N]`, so the
+                    // funcref reaches the unit's function rather than module 0's. Module-0 code yields
+                    // slot N. A unit that names its own functions runs only once they are installed,
+                    // so a unit frame without its slots is `Malformed`, never a funcref into module 0.
+                    let m = frames[top].module;
+                    let idx = if m == 0 {
+                        *func
+                    } else if m == INVOKE_MODULE {
+                        invoked_ref_slots
+                            .as_deref()
+                            .and_then(|s| s.get(*func as usize).copied())
+                            .ok_or(Trap::Malformed)?
+                    } else {
+                        module_ref_slot(&mut local_unit_ref_slots, dt, m, *func)
+                            .ok_or(Trap::Malformed)?
                     };
                     frames[top].vals.push(Reg::from_i32(idx as i32));
                 }
@@ -18307,7 +18391,8 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
         Inst::FToITrap { op, a } => trunc_trap(*op, get(vals, *a)?)?,
         Inst::IToFConv { op, a } => i_to_f(*op, get(vals, *a)?),
         Inst::Cast { op, a } => cast(*op, get(vals, *a)?),
-        // A funcref is just the function index as plain i32 data (§3c).
+        // A funcref is just the function index as plain i32 data (§3c): module 0's. `run_inner`
+        // evaluates every `ref.func` itself, so a §22 unit's yields its own function's slot.
         Inst::RefFunc { func } => Reg::from_i32(*func as i32),
         Inst::Load {
             op, addr, offset, ..
@@ -30194,9 +30279,10 @@ impl Host {
     }
 
     /// Every domain's install occupancy, in domain-then-install order, as a freshly-built dispatch
-    /// table re-applies it ([`DomainTable::install_at`]) so a restored install survives a
-    /// freeze/thaw (DURABILITY.md §12.5 install-durability): each slot with its unit's funcs, types
-    /// and `(table, unit)`. Empty for a fresh run (no installs recorded), so re-apply is a no-op there.
+    /// table re-applies it ([`DomainTable::install`] at each recorded slot) so a restored install
+    /// survives a freeze/thaw (DURABILITY.md §12.5 install-durability): each slot with its unit's
+    /// funcs, types and `(table, unit)`. Empty for a fresh run (no installs recorded), so re-apply is a
+    /// no-op there.
     fn jit_reapply(&self) -> Vec<JitReapply> {
         let mut out = Vec::new();
         for (d, t) in self.jit_tables.iter().enumerate() {
@@ -38935,7 +39021,7 @@ mod domain_table_tests {
         let worker = Arc::clone(&dt);
 
         let slot = dt
-            .install(unit(2), Arc::from(Vec::new()), (0, 0))
+            .install(unit(2), Arc::from(Vec::new()), (0, 0), None)
             .expect("install"); // a (i32,i32)->(i32) unit
         assert_eq!(
             slot, 1,
@@ -38966,7 +39052,7 @@ mod domain_table_tests {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2)); // 4 slots, 1 real func
         let slot = dt
-            .install(unit(1), Arc::from(Vec::new()), (0, 0))
+            .install(unit(1), Arc::from(Vec::new()), (0, 0), None)
             .expect("install") as usize;
         assert_eq!(slot, 1);
         assert!(!dt.uninstall(0, 1), "slot 0 is the real function");
@@ -38989,7 +39075,7 @@ mod domain_table_tests {
     fn resolve_module_routes_program_invoke_and_installed() {
         let parent: Arc<[Func]> = unit(1);
         let dt = Arc::new(DomainTable::new(&parent, 2));
-        dt.install(unit(2), Arc::from(Vec::new()), (0, 0))
+        dt.install(unit(2), Arc::from(Vec::new()), (0, 0), None)
             .expect("install"); // module 1
         let invoked = Some(unit(3));
         let mut local: Vec<Arc<[Func]>> = Vec::new();

@@ -2325,8 +2325,9 @@ pub(crate) unsafe extern "C" fn thread_join(
     };
     // #1469 — inside a child-domain task the thread that would block is an executor worker, not a
     // vCPU: the task root parks the *task* instead (as `fiber_resume_block` does). A guest fiber
-    // inside the task cannot park the task from its own stack, so it fails closed rather than hold
-    // a worker the joined vCPU may need.
+    // inside the task fails closed rather than hold a worker the joined vCPU may need. (An
+    // `Instantiator` join there parks the task through the fiber's resumers, #2322, a route this
+    // join could share: `ParkOn::Thread` is passed up the same way.)
     if fiber_rt::in_task() {
         return match fiber_rt::current_fiber_slot() {
             Some(s) if s.is_platform() => task_join(dom, &s, &done, trap_out),
@@ -2785,7 +2786,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
         // keeps. So the task root parks the *task* on the one event park (counted, woken by every
         // notify, poisoned at teardown) and re-polls when woken. A guest fiber inside the task
-        // cannot park the task from its own stack, so it fails closed rather than block a worker.
+        // fails closed rather than block a worker.
         if fiber_rt::in_task() {
             match fiber_rt::current_fiber_slot() {
                 Some(s) if s.is_platform() => {

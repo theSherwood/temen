@@ -275,8 +275,8 @@ fn installed_unit_spawns_its_own_func_native_agrees() {
     // (jit) -> i32:  slot = install(compile(blob));  return call.dyn[slot]().
     let guest_src = "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  v1 = i64.const 20480\n  v2 = i64.const BLOBLEN\n  v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  v5 = i32.wrap_i64 v4\n  v6 = call.dyn () -> (i32) v5 ()\n  return v6\n  }\n}\n";
     let guest = with_len(guest_src, b.len());
-    // Reserve a 16-slot table: parent f0 at slot 0, the unit's two funcs auto-install (JIT) into
-    // padding, and the explicit `install` lands in a further padding slot — ample room.
+    // Reserve a 16-slot table: parent f0 at slot 0, the unit's two funcs auto-install into padding
+    // (on every engine, #2314), and the explicit `install` takes a further padding slot.
     let (out, _) = diff_run_threads(&guest, &b, &[], 4);
     assert!(
         matches!(out, JitOutcome::Returned(ref s) if s == &[7]),

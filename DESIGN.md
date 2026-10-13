@@ -3228,19 +3228,33 @@ by `crates/temen/tests/unit_instantiator.rs` (the oracle, the four bytecode driv
 routes, and a unit's child spawning in turn) and the frontier matrix's code-origin column, which drives
 both routes.
 
-**Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
-(module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
-*parent* `fn_table`; so a unit whose own body is a fiber entry (jacl's scheduler running an interpreted
-program as the root job) could not name it. Now, when a submitted unit takes its own functions' addresses,
-it is **auto-installed**: `define_extra` (JIT) / `install_unit_funcs` (interp) reserves one padding slot per
-unit function and `ref.func N` lowers to `iconst(slot[N])` — a real shared slot that resolves to the unit's
-own function through the ordinary masked dispatch. No escape-TCB change (invariant I2): only *which constant*
-`ref.func` emits, plus the existing Model-B2 `install_at` primitive; fails closed on too few reserved slots.
-The same mechanism serves `thread.spawn` entries — a unit spawning its own function auto-installs it
-so the spawn's shared-`fn_table` dispatch reaches the unit, not the parent's slot `N` (the
-`ref_slots` remap covers `ThreadSpawn` too). Pinned by
-`jit_cap::submitted_unit_fibers_over_its_own_func_agrees` and
-`installed_unit_spawns_its_own_func_native_agrees` (differential).
+**Unit-own funcrefs (2026-07-30; every engine 2026-10-13, #2314).** A unit can also name its **own**
+functions — not just a parent (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`,
+which resolves against the *parent* `fn_table`; so a unit whose own body is a fiber entry (jacl's scheduler
+running an interpreted program as the root job), or a closure over its own function (a jacl REPL line
+defining a proc), named module 0's function `N`. Now a submitted unit that names its own functions —
+`ref.func`, or a `thread.spawn` entry (`Func::names_own_funcs`, the one test every engine applies) — is
+**auto-installed** once: each of its functions fills a padding slot, the first free ones in order, and
+`ref.func N` yields `slot[N]`, a real shared slot that resolves to the unit's own function through the
+ordinary masked dispatch. Every install and invoke of the unit reuses those slots, and each `install` fills
+one more slot with the unit's entry, as the same module. Cranelift auto-installs when it compiles the unit
+(`define_extra` lowers `ref.func N` to `iconst(slot[N])`); the interpreters at the unit's first install or
+invoke (the bytecode engine lowers its `Op::RefFunc` to the slot as it compiles the unit; the tree-walker
+keeps each installed module's slots beside it, and the invoked unit's in `invoked_ref_slots`). So the slots
+a guest sees agree whenever nothing is installed between the compile and the first use. Before #2314 only
+Cranelift did this for an installed unit — the tree-walker remapped only an invoked unit and the bytecode
+engine none — so an installed unit's closure over its own function called the program's. Only Cranelift
+needs the slots for a `thread.spawn`: its spawn dispatches through `fn_table` (the `ref_slots` remap covers
+`ThreadSpawn` too), while the interpreters spawn in the spawning frame's module. Every engine fills them
+anyway, so the slot numbers agree. No escape-TCB change (invariant I2): only *which constant* `ref.func` emits,
+plus the existing Model-B2 slot fill. Too few free slots fails closed: Cranelift's compile returns
+`-EINVAL`, an interpreter's install `-ENOSPC`, and its invoke `CapFault`s. The install occupancy
+(DURABILITY.md §12.5) records only the entry's slot, so a run that re-applies it fills the unit's
+functions again into the first free slots — where they were only if nothing was installed before the unit.
+Pinned by `unit_own_funcrefs.rs` (the oracle, the four bytecode drivers and Cranelift: installed,
+escaping, repeated, invoked, spawning and full-table cases), `jit_cap::submitted_unit_fibers_over_its_own_func_agrees`,
+`installed_unit_spawns_its_own_func_native_agrees` and
+`durable_guest_jit::durable_jit_install_own_funcref_survives_freeze_thaw`.
 
 **Powerbox hosts fibers (2026-07-30).** The CLI powerbox (`grant_powerbox_prefix`) is the maximal grant,
 so its `Jit` cap now opts into fiber hosting (`set_jit_hosts_fibers(true)`), and `powerbox_compile_run`
@@ -3702,16 +3716,17 @@ the lanes and the run-wide live count stay the run's (the child's domain names t
 deadlock predicate. Child code is shared across spawns, so the thread thunks find the task's domain
 through a thread-local seeded for each residency and on each of its vCPU threads, never a baked
 address. A `thread.join` or `cont.resume.block` at a task's root parks the *task* on its one event
-park rather than block a worker; from a guest fiber inside the task, which cannot park the task from
-its own stack, it fails closed (`ThreadFault`). A root that returns while its vCPUs run publishes its
-outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not at its
-root's return — and the task *retires*, keeping its window and powerbox until its last vCPU ends; run
-teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run under its
-freeze word (#2010): each reserves a shadow context in the child's window, so a freeze unwinds each
-into its own region, as the run's root's vCPUs unwind. Its fiber runtime is armed over that window
-too, and its capture flattens its fibers as a run's root's are (#2031). A root that unwound for a
-freeze has no outcome to publish, so its task retires without one, and the capture is taken once its
-last vCPU has unwound too (DURABILITY.md §4). Pins:
+park rather than block a worker; from a guest fiber inside the task it still fails closed
+(`ThreadFault`). An `Instantiator` join there parks the task through the fiber's resumers instead
+(#2322, below), a route these two could take too. A root that returns while its vCPUs run publishes
+its outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not
+at its root's return — and the task *retires*, keeping its window and powerbox until its last vCPU
+ends; run teardown poisons a retiring task as it poisons a parked one. A durable task's vCPUs run
+under its freeze word (#2010): each reserves a shadow context in the child's window, so a freeze
+unwinds each into its own region, as the run's root's vCPUs unwind. Its fiber runtime is armed over
+that window too, and its capture flattens its fibers as a run's root's are (#2031). A root that
+unwound for a freeze has no outcome to publish, so its task retires without one, and the capture is
+taken once its last vCPU has unwound too (DURABILITY.md §4). Pins:
 `temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
 tiers (`forth_sandbox.rs`).
 
@@ -3722,17 +3737,23 @@ The child's powerbox is the host its `Instantiator` resolves against and the par
 through the family the embedder's `GrantChildHooks::as_parent` builds over it (a child powerbox is
 always the shared form). The executor, the futex domain and the kill cell stay the run's. A
 grandchild's task is gated on every lane up to the root's, as the oracle gates a vCPU on its whole
-chain. The child's root joins from a task, so its `join` parks the task, as `thread.join` does there;
-a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A parent's nursery holds its
-children's to the run's teardown, which releases what each one retains only after the executor has
-drained: a grandchild that outlives its parent still hands its lane and window back to the parent's
-host, and that retained ref is what keeps the host alive. A durable child's nursery is durable, so
-its children are, and a freeze reaches them through it (DURABILITY.md §4, "The JIT captures them
-too"). Still refused: a carve spawn from a detached child (`CapFault`; its task would write back into
-a window that can be freed first, and #1867 deletes carves). Pins:
+chain. The child joins from a task, so its `join` (and `wait`) parks the task, as `thread.join` does
+there; a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A join from a guest
+fiber parks the task too (#2322). A join blocks its whole vCPU on every engine — the oracle parks the
+vCPU, the bytecode drivers the task — and counts it blocked for the deadlock verdict, so the fiber's
+event park is not reported to its resumer as `FIBER_PARKED`: each resumer's `cont.resume` parks its
+own context with it in turn, up to the task's platform slot, and switches back in when the task is
+resumed. No resumer runs on, and the task holds no lane while it waits. An outcome already in is
+returned at once, from any stack. A parent's nursery holds its children's to the run's teardown,
+which releases what each one retains only after the executor has drained: a grandchild that outlives
+its parent still hands its lane and window back to the parent's host, and that retained ref is what
+keeps the host alive. A durable child's nursery is durable, so its children are, and a freeze
+reaches them through it (DURABILITY.md §4, "The JIT captures them too"). Still refused: a carve
+spawn from a detached child (`CapFault`; its task would write back into a window that can be freed
+first, and #1867 deletes carves). Pins:
 `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the chain),
-`temen/tests/instantiate_record.rs` on every backend, and `temen/tests/durable_detached_jit.rs`
-(durable).
+`temen/tests/instantiate_record.rs` on every backend, `temen/tests/fiber_join_child.rs` (a fiber's
+join, on every engine), and `temen/tests/durable_detached_jit.rs` (durable).
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 

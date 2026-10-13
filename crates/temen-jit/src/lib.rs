@@ -5373,15 +5373,9 @@ impl CompiledModule {
         // lower to `ref_slots[N]` (below); the finalized code is published into these slots after the
         // build. `None` when the unit names no own function — then no slots are consumed. Single
         // `call.cap`, so the picked padding slots stay free until we `install_at` them (no concurrent
-        // install races within a compile).
-        let uses_ref_func = funcs.iter().any(|f| {
-            f.blocks.iter().any(|b| {
-                b.insts
-                    .iter()
-                    .any(|i| matches!(i, Inst::RefFunc { .. } | Inst::ThreadSpawn { .. }))
-            })
-        });
-        let ref_slots: Option<Vec<u32>> = if uses_ref_func {
+        // install races within a compile). The test is the one both interpreters install on
+        // (`Func::names_own_funcs`), so every engine fills the same slots.
+        let ref_slots: Option<Vec<u32>> = if funcs.iter().any(Func::names_own_funcs) {
             let free: Vec<u32> = self
                 .fn_table
                 .iter()
