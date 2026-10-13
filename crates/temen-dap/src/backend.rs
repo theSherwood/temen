@@ -29,8 +29,8 @@ use temen_interp::MemEvent;
 use crate::json::Json;
 use std::sync::Arc;
 use temen_interp::{
-    CapTape, FrameInfo, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap,
-    Value, VarValue, WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
+    CapTape, Host, Inspector, IrPc, RootWindow, SourceLoc, Stop, StopReason, Trap, Value, VarValue,
+    WatchId, WatchKind, DEFAULT_CHANNEL, DEFAULT_SPAWN,
 };
 use temen_ir::{DebugInfo, FuncIdx, Module};
 
@@ -210,7 +210,10 @@ pub trait Debuggee {
     }
 
     // --- inspection ------------------------------------------------------------------------------
-    fn backtrace(&self) -> Vec<FrameInfo>;
+    /// The pc of every frame on the focused thread's stack, innermost first. A frame's DAP index is
+    /// its position here, and [`source_loc`](Debuggee::source_loc) resolves just the frames a request
+    /// shows, so a deep stack costs only a pc walk (#2304).
+    fn frame_pcs(&self) -> Vec<IrPc>;
     /// The §6 debug info of module `module`: the program's (`0`), or another module's the backend
     /// debugs (#2239). `None` for a module without it.
     fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>>;
@@ -416,8 +419,8 @@ impl Debuggee for Inspector {
     ) -> Option<WatchId> {
         Inspector::set_value_watchpoint(self, frame_from_top, name, kind)
     }
-    fn backtrace(&self) -> Vec<FrameInfo> {
-        Inspector::backtrace(self)
+    fn frame_pcs(&self) -> Vec<IrPc> {
+        Inspector::frame_pcs(self)
     }
     fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>> {
         Inspector::debug_info(self, module)
@@ -1244,20 +1247,11 @@ impl Debuggee for BytecodeBackend {
         self.apply_watches();
         Some(id)
     }
-    fn backtrace(&self) -> Vec<FrameInfo> {
-        let mut out = Vec::new();
+    fn frame_pcs(&self) -> Vec<IrPc> {
         // The focused thread's stack (`select_task`'s pick; the sole thread of a spawn-free guest).
-        for d in 0..self.run.depth() {
-            if let Some(pc) = self.run.frame_pc(d) {
-                let source = Debuggee::source_loc(self, pc);
-                out.push(FrameInfo {
-                    pc,
-                    vals: Vec::new(), // unused by DapServer (it reads via read_var)
-                    source,
-                });
-            }
-        }
-        out
+        (0..self.run.depth())
+            .filter_map(|d| self.run.frame_pc(d))
+            .collect()
     }
     fn debug_info(&self, module: u32) -> Option<Arc<DebugInfo>> {
         self.run.debug_info(module)

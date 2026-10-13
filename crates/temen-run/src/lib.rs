@@ -6045,11 +6045,12 @@ pub fn nim_posix_imports(
 /// pass is simply not there.
 #[derive(Default)]
 pub struct ExecGrants<'a> {
-    /// The **command registry**: each `(path, module)` is granted and registered as a filesystem
-    /// executable, so the guest's own `execve(path, …)` ([`temen_posix::OP_EXECVE`]) can become it.
-    /// That is what lets a nim program spawn its own helpers (nimony's driver runs nifmake, which
-    /// runs every phase) rather than a host cranking the shell-outs from outside.
-    pub commands: &'a [(String, Module)],
+    /// The **command registry**: each module is granted once and registered as a filesystem
+    /// executable at each of its paths ([`temen_posix::Posix::grant_executable`]), so the guest's own
+    /// `execve(path, …)` ([`temen_posix::OP_EXECVE`]) can become it. That is what lets a nim program
+    /// spawn its own helpers (nimony's driver runs nifmake, which runs every phase) rather than a
+    /// host cranking the shell-outs from outside.
+    pub commands: &'a [(temen_interp::PreparedModule, Vec<String>)],
     /// Whether they may also run the **programs they build**: a `ModuleLoader`
     /// ([`grant_module_loader`]), which every fork and exec carries, promotes a file holding a
     /// module's encoding at its `execve` (PROCESS.md: `cc x.c && ./a.out`). nimony's compile-time
@@ -6137,10 +6138,8 @@ pub fn nim_noc_run(
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
         // What this run may exec, granted on the very host it uses.
-        for (path, m) in exec.commands {
-            let wl = m.memory.map_or(0, |mc| mc.size_log2);
-            let h = host.grant_module(m);
-            posix.register_executable(path, h, wl);
+        for (m, paths) in exec.commands {
+            posix.grant_executable(host, m, paths);
         }
         if exec.built {
             grant_module_loader(host);

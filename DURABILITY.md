@@ -687,7 +687,7 @@ oracle and the resumable engine admit with the authority and refuse without it, 
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
 `temen_encode::digest256`, the same function behind the codec's root R5 gate), never the module bytes.
-The thaw resolves that digest against the restore host's re-granted modules (`Host::module_by_digest`)
+The thaw resolves that digest against the restore host's re-granted modules (`Host::tables_by_digest`)
 and runs the *child*'s funcs; a **missing or mismatched** re-grant fails closed — the parent's
 re-executed `join` traps rather than mis-run a wrong module in the carve (the per-child R5 identity
 gate). The grant handle itself rides too since #1361 — by the same digest (§12.5 above), so the child
