@@ -8991,9 +8991,9 @@ pub extern "C" fn temen_link_run(
     stdin_len: usize,
 ) -> i64 {
     let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
-        Some(m) => m,
-        None => {
-            unsafe { LAST_STATUS = STATUS_DECODE_ERR };
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the library {e}")));
             return 0;
         }
     };
@@ -9061,9 +9061,12 @@ const LINK_SETS_MAX: usize = 4;
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    let Some(mut module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
-        set(STATUS_DECODE_ERR);
-        return -1;
+    let mut module = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the library {e}")));
+            return -1;
+        }
     };
     if let Some(debug) = module.debug_info.as_mut() {
         debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
@@ -9137,13 +9140,52 @@ fn link_slice(p: *const u8, n: usize) -> &'static [u8] {
 
 /// A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start with a
 /// NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect; a resolved
-/// runnable module is a degenerate unit and loads fine), text rides the parser.
-fn link_load_unit(bytes: &[u8]) -> Option<temen_ir::Module> {
+/// runnable module is a degenerate unit and loads fine), text rides the parser. The error says why the
+/// bytes don't load, for a link entry to report (#2297).
+fn link_load_unit(bytes: &[u8]) -> Result<temen_ir::Module, String> {
     if temen_encode::wire::is_module_blob(bytes) {
-        temen_encode::decode_unit(bytes).ok()
+        temen_encode::decode_unit(bytes).map_err(|e| format!("does not decode: {e:?}"))
     } else {
-        temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+        let text = core::str::from_utf8(bytes)
+            .map_err(|_| "is neither an encoded unit nor UTF-8 text".to_string())?;
+        temen_text::parse_module(text).map_err(|e| format!("does not parse: {e}"))
     }
+}
+
+/// Why a link entry failed: the `STATUS_*` it reports in [`temen_status`], and the reason, which the
+/// entry leaves on the stderr slot ([`temen_stderr_ptr`]/[`temen_stderr_len`]) — "multiple definition
+/// of `strlen`" where the status alone says only that the link was refused (#2297).
+#[derive(Debug)]
+pub struct LinkFailure {
+    pub status: i32,
+    pub message: String,
+}
+
+impl LinkFailure {
+    fn unsupported(message: impl Into<String>) -> Self {
+        LinkFailure {
+            status: STATUS_UNSUPPORTED,
+            message: message.into(),
+        }
+    }
+
+    fn decode(message: impl Into<String>) -> Self {
+        LinkFailure {
+            status: STATUS_DECODE_ERR,
+            message: message.into(),
+        }
+    }
+}
+
+/// Report a failed link entry: its status in [`temen_status`] and its reason on the stderr slot.
+/// Returns the status, for the entry to hand back in its own convention.
+fn link_failed(f: LinkFailure) -> i32 {
+    // SAFETY: single-threaded wasm; the slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(ERR), f.message.into_bytes());
+        LAST_STATUS = f.status;
+    }
+    f.status
 }
 
 fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> {
@@ -9172,19 +9214,16 @@ pub extern "C" fn temen_link_text(
     entry_ptr: *const u8,
     entry_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the entry name is not UTF-8"));
     };
-    let Some(lib) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the library {e}"))),
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     let lib_exports = link_lib_exports(&lib);
     let unit = temen_ir::LinkUnitRef {
@@ -9197,11 +9236,13 @@ pub extern "C" fn temen_link_text(
         Ok(m) => {
             let text = temen_text::print_module(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes()) };
-            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes());
+                LAST_STATUS = STATUS_OK;
+            }
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9400,16 +9441,12 @@ pub extern "C" fn temen_link_child_libs(
     name_ptr: *const u8,
     name_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(name) = core::str::from_utf8(link_slice(name_ptr, name_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the child's name is not UTF-8"));
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     match resident_link(
         handle_slice(handles_ptr, handles_len),
@@ -9419,10 +9456,10 @@ pub extern "C" fn temen_link_child_libs(
     ) {
         Ok((m, _)) => {
             stage_child_program(name, m);
-            set(STATUS_OK);
+            unsafe { LAST_STATUS = STATUS_OK };
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9473,7 +9510,7 @@ pub extern "C" fn temen_module_imports(ptr: *const u8, len: usize) -> i32 {
         set(s);
         0
     };
-    let Some(m) = link_load_unit(link_slice(ptr, len)) else {
+    let Ok(m) = link_load_unit(link_slice(ptr, len)) else {
         return refuse(STATUS_DECODE_ERR);
     };
     if m.imports
@@ -9525,26 +9562,24 @@ fn link_lib_stash(
     entry_len: usize,
     render: impl FnOnce(&temen_ir::Module) -> Vec<u8>,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let fail = |s: i32| {
-        set(s);
-        -s
-    };
     let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
-        return fail(STATUS_DECODE_ERR);
+        return -link_failed(LinkFailure::decode("the entry name is not UTF-8"));
     };
-    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
-        return fail(STATUS_DECODE_ERR);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
+        Ok(m) => m,
+        Err(e) => return -link_failed(LinkFailure::decode(format!("the program unit {e}"))),
     };
     match resident_link(handles, &program, entry, false) {
         Ok((m, _)) => {
             let bytes = render(&m);
             // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
-            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
-            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), bytes);
+                LAST_STATUS = STATUS_OK;
+            }
             0
         }
-        Err(status) => fail(status),
+        Err(f) => -link_failed(f),
     }
 }
 
@@ -9589,7 +9624,7 @@ pub fn link_program(
     lib: temen_ir::LinkUnitRef<'_>,
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_multi(&[lib], program, entry)
 }
 
@@ -9608,7 +9643,7 @@ pub fn link_program_multi(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_as(libs, program, entry, false)
 }
 
@@ -9620,18 +9655,18 @@ pub fn link_child_program_multi(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     link_program_as(libs, program, entry, true)
 }
 
 /// The link behind [`link_program_multi`] and [`link_child_program_multi`]: `child` picks the
-/// bootstrap.
+/// bootstrap. Every link entry goes through here, so this is where a failure gets its reason (#2297).
 fn link_program_as(
     libs: &[temen_ir::LinkUnitRef<'_>],
     program: &temen_ir::Module,
     entry: &str,
     child: bool,
-) -> Result<temen_ir::Module, i32> {
+) -> Result<temen_ir::Module, LinkFailure> {
     let mut prog_exports = link_lib_exports(program);
     // **Enter at the program unit's own `_start`, not at `main`** (#1536). The frontend's bootstrap is
     // the only thing that knows how to call *this* `main`: chibicc threads a data-stack pointer as an
@@ -9661,7 +9696,8 @@ fn link_program_as(
         data_exports: &program.data_exports,
         live: None,
     });
-    let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
+    let mut linked = temen_ir::link_with_manifest_ref(&units)
+        .map_err(|e| LinkFailure::unsupported(e.to_string()))?;
     // The frontend bootstrap when the program unit had one, else `entry` itself — a hand-written unit
     // with no `_start` still gets the old behaviour, a synthesized call to its entry.
     let boot = if has_prog_start {
@@ -9669,7 +9705,9 @@ fn link_program_as(
     } else {
         entry
     };
-    let entry_idx = linked.resolve_export(boot).ok_or(STATUS_UNSUPPORTED)?;
+    let entry_idx = linked
+        .resolve_export(boot)
+        .ok_or_else(|| LinkFailure::unsupported(format!("no `{boot}` to enter")))?;
     // A *library* unit's bootstrap is not this program's entry, and `synth_manifest_start` refuses a
     // module that already exports `_start`.
     linked.exports.retain(|e| e.name != PROG_START_ALIAS);
@@ -9702,12 +9740,14 @@ fn link_program_as(
     } else {
         temen_ir::synth_manifest_start(linked, entry_idx, true)
     }
-    .map_err(|_| STATUS_UNSUPPORTED)?;
+    .map_err(|e| LinkFailure::unsupported(format!("cannot enter the program: {e}")))?;
     // Verify before handing it on: a program that references an undefined proc links to an
     // unresolvable manifest import / out-of-range target, which would otherwise fault deep in the
     // engine. Reject it cleanly so a typo can't take down the playground's wasm instance.
-    if temen_verify::verify_module(&module).is_err() {
-        return Err(STATUS_UNSUPPORTED);
+    if let Err(e) = temen_verify::verify_module(&module) {
+        return Err(LinkFailure::unsupported(format!(
+            "the linked program does not verify: {e:?}"
+        )));
     }
     Ok(module)
 }
@@ -9729,14 +9769,14 @@ pub fn link_run_units(
     };
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),
-        Err(status) => PbOutcome {
+        Err(f) => PbOutcome {
             trap: None,
             fault_addr: None,
-            status,
+            status: f.status,
             value: 0,
             exit_code: 0,
             stdout: Vec::new(),
-            stderr: Vec::new(),
+            stderr: f.message.into_bytes(),
             framebuffer: None,
         },
     }
@@ -9754,36 +9794,32 @@ fn link_run_stash(
     entry_len: usize,
     stdin_ptr: *const u8,
     stdin_len: usize,
-    link: impl FnOnce(&temen_ir::Module, &str) -> Result<(temen_ir::Module, Option<Memo>), i32>,
+    link: impl FnOnce(&temen_ir::Module, &str) -> Result<(temen_ir::Module, Option<Memo>), LinkFailure>,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
-        Ok(s) => s,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+    let Ok(entry_name) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        link_failed(LinkFailure::decode("the entry name is not UTF-8"));
+        return 0;
     };
     let stdin = link_slice(stdin_ptr, stdin_len);
     let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
-        Some(m) => m,
-        None => {
-            set(STATUS_DECODE_ERR);
+        Ok(m) => m,
+        Err(e) => {
+            link_failed(LinkFailure::decode(format!("the program unit {e}")));
             return 0;
         }
     };
     let (module, memo) = match link(&program, entry_name) {
         Ok(linked) => linked,
-        Err(status) => {
-            set(status);
+        Err(f) => {
+            link_failed(f);
             return 0;
         }
     };
 
     let out = onramp_run(&module, stdin, &run_env(), None, true, memo);
-    set(out.status);
     // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
     unsafe {
+        LAST_STATUS = out.status;
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
@@ -9856,8 +9892,10 @@ fn resident_link(
     program: &temen_ir::Module,
     entry: &str,
     child: bool,
-) -> Result<(temen_ir::Module, &'static LinkSet), i32> {
-    let set = link_set(handles).ok_or(STATUS_UNSUPPORTED)?;
+) -> Result<(temen_ir::Module, &'static LinkSet), LinkFailure> {
+    let closed =
+        || LinkFailure::unsupported(format!("a library handle in {handles:?} is not open"));
+    let set = link_set(handles).ok_or_else(closed)?;
     let linked = match &set.base {
         Some((base, exports)) => {
             let live = base_live(base, exports, program);
@@ -9870,7 +9908,7 @@ fn resident_link(
             link_program_as(&[unit], program, entry, child)
         }
         None => {
-            let units = resident_units(handles).ok_or(STATUS_UNSUPPORTED)?;
+            let units = resident_units(handles).ok_or_else(closed)?;
             link_program_as(&units, program, entry, child)
         }
     };

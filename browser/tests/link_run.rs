@@ -4,9 +4,11 @@
 //! tell them apart and the linked entry must run to its value.
 
 use temen_browser::{
-    temen_link_lib_close, temen_link_lib_open, temen_link_run, temen_link_run_lib, temen_status,
+    temen_link_lib_close, temen_link_lib_open, temen_link_run, temen_link_run_lib,
+    temen_link_text_libs, temen_status, temen_stderr_len, temen_stderr_ptr, STATUS_DECODE_ERR,
+    STATUS_UNSUPPORTED,
 };
-use temen_ir::{Block, Func, Inst, Memory, Module, Terminator, ValType};
+use temen_ir::{Block, Export, Func, Inst, LinkUnitRef, Memory, Module, Terminator, ValType};
 
 #[path = "support/ffi.rs"]
 mod ffi;
@@ -116,4 +118,92 @@ fn resident_libraries_link_many_programs_by_handle() {
     assert_eq!(hc, ha.min(hb), "lowest free slot is reused");
     assert_eq!(run(hc, 5), (5, 0));
     temen_link_lib_close(hc);
+}
+
+/// The stderr slot, where a link entry leaves why it failed.
+fn stderr() -> String {
+    let (p, n) = (temen_stderr_ptr(), temen_stderr_len());
+    if n == 0 {
+        return String::new();
+    }
+    // SAFETY: the slot holds `n` bytes until the next entry replaces it, and the lock is held.
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p, n) }).into_owned()
+}
+
+/// #2297: a refused link says why. The status alone said only that the link was refused, so a C
+/// card whose program defined its own `strlen` could show nothing better than "status 2". Natively
+/// the reason is the `LinkFailure`'s; through the FFI it rides the stderr slot beside the status.
+#[test]
+fn a_refused_link_names_the_reason() {
+    let _exports = ffi::lock();
+    let exporting = |val: i64| Module {
+        exports: vec![Export {
+            name: "dup".into(),
+            func: 0,
+        }],
+        ..unit(val)
+    };
+    let (lib, prog) = (exporting(7), exporting(42));
+
+    // Both units define `dup`: a C linker's "multiple definition", not a bare status.
+    let lib_exports: Vec<_> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    let lib_unit = LinkUnitRef {
+        module: &lib,
+        exports: &lib_exports,
+        data_exports: &lib.data_exports,
+        live: None,
+    };
+    let err = temen_browser::link_program_multi(&[lib_unit], &prog, "run")
+        .expect_err("both units define `dup`");
+    assert_eq!(err.status, STATUS_UNSUPPORTED);
+    assert_eq!(err.message, "multiple definition of `dup`");
+
+    // The same link through the FFI, against the library resident.
+    let lib_text = temen_text::print_module(&lib);
+    let h = temen_link_lib_open(lib_text.as_ptr(), lib_text.len());
+    assert!(h >= 0, "the library opens");
+    let link = |prog: &[u8]| -> (i32, i32, String) {
+        let entry = b"run";
+        let rc = temen_link_text_libs(
+            [h].as_ptr(),
+            1,
+            prog.as_ptr(),
+            prog.len(),
+            entry.as_ptr(),
+            entry.len(),
+        );
+        (rc, temen_status(), stderr())
+    };
+    let prog_text = temen_text::print_module(&prog);
+    assert_eq!(
+        link(prog_text.as_bytes()),
+        (
+            -STATUS_UNSUPPORTED,
+            STATUS_UNSUPPORTED,
+            "multiple definition of `dup`".to_string()
+        )
+    );
+    // A program unit that does not load says so, under its own status.
+    assert_eq!(
+        link(b"\xff\xfe"),
+        (
+            -STATUS_DECODE_ERR,
+            STATUS_DECODE_ERR,
+            "the program unit is neither an encoded unit nor UTF-8 text".to_string()
+        )
+    );
+    // So does a handle that is no longer open.
+    temen_link_lib_close(h);
+    assert_eq!(
+        link(prog_text.as_bytes()),
+        (
+            -STATUS_UNSUPPORTED,
+            STATUS_UNSUPPORTED,
+            format!("a library handle in [{h}] is not open")
+        )
+    );
 }
