@@ -1,8 +1,8 @@
 // chibicc compile-time — **bytecode interpreter vs wasm-JIT**, timed on Node's V8 (the browser
 // engine), no Playwright. The fast-iteration twin of the playground C-compiler card: for each C
 // program it runs chibicc.temen's compile pass twice — once on the bytecode interpreter
-// (`temen_run_onramp_fs`) and once on the wasm-JIT (`runJitCompiler`, which emits chibicc's `_start` to
-// wasm, `WebAssembly.compile`s it, and runs it, bouncing cap-calls cross-tier) — asserts the emitted
+// (`temen_run_onramp_fs`) and once on the wasm-JIT (`runJitCompiler`, which runs chibicc's root whole
+// as the pump's leaf on emitted wasm, bouncing cap calls cross-tier) — asserts the emitted
 // TEMEN-IR is byte-identical across tiers, and reports the wall-clock speedup. Runs on the **threads**
 // wasm32 cdylib (imported shared memory, exactly the page's build) on Node's WebAssembly.
 //

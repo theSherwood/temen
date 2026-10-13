@@ -3,7 +3,7 @@
 //! now `JitOnrampRun` emits it **paged** (`compile_jit_paged` → `compile_module_reactor_paged`) and
 //! rebuilds the #750 page-state table from each bounce's live map, the driver re-pointing the emitted
 //! `"pagestate"`/`"mapped"` globals — the single-shot twin of the coop tier's `sync_pagestate`. This is
-//! the wasmi driver playing `driveJitRun`'s role, for both cells of the frontier the tier serves:
+//! the wasmi driver playing `driveDetachedRun`'s role, for both cells of the frontier the tier serves:
 //!
 //! - a **root on-ramp guest** (`open_shared_run`, the paramless `_start` resolving `addrspace` by name):
 //!   its helper `protect`s the page holding "K" = 75 read-only and `unmap`s another; `_start` reads K
@@ -190,7 +190,7 @@ struct Drv {
     bounces: u32,
 }
 
-/// Drive the run's emitted `f0` on wasmi — `driveJitRun`'s role, with the #1201 paged sync: copy the
+/// Drive the run's emitted `f0` on wasmi — `driveDetachedRun`'s role, with the #1201 paged sync: copy the
 /// run's table into the wasmi memory and re-point `"pagestate"`/`"mapped"` before `f0` and after each
 /// bounce.
 fn drive(engine: &Engine, mut store: Store<Drv>, memory: Memory, slots: Vec<Val>) -> Outcome {
@@ -242,7 +242,7 @@ fn drive(engine: &Engine, mut store: Store<Drv>, memory: Memory, slots: Vec<Val>
                     .run_cross_tier(func as u32, &args);
                 match outcome {
                     Ok(vals) => {
-                        // The per-bounce refresh (`driveJitRun`'s `syncGlobals()`): the run's rebuilt
+                        // The per-bounce refresh (`driveDetachedRun`'s `syncGlobals()`): the run's rebuilt
                         // table into the wasmi memory, `"pagestate"`/`"mapped"` re-pointed at it.
                         let (table, mapped) = {
                             let r = caller.data().run.as_ref().unwrap();

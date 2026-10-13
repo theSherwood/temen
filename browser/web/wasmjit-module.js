@@ -1,15 +1,14 @@
-// Single-shot **wasm-JIT module runner** — the run-to-completion twin of `wasmjit-reactor.js` (which
-// drives a `tick` per frame). An on-ramp module's whole program is func 0 (`_start`); the cdylib emits
-// it and this module compiles + runs `f0(win, env, ...slots)` **once** against the cdylib's own shared
-// linear memory, servicing the cross-tier helpers through `env.call_interp`. After the run,
-// `temen_onramp_jit_run_finish` captures stdout/stderr/exit into the shared slots — read them via the
-// usual `temen_stdout_*` / `temen_exit_code` accessors, exactly like the interpreter `temen_run_onramp` path.
+// Runs on the **emitted tier** — the run-to-completion twins of `wasmjit-reactor.js` (which drives a
+// `tick` per frame). `runJitModule` (a stdin guest), `runJitCompiler` and `runJitSelfhost` (chibicc over
+// a seeded memfs + argv) open the pump, which runs the root whole as a leaf (#1414 S4-3), and drive it
+// with `driveCoopTierupRun`. Each returns the run status (0 = returned, 5 = exited) or throws when the
+// root isn't emittable or the run traps (the caller falls back to the interpreter). The run's stdout,
+// stderr and exit code land in the shared slots, read through the usual `temen_stdout_*` /
+// `temen_exit_code` accessors exactly as after the interpreter's `temen_run_onramp`.
 //
-// `runJitCompiler` and `runJitSelfhost` feed the guest from a seeded memfs + argv (the chibicc card:
-// `/in.c` + `/include/*.h`) and drive this loop. Both return the run status (0 = returned, 5 = exited)
-// or throw if `_start` isn't emittable (the caller falls back to the interpreter). Synchronous guest
-// work; only the initial `WebAssembly.compile` is async. `runJitModule` runs a stdin guest on the pump
-// instead (`driveCoopTierupRun`, #1414 S4-3a).
+// `runWarmJit` and `driveDetachedRun` still drive a **single-shot** run: the cdylib emits one entry and
+// this module calls `f0(win, env, ...slots)` once against linear memory, servicing the cross-tier
+// helpers through `env.call_interp`, then `temen_*_finish` captures the outcome.
 
 import {
   cacheGet, cachePut, jitCacheStats, moduleCacheClear, JIT_MODULE_CACHE_MAX, driveCoopTierupRun,
@@ -70,113 +69,13 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
   return { f0: pick(instance), instance };
 }
 
-// Drive an already-opened single-shot JIT run to completion: get the emitted `_start`'s instance (compiled
-// + instantiated against the cdylib's shared `memory`, reused across Runs) and call `f0(win, env, ...slots)`
-// once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open_fs` or
-// `temen_selfhost_jit_emit_object_fs`) already.
-// `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
-// instance are reused across Runs (see `cachedInstanceF0`).
-export async function driveJitRun(ex, memory, cacheKey) {
-  const u8 = () => new Uint8Array(memory.buffer);
-  // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
-  const win = Number(ex.temen_onramp_jit_run_win_ptr());
-  const envBytes = ex.temen_onramp_jit_run_env_bytes();
-  const slots = [];
-  for (let i = 0, n = ex.temen_onramp_jit_run_slot_count(); i < n; i++) {
-    slots.push(ex.temen_onramp_jit_run_slot(i));
-  }
-
-  // `env.call_interp` relays each cross-tier call to the cdylib; a nonzero status (exit/trap) throws to
-  // unwind the emitted `f0` (the browser's JS import model — `Exit` and real traps both caught below).
-  // Reuse the compiled Module **and** the instance across Runs of the same guest module (issue #803):
-  // the emitted bytes are copied out of wasm memory only on a compile miss, and one instance serves every
-  // Run. Safe even though this path re-opens a fresh window each Run — `win` is passed to `f0` per Run,
-  // and the cross-tier bounce routes to the current cdylib run, so a reused instance runs against current
-  // state (the warm path reuses the same way, and the reactor reuses one instance across every frame).
-  let f0, instance;
-  // #1153: the emitted `"mapped"` bound, re-synced after each `vm_map`-growing bounce so a grown store
-  // admits (parity with the coop tier — the single-shot on-ramp path no longer pre-sizes a fixed window).
-  // #1201: a PAGED run (the guest `unmap`s/`protect`s its pages) also exports `"pagestate"` — the cdylib
-  // rebuilds the page-state table after each bounce and `"mapped"` is then its coverage; re-point both
-  // before `f0` and after every bounce (the `syncPaged` contract of the §14 codegen Worker / coop driver).
-  let mappedGlobal = null, pagestateGlobal = null;
-  const syncGlobals = () => {
-    if (pagestateGlobal) pagestateGlobal.value = Number(ex.temen_onramp_jit_run_pagestate_ptr());
-    if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
-  };
-  try {
-    ({ f0, instance } = await cachedInstanceF0(
-      memory,
-      cacheKey,
-      () => {
-        // Copy the emitted bytes out (a later temen_alloc could move the stash).
-        const wptr = Number(ex.temen_onramp_jit_run_wasm_ptr());
-        const wlen = ex.temen_onramp_jit_run_wasm_len();
-        return u8().slice(wptr, wptr + wlen);
-      },
-      (func, argsPtr) => {
-        const st = ex.temen_onramp_jit_run_call_interp(func, argsPtr);
-        if (st !== 0) throw new Error('cross-tier stop');
-        // A `vm_map` grow in the bounce advanced the run's committed extent — re-sync the emitted
-        // `"mapped"` (the `driveCoopTierupRun` scalar pattern; on-ramp guests grow scalar, no paged
-        // pagestate on the mask-only emit; a paged run re-points its table too). Inert until the
-        // globals are registered just below (and on a cached instance the first Run's closure carries
-        // them, reading the current run's state via the FFI each time).
-        syncGlobals();
-      },
-    ));
-  } catch (e) {
-    ex.temen_onramp_jit_run_close();
-    throw e;
-  }
-  mappedGlobal = instance.exports.mapped ?? null;
-  pagestateGlobal = instance.exports.pagestate ?? null;
-  // #1153: reset the bound to THIS run's committed extent before `f0` runs. A cached instance (issue
-  // #803) carries the prior Run's grown `"mapped"`; each Run re-opens a cold window at the declared
-  // extent, so without this reset an early emitted access (before the Run's first `vm_map` bounce)
-  // could admit against a stale-high bound. `temen_onramp_jit_run_mapped` reads the current run.
-  syncGlobals();
-
-  const env = Number(ex.temen_alloc(envBytes));
-  new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
-  // Capture how `f0` finished so the runner reports it with parity to the interpreter: its return value
-  // (the guest's top-level result) when it returns, and whether it *threw*. The cdylib pairs `threw` with
-  // its own `exited` flag (set on a cross-tier `Exit`) — a throw that didn't exit is a trap, so the run
-  // reports STATUS_TRAP instead of a truncated STATUS_OK (INVARIANT 9).
-  let threw = 0;
-  let value = 0n;
-  try {
-    // f0(win, env, ...cap-handle slots) — runs `_start` (→ main) to completion on emitted wasm. Its
-    // return is the guest's result (an i32/i64, or undefined for a void `_start`); normalize to i64.
-    const r = f0(win, env, ...slots);
-    value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch {
-    // The emitted `f0` unwound — a cross-tier `exit` (expected for a guest that calls exit) or a trap
-    // (a wasm `unreachable` / a cross-tier bounce that trapped). `temen_onramp_jit_run_finish` tells which.
-    threw = 1;
-  }
-  ex.temen_dealloc(env, envBytes);
-  ex.temen_onramp_jit_run_report(threw, value); // record the return value + throw before capturing
-  const status = ex.temen_onramp_jit_run_finish(); // capture stdout/stderr/exit/value into the shared slots
-  let trapMsg = '';
-  if (status === 3) {
-    const tl = ex.temen_onramp_jit_run_trap_len();
-    trapMsg = tl ? new TextDecoder().decode(u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + tl)) : '';
-  }
-  ex.temen_onramp_jit_run_close();
-  // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
-  // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
-  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted run trapped (declined to the interpreter): ' + trapMsg);
-  return status;
-}
-
 // Drive an opened **detached** single-shot run (#1285, DETACHED_JIT.md §3.1): the emitted `_start`
 // instance is bound to the CHILD's own `WebAssembly.Memory` (`childMemory`, registered as the run's foreign
 // memory), not the engine's. `win` is the host header page the cdylib reports; the `env` bounce cell lives
 // at child offset 0 (the emitted code stores its scratch slots through ITS memory), so each `call_interp`
 // mirrors the cell into an engine-side scratch for the bounce and back after. A paged run's `pagestate`
 // table is copied into the header at `temen_detached_pagestate_off()` on every sync. Everything else —
-// `"mapped"` re-sync, report/finish/close, trap ⇒ decline — is `driveJitRun`'s contract.
+// `"mapped"` re-sync, report/finish/close, trap ⇒ decline — is the single-shot run's contract.
 export async function driveDetachedRun(ex, memory, childMemory, cacheKey) {
   const eu8 = () => new Uint8Array(memory.buffer);
   const cu8 = () => new Uint8Array(childMemory.buffer);
@@ -381,8 +280,8 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
 // emitted wasm over the restored warm image, so a compute-heavy program runs the eval near-native while
 // init stays paid-once. The engine emits `eval_run` on the first Run and caches it (a warm+JIT Run never
 // re-pays the cdylib emit); the compiled `WebAssembly.Module` is cached across Runs too (keyed by
-// `cacheKey`). Differs from `driveJitRun` only in the accessors it drives and in passing the entry `sp`
-// as the emitted `f0`'s third argument (an i64 slot ⇒ a BigInt). Assumes `temen_warm_open` already
+// `cacheKey`). The single-shot run's contract over the warm accessors, passing the entry `sp` as the
+// emitted `f0`'s third argument (an i64 slot ⇒ a BigInt). Assumes `temen_warm_open` already
 // succeeded for this module. Returns the run status (0 = returned, 5 = exited); throws if `eval_run`
 // isn't wasm-drivable or the run traps (the caller falls back to the interpreter warm path).
 export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
@@ -529,10 +428,11 @@ export async function primeWarmJit(ex, memory, cacheKey, shared = 1) {
   }
 }
 
-// Run the **chibicc compiler** on the wasm-JIT: feed it the user's C `srcBytes` (seeded at `/in.c`) plus
-// the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
-// argv (`temen_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver
-// just hands over the module + source. The emitted TEMEN-IR comes back on `temen_stdout_*` after finish.
+// Run the **chibicc compiler** on the emitted tier, on the pump (#1414 S4-3b): feed it the user's C
+// `srcBytes` (seeded at `/in.c`) plus the built-in libc headers under `/include`. The cdylib assembles
+// the memfs + argv (`temen_coop_open_fs`, sharing the bytecode card's `chibicc_card_image`) and runs
+// chibicc's root whole as a leaf, so this driver just hands over the module + source. The emitted
+// TEMEN-IR comes back on `temen_stdout_*` at the run's end.
 // `flags` picks how to compile: bit 0 = `-g`, bit 1 = a linkable **program unit** against libc
 // declarations only (#1392). chibicc's emitted `_start` is independent of both (the source and argv are
 // fed through the memfs, not baked into the code), so `cacheKey` stays valid across them.
@@ -543,33 +443,33 @@ export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, flags = 
   u8().set(moduleBytes, modP);
   u8().set(srcBytes, srcP);
   // Empty header image (0, 0) — the cdylib seeds the built-in playground headers itself. `flags` is the
-  // same word the bytecode `temen_run_onramp_fs` takes.
-  const opened = ex.temen_onramp_jit_run_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length, flags);
+  // same word the bytecode `temen_run_onramp_fs` takes; `1` = the play threads build's shared memory.
+  const opened = ex.temen_coop_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length, flags, 1);
   ex.temen_dealloc(modP, moduleBytes.length);
   ex.temen_dealloc(srcP, srcBytes.length);
   if (opened !== 0) {
-    throw new Error(`JIT compiler open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
+    throw new Error(`JIT compiler open failed: status ${ex.temen_status()} (2 = the root is not emittable)`);
   }
-  return driveJitRun(ex, memory, cacheKey);
+  return driveCoopTierupRun(ex, memory, { cacheKey });
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
 // its own cc1 TUs (`tuBytes`, a memfs-relative path like `frontend/chibicc/hashmap.c`) to a linkable
 // object, reading the TU + its glibc header closure from `imgBytes` (the committed closure image). Same
-// shape as `runJitCompiler` but through `temen_selfhost_jit_emit_object_fs` (raw image + `--emit-object`
-// argv, 128 MiB window for the giants). The emitted object text comes back on `temen_stdout_*` after finish.
+// shape as `runJitCompiler` but through `temen_coop_open_selfhost_fs` (raw image + `--emit-object` argv;
+// the window grows for the giants). The emitted object text comes back on `temen_stdout_*` at the end.
 export async function runJitSelfhost(ex, memory, moduleBytes, imgBytes, tuBytes, debugInfo = 0, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const modP = Number(ex.temen_alloc(moduleBytes.length));
   const imgP = Number(ex.temen_alloc(imgBytes.length));
   const tuP = Number(ex.temen_alloc(tuBytes.length));
   u8().set(moduleBytes, modP); u8().set(imgBytes, imgP); u8().set(tuBytes, tuP);
-  const opened = ex.temen_selfhost_jit_emit_object_fs(modP, moduleBytes.length, imgP, imgBytes.length, tuP, tuBytes.length, debugInfo);
+  const opened = ex.temen_coop_open_selfhost_fs(modP, moduleBytes.length, imgP, imgBytes.length, tuP, tuBytes.length, debugInfo, 1);
   ex.temen_dealloc(modP, moduleBytes.length);
   ex.temen_dealloc(imgP, imgBytes.length);
   ex.temen_dealloc(tuP, tuBytes.length);
   if (opened !== 0) {
-    throw new Error(`JIT self-host open failed: status ${ex.temen_status()} (2 = _start not emittable)`);
+    throw new Error(`JIT self-host open failed: status ${ex.temen_status()} (2 = the root is not emittable)`);
   }
-  return driveJitRun(ex, memory, cacheKey);
+  return driveCoopTierupRun(ex, memory, { cacheKey });
 }

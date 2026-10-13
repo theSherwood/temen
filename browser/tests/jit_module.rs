@@ -125,7 +125,7 @@ fn jit(m: &temen_ir::Module, stdin: &[u8]) -> (Out, u128) {
                 match outcome {
                     Ok(vals) => {
                         // #1153: re-sync the emitted `"mapped"` global to the (possibly `vm_map`-grown)
-                        // live committed extent after each bounce — exactly what `driveJitRun` does in
+                        // live committed extent after each bounce — exactly what `driveDetachedRun` does in
                         // the browser. Without this, an emitted store into a grown page traps against the
                         // stale compile-time bound; with it, the single-shot JIT tier grows in lockstep
                         // with the coop tier (invariant 14, runtime-backend parity).
