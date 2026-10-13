@@ -5421,20 +5421,17 @@ pub extern "C" fn temen_selfhost_emit_object_fs(
 // `temen_run_pg` boots a *fresh* backend per call, runs the SQL to EOF, and lets it exit — every query
 // pays the multi-second boot and loses all state. A `PgSession` keeps ONE backend alive: boot to the
 // `backend>` prompt once, then each query pushes SQL onto the (now **blocking**) stdin and resumes the
-// vCPU until it parks at the next read — so queries after the first are sub-second and DDL/DML persist
-// across them, exactly like a real `psql` session. This rides the [`bytecode::Vcpu::set_stdin_blocking`]
-// park (a `read` on an exhausted buffer suspends instead of returning EOF) over the same reserved
-// window `temen_run_pg` uses; Postgres `--single` is single-threaded, so the only events are the stdin
-// park, a clean exit, or a trap.
+// run until it parks at the next read — so queries after the first are sub-second and DDL/DML persist
+// across them, exactly like a real `psql` session. The run is the pump's suspend/resume session, as the
+// bash card's is (#1122 route (a); #1414 S4-2): a `read` on an exhausted blocking stdin parks its task,
+// the pump returns [`bytecode::CoopEvent::Idle`] once nothing else can run, and the next pump re-admits
+// the reader when stdin has bytes. It runs over the same reserved window `temen_run_pg` uses.
 
-/// A live single-user Postgres backend suspended at a stdin read. Owns its leaked [`bytecode::VcpuProgram`]
-/// (the vCPU borrows it `'static`; reclaimed when the session is replaced/closed) and tracks how much of
-/// the backend's cumulative stdout has already been handed back, so each query returns only its delta.
+/// A live single-user Postgres backend suspended at a stdin read. Tracks how much of the backend's
+/// cumulative stdout has already been handed back, so each query returns only its delta.
 struct PgSession {
-    /// The compiled program, leaked so `vcpu` can borrow it `'static`; reclaimed in [`pg_close_session`].
-    prog: *mut bytecode::VcpuProgram,
-    vcpu: bytecode::Vcpu<'static>,
-    /// Bytes of `vcpu`'s cumulative stdout already returned (delta cursor).
+    run: bytecode::CoopRun,
+    /// Bytes of the run's cumulative stdout already returned (delta cursor).
     stdout_pos: usize,
     /// The backend exited or trapped — no further queries are possible.
     ended: bool,
@@ -5446,61 +5443,58 @@ struct PgSession {
 /// The one live session (single-threaded wasm ⇒ a plain static). `None` until [`temen_pg_open`].
 static mut PG_SESSION: Option<PgSession> = None;
 
-/// Drop the live session (if any) and **reclaim** its leaked program. Order matters: the vCPU (which
-/// borrows the program `'static`) must drop before the program box is reclaimed.
+/// Drop the live session, if any.
 fn pg_close_session() {
     // SAFETY: single-threaded wasm; exclusive access to the session static.
-    unsafe {
-        if let Some(s) = (*core::ptr::addr_of_mut!(PG_SESSION)).take() {
-            let prog = s.prog;
-            drop(s); // drops `vcpu` (releasing the `'static` borrow); the raw `prog` ptr is a no-op drop
-            drop(Box::from_raw(prog)); // reclaim the leaked VcpuProgram
-        }
+    unsafe { *core::ptr::addr_of_mut!(PG_SESSION) = None };
+}
+
+/// Publish a session call's report ([`PbOutcome::publish`]): `0` when the backend is ready for the
+/// next query, else the negative status.
+fn pg_report(out: PbOutcome) -> i32 {
+    let status = out.status;
+    out.publish();
+    if status == STATUS_OK {
+        0
+    } else {
+        -status
     }
 }
 
-/// Advance the session's vCPU to its next stop. Returns [`STATUS_OK`] when it parks at a stdin read
-/// (ready for the next query), [`STATUS_EXIT`] when the backend ends cleanly (it returns, or calls
-/// `exit`: #2288), [`STATUS_TRAP`] on a trap, and [`STATUS_UNSUPPORTED`] for any other event (a
-/// `--single` backend spawns/JITs nothing). Marks the session `ended` on anything but a park.
+/// Run the backend to its next stop and report it. Parked at a stdin read, ready for the next query,
+/// is [`STATUS_OK`]. Anything else ends the session, reported as a run's end is
+/// ([`PbOutcome::ended`]); a backend that returns has exited, as one that calls `exit` has (#2288), so
+/// an ended session never reads as ready. The report's stdout is what the backend wrote since the last
+/// call.
 fn pg_pump(s: &mut PgSession) -> i32 {
-    match s.vcpu.run() {
-        bytecode::VcpuEvent::StdinPark => STATUS_OK,
-        bytecode::VcpuEvent::Done(_) | bytecode::VcpuEvent::Trapped(Trap::Exit(_)) => {
-            s.ended = true;
-            STATUS_EXIT
+    let ev = s.run.run();
+    let host = s.run.host_mut();
+    let stdout = host.stdout.get(s.stdout_pos..).unwrap_or(&[]).to_vec();
+    s.stdout_pos = host.stdout.len();
+    drop(host);
+    let ran = match ev {
+        bytecode::CoopEvent::Idle => {
+            return pg_report(PbOutcome {
+                stdout,
+                ..PbOutcome::refused(STATUS_OK)
+            })
         }
-        bytecode::VcpuEvent::Trapped(_) => {
-            s.ended = true;
-            STATUS_TRAP
-        }
-        // A `--single` backend spawns, JITs and nests nothing; named rather than `_` (see
-        // `VcpuEvent`) so a new event is a decision here, not a silent `STATUS_UNSUPPORTED`.
-        bytecode::VcpuEvent::TierUp { .. }
-        | bytecode::VcpuEvent::Spawn { .. }
-        | bytecode::VcpuEvent::Join { .. }
-        | bytecode::VcpuEvent::Wait { .. }
-        | bytecode::VcpuEvent::Notify { .. }
-        | bytecode::VcpuEvent::JitInstall { .. }
-        | bytecode::VcpuEvent::JitUninstall { .. }
-        | bytecode::VcpuEvent::JitInvoke { .. }
-        | bytecode::VcpuEvent::Instantiate { .. }
-        | bytecode::VcpuEvent::InstantiateDetached { .. }
-        | bytecode::VcpuEvent::CapPending { .. } => {
-            s.ended = true;
-            STATUS_UNSUPPORTED
-        }
+        bytecode::CoopEvent::Done(vals) => Some(Ok(vals)),
+        bytecode::CoopEvent::Trapped(t) => Some(Err(t)),
+        // Never surfaced here: the session pumps unsliced, arms no tier-up, and declares no
+        // host-completed cap.
+        bytecode::CoopEvent::Paused
+        | bytecode::CoopEvent::CapPark { .. }
+        | bytecode::CoopEvent::TierUp { .. }
+        | bytecode::CoopEvent::Resume { .. }
+        | bytecode::CoopEvent::JitInvoke { .. } => None,
+    };
+    s.ended = true;
+    let mut out = PbOutcome::ended(ran, stdout, Vec::new());
+    if out.status == STATUS_OK {
+        out.status = STATUS_EXIT;
     }
-}
-
-/// Stash the session's stdout **delta** (bytes since the last hand-back) into the `OUT` buffer the
-/// `temen_stdout_ptr`/`_len` accessors expose, advancing the cursor.
-fn pg_flush_stdout(s: &mut PgSession) {
-    let out = &s.vcpu.host_mut().stdout;
-    let delta = out.get(s.stdout_pos..).unwrap_or(&[]).to_vec();
-    s.stdout_pos = out.len();
-    // SAFETY: single-threaded wasm; read back only via the export accessors.
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), delta) };
+    pg_report(out)
 }
 
 /// **Open a persistent Postgres session.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the
@@ -5516,72 +5510,48 @@ pub extern "C" fn temen_pg_open(
     img_ptr: *const u8,
     img_len: usize,
 ) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     pg_close_session(); // a fresh open supersedes any live session
-                        // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
+    let refuse = |status: i32| pg_report(PbOutcome::refused(status));
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
-        }
+    let Ok(m) = temen_encode::decode_module(bytes) else {
+        return refuse(STATUS_DECODE_ERR);
     };
     if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return -STATUS_VERIFY_ERR;
+        return refuse(STATUS_VERIFY_ERR);
     }
     let (mut host, init_mem, fs_snap) = match pg_setup(&m, image, &PG_SINGLE_ARGV) {
         Ok(setup) => setup,
-        Err(status) => {
-            set(status);
-            return -status;
-        }
+        Err(status) => return refuse(status),
     };
     host.set_stdin_blocking(true); // the read at the prompt parks instead of returning EOF
-    let prog = match bytecode::VcpuProgram::compile(&m) {
-        Some(p) => Box::into_raw(Box::new(p)),
-        None => {
-            set(STATUS_UNSUPPORTED);
-            return -STATUS_UNSUPPORTED;
-        }
-    };
-    // SAFETY: `prog` is leaked here and only reclaimed by `pg_close_session` after its vCPU drops, so the
-    // `&'static` borrow is valid for the session's whole life.
-    let vcpu = match bytecode::Vcpu::new_root_reserved_with_powerbox(
-        unsafe { &*prog },
+    let mut run = match bytecode::CoopRun::new_reserved(
+        &m,
         0,
         &[],
-        &init_mem,
+        DEFAULT_FUEL,
         host,
+        None,
+        &init_mem,
         temen_ir::DEFAULT_RESERVED_LOG2,
     ) {
-        Ok(v) => v,
-        Err(_) => {
-            // SAFETY: nothing borrows `prog` yet — the vCPU build failed — so reclaim it directly.
-            unsafe { drop(Box::from_raw(prog)) };
-            set(STATUS_TRAP);
-            return -STATUS_TRAP;
-        }
+        Some(Ok(run)) => run,
+        Some(Err(t)) => return pg_report(PbOutcome::ended(Some(Err(t)), Vec::new(), Vec::new())),
+        None => return refuse(STATUS_UNSUPPORTED),
     };
+    run.set_suspend_on_idle(true);
     let mut session = PgSession {
-        prog,
-        vcpu,
+        run,
         stdout_pos: 0,
         ended: false,
         fs_snap,
     };
-    let status = pg_pump(&mut session); // run boot to the first stdin park (the prompt)
-    pg_flush_stdout(&mut session); // hand back the banner + prompt
-    set(status);
+    // Boot to the first stdin park: the banner and the prompt.
+    let rc = pg_pump(&mut session);
     // SAFETY: single-threaded wasm; exclusive access to the session static.
     unsafe { *core::ptr::addr_of_mut!(PG_SESSION) = Some(session) };
-    if status == STATUS_OK {
-        0
-    } else {
-        -status
-    }
+    rc
 }
 
 /// **Run one query on the open session.** Push the SQL at `[sql_ptr, sql_len)` (a trailing newline is
@@ -5591,34 +5561,24 @@ pub extern "C" fn temen_pg_open(
 /// negative `STATUS_*` (incl. [`STATUS_UNSUPPORTED`] if no session is open or it already ended).
 #[no_mangle]
 pub extern "C" fn temen_pg_query(sql_ptr: *const u8, sql_len: usize) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: single-threaded wasm; exclusive access to the session static.
-    let Some(session) = (unsafe { (*core::ptr::addr_of_mut!(PG_SESSION)).as_mut() }) else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
+    let session = unsafe { (*core::ptr::addr_of_mut!(PG_SESSION)).as_mut() };
+    let Some(session) = session.filter(|s| !s.ended) else {
+        return pg_report(PbOutcome::refused(STATUS_UNSUPPORTED));
     };
-    if session.ended {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    }
     // SAFETY: the host guarantees `[sql_ptr, sql_len)` is a live `temen_alloc`ation it just filled.
     let sql: &[u8] = if sql_ptr.is_null() || sql_len == 0 {
         &[]
     } else {
         unsafe { core::slice::from_raw_parts(sql_ptr, sql_len) }
     };
-    session.vcpu.push_stdin(sql);
+    let mut host = session.run.host_mut();
+    host.push_stdin(sql);
     if sql.last() != Some(&b'\n') {
-        session.vcpu.push_stdin(b"\n"); // flush the statement to `--single`'s line reader
+        host.push_stdin(b"\n"); // flush the statement to `--single`'s line reader
     }
-    let status = pg_pump(session);
-    pg_flush_stdout(session);
-    set(status);
-    if status == STATUS_OK {
-        0
-    } else {
-        -status
-    }
+    drop(host);
+    pg_pump(session)
 }
 
 /// **Snapshot the open session's database** to a shippable data image. Serializes the live `mem_fs`
