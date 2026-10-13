@@ -543,6 +543,29 @@ different things depending on which pair you compare:
   where they used to skip only ops off module 0. Covered by `bytecode_debug_detached.rs` and
   `state_writes.rs`.
 
+  **Breakpoints bind in every module a child runs (#2239).** A child image of the debuggee, and any
+  module a child or an exec runs, is a unit of the debug run's own, with its own index. A breakpoint
+  set on module 0's ops never reached it, and its frames read as nothing. So the debuggers take
+  source-line breakpoints, per file: `set_line_breakpoints(file, lines)`. Each line resolves once,
+  when it is set, to the nearest line at or after it with code in a module the run has admitted
+  (`bind_line`, in a file the name matches exactly, by suffix or by basename). It then binds at the
+  first op on that line in every module of the run with code on it, as a native debugger binds a
+  breakpoint in each library it loads. A module without code on the line does not snap it on: a
+  child image's bootstrap replaced function 0, so a line in the root's code past a join would
+  otherwise have snapped into the child's loop. A line no admitted module resolves binds where it
+  is. The bytecode debugger binds in a module the first time one of its ops comes up for the check,
+  so a module a child runs binds when the run admits it. The tree-walker debugs its program alone
+  (its units are §22 `Jit` units, and a §14 child runs undebugged), so it binds there. A debug run
+  compiles every module it admits unfused, so each op is a stop, and with its frame metadata
+  (`Compiled::debug`), so its frames read its own §6 info (`FrameReader::md_for`). The DAP keeps
+  `setBreakpoints`' lines and conditions per file. A stop's condition is that of the lines bound at
+  its op, in its module; a frame's name, source, Locals and evaluation read the frame's module's
+  info (`Debuggee::debug_info`). A line no admitted module resolves is unverified. Covered by
+  `bytecode_debug_detached.rs` (a line of the program stops its child image, on a fused-away compare
+  too; a line past the root's join stops the root alone), `bytecode_debug_instantiate_module.rs` (a
+  line of a child's own source) and `threaded_powerbox.rs` (the DAP: snapping, the child's frame,
+  Locals and a condition).
+
   **§14 coroutine step-into on the multi-vCPU engine (slice 16).** Coroutine step-into (14b/14c) now
   reaches the scheduled engine: `coro_step_into` is on by default for every debug-engine `VTask`, and the
   coroutine-active task is **pinned** in the scheduler (`dbg_pinned_coro` in `drive`/`tick`) — a `resume`
