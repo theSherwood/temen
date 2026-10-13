@@ -52,13 +52,6 @@ fn check(name: &str, src: &str) {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

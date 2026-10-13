@@ -431,15 +431,15 @@ unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::Detached
 
 /// D66 — a granted child's teardown: release its powerbox and, for a detached child, return its
 /// lane to the parent through the `lane_give` hook (`-1` for a carve child: a no-op, it holds none).
-/// `window` is the `(budget, bytes)` a detached spawn spent on the child's window: they go back to
-/// that budget here, when the window goes (owner, 2026-09-29 — `Budget.mem` accounts live windows).
-/// `None` for a carve child and for a thaw's re-launch, which spent nothing in this life.
+/// `window` is the `(budget, bytes, runs)` lease a detached spawn's admission charged for the child's
+/// window: it goes back to that budget here, when the window goes (owner, 2026-09-29 — `Budget`
+/// accounts live windows). `None` for a carve child.
 unsafe fn granted_teardown(
     rt: &Nursery,
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
     lane: i64,
-    window: Option<(i32, u64)>,
+    window: Option<(i32, u64, u64)>,
     fuel: Option<Box<crate::FuelCell>>,
 ) -> crate::child_exec::Teardown {
     let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
@@ -477,31 +477,31 @@ unsafe fn give_back(
     lane_give: usize,
     mem_give: usize,
     lane: i64,
-    window: Option<(i32, u64)>,
+    window: Option<(i32, u64, u64)>,
 ) {
     if lane_give != 0 && lane >= 0 {
         let give: crate::LaneGiver = core::mem::transmute(lane_give);
         give(parent_ctx, lane);
     }
-    if let (Some((budget, bytes)), true) = (window, mem_give != 0) {
+    if let (Some((budget, bytes, runs)), true) = (window, mem_give != 0) {
         let give: crate::BudgetMemGiver = core::mem::transmute(mem_give);
-        give(parent_ctx, child, budget, bytes);
+        give(parent_ctx, child, budget, bytes, runs);
     }
 }
 
 /// #1975 — the undo of a detached spawn's admission (`budget_mem_take`), for a spawn that files no
-/// child after it: its window's bytes and its lane go back, so it charges nothing.
+/// child after it: its `lease` and its lane go back, so it charges nothing.
 ///
 /// # Safety
 /// `rt` is the live nursery whose `grant_ctx` the admission charged.
-unsafe fn undo_admission(rt: &Nursery, budget: i32, bytes: u64, lane: i64) {
+unsafe fn undo_admission(rt: &Nursery, lease: (i32, u64, u64), lane: i64) {
     give_back(
         rt.grant_ctx(),
         core::ptr::null_mut(),
         rt.grant_lane_give.load(Ordering::Acquire),
         rt.grant_budget_mem_give.load(Ordering::Acquire),
         lane,
-        Some((budget, bytes)),
+        Some(lease),
     );
 }
 
@@ -674,7 +674,8 @@ pub(crate) struct Nursery {
     grant_parent_domain: std::sync::atomic::AtomicU64,
     grant_parent_lane_cap: std::sync::atomic::AtomicI64,
     /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
-    /// [`crate::PremapApply`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`).
+    /// [`crate::WindowReady`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`). The last is
+    /// also every detached child's window-ready hook (#2268).
     grant_premap_admit: std::sync::atomic::AtomicUsize,
     grant_premap_stage: std::sync::atomic::AtomicUsize,
     grant_premap_apply: std::sync::atomic::AtomicUsize,
@@ -1406,7 +1407,7 @@ impl Nursery {
         // same host hook that applies a spawn's op-15 pre-map.
         let apply_addr = self.grant_premap_apply.load(Ordering::Acquire);
         let premap_apply = (apply_addr != 0)
-            .then(|| core::mem::transmute::<usize, crate::PremapApply>(apply_addr));
+            .then(|| core::mem::transmute::<usize, crate::WindowReady>(apply_addr));
         let premap_ctx = SendRaw(gc.ctx);
         let filed = file_task(
             self,
@@ -1428,9 +1429,10 @@ impl Nursery {
                 let mapped = rw.len() as u64;
                 w.apply_prots(0, &prots, mapped, &image);
             },
+            // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {
                 // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-                Some(apply) => apply(premap_ctx.0, base, mapped, reserved) != 0,
+                Some(apply) => apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0) != 0,
                 None => true,
             },
             None,
@@ -2489,16 +2491,15 @@ unsafe fn spawn_detached_child(
     mapped_log2: u8,
     reserved_log2: u8,
     seeds: Vec<Seed>,
-    premap_apply: Option<crate::PremapApply>,
+    window_ready: Option<crate::WindowReady>,
     args: Vec<i64>,
     n_results: usize,
     release: crate::GrantChildReleaser,
     gc: &crate::GrantChild,
     trap_out: *mut i64,
-    // #1587 — the funding budget + the window bytes `instantiate_detached` already took from it, so
-    // a spawn that fails *after* that commit can hand them back.
-    budget: i32,
-    child_size: u64,
+    // #1587 — the lease `instantiate_detached` already took from the funding budget, `(budget, bytes,
+    // runs)`, so a spawn that fails *after* that commit can hand it back.
+    lease: (i32, u64, u64),
     // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: un-metered);
     // its task's teardown returns what it did not burn.
     fuel: Option<Box<crate::FuelCell>>,
@@ -2521,15 +2522,24 @@ unsafe fn spawn_detached_child(
     let freezing = parent_freezing();
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(
-        rt,
-        release,
-        gc.ctx,
-        gc.lane_cap,
-        Some((budget, child_size)),
-        fuel,
-    );
+    let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
     let premap_ctx = SendRaw(gc.ctx);
+    // The segments that fit the window, and of them the read-only ranges its window-ready hook hands
+    // the child's page map (#2268).
+    let len = 1usize << mapped_log2;
+    let seeds: Vec<Seed> = seeds
+        .into_iter()
+        .filter(|s| {
+            (s.offset as usize)
+                .checked_add(s.bytes.len())
+                .is_some_and(|end| end <= len)
+        })
+        .collect();
+    let ro: Vec<[u64; 2]> = seeds
+        .iter()
+        .filter(|s| s.readonly && !s.bytes.is_empty())
+        .map(|s| [s.offset, s.offset + s.bytes.len() as u64])
+        .collect();
     let filed = file_task(
         rt,
         code,
@@ -2540,15 +2550,6 @@ unsafe fn spawn_detached_child(
         // the `readonly` segments go RO, as in a root's window (#1730): a detached child is
         // root-shaped, so a write to its const data faults.
         |w| {
-            let len = w.rw_mut().len();
-            let seeds: Vec<&Seed> = seeds
-                .iter()
-                .filter(|s| {
-                    (s.offset as usize)
-                        .checked_add(s.bytes.len())
-                        .is_some_and(|end| end <= len)
-                })
-                .collect();
             let rw = w.rw_mut();
             for s in &seeds {
                 let off = s.offset as usize;
@@ -2561,11 +2562,11 @@ unsafe fn spawn_detached_child(
                 w.protect_ro(s.offset, s.bytes.len() as u64);
             }
         },
-        // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the child
-        // powerbox's own `map` path); none staged ⇒ nothing to do.
-        |base, mapped, reserved| match premap_apply {
+        // The child's page map takes its read-only pages, and the op-15 pre-mapped region, if any,
+        // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.
+        |base, mapped, reserved| match window_ready {
             // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-            Some(apply) => apply(premap_ctx.0, base, mapped, reserved) != 0,
+            Some(ready) => ready(premap_ctx.0, base, mapped, reserved, ro.as_ptr(), ro.len()) != 0,
             None => true,
         },
         None,
@@ -2778,12 +2779,15 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     // The optional pre-mapped region (`premap_region < 0` ⇒ none): admitted host-side — the
     // interpreter's `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take.
     let premap = (premap_region >= 0).then_some((premap_region as i32, premap_off as u64));
-    let mut premap_apply: Option<crate::PremapApply> = None;
+    // #2268 — the child's window-ready hook, which records its read-only pages and applies the
+    // pre-map, if any.
+    let apply_addr = rt.grant_premap_apply.load(Ordering::Acquire);
+    let window_ready =
+        (apply_addr != 0).then(|| core::mem::transmute::<usize, crate::WindowReady>(apply_addr));
     if let Some((r, o)) = premap {
         let admit_addr = rt.grant_premap_admit.load(Ordering::Acquire);
         let stage_addr = rt.grant_premap_stage.load(Ordering::Acquire);
-        let apply_addr = rt.grant_premap_apply.load(Ordering::Acquire);
-        if admit_addr == 0 || stage_addr == 0 || apply_addr == 0 {
+        if admit_addr == 0 || stage_addr == 0 || window_ready.is_none() {
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -2793,13 +2797,17 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             0 => return EINVAL as i32,
             _ => return 0, // forged: `*trap_out` is set
         }
-        premap_apply = Some(core::mem::transmute::<usize, crate::PremapApply>(
-            apply_addr,
-        ));
     }
     // Admission = the lane reserved and the budget's window charge (the commit; every refusal above
     // charged nothing).
-    let lane = take(rt.grant_ctx(), budget as i32, child_size);
+    // #2268 — the lease: the window's bytes, its child's first vCPU, and the mappings its domain and
+    // window will hold, bounded by its program's read-only segments and the pre-map.
+    let lease = (
+        budget as i32,
+        child_size,
+        temen_ir::window_runs_bound(child_data, premap.is_some()),
+    );
+    let lane = take(rt.grant_ctx(), lease.0, lease.1, lease.2);
     if lane == crate::ADMIT_REFUSED {
         return EINVAL as i32;
     }
@@ -2829,7 +2837,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         trap_out,
     ) == 0
     {
-        undo_admission(rt, budget as i32, child_size, lane);
+        undo_admission(rt, lease, lane);
         return 0;
     }
     // #1975 — every exit from here that files no child hands back what the admission took, as the
@@ -2840,7 +2848,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         if bind(rt.grant_ctx(), gc.ctx, module, unit) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
-            undo_admission(rt, budget as i32, child_size, lane);
+            undo_admission(rt, lease, lane);
             return EINVAL as i32;
         }
     }
@@ -2852,7 +2860,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         if stage(rt.grant_ctx(), gc.ctx, r, o) == 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
-            undo_admission(rt, budget as i32, child_size, lane);
+            undo_admission(rt, lease, lane);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -2893,7 +2901,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         Err(_) => {
             release(gc.ctx);
             release(gc.retained_ctx);
-            undo_admission(rt, budget as i32, child_size, lane);
+            undo_admission(rt, lease, lane);
             *trap_out = TrapKind::CapFault as i64;
             return 0;
         }
@@ -2923,14 +2931,13 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         size_log2 as u8,
         temen_ir::DEFAULT_RESERVED_LOG2,
         seeds,
-        premap_apply,
+        window_ready,
         args,
         n_results,
         release,
         &gc,
         trap_out,
-        budget as i32,
-        child_size,
+        lease,
         child_fuel,
         node,
         durable.then_some(child_shadow),

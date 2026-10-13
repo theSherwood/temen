@@ -37,13 +37,6 @@ fn stdout_of(backend: Backend) -> Vec<u8> {
     let t = temen_llvm::translate_ll_path(bc).expect("translate Lua eval bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: SCRIPT.as_bytes().to_vec(), // the guest reads its program off stdin
         memory_size_log2: None,
         args: vec![],

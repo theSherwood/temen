@@ -1057,6 +1057,7 @@ pub(crate) unsafe fn run_image(
     });
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+    cm.set_window_ready(Some(cc.window_ready()));
     cm.set_budget_taker(Some(production_budget_taker(cc)));
     let r = match start {
         Entry::Fresh {

@@ -3896,13 +3896,6 @@ fn demo_lmdb_mmap_cap_vs_native() {
     let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args,
@@ -4075,13 +4068,6 @@ fn demo_lmdb_crash_recovery() {
     let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args,
@@ -4255,13 +4241,6 @@ fn demo_lmdb_mmap_zerocopy_vs_native() {
     let t = temen_llvm::translate_ll_path(&linked).expect("translate lmdb guest");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args,
@@ -4396,13 +4375,6 @@ fn demo_ring_buffer_magic_mapping_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate ring guest");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -4529,13 +4501,6 @@ fn demo_sqlite_fs_cap_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate sqlite_fs bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = |args: Vec<Vec<u8>>| temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args,
@@ -4667,13 +4632,6 @@ fn demo_pg_oscap_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_oscap bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -4757,13 +4715,6 @@ fn trap_error_surfaces_guest_output() {
     let t = temen_llvm::translate_ll_path_with_options(&bc, opts).expect("translate");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -4984,13 +4935,6 @@ fn demo_pg_stdio_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_stdio bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -5072,13 +5016,6 @@ fn demo_pg_stream_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_stream bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -5161,13 +5098,6 @@ fn demo_pg_fprintf_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_fprintf bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],
@@ -5265,13 +5195,6 @@ fn demo_pg_sscanf_vs_native() {
     let t = temen_llvm::translate_ll_path(&bc).expect("translate pg_sscanf bitcode");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = || temen_run::RunConfig {
-        limits: temen_run::Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: stdin_bytes.to_vec(),
         memory_size_log2: None,
         args: vec![],

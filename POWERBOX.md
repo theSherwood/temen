@@ -169,8 +169,8 @@ into one (F6), then retired for the root's grant on the budget tree (#2113).
 
 ### Phase 3 — uniform run config across backends — done
 - [x] `Limits` is the single knob the consumer sets: `fuel`, `deadline`, and the root's grant
-      (`mem`, `channel`, `spawn`), the ceilings of the run's own budget node on every backend
-      (#2113). It replaced the `max_fibers`/`max_vcpus` quota: the hard ceilings
+      (`mem`, `channel`, `spawn`, `maps`), the ceilings of the run's own budget node on every
+      backend (#2113, #2268). It replaced the `max_fibers`/`max_vcpus` quota: the hard ceilings
       (`MAX_FIBERS`/`MAX_VCPUS`) stay, and the grant bounds a run below them.
 - [x] `Limits` + `RunConfig` (fuel = the root budget's fuel ceiling on every backend since #1944
       slice 3, its default per backend — 2^34 on the interpreters, none on the JIT; deadline = the

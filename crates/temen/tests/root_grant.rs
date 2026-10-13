@@ -153,7 +153,7 @@ fn granted(grant: Option<(i64, i64)>, space: bool) -> impl Fn() -> (Host, Vec<Va
     move || {
         let mut h = Host::new();
         if let Some((mem, spawn)) = grant {
-            h.set_grant(mem, -1, spawn);
+            h.set_grant(mem, -1, spawn, -1);
         }
         let args = if space {
             vec![Value::I32(h.grant_address_space(0, 1 << 20))]

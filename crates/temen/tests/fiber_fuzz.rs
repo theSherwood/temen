@@ -341,7 +341,7 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
     const MAX_FIBERS_Q: i64 = 64;
     let granted = || {
         let mut host = Host::new();
-        host.set_grant(MAX_FIBERS_Q * temen_ir::FIBER_STACK as i64, -1, -1);
+        host.set_grant(MAX_FIBERS_Q * temen_ir::FIBER_STACK as i64, -1, -1, -1);
         host
     };
 

@@ -347,3 +347,36 @@ fn channel_omitted_arg_inherits_the_parent_ceiling() {
         "jit ≡ interp: {jo:?}"
     );
 }
+
+/// #2268 — `maps`, the sixth field: a six-arg `split` asks for `50` of it under an unbounded parent,
+/// and a grandchild's `80` is clamped to its parent's `50`. `read(5)` reports each (the parent, which
+/// no level caps, reads `-1`). Returns `(child, grandchild, parent)`.
+const SPLIT_MAPS: &str = "memory 17\n\
+func (i32) -> (i64, i64, i64) {\n\
+block 0 (vb: i32) {\n\
+  all = i64.const -1\n\
+  m50 = i64.const 50\n\
+  m80 = i64.const 80\n\
+  vsub = call.cap 14 0 (i64, i64, i64, i64, i64, i64) -> (i32) vb (all, all, all, all, all, m50)\n\
+  vsub2 = call.cap 14 0 (i64, i64, i64, i64, i64, i64) -> (i32) vsub (all, all, all, all, all, m80)\n\
+  fld5 = i64.const 5\n\
+  vc = call.cap 14 1 (i64) -> (i64) vsub (fld5)\n\
+  vg = call.cap 14 1 (i64) -> (i64) vsub2 (fld5)\n\
+  vp = call.cap 14 1 (i64) -> (i64) vb (fld5)\n\
+  return vc vg vp\n\
+  }\n\
+}\n";
+
+#[test]
+fn maps_split_and_read_matches_across_backends() {
+    let (ir, jo) = both(SPLIT_MAPS, (-1, -1, -1));
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(50), Value::I64(50), Value::I64(-1)]),
+        "interp: the child holds its 50, the grandchild is clamped to it, the parent is unbounded"
+    );
+    assert!(
+        matches!(&jo, JitOutcome::Returned(s) if s == &[50, 50, -1]),
+        "jit ≡ interp on the maps dimension: {jo:?}"
+    );
+}

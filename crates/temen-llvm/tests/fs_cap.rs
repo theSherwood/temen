@@ -23,13 +23,6 @@ fn instance() -> temen_run::Instance {
 
 fn config() -> RunConfig {
     RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: vec![],

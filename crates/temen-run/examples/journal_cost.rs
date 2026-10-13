@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::journal::JournalPolicy;
-use temen_run::{Limits, RunConfig};
+use temen_run::RunConfig;
 
 /// A guest to measure, and how to reach it.
 struct Guest {
@@ -178,13 +178,6 @@ thread_local! {
 fn build(g: &Guest, module: &temen_ir::Module) -> Option<ScheduledDebugRun> {
     let inst = temen_run::instantiate(module.clone()).expect("instantiate (verifies)");
     let cfg = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         args: g.args.iter().map(|s| s.as_bytes().to_vec()).collect(),
         ..RunConfig::default()
     };

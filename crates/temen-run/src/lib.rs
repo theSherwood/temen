@@ -1382,8 +1382,6 @@ pub fn jit_cap_run(
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
     let restore = jit_restore_prots(m, host, init);
-    // #2025 — an `init` that names §13 pages has them aliased back onto their regions.
-    let realias = host.has_premap();
     let init_mem = init.bytes();
     // #1810: a durable run's capture is its freeze image, so it reaches the guest's high-water.
     let durable = host.is_durable();
@@ -1428,9 +1426,7 @@ pub fn jit_cap_run(
         if durable {
             cm.set_high_water(Some(cc.high_water()));
         }
-        if realias {
-            cm.set_window_ready(Some(cc.window_ready()));
-        }
+        cm.set_window_ready(Some(cc.window_ready()));
         cm.set_restore_prots(restore);
         cm.set_freeze_controller(freeze);
         if hosts_fibers {
@@ -1492,9 +1488,7 @@ pub fn jit_cap_run(
     if durable {
         cm.set_high_water(Some(cc.high_water()));
     }
-    if realias {
-        cm.set_window_ready(Some(cc.window_ready()));
-    }
+    cm.set_window_ready(Some(cc.window_ready()));
     cm.set_restore_prots(restore);
     cm.set_freeze_controller(freeze);
     if hosts_fibers {
@@ -1654,7 +1648,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 prots: window.dense_prots().into_iter().map(window_prot).collect(),
                 // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
                 child: unsafe { gc.assume_init() },
-                window: window_lease,
+                window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
                 children,
                 residue,
             },
@@ -2007,6 +2001,7 @@ pub fn recompact_jit(
         run_node(host),
         table_reserve_log2,
     )?;
+    fresh.set_window_ready(Some(CapCtx::Raw(host).window_ready()));
     recompact_into(&mut fresh, host, domain, old)?;
     Ok(fresh)
 }
@@ -2203,7 +2198,7 @@ impl JitSession {
         let host = Box::new(Mutex::new(host));
         let ctx = &*host as *const Mutex<Host> as *mut c_void;
         let mut fuel = temen_jit::FuelCell::fixed(0);
-        let cm = CompiledModule::compile(
+        let mut cm = CompiledModule::compile(
             base,
             entry,
             cap_thunk_locked,
@@ -2217,6 +2212,7 @@ impl JitSession {
             node,
             table_reserve_log2,
         )?;
+        cm.set_window_ready(Some(CapCtx::Locked(&*host).window_ready()));
         Ok(JitSession {
             base: base.clone(),
             entry,
@@ -2293,6 +2289,7 @@ impl JitSession {
             node,
             self.table_reserve_log2,
         )?;
+        fresh.set_window_ready(Some(CapCtx::Locked(&*self.host).window_ready()));
         {
             let mut host = self.host.lock().unwrap_or_else(|e| e.into_inner());
             recompact_into(&mut fresh, &mut host, self.domain, &self.cm)?;
@@ -2591,12 +2588,12 @@ locked_parent_hook!(
 locked_parent_hook!(
     budget_mem_take_locked,
     budget_mem_take,
-    (budget: i32, bytes: u64) -> i64
+    (budget: i32, bytes: u64, runs: u64) -> i64
 );
 locked_parent_hook!(
     budget_mem_give_locked,
     budget_mem_give,
-    (child: *mut c_void, budget: i32, bytes: u64) -> ()
+    (child: *mut c_void, budget: i32, bytes: u64, runs: u64) -> ()
 );
 locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
 locked_parent_hook!(
@@ -2697,10 +2694,11 @@ impl CapCtx {
         (f, self.ptr())
     }
 
-    /// #2025 — the root window's [`temen_jit::PremapApply`] in this shape: a durable thaw's §13
-    /// pages aliased back onto their regions ([`window_aliases`]).
-    fn window_ready(self) -> (temen_jit::PremapApply, *mut c_void) {
-        let f: temen_jit::PremapApply = match self {
+    /// #2025 — the root window's [`temen_jit::WindowReady`] in this shape ([`window_aliases`]): its
+    /// page map takes its read-only pages (#2268), and a durable thaw's §13 pages are aliased back
+    /// onto their regions.
+    fn window_ready(self) -> (temen_jit::WindowReady, *mut c_void) {
+        let f: temen_jit::WindowReady = match self {
             CapCtx::Raw(_) => window_ready,
             CapCtx::Locked(_) => premap_apply,
         };
@@ -2711,14 +2709,30 @@ impl CapCtx {
 /// [`premap_apply`] over a raw host: a single-threaded run's root window.
 ///
 /// # Safety
-/// `ctx` is the run's live `*mut Host`; `[base, base+reserved)` its live reservation.
+/// `ctx` is the run's live `*mut Host`; `[base, base+reserved)` its live reservation; `ro` points at
+/// `n_ro` ranges.
 unsafe extern "C" fn window_ready(
     ctx: *mut c_void,
     base: *mut u8,
     mapped: u64,
     reserved: u64,
+    ro: *const [u64; 2],
+    n_ro: usize,
 ) -> i32 {
-    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved)
+    let ro = ranges(ro, n_ro);
+    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved, ro)
+}
+
+/// The `n` ranges a [`temen_jit::WindowReady`] hook is handed at `ro`.
+///
+/// # Safety
+/// `ro` points at `n` live ranges, or `n` is `0`.
+unsafe fn ranges<'a>(ro: *const [u64; 2], n: usize) -> &'a [[u64; 2]] {
+    if n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(ro, n)
+    }
 }
 
 /// [`temen_jit::HighWater`] over a raw host: [`Host::cap_high_water`].
@@ -3622,44 +3636,63 @@ pub unsafe extern "C" fn premap_stage(
     i32::from(parent.stage_premap(region, child_off, &mut child))
 }
 
-/// Op-15 **pre-map apply** on the JIT ([`temen_jit::PremapApply`]), on the child thread once its window
-/// exists: `Host::apply_premap` over the child's own window view — the same `MprotectWindow` (shared
-/// page map, NULL guard) and the same futex region recorder its first `call.cap` would set up, so the
-/// pre-mapped pages are a real `MAP_SHARED` alias, canonicalized exactly like self-mapped ones. `0` ⇒
-/// the backing cannot be aliased here (a software-only region); the child never runs.
+/// A fresh window's ready hook on the JIT ([`temen_jit::WindowReady`]) over a shared powerbox cell:
+/// every detached child's, on its thread once its window exists, and a locked run's root's. Then
+/// [`window_aliases`] — the same `MprotectWindow` (shared page map, NULL guard) and the same futex
+/// region recorder its first `call.cap` would set up, so an op-15 pre-mapped page is a real
+/// `MAP_SHARED` alias, canonicalized exactly like a self-mapped one. `0` ⇒ the backing cannot be
+/// aliased here (a software-only region); the window's guest never runs.
 ///
 /// # Safety
-/// `child_ctx` is the child powerbox cell; `[base, base+reserved)` its live reservation.
+/// `ctx` is the powerbox cell; `[base, base+reserved)` its live reservation; `ro` points at `n_ro`
+/// ranges.
 pub unsafe extern "C" fn premap_apply(
-    child_ctx: *mut c_void,
+    ctx: *mut c_void,
     base: *mut u8,
     mapped: u64,
     reserved: u64,
+    ro: *const [u64; 2],
+    n_ro: usize,
 ) -> i32 {
-    let child_cell = &*(child_ctx as *const Mutex<Host>);
-    let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
-    window_aliases(&mut child, base, mapped, reserved)
+    let ro = ranges(ro, n_ro);
+    let cell = &*(ctx as *const Mutex<Host>);
+    let mut host = cell.lock().unwrap_or_else(|e| e.into_inner());
+    window_aliases(&mut host, base, mapped, reserved, ro)
 }
 
-/// `Host::apply_premap` over `host`'s fresh window `[base, base+mapped)`: the op-15 pre-map and a
-/// durable thaw's §13 pages (#2025), through the window view its first `call.cap` would set up.
+/// `host`'s fresh window `[base, base+mapped)` starts, before its guest runs: its page map starts
+/// ([`Host::start_window_pages`]) with the read-only pages `ro` its data segments made (#2268), as the
+/// interpreter's own starts with them, then `Host::apply_premap` aliases the op-15 pre-map and a
+/// durable thaw's §13 pages (#2025) — all through the window view its first `call.cap` would set up —
+/// and the domain holds the window's runs of page state ([`Host::start_window`]).
 ///
 /// # Safety
 /// `[base, base+reserved)` is `host`'s live reservation.
-unsafe fn window_aliases(host: &mut Host, base: *mut u8, mapped: u64, reserved: u64) -> i32 {
+unsafe fn window_aliases(
+    host: &mut Host,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+    ro: &[[u64; 2]],
+) -> i32 {
     #[cfg(any(unix, windows))]
     {
         install_region_hook(host, base, reserved);
-        let pages = host.cap_window_pages(base as usize);
+        let pages = host.start_window_pages(base as usize);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
         // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
         // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
         wm.set_null_guard(temen_ir::module_null_guard());
-        i32::from(host.apply_premap(&mut wm) >= 0)
+        wm.seed_readonly(ro);
+        if host.apply_premap(&mut wm) < 0 {
+            return 0;
+        }
+        host.start_window(wm.window_runs());
+        1
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (base, mapped, reserved, host);
+        let _ = (base, mapped, reserved, host, ro);
         0
     }
 }
@@ -3671,14 +3704,24 @@ unsafe fn window_aliases(host: &mut Host, base: *mut u8, mapped: u64, reserved: 
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
-pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i64 {
+pub unsafe extern "C" fn budget_mem_take(
+    ctx: *mut c_void,
+    budget: i32,
+    bytes: u64,
+    runs: u64,
+) -> i64 {
     let parent = &mut *(ctx as *mut Host);
     // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
     // the funding budget's lane is reserved against the parent's Σ and its `mem` taken, or neither.
     // The thunk hands the lane to the builder that follows ([`grant_detached_child_build`]), and it
     // comes back through [`lane_give`] when the child-domain executor reaps the task.
+    let lease = temen_interp::Lease {
+        budget,
+        bytes,
+        runs,
+    };
     parent
-        .admit_detached_spawn(budget, bytes)
+        .admit_detached_spawn(lease)
         .unwrap_or(temen_jit::ADMIT_REFUSED)
 }
 
@@ -3704,6 +3747,7 @@ pub unsafe extern "C" fn budget_mem_give(
     child: *mut c_void,
     budget: i32,
     bytes: u64,
+    runs: u64,
 ) {
     if !child.is_null() {
         let child = &*(child as *const Mutex<Host>);
@@ -3713,7 +3757,11 @@ pub unsafe extern "C" fn budget_mem_give(
             .release_memory();
     }
     let parent = &mut *(ctx as *mut Host);
-    parent.release_detached(budget, bytes);
+    parent.release_detached(temen_interp::Lease {
+        budget,
+        bytes,
+        runs,
+    });
 }
 
 /// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
@@ -3903,6 +3951,51 @@ impl MprotectWindow {
             return;
         }
         self.null_guard = guard;
+    }
+
+    /// #2268 — the runs of `pages` of the page map, before and after `change`
+    /// ([`temen_interp::page_runs`]).
+    fn runs(
+        &self,
+        pages: core::ops::RangeInclusive<u64>,
+        edges: (bool, bool),
+        change: temen_interp::ClassChange,
+    ) -> (u64, u64) {
+        use temen_interp::PageClass;
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        temen_interp::page_runs(
+            &map,
+            pages,
+            self.null_guard / self.page,
+            self.mapped.div_ceil(self.page),
+            |p, s| match *s {
+                PageState::Rw => PageClass::Own(2),
+                PageState::Ro => PageClass::Own(1),
+                PageState::Unmapped => PageClass::Own(0),
+                PageState::Backed {
+                    region,
+                    off,
+                    writable,
+                } => PageClass::alias(region, p, off, self.page, writable),
+            },
+            edges,
+            change,
+        )
+    }
+
+    /// #2268 — record the pages the window's `readonly` data segments made read-only, `ro` (byte
+    /// ranges), as the interpreter's `init_data` records them in its own page map: whole pages, in
+    /// the backed prefix, and none the NULL guard covers, which is protected after them on every
+    /// engine. A page the map already names keeps its entry — a thaw's map is the window's.
+    pub fn seed_readonly(&mut self, ro: &[[u64; 2]]) {
+        let guard = self.null_guard / self.page;
+        let prefix = self.mapped.div_ceil(self.page);
+        let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        for &[start, end] in ro.iter().filter(|r| r[1] > r[0]) {
+            for page in (start / self.page).max(guard)..end.div_ceil(self.page).min(prefix) {
+                map.entry(page).or_insert(PageState::Ro);
+            }
+        }
     }
 
     /// Read one page's explicit state from the shared map (locks; `None` ⇒ absent / region default).
@@ -4345,6 +4438,26 @@ impl GuestMem for MprotectWindow {
         temen_interp::window_tail_bytes(&map, pages, self.mapped, self.page, held_tail, |p| {
             matches!(p, PageState::Backed { .. })
         })
+    }
+    /// The runs here are the window's real mappings: one per run of equal protection, one per
+    /// §13 view (see [`temen_interp::PageClass`]).
+    fn page_runs(&self, offset: u64, len: u64, change: temen_interp::ClassChange) -> (u64, u64) {
+        let Ok(pages) = self.prot_pages(offset, len) else {
+            return (0, 0);
+        };
+        let (first, last) = (*pages.start(), *pages.end());
+        let end = self.reserved.div_ceil(self.page) - 1;
+        let (lo, hi) = (first.saturating_sub(1), (last + 1).min(end));
+        self.runs(lo..=hi, (lo < first, hi > last), change)
+    }
+    fn window_runs(&self) -> u64 {
+        match self.reserved.div_ceil(self.page) {
+            0 => 0,
+            pages => {
+                let keep = temen_interp::ClassChange::Keep;
+                self.runs(0..=pages - 1, (false, false), keep).0
+            }
+        }
     }
     /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism). A
     /// never-mapped reserved tail page becomes addressable (on windows `hw_protect` commits it),
@@ -5382,6 +5495,7 @@ impl PowerboxProgram {
                 .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
         }
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+        cm.set_window_ready(Some(cc.window_ready()));
         cm.set_budget_taker(Some(production_budget_taker(cc)));
         Ok(PowerboxProgram {
             inst,
@@ -6406,6 +6520,9 @@ pub struct Limits {
     /// The root's `spawn`: the run's live vCPUs, its own main vCPU first (threads, fork twins,
     /// spawned processes, children).
     pub spawn: Option<u64>,
+    /// The root's `maps` (#2268): the OS mappings the run causes the host — its windows' page-state
+    /// runs, its vCPUs, domains and regions. Unbounded by default: the process-wide pool bounds it.
+    pub maps: Option<u64>,
 }
 
 impl Limits {
@@ -6414,7 +6531,8 @@ impl Limits {
         self.fuel.unwrap_or(temen_interp::DEFAULT_FUEL)
     }
 
-    /// #2113 — set the root's grant on `host`: its own node's `mem`, `channel` and `spawn` ceilings.
+    /// #2113 — set the root's grant on `host`: its own node's `mem`, `channel`, `spawn` and `maps`
+    /// ceilings.
     fn grant(&self, host: &mut Host) {
         let ceiling =
             |v: Option<u64>, default: u64| i64::try_from(v.unwrap_or(default)).unwrap_or(-1);
@@ -6422,6 +6540,7 @@ impl Limits {
             ceiling(self.mem, temen_interp::DEFAULT_MEM),
             ceiling(self.channel, temen_interp::DEFAULT_CHANNEL),
             ceiling(self.spawn, temen_interp::DEFAULT_SPAWN),
+            ceiling(self.maps, temen_interp::DEFAULT_MAPS),
         );
     }
 }

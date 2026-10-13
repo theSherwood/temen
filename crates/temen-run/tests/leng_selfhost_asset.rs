@@ -16,7 +16,7 @@
 
 #![cfg(target_os = "linux")]
 
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 const ASSET: &[u8] = include_bytes!("../demos/leng_selfhost/temen-leng.temen");
 
@@ -62,13 +62,6 @@ fn asset_translates_real_hexer_leng_byte_identical_to_native() {
         // In-sandbox: feed the Leng file on stdin, capture stdout. The asset is a powerbox program
         // (synthesized `_start`), so it runs through the fixed §3e powerbox on the tree-walker.
         let cfg = RunConfig {
-            limits: Limits {
-                fuel: None,
-                deadline: None,
-                mem: None,
-                channel: None,
-                spawn: None,
-            },
             stdin: leng,
             memory_size_log2: None,
             args: vec![],

@@ -16,7 +16,7 @@
 
 use std::process::exit;
 
-use temen_run::{fs, Backend, Limits, Outcome, RunConfig};
+use temen_run::{fs, Backend, Outcome, RunConfig};
 
 fn main() {
     let mut a = std::env::args().skip(1);
@@ -63,13 +63,6 @@ fn main() {
     };
 
     let cfg = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: vec![],
         memory_size_log2: None,
         args: {
@@ -102,13 +95,6 @@ fn main() {
         let out_mod = temen_text::parse_module(&text).expect("parse compiled IR");
         let out_inst = temen_run::instantiate(out_mod).expect("instantiate compiled program");
         let out_cfg = RunConfig {
-            limits: Limits {
-                fuel: None,
-                deadline: None,
-                mem: None,
-                channel: None,
-                spawn: None,
-            },
             stdin: vec![],
             memory_size_log2: None,
             args: vec![],

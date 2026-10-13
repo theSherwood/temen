@@ -101,8 +101,9 @@ windows, charged to `mem` of that node, the twin's with the growth it copies, be
 exists, and handed back when it ends; an exec keeps the charge (#2106, #2110). A thaw re-charges the
 threads it re-creates. On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
-the embedder's grant (#2113): `Limits` sets its `mem`, `channel` and `spawn` ceilings
-(`Host::set_grant`), and a run whose embedder names none holds large defaults. The root is charged to
+the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings
+(`Host::set_grant`), and a run whose embedder names none holds large defaults — `maps` none at all,
+since every run's mappings are already held against the process's own limit (#2268). The root is charged to
 it as a child is to its budget, on every engine: its window and main vCPU when an activation opens
 (`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, and
 everything it makes after, its growth and its processes' windows included. A carve child (ops 0/5/13, v0

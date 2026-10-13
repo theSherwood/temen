@@ -59,7 +59,9 @@ long __vm_instantiate_join(int inst, long child);
 // (`vm_jit_*`), and only an empty grant may use one (#2219).
 #define VM_EMPTY (-0x40000000) /* 0xC000_0000, temen_interp::GRANT_EMPTY */
 // `__vm_budget_read(budget, field)` — what remains of a `Budget` field: 0 fuel, 1 memory (bytes of
-// detached window you may still mint), 2 spawns. The powerbox's `"budget"` holds one window's worth.
+// detached window you may still mint), 2 spawns, 5 the host's memory mappings you may still cause
+// (a run of pages of one protection in a window, a thread, a region). The powerbox's `"budget"` holds
+// one window's worth.
 long __vm_budget_read(int budget, long field);
 //
 // **Reflection** (§7): discover what the host actually granted *this* domain — read-only and

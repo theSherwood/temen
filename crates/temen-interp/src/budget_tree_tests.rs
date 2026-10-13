@@ -170,9 +170,9 @@ fn a_fork_twin_charges_its_parents_nodes() {
 #[test]
 fn concurrent_charges_never_overdraw_a_shared_ancestor() {
     let tree = Arc::new(BudgetTree::default());
-    let root = tree.mint(None, [-1, 1000, -1, -1, -1], [0; BUDGET_DIMS]);
+    let root = tree.mint(None, [-1, 1000, -1, -1, -1, -1], [0; BUDGET_DIMS]);
     let kids: Vec<u32> = (0..4)
-        .map(|_| tree.split(root, [-1, 600, -1, -1], -1).expect("split"))
+        .map(|_| tree.split(root, [-1, 600, -1, -1, -1, -1]).expect("split"))
         .collect();
     let admitted: usize = std::thread::scope(|s| {
         let runs: Vec<_> = kids

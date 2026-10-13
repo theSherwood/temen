@@ -87,13 +87,6 @@ fn main() {
     let t = temen_llvm::translate_ll_path(&ll).expect("translate uxn_bench.c");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            mem: None,
-            channel: None,
-            spawn: None,
-        },
         stdin: rom,
         memory_size_log2: None,
         args: vec![],

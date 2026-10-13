@@ -258,7 +258,10 @@ use temen_ir::Module;
 /// writable, with no bytes of its own; a `SharedRegion` handle is `B_SHARED_REGION` (16) + number.
 /// v40 (#2054): a stdio stream its spawner re-granted is `B_STREAM_INHERITED` (17) + role, so a
 /// detached child's thaw aliases it to its spawner's stream again instead of a buffer nothing reads.
-const FORMAT_VERSION: u16 = 40;
+/// v41 (#2268): a budget vector in Section 10 has a sixth field, `maps`, the OS mappings its subtree
+/// causes the host. Its charge rides as 0, like `channel`'s: the thaw re-charges every window, vCPU
+/// and region it rebuilds.
+const FORMAT_VERSION: u16 = 41;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1121,14 +1124,14 @@ fn number_budgets(
     Ok(())
 }
 
-/// A budget vector's five fields, in `read`'s order.
-fn budget_fields(q: &BudgetState) -> [i64; 5] {
-    [q.fuel, q.mem, q.spawn, q.channel, q.lane]
+/// A budget vector's six fields, in `read`'s order.
+fn budget_fields(q: &BudgetState) -> [i64; 6] {
+    [q.fuel, q.mem, q.spawn, q.channel, q.lane, q.maps]
 }
 
-/// Serialize Section 10 ([`TAG_BUDGETS`], v37): the node count, then by number each node's parent
-/// (`0` a root, else its number + 1), its five ceilings (`-1` = unbounded, as its two's-complement
-/// `u64`) and its five charges.
+/// Serialize Section 10 ([`TAG_BUDGETS`], v37, v41): the node count, then by number each node's
+/// parent (`0` a root, else its number + 1), its six ceilings (`-1` = unbounded, as its
+/// two's-complement `u64`) and its six charges.
 fn write_budgets(b: &mut Vec<u8>, nodes: &[DurableBudget]) {
     write_uleb(b, nodes.len() as u64);
     for n in nodes {
@@ -1150,7 +1153,7 @@ fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreErro
         return Ok(Vec::new());
     };
     fn vector(r: &mut Reader, min: i64) -> Result<BudgetState, RestoreError> {
-        let mut f = [0i64; 5];
+        let mut f = [0i64; 6];
         for v in &mut f {
             *v = r.uleb()? as i64;
             if *v < min {
@@ -1163,6 +1166,7 @@ fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreErro
             spawn: f[2],
             channel: f[3],
             lane: f[4],
+            maps: f[5],
         })
     }
     let mut r = Reader::new(body);

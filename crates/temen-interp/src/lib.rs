@@ -849,9 +849,9 @@ pub(crate) struct HostCursor {
     pub(crate) clock_ns: i64,
     pub(crate) cap_consumed: usize,
     pub(crate) cap_record_len: usize,
-    /// #2113 — the host's half of its window's accounting ([`Host::grown`], [`Host::own_window`],
-    /// [`Host::main_vcpu`]): the tree an undo puts back holds the charges, these what they are for.
-    pub(crate) held: (u64, u64, bool),
+    /// #2113 — the host's half of its window's accounting ([`WindowHeld`]): the tree an undo puts
+    /// back holds the charges, this what they are for.
+    pub(crate) held: WindowHeld,
     /// The `Jit` tables' [`compile_mark`](Host::jit_compile_mark) — not restored but compared: a
     /// `compile` adds a unit and a `JitCode` handle, which a cursor cannot take back, so an undo across
     /// one declines (#2015).
@@ -897,7 +897,7 @@ struct HostReplaySubstate {
     svc_next_ticket: u64,
     /// #2113 — the host's half of its window's accounting, as [`HostCursor::held`]: the checkpoint's
     /// tree holds the charges.
-    held: (u64, u64, bool),
+    held: WindowHeld,
     /// #1455 — each host capability's **own** declared state, positional over `host_procs`
     /// ([`Host::capture_cap_states`]). A checkpoint restores into a run whose powerbox was rebuilt from
     /// scratch, so a capability carrying guest-observable state of its own (an `fs` server's per-`open`
@@ -1103,6 +1103,12 @@ impl GuestMem for RecordingMem<'_> {
     }
     fn tail_bytes(&self, offset: u64, len: u64) -> TailBytes {
         self.inner.tail_bytes(offset, len)
+    }
+    fn page_runs(&self, offset: u64, len: u64, change: ClassChange) -> (u64, u64) {
+        self.inner.page_runs(offset, len, change)
+    }
+    fn window_runs(&self) -> u64 {
+        self.inner.window_runs()
     }
     fn map_region(
         &mut self,
@@ -3070,7 +3076,7 @@ fn relaunch_detached(
         shadow,
         memory_log2,
         module,
-        host,
+        mut host,
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host, window.page_map())?;
@@ -3080,7 +3086,7 @@ fn relaunch_detached(
         .host
         .lock_unpoisoned()
         .relaunch_lease(&host, memory_log2)
-        .map(|(budget, bytes)| (Arc::clone(&spawner.host), budget, bytes));
+        .map(|lease| (Arc::clone(&spawner.host), lease));
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
@@ -3097,6 +3103,8 @@ fn relaunch_detached(
     if !host.realias_regions(&mut mem, &window.dense_prots()) {
         return None;
     }
+    // #2268 — the window has started, with the runs its artifact gave it.
+    host.start_window(mem.window_runs());
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
     mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())?;
@@ -5528,13 +5536,18 @@ impl ExecReq {
             let back = m.twin_backing(m.window.reserved());
             m.exec_window(back, &self.data, self.null_guard, self.args.as_deref())
         });
+        // #2268 — the image's window has started.
+        let mut host = self.host;
+        if let Some(m) = &mem {
+            host.start_window(m.window_runs());
+        }
         VCpu::new(
             self.funcs,
             self.types,
             self.entry as FuncIdx,
             &self.entry_args,
             mem,
-            Arc::new(Mutex::new(self.host)),
+            Arc::new(Mutex::new(host)),
             fuel,
             depth,
             id,
@@ -7828,8 +7841,8 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
     // Every vCPU of the dying domain passes here; the first hands it back, with the window of a
     // process that paid for its own (#2106).
     v.host.lock_unpoisoned().release_memory();
-    if let Some((cell, budget, bytes)) = v.window_lease.take() {
-        cell.lock_unpoisoned().release_detached(budget, bytes);
+    if let Some((cell, lease)) = v.window_lease.take() {
+        cell.lock_unpoisoned().release_detached(lease);
     }
     // #1816 — a fork twin's main vCPU killed here has finished as surely as one reaching `Done`:
     // its personalities and its `waitpid` benchers hear it the same way.
@@ -9084,8 +9097,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // A detached child's window goes back to the budget that paid for it (no lock held
                 // here). Never during a freeze unwind: the child is captured, not ended.
                 if !froze {
-                    if let Some((cell, budget, bytes)) = v.window_lease.take() {
-                        cell.lock_unpoisoned().release_detached(budget, bytes);
+                    if let Some((cell, lease)) = v.window_lease.take() {
+                        cell.lock_unpoisoned().release_detached(lease);
                     }
                 }
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
@@ -12079,7 +12092,7 @@ struct VCpu {
     /// detached child's root only. Its bytes go back to that budget when the child ends (the `Done`
     /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
     /// same moment the Cranelift executor's teardown gives them back.
-    window_lease: Option<(Arc<Mutex<Host>>, i32, u64)>,
+    window_lease: Option<(Arc<Mutex<Host>>, Lease)>,
     /// #2001 — this vCPU's `spawn` charge on its domain's node, handed back when the vCPU is
     /// dropped. Taken by what makes the vCPU: `thread.spawn`, a fork, a `posix_spawn`, or a thaw
     /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), on a
@@ -15426,17 +15439,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // detached child capturable at all.
                             let mod_durable_ok = !durable || cm.durable;
                             // D66 — admission is one call, shared by every engine: the funding
-                            // budget's lane is reserved against our Σ and its `mem` spent, or neither.
+                            // budget's lane is reserved against our Σ and its lease charged, or
+                            // neither.
+                            let lease = Lease {
+                                budget,
+                                bytes: child_size,
+                                runs: window_runs_bound(&cm.data, premap.is_some()),
+                            };
                             let admitted = (ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && mod_durable_ok
                                 && payload_ok
                                 && premap_ok)
-                                .then(|| {
-                                    host.lock_unpoisoned()
-                                        .admit_detached_spawn(budget, child_size)
-                                })
+                                .then(|| host.lock_unpoisoned().admit_detached_spawn(lease))
                                 .flatten();
                             if admitted.is_none() {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
@@ -15494,11 +15510,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // #1975 — every exit from here that spawns nothing hands back what
                                 // the admission took, so the spawn charges nothing.
                                 let undo = || {
-                                    host.lock_unpoisoned().undo_detached_spawn(
-                                        budget,
-                                        child_size,
-                                        child_lane_val,
-                                    )
+                                    host.lock_unpoisoned()
+                                        .undo_detached_spawn(lease, child_lane_val)
                                 };
                                 // The pre-mapped region: staged into the child powerbox (a re-grant,
                                 // as the list above) and aliased onto its window through the child's
@@ -15524,6 +15537,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
                                     ch.set_self_module_opt(Some(Arc::clone(&cm.module)));
+                                    // #2268 — its window starts, its pre-map in it.
+                                    ch.start_window(fm.window_runs());
                                     let child_host = Arc::new(Mutex::new(ch));
                                     // #863 slice 3 — a child that inherited a personality signal door
                                     // via the re-grant above gets its own **domain-scoped, weak**
@@ -15555,7 +15570,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // lifecycle"). A freeze is a lifecycle action.
                                     let bell = Arc::new(AtomicBool::new(false));
                                     let bell_child = Arc::clone(&bell);
-                                    let lease = (Arc::clone(host), budget, child_size);
+                                    let lease = (Arc::clone(host), lease);
                                     // D66 — the child's lane chain: its own domain at its own cap, then
                                     // ours, so its tasks count against both (INVARIANTS #3 ruling).
                                     let chain_child = {
@@ -15632,6 +15647,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 .push(Reg::from_i32((threads.len() - 1) as i32));
                                         }
                                         None => {
+                                            // #2268 — and its window's own charge, as it started.
+                                            child_host_keep.lock_unpoisoned().release_memory();
                                             undo();
                                             return Err(Trap::ThreadFault);
                                         }
@@ -19740,15 +19757,22 @@ impl SharedBacking for VecBacking {
     }
 }
 
-/// #2111 — a region the run's domains made (a guest's `create_region`, or a thaw's rebuild): its
-/// backing, charged `bytes` of `channel` to `node` and every ancestor for as long as it lives. The
-/// charge rides the shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go
-/// of it last refunds the node that paid. A domain lets go of its regions when it ends
+/// #2111 — a region the run's domains made (a guest's `create_region` or a file mapping, or a thaw's
+/// rebuild): its backing, charged to `node` and every ancestor for as long as it lives — its `bytes`
+/// of `channel`, and (#2268) the mapping the host holds of it ([`region_cost`]). The charge rides the
+/// shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go of it last
+/// refunds the node that paid. A domain lets go of its regions when it ends
 /// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
 struct ChargedRegion {
     backing: RegionBacking,
     node: NodeRef,
     bytes: u64,
+}
+
+/// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
+/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it.
+fn region_cost(bytes: u64) -> [(usize, u64); 2] {
+    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1)]
 }
 
 impl SharedBacking for ChargedRegion {
@@ -19779,7 +19803,7 @@ impl Drop for ChargedRegion {
     fn drop(&mut self) {
         self.node
             .tree
-            .refund(self.node.node, BUDGET_CHANNEL, self.bytes);
+            .refund_set(self.node.node, &region_cost(self.bytes));
     }
 }
 
@@ -19839,6 +19863,142 @@ pub fn window_tail_bytes<S>(
     }
 }
 
+/// #2268 — what decides whether two neighbouring window pages can share one OS mapping where the
+/// window is real hardware (the JIT's): the window's own pages share one when their access matches;
+/// a §13 alias shares one only with the next page of the same region, at the next region offset,
+/// with the same writability. A window's runs of equal class are its mappings, which `Budget.maps`
+/// pays for on every engine alike.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PageClass {
+    /// The window's own memory: `0` no access, `1` read, `2` read-write.
+    Own(u8),
+    /// A §13 alias of `region`; `base` is the region offset its page 0 would have, so consecutive
+    /// pages of one alias share it.
+    Alias {
+        region: u32,
+        base: u64,
+        writable: bool,
+    },
+}
+
+impl PageClass {
+    /// The class a `map`/`protect` with cap `prot` bits gives the window's own page.
+    pub fn own(prot: i32) -> PageClass {
+        PageClass::Own(if prot & 2 != 0 {
+            2
+        } else if prot & 1 != 0 {
+            1
+        } else {
+            0
+        })
+    }
+
+    /// The class of page `p` aliasing `region` at `off`.
+    pub fn alias(region: u32, p: u64, off: u64, page: u64, writable: bool) -> PageClass {
+        PageClass::Alias {
+            region,
+            base: off.wrapping_sub(p.wrapping_mul(page)),
+            writable,
+        }
+    }
+}
+
+/// #2268 — what a page op does to the classes of the pages it covers.
+#[derive(Clone, Copy, Debug)]
+pub enum ClassChange {
+    /// Nothing: count the runs as they are.
+    Keep,
+    /// Every page takes this class: a `map`, an `unmap`, a §13 alias.
+    Every(PageClass),
+    /// A `protect` to `prot` bits: an alias keeps its region and offset with the new writability,
+    /// the window's own page takes [`PageClass::own`] (`protect(none)` ends an alias, so it is an
+    /// [`ClassChange::Every`]).
+    Protect(i32),
+}
+
+/// #2268 — how many runs of [`PageClass`] `pages` of a window's page map make, before and after
+/// `change` reaches them: `edges` says whether the first and last page are neighbours of an op's
+/// pages, which it leaves alone (`(false, false)` and [`ClassChange::Keep`] count the pages as they
+/// are). Pages outside the span keep their runs, so an op changes the window's mappings by
+/// `after - before`. A page absent from the map takes the region default: no access below `guard`
+/// (the JIT keeps its NULL guard outside its map), read-write below `mapped`, none above. One pass
+/// over the map's entries in the span, however large it is, and nothing allocated: a page op pays
+/// it before every op.
+pub fn page_runs<S>(
+    map: &BTreeMap<u64, S>,
+    pages: core::ops::RangeInclusive<u64>,
+    guard: u64,
+    mapped: u64,
+    class: impl Fn(u64, &S) -> PageClass,
+    edges: (bool, bool),
+    change: ClassChange,
+) -> (u64, u64) {
+    /// A count of runs: one more each time a page's class differs from the last one's.
+    #[derive(Default)]
+    struct Runs(Option<PageClass>, u64);
+    impl Runs {
+        fn push(&mut self, c: PageClass) {
+            if self.0 != Some(c) {
+                (self.0, self.1) = (Some(c), self.1 + 1);
+            }
+        }
+    }
+    let (first, last) = (*pages.start(), *pages.end());
+    // The pages `change` reaches: `[from, to)`.
+    let (from, to) = (
+        first + edges.0 as u64,
+        (last + 1).saturating_sub(edges.1 as u64),
+    );
+    let changed = |c: PageClass| match change {
+        ClassChange::Keep => c,
+        ClassChange::Every(to) => to,
+        ClassChange::Protect(prot) => match c {
+            PageClass::Alias { region, base, .. } => PageClass::Alias {
+                region,
+                base,
+                writable: prot & 2 != 0,
+            },
+            PageClass::Own(_) => PageClass::own(prot),
+        },
+    };
+    let (mut before, mut after) = (Runs::default(), Runs::default());
+    // Pages `[a, b)` of class `c`: before as they are, after as `change` leaves each part.
+    let mut piece = |c: PageClass, a: u64, b: u64| {
+        if a >= b {
+            return;
+        }
+        before.push(c);
+        for (part, (x, y)) in [
+            (c, (a, b.min(from))),
+            (changed(c), (a.max(from), b.min(to))),
+            (c, (a.max(to), b)),
+        ] {
+            if x < y {
+                after.push(part);
+            }
+        }
+    };
+    // The absent pages `[a, b)`, split where the default changes.
+    fn gap(
+        piece: &mut impl FnMut(PageClass, u64, u64),
+        (guard, mapped): (u64, u64),
+        a: u64,
+        b: u64,
+    ) {
+        piece(PageClass::Own(0), a, b.min(guard));
+        piece(PageClass::Own(2), a.max(guard), b.min(mapped));
+        piece(PageClass::Own(0), a.max(guard).max(mapped), b);
+    }
+    let mut next = first;
+    for (&p, s) in map.range(pages) {
+        gap(&mut piece, (guard, mapped), next, p);
+        piece(class(p, s), p, p + 1);
+        next = p + 1;
+    }
+    gap(&mut piece, (guard, mapped), next, last + 1);
+    (before.1, after.1)
+}
+
 /// The guest window a capability handler borrows `(ptr, len)` buffers from (§7). Both
 /// the interpreter's lazily-paged [`Mem`] and a JIT's flat window implement this, so a
 /// single host dispatch ([`Host::cap_dispatch`]) serves both backends. **All offsets/pointers are
@@ -19877,6 +20037,20 @@ pub trait GuestMem {
     /// a window that cannot grow (the default).
     fn tail_bytes(&self, _offset: u64, _len: u64) -> TailBytes {
         TailBytes::default()
+    }
+
+    /// #2268 — the runs of [`PageClass`] over the pages a page op on `[offset, offset+len)` covers,
+    /// and the page either side, before and after `change` ([`page_runs`]): the op changes
+    /// the window's OS mappings by `after - before`. `(0, 0)` for a range the op would refuse, and
+    /// for a window without a page map (the default).
+    fn page_runs(&self, _offset: u64, _len: u64, _change: ClassChange) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// #2268 — the runs of [`PageClass`] over the whole window: its OS mappings, on a JIT. `0` for a
+    /// window without a page map (the default).
+    fn window_runs(&self) -> u64 {
+        0
     }
 
     /// `SharedRegion` op 0 `map` (§13): alias `backing`'s `[region_off, region_off+len)` pages into
@@ -20112,8 +20286,8 @@ enum Binding {
     Budget(u32),
 }
 
-/// §15 / PROCESS.md §5 — one value per `Budget` dimension (fuel / mem / spawn / channel / lane, in
-/// `read`'s field order); the vector is kept deliberately short (O8). `-1` = unbounded, else a
+/// §15 / PROCESS.md §5 — one value per `Budget` dimension (fuel / mem / spawn / channel / lane / maps,
+/// in `read`'s field order); the vector is kept deliberately short (O8). `-1` = unbounded, else a
 /// non-negative amount. What the amounts mean depends on where the vector is used (#1944): a budget
 /// node's **ceilings** ([`DurableBudget::ceiling`], what the thaw hook ([`Host::set_budget_thaw_hook`])
 /// sees and returns), what its subtree has **charged** against them ([`DurableBudget::used`]), or the
@@ -20133,6 +20307,12 @@ pub struct BudgetState {
     /// ([`Host::admit_detached_spawn`]), and a reaped child returns its lane. Stamped onto the
     /// child's [`Host::lane_cap`] at spawn. A node's `used` lane is always 0.
     pub lane: i64,
+    /// #2268 — the OS memory **mappings** the subtree causes the host to hold: its windows' runs of
+    /// page state ([`PageClass`]), [`MAPS_PER_VCPU`] per live vCPU, [`MAPS_PER_DOMAIN`] per domain,
+    /// one per §13 region. `-1` = unbounded. The host process has a fixed number of mappings to share
+    /// among every domain in it, and one too many takes the whole process down; every engine charges
+    /// the same counts, so a guest is refused at the same op on each.
+    pub maps: i64,
 }
 
 impl BudgetState {
@@ -20143,11 +20323,19 @@ impl BudgetState {
             spawn: d[2],
             channel: d[3],
             lane: d[4],
+            maps: d[5],
         }
     }
 
     fn dims(self) -> [i64; BUDGET_DIMS] {
-        [self.fuel, self.mem, self.spawn, self.channel, self.lane]
+        [
+            self.fuel,
+            self.mem,
+            self.spawn,
+            self.channel,
+            self.lane,
+            self.maps,
+        ]
     }
 }
 
@@ -20162,8 +20350,8 @@ pub struct DurableBudget {
     pub used: BudgetState,
 }
 
-/// The `Budget` dimensions, in `read`'s field order: fuel, mem, spawn, channel, lane.
-const BUDGET_DIMS: usize = 5;
+/// The `Budget` dimensions, in `read`'s field order: fuel, mem, spawn, channel, lane, maps.
+const BUDGET_DIMS: usize = 6;
 /// The `fuel` dimension's index: what a vCPU's draws charge (#1944 slice 3).
 const BUDGET_FUEL: usize = 0;
 /// The `mem` dimension's index: what a detached window charges.
@@ -20178,6 +20366,69 @@ const BUDGET_SPAWN: usize = 2;
 const BUDGET_CHANNEL: usize = 3;
 /// The `lane` dimension's index: a ceiling on a child's lane, never charged by the tree (D66).
 const BUDGET_LANE: usize = 4;
+/// The `maps` dimension's index: the OS mappings a subtree causes (#2268, [`BudgetState::maps`]).
+const BUDGET_MAPS: usize = 5;
+
+/// #2268 — the mappings the host keeps for itself out of the OS limit: its libraries, heap and
+/// threads, and its embedder's.
+const MAPS_HOST_RESERVE: u64 = 8192;
+
+pub use temen_ir::{window_runs_bound, WINDOW_RUNS};
+
+/// #2268 — what a live vCPU holds of the host's mappings: its thread's stack and guard page, and the
+/// alternate signal stack and guard page every Rust thread is given.
+pub const MAPS_PER_VCPU: u64 = 4;
+
+/// #2268 — what a domain holds of the host's mappings besides its window's runs past
+/// [`WINDOW_RUNS`]: those three, its code (the JIT's arena: its reservation, and its executable,
+/// read-only and writable runs) and its offload pool's [`OFFLOAD_POOL_THREADS`] threads, which its
+/// first blocking `submit` starts. Every engine charges it alike, with the domain's window.
+pub const MAPS_PER_DOMAIN: u64 = WINDOW_RUNS + 5 + OFFLOAD_POOL_THREADS as u64 * MAPS_PER_VCPU;
+
+/// #2268 — Linux's default `vm.max_map_count`, for a host that cannot read its own.
+const MAPS_LINUX_DEFAULT: u64 = 65530;
+
+/// #2268 — what every run in this process holds of [`maps_pool`] between them.
+static MAPS_IN_USE: AtomicU64 = AtomicU64::new(0);
+
+/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's
+/// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
+/// mapping past the OS limit fails an `mmap` or `mprotect` anywhere in the process, the host's own
+/// allocations included, which aborts it; so every `maps` charge, on every engine and in every run,
+/// is checked against this as well as its own chain. Other hosts have no such limit: unbounded.
+pub fn maps_pool() -> u64 {
+    static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        if cfg!(target_os = "linux") {
+            std::fs::read_to_string("/proc/sys/vm/max_map_count")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(MAPS_LINUX_DEFAULT)
+                .saturating_sub(MAPS_HOST_RESERVE)
+        } else {
+            u64::MAX
+        }
+    })
+}
+
+/// #2268 — take `n` of [`maps_pool`] for a charge: `false`, taking nothing, when that would pass
+/// the pool (`check`) — a [`BudgetTree::force_charge`] takes it regardless.
+fn maps_take(n: u64, check: bool) -> bool {
+    n == 0
+        || MAPS_IN_USE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let now = used.saturating_add(n);
+                (!check || now <= maps_pool()).then_some(now)
+            })
+            .is_ok()
+}
+
+/// #2268 — hand `n` back to [`maps_pool`].
+fn maps_give(n: u64) {
+    let _ = MAPS_IN_USE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        Some(used.saturating_sub(n))
+    });
+}
 
 /// #1944 — one node of a run's budget tree: a **ceiling** per dimension (`-1` = unbounded) and what
 /// its subtree has **charged** against it. A use charges the node that pays and every ancestor, so no
@@ -20208,22 +20459,68 @@ pub const DEFAULT_MEM: u64 = 64 << 30;
 pub const DEFAULT_CHANNEL: u64 = 64 << 30;
 /// #2113 — the root's `spawn` grant when its embedder names none: [`MAX_VCPUS`] live vCPUs.
 pub const DEFAULT_SPAWN: u64 = MAX_VCPUS as u64;
+/// #2268 — the root's `maps` grant when its embedder names none: unbounded (`u64::MAX`, as an
+/// unlimited fuel is), so the process-wide pool ([`maps_pool`]) is what bounds a run by default. A
+/// guest can then never take the process down by its mappings, and an embedder hosting several runs
+/// grants each its share to keep one from starving the others.
+pub const DEFAULT_MAPS: u64 = u64::MAX;
+
+/// #1877, #2268 — what a detached child's admission charges the budget that funds it for its window
+/// ([`Host::admit_detached_spawn`]), which the child's end hands back ([`Host::release_detached`]):
+/// `budget` is the spawner's handle on it, `bytes` the window's declared size, and `runs` the bound on
+/// the window's runs of page state ([`window_runs_bound`]), all reserved before the window is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lease {
+    pub budget: i32,
+    pub bytes: u64,
+    pub runs: u64,
+}
+
+impl Lease {
+    /// What the lease holds: the window's `bytes` of `mem`; its child's first vCPU ([`VcpuCost`]); and
+    /// the domain's mappings ([`MAPS_PER_DOMAIN`]) and its window's runs past [`WINDOW_RUNS`].
+    fn cost(&self) -> [(usize, u64); 3] {
+        let window = MAPS_PER_DOMAIN + self.runs.saturating_sub(WINDOW_RUNS);
+        [
+            (BUDGET_MEM, self.bytes),
+            (BUDGET_SPAWN, 1),
+            (BUDGET_MAPS, MAPS_PER_VCPU + window),
+        ]
+    }
+}
+
+/// #2113, #2268 — a domain's half of its window's accounting: what its charges on the budget tree are
+/// for ([`Host::grown`], [`Host::own_window`], [`Host::main_vcpu`], [`Host::runs`], [`Host::maps`],
+/// [`Host::domain_maps`]). What puts the tree back — a debugger's undo, a checkpoint — puts this back
+/// with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowHeld {
+    grown: u64,
+    own_window: u64,
+    main_vcpu: bool,
+    runs: u64,
+    maps: u64,
+    domain_maps: u64,
+}
 
 /// #2113 — the window a run's root opens an activation over ([`Host::begin_activation`]), as the
 /// run's own node pays for it: `declared` bytes, and `grown` past them that it holds committed as its
-/// own.
+/// own. #2268 — and its `runs` of page state, its mappings ([`Host::start_window`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RootWindow {
     pub declared: u64,
     pub grown: u64,
+    pub runs: u64,
 }
 
 impl RootWindow {
-    /// A fresh run of `m`: its declared memory, nothing grown yet.
+    /// A fresh run of `m`, before its window is built: its declared memory, nothing grown yet, and a
+    /// fresh window's runs — the JIT counts its own once the window exists ([`Host::start_window`]).
     pub fn fresh(m: &Module) -> RootWindow {
         RootWindow {
             declared: m.memory.map_or(0, |mc| 1 << mc.size_log2),
             grown: 0,
+            runs: WINDOW_RUNS,
         }
     }
 
@@ -20232,7 +20529,19 @@ impl RootWindow {
         mem.map_or(RootWindow::default(), |m| RootWindow {
             declared: m.window.mapped(),
             grown: m.tail_bytes(0, m.window.reserved()).held,
+            runs: m.window_runs(),
         })
+    }
+}
+
+impl Drop for BudgetTree {
+    /// #2268 — a run that ends hands the process back every mapping its tree still holds. A use the
+    /// run never refunded (it ended mid-op, or a domain was never released) cannot leak out of the
+    /// pool.
+    fn drop(&mut self) {
+        maps_give(Self::maps_held(
+            self.0.get_mut().unwrap_or_else(|e| e.into_inner()),
+        ));
     }
 }
 
@@ -20274,6 +20583,16 @@ impl BudgetTree {
         (nodes.len() - 1) as u32
     }
 
+    /// #2268 — what `nodes` hold of [`maps_pool`]: what each tree root has charged, since every
+    /// charge reaches its root.
+    fn maps_held(nodes: &[BudgetNode]) -> u64 {
+        nodes
+            .iter()
+            .filter(|n| n.parent.is_none())
+            .map(|n| n.used[BUDGET_MAPS].max(0) as u64)
+            .sum()
+    }
+
     /// `n` and its ancestors, nearest first. A parent is always minted before its child, so the walk
     /// only moves down the vector and ends.
     fn chain(nodes: &[BudgetNode], n: u32) -> impl Iterator<Item = u32> + '_ {
@@ -20293,8 +20612,8 @@ impl BudgetTree {
         let mut out = [-1i64; BUDGET_DIMS];
         for i in Self::chain(nodes, n).filter(|&i| i != Self::RUN_NODE) {
             let node = &nodes[i as usize];
-            let dims = out.iter_mut().zip(node.ceiling).zip(node.used);
-            for ((o, ceiling), used) in dims.take(BUDGET_LANE) {
+            let dims = out.iter_mut().zip(node.ceiling).zip(node.used).enumerate();
+            for (_, ((o, ceiling), used)) in dims.filter(|&(d, _)| d != BUDGET_LANE) {
                 if ceiling >= 0 {
                     let left = if room {
                         (ceiling - used).max(0)
@@ -20329,31 +20648,54 @@ impl BudgetTree {
     /// Charge `amount` of dimension `d` to `n` and every ancestor, or to none of them: `false` when
     /// any bounded level lacks the room.
     fn charge(&self, n: u32, d: usize, amount: u64) -> bool {
-        self.add(n, d, amount, true)
+        self.add(n, &[(d, amount)], true)
     }
 
     /// [`Self::charge`] past any ceiling: a use that exists already, accounted again — what a thaw
     /// rebuilds (a pipe, a re-created vCPU), or an embedder's own mint. It still charges every level.
     fn force_charge(&self, n: u32, d: usize, amount: u64) {
-        self.add(n, d, amount, false);
+        self.add(n, &[(d, amount)], false);
     }
 
-    fn add(&self, n: u32, d: usize, amount: u64, check: bool) -> bool {
+    /// Charge each `(dimension, amount)` of `set` to `n` and every ancestor, under one lock: all of
+    /// them, or — when a bounded level lacks the room for one, and `check` asks — none.
+    fn add(&self, n: u32, set: &[(usize, u64)], check: bool) -> bool {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
             return false;
         }
-        let a = i64::try_from(amount).unwrap_or(i64::MAX);
-        let room = Self::left(&nodes, n, d);
-        if check && room >= 0 && a > room {
+        let amount = |a: u64| i64::try_from(a).unwrap_or(i64::MAX);
+        let full = |&(d, a): &(usize, u64)| {
+            let room = Self::left(&nodes, n, d);
+            room >= 0 && amount(a) > room
+        };
+        if check && set.iter().any(full) {
             return false;
         }
-        let chain: Vec<u32> = Self::chain(&nodes, n).collect();
-        for i in chain {
-            let u = &mut nodes[i as usize].used[d];
-            *u = u.saturating_add(a);
+        // #2268 — the process's mappings are every run's to share.
+        let maps = set
+            .iter()
+            .filter(|&&(d, _)| d == BUDGET_MAPS)
+            .map(|&(_, a)| a);
+        if !maps_take(maps.sum(), check) {
+            return false;
         }
+        Self::each_level(&mut nodes, n, |node| {
+            for &(d, a) in set {
+                node.used[d] = node.used[d].saturating_add(amount(a));
+            }
+        });
         true
+    }
+
+    /// `f` over `n` and each ancestor, nearest first: [`Self::chain`] for a walk that writes.
+    fn each_level(nodes: &mut [BudgetNode], n: u32, mut f: impl FnMut(&mut BudgetNode)) {
+        let mut at = Some(n);
+        while let Some(i) = at {
+            let node = &mut nodes[i as usize];
+            f(node);
+            at = node.parent;
+        }
     }
 
     /// What `n`'s subtree has charged of dimension `d`.
@@ -20373,16 +20715,24 @@ impl BudgetTree {
 
     /// The undo of a [`Self::charge`]: return `amount` of dimension `d` to `n` and every ancestor.
     fn refund(&self, n: u32, d: usize, amount: u64) {
+        self.refund_set(n, &[(d, amount)]);
+    }
+
+    /// The undo of an [`Self::add`] of `set`, under one lock.
+    fn refund_set(&self, n: u32, set: &[(usize, u64)]) {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
             return;
         }
-        let a = i64::try_from(amount).unwrap_or(i64::MAX);
-        let chain: Vec<u32> = Self::chain(&nodes, n).collect();
-        for i in chain {
-            let u = &mut nodes[i as usize].used[d];
-            *u = u.saturating_sub(a).max(0);
+        let amount = |a: u64| i64::try_from(a).unwrap_or(i64::MAX);
+        for &(d, a) in set.iter().filter(|&&(d, _)| d == BUDGET_MAPS) {
+            maps_give(amount(a).min(nodes[n as usize].used[d]).max(0) as u64);
         }
+        Self::each_level(&mut nodes, n, |node| {
+            for &(d, a) in set {
+                node.used[d] = node.used[d].saturating_sub(amount(a)).max(0);
+            }
+        });
     }
 
     /// #1944 slice 3 — a fuel draw for a consumer of `n`: up to [`FUEL_CHUNK`], never more than half
@@ -20400,11 +20750,9 @@ impl BudgetTree {
             return None;
         }
         let take = (room as u64).div_ceil(2).min(FUEL_CHUNK);
-        let chain: Vec<u32> = Self::chain(&nodes, n).collect();
-        for i in chain {
-            let u = &mut nodes[i as usize].used[BUDGET_FUEL];
-            *u = u.saturating_add(take as i64);
-        }
+        Self::each_level(&mut nodes, n, |node| {
+            node.used[BUDGET_FUEL] = node.used[BUDGET_FUEL].saturating_add(take as i64);
+        });
         Some(take)
     }
 
@@ -20434,9 +20782,9 @@ impl BudgetTree {
     }
 
     /// A child of `holder`: each requested ceiling clamped to the tightest one along the holder's
-    /// chain (`-1` in a field stays unbounded, bounded by the chain), and `lane` as given. Deducts
+    /// chain (`-1` in a field stays unbounded, bounded by the chain), and the lane as given. Deducts
     /// nothing. `None` for an unknown holder.
-    fn split(&self, holder: u32, ask: [i64; BUDGET_LANE], lane: i64) -> Option<u32> {
+    fn split(&self, holder: u32, ask: [i64; BUDGET_DIMS]) -> Option<u32> {
         let cap = {
             let nodes = self.0.lock_unpoisoned();
             if (holder as usize) >= nodes.len() {
@@ -20444,8 +20792,8 @@ impl BudgetTree {
             }
             Self::bound(&nodes, holder, false)
         };
-        let mut ceiling = [lane; BUDGET_DIMS];
-        for d in 0..BUDGET_LANE {
+        let mut ceiling = ask;
+        for d in (0..BUDGET_DIMS).filter(|&d| d != BUDGET_LANE) {
             ceiling[d] = match (ask[d], cap[d]) {
                 (a, _) if a < 0 => -1,
                 (a, c) if c < 0 => a,
@@ -20490,7 +20838,8 @@ impl BudgetTree {
     /// its own ([`Host::restore_durable_budgets`]), so its children carry `parent: None`.
     ///
     /// A node's `channel` use is carried as `0`: the thaw re-charges every pipe it rebuilds, to the
-    /// thawing root ([`Host::restore_durable_pipes`]), so carrying it too would count it twice. Its
+    /// thawing root ([`Host::restore_durable_pipes`]), so carrying it too would count it twice. So is
+    /// its `maps` use: the thaw re-charges every window, vCPU and region it rebuilds (#2268). Its
     /// `spawn` use is carried as is, like its `mem`: the detached children it counts stay charged
     /// through a freeze, and the thaw files their leases again ([`Host::relaunch_lease`]).
     fn capture(&self, held: impl IntoIterator<Item = u32>, root: u32) -> Vec<DurableBudget> {
@@ -20506,6 +20855,7 @@ impl BudgetTree {
                 let node = &nodes[k as usize];
                 let mut used = node.used;
                 used[BUDGET_CHANNEL] = 0;
+                used[BUDGET_MAPS] = 0;
                 DurableBudget {
                     key: k,
                     parent: node.parent.filter(|&p| p != root),
@@ -20554,63 +20904,82 @@ impl NodeRef {
     /// embedder that keeps its own vCPUs (the Cranelift JIT's threads, #2001) pairs it with
     /// [`Self::vcpu_ended`]; the interpreters hold a [`LiveVcpu`] instead.
     pub fn charge_vcpu(&self) -> bool {
-        self.tree.charge(self.node, BUDGET_SPAWN, 1)
+        self.tree.add(self.node, VcpuCost::SET, true)
     }
 
     /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the
     /// freeze.
     pub fn force_vcpu(&self) {
-        self.tree.force_charge(self.node, BUDGET_SPAWN, 1);
+        self.tree.add(self.node, VcpuCost::SET, false);
     }
 
     /// Hand back a vCPU's charge when it ends.
     pub fn vcpu_ended(&self) {
-        self.tree.refund(self.node, BUDGET_SPAWN, 1);
+        self.tree.refund_set(self.node, VcpuCost::SET);
     }
 
-    /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to the chain, all or
-    /// nothing: `false` when a level's `mem` is full. The Cranelift JIT, which keeps its own fibers,
-    /// pairs it with [`Self::fiber_ended`]; the interpreters hold a [`LiveFiber`] instead.
+    /// #2112 — charge one live fiber ([`FiberCost`]) to the chain, all or nothing: `false` when a
+    /// level's `mem` is full. The Cranelift JIT, which keeps its own fibers, pairs it with
+    /// [`Self::fiber_ended`]; the interpreters hold a [`LiveFiber`] instead.
     pub fn charge_fiber(&self) -> bool {
-        self.tree
-            .charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK)
+        self.tree.add(self.node, FiberCost::SET, true)
     }
 
     /// [`Self::charge_fiber`] past any ceiling: a fiber a thaw re-creates, which lived before the
     /// freeze.
     pub fn force_fiber(&self) {
-        self.tree
-            .force_charge(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+        self.tree.add(self.node, FiberCost::SET, false);
     }
 
     /// Hand back a fiber's charge when it ends.
     pub fn fiber_ended(&self) {
-        self.tree
-            .refund(self.node, BUDGET_MEM, temen_ir::FIBER_STACK);
+        self.tree.refund_set(self.node, FiberCost::SET);
     }
 }
 
-/// #2001, #2112 — what a live vCPU or fiber holds of its domain's node: `N` of dimension `D`, charged to
-/// the node and every ancestor when it is made and handed back when this is dropped.
-pub struct Held<const D: usize, const N: u64>(Option<NodeRef>);
+/// What a [`Held`] use costs its node and every ancestor: one `(dimension, amount)` per dimension it
+/// charges, all of them or none.
+pub trait Cost {
+    const SET: &'static [(usize, u64)];
+}
 
-impl<const D: usize, const N: u64> Held<D, N> {
+/// #2001, #2268 — a live vCPU's [`Cost`]: one `spawn`, and its thread's [`MAPS_PER_VCPU`] mappings.
+pub struct VcpuCost;
+
+impl Cost for VcpuCost {
+    const SET: &'static [(usize, u64)] = &[(BUDGET_SPAWN, 1), (BUDGET_MAPS, MAPS_PER_VCPU)];
+}
+
+/// #2112 — a live fiber's [`Cost`]: [`temen_ir::FIBER_STACK`] of `mem`. Its stack is a slot of the
+/// process's one fiber arena, whose few mappings the host keeps for itself ([`maps_pool`]).
+pub struct FiberCost;
+
+impl Cost for FiberCost {
+    const SET: &'static [(usize, u64)] = &[(BUDGET_MEM, temen_ir::FIBER_STACK)];
+}
+
+/// #2001, #2112 — what a live vCPU or fiber holds of its domain's node: its [`Cost`], charged to the
+/// node and every ancestor when it is made and handed back when this is dropped.
+pub struct Held<C: Cost>(Option<NodeRef>, core::marker::PhantomData<C>);
+
+impl<C: Cost> Held<C> {
     /// Charge `node` and every ancestor: `None`, with nothing charged, when a level is full. The guard
     /// is built only once the charge took: a refused one dropped would hand back what was never
     /// charged. Public for an embedder that keeps its own vCPUs (the Cranelift JIT's processes).
     pub fn charge(node: NodeRef) -> Option<Self> {
-        node.tree.charge(node.node, D, N).then(|| Held(Some(node)))
+        let held = node.tree.add(node.node, C::SET, true);
+        held.then(|| Held(Some(node), core::marker::PhantomData))
     }
 
     /// Charge `node` past any ceiling: what a thaw re-creates, which lived before the freeze.
     pub(crate) fn force(node: NodeRef) -> Self {
-        node.tree.force_charge(node.node, D, N);
-        Held(Some(node))
+        node.tree.add(node.node, C::SET, false);
+        Held(Some(node), core::marker::PhantomData)
     }
 
     /// One that holds no charge.
     pub(crate) fn none() -> Self {
-        Held(None)
+        Held(None, core::marker::PhantomData)
     }
 
     /// Whether this holds a charge.
@@ -20619,27 +20988,28 @@ impl<const D: usize, const N: u64> Held<D, N> {
     }
 }
 
-impl<const D: usize, const N: u64> Drop for Held<D, N> {
+impl<C: Cost> Drop for Held<C> {
     fn drop(&mut self) {
         if let Some(n) = &self.0 {
-            n.tree.refund(n.node, D, N);
+            n.tree.refund_set(n.node, C::SET);
         }
     }
 }
 
-/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node: one `spawn`, so a node's `spawn`
-/// counts the live vCPUs of its subtree (the cgroups `pids.max` model).
+/// #1944 slice 3, #2001 — a live vCPU's charge on its domain's node ([`VcpuCost`]): one `spawn`, so a
+/// node's `spawn` counts the live vCPUs of its subtree (the cgroups `pids.max` model), and its
+/// thread's mappings (#2268).
 ///
 /// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
 /// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
 /// either the run's own, which no guest reads, or a detached child's, whose admission charged the
 /// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]). A carve
 /// child's holds none either, until #1867 deletes the carve path.
-pub type LiveVcpu = Held<BUDGET_SPAWN, 1>;
+pub type LiveVcpu = Held<VcpuCost>;
 
 /// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
 /// `cont.new` makes it ([`Host::fiber_charge`]) and handed back when it returns or its registry goes.
-pub type LiveFiber = Held<BUDGET_MEM, { temen_ir::FIBER_STACK }>;
+pub type LiveFiber = Held<FiberCost>;
 
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
@@ -21977,7 +22347,8 @@ pub(crate) struct ChildPowerbox {
     attestation: Attestation,
     durable: bool,
     own_budget: u32,
-    grown: u64,
+    /// #1909, #2268 — its window's accounting, which the restored tree still charges.
+    held: WindowHeld,
     lane_cap: i64,
 }
 
@@ -22517,8 +22888,19 @@ fn translate_cap_slots(
 // The `Host` *is* the region minter — the narrow authority a `HostProcRegion` handler is handed. It
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
+    /// #2268 — the region a capability maps a file as (§4b) is the guest's: its mapping is charged
+    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives.
     fn grant_region(&mut self, backing: RegionBacking) -> i32 {
-        self.grant_shared_region_backed(backing)
+        if !self.budgets.add(self.own_budget, &region_cost(0), true) {
+            return ENOMEM as i32;
+        }
+        let backing: RegionBacking = Arc::new(ChargedRegion {
+            backing,
+            node: self.own_node(),
+            bytes: 0,
+        });
+        self.try_grant_shared_region_backed(backing)
+            .unwrap_or(EMFILE as i32)
     }
 }
 
@@ -23033,6 +23415,18 @@ pub struct Host {
     /// activation opens ([`Host::begin_activation`]) and handed back with the window. A detached
     /// child's first vCPU rides its admission lease instead.
     main_vcpu: bool,
+    /// #2268 — the runs of page state this domain's window has ([`PageClass`]), its OS mappings on a
+    /// JIT: counted as the window starts ([`Host::start_window`]), then what each page op leaves
+    /// ([`Host::page_op`]).
+    runs: u64,
+    /// #2268 — what this domain holds of `maps` for its window's [`Self::runs`] past [`WINDOW_RUNS`],
+    /// on `own_budget` and every ancestor. Handed back with its memory ([`Host::release_memory`]).
+    maps: u64,
+    /// #2268 — [`MAPS_PER_DOMAIN`] while this domain holds it itself: a run's root, from its
+    /// activation ([`Host::begin_activation`]), and a process, from its creation
+    /// ([`Host::process_powerbox`]), across an exec, as [`Self::own_window`] is. A detached child's
+    /// lease holds it instead ([`Lease`]).
+    domain_maps: u64,
     /// #2220 — this domain has ended: its memory went back ([`Host::release_memory`]), so nothing
     /// more is granted into it ([`Host::grant_running_child`]) — a pipe end granted after its ends
     /// were released would hold its count forever. Set under the domain's lock, so a grant either
@@ -24004,6 +24398,9 @@ impl Host {
             grown: 0,
             own_window: 0,
             main_vcpu: false,
+            runs: WINDOW_RUNS,
+            maps: 0,
+            domain_maps: 0,
             ended: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
@@ -24116,29 +24513,36 @@ impl Host {
     /// `Host` field leaves it at the `Host::new` default in the twin until this is revisited.
     ///
     /// #1909, #2106 — the twin's window is a copy of this one, `window` declared bytes and the grown
-    /// tail past them, so the twin pays for both ([`Self::process_powerbox`]): a level without the
-    /// room refuses the fork, as a full `spawn` ceiling does.
+    /// tail past them, and (#2268) its runs of page state, so the twin pays for all of them
+    /// ([`Self::process_powerbox`]): a level without the room refuses the fork, as a full `spawn`
+    /// ceiling does.
     fn fork_powerbox(&self, twin_pid: u64, window: u64) -> Option<Host> {
-        self.process_powerbox(twin_pid, window, self.grown)
+        self.process_powerbox(twin_pid, window, self.grown, self.runs)
     }
 
     /// #2106, INVARIANTS #3 R2 — [`Self::powerbox_copy`] for a new process whose window starts with
-    /// `window` declared bytes and `grown` past them. A new window spends `Budget.mem`, so the process
-    /// pays for it: charged to the node it shares with this domain and every ancestor, all or nothing,
-    /// before any fork factory runs, so a refusal registers no process. It goes back when the process
-    /// ends ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or
-    /// the powerbox cannot be duplicated.
-    fn process_powerbox(&self, pid: u64, window: u64, grown: u64) -> Option<Host> {
-        let charge = window + grown;
-        if !self.budgets.charge(self.own_budget, BUDGET_MEM, charge) {
+    /// `window` declared bytes, `grown` past them and (#2268) `runs` runs of page state. A new window
+    /// spends `Budget.mem`, and a new domain the host's mappings, so the process pays for them:
+    /// charged to the node it shares with this domain and every ancestor, all or nothing, before any
+    /// fork factory runs, so a refusal registers no process. They go back when the process ends
+    /// ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or the
+    /// powerbox cannot be duplicated.
+    fn process_powerbox(&self, pid: u64, window: u64, grown: u64, runs: u64) -> Option<Host> {
+        let maps = runs.saturating_sub(WINDOW_RUNS);
+        let cost = [
+            (BUDGET_MEM, window + grown),
+            (BUDGET_MAPS, MAPS_PER_DOMAIN + maps),
+        ];
+        if !self.budgets.add(self.own_budget, &cost, true) {
             return None;
         }
         let Some(mut twin) = self.powerbox_copy(pid) else {
-            self.budgets.refund(self.own_budget, BUDGET_MEM, charge);
+            self.budgets.refund_set(self.own_budget, &cost);
             return None;
         };
         twin.own_window = window;
         twin.grown = grown;
+        (twin.runs, twin.maps, twin.domain_maps) = (runs, maps, MAPS_PER_DOMAIN);
         Some(twin)
     }
 
@@ -25540,7 +25944,7 @@ impl Host {
             clock_ns: self.clock_ns,
             cap_consumed: self.cap_consumed,
             cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
-            held: (self.grown, self.own_window, self.main_vcpu),
+            held: self.window_held(),
             jit_mark: self.jit_compile_mark(),
         }
     }
@@ -25576,7 +25980,7 @@ impl Host {
         if let Some(rec) = self.cap_record.as_mut() {
             rec.truncate(c.cap_record_len);
         }
-        (self.grown, self.own_window, self.main_vcpu) = c.held;
+        self.set_window_held(c.held);
     }
 
     /// Whether this host's run-mutable state is invertible by a [`HostCursor`] alone — the journal's
@@ -25647,7 +26051,7 @@ impl Host {
             svc_results,
             svc_next_ticket,
             cap_states: self.capture_cap_states(),
-            held: (self.grown, self.own_window, self.main_vcpu),
+            held: self.window_held(),
             jit_quota: self
                 .jit_tables
                 .iter()
@@ -25689,7 +26093,7 @@ impl Host {
             s.svc_results.clone(),
             s.svc_next_ticket,
         );
-        (self.grown, self.own_window, self.main_vcpu) = s.held;
+        self.set_window_held(s.held);
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them. Under a replaying tape too: a replay re-runs such a
@@ -25813,6 +26217,16 @@ impl Host {
                 m
             }
         }
+    }
+
+    /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
+    /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
+    /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
+    pub fn start_window_pages(&mut self, base: usize) -> CapPageMap {
+        if !matches!(self.cap_pages, Some((UNCLAIMED_BASE, _))) {
+            self.cap_pages = None;
+        }
+        self.cap_window_pages(base)
     }
 
     /// Start the JIT window page map (see [`Host::cap_window_pages`]) of a run about to build a fresh
@@ -26568,8 +26982,8 @@ impl Host {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        self.budgets
-            .force_charge(self.own_budget, BUDGET_CHANNEL, bytes.len() as u64);
+        let cost = region_cost(bytes.len() as u64);
+        self.budgets.add(self.own_budget, &cost, false);
         Arc::new(ChargedRegion {
             backing,
             node: self.own_node(),
@@ -26899,12 +27313,10 @@ impl Host {
         for i in 0..nodes.len() {
             let carried = nodes[i].ceiling;
             let offered = hook(carried);
+            // Every dimension, so one added later cannot be widened unchecked.
             let ok = offered.is_some_and(|o| {
-                attenuates(carried.fuel, o.fuel)
-                    && attenuates(carried.mem, o.mem)
-                    && attenuates(carried.spawn, o.spawn)
-                    && attenuates(carried.channel, o.channel)
-                    && attenuates(carried.lane, o.lane)
+                let pairs = carried.dims().into_iter().zip(o.dims());
+                pairs.into_iter().all(|(c, o)| attenuates(c, o))
             });
             match (ok, offered) {
                 (true, Some(o)) => nodes[i].ceiling = o,
@@ -27039,17 +27451,18 @@ impl Host {
         self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
     }
 
-    /// #2113 — the embedder's grant to the run this domain roots: its own node's `mem`, `channel` and
-    /// `spawn` ceilings (`-1` = unbounded), which bound everything charged under it — the domain's
-    /// windows, fibers, regions, pipes and vCPUs, and its children's. A run's root holds the default
-    /// grant until this is called ([`DEFAULT_MEM`]); its fuel is granted per activation
+    /// #2113 — the embedder's grant to the run this domain roots: its own node's `mem`, `channel`,
+    /// `spawn` and `maps` ceilings (`-1` = unbounded), which bound everything charged under it — the
+    /// domain's windows, fibers, regions, pipes and vCPUs, and its children's. A run's root holds the
+    /// default grant until this is called ([`DEFAULT_MEM`]); its fuel is granted per activation
     /// ([`Self::begin_activation`]).
-    pub fn set_grant(&mut self, mem: i64, channel: i64, spawn: i64) {
+    pub fn set_grant(&mut self, mem: i64, channel: i64, spawn: i64, maps: i64) {
         self.budgets.set_ceiling(self.own_budget, BUDGET_MEM, mem);
         self.budgets
             .set_ceiling(self.own_budget, BUDGET_CHANNEL, channel);
         self.budgets
             .set_ceiling(self.own_budget, BUDGET_SPAWN, spawn);
+        self.budgets.set_ceiling(self.own_budget, BUDGET_MAPS, maps);
     }
 
     /// #989 — set this domain's own node's channel-memory ceiling (bytes); `-1` = unbounded. The carve
@@ -27130,23 +27543,19 @@ impl Host {
     /// a refused spawn charges nothing. `Some(lane)` = admitted (the lane to stamp on the child and to
     /// return at its reap); `None` = refused, probeably. The window's lease hands the `mem` and the
     /// vCPU back when the child ends ([`Host::release_detached`]).
-    pub fn admit_detached_spawn(&mut self, budget: i32, child_size: u64) -> Option<i64> {
+    pub fn admit_detached_spawn(&mut self, lease: Lease) -> Option<i64> {
         // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
         // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
         // Checked first, so a refusal charges nothing.
         if self.durable && !self.holds_freeze_authority(FreezeScope::DetachedProgeny) {
             return None;
         }
-        let lane = self.peek_budget(budget).map_or(-1, |b| b.lane);
+        let lane = self.peek_budget(lease.budget).map_or(-1, |b| b.lane);
         if !self.try_grant_lane(lane) {
             return None;
         }
-        if !self.budget_mem_take(budget, child_size) {
-            self.give_lane(lane);
-            return None;
-        }
-        if !self.budget_charge(budget, BUDGET_SPAWN, 1) {
-            self.budget_mem_give(budget, child_size);
+        let node = self.budget_node(lease.budget);
+        if !node.is_some_and(|n| self.budgets.add(n, &lease.cost(), true)) {
             self.give_lane(lane);
             return None;
         }
@@ -27154,21 +27563,20 @@ impl Host {
     }
 
     /// #1975 — the undo of [`Host::admit_detached_spawn`], for a spawn that goes no further after its
-    /// admission: the window's bytes and the first vCPU go back to the budget and the lane to this
-    /// domain's Σ, so a spawn refused after its admission charges nothing, as one refused before it does.
-    pub fn undo_detached_spawn(&mut self, budget: i32, child_size: u64, lane: i64) {
-        self.release_detached(budget, child_size);
+    /// admission: what its lease holds goes back to the budget and the lane to this domain's Σ, so a
+    /// spawn refused after its admission charges nothing, as one refused before it does.
+    pub fn undo_detached_spawn(&mut self, lease: Lease, lane: i64) {
+        self.release_detached(lease);
         self.give_lane(lane);
     }
 
     /// #1877, #1944 slice 3 — a detached child's window lease, settled: the child ended (joined or
-    /// reaped), or its spawn failed after the admission, so its window's `bytes` of `mem` and its first
-    /// vCPU go back to the budget that paid for them, at every level. Never on a freeze: a frozen
+    /// reaped), or its spawn failed after the admission, so what its admission charged (its
+    /// [`Lease`]) goes back to the budget that paid for it, at every level. Never on a freeze: a frozen
     /// child stays charged, and the thaw's relaunch files the lease again ([`Host::relaunch_lease`]).
-    pub fn release_detached(&mut self, budget: i32, bytes: u64) {
-        self.budget_mem_give(budget, bytes);
-        if let Some(node) = self.budget_node(budget) {
-            self.budgets.refund(node, BUDGET_SPAWN, 1);
+    pub fn release_detached(&mut self, lease: Lease) {
+        if let Some(node) = self.budget_node(lease.budget) {
+            self.budgets.refund_set(node, &lease.cost());
         }
     }
 
@@ -27177,14 +27585,26 @@ impl Host {
     /// `"budget"`), and the window's size, `1 << window_log2`. The same lease op 15 filed at the spawn,
     /// so the thawed child's end hands its window back as an unfrozen child's does. `None` when `child`
     /// holds no budget or this domain no handle on it.
-    pub fn relaunch_lease(&self, child: &Host, window_log2: u8) -> Option<(i32, u64)> {
+    ///
+    /// #2268 — a freeze carries no `maps` (each process's mappings are its own), so the lease's are
+    /// charged again here, past any ceiling: the bound on its window's runs from its program
+    /// ([`window_runs_bound`]), the window's §13 pages counted with the rest once it starts.
+    pub fn relaunch_lease(&self, child: &Host, window_log2: u8) -> Option<Lease> {
         let node = child.budget_node(child.resolve_cap_name("budget")?)?;
         let slot = self
             .table
             .iter()
             .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
         let handle = slot as u32 | ((self.table[slot].generation & GEN_MASK) << CAP_LOG2);
-        Some((handle as i32, 1u64 << window_log2))
+        let data = child.self_module.as_ref().map_or(&[][..], |m| &m.data[..]);
+        let lease = Lease {
+            budget: handle as i32,
+            bytes: 1u64 << window_log2,
+            runs: window_runs_bound(data, false),
+        };
+        let maps = lease.cost().into_iter().filter(|&(d, _)| d == BUDGET_MAPS);
+        self.budgets.add(node, &maps.collect::<Vec<_>>(), false);
+        Some(lease)
     }
 
     /// The node a live `Budget` handle names.
@@ -27219,12 +27639,19 @@ impl Host {
     /// page given back (unmapped, or aliased to a region) is refunded; one protected to nothing keeps
     /// its contents, and its charge. A run's root's window is metered against the run's own node, its
     /// embedder's grant (#2113).
+    ///
+    /// #2268 — likewise the runs of page state the op adds to the window, which are its OS mappings
+    /// on a JIT: `change` says what the op does to its pages' classes, and the growth that predicts
+    /// past a fresh window's runs is charged to `maps` first, all or nothing; after the op the charge
+    /// is settled to the runs it left. Every engine counts the same page map, so each refuses the
+    /// same op.
     fn page_op(
         &mut self,
         mem: &mut dyn GuestMem,
         off: u64,
         len: u64,
         commits: Commits,
+        change: ClassChange,
         op: impl FnOnce(&Host, &mut dyn GuestMem) -> i64,
     ) -> i64 {
         let grown = self.grown;
@@ -27235,19 +27662,47 @@ impl Host {
             Commits::Every => before.tail - held,
             Commits::Own => before.tail - held - before.aliased,
         };
-        if worst > 0 && !self.budgets.charge(self.own_budget, BUDGET_MEM, worst) {
+        // #2268 — and the runs of page state it would leave past a fresh window's.
+        let (was, will) = mem.page_runs(off, len, change);
+        let extra = |runs: u64| runs.saturating_sub(WINDOW_RUNS);
+        let more = extra((self.runs + will).saturating_sub(was)).saturating_sub(extra(self.runs));
+        let charge = [(BUDGET_MEM, worst), (BUDGET_MAPS, more)];
+        if (worst > 0 || more > 0) && !self.budgets.add(self.own_budget, &charge, true) {
             return ENOMEM;
         }
         let r = op(self, mem);
+        // The runs it left: what it predicted when it took effect, recounted in a debug build.
+        let left = if r == 0 && !cfg!(debug_assertions) {
+            will
+        } else {
+            mem.page_runs(off, len, ClassChange::Keep).0
+        };
+        debug_assert!(
+            r != 0 || left == will,
+            "a page op left {left} runs where {will} were predicted"
+        );
+        let runs = (self.runs + left).saturating_sub(was);
+        let (charged, owed) = (extra(self.runs) + more, extra(runs));
+        self.maps = (self.maps + owed).saturating_sub(extra(self.runs));
+        self.runs = runs;
         let after = mem.tail_bytes(off, len).held;
         let now = (grown + after).saturating_sub(held);
         debug_assert!(
             now <= grown + worst,
             "a page op held more than it was charged"
         );
-        let back = (grown + worst).saturating_sub(now);
-        if back > 0 {
-            self.budgets.refund(self.own_budget, BUDGET_MEM, back);
+        // Settled to what the op left: what the worst case charged past it goes back, under one
+        // lock, and runs a failed op left past its prediction are charged regardless.
+        let back = [
+            (BUDGET_MEM, (grown + worst).saturating_sub(now)),
+            (BUDGET_MAPS, charged.saturating_sub(owed)),
+        ];
+        if back.iter().any(|&(_, a)| a > 0) {
+            self.budgets.refund_set(self.own_budget, &back);
+        }
+        if owed > charged {
+            self.budgets
+                .force_charge(self.own_budget, BUDGET_MAPS, owed - charged);
         }
         self.grown = now;
         r
@@ -27270,12 +27725,69 @@ impl Host {
         if held > 0 {
             self.budgets.refund(self.own_budget, BUDGET_MEM, held);
         }
+        self.release_maps();
         if std::mem::take(&mut self.main_vcpu) {
-            self.budgets.refund(self.own_budget, BUDGET_SPAWN, 1);
+            self.budgets.refund_set(self.own_budget, VcpuCost::SET);
         }
         if self.own_budget != BudgetTree::RUN_NODE {
             self.regions.clear();
         }
+    }
+
+    /// #2268 — hand back what this domain holds of `maps` itself ([`Self::maps`],
+    /// [`Self::domain_maps`]): its window is gone.
+    fn release_maps(&mut self) {
+        let held = std::mem::take(&mut self.maps) + std::mem::take(&mut self.domain_maps);
+        if held > 0 {
+            self.budgets.refund(self.own_budget, BUDGET_MAPS, held);
+        }
+        self.runs = WINDOW_RUNS;
+    }
+
+    /// #2113, #2268 — this domain's half of its window's accounting.
+    pub(crate) fn window_held(&self) -> WindowHeld {
+        WindowHeld {
+            grown: self.grown,
+            own_window: self.own_window,
+            main_vcpu: self.main_vcpu,
+            runs: self.runs,
+            maps: self.maps,
+            domain_maps: self.domain_maps,
+        }
+    }
+
+    /// #2113, #2268 — put back a [`Self::window_held`], with the tree that holds its charges.
+    pub(crate) fn set_window_held(&mut self, h: WindowHeld) {
+        WindowHeld {
+            grown: self.grown,
+            own_window: self.own_window,
+            main_vcpu: self.main_vcpu,
+            runs: self.runs,
+            maps: self.maps,
+            domain_maps: self.domain_maps,
+        } = h;
+    }
+
+    /// #2268 — this domain's window has started, before its guest runs, with `runs` runs of page
+    /// state ([`GuestMem::window_runs`]), which its page ops count from: it holds their count past
+    /// [`WINDOW_RUNS`] of `maps` ([`Self::maps`]), past any ceiling — the window exists, and what could
+    /// refuse it was its admission, or its embedder's choice to run it. Every engine calls this where
+    /// a window starts: a root's activation ([`Self::begin_activation`]), and the JIT's window-ready
+    /// hook and the interpreters' builds of a detached child's window.
+    pub fn start_window(&mut self, runs: u64) {
+        let (held, owed) = (
+            self.runs.saturating_sub(WINDOW_RUNS),
+            runs.saturating_sub(WINDOW_RUNS),
+        );
+        if owed > held {
+            self.budgets
+                .force_charge(self.own_budget, BUDGET_MAPS, owed - held);
+        } else if held > owed {
+            self.budgets
+                .refund(self.own_budget, BUDGET_MAPS, held - owed);
+        }
+        self.maps = (self.maps + owed).saturating_sub(held);
+        self.runs = runs;
     }
 
     /// #1944 slice 3, #2113 — open an activation of the run this domain roots, over `window`, with
@@ -27296,8 +27808,14 @@ impl Host {
         self.budgets
             .force_charge(self.own_budget, BUDGET_MEM, window.declared + window.grown);
         (self.own_window, self.grown) = (window.declared, window.grown);
+        // #2268 — its mappings: the domain's own, then its window's runs.
+        self.release_maps();
+        self.budgets
+            .force_charge(self.own_budget, BUDGET_MAPS, MAPS_PER_DOMAIN);
+        self.domain_maps = MAPS_PER_DOMAIN;
+        self.start_window(window.runs);
         if !std::mem::replace(&mut self.main_vcpu, true) {
-            self.budgets.force_charge(self.own_budget, BUDGET_SPAWN, 1);
+            self.budgets.add(self.own_budget, VcpuCost::SET, false);
         }
         self.own_node()
     }
@@ -29335,10 +29853,11 @@ impl Host {
     /// #989 — [`grant_budget`] with an explicit `channel` (host-served channel-memory) dimension.
     /// A node under this domain's own, with these ceilings (`-1` = unbounded).
     pub fn grant_budget_channel(&mut self, fuel: i64, mem: i64, spawn: i64, channel: i64) -> i32 {
-        // D66: the lane is unbounded unless a `split` narrows it.
+        // D66: the lane is unbounded unless a `split` narrows it; `maps` is left to the levels
+        // above (#2268).
         let id = self.budgets.mint(
             Some(self.own_budget),
-            [fuel, mem, spawn, channel, -1],
+            [fuel, mem, spawn, channel, -1, -1],
             [0; BUDGET_DIMS],
         );
         self.grant(cap_id::BUDGET, Binding::Budget(id))
@@ -30607,7 +31126,7 @@ impl Host {
             attestation: self.attestation,
             durable: self.durable,
             own_budget: self.own_budget,
-            grown: self.grown,
+            held: self.window_held(),
             lane_cap: self.lane_cap,
         })
     }
@@ -30621,8 +31140,8 @@ impl Host {
         child.attestation = pb.attestation;
         child.budgets = Arc::clone(&self.budgets);
         child.own_budget = pb.own_budget;
-        // #1909 — the growth the checkpoint's window held, which the restored tree still charges.
-        child.grown = pb.grown;
+        // #1909, #2268 — what the checkpoint's window held, which the restored tree still charges.
+        child.set_window_held(pb.held);
         child.lane_cap = pb.lane_cap;
         child.restore_durable_handles(&pb.handles);
         child.cap_names = pb.names.clone();
@@ -30640,9 +31159,17 @@ impl Host {
         self.budgets.0.lock_unpoisoned().clone()
     }
 
-    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it.
+    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it. #2268 — the
+    /// process's pool of mappings follows what the tree holds of `maps`.
     pub(crate) fn set_budget_tree(&self, nodes: &[BudgetNode]) {
-        *self.budgets.0.lock_unpoisoned() = nodes.to_vec();
+        let mut tree = self.budgets.0.lock_unpoisoned();
+        let (was, now) = (BudgetTree::maps_held(&tree), BudgetTree::maps_held(nodes));
+        if now > was {
+            maps_take(now - was, false);
+        } else {
+            maps_give(was - now);
+        }
+        *tree = nodes.to_vec();
     }
 
     /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
@@ -30859,7 +31386,7 @@ impl Host {
     /// a level of the shared node lacks the room for the window.
     pub fn spawn_powerbox(&mut self, pid: u64, plan: SpawnPlan, window: u64) -> Option<Host> {
         let pages = self.cap_pages.take();
-        let twin = self.process_powerbox(pid, window, 0);
+        let twin = self.process_powerbox(pid, window, 0, WINDOW_RUNS);
         self.cap_pages = pages;
         let twin = twin?;
         if let Some((_, source)) = twin.signal_poll() {
@@ -31222,6 +31749,9 @@ impl Host {
         // for itself stays paid for, as a root's main vCPU stays charged (#2113).
         host.own_window = std::mem::take(&mut self.own_window);
         host.main_vcpu = std::mem::take(&mut self.main_vcpu);
+        // #2268 — and so is the domain's own share of the host's mappings; the new window's runs are
+        // counted once it starts ([`Self::start_window`]).
+        host.domain_maps = std::mem::take(&mut self.domain_maps);
         // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
         // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
         // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
@@ -32097,14 +32627,25 @@ impl Host {
                         let region_off = *args.get(1).unwrap_or(&0) as u64;
                         let len = *args.get(2).unwrap_or(&0) as u64;
                         let prot = *args.get(3).unwrap_or(&0) as i32;
-                        self.page_op(mem, win_off, len, Commits::Nothing, |h, m| {
+                        // #2268 — every page becomes the next page of one alias of the region.
+                        let page = mem.page_size().max(1) as u64;
+                        let alias = PageClass::alias(
+                            region,
+                            win_off / page,
+                            region_off,
+                            page,
+                            prot & PROT_WRITE != 0,
+                        );
+                        let change = ClassChange::Every(alias);
+                        self.page_op(mem, win_off, len, Commits::Nothing, change, |h, m| {
                             h.region_map(m, win_off, region_off, len, prot, region, backing)
                         })
                     }
                     1 => {
                         let win_off = *args.first().unwrap_or(&0) as u64;
                         let len = *args.get(1).unwrap_or(&0) as u64;
-                        self.page_op(mem, win_off, len, Commits::Nothing, |h, m| {
+                        let gone = ClassChange::Every(PageClass::Own(0));
+                        self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
                             if let Some(hook) = &h.region_hook {
                                 hook(win_off, len, None);
                             }
@@ -32125,7 +32666,7 @@ impl Host {
                 };
                 match op {
                     0 => {
-                        // split(fuel, mem, spawn[, channel[, lane]]) -> sub_handle | -errno. A child node
+                        // split(fuel, mem, spawn[, channel[, lane[, maps]]]) -> sub_handle | -errno. A child node
                         // under this one: each requested ceiling is clamped to the tightest along this
                         // node's chain, and `-1` leaves the child unbounded on its own, so only its
                         // ancestors cap it. Deducts nothing: a ceiling is a cap, not a reservation.
@@ -32144,8 +32685,10 @@ impl Host {
                             *args.get(1).unwrap_or(&0),
                             *args.get(2).unwrap_or(&0),
                             *args.get(3).unwrap_or(&-1), // #989 — omitted ⇒ unbounded (the chain caps it)
+                            lane,
+                            *args.get(5).unwrap_or(&-1), // #2268 — omitted ⇒ unbounded (the chain caps it)
                         ];
-                        let Some(child) = tree.split(node, ask, lane) else {
+                        let Some(child) = tree.split(node, ask) else {
                             return Ok(vec![EINVAL]);
                         };
                         // A full handle table (-EMFILE) leaves the minted node unreferenced: nothing
@@ -32158,10 +32701,11 @@ impl Host {
                         ])
                     }
                     // read(field) -> room | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15 monitoring
-                    // readout), `3` channel — the room left along the chain, the least any level has
-                    // left (`-1` when every level is unbounded) — and `4` lane, this node's own.
+                    // readout), `3` channel and `5` maps — the room left along the chain, the least
+                    // any level has left (`-1` when every level is unbounded) — and `4` lane, this
+                    // node's own.
                     1 => Ok(vec![match *args.first().unwrap_or(&-1) {
-                        f @ 0..=4 => room[f as usize],
+                        f @ 0..=5 => room[f as usize],
                         _ => EINVAL,
                     }]),
                     2 => {
@@ -32238,7 +32782,7 @@ impl Host {
                     }
                     if !self
                         .budgets
-                        .charge(self.own_budget, BUDGET_CHANNEL, len as u64)
+                        .add(self.own_budget, &region_cost(len as u64), true)
                     {
                         return Ok(vec![ENOMEM]);
                     }
@@ -32282,15 +32826,28 @@ impl Host {
                 let at = base + off;
                 let access = prot & (PROT_READ | PROT_WRITE) != 0;
                 let commits = |c| if access { c } else { Commits::Nothing };
+                // #2268 — what each op does to its pages' classes: a `map` makes them the window's
+                // own, an `unmap` (or a `protect` to nothing, which ends an alias) inaccessible.
+                let own = ClassChange::Every(PageClass::own(prot));
+                let gone = ClassChange::Every(PageClass::Own(0));
                 Ok(vec![match op {
                     0 => {
                         let every = commits(Commits::Every);
-                        self.page_op(mem, at, len, every, |_, m| m.map(at, len, prot))
+                        self.page_op(mem, at, len, every, own, |_, m| m.map(at, len, prot))
                     }
-                    1 => self.page_op(mem, at, len, Commits::Nothing, |_, m| m.unmap(at, len)),
+                    1 => self.page_op(mem, at, len, Commits::Nothing, gone, |_, m| {
+                        m.unmap(at, len)
+                    }),
                     2 => {
-                        let own = commits(Commits::Own);
-                        self.page_op(mem, at, len, own, |_, m| m.protect(at, len, prot))
+                        let commit = commits(Commits::Own);
+                        let change = if access {
+                            ClassChange::Protect(prot)
+                        } else {
+                            gone
+                        };
+                        self.page_op(mem, at, len, commit, change, |_, m| {
+                            m.protect(at, len, prot)
+                        })
                     }
                     _ => EINVAL,
                 }])
@@ -33732,6 +34289,35 @@ impl Mem {
     /// Context `ctx`'s per-context **thaw** state word.
     pub(crate) fn thaw_state_off(&self, ctx: usize) -> u64 {
         self.shadow.thaw_state_off(ctx)
+    }
+
+    /// #2268 — the runs of `pages` of this window's page map, before and after `change`
+    /// ([`page_runs`]).
+    fn runs(
+        &self,
+        pages: core::ops::RangeInclusive<u64>,
+        edges: (bool, bool),
+        change: ClassChange,
+    ) -> (u64, u64) {
+        let space = self.space_read();
+        page_runs(
+            &space.prot,
+            pages,
+            self.null_guard / self.page,
+            self.window.mapped().div_ceil(self.page),
+            |p, s| match *s {
+                PageProt::Rw => PageClass::Own(2),
+                PageProt::Ro => PageClass::Own(1),
+                PageProt::Unmapped => PageClass::Own(0),
+                PageProt::Backed {
+                    region,
+                    region_off,
+                    writable,
+                } => PageClass::alias(region, p, region_off, self.page, writable),
+            },
+            edges,
+            change,
+        )
     }
 
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
@@ -35274,6 +35860,26 @@ impl GuestMem for Mem {
         )
     }
 
+    fn page_runs(&self, offset: u64, len: u64, change: ClassChange) -> (u64, u64) {
+        let Ok(pages) = self.prot_pages(offset, len) else {
+            return (0, 0);
+        };
+        let (first, last) = (*pages.start(), *pages.end());
+        let end = self.window.reserved().div_ceil(self.page) - 1;
+        let (lo, hi) = (first.saturating_sub(1), (last + 1).min(end));
+        self.runs(lo..=hi, (lo < first, hi > last), change)
+    }
+
+    fn window_runs(&self) -> u64 {
+        match self.window.reserved().div_ceil(self.page) {
+            0 => 0,
+            pages => {
+                self.runs(0..=pages - 1, (false, false), ClassChange::Keep)
+                    .0
+            }
+        }
+    }
+
     /// §3e op 2 `protect`: change the protection of mapped pages without touching their backing
     /// (the D40 read-only const-segment mechanism: `protect(READ)` ⇒ later stores fault). A §13
     /// aliased page stays aliased — only its writability changes (or it `unmap`s if neither R nor W),
@@ -35397,6 +36003,12 @@ impl GuestMem for SoleMem<'_> {
     }
     fn tail_bytes(&self, offset: u64, len: u64) -> TailBytes {
         self.0.tail_bytes(offset, len)
+    }
+    fn page_runs(&self, offset: u64, len: u64, change: ClassChange) -> (u64, u64) {
+        self.0.page_runs(offset, len, change)
+    }
+    fn window_runs(&self) -> u64 {
+        self.0.window_runs()
     }
     fn map_region(
         &mut self,
@@ -36115,7 +36727,7 @@ mod growth_tests {
     /// AddressSpace)`.
     fn root(mem: i64) -> (Host, Mem, i32) {
         let mut root = Host::new();
-        root.set_grant(mem, -1, -1);
+        root.set_grant(mem, -1, -1, -1);
         let (_, space) = root.grant_starter_caps(1 << 20);
         let mem = Mem::with_reservation(20, 16, None);
         let window = RootWindow::of(Some(&mem));
@@ -36135,6 +36747,7 @@ mod growth_tests {
         let wider = RootWindow {
             declared: 2 * WINDOW,
             grown: GROWTH,
+            runs: WINDOW_RUNS,
         };
         let _ = root.begin_activation(u64::MAX, wider);
         assert_eq!(
@@ -37118,6 +37731,134 @@ mod mem_fork_tests {
         assert!(
             !Arc::ptr_eq(&twin.back, &m.back),
             "flat, but its own backing — never an alias of the parent's"
+        );
+    }
+}
+
+#[cfg(test)]
+mod page_class_tests {
+    //! #2268 — the run counting `Budget.maps` charges a window's page ops by. A page map here is a
+    //! `BTreeMap` of explicit classes; absent pages take the window default (`guard` 4 pages, the
+    //! declared prefix 16, the reserved tail beyond).
+    use super::*;
+    use core::ops::RangeInclusive;
+
+    const GUARD: u64 = 4;
+    const MAPPED: u64 = 16;
+    const RW: PageClass = PageClass::Own(2);
+    const RO: PageClass = PageClass::Own(1);
+    const NONE: PageClass = PageClass::Own(0);
+
+    /// The runs of `pages` before and after `change`, with `edges` their neighbours.
+    fn count(
+        map: &BTreeMap<u64, PageClass>,
+        pages: RangeInclusive<u64>,
+        edges: (bool, bool),
+        change: ClassChange,
+    ) -> (u64, u64) {
+        page_runs(map, pages, GUARD, MAPPED, |_, c| *c, edges, change)
+    }
+
+    /// The runs `pages` make as they are.
+    fn runs(map: &BTreeMap<u64, PageClass>, pages: RangeInclusive<u64>) -> u64 {
+        count(map, pages, (false, false), ClassChange::Keep).0
+    }
+
+    /// An op over `pages` of a 64-page window: its runs before and after `change`, counted over
+    /// the op's pages and the page either side, as `Host::page_op` does.
+    fn op(
+        map: &BTreeMap<u64, PageClass>,
+        pages: RangeInclusive<u64>,
+        change: ClassChange,
+    ) -> (u64, u64) {
+        let (first, last) = (*pages.start(), *pages.end());
+        let (lo, hi) = (first.saturating_sub(1), (last + 1).min(63));
+        count(map, lo..=hi, (lo < first, hi > last), change)
+    }
+
+    #[test]
+    fn a_fresh_window_is_its_guard_its_prefix_and_its_tail() {
+        let map = BTreeMap::new();
+        assert_eq!(runs(&map, 0..=63), 3);
+        assert_eq!(runs(&map, 6..=9), 1);
+        assert_eq!(runs(&map, 15..=17), 2);
+        // A read-only page in the prefix splits it; one in the guard does not show.
+        let ro = BTreeMap::from([(8, RO)]);
+        assert_eq!(runs(&ro, 0..=63), 5);
+        assert_eq!(runs(&BTreeMap::from([(2, NONE)]), 0..=63), 3);
+    }
+
+    #[test]
+    fn splitting_a_run_costs_two_and_mending_it_gives_them_back() {
+        let mut map = BTreeMap::new();
+        // A read-only page inside the prefix splits its run in three.
+        assert_eq!(op(&map, 8..=8, ClassChange::Protect(1)), (1, 3));
+        map.insert(8, RO);
+        // Its neighbour joins it: no new run.
+        assert_eq!(op(&map, 9..=9, ClassChange::Protect(1)), (2, 2));
+        map.insert(9, RO);
+        // Both back to read-write: the three runs are one again.
+        assert_eq!(op(&map, 8..=9, ClassChange::Protect(3)), (3, 1));
+        // Every other page of a span: each one splits off two more runs.
+        assert_eq!(
+            op(&BTreeMap::new(), 10..=10, ClassChange::Protect(1)),
+            (1, 3)
+        );
+    }
+
+    #[test]
+    fn growing_the_prefix_contiguously_costs_nothing() {
+        let mut map = BTreeMap::new();
+        // The first tail page, committed read-write, extends the prefix's run.
+        assert_eq!(op(&map, 16..=19, ClassChange::Every(RW)), (2, 2));
+        for p in 16..=19 {
+            map.insert(p, RW);
+        }
+        // A commit far into the tail, apart from it, is a run of its own.
+        assert_eq!(op(&map, 40..=40, ClassChange::Every(RW)), (1, 3));
+        // Unmapping the grown pages again joins the tail.
+        assert_eq!(op(&map, 16..=19, ClassChange::Every(NONE)), (2, 2));
+    }
+
+    #[test]
+    fn an_alias_is_one_run_only_where_its_region_offsets_continue() {
+        let page = 4096;
+        let a = |p: u64, off: u64| PageClass::alias(7, p, off, page, true);
+        let mut map = BTreeMap::new();
+        // Pages 30..=31 alias region offsets 0 and 4096: one run.
+        map.insert(30, a(30, 0));
+        map.insert(31, a(31, page));
+        assert_eq!(runs(&map, 29..=32), 3);
+        // Page 32 continues it; page 33 restarts the region at 0, a new mapping.
+        assert_eq!(
+            op(&map, 32..=32, ClassChange::Every(a(32, 2 * page))),
+            (2, 2)
+        );
+        map.insert(32, a(32, 2 * page));
+        assert_eq!(op(&map, 33..=33, ClassChange::Every(a(33, 0))), (2, 3));
+        // `protect` keeps the region and offset, so a read-only alias run stays one run.
+        assert_eq!(op(&map, 30..=32, ClassChange::Protect(1)), (3, 3));
+        // And the window's own neighbour of the same access never joins it.
+        assert_ne!(a(30, 0), RW);
+    }
+
+    #[test]
+    fn the_window_edges_have_no_neighbour() {
+        let map = BTreeMap::new();
+        // The last page alone: a run split off the tail's end.
+        assert_eq!(
+            count(&map, 62..=63, (true, false), ClassChange::Every(RW)),
+            (1, 2)
+        );
+        // The whole window at once becomes one run.
+        assert_eq!(
+            count(&map, 0..=63, (false, false), ClassChange::Every(NONE)),
+            (3, 1)
+        );
+        // Keeping the classes changes nothing.
+        assert_eq!(
+            count(&map, 0..=63, (false, false), ClassChange::Keep),
+            (3, 3)
         );
     }
 }

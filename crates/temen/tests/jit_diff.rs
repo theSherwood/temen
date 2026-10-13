@@ -1429,6 +1429,147 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
     assert_eq!(imem, jmem, "interp/JIT windows diverge");
 }
 
+/// #2268 — the JIT's page map starts with the pages its window's `readonly` data made read-only, as
+/// the interpreter's does, so the host refuses to copy into one (`-EFAULT`) on both engines. The JIT
+/// used to leave them out of its map: the host copied into the page, faulted in host code, and the
+/// guest saw a `MemoryFault`. Run through `jit_cap_run`, the production root that hands its window
+/// to the embedder before the guest runs.
+#[cfg(any(unix, windows))]
+#[test]
+fn jit_cap_host_write_into_readonly_data_is_refused_differential() {
+    use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Value};
+
+    const EFAULT: i64 = -14;
+    // 64 KiB: page-aligned on 4 KiB and 16 KiB hosts alike, inside the 128 KiB window.
+    const RO: u64 = 65536;
+    let src = format!(
+        "data ro {RO} \"\\xab\\xcd\"\n\
+         memory 17\n\
+         func (i32) -> (i64, i64) {{\n\
+         block 0 (v0: i32) {{\n\
+         \x20 v1 = i64.const {RO}\n\
+         \x20 v2 = i64.const 2\n\
+         \x20 v3 = call.cap 0 0 (i64, i64) -> (i64) v0 (v1, v2)\n\
+         \x20 v4 = i64.load8_u v1\n\
+         \x20 return v3 v4\n\
+           }}\n\
+         }}\n"
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    let host = || {
+        let mut h = Host::new();
+        h.stdin = b"xy".to_vec();
+        let s = h.grant_stream(StreamRole::In);
+        (h, s)
+    };
+    let ((mut hi, si), (mut hj, sj)) = (host(), host());
+    assert_eq!(si, sj, "grants are deterministic");
+    let init = vec![0u8; 1 << 17];
+    let mut fuel = 1_000_000u64;
+    let (interp, _) =
+        run_capture_reserved_with_host(&m, 0, &[Value::I32(si)], &mut fuel, &init, 18, &mut hi);
+    let (jit, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[sj as i64],
+        &MemLayout::image(init),
+        18,
+        0,
+        &mut hj,
+        None,
+    )
+    .expect("jit compiles");
+
+    let want = [EFAULT, 0xab];
+    assert_eq!(
+        interp.expect("interp runs"),
+        want.map(Value::I64).to_vec(),
+        "interp: the read is refused and the page keeps its byte"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &want),
+        "jit: the read is refused and the page keeps its byte: {jit:?}"
+    );
+}
+
+/// #2268 — `Budget.maps` refuses the same page op on the JIT as on the interpreter. The window's
+/// runs of page state are its mappings on the JIT, and every engine charges them alike: a read-only
+/// page split off the declared prefix costs two, so under a grant with room for three splits the
+/// fourth is refused (`-ENOMEM`, nothing changed), and protecting one back read-write merges it and
+/// refunds the room for the fourth. The module's read-only segment is two runs of the window from
+/// its start, which both engines count before the guest runs.
+#[cfg(any(unix, windows))]
+#[test]
+fn jit_cap_maps_refuses_the_same_page_op_differential() {
+    use temen_interp::{
+        run_capture_reserved_with_host, Host, MemLayout, Value, MAPS_PER_DOMAIN, MAPS_PER_VCPU,
+    };
+
+    const ENOMEM: i64 = -12;
+    // 64 KiB apart: never neighbours, on a 4 KiB host or a 16 KiB one.
+    let src = "data ro 983040 \"\\xab\"\n\
+         memory 20\n\
+         func (i32) -> (i64, i64, i64, i64, i64, i64) {\n\
+         block 0 (vm: i32) {\n\
+         \x20 vp = call.cap 5 3 () -> (i64) vm ()\n\
+         \x20 vr = i32.const 1\n\
+         \x20 vrw = i32.const 3\n\
+         \x20 a1 = i64.const 65536\n\
+         \x20 a2 = i64.const 131072\n\
+         \x20 a3 = i64.const 196608\n\
+         \x20 a4 = i64.const 262144\n\
+         \x20 r1 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a1, vp, vr)\n\
+         \x20 r2 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a2, vp, vr)\n\
+         \x20 r3 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a3, vp, vr)\n\
+         \x20 r4 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a4, vp, vr)\n\
+         \x20 r5 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a1, vp, vrw)\n\
+         \x20 r6 = call.cap 5 2 (i64, i64, i32) -> (i64) vm (a4, vp, vr)\n\
+         \x20 return r1 r2 r3 r4 r5 r6\n\
+           }\n\
+         }\n";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+
+    // The root's own mappings, its main vCPU's, its read-only segment's two runs, and three splits.
+    let maps = (MAPS_PER_DOMAIN + MAPS_PER_VCPU + 2 + 3 * 2) as i64;
+    let host = || {
+        let mut h = Host::new();
+        h.set_grant(-1, -1, -1, maps);
+        let vm = h.grant_memory();
+        (h, vm)
+    };
+    let ((mut hi, mi), (mut hj, mj)) = (host(), host());
+    assert_eq!(mi, mj, "grants are deterministic");
+    let init = vec![0u8; 1 << 20];
+    let mut fuel = 1_000_000u64;
+    let (interp, _) =
+        run_capture_reserved_with_host(&m, 0, &[Value::I32(mi)], &mut fuel, &init, 21, &mut hi);
+    let (jit, _) = temen_run::jit_cap_run(
+        &m,
+        0,
+        &[mj as i64],
+        &MemLayout::image(init),
+        21,
+        0,
+        &mut hj,
+        None,
+    )
+    .expect("jit compiles");
+
+    let want = [0, 0, 0, ENOMEM, 0, 0];
+    assert_eq!(
+        interp.expect("interp runs"),
+        want.map(Value::I64).to_vec(),
+        "interp: the fourth split is refused until a merge makes room"
+    );
+    assert!(
+        matches!(jit, JitOutcome::Returned(ref s) if s == &want),
+        "jit: the fourth split is refused until a merge makes room: {jit:?}"
+    );
+}
+
 // ---- call.cap: the JIT dispatches through a host thunk to the interpreter's Host ----
 //
 // This module's broad Memory-cap differential is still unix-gated; the cross-platform `_with_host`
