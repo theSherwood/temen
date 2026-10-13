@@ -14,8 +14,8 @@ tree-walker, bytecode engine and wasm-JIT, a private copy written back at finish
 on the Cranelift JIT (#1814). R3's escape hatch fires: delete the carve path, never keep both. Read
 the "nested stays" / "opt-in" / "alias grant" passages below as the pre-2026-09-29 plan. Decision A
 (§7 slices 0–5) is built and is the surviving mechanism; what remains is moving the carve-dependent
-features (the §2.2 pager, the nested subtree freeze, every producer of a carve spawn) onto it and
-deleting the carve path — tracked in #1289.
+features (the §2.2 pager, the nested subtree freeze) onto it and deleting the rest of the carve path —
+tracked in #1289. The carve spawn itself is gone: every engine traps it `CapFault` (#1867).
 
 **One-line summary.** The isolated, independently-growable, concurrency-safe child that
 #1253 and the playground need **already exists in the design and the reference
@@ -66,9 +66,9 @@ child in its own address space.** In temen that structure already has a name.
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
 | Native JIT (`temen-jit`) hosts op 15 (#1287): `instantiate_detached` thunk → `compile_child_windowed` (declared committed inside a root-sized lazy reservation) → `run_detached_child_then` (no carve, no copy-in/copy-back); powerbox via `Host::spawn_detached_child` (`window_exposed = false`, caps over the reservation); minter admission via the `minter_take` hook | `instantiator_rt.rs`; `temen-run` `grant_detached_child_build`/`minter_take`; `detached_child_jit.rs` | **Built** — differential vs the tree-walker |
-| wasm-JIT (`temen-wasm-jit`) nested emit lowers INSTANTIATOR ops **0, 1, 13, 17 only** | `crates/temen-wasm-jit/src/lib.rs` 769 | **op 15 not lowered** |
-| JIT children are **position-independent** (base is a runtime arg; compile cache reuses across offsets) | PROCESS.md §4 S1; `jit_instantiate_cache.rs` | **Built** — the emit needs no change to run in a different memory |
-| Native JIT nested children **already run in their own window**: `compile_child` lowers with `sub_base = 0` and the runners allocate a fresh `GuestWindow`, copying the carve in before and back out after (S1c: "own guarded window", parent-domain shared futex) | `crates/temen-jit/src/lib.rs` 4974, 5081, 5283–5325, 4651–4658, 4788–4793 | **Built** — the native tier is one deletion (the two memcpys) away from detached semantics |
+| wasm-JIT (`temen-wasm-jit`) nested emit lowers INSTANTIATOR ops **1 and 17 only** (0 and 13 until the carve spawn retired, #1867) | `crates/temen-wasm-jit/src/lib.rs` `is_nested_cap` | **op 15 not lowered** |
+| JIT children are **position-independent** (base is a runtime arg; the carve compile cache reused code across offsets) | PROCESS.md §4 S1 | **Built** — the emit needs no change to run in a different memory; the carve cache is retired with the carve spawn (#1867) |
+| Native JIT nested children **ran in their own window**: `compile_child` lowered with `sub_base = 0` and the runners allocated a fresh `GuestWindow`, copying the carve in before and back out after (S1c: "own guarded window", parent-domain shared futex) | `crates/temen-jit/src/lib.rs` (history) | **Deleted** with the carve spawn (#1867); the detached path above is what runs |
 
 PROCESS.md §5 even records the motivation this note re-derives: *"nested carves subdivide
 parent VA (real in the browser's wasm32 window)"* and *"Projects choose per child; a shell

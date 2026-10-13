@@ -119,7 +119,7 @@ fn drive(prog: &bytecode::VcpuProgram, mut vcpu: bytecode::Vcpu<'_>) -> Result<V
                 let child = vcpu
                     .take_child()
                     .expect("an InstantiateDetached carries its admitted child")
-                    .start(prog, window(1u64 << temen_ir::DEFAULT_RESERVED_LOG2), None)
+                    .start(prog, window(1u64 << temen_ir::DEFAULT_RESERVED_LOG2))
                     .expect("the child builds");
                 let r = drive(prog, child);
                 let token = children.len() as u64;

@@ -1,8 +1,8 @@
 //! #1469 — a §14 child that uses `thread.spawn`/`join` runs on the **Cranelift JIT**, as on the
-//! tree-walk oracle. Carved (op 5) and detached (op 15) children run as executor tasks; a task's
-//! spawned vCPUs run in a domain of the child's own — its thread handles number from 0, they share
-//! the child's window and fiber registry — while waits, notifies and the run-wide vCPU count stay
-//! the run's. Each program runs on both engines, and the child must have been JIT-compiled.
+//! tree-walk oracle. A detached (op 15) child runs as an executor task; a task's spawned vCPUs run
+//! in a domain of the child's own — its thread handles number from 0, they share the child's window
+//! and fiber registry — while waits, notifies and the run-wide vCPU count stay the run's. Each
+//! program runs on both engines, and the child must have been JIT-compiled.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -17,14 +17,9 @@ use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 const PARENT_LOG2: u8 = 23;
 const CHILD_LOG2: u8 = 16;
 
-/// The parent (args `(instantiator, child module, budget)`): spawns the child carved or detached
-/// and returns its join status.
-fn parent_src(detached: bool) -> String {
-    let spawn = if detached {
-        "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
-    } else {
-        "ch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, gz, off, sl, gz)"
-    };
+/// The parent (args `(instantiator, child module, budget)`): spawns the child detached and returns
+/// its join status.
+fn parent_src() -> String {
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -32,9 +27,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  off = i64.const 4194304
   sl = i64.const {CHILD_LOG2}
-  {spawn}
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
   vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
   return vr
   }}
@@ -97,25 +91,19 @@ fn jit(parent: &Module, child: &Module) -> Result<i64, String> {
     }
 }
 
-/// Run `child` under a carved and a detached parent on both engines; the JIT must match the oracle
-/// and must have compiled the child. Returns the (common) outcome per spawn kind.
-fn parity(child: &str) -> [Result<i64, String>; 2] {
+/// Run `child` under the parent on both engines; the JIT must match the oracle and must have
+/// compiled the child. Returns the (common) outcome.
+fn parity(child: &str) -> Result<i64, String> {
     let c = parse(child);
-    [false, true].map(|detached| {
-        let p = parse(&parent_src(detached));
-        let want = oracle(&p, &c);
-        let before = temen_jit::child_compiles();
-        assert_eq!(
-            jit(&p, &c),
-            want,
-            "detached {detached}: the JIT matches the oracle"
-        );
-        assert!(
-            temen_jit::child_compiles() > before,
-            "detached {detached}: the child was JIT-compiled"
-        );
-        want
-    })
+    let p = parse(&parent_src());
+    let want = oracle(&p, &c);
+    let before = temen_jit::child_compiles();
+    assert_eq!(jit(&p, &c), want, "the JIT matches the oracle");
+    assert!(
+        temen_jit::child_compiles() > before,
+        "the child was JIT-compiled"
+    );
+    want
 }
 
 /// A thread entry: returns `arg * 10`.
@@ -158,7 +146,7 @@ block 0 (vs: i64) {{
 }}
 {TIMES_TEN}"
     );
-    assert_eq!(parity(&child), [Ok(130), Ok(130)]);
+    assert_eq!(parity(&child), Ok(130));
 }
 
 /// A child's vCPU parks on a word of the child's window until the child's root notifies it, then
@@ -208,7 +196,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    assert_eq!(parity(&child), [Ok(5007), Ok(5007)]);
+    assert_eq!(parity(&child), Ok(5007));
 }
 
 /// A child's vCPUs share its fiber registry: the root creates a fiber, a spawned vCPU resumes it by
@@ -246,7 +234,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    assert_eq!(parity(&child), [Ok(105), Ok(105)]);
+    assert_eq!(parity(&child), Ok(105));
 }
 
 /// A trap in a child's vCPU ends the child's domain — its root, parked in the join, included — and
@@ -273,10 +261,7 @@ block 0 (vsp: i64, varg: i64) {{
 }}"
     );
     let got = parity(&child);
-    assert!(
-        got.iter().all(|r| r.is_err()),
-        "the child's trap surfaces: {got:?}"
-    );
+    assert!(got.is_err(), "the child's trap surfaces: {got:?}");
 }
 
 /// A child's root that returns while a vCPU it spawned still runs: the child's outcome is the
@@ -306,7 +291,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    assert_eq!(parity(&child), [Ok(42), Ok(42)]);
+    assert_eq!(parity(&child), Ok(42));
 }
 
 /// **A child task that joins a finished vCPU is not blocked.** The child's root spawns W, which
@@ -368,5 +353,5 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    assert_eq!(parity(&child), [Ok(300), Ok(300)]);
+    assert_eq!(parity(&child), Ok(300));
 }

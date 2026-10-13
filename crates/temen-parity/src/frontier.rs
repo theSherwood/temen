@@ -309,16 +309,6 @@ const B: Cell = Cell {
     note: "",
 };
 
-/// The Instantiator's divergence on the **backend** column: `instantiate_module` (op 13) answers
-/// `-EINVAL` on the oracle and traps `CapFault` under the Cranelift probe on 6 call shapes (#1821).
-/// Invariant 9 lets a backend decline to the oracle; it does not let one run the op and report a
-/// different failure — so this is a `NotYet`, not a `Declines`. (`join`'s #1573 divergence is fixed
-/// and pinned by `join_traps_as_the_oracle_does`.)
-const INSTANTIATE_MODULE_DIVERGES: Cell = Cell {
-    status: Status::NotYet,
-    note: "instantiate_module (op 13) answers -EINVAL on the oracle and CapFault under the Cranelift probe (#1821)",
-};
-
 /// `Full` on the **code origin** axis: a §22 guest-JIT unit and the host-translated base module get
 /// the same answer out of every one of the row's ops. `tests/code_origin_conformance.rs` makes the
 /// identical `call.cap` from each and compares them shape by shape.
@@ -406,7 +396,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::Instantiator => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
-            INSTANTIATE_MODULE_DIVERGES,
+            B,
             U,
             K,
             declines(
@@ -414,10 +404,9 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
             ),
             conditional(
-                "instantiate/join/instantiate_module(_named)/instantiate_rec/instantiate_detached \
-                 run on the debug scheduler through the executor's admission (#1855), and so does \
-                 grant (op 19, #2220); the coroutine spawns fall back, and child_offer (op 14) \
-                 reaches the debug scheduler and is declined",
+                "join/instantiate_rec/instantiate_detached run on the debug scheduler through the \
+                 executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op \
+                 14) reaches the debug scheduler and is declined",
             )],
 
         // Declines on nesting as a re-grant (a grant list cannot carry one): a child's own `"budget"` is

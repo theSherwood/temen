@@ -13,7 +13,7 @@ use std::io::Write;
 
 use temen_browser::{
     capture_exec, durable_run, dynlink_exec, instantiate_exec, jit_exec, powerbox_exec,
-    reflect_exec, region_exec, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    reflect_exec, region_exec, STATUS_OK, STATUS_TRAP,
 };
 use temen_durable::{
     init_durable_window, transform_module, write_state, STATE_NORMAL, STATE_REWINDING,
@@ -718,61 +718,66 @@ block 0 () {
 }
 "#;
 
-// ---- §14 coroutines (Instantiator.spawn_coroutine / resume + Yielder.yield) --------------------
-// Lifted from `crates/temen/tests/bytecode_coroutines.rs`. Need an Instantiator (iface 6) like nested
-// children, so they run through the `temen_run_nested` path. spawn=op 2, resume=op 3; yield=iface 7 op 0.
+// ---- §14 retired carve spawns (#1867) -----------------------------------------------------------
+// Ops 0, 5 and 13 and a version-0 op-17 record spawned a child into a carve of the spawner's window.
+// That placement is gone: each traps `CapFault` once the handle resolves, on every engine, as an
+// Instantiator op the oracle has no arm for always did. The entries and modules they name don't
+// matter; the spawn traps before it reads them.
 
-// Parent spawns a coroutine confined to [64 KiB, 128 KiB), resumes it 3×; the child yields 100, then
-// 200+r1, then returns 999+r2 (r1=10, r2=20). Result 100 + 210 + 1019 + RETURNED*1_000_000.
-const CORO: &str = r#"memory 17
+const CARVE_OP0: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
   v2 = i64.const 65536
-  v3 = i64.const 16
+  v3 = i64.const 12
   v4 = i64.const 0
-  v5 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = i64.const 0
-  v7, v8 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
-  v9 = i64.const 10
-  v10, v11 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
-  v12 = i64.const 20
-  v13, v14 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
-  v15 = i64.add v8 v11
-  v16 = i64.add v15 v14
-  v17 = i64.extend_i32_s v13
-  v18 = i64.const 1000000
-  v19 = i64.mul v17 v18
-  v20 = i64.add v16 v19
-  return v20
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
-  v3 = i32.const 7
-  i32.store8 v2 v3
-  v4 = i64.const 100
-  v5 = call.cap 7 0 (i64) -> (i64) v1 (v4)
-  v6 = i64.const 200
-  v7 = i64.add v6 v5
-  v8 = call.cap 7 0 (i64) -> (i64) v1 (v7)
-  v9 = i64.const 999
-  v10 = i64.add v9 v8
-  return v10
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = i64.extend_i32_s v5
+  return v6
   }
 }
 "#;
 
-// Resuming a coroutine handle that was never spawned is an inert CapFault (a trap) on both engines.
-const CORO_FORGED: &str = r#"memory 17
+const CARVE_OP5: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i32.const 9
+  v1 = i64.const 0
+  v2 = i64.const 1
+  v3 = i64.const 65536
+  v4 = i64.const 12
+  v5 = i64.const 0
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v5)
+  v7 = i64.extend_i32_s v6
+  return v7
+  }
+}
+"#;
+
+const CARVE_OP13: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 0
   v2 = i64.const 0
-  v3, v4 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v1, v2)
-  return v4
+  v3 = i64.const 0
+  v4 = i64.const 1
+  v5 = i64.const 65536
+  v6 = i64.const 12
+  v7 = i64.const 0
+  v8 = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4, v5, v6, v7)
+  v9 = i64.extend_i32_s v8
+  return v9
+  }
+}
+"#;
+
+// An all-zero record is a version-0 one.
+const CARVE_REC_V0: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
+  v3 = i64.extend_i32_s v2
+  return v3
   }
 }
 "#;
@@ -1914,28 +1919,15 @@ const FLOAT_ARGS: &[i64] = &[
 ];
 
 // Fail-closed UNSUPPORTED path: a module the bytecode engine rejects (`compile_module → None`) —
-// `cont.new` (fiber) **and** a coroutine `call.cap 6 2` in one module is an unsupported combination,
-// so `temen_run` must return STATUS_UNSUPPORTED, matching native. (Forged handle never runs.)
+// `fuel.remaining` (self op 13, `4294967295` = `CAP_SELF_TYPE_ID`) is serviced by the tree-walker
+// alone, so the whole module declines, and `temen_run` must return STATUS_UNSUPPORTED, matching
+// native.
 const UNSUP: &str = r#"
 func () -> (i64) {
 block 0 () {
-  v0 = ref.func 1
-  v1 = i64.const 0
-  v2 = cont.new v0 v1
-  v3 = i32.const 0
-  v4 = i64.const 1
-  v5 = i64.const 0
-  v6 = i64.const 12
-  v7 = i64.const 0
-  v8 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v3 (v4, v5, v6, v7)
-  v9 = i64.const 0
-  return v9
-  }
-}
-func (i64, i64) -> (i64) {
-block 0 (vsp: i64, varg: i64) {
-  v0 = i64.const 0
-  return v0
+  v0 = i32.const 0
+  v1 = call.cap 4294967295 13 () -> (i64) v0 ()
+  return v1
   }
 }
 "#;
@@ -2089,10 +2081,11 @@ fn main() {
             (STATUS_OK, temen_ir::errno::EINVAL),
         ),
         ("child_trap", trap.as_str(), (STATUS_TRAP, 0)),
-        // §14 coroutines reuse the Instantiator grant, so they run on the same `temen_run_nested` path
-        // — which declines them: the bytecode engine does not compile a coroutine op.
-        ("coro_roundtrip", CORO, (STATUS_UNSUPPORTED, 0)),
-        ("coro_forged", CORO_FORGED, (STATUS_UNSUPPORTED, 0)),
+        // The retired carve spawns trap (#1867).
+        ("carve_op0", CARVE_OP0, (STATUS_TRAP, 0)),
+        ("carve_op5", CARVE_OP5, (STATUS_TRAP, 0)),
+        ("carve_op13", CARVE_OP13, (STATUS_TRAP, 0)),
+        ("carve_rec_v0", CARVE_REC_V0, (STATUS_TRAP, 0)),
     ];
     json.push_str("],\n\"nested\":[\n");
     for (i, (name, src, want)) in nested.iter().enumerate() {

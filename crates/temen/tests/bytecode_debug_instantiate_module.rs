@@ -1,14 +1,11 @@
-//! Debugging §14 **`instantiate_module`** (op 5) confined children on the multi-vCPU
-//! `ScheduledDebugRun` (debugging slice 15b). Like op-0 `instantiate` (slice 15a), the child runs on the
-//! cooperative debug scheduler as its own confined vCPU — but it runs a **host-granted separate
-//! `Module`**: the debug engine resolves it from the powerbox, compiles it, and pushes it to the shared
-//! source (the mutable-`Domain` step), then materializes its data segments into the carve. So a
-//! breakpoint fires inside the **granted module's** body (a distinct pushed module index) on a distinct
-//! thread, `read_window` reads the child's confined window, and the run stays bit-identical to the
-//! production bytecode engine + tree-walker oracle.
-//!
-//! Same `PARENT`/`CHILD_SRC` fixture as `bytecode_separate_module.rs`, driven through the scheduled debug
-//! engine directly (`ScheduledDebugRun::new_with_host`).
+//! Debugging a §14 child that runs a **host-granted separate `Module`** on the multi-vCPU
+//! `ScheduledDebugRun` (debugging slice 15b). The child runs on the cooperative debug scheduler as its
+//! own vCPU: the debug engine resolves the module from the powerbox, compiles it, and pushes it to the
+//! shared source (the mutable-`Domain` step), then seeds its data segments into the child's window. So
+//! a breakpoint fires inside the **granted module's** body (a distinct pushed module index) on a
+//! distinct thread, `read_window` reads the child's own window, and the run stays bit-identical to the
+//! production bytecode engine + tree-walker oracle. The child is spawned detached, by a v1 record; a
+//! detached child's checkpoints are `bytecode_debug_detached.rs`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -39,24 +36,8 @@ block 0 (v0: i64) {
 }
 "#;
 
-// Parent `(instantiator, module) -> i64`: instantiate_module the granted module into a 64 KiB carve at
-// 64 KiB, join it, return its value (1086).
-const PARENT: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  return v7
-  }
-}
-"#;
-
-// #1867 — the same spawn, detached: parent `(instantiator, module, budget) -> i64` spawns the granted
-// module through a v1 record at 17408 paid from the budget, joins it, and returns its value (1086).
+// The parent `(instantiator, module, budget) -> i64` spawns the granted module through a v1 record at
+// 17408 paid from the budget, joins it, and returns its value (1086).
 const DETACHED_PARENT: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -83,21 +64,19 @@ fn powerbox() -> (Host, i32, i32) {
     (host, inst, mh)
 }
 
-/// A `ScheduledDebugRun` on the instantiate_module kernel carrying the powerbox.
-fn module_session() -> ScheduledDebugRun {
-    let m = parse_module(PARENT).expect("parse");
-    let (host, inst, mh) = powerbox();
-    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(inst), Value::I32(mh)], host)
-        .expect("scheduled debug engine must drive §14 instantiate_module")
-}
-
-/// A `ScheduledDebugRun` on [`DETACHED_PARENT`], with a `Budget` for the child's window.
-fn detached_session() -> ScheduledDebugRun {
+/// [`DETACHED_PARENT`] with its record, and its powerbox and args: [`powerbox`] and a `Budget` for the
+/// child's window.
+fn detached() -> (temen_ir::Module, Host, [Value; 3]) {
     let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1(0)));
     let m = parse_module(&src).expect("parse");
     let (mut host, inst, mh) = powerbox();
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    let args = [inst, mh, budget].map(Value::I32);
+    (m, host, [inst, mh, budget].map(Value::I32))
+}
+
+/// A `ScheduledDebugRun` on [`detached`].
+fn detached_session() -> ScheduledDebugRun {
+    let (m, host, args) = detached();
     ScheduledDebugRun::new_with_host(&m, 0, &args, host)
         .expect("scheduled debug engine must drive a detached module child")
 }
@@ -135,41 +114,28 @@ fn child_module_after_store() -> IrPc {
     }
 }
 
-/// An `instantiate_module` round-trip runs correctly on the scheduled debugger and matches the
-/// production bytecode engine **and** the tree-walker oracle — declined before this slice.
+/// A module child's round-trip runs correctly on the scheduled debugger and matches the production
+/// bytecode engine **and** the tree-walker oracle.
 #[test]
-fn instantiate_module_debug_run_matches_the_oracle() {
-    let mut r = module_session();
+fn a_module_child_debug_run_matches_the_oracle() {
+    let mut r = detached_session();
     let mut fuel = 5_000_000u64;
     let res = drive_to_end(&mut r, &mut fuel);
     assert_eq!(res, Ok(vec![Value::I64(WANT)]), "child returns 86 + 1000");
 
-    let m = parse_module(PARENT).unwrap();
-    let (mut h_bc, inst_bc, mh_bc) = powerbox();
+    let (m, mut h_bc, args) = detached();
     let mut f_bc = 5_000_000u64;
-    let bc = bytecode::compile_and_run_with_host(
-        &m,
-        0,
-        &[Value::I32(inst_bc), Value::I32(mh_bc)],
-        &mut f_bc,
-        &mut h_bc,
-    )
-    .expect("bytecode engine drives instantiate_module");
+    let bc = bytecode::compile_and_run_with_host(&m, 0, &args, &mut f_bc, &mut h_bc)
+        .expect("bytecode engine drives the module child");
     assert_eq!(
         bc.clone().map_err(|_| ()),
         res,
         "debug run ≡ production bytecode"
     );
 
-    let (mut h_tw, inst_tw, mh_tw) = powerbox();
+    let (m, mut h_tw, args) = detached();
     let mut f_tw = 5_000_000u64;
-    let tw = run_with_host(
-        &m,
-        0,
-        &[Value::I32(inst_tw), Value::I32(mh_tw)],
-        &mut f_tw,
-        &mut h_tw,
-    );
+    let tw = run_with_host(&m, 0, &args, &mut f_tw, &mut h_tw);
     assert_eq!(tw, bc, "bytecode ≡ tree-walker");
 }
 
@@ -258,11 +224,11 @@ fn a_line_of_a_childs_own_source_binds_when_the_run_admits_it() {
     assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(WANT)]));
 }
 
-/// Stopped inside the module child after its `i32.store8`, `read_window` reads the child's **confined**
-/// window: the marker byte 7 at the child's offset 16 KiB (backing 80 KiB), not the shared window's.
+/// Stopped inside the module child after its `i32.store8`, `read_window` reads the child's **own**
+/// window: the marker byte 7 at its offset 16 KiB, which the root's window does not hold.
 #[test]
-fn inspect_a_module_childs_confined_window() {
-    let mut r = module_session();
+fn inspect_a_module_childs_window() {
+    let mut r = detached_session();
     r.set_breakpoints(vec![child_module_after_store()]);
     let mut fuel = 5_000_000u64;
     match r.run_until_stop(&mut fuel) {
@@ -274,17 +240,17 @@ fn inspect_a_module_childs_confined_window() {
     assert_eq!(
         r.read_window(16384, 1).unwrap(),
         vec![7u8],
-        "reads the granted module child's confined window, not the shared one"
+        "reads the granted module child's own window"
     );
     assert_eq!(drive_to_end(&mut r, &mut fuel), Ok(vec![Value::I64(WANT)]));
 }
 
-/// Reverse debugging composes with `instantiate_module`: a fresh session ticked to a turn reached inside
-/// the granted module reproduces the exact child position — `seek` reconstructs the pushed module + env/
+/// Reverse debugging composes with a module child: a fresh session ticked to a turn reached inside the
+/// granted module reproduces the exact child position — `seek` reconstructs the pushed module + env/
 /// task set deterministically.
 #[test]
 fn module_child_tick_replays_deterministically() {
-    let mut a = module_session();
+    let mut a = detached_session();
     a.set_breakpoints(vec![child_module_first_op()]);
     let mut fuel = 5_000_000u64;
     assert!(matches!(
@@ -294,7 +260,7 @@ fn module_child_tick_replays_deterministically() {
     let turn = a.op_turn();
     let child = a.stopped_task().unwrap();
 
-    let mut b = module_session();
+    let mut b = detached_session();
     let mut f2 = 5_000_000u64;
     while b.op_turn() < turn && b.tick(&mut f2) {}
     b.locate();
@@ -304,95 +270,5 @@ fn module_child_tick_replays_deterministically() {
         b.frame_pc(0),
         Some(child_module_first_op()),
         "replay reproduced the granted-module child's position"
-    );
-}
-
-/// A per-turn observation of the scheduled instantiate_module run: the global turn, every live task's
-/// call stack (frames as `m{module}f{func}b{block}i{inst}`, so a frame in the pushed child module reads
-/// `m1...`), and the child carve's bytes (its window starts at 64 KiB; the child stores marker 7 at its
-/// offset 16 KiB — above its guard).
-fn sched_full_obs(run: &mut ScheduledDebugRun) -> (u64, String, Vec<u8>) {
-    let turn = run.op_turn();
-    let mut stacks = Vec::new();
-    for tid in run.threads() {
-        run.select_task(tid);
-        let mut frames = Vec::new();
-        for d in 0..run.depth() {
-            if let Some(pc) = run.frame_pc(d) {
-                frames.push(format!(
-                    "m{}f{}b{}i{}",
-                    pc.module, pc.func, pc.block, pc.inst
-                ));
-            }
-        }
-        stacks.push(format!("{tid}=[{}]", frames.join(",")));
-    }
-    let win = run.read_window(65536 + 16384, 8).unwrap_or_default();
-    (turn, stacks.join(";"), win)
-}
-
-/// Warm≡cold oracle for **§14 separate-module `instantiate_module` child** checkpointing on the multi-vCPU
-/// engine (DEBUGGING.md W1): at every turn where a checkpoint could be taken — including while the child
-/// vCPU steps *inside the pushed module's body* — a `ScheduledDebugRun::restore`d run replays forward
-/// **identically** to the trusted single from-0 run. This exercises the separate-module `DbgEnv`
-/// reconstruction: the pushed source unit is re-pushed (so a `module 1` frame resolves) and each child
-/// env's table is rebuilt over its own module index, alongside the window + powerbox + task set.
-#[test]
-fn scheduled_instantiate_module_checkpoint_snapshot_restore_round_trips() {
-    const FUEL: u64 = 5_000_000;
-
-    let mut refr = module_session();
-    let mut f = FUEL;
-    let mut ref_obs = vec![sched_full_obs(&mut refr)];
-    while refr.tick(&mut f) {
-        ref_obs.push(sched_full_obs(&mut refr));
-    }
-    let total = ref_obs.len() - 1;
-    assert_eq!(
-        refr.result().unwrap().as_ref().unwrap(),
-        &[Value::I64(WANT)]
-    );
-    assert!(
-        ref_obs.iter().any(|(_, s, _)| s.contains("m1f")),
-        "the run steps inside the pushed child module (module 1)"
-    );
-
-    let mut checkpointed_in_child = false;
-    for c in 0..=total {
-        let mut at_c = module_session();
-        let mut f = FUEL;
-        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
-        let Ok(snap) = at_c.snapshot() else {
-            continue; // C is outside the checkpointable subset
-        };
-        if ref_obs[c].1.contains("m1f") {
-            checkpointed_in_child = true;
-        }
-        let mut warm = module_session();
-        warm.restore(at_c.op_turn(), &snap);
-        let mut i = c;
-        assert_eq!(
-            sched_full_obs(&mut warm),
-            ref_obs[i],
-            "restore at C={c} lands at reference"
-        );
-        let mut f = FUEL;
-        while warm.tick(&mut f) {
-            i += 1;
-            assert_eq!(
-                sched_full_obs(&mut warm),
-                ref_obs[i],
-                "forward replay after restore at C={c}"
-            );
-        }
-        assert_eq!(i, total, "warm run from C={c} reached the same end");
-        assert_eq!(
-            warm.result().unwrap().as_ref().unwrap(),
-            &[Value::I64(WANT)]
-        );
-    }
-    assert!(
-        checkpointed_in_child,
-        "a checkpoint was taken (and restored) while the child vCPU was inside the pushed module"
     );
 }

@@ -232,9 +232,10 @@ different things depending on which pair you compare:
   `instantiate`-child environments (`extra_envs`, as `EnvSnapshot`). On restore each coroutine window
   (`rebuild_coro`, shared with the single-vCPU path) and each child env (`rebuild_env`: `nested_view` +
   a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
-  the reseeded shared window. Admitting `instantiate` children is what unlocks **scheduled coroutines**:
-  the bytecode engine rejects `coroutine + thread`, so a scheduled coroutine only ever arises alongside
-  an `instantiate` sibling. Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
+  the reseeded shared window. Admitting `instantiate` children is what unlocked **scheduled coroutines**:
+  the bytecode engine rejected `coroutine + thread`, so a scheduled coroutine only ever arose alongside
+  an `instantiate` sibling. (Both are since retired: the coroutine ops by #2069, the carve
+  `instantiate` by #1867.) Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
   **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
   (`memory.wait`) fibers. Oracles:
   `dap_checkpoints.rs::scheduled_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
@@ -297,7 +298,7 @@ different things depending on which pair you compare:
   `bytecode_debug_demand_checkpoint.rs` (a single-vCPU demand coroutine, restored at *every* clock
   including suspended mid-fault, matching the tree-walker result) and `bytecode_debug_child_page_mapping.rs`
   (a scheduled `instantiate` child that unmaps a page then faults loading it — exercising `EnvSnapshot.prot`
-  on the multi-vCPU engine). Both assert *every* clock/turn is checkpointable (fails under the old
+  on the multi-vCPU engine; deleted with the carve spawn, #1867). Both assert *every* clock/turn is checkpointable (fails under the old
   `fault_yields`/bytes-only exclusions). Still excluded (→ replay-from-0): a child holding or aliasing a
   §13 region (#2026 carries the root's only) and children carved beyond the parent's captured prefix.
 
@@ -467,7 +468,7 @@ different things depending on which pair you compare:
   natural table + a Yielder-only powerbox. Thereafter it is `resume`d and stepped by the same 14b path —
   so a breakpoint fires in the parent *and* inside the **granted module's** body (a distinct pushed
   module index), and `read_window` reads the child's confined window. Gated to the single-vCPU
-  `DebugRun` (`coro_step_into`); the scheduled engine still declines it. Oracle here is the production
+  `DebugRun` (`coro_step_into`); the scheduled engine declined it. Oracle here is the production
   bytecode engine (`compile_and_run_with_host`) — `run_with_host` drives only the same-module form.
   Covered by `bytecode_debug_coroutine_module.rs` (oracle parity, a parent breakpoint, step-into the
   granted module's body with confined-window read, deterministic body-position tick-replay). Full
@@ -475,10 +476,11 @@ different things depending on which pair you compare:
   module debug metadata) landed in **slice 17** (single-vCPU *and* scheduled); position-level step-into and
   window reads work here.
 
-  **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** *(Retiring: slices
-  15a–15c debug carve children, and the carve path is being deleted — INVARIANTS #13, 2026-09-29;
-  #1289. The detached equivalent is `dbg_instantiate_detached`: op 15's child as a `DbgEnv` over its
-  own `Mem`, joined like a confined child.)* `instantiate` (op 0) is
+  **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** *(Retired: slices
+  15a–15c debug carve children, and every engine now traps the carve spawn — INVARIANTS #13; #1867.
+  These slices are history, and their tests are deleted. The detached equivalent is
+  `dbg_instantiate_detached`: op 15's child as a `DbgEnv` over its own `Mem`, joined like a confined
+  child.)* `instantiate` (op 0) is
   no longer declined on the scheduled engine: `ScheduledDebugRun` grew a per-task `env` (the debug-engine
   counterpart of the production `TaskSlot::env`) and an `extra_envs: Vec<DbgEnv>`. A new `dbg_instantiate`
   helper (mirroring the production `drive`'s `Instantiate` arm) builds a **confined executor child** as
@@ -525,8 +527,9 @@ different things depending on which pair you compare:
   hand copies of the production arms, and they drifted: they refused a §3d budget and every grant list
   with `Trap::Malformed` (so every op-13 spawn trapped under the debugger, where the oracle runs it), and
   they checked a nested holder's carve against the *root's* NULL guard. Both are gone. The debug
-  scheduler admits every confined child through `admit_confined_child`, the function the cooperative
-  executor and the OS-thread parallel driver call, and `dbg_start_child` only schedules it (as for op 15).
+  scheduler admitted every confined child through `admit_confined_child`, the function the cooperative
+  executor and the OS-thread parallel driver called, until the carve spawn retired (#1867); a detached
+  child goes through `admit_detached_child` the same way, and `dbg_start_child` only schedules it.
   `spawn_every_driver.rs` pins the answers on the oracle and all four bytecode drivers.
 
   **A detached child of the debuggee's own program (#2076), and edits in a child (#2072).** A detached
@@ -573,9 +576,10 @@ different things depending on which pair you compare:
   ops. The breakpoint/watch scan, `reader`/`read_window`, and the step-depth predicate all resolve against
   the task's active continuation (the coroutine child when mid-`resume`), so a breakpoint fires inside a
   coroutine body on the right thread, a sibling vCPU stays frozen while the coroutine is single-stepped,
-  and reverse `tick`-replay stays deterministic. The sibling here is an `instantiate` executor child, not
-  a `thread.spawn` worker: the bytecode engine rejects `coroutine + thread` in one module (tree-walker-only,
-  `compile_module`), while `instantiate + coroutine` gives a real second scheduled vCPU. Covered by
+  and reverse `tick`-replay stays deterministic. The sibling here was an `instantiate` executor child, not
+  a `thread.spawn` worker: the bytecode engine rejected `coroutine + thread` in one module (tree-walker-only,
+  `compile_module`), while `instantiate + coroutine` gave a real second scheduled vCPU. (Both are since
+  retired: the coroutine ops by #2069, the carve `instantiate` by #1867.) Covered by
   `bytecode_debug_scheduled_coroutine.rs` (oracle parity, breakpoint-inside-body with the sibling frozen,
   deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
   the single-vCPU engine does.
@@ -635,7 +639,8 @@ different things depending on which pair you compare:
   `thread.spawn`/`join`/`wait`/`notify`, **fibers**, **§14 coroutines** (step-into — same-module and
   separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
-  (slices 14b/14c, 15a/15b/15c, 16), and **source-variable inspection inside a separate-module child body**
+  (slices 14b/14c, 15a/15b/15c, 16; both since retired, the coroutines by #2069 and the carve spawns by
+  #1867, leaving the detached children of op 15/17 — #1866), and **source-variable inspection inside a separate-module child body**
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the

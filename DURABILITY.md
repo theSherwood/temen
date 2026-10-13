@@ -21,12 +21,16 @@ that means the nested subtree freeze that rides the parent's window image (the `
 into a child's carve, `FrozenNested` re-attach records, thaw's in-place carve re-attach, the
 carve-named `FreezeAuthority`) is the path being deleted; the surviving mechanism is the detached
 child's own root-shaped artifact (Section 8), rung to unwind by its freeze doorbell under
-`FreezeScope::DetachedProgeny` (§4, "Detached children"). Carve descriptions below stay accurate for
-today's code and are marked **Retiring**; new work targets the detached path, and planned work below
-that would extend the carve path (JIT nesting parity, separate-module carve children, carve-masking
-fuzz units, nested freeze declines "to be closed") is withdrawn — those gaps close by deletion. The
-interim contract: the parent writes a carve before the spawn and reads it after the join; concurrent
-use is unsupported, which is where the engines diverge today (#1814).
+`FreezeScope::DetachedProgeny` (§4, "Detached children"). Carve descriptions below are marked
+**Retiring**. Every engine now traps the carve spawn `CapFault` (#1867 slice 2), so no new carve child
+arises; the machinery below still re-attaches one that a thaw finds in an older artifact, until the
+nested freeze goes. The tests that pinned it by spawning a carve child are deleted with the spawn
+(`durable_nesting.rs`'s nested half, `durable_nesting_jit.rs`); the detached path's twins are
+`durable_detached_jit.rs` and temen-interp's `durable_detached_parity.rs`. New work targets the
+detached path, and planned work below that would extend the carve path (JIT nesting parity,
+separate-module carve children, carve-masking fuzz units, nested freeze declines "to be closed") is
+withdrawn — those gaps close by deletion. #1814's divergence (concurrent use of a carve) went with
+the spawn.
 
 A "durable" domain can be quiesced, serialized to `(window pages + prots, shadow
 control state, handle table)`, and later restored to bytewise-equivalent execution —
@@ -383,13 +387,14 @@ lack the *authority* to rebuild, not a representation.
 only freezable modules and may only spawn durable children.* STW quiesces the subtree
 as a unit.
 
-**Status: enforcement landed** (`crates/temen/tests/durable_nesting.rs`) — the first slice of
-nested-guest durability. The freezable bit is a **grant-time attestation**:
+**Status: enforcement landed** (`crates/temen/tests/durable_nesting.rs`; the detached spawn's half is
+`durable_detached_parity.rs`) — the first slice of nested-guest durability. The freezable bit is a **grant-time attestation**:
 `Host::grant_durable_module` marks a `Module` grant as instrumented (the host ran
 `temen_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
 IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
-domain's §14 ops then enforce the rule fail-closed (`-EINVAL`, like a bad carve): `instantiate`
-/ `spawn_coroutine` (module forms 5/6/7) refuse an **unmarked** grant; a **same-module** child
+domain's §14 ops then enforce the rule fail-closed (`-EINVAL`): a spawn — `instantiate` /
+`spawn_coroutine` (module forms 5/6/7) then, the detached spawn (op 15/17) now that every engine
+refuses the carve spawn (#1867) — refuses an **unmarked** grant; a **same-module** child
 stays admissible (it runs the parent's own instrumented funcs); and the admitted child
 **inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
 shadow state and its own nested instantiates re-apply the same admission rule (the subtree
@@ -492,9 +497,10 @@ is admitted. Pinned by `durable_guest_jit.rs::durable_jit_compile_fences_suspend
 *admitted* — instrument *every* `call.dyn` as may-suspend once a `Jit` cap is granted — trades an
 always-on poll on all durable indirect calls (+ shadow-frame budget pressure) for accepting the
 run-time-installable-targets case; deferred until a workload needs it.
-The **JIT**'s native §14 nursery fails `instantiate`/`coro_spawn`
-closed under a durable run (its child runner re-compiles children with no durable state; the
-interpreter is the reference for durable nesting — JIT parity is a follow-up). Non-durable
+The **JIT**'s native §14 nursery failed `instantiate`/`coro_spawn`
+closed under a durable run (its child runner re-compiled children with no durable state; the
+interpreter was the reference for durable nesting). Both are retired (#2069, #1867); a durable JIT
+run's detached children freeze through `durable_detached_jit.rs`'s path. Non-durable
 domains are unaffected (`separate_module.rs` unchanged).
 
 > **Retiring:** from its subtree-freeze slice on, this block describes the carve path (the
@@ -912,9 +918,10 @@ fails closed on `mod_mem = Some`; needs the module resolver wired onto `_durable
 module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 
 *(The §14 surface itself has since grown — PROCESS.md's S-slices. The grant-carrying instantiate
-forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **fail
-closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host has no freeze
-story yet, the same exclusion as the separate-module child (`temen-jit/src/instantiator_rt.rs`). And
+forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **failed
+closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host had no freeze
+story, the same exclusion as the separate-module child. All three are retired (#1867); they trap
+`CapFault` on every run. And
 `self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently
 defaults it (PROCESS.md O14).)*
@@ -1956,7 +1963,7 @@ stay as the fail-closed backstop for a cause that arises *after* the census — 
 landed freeze (4A.7, below) is the one named. The owner's standing rule is that freezes should basically never
 fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap against §4's cut rule, filed to be closed
 (#1703). On the oracle only for now; freeze-from-start (a window that begins `UNWINDING`) and freeze-on-quiesce
-are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a nested child beside a thread
+are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs`, deleted with the carve spawn (#1867) (a nested child beside a thread
 declines, and the run's result equals the unarmed run's; with the census disabled it ends `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the
 root's handles are the codec's").
 

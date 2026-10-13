@@ -827,8 +827,8 @@ build-out on proven mechanism, exactly like W3 turned out to be.
   program registry (a miss is `-EPERM`), the full argv rides the §3e args buffer so an ordinary
   `main(int, char**)` reads it standalone, wire `stdin` seeds the child, both output streams are
   captured, and the exit code is the child's entry result verbatim. It is **not** new substrate: it
-  is a `HostCap` composed over the §14 Instantiator machinery temen already has (op 13
-  `instantiate_module_named` + `join`), the same mold as `fs`. Proven byte-for-byte on all three
+  is a `HostCap` that runs the child as a fresh top-level domain (`temen_run::domain_exec`), the same
+  mold as `fs`. Proven byte-for-byte on all three
   engines (`crates/temen-run/tests/exec_cap.rs:141`), incl. stdin flowing into the child
   (`exec_cap.rs:219`).
 
@@ -843,11 +843,11 @@ the right tool at the **other** granularity — merging the modules *within a si
 two levels: **`link` = within-program (W2); `exec` = across-phases (W4).** They compose — each phase
 is itself a `link`ed module, and the driver `exec`s the phases in sequence.
 
-There is already a **working precedent at exactly W4's shape**: the compiled-C shell drives
-`instantiate_module_named` (op 13) + `join`, resolving `argv[0]` against a name → `Module` registry,
+There is already a **working precedent at exactly W4's shape**: the compiled-C shell drives a
+detached spawn (an op-17 record, `vm_spawn`; op 13 `instantiate_module_named` before #1867) + `join`,
+resolving `argv[0]` against a name → `Module` registry,
 running an unmodified `main(argc, argv)` child with inherited stdout and seeded argv, and threading
-each command's exit status into `$?` (`crates/temen/tests/c_shell_exec.rs`,
-`crates/temen/tests/stage1_exec_command.rs`). A `nifmake` driver is that shell with a fixed four-command
+each command's exit status into `$?` (`crates/temen/tests/c_shell_exec.rs`). A `nifmake` driver is that shell with a fixed four-command
 script.
 
 **Passing intermediate files between phases.** nimony's phases hand `.p.nif`/`.s.nif`/`.nif`/`.c`

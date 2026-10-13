@@ -2282,10 +2282,11 @@ default above still stands for every handle-gated capability.
 
 ### wasm-JIT tier coverage (the `compile_nested` front door)  [SETTLED — built]
 VM-in-VM runs correctly on **every** tier: fed to the general `compile_jit` front door a §14 unit
-runs interpreter-driven, the interpreter servicing `instantiate`/`join` via `VcpuStop::Instantiate`.
-The wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is a *performance* path that lowers a
-nesting parent's `instantiate`/`join`/window-carve/`thread`/futex ops to host bounces
-(`env.instantiate` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. `compile_nested`
+runs interpreter-driven, the interpreter servicing the spawn and `join` via
+`VcpuStop::InstantiateDetached`. The wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is
+a *performance* path that lowers a nesting parent's spawn (op 17)/`join`/`thread`/futex ops to host
+bounces (`env.instantiate_rec` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. (The
+carve spawns it once lowered, ops 0 and 13, are retired, #1867.) `compile_nested`
 is its single front door — the nesting analogue of `compile_jit` — deriving the drive mode from the
 IR, so a verified unit always yields a runnable artifact:
 
@@ -3748,9 +3749,8 @@ returned at once, from any stack. A parent's nursery holds its children's to the
 which releases what each one retains only after the executor has drained: a grandchild that outlives
 its parent still hands its lane and window back to the parent's host, and that retained ref is what
 keeps the host alive. A durable child's nursery is durable, so its children are, and a freeze
-reaches them through it (DURABILITY.md §4, "The JIT captures them too"). Still refused: a carve
-spawn from a detached child (`CapFault`; its task would write back into a window that can be freed
-first, and #1867 deletes carves). Pins:
+reaches them through it (DURABILITY.md §4, "The JIT captures them too"). A carve spawn is refused
+from any domain (`CapFault`, #1867). Pins:
 `temen-run/tests/detached_child_jit.rs`, `child_exec_jit.rs` (the chain),
 `temen/tests/instantiate_record.rs` on every backend, `temen/tests/fiber_join_child.rs` (a fiber's
 join, on every engine), and `temen/tests/durable_detached_jit.rs` (durable).

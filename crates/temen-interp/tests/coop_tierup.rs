@@ -871,146 +871,10 @@ block 0 (vx: i64) {
     assert_eq!(offers, vec![1], "the image is offered once");
 }
 
-/// #816 — the routed **flat window view**: while a confined child's tier-up is pending,
-/// [`CoopRun::pending_win`] must hand the driver the CHILD's carve (base = root backing + carve
-/// offset, len = carve size), and a write through it must land where the parent reads it in its own
-/// window (the shared backing). Emulates the browser host: each event writes a marker byte at the
-/// pending window's offset 8 (what an emitted store would do), then delivers the leaf's value. The
-/// guest sums the leaf results with the markers read back through the parent window — so a
-/// mis-routed pointer (root base for a child event) or a mis-sized span fails the value assert.
-/// Unix-only: the native test backing must be flat (`Region::Mapped`) for the raw view; on the
-/// browser the backing is always flat (`Region::shared` over the cdylib buffer).
-#[cfg(unix)]
-#[test]
-fn coop_tierup_pending_win_routes_to_the_child_carve() {
-    // func 0 (root): instantiate child at 65536 (4 KiB), join → child result; call leaf(3) itself;
-    // read marker bytes at [16392] (root's own event — above the #1094 guard, since the root window
-    // is guarded) and [65536+8] (the child's event — its 4 KiB carve is sub-guard/unguarded, visible
-    // through the parent window on the shared backing); return child + local + markers.
-    // func 1 (child entry): call leaf(5), return it. func 2: the leaf f(x) = x*3 + 7.
-    const SRC: &str = r#"
-memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ve = i64.const 1
-  voff = i64.const 65536
-  vsl = i64.const 12
-  vq = i64.const 0
-  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vsl, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  v3 = i64.const 3
-  vlocal = call 2 (v3)
-  vma = i64.const 16392
-  vm0 = i32.load8_u vma
-  vm0e = i64.extend_i32_u vm0
-  vca = i64.const 65544
-  vm1 = i32.load8_u vca
-  vm1e = i64.extend_i32_u vm1
-  vs1 = i64.add vj vlocal
-  vs2 = i64.add vs1 vm0e
-  vs3 = i64.add vs2 vm1e
-  return vs3
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v5 = i64.const 5
-  vr = call 2 (v5)
-  return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (vx: i64) {
-  v3 = i64.const 3
-  vm = i64.mul vx v3
-  v7 = i64.const 7
-  va = i64.add vm v7
-  return va
-  }
-}
-"#;
-    let m = parse_module(SRC).unwrap();
-    temen_verify::verify_module(&m).expect("verify");
-    let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
-    let args = [Value::I32(inst)];
-    let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
-    // The browser shape: the window lives over a caller-provided flat backing with the reservation
-    // clamped to it, so `pending_win` resolves and spans exactly the run window / child carve.
-    let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
-    let mut run = bytecode::CoopRun::new_over(
-        &m,
-        0,
-        &args,
-        FUEL,
-        host,
-        Some(TierUpConfig {
-            root: ProgramEmit {
-                eligible,
-                page_checked: false,
-            },
-            leaf: None,
-            modules: None,
-        }),
-        &[],
-        17,
-        back,
-    )
-    .expect("supported")
-    .expect("entry in range");
-    // Expected per-event windows: the root's event spans the full 2^17 window at the backing base;
-    // the child's spans its 4 KiB carve at base + 65536.
-    let mut spans: Vec<u64> = Vec::new();
-    let result = loop {
-        match run.run() {
-            bytecode::CoopEvent::Done(vals) => break Ok(vals),
-            bytecode::CoopEvent::Trapped(t) => break Err(t),
-            bytecode::CoopEvent::Idle
-            | bytecode::CoopEvent::Paused
-            | bytecode::CoopEvent::CapPark { .. } => {
-                panic!("unexpected Idle (suspend_on_idle is never armed here)")
-            }
-            bytecode::CoopEvent::Resume { .. } => {
-                panic!("unexpected Resume (no leaf image here)")
-            }
-            bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
-            bytecode::CoopEvent::TierUp { func, argv, .. } => {
-                assert_eq!(func, 2, "only the leaf is eligible");
-                let (ptr, len) = run
-                    .pending_win()
-                    .expect("a flat native backing resolves the pending window");
-                spans.push(len);
-                // The emitted region's effect, emulated over the routed window: store the marker at
-                // a window-relative offset the guest can read back. The root window is guarded
-                // ([0,16384) unmapped), so its marker goes above the guard at 16392; the child's
-                // 4 KiB carve is sub-guard (unguarded), so its marker stays at offset 8. (Keyed by
-                // the span: only the root event spans the whole guarded window.)
-                // SAFETY: the paused task is parked inside the event; `ptr` spans `len` bytes of the
-                // run backing, exclusively ours until deliver (single-threaded pump).
-                let moff = if len >= 16384 { 16392 } else { 8 };
-                unsafe { std::ptr::write(ptr.cast_mut().add(moff), 21u8) };
-                let x = argv[0];
-                run.deliver_tierup(&[x * 3 + 7]);
-            }
-        }
-    };
-    // Child event first (the scheduler runs the child to completion inside the join), then root's.
-    assert_eq!(
-        spans,
-        vec![4096, 1 << 17],
-        "pending_win must span the child carve for the child's event and the run window for the root's"
-    );
-    // child leaf f(5)=22 + root leaf f(3)=16 + root marker 21 + child marker 21 = 80.
-    assert_eq!(
-        result,
-        Ok(vec![Value::I64(80)]),
-        "markers must land in each task's own window"
-    );
-}
-
 // #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is
 // the proven browser fork probe (`FORK_TWIN`, FORK.md §9): a manager (f0) spawns a server (f1,
-// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as §14 children; the guest calls
+// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as detached §14 children (the server
+// through the v1 record `fork_twin_src` lays at 17792); the guest calls
 // `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
 // copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
 // reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
@@ -1027,27 +891,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32) {
-  vlog = i64.const 12
-  vq = i64.const 0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 131072
-  q1v2 = i64.const -4294967284
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
+  q1a0 = i64.const 17792
+  q1b = i64.const 17820
+  i32.store q1b vbud
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -1151,18 +997,16 @@ block 0 (vx: i64) {
 }
 "#;
 
-/// Where [`fork_twin_src`]'s guest runs: in a 4 KiB carve of the root window (a v0 record, which
-/// #1867 retires), or detached, in a window of its own (a v1 record, #2102) — running the manager's
-/// own program (module `-1`, which #2219's slice 3 retires), or a child image of it (#2248).
+/// What [`fork_twin_src`]'s guest runs, detached in a window of its own (a v1 record, #2102): the
+/// manager's own program (module `-1`, which #2219's slice 3 retires), or a child image of it (#2248).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Guest {
-    Carve,
     Detached,
     Image,
 }
 
-/// [`SRC_FORK_TWIN`] with its guest placed `guest`. Its scratch is at 0 in the carve, which is
-/// unguarded, and above the NULL guard a detached window has (#964).
+/// [`SRC_FORK_TWIN`] with its guest placed `guest`. Its scratch is above the NULL guard its window
+/// has (#964).
 fn fork_twin_src(guest: Guest) -> String {
     let detached = |module: &str, entry| {
         let spawn = format!(
@@ -1179,7 +1023,6 @@ fn fork_twin_src(guest: Guest) -> String {
         (spawn, 16896, rec)
     };
     let (spawn, scratch, rec) = match guest {
-        Guest::Carve => (CARVE_GUEST.to_string(), 0, String::new()),
         Guest::Detached => detached("", 4),
         Guest::Image => detached("  q2m = i64.const 17688\n  i32.store q2m vmod\n", 0),
     };
@@ -1188,33 +1031,9 @@ fn fork_twin_src(guest: Guest) -> String {
         .replace("@S0@", &scratch.to_string())
         .replace("@S8@", &(scratch + 8).to_string())
         .replace("@S16@", &(scratch + 16).to_string())
+        + &rec::segment(17792, &temen_ir::SpawnRec::v1(1))
         + &rec
 }
-
-/// The guest's v0 carve record at 17664: entry 4, a 4 KiB carve at 135168, its grants `"svc"` and
-/// `"o"` at 16640.
-const CARVE_GUEST: &str = "  q2v0 = i64.const 17179869184
-  q2v1 = i64.const 135168
-  q2v2 = i64.const -4294967284
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2v5 = i64.const 16640
-  q2v6 = i64.const 2
-  q2a0 = i64.const 17664
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 17672
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 17680
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 17688
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 17696
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 17704
-  i64.store q2a5 q2v5
-  q2a6 = i64.const 17712
-  i64.store q2a6 q2v6
-";
 
 /// Every target (unlike the unix-only pending-win test): the run backing is an **owned flat**
 /// buffer (`Region::owned_zeroed` — the same shape as the browser's `Region::shared` window), so
@@ -1225,12 +1044,10 @@ const CARVE_GUEST: &str = "  q2v0 = i64.const 17179869184
 #[test]
 fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     // Both leaf calls tier up: the original guest's and the fork twin's, whose private
-    // `fork_private` window is its OWN flat allocation, outside the root backing. A carve guest's
-    // window lies INSIDE the root backing, and both span the 4 KiB carve; a detached guest's
+    // `fork_private` window is its OWN flat allocation, outside the root backing. The guest's
     // 256 KiB window is its own, and so is its twin's. An image guest's calls are its image's
     // (program 1), and so are its twin's (#2248).
     for (guest, want_events) in [
-        (Guest::Carve, vec![(0, false, 4096), (0, true, 4096)]),
         (
             Guest::Detached,
             vec![(0, false, 1 << 18), (0, false, 1 << 18)],
@@ -1297,7 +1114,7 @@ fn fork_twin_run(
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let module = match guest {
         Guest::Image => host.grant_module(&temen_ir::child_image_at(m, 4).expect("child image")),
-        Guest::Carve | Guest::Detached => -1,
+        Guest::Detached => -1,
     };
     let args = [inst, out_h, budget, module].map(Value::I32);
     let back = std::sync::Arc::new(

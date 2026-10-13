@@ -2290,7 +2290,7 @@ pub extern "C" fn temen_par_child_detached(
     }
     let back = std::sync::Arc::new(foreign_region(mem_id, 1u64 << size_log2));
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match child.start(unsafe { prog_ref(prog) }, back, None) {
+    match child.start(unsafe { prog_ref(prog) }, back) {
         Ok(inner) => {
             // #1865: the child's starter cap handles (its entry args), staged for a Worker that runs
             // the entry on the emitted tier.
@@ -2631,8 +2631,6 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     }
                 }
             }
-            // A §14 carve spawn: the par driver's children are detached (#1865), so it fails closed.
-            bytecode::VcpuEvent::Instantiate { .. } => return par_trap(v, &Trap::CapFault),
             // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
             // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
             bytecode::VcpuEvent::StdinPark => return par_trap(v, &Trap::CapFault),
@@ -11597,7 +11595,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             temen_interp::host_page_size(),
                         ));
                         let r = child
-                            .start(prog, back, None)
+                            .start(prog, back)
                             .and_then(|c| plan::drive_op13(prog, c));
                         let token = d.children.len() as u64;
                         d.children.push(Some(r));
@@ -11658,8 +11656,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             // child (#1289), no threads, no tier-up of its own, no §22 units, no cap or stdin park.
             // Named rather than `_` (see `VcpuEvent`) so a new event fails to build here instead of
             // trapping the driver.
-            bytecode::VcpuEvent::Instantiate { .. }
-            | bytecode::VcpuEvent::TierUp { .. }
+            bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }

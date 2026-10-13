@@ -135,12 +135,12 @@ wasmtime run --invoke run_dynlink   -W memory64=y "$W"   # 777 (compile_linked r
 wasmtime run --invoke run_durable   -W memory64=y "$W"   # 2001 (durable NORMAL run; freeze/thaw differ in corpus)
 wasmtime run --invoke run_float     -W memory64=y "$W"   # 4611686018427387904 (sqrt(4.0)=2.0, bit-exact)
 
-# Full differential (14 feature families, 187 cases) vs native ground truth — byte-identical
+# Full differential (14 feature families, 189 cases) vs native ground truth — byte-identical
 cargo run --bin gencorpus                                # native ground truth → corpus.json
-node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm   # wasm32 (Node): 187/187
-# wasm64 (Wasmtime embedding): the same 187 cases byte-fed through the production target
+node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm   # wasm32 (Node): 189/189
+# wasm64 (Wasmtime embedding): the same 189 cases byte-fed through the production target
 cargo run --manifest-path wt/Cargo.toml --release -- \
-  target/wasm64-unknown-unknown/release/temen_browser.wasm                 # wasm64: 187/187
+  target/wasm64-unknown-unknown/release/temen_browser.wasm                 # wasm64: 189/189
 
 # A powerbox defined in JS — guest capabilities bound to page functions through `temen_host.js_cap_call`
 node browser-jspb-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
@@ -169,10 +169,9 @@ as an interactive playground card:
   under wasm — the same reason the whole browser path is bytecode-only (see "Why the bytecode engine"
   above).
 
-- **Sequential subset.** `compile_inst` rejects `Instantiator`/`SharedRegion` call.caps, which the
-  full shell carries (external commands + concurrent ring pipelines). So the browser fixture is built
-  with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in `shell_main.c` drop those paths, leaving a
-  bytecode-compilable module. **The browser gets Stage-0** (builtins, redirects, in-window memfs
+- **Sequential subset.** The full shell carries external commands and concurrent ring pipelines; the
+  browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`, whose `#ifndef` guards in `shell_main.c`
+  drop those paths. **The browser gets Stage-0** (builtins, redirects, in-window memfs
   pipelines, command lists, `if`, variables, globbing, comments) — external commands and concurrent
   pipelines are native-only.
 
@@ -262,7 +261,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `temen_alloc` buffers, so a small Wasmtime-embedding harness (`temen-wt`, deps `wasmtime` + `serde_json`,
   no Temen crates) loads the **wasm64** module, `temen_alloc`s + writes each corpus module/stdin/window,
   calls the exports, reads results/streams/snapshots back, and compares to the *same* `corpus.json`.
-  **187/187 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
+  **189/189 match on wasm64** — byte-identical to wasm32 and native, including the 128 KiB durability
   snapshots and the 2 MiB echo. So the full differential now runs on **both** targets, not probe-only
   on the production one.
 - [x] **cfg-gate `lib.rs` for wasm.** `page_size` is now native-only (`target.'cfg(not(wasm))'`)
@@ -273,15 +272,16 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   the built binary). Source-level gating of it was deferred — pure churn for no artifact change.
 - [x] **Differential check (14 feature families, wasm32 + wasm64).** `gencorpus` (host) encodes a
   corpus + computes the **native** result per case; `corpus.mjs` (wasm32, Node) and `browser/wt`
-  (wasm64, Wasmtime) run the same modules through the wasm exports and compare. **187/187 match**, zero
+  (wasm64, Wasmtime) run the same modules through the wasm exports and compare. **189/189 match**, zero
   host imports.
   *Compute/concurrency* (37): i64 arith+branches, multi-function `call`, memory store/load,
   divide-by-zero → `STATUS_TRAP`, **and a `thread.spawn` kernel** (8 vCPUs × 500 `atomic.rmw.add` =
   **4000** on the cooperative `drive`). *Powerbox* (5): stdout greeting, stdin→stdout echo,
   monotonic-clock delta, `exit(42)` → `STATUS_EXIT`, and stderr role-routing. *Snapshot* (3): a window
   seeded with 16 i64 words, transformed in place (`+arg`), with the **final memory image** captured
-  and compared byte-for-byte. *Nested children* (5): §14 confined sub-guests (shared backing, depth-2,
-  attenuated AddressSpace, boundary rejection, trap propagation). Plus fibers/coroutines, tail calls,
+  and compared byte-for-byte. *Nested children* (9): §14 sub-guests in windows of their own (isolation,
+  depth-2, attenuated AddressSpace, a refused window, trap propagation), and the four retired carve
+  spawns, each `STATUS_TRAP` (#1867). Plus fibers, tail calls,
   SIMD/v128, gc.roots, reflection, SharedRegion, guest-JIT, dynlink, durability. *Scalar floats* (65):
   f32/f64 `add`/`sub`/`mul`/`div`/`sqrt`/`min`/`max`/`copysign`/conversions/comparisons over **NaN /
   ±inf / ±0 / subnormal / rounding** bit patterns — reinterpreted to i64 bits and compared **exactly**,
@@ -320,12 +320,11 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
   (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
   sub-guests inside the wasm sandbox.
-- [x] **§12 fibers + §14 coroutines.** Cooperative continuation switching — the engine's signature.
+- [x] **§12 fibers.** Cooperative continuation switching — the engine's signature.
   *Fibers* (`cont.new`/`cont.resume`/`suspend`, no powerbox → the plain `temen_run0` path): run-to-
   completion (`107`), suspend round-trip (`36`), multi-suspend loop (`19`), and forged-handle / root-
-  suspend faults (`STATUS_TRAP`). *Coroutines* (`spawn_coroutine`/`resume` + `Yielder.yield`, on the
-  `temen_run_nested` Instantiator path): a 3-resume yield round-trip (`1001329`) and a forged-resume
-  fault. All 7 match native; wasm64 `run_fiber() == 107`, `run_coroutine() == 1001329`.
+  suspend faults (`STATUS_TRAP`). All match native; wasm64 `run_fiber() == 107`. (The §14 coroutine
+  cases went with the coroutine ops, #2069, #1867.)
 - [x] **Tail calls** (`return_call`/`return_call.dyn`, O(1) window reuse). Plain compute path:
   tail-recursive factorial (sweep) + indirect dispatch through the natural table (incl. out-of-range →
   `IndirectCall` trap). wasm64 `run_tailcall() == 120`.
@@ -806,7 +805,7 @@ schedule/IO-shaped; the real-language playground tab is what makes this the high
 v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation, lazy hot-block
 discovery. Temen has none of that. Code arrives as **complete, verified, immutable IR units at exactly
 three explicit points** — module load (`temen_par_compile`), §22 `jit_compile`/`install` (already
-literally the API for "compile this unit"), §14 `instantiate_module` — and uninstall is drop, never
+literally the API for "compile this unit"), and a §14 spawn's granted module — and uninstall is drop, never
 patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `v128`, typed
 SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
 80%: codegen at unit granularity, dispatch through a real funcref table, state in linear memory at
@@ -1130,13 +1129,13 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    **[landed — §14 VM-in-VM emitter mechanism + native differential]** A unit whose entry *uses* its
    `Instantiator` cap (spawns a nested confined VM + `join`s it) now emits, where before **any**
    `call.cap` forced the whole entry onto the interpreter (`block_value_types` rejected it).
-   [`temen_wasm_jit::compile_module_nested`] lowers `call.cap 6` INSTANTIATOR `instantiate` (op 0) /
+   [`temen_wasm_jit::compile_module_nested`] lowered `call.cap 6` INSTANTIATOR `instantiate` (op 0) /
    `join` (op 1) to a host-driver bounce — `env.instantiate` / `env.join` imports, the
    funcref-table-free analog of `env.call_interp` — so the child vCPU spawn + join happen host-side,
-   exactly as the interpreter surfaces `VcpuStop::Instantiate` to its driver; the emitted parent does
+   exactly as the interpreter surfaced `VcpuStop::Instantiate` to its driver; the emitted parent does
    no confinement itself (the child's window carve + attenuated powerbox stay the host's job, unchanged
    from the interpreter path). Opt-in, so the production paths are byte-identical. The spawn is now
-   op 17's `env.instantiate_rec` bounce (#1867 retires the op-0 carve), pinned by
+   op 17's `env.instantiate_rec` bounce (the op-0 carve is retired and no longer lowered, #1867), pinned by
    `crates/temen-wasm-jit/tests/instantiate_rec.rs`: an emitted entry that spawns + `join`s a child
    returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
    actually fired).
@@ -1542,7 +1541,7 @@ fibers when JSPI / core stack-switching ships.
   (`crates/temen/tests/bytecode_diff.rs` + the `bytecode_{caps,fibers,threads,coroutines,instantiate,
   tailcall,debug,durable,dynlink}.rs` suite) must stay green after the cfg-gating — proving the port
   didn't disturb engine semantics.
-- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 187/187
+- **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 189/189
   differential vs native on wasm32), `browser/wt` (wasm64 via a Wasmtime embedding), and
   `node browser/browser-jspb-test.mjs` (the JS-defined powerbox over real host imports). The 17
   embedded `--invoke` probes under

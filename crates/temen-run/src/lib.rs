@@ -1432,7 +1432,6 @@ pub fn jit_cap_run(
         // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
         // (`jit_proc::run_image`); without them a granted spawn here was an inert `CapFault`.
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
-        cm.set_budget_taker(Some(production_budget_taker(cc)));
         if durable {
             cm.set_high_water(Some(cc.high_water()));
         }
@@ -1494,7 +1493,6 @@ pub fn jit_cap_run(
     )?;
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
-    cm.set_budget_taker(Some(production_budget_taker(cc)));
     if durable {
         cm.set_high_water(Some(cc.high_water()));
     }
@@ -2510,38 +2508,6 @@ unsafe fn resolve_module_into(
     }
 }
 
-/// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
-/// CALLS.md 5c.1c — the production granted-child hook set (`jit_proc::run_image` installs it on
-/// every CLI JIT run): the same callbacks the test harnesses wire by hand.
-/// §3c.2 — the production [`temen_jit::BudgetTaker`]: peek/drain a Budget on the run's parent
-/// `Host` for a record spawn, mirroring the interpreter's op-17 discipline exactly (see
-/// [`temen_interp::Host::budget_for_spawn`]).
-///
-/// # Safety
-/// `ctx` is the run's live `*mut Host` (the cap thunk's ctx); `out`/`trap_out` are writable.
-pub unsafe extern "C" fn budget_take(
-    ctx: *mut core::ffi::c_void,
-    handle: i32,
-    child_size: u64,
-    mode: i32,
-    out: *mut temen_jit::BudgetTaken,
-    trap_out: *mut i64,
-) -> i32 {
-    let host = &mut *(ctx as *mut Host);
-    match host.budget_for_spawn(handle, child_size, mode == 1) {
-        None => {
-            *trap_out = temen_jit::TrapKind::CapFault as i64;
-            0
-        }
-        Some(Err(())) => 2,
-        Some(Ok((fuel, spawn))) => {
-            (*out).fuel = fuel;
-            (*out).spawn = spawn;
-            1
-        }
-    }
-}
-
 /// #1234 — the `Mutex<Host>`-ctx twin of a §14 child hook. Every hook below reaches the run's
 /// **parent** host through the ctx the run baked into its `call.cap` sites, and there are two shapes
 /// for that one pointer: a single-threaded run bakes a raw `*mut Host` (with [`cap_thunk`]), a
@@ -2565,24 +2531,6 @@ macro_rules! locked_parent_hook {
     };
 }
 
-locked_parent_hook!(
-    grant_child_build_locked,
-    grant_child_build,
-    (grant_handle: i32, child_size: u64, out: *mut temen_jit::GrantChild) -> i32
-);
-locked_parent_hook!(
-    grant_named_child_build_locked,
-    grant_named_child_build,
-    (
-        mem_base: *mut u8,
-        mem_size: u64,
-        grants_ptr: u64,
-        grants_n: u64,
-        child_size: u64,
-        out: *mut temen_jit::GrantChild,
-        trap_out: *mut i64,
-    ) -> i32
-);
 locked_parent_hook!(
     grant_detached_child_build_locked,
     grant_detached_child_build,
@@ -2635,17 +2583,6 @@ locked_parent_hook!(
     child_grant_locked,
     child_grant,
     (child_ctx: *mut c_void, handle: i64, trap_out: *mut i64) -> i32
-);
-locked_parent_hook!(
-    budget_take_locked,
-    budget_take,
-    (
-        handle: i32,
-        child_size: u64,
-        mode: i32,
-        out: *mut temen_jit::BudgetTaken,
-        trap_out: *mut i64,
-    ) -> i32
 );
 
 /// #1234 — **the parent host a run baked into its `call.cap` sites, together with the shape it
@@ -2863,8 +2800,8 @@ fn jit_layout(m: &Module, host: &Host, bytes: Vec<u8>) -> temen_interp::MemLayou
 /// a shared `Arc<Mutex<Host>>`), so they are the same function either way.
 pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     let locked = ctx.is_locked();
-    // D66 — the parent's lane coordinates, read now (before any guest runs) so a carve child's task
-    // is gated on its parent's lane without a hook call at every spawn.
+    // D66 — the parent's lane coordinates, read now (before any guest runs): the run's own lane, which
+    // its domain's vCPUs and its children's tasks draw on.
     // SAFETY: `ctx` is the live parent host in the shape it declares (the contract of this fn).
     let (parent_domain, parent_lane_cap) = unsafe {
         match ctx {
@@ -2878,16 +2815,6 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     temen_jit::GrantChildHooks {
         parent_domain,
         parent_lane_cap,
-        build: if locked {
-            grant_child_build_locked
-        } else {
-            grant_child_build
-        },
-        build_named: if locked {
-            grant_named_child_build_locked
-        } else {
-            grant_named_child_build
-        },
         build_detached: if locked {
             grant_detached_child_build_locked
         } else {
@@ -2954,76 +2881,12 @@ unsafe fn child_as_parent(child_ctx: *mut c_void) -> temen_jit::GrantChildHooks 
     production_grant_hooks(CapCtx::Locked(child_ctx as *const Mutex<Host>))
 }
 
-/// The production [`temen_jit::BudgetTaker`] for a run with this cap ctx — the `set_budget_taker`
-/// twin of [`production_grant_hooks`]. It reads the same `parent_ctx` the hooks carry (the nursery
-/// hands every hook that pointer), so passing the run's `CapCtx` here keeps the two in step.
-pub fn production_budget_taker(ctx: CapCtx) -> temen_jit::BudgetTaker {
-    if ctx.is_locked() {
-        budget_take_locked
-    } else {
-        budget_take
-    }
-}
-
-/// re-grant one of the parent's coordinate-free capabilities (`Stream`/`Exit`/`Clock`, named by
-/// `grant_handle`) into a fresh child powerbox `Host` confined to `[0, child_size)`, so a JIT child
-/// can do I/O instead of being born destitute. The child `Host` is heap-`Box`ed and returned as the
-/// opaque `ctx` the JIT compiles the child against (`temen_run::cap_thunk` with this host), together with
-/// the three entry-arg handles (`Instantiator`, `AddressSpace`, grant). Frees nothing — the paired
-/// [`grant_child_release`] does, after the child runs. Returns `0` (an inert `CapFault`) for a forged /
-/// non-copyable handle. The grant logic lives on [`Host::spawn_granted_child`] so the interpreter and
-/// JIT build the *same* child powerbox (differential lockstep).
+/// Free a child `Host` built by [`grant_detached_child_build`] — the paired
+/// [`temen_jit::GrantChildReleaser`], called once after the child has run.
 ///
 /// # Safety
-/// `ctx` is the live `*mut Host` (the same as the cap thunk's parent host); `out` is a writable
-/// [`temen_jit::GrantChild`]. The returned `ctx` must be released with [`grant_child_release`].
-pub unsafe extern "C" fn grant_child_build(
-    ctx: *mut c_void,
-    grant_handle: i32,
-    child_size: u64,
-    out: *mut temen_jit::GrantChild,
-) -> i32 {
-    let parent = &mut *(ctx as *mut Host);
-    match parent.spawn_granted_child(grant_handle, child_size) {
-        Some((child, inst_handle, as_handle, cg)) => {
-            // CALLS.md 5c.0 — the child powerbox is **shared**: one ref rides the child thread
-            // (compiled against the lock-taking thunk), one is retained by the nursery so
-            // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
-            // `grant_child_release` (child exit / nursery teardown).
-            let mut child = child;
-            // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on
-            // this cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
-            child.set_park_hub(parent.park_hub());
-            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
-            let jit_table_log2 = child.jit_table_log2();
-            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
-            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
-            let shared = child.into_cell();
-            let retained = std::sync::Arc::clone(&shared);
-            *out = temen_jit::GrantChild {
-                ctx: std::sync::Arc::into_raw(shared) as *mut c_void,
-                retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
-                inst_handle,
-                as_handle,
-                grant_handle: cg,
-                jit_table_log2,
-                domain,
-                lane_cap,
-                parent_domain,
-                parent_lane_cap,
-            };
-            1
-        }
-        None => 0,
-    }
-}
-
-/// Free a child `Host` built by [`grant_child_build`] — the paired [`temen_jit::GrantChildReleaser`],
-/// called once after the granted child has run.
-///
-/// # Safety
-/// `ctx` is a [`temen_jit::GrantChild::ctx`] a `grant_child_build` returned and that has not yet been
-/// released.
+/// `ctx` is a [`temen_jit::GrantChild::ctx`] a `grant_detached_child_build` returned and that has
+/// not yet been released.
 pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     if !ctx.is_null() {
         // CALLS.md 5c.1b — clear the serve context first (idempotent across the two releases): the
@@ -3052,7 +2915,7 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
             g.set_client_gone();
             ring(&g);
         }
-        // CALLS.md 5c.0 — one counted ref of the shared child powerbox (see `grant_child_build`);
+        // CALLS.md 5c.0 — one counted ref of the shared child powerbox (see `finish_child_build`);
         // the `Host` drops when the last of {child-thread ref, nursery-retained ref} is released.
         drop(std::sync::Arc::from_raw(ctx as *const Mutex<Host>));
     }
@@ -3409,14 +3272,14 @@ unsafe fn live_impl_call(
 }
 
 /// IMPORTS.md phase 3 / S2.1 — bind a spawned child module's import manifest against its freshly
-/// built powerbox (the [`temen_jit::ChildManifestBinder`] hook for op 13): resolve the granted
+/// built powerbox (the [`temen_jit::ChildManifestBinder`] hook a detached spawn calls): resolve the granted
 /// `Module`'s retained manifest on the parent and apply the shared reference child policy on the
 /// child host ([`Host::bind_child_manifest`] — the same call the interpreter's inline spawn makes),
 /// so the two backends bind identically. A forged module handle binds nothing (the spawn itself
 /// already failed closed on it).
 ///
 /// # Safety
-/// `parent_ctx`/`child_ctx` are the live parent/child `*mut Host` the op-13 runtime holds.
+/// `parent_ctx`/`child_ctx` are the live parent/child `*mut Host` the spawn runtime holds.
 pub unsafe extern "C" fn child_bind_imports(
     parent_ctx: *mut c_void,
     child_ctx: *mut c_void,
@@ -3506,51 +3369,24 @@ pub unsafe extern "C" fn child_grant(
     }
 }
 
-/// PROCESS.md S2 (JIT parity) — the §14 **named-grant-list builder** for `instantiate_named` (op 11):
-/// read `grants_n` 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
-/// window-relative `grants_ptr`, re-grant each record's copyable handle into a fresh child powerbox
-/// `Host` **under its name** (via the shared [`Host::spawn_named_child`]), and return the child host +
-/// its `Instantiator`/`AddressSpace` handles (`grant_handle` unused — named grants are found by
-/// `self.resolve`, not passed as an arg). The multi-cap, by-name analog of [`grant_child_build`].
+/// PROCESS.md §5 / #1287 — the **detached** child's powerbox builder ([`temen_jit::GrantChildHooks::
+/// build_detached`]): read `grants_n` 16-byte records `{name_off: u32, name_len: u32, handle: i32,
+/// flags: u32}` at window-relative `grants_ptr` and re-grant each record's copyable handle into a
+/// fresh child powerbox `Host` **under its name**, built through [`Host::spawn_detached_child`]: the
+/// child attests `window_exposed = false`, its starter caps span `child_size` = the window
+/// reservation (a root's shape; the JIT thunk passes it), and it gets what [`budget_mem_take`] just
+/// admitted it with: the lease's `budget` as its `"budget"`, the `runs` its window is paid for up
+/// to, and `lane`.
 ///
-/// Fails the whole spawn closed, exactly like the interpreter's op-11 path: an out-of-window record or
-/// name is a `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns
-/// `1` on success (`out` filled), `0` with `*trap_out` set otherwise. Frees nothing — the paired
+/// Fails the whole spawn closed, exactly like the interpreter: an out-of-window record or name is a
+/// `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns `1` on
+/// success (`out` filled), `0` with `*trap_out` set otherwise. Frees nothing — the paired
 /// [`grant_child_release`] does.
 ///
 /// # Safety
 /// `ctx` is the live parent `*mut Host`; `[mem_base, mem_base+mem_size)` is the parent's mapped window
 /// (records/names are read within it); `out`/`trap_out` are writable. The returned `ctx` must be freed
 /// with [`grant_child_release`].
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn grant_named_child_build(
-    ctx: *mut c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    grants_ptr: u64,
-    grants_n: u64,
-    child_size: u64,
-    out: *mut temen_jit::GrantChild,
-    trap_out: *mut i64,
-) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, trap_out)
-    else {
-        return 0;
-    };
-    let parent = &mut *(ctx as *mut Host);
-    let built = parent.spawn_named_child(&grants, child_size);
-    finish_child_build(parent, built, out, trap_out)
-}
-
-/// PROCESS.md §5 / #1287 — the **detached** child's powerbox builder ([`temen_jit::GrantChildHooks::
-/// build_detached`]): the same by-name grant records as [`grant_named_child_build`], built through
-/// [`Host::spawn_detached_child`] — the child attests `window_exposed = false`, its starter caps span
-/// `child_size` = the window reservation (a root's shape; the JIT thunk passes it), and it gets what
-/// [`budget_mem_take`] just admitted it with: the lease's `budget` as its `"budget"`, the `runs` its
-/// window is paid for up to, and `lane`.
-///
-/// # Safety
-/// As [`grant_named_child_build`].
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn grant_detached_child_build(
     ctx: *mut c_void,
@@ -3814,9 +3650,9 @@ unsafe fn read_grant_records(
         .ok()
 }
 
-/// Wrap a built child powerbox as the two counted shared refs the JIT expects (see
-/// [`grant_child_build`]): arm the wake signal, inherit the kill cell, fill `out`. `None` (a
-/// non-re-grantable handle) is the fail-closed `CapFault`.
+/// Wrap a built child powerbox as the two counted shared refs the JIT expects: arm the wake signal,
+/// inherit the kill cell, fill `out`. `None` (a non-re-grantable handle) is the fail-closed
+/// `CapFault`.
 unsafe fn finish_child_build(
     parent: &Host,
     built: Option<(Host, i32, i32)>,
@@ -3825,9 +3661,13 @@ unsafe fn finish_child_build(
 ) -> i32 {
     match built {
         Some((child, inst_handle, as_handle)) => {
-            // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
+            // CALLS.md 5c.0 — the child powerbox is **shared**: one ref rides the child thread
+            // (compiled against the lock-taking thunk), one is retained by the nursery so
+            // `child_offer` can mint a live-impl over it. Each ref is released exactly once via
+            // `grant_child_release` (child exit / nursery teardown).
             let mut child = child;
-            // CALLS.md 5c.1b — as `grant_child_build`: inherit the park hub.
+            // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on
+            // this cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
             child.set_park_hub(parent.park_hub());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
@@ -5519,7 +5359,6 @@ impl PowerboxProgram {
         }
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
         cm.set_window_ready(Some(cc.window_ready()));
-        cm.set_budget_taker(Some(production_budget_taker(cc)));
         Ok(PowerboxProgram {
             inst,
             win,

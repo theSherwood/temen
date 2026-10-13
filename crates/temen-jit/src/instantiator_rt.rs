@@ -14,19 +14,9 @@
 //! "park only the calling fiber" (vs. today's synchronous run-at-`instantiate`) are follow-ups.
 
 use crate::{CapThunk, TrapKind};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry};
-
-/// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
-/// a compiled child ([`crate::CompiledModule`]) depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
-/// for the whole run per the [`crate::ModuleResolver`] contract — a held grant's storage outlives the
-/// run and distinct live modules have distinct storage, so a stale-pointer collision cannot happen
-/// within a run; the worst case of any mismatch is a miss, never wrong code). `entry` picks the
-/// trampolined function; `size_log2` picks the baked window mask. The carve **base** is deliberately
-/// absent — it is a runtime arg, so one entry serves every offset.
-type ChildCodeKey = (usize, usize, u32, u8);
 
 /// #1726 — the program an **installed §22 unit** runs, kept alive by the `CompiledModule` that
 /// defined it, so the unit's `Instantiator` call sites can bake its address as `self_prog`. A
@@ -34,8 +24,6 @@ type ChildCodeKey = (usize, usize, u32, u8);
 /// frame's module, as on both interpreters — not module 0's. `self_prog == 0` names the nursery's own
 /// program (module 0), which is every call site outside a unit.
 pub(crate) struct UnitProg {
-    pub(crate) funcs: std::sync::Arc<[Func]>,
-    pub(crate) types: std::sync::Arc<[TypeEntry]>,
     /// The unit's `(table, unit)` on its host ([`crate::unit_ref`]), which the host callbacks resolve
     /// a detached self-spawn from the unit against (#2143); [`crate::NO_UNIT`] for a unit no host
     /// names.
@@ -362,57 +350,6 @@ unsafe fn file_task(
 struct SendRaw<T>(T);
 unsafe impl<T> Send for SendRaw<T> {}
 
-/// D66 — file a **carve** child (ops 0/5/8/11/13): its window is a private image of the parent's
-/// carve `[parent_mem_base + sub_base, +2^size_log2)`, seeded at filing and written back at finish
-/// (the parent is the superset). `chain` is the lane chain the executor gates it on.
-#[allow(clippy::too_many_arguments)]
-unsafe fn file_carve_task(
-    rt: &Nursery,
-    code: std::sync::Arc<crate::CompiledModule>,
-    sub_base: u64,
-    size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: Vec<i64>,
-    n_results: usize,
-    chain: Vec<(usize, i64)>,
-    retained_ctx: usize,
-    teardown: crate::child_exec::Teardown,
-) -> Filed {
-    let size = 1usize << size_log2;
-    let src = SendRaw(parent_mem_base);
-    let dst = SendRaw(parent_mem_base);
-    file_task(
-        rt,
-        code,
-        size_log2,
-        size_log2,
-        move |w| {
-            let src = src;
-            // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = `size`.
-            let carve = unsafe { std::slice::from_raw_parts(src.0.add(sub_base as usize), size) };
-            w.rw_mut()[..size].copy_from_slice(carve);
-        },
-        |_, _, _| true,
-        Some(Box::new(move |image: &[u8]| {
-            let dst = dst;
-            // SAFETY: as the copy-in; the parent window is alive until `join_children` returns.
-            let carve =
-                unsafe { std::slice::from_raw_parts_mut(dst.0.add(sub_base as usize), size) };
-            carve.copy_from_slice(&image[..size]);
-        })),
-        args,
-        n_results,
-        chain,
-        retained_ctx,
-        teardown,
-        None,
-        None,
-        None,
-        None,
-        crate::DurableResidue::default(),
-    )
-}
-
 /// #2010 — give back the powerbox refs a thaw's seed holds, and its children's, for a re-launch that
 /// has no nursery to file them in.
 ///
@@ -505,48 +442,6 @@ unsafe fn undo_admission(rt: &Nursery, lease: (i32, u64, u64), lane: i64) {
     );
 }
 
-/// D66 — file a **granted** carve child (ops 8/11/13): register its serve context on the shared
-/// powerbox first (CALLS.md 5c.1b — so a dispatch enqueued at any point of the child's life finds
-/// it; the releaser clears it before the module drops), then file it with its powerbox teardown.
-#[allow(clippy::too_many_arguments)]
-unsafe fn file_granted_carve_task(
-    rt: &Nursery,
-    code: crate::CompiledModule,
-    sub_base: u64,
-    size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: Vec<i64>,
-    n_results: usize,
-    release: crate::GrantChildReleaser,
-    gc: &crate::GrantChild,
-    trap_out: *mut i64,
-) -> i32 {
-    let code = std::sync::Arc::new(code);
-    register_serve(rt, gc.ctx, &code);
-    let teardown = granted_teardown(rt, release, gc.ctx, -1, None, None);
-    match file_carve_task(
-        rt,
-        code,
-        sub_base,
-        size_log2,
-        parent_mem_base,
-        args,
-        n_results,
-        rt.lane_chain_of(gc),
-        gc.retained_ctx as usize,
-        teardown,
-    ) {
-        Filed::Slot(slot) => slot,
-        // #1586 — `ThreadFault` is what the interpreter raises at the same ceiling.
-        Filed::AtCeiling => {
-            *trap_out = TrapKind::ThreadFault as i64;
-            0
-        }
-        // #1587 — a refused task is a probeable `-EINVAL`, never a host abort.
-        Filed::Refused => EINVAL as i32,
-    }
-}
-
 /// CALLS.md 5c.1b — register a granted child's serve context (its live `CompiledModule`) on its
 /// shared powerbox. The same registration is the child's `Jit` native ctx (#1296).
 unsafe fn register_serve(
@@ -592,21 +487,6 @@ pub(crate) struct Nursery {
     /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
-    /// Address of the parent run's **counted-fuel** cell ([`crate::FuelCell`]; `0` ⇒ the parent isn't
-    /// fuel-armed, so its carve children stay un-metered). Read (not charged) at each carve spawn to
-    /// derive the child's allowance `min(quota, what the parent can still burn)` — the JIT mirror of the
-    /// interpreter's carve `child_fuel` (#1944 slice 3 leaves the carve path's fuel as it was).
-    parent_fuel_addr: usize,
-    /// Each fuel-armed carve child's fixed allowance, kept alive here until run teardown (after
-    /// [`Nursery::join_children`]) because an **async** child's OS thread — or a suspended **coro** —
-    /// decrements it after the spawning thunk has returned. `Box` gives a stable heap address to bake
-    /// into the child's code; the cells are never merged back into the parent (no credit-back,
-    /// exactly like the interpreter's value-copy `child_fuel`). A detached child's cell, which draws
-    /// from its own budget node, is its task's instead ([`granted_teardown`]).
-    // `Box` is load-bearing: the baked address must survive a `push`, which a `Vec`'s realloc would
-    // move — so the clippy `vec_box` "simplification" would dangle the address in a child's code.
-    #[allow(clippy::vec_box)]
-    child_fuel_cells: Mutex<Vec<Box<crate::FuelCell>>>,
     /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none — the durable
     /// nested nursery). Children compile their `atomic.wait`/`notify` against this **shared** futex
     /// table, so concurrent children (and the parent's own vCPUs) rendezvous — the pipeline
@@ -628,11 +508,6 @@ pub(crate) struct Nursery {
     /// #1693 — the run's async freeze controller, if any (set at run entry, like `durable`): each
     /// durable child registers its window with it, so a request reaches the child mid-run.
     freeze: Mutex<Option<std::sync::Arc<crate::FreezeController>>>,
-    /// This nursery's own §14 domain **task id** — `0` for the root, and a subtree-unique id (from
-    /// [`Nursery::task_counter`]) for each nested child's nursery. `instantiate` stamps it as the
-    /// recorded child's `parent_task` (DURABILITY.md §4 depth-2), so a thaw can group residue by parent
-    /// (the root's direct child carries `0`; a grandchild carries its parent-child's id).
-    my_task: usize,
     /// §4 depth-2: the **shared** subtree task-id counter — the next id to hand a nested child's
     /// nursery. Threaded down the subtree (every nursery in one freeze shares the `Arc`) so ids are
     /// assigned in instantiate order across all levels, matching the interpreter's dense scheme.
@@ -644,25 +519,6 @@ pub(crate) struct Nursery {
     /// parent-child's nursery — coalesces at the **root**, where the top-level run drains it
     /// (`take_frozen_nested`). The JIT analog of the interpreter's `VCpu::freeze_sink`.
     frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
-    /// PROCESS.md S1: **per-carve compile cache** for non-durable children. Keyed by
-    /// [`ChildCodeKey`], each entry is a compiled [`crate::CompiledModule`] reused across spawns — so a
-    /// shell respawning the same applet (any offset, same size) recompiles nothing. Held behind the
-    /// nursery, alive for the run; the durable / nesting child bypasses it (its baked per-child
-    /// nursery makes its code un-shareable). **`Arc`** (S1c): a cached child can be handed to an
-    /// OS-thread child executor and run concurrently on several threads — sound because a compiled child is
-    /// `Send + Sync` (its code arena + `fn_table` are immutable read-execute memory after
-    /// `finalize_definitions`; the `unsafe impl` + compile-time assertion live in `lib.rs`). A lookup
-    /// still drops the lock before the run. (Children run synchronously on the calling thread **today**;
-    /// this makes the artifact ready for the async spawn slice that follows.)
-    child_code: Mutex<HashMap<ChildCodeKey, std::sync::Arc<crate::CompiledModule>>>,
-    /// PROCESS.md S2 (JIT parity): the host callbacks for `instantiate_granted` (op 8) — build a
-    /// granted child's powerbox `Host` and free it after the run — stored as raw fn-pointer addresses
-    /// (`0` ⇒ none, an inert `CapFault`, like a run that re-grants nothing). Set once at run entry via
-    /// [`Nursery::set_grant_hooks`] (the same interior-mutability contract as [`Nursery::set_durable`]:
-    /// written before the guest runs, then only read by the `instantiate_granted` thunk), so no new
-    /// param threads through the compile pipeline.
-    grant_build: std::sync::atomic::AtomicUsize,
-    grant_build_named: std::sync::atomic::AtomicUsize,
     /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `Budget` taker
     /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ op 15 is an
     /// inert `CapFault`, like the other grant ops without hooks).
@@ -672,10 +528,6 @@ pub(crate) struct Nursery {
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
     /// D66 — [`crate::LaneGiver`]: a reaped child task returns its lane to the parent.
     grant_lane_give: std::sync::atomic::AtomicUsize,
-    /// D66 — the parent domain's `(id, lane cap)` ([`crate::GrantChildHooks::parent_domain`] /
-    /// `parent_lane_cap`): what a plain carve child's task is gated on.
-    grant_parent_domain: std::sync::atomic::AtomicU64,
-    grant_parent_lane_cap: std::sync::atomic::AtomicI64,
     /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
     /// [`crate::WindowReady`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`). The last is
     /// also every detached child's window-ready hook (#2268).
@@ -687,8 +539,6 @@ pub(crate) struct Nursery {
     grant_budget_node: std::sync::atomic::AtomicUsize,
     /// #1854 — the installed child [`crate::HighWater`] (0 = none).
     grant_high_water: std::sync::atomic::AtomicUsize,
-    /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
-    grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
     grant_bind_imports: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
@@ -708,18 +558,6 @@ pub(crate) struct Nursery {
     /// `cap_ctx`: the run may have baked either shape there, and only the hooks' own registration
     /// knows which one this family expects. `0` when no hooks are registered.
     grant_parent_ctx: std::sync::atomic::AtomicUsize,
-    /// #964: the run's NULL guard (`0` = unguarded), set once at run entry via
-    /// [`Nursery::set_null_guard`] (same interior-mutability contract as `set_durable`). A carve
-    /// overlapping `[0, guard)` of the window is refused `-EINVAL` — the host seeds/copies a
-    /// child's carve outside the guarded call, so an mprotect-guarded carve would fault the host.
-    null_guard: std::sync::atomic::AtomicU64,
-    /// The parent module's declared shadow arena — a same-module (op-0 self) child places its
-    /// contexts in *its own* window at the same declared offsets.
-    shadow: temen_ir::durable_abi::ShadowArena,
-    /// #1956 — whether this nursery files **carve** children (ops 0/5/13, v0 records): a run's does,
-    /// a detached child's does not. A carve child's task writes its image back into its parent's
-    /// window when it ends, and only a run's own window outlives every task. Carves go with #1867.
-    carves: bool,
     /// #1956 — the lane chain above this nursery's domain: empty for a run's, the enclosing
     /// domains' for a detached child's. With its children's own two lanes it makes the whole chain
     /// a child's task is gated on ([`Nursery::lane_chain_of`]), as the oracle gates every vCPU.
@@ -751,13 +589,10 @@ impl Nursery {
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
         epoch_addr: usize,
-        parent_fuel_addr: usize,
         futex_sched: usize,
-        my_task: usize,
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
         serve_handlers: Box<[u32]>,
-        shadow: temen_ir::durable_abi::ShadowArena,
         // #1956 — the executor this nursery files its children on: a run's own (`None`, made here),
         // or the run's, shared by a detached child's nursery.
         child_exec: Option<std::sync::Arc<crate::child_exec::ChildExec>>,
@@ -766,13 +601,10 @@ impl Nursery {
             funcs,
             types,
             serve_handlers,
-            shadow,
             cap_thunk,
             cap_ctx,
             resolve_module,
             epoch_addr,
-            parent_fuel_addr,
-            child_fuel_cells: Mutex::new(Vec::new()),
             futex_sched,
             children: Mutex::new(Vec::new()),
             child_exec: child_exec.unwrap_or_else(|| {
@@ -788,20 +620,13 @@ impl Nursery {
                 }
                 e
             }),
-            carves: true,
             ancestors: Vec::new(),
             kids: Mutex::new(Vec::new()),
             grant_as_parent: std::sync::atomic::AtomicUsize::new(0),
-            grant_parent_domain: std::sync::atomic::AtomicU64::new(0),
-            grant_parent_lane_cap: std::sync::atomic::AtomicI64::new(-1),
             durable: AtomicBool::new(false),
             freeze: Mutex::new(None),
-            my_task,
             task_counter,
             frozen_nested_sink,
-            child_code: Mutex::new(HashMap::new()),
-            grant_build: std::sync::atomic::AtomicUsize::new(0),
-            grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
@@ -811,7 +636,6 @@ impl Nursery {
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_node: std::sync::atomic::AtomicUsize::new(0),
             grant_high_water: std::sync::atomic::AtomicUsize::new(0),
-            grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
             grant_parent_ctx: std::sync::atomic::AtomicUsize::new(0),
@@ -819,31 +643,15 @@ impl Nursery {
             grant_mint: std::sync::atomic::AtomicUsize::new(0),
             grant_into: std::sync::atomic::AtomicUsize::new(0),
             grant_thunk: std::sync::atomic::AtomicUsize::new(0),
-            null_guard: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// #964: install the run's NULL guard (see the `null_guard` field). Called once at run entry,
-    /// before any guest code can `instantiate`; child nurseries keep the `0` default (a child's
-    /// own window is unguarded).
-    pub(crate) fn set_null_guard(&self, guard: u64) {
-        self.null_guard.store(guard, Ordering::Release);
-    }
-
-    /// PROCESS.md S2 (JIT parity): install the granted-child host callbacks — build a granted child's
-    /// powerbox (positional op 8 / by-name op 11) and release it after the run. Called once at run entry
-    /// (like [`Self::set_durable`]), before any `instantiate_granted`/`instantiate_named` site can fire.
-    /// `None` leaves them `0` (both ops stay an inert `CapFault`).
-    /// §3c.2 — install/clear the Budget taker (see [`crate::CompiledModule::set_budget_taker`]).
-    pub(crate) fn set_budget_take(&self, addr: usize) {
-        self.grant_budget_take.store(addr, Ordering::Release);
-    }
-
+    /// PROCESS.md S2 (JIT parity): install the child host callbacks — build a detached child's
+    /// powerbox and release it after the run. Called once at run entry (like [`Self::set_durable`]),
+    /// before any spawn site can fire. `None` leaves them `0` (a spawn is an inert `CapFault`).
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t, rs, bd, mt, mg, lg, pc, pa, ps, pp) = match hooks {
+        let (r, bi, m, t, rs, bd, mt, mg, lg, pc, pa, ps, pp) = match hooks {
             Some(h) => (
-                h.build as usize,
-                h.build_named as usize,
                 h.release as usize,
                 h.bind_imports as usize,
                 h.mint as usize,
@@ -858,17 +666,12 @@ impl Nursery {
                 h.premap_stage as usize,
                 h.premap_apply as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
-        self.grant_build.store(b, Ordering::Release);
-        self.grant_build_named.store(bn, Ordering::Release);
         self.grant_build_detached.store(bd, Ordering::Release);
         self.grant_budget_mem_take.store(mt, Ordering::Release);
         self.grant_budget_mem_give.store(mg, Ordering::Release);
         self.grant_lane_give.store(lg, Ordering::Release);
-        let (pd, pl) = hooks.map_or((0, -1), |h| (h.parent_domain, h.parent_lane_cap));
-        self.grant_parent_domain.store(pd, Ordering::Release);
-        self.grant_parent_lane_cap.store(pl, Ordering::Release);
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
@@ -953,16 +756,12 @@ impl Nursery {
             gc.ctx,
             Some(hooks.resolve_module),
             self.epoch_addr,
-            0,
             self.futex_sched,
-            0,
             self.task_counter(),
             self.nested_sink(),
             self.serve_handlers.clone(),
-            temen_ir::durable_abi::ShadowArena::EMPTY,
             Some(std::sync::Arc::clone(&self.child_exec)),
         );
-        n.carves = false;
         n.ancestors = self.lane_chain_of(gc);
         n.ancestors.pop(); // the child's own lane is its children's parent lane
         n.set_grant_hooks(Some(hooks));
@@ -973,58 +772,6 @@ impl Nursery {
             .unwrap_or_else(|e| e.into_inner())
             .push(std::sync::Arc::clone(&n));
         Some(n)
-    }
-
-    /// #1956 — refuse a carve spawn on a nursery that files none (see [`Nursery::carves`]) with a
-    /// `CapFault`, as a detached child's carve record was refused before it had a nursery.
-    ///
-    /// # Safety
-    /// `trap_out` is the run's live trap cell.
-    unsafe fn refuses_carve(&self, trap_out: *mut i64) -> bool {
-        if !self.carves {
-            *trap_out = TrapKind::CapFault as i64;
-        }
-        !self.carves
-    }
-
-    /// D66 — the lane chain a **plain** carve child (op 0/5) is gated on: its parent's lane alone.
-    fn parent_lane_chain(&self) -> Vec<(usize, i64)> {
-        vec![(
-            self.grant_parent_domain.load(Ordering::Acquire) as usize,
-            self.grant_parent_lane_cap.load(Ordering::Acquire),
-        )]
-    }
-
-    /// Derive and allocate a child's counted-fuel cell, exactly as the interpreter derives `child_fuel`
-    /// (INTERP_PERF.md "Fuel unification" step 5; the tree-walker at `lib.rs` "Quota: the child's fuel,
-    /// sub-allocated from (and capped by) ours"): the child's budget is `min(quota, parent_remaining)`,
-    /// or the parent's *entire* remaining fuel when `quota <= 0` (the "unspecified" sentinel). The
-    /// operand the lowering passes to the instantiate thunks as `fuel` is that same `quota`. Returns the
-    /// cell's stable address to bake into the child's code, or `0` when the parent isn't fuel-armed (the
-    /// child stays un-metered, byte-identical to before this slice). The cell lives in the nursery until
-    /// teardown so an async/coro child can decrement it after the spawning thunk has returned; it is
-    /// never merged back into the parent (no credit-back — the interpreter's `child_fuel` is a value copy).
-    ///
-    /// # Safety
-    /// Runs on the spawning vCPU's own thread, the sole writer of `*parent_fuel_addr`, so the read is
-    /// race-free; `parent_fuel_addr` (when nonzero) is the live host-owned parent fuel cell.
-    unsafe fn arm_child_fuel(&self, quota: i64) -> usize {
-        if self.parent_fuel_addr == 0 {
-            return 0; // parent un-metered ⇒ child un-metered
-        }
-        let parent_can = (*(self.parent_fuel_addr as *const crate::FuelCell)).can_burn();
-        let child_fuel = if quota <= 0 {
-            parent_can
-        } else {
-            (quota as u64).min(parent_can)
-        };
-        let cell = crate::FuelCell::fixed(child_fuel);
-        let addr = &*cell as *const crate::FuelCell as usize;
-        self.child_fuel_cells
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(cell);
-        addr
     }
 
     /// #1944 slice 3 — the budget node child powerbox `ctx` holds as its own
@@ -1051,18 +798,6 @@ impl Nursery {
         let node = core::mem::transmute::<usize, crate::ChildBudgetNode>(addr)(ctx);
         let fuel = node.clone().and_then(crate::FuelCell::metering);
         (node, fuel)
-    }
-
-    /// This nursery's §14 domain task id (`0` = root) — `instantiate` records it as a child's
-    /// `parent_task` (depth-2 grouping).
-    pub(crate) fn my_task(&self) -> usize {
-        self.my_task
-    }
-
-    /// Reserve the next subtree-unique task id for a nested child's nursery (shared counter).
-    pub(crate) fn next_child_task(&self) -> usize {
-        self.task_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A clone of the shared subtree residue sink + task counter, to hand to a nested child's nursery
@@ -1479,51 +1214,6 @@ impl Nursery {
             .clone()
     }
 
-    /// The program a **self** child runs (#1726): the spawning code's own — `self_prog`, an installed
-    /// unit's [`UnitProg`], or `0` for this nursery's module-0 program.
-    ///
-    /// # Safety
-    /// A nonzero `self_prog` is the address of a [`UnitProg`] the defining `CompiledModule` keeps
-    /// alive for the whole run (it is baked into that unit's code by `define_extra`).
-    unsafe fn self_program(&self, self_prog: i64) -> (&[Func], &[TypeEntry]) {
-        if self_prog == 0 {
-            (&self.funcs, &self.types)
-        } else {
-            let u = &*(self_prog as *const UnitProg);
-            (&u.funcs, &u.types)
-        }
-    }
-
-    /// Resolve a spawn's child source (§14): `module < 0` ⇒ a **self** child (the parent's own
-    /// functions, no data segments, no declared-memory constraint); otherwise a host-granted
-    /// **`Module` handle** resolved via [`Nursery::resolve_module`] — the child runs *that* verified
-    /// module's code, its data segments materialize into the carve, and the carve must equal its
-    /// declared memory. `None` (with `*trap_out` set to a `CapFault`) for a forged handle or a run
-    /// with no resolver.
-    ///
-    /// # Safety
-    /// `trap_out` is the live trap cell. The returned slices borrow host-owned storage valid for the
-    /// run (the [`ModuleResolver`](crate::ModuleResolver) contract).
-    #[allow(clippy::type_complexity)]
-    unsafe fn resolve_child(
-        &self,
-        module: i64,
-        self_prog: i64,
-        trap_out: *mut i64,
-    ) -> Option<(
-        &[Func],
-        &[TypeEntry],
-        Option<i32>,
-        &[Data],
-        temen_ir::durable_abi::ShadowArena,
-    )> {
-        if module < 0 {
-            let (funcs, types) = self.self_program(self_prog);
-            return Some((funcs, types, None, &[], self.shadow));
-        }
-        self.resolve_granted(module, crate::NO_UNIT, trap_out)
-    }
-
     /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) — including
     /// `SELF_MODULE` (`-1`), which the host resolves to the spawning code's program *with* its data
     /// segments and declared memory: the running module's, or from an installed unit's code (`unit`,
@@ -1613,477 +1303,19 @@ fn temen_ir_iface_instantiator() -> u32 {
     6
 }
 
-/// Materialize a §14 separate-module child's **data segments** into its carve `[abs_base, …+size)`
-/// of the live parent window — exactly as if the child wrote them (the parent sees them, the §14
-/// superset; the verifier bounded each segment to the child's declared window == the carve, with a
-/// defensive re-check here). RO protection of `readonly` segments is skipped for nested children
-/// (intra-domain self-corruption is a §1 non-goal).
-///
-/// # Safety
-/// `[mem_base+abs_base, …+child_size)` is committed parent-window memory (the Instantiator bounded
-/// the carve to the holder's range), valid for the call.
-unsafe fn write_data_segments(data: &[Data], mem_base: u64, abs_base: u64, child_size: u64) {
-    for d in data {
-        if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
-            core::ptr::copy_nonoverlapping(
-                d.bytes.as_ptr(),
-                (mem_base as *mut u8).add((abs_base + d.offset) as usize),
-                d.bytes.len(),
-            );
-        }
-    }
-}
-
-/// `instantiate(handle, [module,] entry, off, size_log2, fuel) -> child_handle` — the §14 nesting op
-/// (`module < 0` ⇒ a self child, op 0; a `Module` handle ⇒ a **separate-module child**, op 5 — the
-/// "plugin"). Resolves the holder's carve range, validates the requested power-of-two sub-window fits
-/// within it (`-EINVAL` otherwise; a module child's carve must **equal its declared memory** — §14
-/// transparency), materializes a module child's data segments into the carve, then **re-compiles**
-/// the child entry confined to its own window and runs it (seeded from / copied back to the carve),
-/// stashing its outcome for `join`. Returns a child handle (a table index), or `-EINVAL`. A child
-/// that cannot be compiled (it uses §12 fibers/threads) or a forged module handle is a `CapFault`.
-///
-/// # Safety
-/// Called from JIT'd code with `rt` the baked [`Nursery`], `mem_base` the live parent window base, and
-/// `trap_out` the run's trap cell. All must be valid for the call (the JIT lowering guarantees it).
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn instantiate(
-    rt: *const Nursery,
-    self_prog: i64,
-    mem_base: u64,
-    handle: i32,
-    module: i64,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    fuel: i64,
-    trap_out: *mut i64,
-) -> i32 {
-    let rt_ptr = rt;
-    let rt = &*rt;
-    if rt.refuses_carve(trap_out) {
-        return 0;
-    }
-    let durable = rt.durable.load(Ordering::Acquire);
-    // §14 op-5 — a **separate-module** child (`module >= 0`) gets a full attenuated powerbox: an
-    // Instantiator + AddressSpace + its bound import manifest, so it can `vm_map` (malloc heap growth)
-    // and nest — matching the interpreter, which funnels op 0/5/11/13 through one powerbox path. An
-    // op-0 *self* child (`module < 0`, below) instead runs the parent's own funcs compute-only in its
-    // carve (no powerbox — the durable-nesting design relies on a self child `call.cap` fail-closing).
-    // Route op-5 through the op-13 builder with an **empty** grant list — the exact path the
-    // `child_entry_malloc_binds_vm_map_on_the_jit` gate already proves (it spawns with `grants_n = 0`).
-    // `mem_size = 0` is safe: with no grants the builder reads no grant records from the window. A
-    // durable run is rejected inside `instantiate_module_named` just as the `mod_mem.is_some()` guard
-    // below rejects it here.
-    //
-    // Only when the granted-spawn hooks are installed (`grant_build_named != 0`): a run without them
-    // (the plain `jit_separate_module` differential — a *compute* separate-module child that makes no
-    // `call.cap`) keeps the empty-powerbox path below, matching the interpreter for a capless child
-    // (both tiers return the same value). Delegating unconditionally would `CapFault` such a run at the
-    // absent builder.
-    if module >= 0 && rt.grant_build_named.load(Ordering::Acquire) != 0 {
-        return instantiate_module_named(
-            rt_ptr, self_prog, mem_base, /*mem_size (unused: 0 grants)*/ 0, handle, module,
-            /*grants_ptr*/ 0, /*grants_n*/ 0, entry, off, size_log2, fuel, trap_out,
-        );
-    }
-    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
-        return 0; // `*trap_out` already holds the CapFault
-    };
-    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, self_prog, trap_out)
-    else {
-        return 0; // forged Module handle / no resolver — CapFault set
-    };
-    // Only an op-0 **self** child (`module < 0`, so `mod_mem = None`) reaches here — a separate-module
-    // op-5 child was delegated to `instantiate_module_named` above. A self child runs the parent's own
-    // funcs compute-only in its carve (empty powerbox: a `call.cap` fail-closes with `CapFault`).
-    // §4 (DURABILITY.md, "JIT parity" slice 1): a durable run may nest such a same-module child — a
-    // pure-compute (non-may-suspend) func with no poll sites runs atomically to completion, no durable
-    // control-word setup needed; freezing a *live* nested child on the JIT (ctx-0 control words + shadow
-    // base seeded to match the interpreter) is a later slice. The `mod_mem.is_some()` guard is a dead
-    // defensive backstop now (a self child is always `None`), kept for safety.
-    if durable && mod_mem.is_some() {
-        return EINVAL as i32;
-    }
-
-    // The carve must be a power-of-two-aligned sub-window within `[0, size)` — a child can only get what
-    // the holder sub-allocates (§14/D19). `mod_ok` is trivially true here (`mod_mem = None` for a self
-    // child); the op-5 carve-vs-declared-window relaxation (`declared <= carve`, FORK.md §8.6 / #773)
-    // lives in `instantiate_module_named`, which op-5 delegates to. Bad entry index / size / alignment
-    // ⇒ `-EINVAL`.
-    let entry = entry as u64;
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off = off as u64;
-    let mod_ok = mod_mem.is_none_or(|ml| ml <= size_log2 as i32);
-    let fits = child_size != 0
-        && child_size <= size
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size)
-        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
-        && base + off >= rt.null_guard.load(Ordering::Acquire)
-        // The one entry-shape rule every tier shares (#911, #1720) — this arm used to check only the
-        // index, so it ran an entry the oracle refuses.
-        && child_funcs
-            .get(entry as usize)
-            .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
-    if !fits || !mod_ok {
-        return EINVAL as i32;
-    }
-
-    // A module child's data segments materialize into the carve now — `compile_child_and_run` seeds
-    // the child's window from the carve, so they arrive exactly like the interpreter's shared-backing
-    // writes at spawn.
-    write_data_segments(child_data, mem_base, base + off, child_size);
-
-    // The child entry takes its starter caps as `i64` args (none for a powerbox `_start`); with an
-    // empty powerbox today they are unused, so pass zeros of the entry's arity.
-    let nargs = child_funcs[entry as usize].params.len();
-    let args = vec![0i64; nargs];
-
-    // Fuel unification (step 5): derive this child's own budget cell from the `fuel` operand (the
-    // interpreter's `quota`) clamped to the parent's remaining fuel — `0` when the parent isn't armed,
-    // leaving the child un-metered as before. Owned by the nursery until teardown (an async child
-    // decrements it on its own thread). SAFETY: on the spawning vCPU's thread, sole writer of the cell.
-    let child_fuel_addr = rt.arm_child_fuel(fuel);
-
-    // Durable children stay **synchronous** (their baked per-child nursery + freeze residue can't ride
-    // the cached OS-thread path yet): re-compile + run inline, record the outcome (and any freeze
-    // unwind), and return the join slot.
-    if durable {
-        // §4 depth-2: reserve this child's subtree-unique domain task id (shared counter, instantiate
-        // order), stamped as its nursery's `my_task` so a grandchild it records carries a non-zero
-        // `parent_task`. The child inherits the **shared** residue sink + counter, so its descendants'
-        // freeze residue coalesces at the root.
-        let child_task = rt.next_child_task();
-        let (result, trap, unwound) = match crate::compile_child_and_run(
-            child_funcs,
-            child_types,
-            entry as FuncIdx,
-            base + off,
-            size_log2 as u8,
-            mem_base as *mut u8,
-            &args,
-            rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
-            child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
-            durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
-            child_shadow,
-            false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
-            child_task,
-            rt.nested_sink(),
-            rt.task_counter(),
-            &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
-            rt.freeze(),
-        ) {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                // A child we cannot compile (fibers/threads, or a backend error) is a CapFault, not a
-                // silent success — the guest learns its nesting request was refused.
-                *trap_out = TrapKind::CapFault as i64;
-                return 0;
-            }
-        };
-        let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = children.len();
-        let mut child = Child::finished(result, trap);
-        // §4 freeze export: what a freeze records for this child if it is still unjoined when this
-        // nursery's owner unwinds ([`Nursery::freeze_unjoined`]).
-        child.nested = Some((
-            crate::FrozenNested {
-                parent_task: rt.my_task(),
-                task: child_task,
-                slot,
-                carve_off: base + off,
-                size_log2: size_log2 as u8,
-                entry: entry as u32,
-                completed_result: None,
-            },
-            unwound,
-        ));
-        children.push(child);
-        return slot as i32;
-    }
-
-    // PROCESS.md S1c — the common (non-durable) path is **asynchronous**: compile once per
-    // `(module, entry, size)` (cached, position-independent), then run the child on its **own OS thread
-    // in its own guarded window** and return immediately. `join`/`poll` resolve through the child's
-    // completion cell; the thread is joined at run teardown (`join_children`). This is what lets two
-    // children run concurrently — a pipeline — where the synchronous path serialized them.
-    let key: ChildCodeKey = (
-        child_funcs.as_ptr() as usize,
-        child_funcs.len(),
-        entry as u32,
-        size_log2 as u8,
-    );
-    // A fuel-armed child bakes its **per-spawn** budget-cell address into its code, so that code can't
-    // be shared across spawns — compile fresh and bypass the cache. (Fuel arming is opt-in, so the
-    // common un-armed production path keeps the cache byte-identically.)
-    let compile_fresh = || {
-        crate::compile_nondurable_child(
-            child_funcs,
-            child_types,
-            entry as FuncIdx,
-            size_log2 as u8,
-            rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
-            child_fuel_addr, // §5 fuel: 0 ⇒ un-metered (cacheable); nonzero ⇒ per-spawn (not cached)
-            rt.futex_sched,  // wait/notify against the parent domain's shared futex,,
-            child_shadow,
-        )
-    };
-    let code = if child_fuel_addr != 0 {
-        match compile_fresh() {
-            Ok(cc) => std::sync::Arc::new(cc),
-            Err(_) => {
-                *trap_out = TrapKind::CapFault as i64;
-                return 0;
-            }
-        }
-    } else {
-        let mut cache = rt.child_code.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(c) = cache.get(&key) {
-            std::sync::Arc::clone(c)
-        } else {
-            match compile_fresh() {
-                Ok(cc) => {
-                    let a = std::sync::Arc::new(cc);
-                    cache.insert(key, std::sync::Arc::clone(&a));
-                    a
-                }
-                Err(_) => {
-                    // Un-compilable child (fibers/threads/setjmp, or a backend error) → CapFault.
-                    *trap_out = TrapKind::CapFault as i64;
-                    return 0;
-                }
-            }
-        }
-    };
-    let n_results = child_funcs[entry as usize].results.len();
-    match file_carve_task(
-        rt,
-        code,
-        base + off,
-        size_log2 as u8,
-        mem_base as *mut u8,
-        args,
-        n_results,
-        rt.parent_lane_chain(),
-        0,
-        Box::new(|_| ()), // an empty powerbox: nothing to release
-    ) {
-        Filed::Slot(slot) => slot,
-        // #1586 — at the §15 live-vCPU ceiling (`ThreadFault` is what the interpreter raises when
-        // its scheduler refuses a §14 spawn for the same reason), or — #1587 — a task the platform
-        // refused: op 0 answers both as a value, never a host abort.
-        Filed::AtCeiling | Filed::Refused => {
-            *trap_out = TrapKind::ThreadFault as i64;
-            0
-        }
-    }
-}
-
-/// PROCESS.md S2 (JIT parity) — `instantiate_named(grants_ptr, grants_n, entry, off, size_log2, quota)`
-/// (Instantiator op 11): the multi-cap, by-name form of [`instantiate_granted`]. The child powerbox is
-/// built host-side by [`Nursery::grant_build_named`], which reads `grants_n` 16-byte grant records from
-/// the **parent** window (`[mem_base, mem_base+mem_size)`) and re-grants each copyable handle under its
-/// name; the child finds them by `self.resolve` (lowered to the run's `call.cap` thunk with the
-/// child host as ctx, so name resolution "just works"). The child entry is the 1- or 2-arg form
-/// (`Instantiator` [, `AddressSpace`]) — no positional grant arg. Same non-durable / uncached /
-/// non-nesting shape as [`instantiate_granted`]; a bad record/name is a `MemoryFault`, a non-copyable
-/// grant a `CapFault`, a bad carve/entry `-EINVAL` — all matching the interpreter's op-11 path.
-///
-/// # Safety
-/// As [`instantiate`]: `rt`/`mem_base`/`trap_out` are the baked nursery, live parent window base, and
-/// run trap cell, valid for the call; `mem_size` is the parent window's **reserved** span (#826 — a
-/// grant record in a `map`-grown tail page is admitted; an uncommitted page faults through the
-/// SIGSEGV guard as `MemoryFault`, exactly like a guest access).
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn instantiate_named(
-    rt: *const Nursery,
-    self_prog: i64,
-    mem_base: u64,
-    mem_size: u64,
-    handle: i32,
-    grants_ptr: i64,
-    grants_n: i64,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    fuel: i64,
-    trap_out: *mut i64,
-) -> i32 {
-    let rt = &*rt;
-    if rt.refuses_carve(trap_out) {
-        return 0;
-    }
-    if rt.durable.load(Ordering::Acquire) {
-        return EINVAL as i32;
-    }
-    let build_addr = rt.grant_build_named.load(Ordering::Acquire);
-    let release_addr = rt.grant_release.load(Ordering::Acquire);
-    if build_addr == 0 || release_addr == 0 {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
-    let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
-    let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
-    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
-    // code must synchronize its call.cap calls once the parent can reach the same powerbox. Fall back
-    // to the run's thunk only for a legacy non-sharing builder.
-    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
-    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
-        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
-    } else {
-        rt.cap_thunk
-    };
-
-    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
-        return 0; // `*trap_out` already holds the CapFault
-    };
-    // #922/#1726: a same-module named child runs (and resolves types against) the spawning code's own
-    // program — an installed unit's, or module 0's.
-    let (child_funcs, child_types) = rt.self_program(self_prog);
-    let entry = entry as u64;
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off = off as u64;
-    // A named child receives no positional grant, so its entry is the 1- or 2-arg form (`Instantiator`
-    // [, `AddressSpace`]) returning `i64`, or a powerbox `_start` taking nothing (#1720) — either way it
-    // discovers its granted caps by name.
-    let arity = child_funcs
-        .get(entry as usize)
-        .map_or(0, |f| f.params.len());
-    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
-    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
-    let ok_entry = child_funcs
-        .get(entry as usize)
-        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
-    let fits = child_size != 0
-        && child_size <= size
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size)
-        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
-        && base + off >= rt.null_guard.load(Ordering::Acquire);
-    if !ok_entry || !fits {
-        return EINVAL as i32;
-    }
-
-    // Build the child powerbox host-side from the grant records; a bad record/name sets `*trap_out`
-    // (MemoryFault / CapFault) and fails the whole spawn closed.
-    let mut gc = crate::GrantChild {
-        ctx: core::ptr::null_mut(),
-        retained_ctx: core::ptr::null_mut(),
-        inst_handle: 0,
-        as_handle: 0,
-        grant_handle: 0,
-        jit_table_log2: 0,
-        domain: 0,
-        lane_cap: -1,
-        parent_domain: 0,
-        parent_lane_cap: -1,
-    };
-    if build(
-        rt.grant_ctx(),
-        mem_base as *mut u8,
-        mem_size,
-        grants_ptr as u64,
-        grants_n as u64,
-        child_size,
-        &mut gc,
-        trap_out,
-    ) == 0
-    {
-        return 0; // `*trap_out` already set by the builder
-    }
-
-    // #1234 — bind the child's import manifest against the powerbox just built, exactly as the op-13
-    // and op-15 thunks do below. A same-module child's manifest is the *parent's* own running module,
-    // which the binder fetches with the record's `-1 = self` module selector — so a guest that nests a
-    // confined copy of itself reaches its granted `stdout`/`jit` through `call.import` instead of
-    // `CapFault`ing, on this backend exactly as on the two interpreter tiers (§3.3 withhold: a
-    // `required` slot with nothing to bind fails the spawn closed, probeable `-EINVAL`).
-    //
-    // **Only when the spawn handed the child caps by name** — same gate as the interpreter arms. A
-    // grant-less child was given nothing to bind, so its slots stay empty and fail closed on use,
-    // exactly as before this existed; binding it anyway would refuse spawns that used to work.
-    let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
-    if bind_addr != 0 && grants_n > 0 {
-        let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.grant_ctx(), gc.ctx, -1, crate::NO_UNIT) != 0 {
-            release(gc.ctx);
-            release(gc.retained_ctx);
-            return EINVAL as i32;
-        }
-    }
-
-    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
-    let compiled = crate::compile_child(
-        child_funcs,
-        child_types,
-        entry as FuncIdx,
-        size_log2 as u8,
-        child_thunk,
-        gc.ctx,
-        rt.epoch_addr,
-        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
-        rt.futex_sched,  // wait/notify against the parent domain's shared futex
-        crate::InstEnv::null(),
-        &rt.serve_handlers,
-        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
-        rt.shadow,
-        crate::ChildRun::Task, // an executor task: its own fiber runtime and thread domain (#1469)
-    );
-    let code = match compiled {
-        Ok(code) => code,
-        Err(_) => {
-            release(gc.ctx);
-            release(gc.retained_ctx);
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
-    };
-    let args: Vec<i64> =
-        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
-    let n_results = child_funcs[entry as usize].results.len();
-    // Async (S1c): the child runs on its own OS thread — two named-grant children can pipeline
-    // through a granted `SharedRegion` — and its powerbox host is released from that thread.
-    file_granted_carve_task(
-        rt,
-        code,
-        base + off,
-        size_log2 as u8,
-        mem_base as *mut u8,
-        args,
-        n_results,
-        release,
-        &gc,
-        trap_out,
-    )
-}
-
 /// CONSOLIDATION.md §3c — the **config-record spawn** (`Instantiator` op 17,
-/// `instantiate_rec(record_ptr)`) on the native JIT tier: parse + validate the 56-byte record
-/// from the guest window, then **delegate to the existing spawn thunks** (the same bodies
-/// ops 0/5/11/13 call), so there is exactly one spawn implementation per shape on this tier
-/// too. Field handling mirrors the tree-walker's op-17 arm:
+/// `instantiate_rec(record_ptr)`) on the native JIT tier: parse + validate the record
+/// ([`SpawnRec`]) from the guest window, then **delegate to [`instantiate_detached`]** — a record
+/// is op 15 as data (#1863), so there is exactly one spawn implementation on this tier too. Field
+/// handling mirrors the tree-walker's op-17 arm:
 ///
-/// - `version != 0` → `CapFault` (fail closed).
+/// - a version other than 1, or a nonzero reserved field → `CapFault` (fail closed).
 /// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
 ///   **with** impl exports to the oracle, so a natively-running module has none — and the
 ///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
-/// - `budget != 0` → probeable `-EINVAL`: the Budget-funded spawn is an interpreter-first
-///   feature (§3b); JIT parity is a follow-up (§3c.2), exactly like durable nesting above —
-///   the interpreter is the reference. `budget` and `quota` are mutually exclusive either way.
-/// - module `-1` = self / else a granted `Module` handle; named grants `(grants_ptr, grants_n)`.
 ///
 /// # Safety
-/// Same contract as [`instantiate_module_named`]: called from JITted code on the spawning
+/// Same contract as [`instantiate_detached`]: called from JITted code on the spawning
 /// vCPU's thread with the run's live nursery, window base/size, and a writable `trap_out`.
 pub(crate) unsafe extern "C" fn instantiate_rec(
     rt: *const Nursery,
@@ -2098,375 +1330,47 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     // #826: `mem_size` is the reserved span, so a record in a `map`-grown tail page is read where
     // the interpreter's live page map reads it; a record on a still-uncommitted page faults the
     // copy below through the SIGSEGV guard (`MemoryFault`), exactly like a guest load.
-    let base = (mem_base + rp) as *const u8;
-    let read = |len: usize, trap_out: *mut i64| -> Option<Vec<u8>> {
-        if rp.checked_add(len as u64).is_none_or(|e| e > mem_size) {
-            *trap_out = TrapKind::MemoryFault as i64;
-            return None;
-        }
-        let mut buf = vec![0u8; len];
-        core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), len);
-        Some(buf)
-    };
-    // Copy the record out of the guest window, then share the layout decode with the two
-    // interpreter tiers (#911): the version word says its length (v0 carve, v1 detached); an
-    // unknown version or a nonzero reserved field fails closed.
-    let Some(head) = read(56, trap_out) else {
-        return 0;
-    };
-    let head: &[u8; 56] = head.as_slice().try_into().expect("56 bytes");
-    let Some(len) = SpawnRec::len_for(head) else {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    };
-    let Some(buf) = read(len, trap_out) else {
-        return 0;
-    };
-    let sr = match SpawnRec::parse(&buf) {
-        Some(s) => s,
-        None => {
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
-    };
-    if sr.detached {
-        // #1863: a v1 record is op 15 as data — the op-15 thunk spawns it. No pager on this tier
-        // (the v0 rule below).
-        if sr.pager != u32::MAX {
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
-        return instantiate_detached(
-            rt,
-            self_prog,
-            mem_base,
-            mem_size,
-            handle,
-            sr.budget as i64,
-            sr.modh as i64,
-            sr.grants_ptr as i64,
-            sr.grants_n as i64,
-            sr.entry as i64,
-            sr.size_log2,
-            sr.quota,
-            sr.args.0 as i64,
-            sr.args.1 as i64,
-            sr.region as i64,
-            sr.child_off as i64,
-            trap_out,
-        );
-    }
-    if (*rt).refuses_carve(trap_out) {
-        return 0;
-    }
-    let entry = sr.entry as i64;
-    let off = sr.off as i64;
-    let size_log2 = sr.size_log2;
-    let pager = sr.pager;
-    let modh = sr.modh;
-    let budget = sr.budget;
-    let quota = sr.quota;
-    let grants_ptr = sr.grants_ptr as i64;
-    let grants_n = sr.grants_n as i64;
-    if pager != u32::MAX {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
-    let mut quota = quota;
-    if budget != 0 {
-        if quota != 0 {
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
-        let taker_addr = (*rt).grant_budget_take.load(Ordering::Acquire);
-        if taker_addr == 0 {
-            // No taker installed (bare harnesses): the §3c gap — probeable, budget untouched.
-            return EINVAL as i32;
-        }
-        let taker: crate::BudgetTaker = core::mem::transmute(taker_addr);
-        if !(0..64).contains(&size_log2) {
-            return EINVAL as i32; // same refusal the delegate would give, before any drain
-        }
-        let child_size = 1u64 << size_log2;
-        let mut taken = crate::BudgetTaken {
-            fuel: -1,
-            spawn: -1,
-        };
-        // Peek first (validate + mem-quota gate, budget intact on refusal)…
-        match taker(
-            (*rt).grant_ctx(),
-            budget,
-            child_size,
-            0,
-            &mut taken,
-            trap_out,
-        ) {
-            1 => {}
-            2 => return EINVAL as i32,
-            _ => return 0, // CapFault set
-        }
-        if taken.spawn >= 0 || taken.fuel == 0 {
-            // Bounded spawn ceilings and bounded-zero fuel need child-quota threading this
-            // tier doesn't have yet — the narrowed §3c.2 gap (probeable, budget intact; the
-            // interpreter is the reference).
-            return EINVAL as i32;
-        }
-        // …then drain at commit: past every local guard, the delegate's own guards repeat the
-        // peek's (same size/entry/carve math), so a post-drain refusal is unreachable in
-        // practice; a same-domain sibling racing `split` between peek and drain gets
-        // either-or (its own doing — the armed fuel is the peeked value).
-        match taker(
-            (*rt).grant_ctx(),
-            budget,
-            child_size,
-            1,
-            &mut taken,
-            trap_out,
-        ) {
-            1 => {}
-            2 => return EINVAL as i32,
-            _ => return 0,
-        }
-        quota = if taken.fuel < 0 { 0 } else { taken.fuel };
-    }
-    // §3d: the record folds the plain and named spawn shapes onto one op — and the interpreter
-    // retains EVERY child's powerbox (its `child_offer`, op 14, mints over any live child), so
-    // when the embedder installed the grant hooks (temen-run always does, at both production
-    // sites) an empty grant list still routes through the NAMED path: the retained,
-    // interpreter-parity shape. A bare hookless harness keeps the plain path — its children
-    // cannot mint offers, the documented hookless gap
-    // (`jit_child_offer.rs::child_offer_on_a_hookless_child_refuses` pins it).
-    let hooked = (*rt).grant_build_named.load(Ordering::Acquire) != 0
-        && (*rt).grant_release.load(Ordering::Acquire) != 0;
-    match (modh >= 0, grants_n > 0 || hooked) {
-        (false, false) => instantiate(
-            rt, self_prog, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
-        ),
-        (true, false) => instantiate(
-            rt,
-            self_prog,
-            mem_base,
-            handle,
-            modh as i64,
-            entry,
-            off,
-            size_log2,
-            quota,
-            trap_out,
-        ),
-        (false, true) => instantiate_named(
-            rt, self_prog, mem_base, mem_size, handle, grants_ptr, grants_n, entry, off, size_log2,
-            quota, trap_out,
-        ),
-        (true, true) => instantiate_module_named(
-            rt,
-            self_prog,
-            mem_base,
-            mem_size,
-            handle,
-            modh as i64,
-            grants_ptr,
-            grants_n,
-            entry,
-            off,
-            size_log2,
-            quota,
-            trap_out,
-        ),
-    }
-}
-
-/// STAGE1.md — `instantiate_module_named(module, grants_ptr, grants_n, entry, off, size_log2, quota)`
-/// (Instantiator op 13): the **shell exec** primitive — the union of [`instantiate`]'s separate-module
-/// path (op 5: resolve + compile a host-granted `Module`, materialize its data into the carve) and
-/// [`instantiate_named`]'s by-name grant list (op 11: re-grant caps into the child's powerbox). It is
-/// the only op that runs a foreign program *and* hands it capabilities, so a compiled command (its own
-/// module) can resolve an inherited `stdout` by name and do real I/O. The child ctx is per-spawn, so
-/// the code is compiled uncached (like op 11). A forged module / non-copyable grant / bad record fails
-/// closed exactly as ops 5 and 11 do individually.
-///
-/// # Safety
-/// As [`instantiate`]/[`instantiate_named`]: `rt`/`mem_base`/`mem_size`/`trap_out` are the baked
-/// nursery, live parent window base, **reserved** span (#826, as for `instantiate_named`), and run
-/// trap cell, valid for the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn instantiate_module_named(
-    rt: *const Nursery,
-    self_prog: i64,
-    mem_base: u64,
-    mem_size: u64,
-    handle: i32,
-    module: i64,
-    grants_ptr: i64,
-    grants_n: i64,
-    entry: i64,
-    off: i64,
-    size_log2: i64,
-    fuel: i64,
-    trap_out: *mut i64,
-) -> i32 {
-    let rt = &*rt;
-    if rt.refuses_carve(trap_out) {
-        return 0;
-    }
-    // A durable run may not spawn a separate-module child (host-supplied identity + freeze residue are
-    // a later slice), matching the `instantiate` op-5 path.
-    if rt.durable.load(Ordering::Acquire) {
-        return EINVAL as i32;
-    }
-    let build_addr = rt.grant_build_named.load(Ordering::Acquire);
-    let release_addr = rt.grant_release.load(Ordering::Acquire);
-    if build_addr == 0 || release_addr == 0 {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
-    let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
-    let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
-    // 5c.0 — a builder that shares the child `Host` supplies the lock-taking thunk; granted-child
-    // code must synchronize its call.cap calls once the parent can reach the same powerbox. Fall back
-    // to the run's thunk only for a legacy non-sharing builder.
-    let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
-    let child_thunk: crate::CapThunk = if thunk_addr != 0 {
-        core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
-    } else {
-        rt.cap_thunk
-    };
-
-    let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
-        return 0; // `*trap_out` already holds the CapFault
-    };
-    // Resolve the granted separate module (op 5): its funcs, declared memory, and data segments.
-    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, self_prog, trap_out)
-    else {
-        return 0; // forged Module handle / no resolver — CapFault set
-    };
-    let entry = entry as u64;
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    let off = off as u64;
-    // A named child receives no positional grant, so its entry is the 1- or 2-arg form (a compiled
-    // command's `--child-entry` `_start` is the 1-arg starter form) or a powerbox `_start` taking
-    // nothing (#1720); either way it finds granted caps by name.
-    let arity = child_funcs
-        .get(entry as usize)
-        .map_or(0, |f| f.params.len());
-    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
-    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
-    let ok_entry = child_funcs
-        .get(entry as usize)
-        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
-    // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 /
-    // #773 — the interpreter twin at `instantiate_rec`'s `mod_ok`): a larger window is a safe
-    // superset (confinement, invariant 2, still masks every access to the actual carve), and a
-    // malloc child *needs* it — its on-ramp heap's `heap_base` is `1<<declared` and
-    // grows the heap up into `[1<<declared, carve)`, so a carve equal to the declared window leaves
-    // no heap room. The child is compiled fully-mapped over the whole carve (`compile_child` /
-    // `run_child_code_then`), so those heap pages are already committed and the allocator's `vm_map`
-    // commits are no-ops — matching the interp's `nested_view` (mapped == carve).
-    let mod_ok = mod_mem.is_none_or(|ml| ml <= size_log2 as i32);
-    let fits = child_size != 0
-        && child_size <= size
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= size)
-        // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
-        && base + off >= rt.null_guard.load(Ordering::Acquire);
-    if !ok_entry || !fits || !mod_ok {
-        return EINVAL as i32;
-    }
-    // Materialize the module's data segments into the carve (op 5) before the grants + run.
-    write_data_segments(child_data, mem_base, base + off, child_size);
-
-    // Build the child powerbox host-side from the grant records (op 11); a bad record/name sets
-    // `*trap_out` and fails the whole spawn closed.
-    let mut gc = crate::GrantChild {
-        ctx: core::ptr::null_mut(),
-        retained_ctx: core::ptr::null_mut(),
-        inst_handle: 0,
-        as_handle: 0,
-        grant_handle: 0,
-        jit_table_log2: 0,
-        domain: 0,
-        lane_cap: -1,
-        parent_domain: 0,
-        parent_lane_cap: -1,
-    };
-    if build(
-        rt.grant_ctx(),
-        mem_base as *mut u8,
-        mem_size,
-        grants_ptr as u64,
-        grants_n as u64,
-        child_size,
-        &mut gc,
-        trap_out,
-    ) == 0
+    if rp
+        .checked_add(temen_ir::SPAWN_REC_LEN as u64)
+        .is_none_or(|e| e > mem_size)
     {
-        return 0; // `*trap_out` already set by the builder
+        *trap_out = TrapKind::MemoryFault as i64;
+        return 0;
     }
-
-    // IMPORTS.md phase 3 / S2.1: bind the child module's import manifest against the powerbox just
-    // built, so its `call.import`s dispatch through instance bindings (the interpreter's inline
-    // spawn does the same via `Host::bind_child_manifest` — differential lockstep).
-    let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
-    if bind_addr != 0 {
-        let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        // §3.3 withhold: a `required` import with nothing to bind fails the spawn closed —
-        // probeable `-EINVAL`, before compiling or running any child code (the interpreter's
-        // inline spawn takes the same early exit).
-        if bind(rt.grant_ctx(), gc.ctx, module, crate::NO_UNIT) != 0 {
-            release(gc.ctx);
-            release(gc.retained_ctx);
-            return EINVAL as i32;
-        }
-    }
-
-    // Compile the foreign module's entry confined to the carve, with the child powerbox ctx so its
-    // `self.resolve(name)` routes to the granted caps. Per-spawn ctx ⇒ uncached (like op 11).
-    let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
-    let compiled = crate::compile_child(
-        child_funcs,
-        child_types,
-        entry as FuncIdx,
-        size_log2 as u8,
-        child_thunk,
-        gc.ctx,
-        rt.epoch_addr,
-        child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
-        rt.futex_sched,  // wait/notify against the parent domain's shared futex
-        crate::InstEnv::null(),
-        &rt.serve_handlers,
-        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
-        child_shadow,
-        crate::ChildRun::Task, // an executor task: its own fiber runtime and thread domain (#1469)
+    // Copy the record out of the guest window, then share the layout decode with the two
+    // interpreter tiers (#911).
+    let mut buf = [0u8; temen_ir::SPAWN_REC_LEN];
+    core::ptr::copy_nonoverlapping(
+        (mem_base + rp) as *const u8,
+        buf.as_mut_ptr(),
+        temen_ir::SPAWN_REC_LEN,
     );
-    let code = match compiled {
-        Ok(code) => code,
-        Err(_) => {
-            release(gc.ctx);
-            release(gc.retained_ctx);
-            *trap_out = TrapKind::CapFault as i64;
-            return 0;
-        }
+    let Some(sr) = SpawnRec::parse(&buf) else {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
     };
-    let args: Vec<i64> =
-        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
-    let n_results = child_funcs[entry as usize].results.len();
-    // Async (S1c): a spawned command runs on its own OS thread — the shell-exec primitive can
-    // pipeline (`cmd1 | cmd2` over a granted region ring or pipe) instead of serializing.
-    file_granted_carve_task(
+    // No pager on this tier (above).
+    if sr.pager != u32::MAX {
+        *trap_out = TrapKind::CapFault as i64;
+        return 0;
+    }
+    instantiate_detached(
         rt,
-        code,
-        base + off,
-        size_log2 as u8,
-        mem_base as *mut u8,
-        args,
-        n_results,
-        release,
-        &gc,
+        self_prog,
+        mem_base,
+        mem_size,
+        handle,
+        sr.budget as i64,
+        sr.modh as i64,
+        sr.grants_ptr as i64,
+        sr.grants_n as i64,
+        sr.entry as i64,
+        sr.size_log2,
+        sr.quota,
+        sr.args.0 as i64,
+        sr.args.1 as i64,
+        sr.region as i64,
+        sr.child_off as i64,
         trap_out,
     )
 }
@@ -2659,8 +1563,8 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 /// window before it starts. A durable run refuses outright (multi-window freeze is O6).
 ///
 /// # Safety
-/// As [`instantiate_module_named`]: `rt`/`mem_base`/`mem_size`/`trap_out` are the baked nursery, live
-/// parent window base, **reserved** span, and run trap cell, valid for the call; a nonzero
+/// `rt`/`mem_base`/`mem_size`/`trap_out` are the baked nursery, live parent window base, **reserved**
+/// span, and run trap cell, valid for the call; a nonzero
 /// `self_prog` is a live [`UnitProg`] ([`Nursery::self_program`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(

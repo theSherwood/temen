@@ -4,8 +4,8 @@
 //! (runtime-resolved, never a handle), no nested host can interpose and forge it.
 //!
 //! `attest` routes through the same `Host::self_dispatch` on every backend (like `self.count`), so
-//! the **root** report is a cross-backend differential. A §14 nested child's report (window-exposed)
-//! is interpreter-first: a plain JIT child has an empty powerbox, so `self.*` there is a follow-up.
+//! the **root** report is a cross-backend differential. A detached child's report is
+//! `spawn_every_driver.rs`'s `a_detached_child_attests_its_spawners_tier`.
 
 use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
@@ -100,76 +100,5 @@ fn root_attest_packs_tier_and_exposure_bits() {
             freeze_exposed: true,
         },
         769,
-    );
-}
-
-/// A §14 nested child (interpreter): the parent `instantiate`s a child that returns its own `attest`,
-/// `join`s it, and returns `child_attest * 1000 + parent_attest`. The parent is the root (packed `1`);
-/// the child is **window-exposed** (its carve is a superset the parent reads) and non-durable, so its
-/// report is `1 | (1 << 8)` = `257`. Result `257 * 1000 + 1` = `257001`.
-const NESTED_ATTEST: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (vinst: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=16384 sl=12 quota=0 (child carve + record both above the #1094 NULL guard)\n\
-  q0v0 = i64.const 4294967296\n\
-  q0v1 = i64.const 0\n\
-  q0off = i64.const 16384\n\
-  q0v2 = i64.const -4294967284\n\
-  q0v3 = i64.const 4294967295\n\
-  q0a0 = i64.const 20480\n\
-  i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 20488\n\
-  i64.store q0a1 q0off\n\
-  q0a2 = i64.const 20496\n\
-  i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 20504\n\
-  i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 20512\n\
-  i64.store q0a4 q0v1\n\
-  q0a5 = i64.const 20520\n\
-  i64.store q0a5 q0v1\n\
-  q0a6 = i64.const 20528\n\
-  i64.store q0a6 q0v1\n\
-  vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)\n\
-  vcr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
-  vpa = self.attest\n\
-  vpa64 = i64.extend_i32_u vpa\n\
-  vk = i64.const 1000\n\
-  vt = i64.mul vcr vk\n\
-  vsum = i64.add vt vpa64\n\
-  return vsum\n\
-  }\n\
-}\n\
-func (i64) -> (i64) {\n\
-block 0 (vci: i64) {\n\
-  va = self.attest\n\
-  vr = i64.extend_i32_u va\n\
-  return vr\n\
-  }\n\
-}\n";
-
-#[test]
-fn nested_child_reports_window_exposed_interp() {
-    let m = parse_module(NESTED_ATTEST).expect("parse");
-    verify_module(&m).expect("verify");
-    let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
-    let mut fuel = 50_000_000u64;
-    let r = run_capture_reserved_with_host(
-        &m,
-        0,
-        &[Value::I32(ih)],
-        &mut fuel,
-        &[0u8; 128 << 10],
-        0,
-        &mut host,
-    )
-    .0;
-    // child (exposed) = 257, parent (root) = 1 → 257001. The child *learns it is exposed* — the whole
-    // point of the trust anchor.
-    assert_eq!(
-        r,
-        Ok(vec![Value::I64(257_001)]),
-        "nested child must see window_exposed (257); root does not (1)"
     );
 }

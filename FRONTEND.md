@@ -85,8 +85,7 @@ dispatches to `codegen_ir` (see `cc1()` in `main.c`, where the wiring lives). Tw
 flags: `-g` also emits the Temen debug-info section (file/line table, function names,
 structured types, `debug.var` — `DEBUGGING.md` §6), and `--child-entry` emits function 0
 with the §14 child ABI (`(i64 starter) -> (i64 status)`) so a compiled-C command is
-spawnable as an `instantiate_module` child — a shell "exec" (`STAGE1.md`;
-`crates/temen/tests/stage1_exec_command.rs`). Build with
+spawnable as a §14 child — a shell "exec" (`STAGE1.md`; `crates/temen/tests/stage1_posix_spawn.rs`). Build with
 `make -C frontend/chibicc` (needs `make` + a C compiler; both present in CI). Build
 artifacts (`*.o`, the `chibicc` binary) are git-ignored.
 

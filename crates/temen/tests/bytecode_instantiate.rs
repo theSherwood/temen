@@ -1,14 +1,12 @@
 //! Equality harness for the bytecode engine's **§14 executor-child seam** (INTERP_PERF.md Slice
-//! 1c-5g): `Instantiator.instantiate` / `Instantiator.join`. Unlike a coroutine (driven inline),
-//! an instantiated child runs on the cooperative scheduler — confined to a power-of-two sub-window
-//! of the holder's range (a `nested_view` over the shared backing), with an attenuated powerbox (an
-//! `Instantiator` + an `AddressSpace`, each over its own window) and a `quota` fuel sub-budget — and
-//! is joined through the shared §12 thread machinery.
+//! 1c-5g): a spawn (`Instantiator.instantiate_rec`, `call.cap 6 17`) and `Instantiator.join`
+//! (`call.cap 6 1`). A child runs on the cooperative scheduler in a window of its own, with an
+//! attenuated powerbox (an `Instantiator` + an `AddressSpace` over that window), and is joined through
+//! the shared §12 thread machinery.
 //!
-//! Adapted from `crates/temen/tests/instantiator.rs`. Each case is checked **bit-identical** to the
-//! tree-walker `run_with_host`; `.expect(Some)` gates that the bytecode engine drove the module
-//! (didn't fall back). The host grants the `Instantiator` capability (iface 6); the handle reaches
-//! the guest as func 0's argument. `instantiate` is `call.cap 6 0`, `join` is `call.cap 6 1`.
+//! Each case is checked **bit-identical** to the tree-walker `run_with_host`; `.expect(Some)` gates
+//! that the bytecode engine drove the module (didn't fall back). The host grants the `Instantiator`
+//! capability (iface 6); the handle reaches the guest as func 0's argument.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -18,7 +16,7 @@ use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
 /// A host for `m` with an `Instantiator` over the low 128 KiB, and the `"budget"` and `"child"` (`m`'s
-/// child image of func 1, #2219) of a detached spawn. The carve fixtures use neither.
+/// child image of func 1, #2219) of a detached spawn.
 fn host(m: &Module) -> (Host, i32) {
     let mut h = Host::new();
     let budget = h.grant_budget(-1, 1 << 20, -1);
@@ -49,142 +47,6 @@ fn check(src: &str, want: Result<Vec<Value>, ()>) {
         Ok(vals) => assert_eq!(bc, Ok(vals), "instantiate result\n{src}"),
         Err(()) => assert!(bc.is_err(), "expected a trap, got {bc:?}\n{src}"),
     }
-}
-
-/// Parent (func 0) instantiates the child (func 1) in a 4 KiB window at 64 KiB, joins it, then reads
-/// back the marker the child wrote into the **shared** backing — proving the child ran confined on
-/// the executor and its writes are visible to the parent (the §14 shared data plane). The child
-/// writes 123 at its own offset 7 (→ backing 64 KiB + 7) and returns 42; the parent returns
-/// `42 * 1000 + 123 = 42123`.
-const SHARED_MEM: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  v7 = i64.const 65543
-  v8 = i32.load8_u v7
-  v9 = i64.extend_i32_u v8
-  v10 = i64.const 1000
-  v11 = i64.mul v6 v10
-  v12 = i64.add v11 v9
-  return v12
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 7
-  v2 = i32.const 123
-  i32.store8 v1 v2
-  v3 = i64.const 42
-  return v3
-  }
-}
-"#;
-
-#[test]
-fn instantiate_join_shares_backing() {
-    check(SHARED_MEM, Ok(vec![Value::I64(42123)]));
-}
-
-/// Depth-2 VM-in-VM (from `instantiator.rs`): the child, handed an `Instantiator` over *its* window,
-/// itself instantiates a grandchild — confinement composes. The grandchild returns 77, propagated up
-/// through two joins. #1094: the child is a 32 KiB window and the grandchild carves at child offset
-/// 16384 (above the NULL guard) — the cooperative driver checks a nested carve's base against the
-/// root guard, so a grandchild carve must clear it.
-const DEPTH_TWO: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=15 quota=0
-  q1v0 = i64.const 4294967296
-  q1v1 = i64.const 65536
-  q1v2 = i64.const -4294967281
-  q1v3 = i64.const 4294967295
-  q1v4 = i64.const 0
-  q1a0 = i64.const 17600
-  i64.store q1a0 q1v0
-  q1a1 = i64.const 17608
-  i64.store q1a1 q1v1
-  q1a2 = i64.const 17616
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i64.store q1a3 q1v3
-  q1a4 = i64.const 17632
-  i64.store q1a4 q1v4
-  q1a5 = i64.const 17640
-  i64.store q1a5 q1v4
-  q1a6 = i64.const 17648
-  i64.store q1a6 q1v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  return v6
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i32.wrap_i64 v0
-  v2 = i64.const 20480
-  v3 = i32.const 171
-  i32.store8 v2 v3
-  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0 — the child's marker and record sit at
-  ; 20 KiB, above the guard its 32 KiB carve reserves (#1206) and clear of the grandchild carve
-  q2v0 = i64.const 8589934592
-  q2v1 = i64.const 16384
-  q2v2 = i64.const -4294967286
-  q2v3 = i64.const 4294967295
-  q2v4 = i64.const 0
-  q2a0 = i64.const 20544
-  i64.store q2a0 q2v0
-  q2a1 = i64.const 20552
-  i64.store q2a1 q2v1
-  q2a2 = i64.const 20560
-  i64.store q2a2 q2v2
-  q2a3 = i64.const 20568
-  i64.store q2a3 q2v3
-  q2a4 = i64.const 20576
-  i64.store q2a4 q2v4
-  q2a5 = i64.const 20584
-  i64.store q2a5 q2v4
-  q2a6 = i64.const 20592
-  i64.store q2a6 q2v4
-  v8 = call.cap 6 17 (i64) -> (i32) v1 (q2a0)
-  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
-  return v9
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 0
-  v2 = i32.const 200
-  i32.store8 v1 v2
-  v3 = i64.const 77
-  return v3
-  }
-}
-"#;
-
-#[test]
-fn nesting_composes_to_depth_two() {
-    check(DEPTH_TWO, Ok(vec![Value::I64(77)]));
 }
 
 /// A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
@@ -230,74 +92,26 @@ fn two_arg_child_manages_its_own_pages() {
     check(&src, Ok(vec![Value::I64(0)]));
 }
 
-/// An out-of-range carve (a 4 KiB child at offset 128 KiB doesn't fit the 128 KiB holder) returns
-/// `-EINVAL` (-22); the parent returns it without joining.
-const BAD_CARVE: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=131072 sl=12 quota=0
-  q4v0 = i64.const 4294967296
-  q4v1 = i64.const 131072
-  q4v2 = i64.const -4294967284
-  q4v3 = i64.const 4294967295
-  q4v4 = i64.const 0
-  q4a0 = i64.const 17792
-  i64.store q4a0 q4v0
-  q4a1 = i64.const 17800
-  i64.store q4a1 q4v1
-  q4a2 = i64.const 17808
-  i64.store q4a2 q4v2
-  q4a3 = i64.const 17816
-  i64.store q4a3 q4v3
-  q4a4 = i64.const 17824
-  i64.store q4a4 q4v4
-  q4a5 = i64.const 17832
-  i64.store q4a5 q4v4
-  q4a6 = i64.const 17840
-  i64.store q4a6 q4v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q4a0)
-  v6 = i64.extend_i32_s v5
-  return v6
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 0
-  return v1
-  }
-}
-"#;
-
-#[test]
-fn out_of_range_carve_rejected() {
-    check(BAD_CARVE, Ok(vec![Value::I64(-22)]));
-}
-
 /// A child trap (`unreachable`) must propagate through `join` as the parent's trap — identically on
-/// both engines.
+/// both engines. The parent spawns its `"child"` as [`ADDRESS_SPACE`]'s does, by the v1 record at
+/// 17728.
 const CHILD_TRAP: &str = r#"memory 17
+data 16640 "budget"
+data 16656 "child"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=0 sl=12 quota=0
-  q5v0 = i64.const 4294967296
-  q5v1 = i64.const 0
-  q5v2 = i64.const -4294967284
-  q5v3 = i64.const 4294967295
-  q5a0 = i64.const 20800
-  i64.store q5a0 q5v0
-  q5a1 = i64.const 20808
-  i64.store q5a1 q5v1
-  q5a2 = i64.const 20816
-  i64.store q5a2 q5v2
-  q5a3 = i64.const 20824
-  i64.store q5a3 q5v3
-  q5a4 = i64.const 20832
-  i64.store q5a4 q5v1
-  q5a5 = i64.const 20840
-  i64.store q5a5 q5v1
-  q5a6 = i64.const 20848
-  i64.store q5a6 q5v1
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q5a0)
+  vnp = i64.const 16640
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  q3b = i64.const 17756
+  i32.store q3b vb
+  vcp = i64.const 16656
+  vcl = i64.const 5
+  vc = self.resolve vcp vcl
+  q3m = i64.const 17752
+  i32.store q3m vc
+  q3a0 = i64.const 17728
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
   v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
   return v6
   }
@@ -311,5 +125,6 @@ block 0 (v0: i64) {
 
 #[test]
 fn child_trap_propagates_through_join() {
-    check(CHILD_TRAP, Err(()));
+    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1(0)));
+    check(&src, Err(()));
 }

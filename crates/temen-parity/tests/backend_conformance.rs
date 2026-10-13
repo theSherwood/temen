@@ -31,7 +31,6 @@
 //! stay `Unaudited` here exactly as they do on the debugger and concurrency columns.
 
 mod support;
-use std::ffi::c_void;
 use support::capability_probe::{probe_module_with, rows, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
@@ -112,7 +111,8 @@ fn bytecode(
     }
 }
 
-/// The Cranelift JIT, driven through the reference host trampoline an embedder supplies.
+/// The Cranelift JIT, driven as an embedder drives it (`temen_run::jit_cap_run`): the reference host
+/// trampoline plus the production hooks a spawn's admission needs.
 fn cranelift(
     mut host: Host,
     handle: i32,
@@ -123,14 +123,17 @@ fn cranelift(
     real: &[(usize, i64)],
 ) -> Verdict {
     let m = probe_module_with(iface, op, argc, res, real);
-    // SAFETY: `cap_thunk`'s contract — `ctx` is a live `*mut Host` that outlives the run below.
-    let out = temen_jit::compile_and_run_with_host(
+    let out = temen_run::jit_cap_run(
         &m,
         0,
         &[handle as i64],
-        temen_run::cap_thunk,
-        &mut host as *mut Host as *mut c_void,
-    );
+        &temen_interp::MemLayout::image(Vec::new()),
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        0,
+        &mut host,
+        None,
+    )
+    .map(|(o, _)| o);
     match out {
         Err(temen_jit::JitError::Unsupported(_)) => Verdict::Declined,
         Err(e) => panic!("cranelift returned an unexpected (non-Unsupported) error: {e:?}"),
@@ -245,8 +248,8 @@ fn the_backend_column_matches_what_the_backends_actually_do() {
 
 /// #1573, pinned so it stays fixed: `join` (op 1) on a child handle that names no live child traps
 /// `ThreadFault` on every backend. It used to trap `CapFault` under Cranelift — the JIT's nesting
-/// runtime chose `CapFault` where the oracle's `take_child` answers `ThreadFault`. The row as a whole
-/// is still `NotYet` for op 13 (#1821), so the column test alone would not catch `join` regressing.
+/// runtime chose `CapFault` where the oracle's `take_child` answers `ThreadFault`. Pinned on its own
+/// so a regression names itself instead of just reddening the row's cell.
 #[test]
 fn join_traps_as_the_oracle_does() {
     let row = rows()

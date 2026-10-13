@@ -459,8 +459,8 @@ rule (§2.1).
   `temen-posix::bind` supersedes `resolve_bound` at its use sites. The
   browser's on-ramp binds manifest modules (`onramp_prepare` keeps the
   rewrite only for legacy positional blobs). **§2.1 child manifests:**
-  `ModuleGrant` retains the import list; an op-13 spawn binds the child's
-  slots against its granted powerbox on both backends
+  `ModuleGrant` retains the import list; a spawn binds the child's
+  slots against its granted powerbox on both backends (op 13 then; the detached spawn now, #1867)
   (`Host::bind_child_manifest`, the interp inline + the JIT's
   `ChildManifestBinder` hook via `temen_run::child_bind_imports`).*
 

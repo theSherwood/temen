@@ -1,8 +1,8 @@
 //! `synth_manifest_child_start`: a module a frontend linked itself (a runtime plus a program, no
 //! translator-made `_start`) runs as a §14 child. Its synthesized `_start` takes the starter
 //! capability, ignores it, calls the entry with the powerbox `sp`, and returns the entry's result
-//! widened to the `i64` status `join` reads — spawned carved (op 13) and detached (op 15), on the
-//! tree-walk oracle, the cooperative bytecode driver, and Cranelift.
+//! widened to the `i64` status `join` reads — spawned detached (op 15), on the tree-walk oracle, the
+//! cooperative bytecode driver, and Cranelift.
 //!
 //! And `vm_region_create` in `CHILD_BINDABLE`: a child whose manifest imports it (a separately
 //! compiled runtime that can mint §13 regions) binds it to its own `AddressSpace` instead of failing
@@ -48,14 +48,9 @@ block 0 (sp: i64) {
 }
 ";
 
-/// The parent (args `(instantiator, child module, budget)`): spawn the child carved at 4 MiB (op 13)
-/// or detached (op 15) with a `2^child_log2` window, join it, return its status.
-fn parent(detached: bool, child_log2: u8) -> String {
-    let spawn = if detached {
-        "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
-    } else {
-        "ch = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (me, gz, gz, gz, off, sl, gz)"
-    };
+/// The parent (args `(instantiator, child module, budget)`): spawn the child detached (op 15) with a
+/// `2^child_log2` window, join it, return its status.
+fn parent(child_log2: u8) -> String {
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -63,9 +58,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  off = i64.const 4194304
   sl = i64.const {child_log2}
-  {spawn}
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
   vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
   return vr
   }}
@@ -99,8 +93,8 @@ fn log2(m: &Module) -> u8 {
     m.memory.expect("a window").size_log2
 }
 
-fn oracle(child: &Module, detached: bool) -> Result<Vec<Value>, Trap> {
-    let parent = parse(&parent(detached, log2(child)));
+fn oracle(child: &Module) -> Result<Vec<Value>, Trap> {
+    let parent = parse(&parent(log2(child)));
     let (mut host, h) = powerbox(child);
     let mut fuel = 50_000_000u64;
     let init = vec![0u8; 1 << PARENT_LOG2];
@@ -116,16 +110,16 @@ fn oracle(child: &Module, detached: bool) -> Result<Vec<Value>, Trap> {
     .0
 }
 
-fn bytecode(child: &Module, detached: bool) -> Option<Result<Vec<Value>, Trap>> {
-    let parent = parse(&parent(detached, log2(child)));
+fn bytecode(child: &Module) -> Option<Result<Vec<Value>, Trap>> {
+    let parent = parse(&parent(log2(child)));
     let (mut host, h) = powerbox(child);
     let mut fuel = 50_000_000u64;
     bytecode::compile_and_run_with_host(&parent, 0, &h.map(Value::I32), &mut fuel, &mut host)
 }
 
 /// `None` on a target without the child executor.
-fn cranelift(child: &Module, detached: bool) -> Option<JitOutcome> {
-    let parent = parse(&parent(detached, log2(child)));
+fn cranelift(child: &Module) -> Option<JitOutcome> {
+    let parent = parse(&parent(log2(child)));
     let (mut host, h) = powerbox(child);
     let init = vec![0u8; 1 << PARENT_LOG2];
     let args = h.map(i64::from);
@@ -145,20 +139,13 @@ fn cranelift(child: &Module, detached: bool) -> Option<JitOutcome> {
     }
 }
 
-/// Runs `child` both ways on every engine and checks each returns `want`.
+/// Runs `child` on every engine and checks each returns `want`.
 fn every_engine(child: &Module, want: i64) {
-    for detached in [false, true] {
-        let how = if detached { "detached" } else { "carved" };
-        assert_eq!(
-            oracle(child, detached),
-            Ok(vec![Value::I64(want)]),
-            "oracle, {how}"
-        );
-        let r = bytecode(child, detached).expect("the bytecode engine lowers the parent");
-        assert_eq!(r, Ok(vec![Value::I64(want)]), "bytecode, {how}");
-        let o = cranelift(child, detached).expect("Cranelift hosts §14 children here");
-        assert_eq!(o, JitOutcome::Returned(vec![want]), "Cranelift, {how}");
-    }
+    assert_eq!(oracle(child), Ok(vec![Value::I64(want)]), "oracle");
+    let r = bytecode(child).expect("the bytecode engine lowers the parent");
+    assert_eq!(r, Ok(vec![Value::I64(want)]), "bytecode");
+    let o = cranelift(child).expect("Cranelift hosts §14 children here");
+    assert_eq!(o, JitOutcome::Returned(vec![want]), "Cranelift");
 }
 
 #[test]

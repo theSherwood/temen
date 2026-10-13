@@ -559,91 +559,71 @@ pub mod durable_abi {
 /// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
 /// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
 ///
-/// **Two versions while the carve placement retires** (INVARIANTS #13 ruling 2026-09-29; #1863) —
-/// the version word is that migration's scaffolding, removed with the carve path (#1867):
+/// A record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
+/// The version word is a fixed tag (#1867 decision 2): it must be 1, so a record written for the
+/// retired carve placement (version 0) fails closed; #2091 retires the tag.
 ///
-/// | off | field | v0 (legacy carve, 56 B) | v1 (detached, [`SPAWN_REC_LEN`] = 88 B) |
-/// |---|---|---|---|
-/// | 0 | `u32` version | 0 | 1 |
-/// | 4 | `u32` entry | entry | entry |
-/// | 8 | `u64` off | carve offset | reserved, must be 0 |
-/// | 16 | `u32` size_log2 | carve size | the child's own window |
-/// | 20 | `u32` pager | impl export / `u32::MAX` | same |
-/// | 24 | `i32` module | handle / `-1` self | same |
-/// | 28 | `i32` budget | `Budget` handle / 0 (funds the child; excludes `quota`) | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
-/// | 32 | `i64` quota | raw fuel | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
-/// | 40, 48 | `u64` grants ptr, count | named-grant list | same |
-/// | 56, 64 | `u64` args ptr, len | — | spawn-time args payload (len 0 = none) |
-/// | 72 | `i32` region | — | pre-mapped `SharedRegion` (−1 = none) |
-/// | 76 | `u32` | — | reserved, must be 0 |
-/// | 80 | `u64` child_off | — | where the region maps in the child |
-///
-/// A v1 record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
+/// | off | field | |
+/// |---|---|---|
+/// | 0 | `u32` version | 1 |
+/// | 4 | `u32` entry | the child's entry function |
+/// | 8 | `u64` | reserved, must be 0 |
+/// | 16 | `u32` size_log2 | the child's own window |
+/// | 20 | `u32` pager | impl export / `u32::MAX` |
+/// | 24 | `i32` module | handle / `-1` self |
+/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
+/// | 32 | `i64` quota | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
+/// | 40, 48 | `u64` grants ptr, count | named-grant list |
+/// | 56, 64 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
+/// | 72 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
+/// | 76 | `u32` | reserved, must be 0 |
+/// | 80 | `u64` child_off | where the region maps in the child |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
-    /// `true` for a v1 (detached) record.
-    pub detached: bool,
     /// Child entry function index (record offset 4).
     pub entry: u32,
-    /// v0: carve window offset within the parent's address space (offset 8). v1: always 0.
-    pub off: u64,
     /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
     pub size_log2: i64,
     /// Pager impl-export index, or `u32::MAX` for none (offset 20).
     pub pager: u32,
     /// `Module` handle, or `-1` for self (offset 24).
     pub modh: i32,
-    /// `Budget` handle, or `0` for none (offset 28) — see the table for its per-version meaning.
+    /// `Budget` handle, or `0` for none (offset 28).
     pub budget: i32,
-    /// Raw fuel quota (offset 32) — v0 only; retired in v1, where it must be 0 and a spawn naming
-    /// any other value traps `CapFault` (#1944 slice 3: the budget caps the child's fuel).
+    /// Raw fuel quota (offset 32) — retired: it must be 0, and a spawn naming any other value traps
+    /// `CapFault` (#1944 slice 3: the budget caps the child's fuel).
     pub quota: i64,
     /// Named-grant list pointer (offset 40).
     pub grants_ptr: u64,
     /// Named-grant list count (offset 48).
     pub grants_n: u64,
-    /// v1: the spawn-time args payload `(ptr, len)` (offsets 56, 64); `(0, 0)` in v0.
+    /// The spawn-time args payload `(ptr, len)` (offsets 56, 64).
     pub args: (u64, u64),
-    /// v1: the pre-mapped region handle (offset 72), `-1` for none (always `-1` in v0).
+    /// The pre-mapped region handle (offset 72), `-1` for none.
     pub region: i32,
-    /// v1: the region's offset in the child's window (offset 80).
+    /// The region's offset in the child's window (offset 80).
     pub child_off: u64,
 }
 
-/// The byte length of a v1 (detached) [`SpawnRec`]; a v0 record is its first 56 bytes.
+/// The byte length of a [`SpawnRec`].
 pub const SPAWN_REC_LEN: usize = 88;
 
 impl SpawnRec {
-    /// The version word of a record whose first 56 bytes are `head` — how many bytes a driver must
-    /// read: 56 for version 0, [`SPAWN_REC_LEN`] for version 1. `None` for any other version (fail
-    /// closed).
-    pub fn len_for(head: &[u8; 56]) -> Option<usize> {
-        match u32::from_le_bytes([head[0], head[1], head[2], head[3]]) {
-            0 => Some(56),
-            1 => Some(SPAWN_REC_LEN),
-            _ => None,
-        }
-    }
-
-    /// Decode a record of exactly [`Self::len_for`] bytes. `None` on an unknown version, a length
-    /// that disagrees with it, or a v1 record whose reserved fields (`off`, offset 76) are nonzero
-    /// — every driver fails that closed. Pure layout decode: no handle/window/geometry validation,
-    /// all of which stays tier-local.
+    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
+    /// word other than 1, or a nonzero reserved field (offsets 8, 76) — every driver fails that
+    /// closed. Pure layout decode: no handle/window/geometry validation, all of which stays
+    /// tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
-        let head: &[u8; 56] = rec.get(..56)?.try_into().ok()?;
-        if Self::len_for(head)? != rec.len() {
+        if rec.len() != SPAWN_REC_LEN {
             return None;
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        let detached = rec.len() == SPAWN_REC_LEN;
-        if detached && (u64_at(8) != 0 || u32_at(76) != 0) {
+        if u32_at(0) != 1 || u64_at(8) != 0 || u32_at(76) != 0 {
             return None;
         }
         Some(SpawnRec {
-            detached,
             entry: u32_at(4),
-            off: u64_at(8),
             size_log2: u32_at(16) as i64,
             pager: u32_at(20),
             modh: u32_at(24) as i32,
@@ -651,24 +631,18 @@ impl SpawnRec {
             quota: u64_at(32) as i64,
             grants_ptr: u64_at(40),
             grants_n: u64_at(48),
-            args: if detached {
-                (u64_at(56), u64_at(64))
-            } else {
-                (0, 0)
-            },
-            region: if detached { u32_at(72) as i32 } else { -1 },
-            child_off: if detached { u64_at(80) } else { 0 },
+            args: (u64_at(56), u64_at(64)),
+            region: u32_at(72) as i32,
+            child_off: u64_at(80),
         })
     }
 
-    /// A v1 (detached) record for `entry` with every other field at its "none" value: the module's
-    /// declared window (`size_log2` 0), no pager, the spawner's own module, no budget, the retired
-    /// `quota` 0, no grants, no args, no region. Producers set the fields they use.
+    /// A record for `entry` with every other field at its "none" value: the module's declared
+    /// window (`size_log2` 0), no pager, the spawner's own module, no budget, the retired `quota`
+    /// 0, no grants, no args, no region. Producers set the fields they use.
     pub fn v1(entry: u32) -> SpawnRec {
         SpawnRec {
-            detached: true,
             entry,
-            off: 0,
             size_log2: 0,
             pager: u32::MAX,
             modh: -1,
@@ -682,12 +656,12 @@ impl SpawnRec {
         }
     }
 
-    /// The record's bytes, the inverse of [`Self::parse`]: 56 for v0, [`SPAWN_REC_LEN`] for v1.
+    /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(SPAWN_REC_LEN);
-        b.extend_from_slice(&(self.detached as u32).to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
         b.extend_from_slice(&self.entry.to_le_bytes());
-        b.extend_from_slice(&self.off.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
         b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
         b.extend_from_slice(&self.pager.to_le_bytes());
         b.extend_from_slice(&self.modh.to_le_bytes());
@@ -695,13 +669,11 @@ impl SpawnRec {
         b.extend_from_slice(&self.quota.to_le_bytes());
         b.extend_from_slice(&self.grants_ptr.to_le_bytes());
         b.extend_from_slice(&self.grants_n.to_le_bytes());
-        if self.detached {
-            b.extend_from_slice(&self.args.0.to_le_bytes());
-            b.extend_from_slice(&self.args.1.to_le_bytes());
-            b.extend_from_slice(&self.region.to_le_bytes());
-            b.extend_from_slice(&0u32.to_le_bytes());
-            b.extend_from_slice(&self.child_off.to_le_bytes());
-        }
+        b.extend_from_slice(&self.args.0.to_le_bytes());
+        b.extend_from_slice(&self.args.1.to_le_bytes());
+        b.extend_from_slice(&self.region.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&self.child_off.to_le_bytes());
         b
     }
 }
@@ -7980,12 +7952,34 @@ mod spawn_rec_tests {
         let b = v1.encode();
         assert_eq!(b.len(), SPAWN_REC_LEN);
         assert_eq!(SpawnRec::parse(&b), Some(v1));
-        let v0 = SpawnRec {
-            detached: false,
-            off: 65536,
-            size_log2: 12,
-            ..SpawnRec::v1(1)
+    }
+
+    /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
+    /// placement — and any other version fail closed, as do the reserved words, a short record
+    /// (a v0 record was 56 bytes) and a long one.
+    #[test]
+    fn only_a_version_1_record_parses() {
+        let b = SpawnRec::v1(1).encode();
+        let with = |o: usize, v: u32| {
+            let mut r = b.clone();
+            r[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            r
         };
-        assert_eq!(SpawnRec::parse(&v0.encode()), Some(v0));
+        for v in [0, 2, u32::MAX] {
+            assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
+        }
+        assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
+        assert_eq!(
+            SpawnRec::parse(&with(12, 1)),
+            None,
+            "the word at 8, high half"
+        );
+        assert_eq!(SpawnRec::parse(&with(76, 1)), None, "the word at 76");
+        assert_eq!(SpawnRec::parse(&b[..56]), None, "a v0-length record");
+        assert_eq!(
+            SpawnRec::parse(&[b.as_slice(), &[0]].concat()),
+            None,
+            "one byte long"
+        );
     }
 }

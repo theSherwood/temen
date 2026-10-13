@@ -225,7 +225,7 @@ rather than converged:
 | `run_kernel` | bare | none | kernels / bench |
 | `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
-| §14 nested (`Instantiator`/`Module`, name-addressable F2) | all 3 | object-cap | `instantiator.rs`, `separate_module.rs` |
+| §14 nested (`Instantiator`/`Module`, name-addressable F2) | all 3 | object-cap | `instantiate_record.rs`, `separate_module.rs` |
 
 **Resolved (F2).** The §14 nested path can now address a child's entry **by name**: a `Module`
 capability (iface 8) gained one callable op — `op 0 resolve_export(name_ptr, name_len) -> funcidx |
@@ -550,7 +550,9 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   is composition of existing mechanism, not new VM semantics — consistent with keeping the VM pure
   mechanism (§2a).
 
-  *Status (Stage 1, landed):* the `posix_spawn`+`wait` core is proven differentially
+  *Status (Stage 1, landed; the carve spawns and the tests named here are retired since, #1867 —
+  `stage1_posix_spawn.rs` and `stage1_applet_dispatch.rs` pin the detached spawn):* the
+  `posix_spawn`+`wait` core was proven differentially
   (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve — op 15's args payload once carves
   retire — spawns a separate host-verified
   `Module` via `Instantiator.instantiate_module` (op 5), and `join`s (op 1) for the child's exit

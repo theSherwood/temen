@@ -15,8 +15,8 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
     Arc::new(m)
 }
 
-/// The detached serving child: its own module, own offer, own serve loop — same shape as the
-/// separate-module (nested) server, now in a window the parent cannot see.
+/// The detached serving child: its own module, own offer, own serve loop, in a window the parent
+/// cannot see.
 const DETACHED_SERVER: &str = r#"
 memory 12
 type 0 func (i64, i64) -> (i64)
@@ -40,7 +40,7 @@ block 0 (va: i64, vb: i64) {
 "#;
 
 /// The parent: spawns the server DETACHED (op 15 — budget, module, no grants), wires its live
-/// offer (`child_offer` — identical to the nested form: the linkage is the powerbox Arc), calls
+/// offer (`child_offer` — the linkage is the powerbox Arc, not the window), calls
 /// `add(40, 2)` through it (park, serve, reply), joins. Composite: join(1)*100 + 42 = 142.
 const DETACHED_CALLER: &str = r#"
 memory 17
@@ -105,37 +105,27 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The trust anchor, side by side: the SAME module spawned **nested** (op 5, a carve of the
-/// parent's window) attests `tier 1 | window_exposed` = 257; spawned **detached** (op 15) it
-/// attests `tier 1` alone = 1 — the distrust-spawner report, platform-vouched. Composite:
-/// nested*1000 + detached = 257_001.
-const ATTEST_BOTH: &str = r#"
+/// The trust anchor: [`ATTEST_MOD`] spawned **detached** (op 15) attests `tier 1` alone — no
+/// `window_exposed`, the distrust-spawner report, platform-vouched.
+const ATTEST_DETACHED: &str = r#"
 memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vmh = i64.extend_i32_u v1
   vmin = i64.extend_i32_u v2
-  ve = i64.const 0
-  voff = i64.const 65536
-  vlog = i64.const 12
-  vq = i64.const 0
-  vN = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ve, voff, vlog, vq)
   vz = i64.const 0
-  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vjN = call.cap 6 1 (i32) -> (i64) v0 (vN)
+  vlog = i64.const 12
+  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, vz, vlog, vz)
   vjD = call.cap 6 1 (i32) -> (i64) v0 (vD)
-  vk = i64.const 1000
-  vm = i64.mul vjN vk
-  vs = i64.add vm vjD
-  return vs
+  return vjD
   }
 }
 "#;
 
 #[test]
-fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed() {
-    let a = module(ATTEST_BOTH);
+fn a_detached_child_attests_its_window_unexposed() {
+    let a = module(ATTEST_DETACHED);
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
@@ -150,11 +140,7 @@ fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed(
         &mut host,
     )
     .expect("run");
-    assert_eq!(
-        r,
-        vec![Value::I64(257_001)],
-        "nested attests tier|exposed (257); detached attests tier alone (1)"
-    );
+    assert_eq!(r, vec![Value::I64(1)], "detached attests tier alone");
 }
 
 /// The budget's quota is the attenuation: with exactly one window's worth (4096 bytes), the
@@ -362,7 +348,7 @@ block 0 (v0: i64) {
 
 /// The parent stores the args blob (`argc 1`, `"hello-detached\0"`) at 18432 in ITS window and passes
 /// `(18432, 24)` as the optional 8th/9th op-15 args (#1286): the host copies it to the child's
-/// `module_args_base()` before start — the detached twin of the op-13 "data segment in the carve".
+/// `module_args_base()` before start.
 const ARGV_PARENT: &str = r#"
 memory 17
 

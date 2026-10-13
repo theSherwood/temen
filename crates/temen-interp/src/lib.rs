@@ -14658,612 +14658,51 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         return Err(Trap::CapFault);
                     }
                     let h = get_i32(&frames[top].vals, *handle)?;
-                    let (ibase, isize) = {
-                        let hg = host.lock_unpoisoned();
-                        hg.resolve_instantiator(h)?
-                    };
-                    // §14 **separate-module children** (ops 5/6/7 = `instantiate_module` /
-                    // `spawn_coroutine_module` / `spawn_demand_coroutine_module`): exactly ops 0/2/4,
-                    // except the first arg is a host-granted `Module` handle (iface 8) and the child
-                    // domain runs *that* verified module — the "plugin-in-plugin" story (a guest can
-                    // only instantiate modules it was given). Resolve the grant here, shift the
-                    // remaining args by one, and fold into the shared op logic below; `join`/`resume`
-                    // (ops 1/3) serve both kinds unchanged. A forged module handle is a `CapFault`.
-                    // §2.2 (op 16): the resolved pager binding, threaded into the spawn tail
-                    // (demand-page the carve + stamp the child's substrate-held pager).
+                    // The handle must name an `Instantiator`: the authority every op below needs.
+                    host.lock_unpoisoned().resolve_instantiator(h)?;
+                    // §2.2: a record's resolved pager binding, threaded into the spawn tail (the
+                    // child's window starts demand-paged and holds the pager substrate-side).
                     let mut pager_ref: Option<(Arc<Mutex<Host>>, u32)> = None;
-                    // §3 (op 17): the record's spawn geometry `(entry, off, size_log2, quota)`,
-                    // overriding the op-0 arm's positional-arg parse when the spawn came in as a
-                    // config record instead of scalars.
-                    let mut rec_geo: Option<(u64, u64, i64, i64)> = None;
-                    // §3b (op 17): the record's Budget handle, validated at parse, consumed
-                    // (drained) only at spawn commit.
-                    let mut rec_budget_h: Option<i32> = None;
-                    // #1863 (op 17, v1): a **detached** record — op 15 as data. Its fields replace
-                    // the op-15 arm's positional-arg parse; the arm is the one detached spawn path.
+                    // #1863 (op 17): a spawn record is op 15 as data. Its fields replace the
+                    // op-15 arm's positional-arg parse; the arm is the one spawn path.
                     let mut rec_detached: Option<SpawnRec> = None;
-                    #[allow(clippy::type_complexity)]
-                    // `named` carries the re-grant **handles** (not pre-resolved bindings): a pipe
-                    // end must alias its shared backing into the child, not copy a parent-local index, so
-                    // resolution happens at child construction via `regrant_into_child`. Validated here.
-                    let (op, child_mod, askip, named): (
-                        u32,
-                        Option<ModuleGrant>,
-                        usize,
-                        Vec<(String, i32)>,
-                    ) = match *op {
-                        5 => {
-                            // The module handle crosses as an i64 arg (the slot ABI); low 32 bits.
-                            let mh =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as i32;
-                            let g = host.lock_unpoisoned().resolve_module(mh)?.clone();
-                            (
-                                0, // instantiate_module → instantiate
-                                Some(g),
-                                1,
-                                Vec::new(),
-                            )
-                        }
+                    let op = match *op {
                         // CONSOLIDATION.md §3 — `instantiate_rec(record_ptr)` (op 17): the
                         // config-record spawn. One record subsumes every spawn variant as data —
-                        // module (`-1` = self), entry, carve `(off, size_log2)`, pager export
-                        // (`u32::MAX` = none; anything else makes a §2.2 demand child paged by
-                        // the spawner's own impl export), quota (raw scalar until §3b's Budget
-                        // handle replaces it; the `budget` field is reserved-zero until then),
-                        // and the op-11 named-grant list `(grants_ptr, grants_n)`. Spawn shape
-                        // is data, not opcode; `join`/`poll`/`detach`/`kill` stay verbs. A
-                        // malformed record (bad version, nonzero reserved field, out-of-window
-                        // list) fails the spawn closed before any child state exists.
+                        // module (`-1` = self), entry, window, pager export (`u32::MAX` = none;
+                        // anything else makes a §2.2 demand child paged by the spawner's own impl
+                        // export), budget, the named-grant list, args and a pre-mapped region.
+                        // Spawn shape is data, not opcode; `join`/`poll`/`detach`/`kill` stay
+                        // verbs. A malformed record (bad version, nonzero reserved field) fails the
+                        // spawn closed before any child state exists.
                         17 => {
                             let rp =
                                 get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let head = m.read_window(rp, 56)?;
-                            let head: &[u8; 56] =
-                                head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-                            // The version word says how long the record is (v0 carve, v1 detached).
-                            let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
-                            let raw = m.read_window(rp, len)?;
-                            // Shared layout decode (#911); budget/grant/pager handling below
-                            // stays tier-local (this arm alone validates the budget handle and the
-                            // pager export against `self_module`, and parses the grant list).
-                            let sr = SpawnRec::parse(&raw).ok_or(Trap::CapFault)?; // version / reserved — fail closed
-                            if sr.detached {
-                                // #1863: a v1 record is op 15 as data — the detached arm spawns
-                                // it, with the pager binding (#1862) validated here as for v0.
-                                if sr.pager != u32::MAX {
-                                    let hg = host.lock_unpoisoned();
-                                    let ok = hg
-                                        .self_module
-                                        .as_ref()
-                                        .is_some_and(|sm| sm.is_pager_export(sr.pager));
-                                    if !ok {
-                                        return Err(Trap::CapFault);
-                                    }
-                                    pager_ref = Some((Arc::clone(host), sr.pager));
+                            // Shared layout decode (#911); budget/grant/pager handling stays
+                            // tier-local (this arm alone validates the pager export against
+                            // `self_module`).
+                            let sr = bytecode::read_spawn_rec(m, rp)?;
+                            // A pager that is not a `{ page: (i64) -> (i64) }` export fails the
+                            // spawn closed (§3.3, #744, #1862).
+                            if sr.pager != u32::MAX {
+                                let hg = host.lock_unpoisoned();
+                                let ok = hg
+                                    .self_module
+                                    .as_ref()
+                                    .is_some_and(|sm| sm.is_pager_export(sr.pager));
+                                if !ok {
+                                    return Err(Trap::CapFault);
                                 }
-                                rec_detached = Some(sr);
-                                (15, None, 0, Vec::new())
-                            } else {
-                                let entry = sr.entry as u64;
-                                let off = sr.off;
-                                let size_log2 = sr.size_log2;
-                                let pager = sr.pager;
-                                let modh = sr.modh;
-                                let budget_h = sr.budget;
-                                let quota = sr.quota;
-                                // §3b: a live Budget handle funds the child — fuel from the budget
-                                // (still capped by the physical remaining), the carve gated by its
-                                // mem quota, the child's vCPU ceiling tightened by its spawn quota.
-                                // Mixing it with a raw quota scalar is ambiguous — fail closed; a
-                                // dangling/mistyped handle likewise. The budget is only *consumed*
-                                // (drained) at spawn commit, so a spawn refused later (bad carve /
-                                // entry) leaves it intact.
-                                if budget_h != 0 {
-                                    if quota != 0 {
-                                        return Err(Trap::CapFault);
-                                    }
-                                    let hg = host.lock_unpoisoned();
-                                    if hg.peek_budget(budget_h).is_none() {
-                                        return Err(Trap::CapFault);
-                                    }
-                                    rec_budget_h = Some(budget_h);
-                                }
-                                let grants_ptr = sr.grants_ptr;
-                                let grants_n = sr.grants_n;
-                                let list = read_grant_records(grants_ptr, grants_n, |o, l| {
-                                    m.read_window(o, l)
-                                })?;
-                                authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
-                                if pager != u32::MAX {
-                                    let hg = host.lock_unpoisoned();
-                                    // A pager that is not a `{ page: (i64) -> (i64) }` export fails
-                                    // the spawn closed (§3.3, #744).
-                                    let ok = hg
-                                        .self_module
-                                        .as_ref()
-                                        .is_some_and(|sm| sm.is_pager_export(pager));
-                                    if !ok {
-                                        return Err(Trap::CapFault);
-                                    }
-                                    pager_ref = Some((Arc::clone(host), pager));
-                                }
-                                let g = if modh >= 0 {
-                                    Some(host.lock_unpoisoned().resolve_module(modh)?.clone())
-                                } else {
-                                    None
-                                };
-                                rec_geo = Some((entry, off, size_log2, quota));
-                                (0, g, 0, list)
+                                pager_ref = Some((Arc::clone(host), sr.pager));
                             }
+                            rec_detached = Some(sr);
+                            15
                         }
-                        // §14 `instantiate_module_named(module, grants_ptr, grants_n, entry, off,
-                        // size_log2, quota)` (STAGE1.md — the shell "exec" primitive): the union of op 5
-                        // (run a host-granted **separate `Module`**) and op 11 (a **named grant list**
-                        // re-granted into the child's powerbox). It is the only op that runs a foreign
-                        // program *and* hands it capabilities — so a compiled command (its own module)
-                        // can resolve an inherited `stdout` by name and do real I/O, not just return a
-                        // status. `module` is arg 0, the grant list at args 1/2, the carve args follow
-                        // (`askip = 3`). Forged module / non-copyable grant / bad record fail closed,
-                        // exactly as ops 5 and 11 do individually.
-                        13 => {
-                            let mh =
-                                get_i64(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?
-                                    as i32;
-                            let g = host.lock_unpoisoned().resolve_module(mh)?.clone();
-                            let grants_ptr =
-                                get_i64(&frames[top].vals, *args.get(1).ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let grants_n =
-                                get_i64(&frames[top].vals, *args.get(2).ok_or(Trap::Malformed)?)?
-                                    as u64;
-                            let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
-                                m.read_window(o, l)
-                            })?;
-                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
-                            (0, Some(g), 3, list)
-                        }
-                        o => (o, None, 0, Vec::new()),
+                        o => o,
                     };
-                    // The function table the child's `entry` indexes — its own module's, or ours.
-                    let cfs: &[Func] = child_mod.as_ref().map_or(fs, |cm| &cm.module.funcs);
                     match op {
-                        // instantiate(entry, off, size_log2, fuel) -> child handle (or -EINVAL). The
-                        // §14 data plane is shared memory: the parent seeds the child's sub-window
-                        // directly (it sees the superset) before/after, so there is no scalar arg.
-                        0 => {
-                            let argn = |i: usize| -> Result<i64, Trap> {
-                                Ok(get(
-                                    &frames[top].vals,
-                                    *args.get(i + askip).ok_or(Trap::Malformed)?,
-                                )?
-                                .i64())
-                            };
-                            let (entry, off, size_log2, quota) = match rec_geo.take() {
-                                Some(g) => g,
-                                None => (argn(0)? as u64, argn(1)? as u64, argn(2)?, argn(3)?),
-                            };
-                            // The child entry returns one `i64` and takes its starter capabilities as
-                            // `i64` args, in order: `Instantiator`, then (if 2 params)
-                            // `AddressSpace`. A missing/mistyped entry is rejected, not run. (The
-                            // op-8 positional 3-arg grant form died with §3d — a child discovers
-                            // re-granted caps by name, via the record's grant list.)
-                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
-                            let ok_entry = cfs
-                                .get(entry as usize)
-                                .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
-                            // The carve must be a power-of-two-aligned sub-window within `[0, isize)`
-                            // — a child can only get what the holder sub-allocates (§14/D19). A
-                            // separate-module child's carve must be **at least its declared memory**
-                            // (FORK.md §8.6 / #773: a larger window is a safe superset — confinement,
-                            // invariant 2, still masks every access to the actual carve; the only
-                            // relaxation vs. an exact-equal carve is that an *out-of-declared-window*
-                            // access — a guest bug — wraps at the carve, not at the declared size. This
-                            // lets a shell spawn a small program into a generous window so its own
-                            // `exec` of a larger command has room. A module with no memory can't nest).
-                            let child_size = if (0..64).contains(&size_log2) {
-                                1u64 << size_log2
-                            } else {
-                                0
-                            };
-                            let mod_ok = child_mod.as_ref().is_none_or(|cm| {
-                                cm.memory_log2().is_some_and(|ml| ml <= size_log2 as u8)
-                            });
-                            let fits = bytecode::carve_fits(
-                                off,
-                                size_log2,
-                                isize,
-                                ibase,
-                                mem.as_ref().map_or(0, |m| m.null_guard),
-                            )
-                                // §3b: a budget-funded spawn's carve must fit the budget's mem
-                                // quota (`-1` = unbounded). Peek, not take — a refused spawn
-                                // leaves the budget intact.
-                                && rec_budget_h.is_none_or(|bh| {
-                                    let hg = host.lock_unpoisoned();
-                                    hg.peek_budget(bh)
-                                        .is_some_and(|b| b.mem < 0 || child_size <= b.mem as u64)
-                                });
-                            // §4 enforcement: *a durable domain admits only freezable modules* — a
-                            // separate-module child must carry the grant's durable attestation
-                            // (`grant_durable_module`); an un-instrumented child could never
-                            // drain-then-unwind, so admitting it would stop the subtree being
-                            // snapshottable as a unit. A same-module child (`None`) runs the
-                            // parent's own (already instrumented) funcs — always admissible.
-                            let mod_durable_ok =
-                                !durable || child_mod.as_ref().is_none_or(|cm| cm.durable);
-                            if !ok_entry || !fits || !mod_ok || !mod_durable_ok {
-                                frames[top].vals.push(Reg::from_i32(EINVAL as i32));
-                            } else {
-                                // `ibase`/`off` are holder-relative; the backing-absolute base
-                                // adds the holder's own window base (0 for a top-level holder), so
-                                // nesting composes at any depth.
-                                let abs_base =
-                                    mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
-                                let child_shadow = child_mod.as_ref().and_then(ModuleGrant::shadow);
-                                let child_mem = mem.as_ref().map(|m| {
-                                    m.nested_view(
-                                        abs_base,
-                                        size_log2 as u8,
-                                        child_shadow.unwrap_or_else(|| m.shadow_arena()),
-                                    )
-                                });
-                                // §2.2 (op 16): a demand process child starts with every page of
-                                // its carve unmapped — first touches fault to the pager binding.
-                                if pager_ref.is_some() {
-                                    if let Some(cm) = child_mem.as_ref() {
-                                        cm.demand_page();
-                                    }
-                                }
-                                // A separate-module child's **data segments** materialize into the
-                                // carve at spawn (exactly as if the child wrote them; the verifier
-                                // bounded them to its declared window == the carve). RO protection of
-                                // `readonly` segments is skipped for nested children (documented —
-                                // intra-domain self-corruption is a §1 non-goal).
-                                if let (Some(cm), Some(m)) = (&child_mod, mem.as_ref()) {
-                                    m.write_segments(abs_base, &cm.module.data, child_size);
-                                }
-                                // Attenuated powerbox: the child gets, over its *own* window (a strict
-                                // subset of the parent's authority), an `Instantiator` (so it can
-                                // itself nest — confinement composes to any depth) and an
-                                // `AddressSpace` (so it can manage its own pages). These are its entry
-                                // arguments. (Pass-through of the parent's *other* handles is a
-                                // follow-up.)
-                                let mut ch = host.lock_unpoisoned().child_host();
-                                // §4: *a durable domain may only spawn durable children* — the
-                                // subtree freezes as a unit, so the child's own spawns/fibers must
-                                // reserve shadow state like the parent's (and its own nested
-                                // instantiates re-apply this same admission rule).
-                                ch.set_durable(durable);
-                                // §6: stamp the child's attestation — nested (its carve is a superset
-                                // the parent reads), freezable iff durable, tier inherited from us.
-                                let carve = (ibase.saturating_add(off), child_size);
-                                let catt = {
-                                    let mut hg = host.lock_unpoisoned();
-                                    // #1440: R1's "for a nested carve child the grant is implied by
-                                    // the aliasing" written as an actual grant. Minted over the whole
-                                    // **instantiator** range, not this one carve: authority is
-                                    // containment-based, so one grant covers every child carved from
-                                    // it — which also keeps a guest that spawns hundreds of children
-                                    // from spending a handle-table slot per spawn. `holds_` makes it
-                                    // idempotent, and the fallible grant means a full table costs the
-                                    // exposure bit's precision, never the run.
-                                    if durable
-                                        && !hg.holds_freeze_authority(FreezeScope::Carve {
-                                            base: carve.0,
-                                            size: carve.1,
-                                        })
-                                    {
-                                        let _ = hg.try_grant_freeze_authority(FreezeScope::Carve {
-                                            base: ibase,
-                                            size: isize,
-                                        });
-                                    }
-                                    hg.child_attestation(durable, Some(carve))
-                                };
-                                ch.set_attestation(catt);
-                                let (cinst, cas) = ch.grant_starter_caps(child_size);
-                                // S2 named grant list (op 11): install each re-granted cap into the child
-                                // **under its name** (so the child resolves it by `self.resolve`).
-                                // Empty for every other op.
-                                for (name, gh) in &named {
-                                    let _ = host.lock_unpoisoned().grant_entry_into_child(
-                                        Some(host),
-                                        name,
-                                        *gh,
-                                        &mut ch,
-                                    );
-                                }
-                                // #863 slice 3 — a child that inherited a personality signal door
-                                // via the re-grant above gets its own **domain-scoped, weak**
-                                // run-wake at build time (no locks: `ch` is not yet shared), so a
-                                // deliverable signal raised against it interrupts ITS blocked
-                                // syscalls — and only its (invariant 12) — exactly like a fork twin
-                                // at mint. Weak: a post-run fire upgrades to nothing.
-                                if let SchedRef::Real(rs) = &sched {
-                                    if let Some((_, source)) = ch.signal_poll() {
-                                        let dom = ch.domain_id() as usize;
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_pipe_wake(Arc::new(move |pipe| {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.wake_pipe_readers(pipe);
-                                            }
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_wake(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom, true);
-                                            }
-                                        }));
-                                        // #798 slice 2 / #1259 — stop/continue, split: `stop_depth` write
-                                        // is the INLINE apply, the stopped-park drain stays deferred.
-                                        let stop_depth = ch.stop_depth.clone();
-                                        source.set_stop_apply(Arc::new(move |stopped| {
-                                            if stopped {
-                                                stop_depth.fetch_add(1, Ordering::SeqCst);
-                                            } else {
-                                                stop_depth.fetch_sub(1, Ordering::SeqCst);
-                                            }
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_stop(Arc::new(move |stopped| {
-                                            if !stopped {
-                                                if let Some(sc) = sched_weak.upgrade() {
-                                                    sc.wake_stopped(dom);
-                                                }
-                                            }
-                                        }));
-                                        // #1213 — and its child-transition nudge (clean re-scan).
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_chld_wake(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.rescan_reap_parks(dom);
-                                            }
-                                        }));
-                                        // #796 default actions / #1259 — terminate, split: `term_flag`
-                                        // write is the INLINE apply, the vCPU wake stays deferred.
-                                        let term_flag = ch.term_flag.clone();
-                                        source.set_kill_apply(Arc::new(move || {
-                                            term_flag.store(true, Ordering::SeqCst);
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_kill(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom, false);
-                                                sc.wake_stopped(dom);
-                                            }
-                                        }));
-                                        // #799 — and its park-request closure.
-                                        let park_cell = ch.park_request.clone();
-                                        source.set_park_request(Arc::new(move |ev| {
-                                            park_cell.store(ev.encode(), Ordering::SeqCst);
-                                        }));
-                                    }
-                                }
-                                // IMPORTS.md phase 3 / S2.1 + §3.3: bind the child module's
-                                // import manifest against its granted powerbox (named offers
-                                // first, then the shared reference policy — same binder the
-                                // JIT's child builders call). §3.3 **withhold**: a `required`
-                                // slot with nothing to bind fails the spawn closed — probeable
-                                // `-EINVAL`, before any child code runs.
-                                let manifest_ok = match &child_mod {
-                                    Some(cm) => ch
-                                        .bind_child_manifest(&cm.module.imports, &cm.module.types)
-                                        .is_ok(),
-                                    // #1234: a **same-module** child runs our program, so its import
-                                    // manifest *is* ours — bind it against the child's own attenuated
-                                    // powerbox, through the same binder and the same `CHILD_BINDABLE`
-                                    // policy a separate-module child goes through. Without it a guest
-                                    // that nests a confined copy of itself (the Forth `sandbox` word)
-                                    // `CapFault`s on its first `call.import`, holding a granted
-                                    // `stdout`/`jit` it has no way to reach. Only when the spawn
-                                    // actually handed it caps by name: a grant-less child was given
-                                    // nothing to bind, so its slots stay empty and fail closed on use
-                                    // exactly as before.
-                                    None if !named.is_empty() => {
-                                        let sm = host.lock_unpoisoned().self_module.clone();
-                                        sm.is_none_or(|sm| {
-                                            ch.bind_same_module_manifest(&sm.imports, &sm.types)
-                                                .is_ok()
-                                        })
-                                    }
-                                    None => true,
-                                };
-                                if !manifest_ok {
-                                    frames[top].vals.push(Reg::from_i32(EINVAL as i32));
-                                } else {
-                                    // §3.6: the child's **self module** — what its serve loop
-                                    // resolves enqueue admission and handlers against. A
-                                    // separate-module child serves its *own* offers; a
-                                    // same-module child serves over the shared program (the
-                                    // parent's registered module).
-                                    let sm = match &child_mod {
-                                        Some(cm) => Some(Arc::clone(&cm.module)),
-                                        None => host.lock_unpoisoned().self_module.clone(),
-                                    };
-                                    ch.set_self_module_opt(sm);
-                                    let child_host = Arc::new(Mutex::new(ch));
-                                    // §3.6 slice 3: keep a live reference past the move into
-                                    // the child vCPU, for `child_offer` (op 14).
-                                    let child_host_keep = Arc::clone(&child_host);
-                                    let child_args = bytecode::child_entry_args(arity, cinst, cas);
-                                    // Quota: the child's fuel, sub-allocated from (and capped
-                                    // by) ours. §3b: a budget-funded spawn draws fuel from the
-                                    // budget instead (bounded 0 = literally zero fuel — distinct
-                                    // from the legacy scalar's 0 = inherit); the budget is
-                                    // CONSUMED here at commit (drained; the handle reads 0s
-                                    // after), and its spawn field tightens the child's vCPU
-                                    // ceiling below.
-                                    let rec_b = rec_budget_h.take().and_then(|bh| {
-                                        let mut hg = host.lock_unpoisoned();
-                                        hg.take_budget(bh)
-                                    });
-                                    // #989 slice 1b — bound the child's host-served channel memory
-                                    // from the funding budget's `channel` (see the module-child branch
-                                    // below; `-1` = unbounded, a no-op vs. the default).
-                                    if let Some(b) = rec_b.as_ref() {
-                                        child_host.lock_unpoisoned().set_channel_cap(b.channel);
-                                    }
-                                    // A carve child's fixed allowance, as it always was: the
-                                    // record's budget or the operand, capped at what this vCPU can
-                                    // still burn (#1944 slice 3 leaves the carve path's fuel alone
-                                    // until #1867 deletes it).
-                                    let child_fuel = Fuel::fixed(match rec_b.as_ref() {
-                                        Some(b) if b.fuel >= 0 => {
-                                            (b.fuel as u64).min(fuel.can_burn())
-                                        }
-                                        Some(_) => fuel.can_burn(),
-                                        None => fuel.carve_allowance(quota),
-                                    });
-                                    // A same-module child runs the **spawning frame's** module — the
-                                    // one `entry` was validated against above (`cfs`), so an installed
-                                    // §22 unit's child runs the unit's function, not module 0's
-                                    // (#1726; the module-aware rule `thread.spawn` already follows).
-                                    let (cfuncs, ctypes) = child_mod.as_ref().map_or_else(
-                                        || (Arc::clone(&cur_funcs), Arc::clone(&cur_types)),
-                                        ModuleGrant::tables,
-                                    ); // (#922)
-                                    let csched = sched.clone();
-                                    // §4 subtree freeze (DURABILITY.md): the child's [`FrozenNested`]
-                                    // residue must reach the **root** host, not the child's private
-                                    // powerbox. Compute our *effective* sink — our inherited one, or our
-                                    // own host if we are the root/a shared-host domain — and hand it down;
-                                    // the child (and transitively any grandchild) pushes there, so a whole
-                                    // nesting subtree's residue coalesces where a thaw reads it (mirrors how
-                                    // `thread.spawn`'s shared host coalesces [`FrozenVCpu`]).
-                                    let residue_sink =
-                                        freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
-                                    // §4 subtree STW (DURABILITY.md): the child inherits our **current
-                                    // durable phase** (its own carve's, which is `UNWINDING` when we are
-                                    // instantiating it mid-freeze), exactly as `thread.spawn` seeds
-                                    // `child.dstate = child_state`. Without this the child's first
-                                    // dispatch would store its default `NORMAL` over the freeze driver's
-                                    // `UNWINDING` broadcast into the carve — clobbering the STW — so a
-                                    // grandchild-of-the-root would never be driven to self-unwind (and
-                                    // its residue would be lost). With it, a child instantiated while its
-                                    // parent is unwinding is born unwinding: it runs its own
-                                    // `instantiate`/`join` under `UNWINDING`, recording *its* live
-                                    // children before it drains — the recursion that makes depth-2+ work.
-                                    let child_dstate = mem
-                                        .as_ref()
-                                        .map(|m| m.durable_state())
-                                        .unwrap_or(STATE_NORMAL);
-                                    // S3 `kill`: a fresh flag for this child's subtree; the child (and its
-                                    // inherited-flag `thread.spawn` descendants) polls it per op, the
-                                    // parent sets it via `Instantiator.kill`.
-                                    let kflag = Arc::new(AtomicBool::new(false));
-                                    let kflag_child = Arc::clone(&kflag);
-                                    // D66 — the child's lane chain: its own domain (a nested child's
-                                    // own cap is unbounded; it counts against ours) then ours.
-                                    let chain_child = {
-                                        let mut c = vec![(
-                                            child_host.lock_unpoisoned().domain_id() as usize,
-                                            -1i64,
-                                        )];
-                                        c.extend(lane_chain.iter().copied());
-                                        c
-                                    };
-                                    // §13.4 slice 4c: the join slot `threads.push` below will
-                                    // assign — threaded into the child so its self-unwind can
-                                    // key its host-state residue.
-                                    let jslot = threads.len();
-                                    // §13.4 slice 4c: this (the spawning) vCPU's own task id — the
-                                    // child stamps it as its `parent_task` so its self-unwind keys
-                                    // its `FrozenChildState` under the correct parent. Without it a
-                                    // grandchild defaults to `0` (the root) and its child-state fails
-                                    // to match its `FrozenNested` at thaw (which the *recording
-                                    // parent* keys with its own id), so a depth-2+ server thaws
-                                    // without its serve module and can't dispatch.
-                                    let self_task = *id;
-                                    let pager_for_child = pager_ref.take();
-                                    let made = sched.spawn(move |id| {
-                                        // A nested child is its **own** domain (own host/window/program),
-                                        // so it gets its own dispatch table, not the parent's.
-                                        // #1296: reserve the install slots the child's re-granted
-                                        // `Jit` table carries (none ⇒ the natural table).
-                                        let cdt = Arc::new(DomainTable::new(
-                                            &cfuncs,
-                                            child_host.lock_unpoisoned().jit_table_log2(),
-                                        ));
-                                        let mut child = VCpu::new(
-                                            cfuncs,
-                                            ctypes,
-                                            entry as u32,
-                                            &child_args, // [Instantiator] or [Instantiator, AddressSpace]
-                                            child_mem,
-                                            child_host,
-                                            child_fuel,
-                                            depth + 1,
-                                            id,
-                                            csched,
-                                            cdt,
-                                        );
-                                        child.memop = memop;
-                                        // §2.2 (op 16): recoverable faults route to the pager
-                                        // binding, substrate-side (the child can't name it).
-                                        if let Some((cell, export)) = pager_for_child {
-                                            child.pager = Some(PagerRef { cell, export });
-                                            child.fault_pager = true;
-                                        }
-                                        // §4: durability is a subtree property — a durable parent's
-                                        // instantiated child runs durable (freezable module enforced
-                                        // at the admission check above).
-                                        child.durable = durable;
-                                        // Its freeze-unwind is carve-self-describing: record no
-                                        // host-side extent (see `VCpu::nested_child`).
-                                        child.nested_child = true;
-                                        // §13.4 slice 4c: the child's join slot — `threads.push`
-                                        // below assigns exactly `threads.len()` at this point —
-                                        // so its self-unwind can key its host-state residue.
-                                        child.nested_slot = jslot;
-                                        // §13.4 slice 4c: stamp the spawning vCPU's id as the child's
-                                        // parent, so a depth-2+ child keys its `FrozenChildState`
-                                        // under its real parent (not the default `0`/root).
-                                        child.parent_task = self_task;
-                                        // §4 depth-2: the child pushes its own [`FrozenNested`] residue
-                                        // (for any grandchild) into the subtree's shared sink, so it
-                                        // coalesces in the root host rather than the child's private one.
-                                        child.freeze_sink = Some(residue_sink);
-                                        // §4 subtree STW: inherit the parent's freeze phase (see above),
-                                        // so a mid-freeze instantiate composes recursively.
-                                        child.dstate = child_dstate;
-                                        child.kill = Some(kflag_child); // S3: parent-settable kill flag
-                                        child.lane_chain = chain_child; // D66: own domain, then ours
-                                        Box::new(child)
-                                    });
-                                    match made {
-                                        Some(child_id) => {
-                                            threads.push(Some(child_id));
-                                            child_kill.insert(threads.len() - 1, kflag); // S3 kill map
-                                                                                         // §14 children are tracked apart from `thread.spawn`
-                                                                                         // vCPUs, with their carve geometry: a durable freeze
-                                                                                         // broadcasts into a live child's carve and records it
-                                                                                         // as residue — or fails closed on the un-covered
-                                                                                         // shapes (see `VCpu::nested_children`).
-                                                                                         // §3.6 slice 3: retain the child's live powerbox
-                                                                                         // so `child_offer` (op 14) can mint a LiveImpl.
-                                            child_hosts.insert(threads.len() - 1, child_host_keep);
-                                            nested_children.push(NestedChildInfo {
-                                                slot: threads.len() - 1,
-                                                carve_off: ibase + off,
-                                                size_log2: size_log2 as u8,
-                                                entry: entry as u32,
-                                                module_digest: child_mod
-                                                    .as_ref()
-                                                    .map(|cm| cm.digest),
-                                            });
-                                            frames[top]
-                                                .vals
-                                                .push(Reg::from_i32((threads.len() - 1) as i32));
-                                        }
-                                        None => return Err(Trap::ThreadFault),
-                                    }
-                                }
-                            }
-                        }
                         // join(child) -> result: park only this fiber until the child finishes (its
                         // result/trap is delivered on resume via `Pending::Join`); siblings run on.
                         //
@@ -20325,8 +19764,8 @@ pub enum FreezeScope {
     /// by its parent — that is what detached means — so authority over one is a real new power, and a
     /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
     /// from above (the embedder, or an ancestor re-granting downward through a spawn's named grants,
-    /// #2018) or not at all, which holds by construction: no guest-reachable op mints a capability,
-    /// and the §14 spawn path mints only the [`Carve`](FreezeScope::Carve) form.
+    /// #2018) or not at all, which holds by construction: no guest-reachable op mints a capability.
+    /// (The carve spawn minted the [`Carve`](FreezeScope::Carve) form; it is retired, #1867.)
     DetachedProgeny,
 }
 
@@ -21272,17 +20711,6 @@ impl Fuel {
     /// `fuel.remaining`: [`Self::can_burn`], `i64::MAX` when unmetered.
     pub(crate) fn remaining(&self) -> i64 {
         self.can_burn().min(i64::MAX as u64) as i64
-    }
-
-    /// A carve child's allowance (ops 0/5/13, v0 records): `quota` if positive, capped at what this
-    /// vCPU can still burn.
-    pub(crate) fn carve_allowance(&self, quota: i64) -> u64 {
-        let can = self.can_burn();
-        if quota <= 0 {
-            can
-        } else {
-            (quota as u64).min(can)
-        }
     }
 
     /// Fuel for a new vCPU of the same domain (`thread.spawn`): it draws from the same node, or, on a
@@ -35608,17 +35036,6 @@ impl Mem {
             return out;
         }
         (0..len).map(|k| self.byte(off + k)).collect()
-    }
-
-    /// Materialize a module's data segments over the window whose image starts at the
-    /// backing-absolute `base`: each segment that lies in `[0, limit)`, the child's window. The one
-    /// route an `execve` and a §14 child write their data by, on both engines.
-    pub(crate) fn write_segments(&self, base: u64, data: &[temen_ir::Data], limit: u64) {
-        for d in data {
-            if d.offset.saturating_add(d.bytes.len() as u64) <= limit {
-                self.write_run(base + d.offset, &d.bytes);
-            }
-        }
     }
 
     fn set_byte(&self, off: u64, b: u8) {

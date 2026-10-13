@@ -200,50 +200,46 @@ fn the_concurrency_column_matches_what_the_two_drivers_actually_do() {
     }
 }
 
-/// The two divergences the column's first rendering found, now both closed — pinned as *specific*
-/// facts so a regression names itself instead of just reddening a cell.
+/// The divergences the column's first rendering found, closed — pinned as *specific* facts so a
+/// regression names itself instead of just reddening a cell.
 ///
 /// `child_offer` (op 14) answered `-EINVAL` on the cooperative driver and **trapped** on the
 /// parallel one, so a guest probing a stale child handle survived on one driver and had its domain
 /// killed on the other — INVARIANTS #5 (errors are values, traps are for forgery) and #9 (refuse
 /// probeably, never diverge). Fixed in #1566.
 ///
-/// `instantiate_module_named` (op 13) was worse than the issue that filed it claimed. Its lowering
-/// passes `grants: Some((ptr, n))` unconditionally, so the parallel driver's `grants.is_some()`
-/// guard declined **every** op-13 spawn there with `Trap::Malformed`, grant-free ones included; the
-/// guard also preceded the module resolve, so a forged handle got that trap instead of the
-/// `CapFault` the cooperative driver gives; and that arm never called `bind_child_manifest`, so a
-/// child's imports went unbound where the cooperative driver bound them. Fixed in #1570 by giving
-/// both drivers one child-host build (since #1855 the whole admission is one:
-/// `admit_confined_child`).
+/// The other was the admission of a spawn: the retired `instantiate_module_named` (op 13) gave a
+/// forged handle `Trap::Malformed` on the parallel driver where the cooperative one gave `CapFault`,
+/// and bound no imports there (#1570). The spawns left — op 15, and op 17 once it has read its
+/// record — run one admission on both drivers, pinned here the same way.
 ///
-/// Reaching op 13's admission at all needs a real `Module` handle and a matching `size_log2` — see
-/// `Row::mint`. With the sweep's zeros it dies at the handle resolve, which is why the original
-/// probe saw the two drivers "agree" on this op while they disagreed one step further in.
+/// Reaching admission at all needs a real `Module` handle — see `Row::mint`. With the sweep's zeros
+/// the call dies at the handle resolve, which is why the original probe saw the two drivers "agree"
+/// on op 13 while they disagreed one step further in.
 #[test]
-fn the_two_instantiator_divergences_stay_closed() {
+fn the_instantiator_divergences_stay_closed() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
-    for op in [13, 14] {
+    for op in [14, 15, 17] {
         let found = divergences(&row, op);
         assert!(
             found.is_empty(),
             "op {op} diverges again — the drivers must give one answer per call shape: {found:?}"
         );
     }
-    // Non-vacuity: op 13 really does reach admission, rather than agreeing by faulting early on
-    // both sides. `-EINVAL` is the answer for a carve that cannot hold the child module.
+    // Non-vacuity: op 15 really does reach admission, rather than agreeing by faulting early on
+    // both sides. `-EINVAL` is the answer for a spawn no `Budget` pays for.
     let (h, x, real) = (row.mint)();
     let real: Vec<(usize, i64)> = real
         .iter()
-        .filter(|(o, _, _)| *o == 13)
+        .filter(|(o, _, _)| *o == 15)
         .map(|(_, i, v)| (*i, *v))
         .collect();
     assert_eq!(
-        coop(h, x, row.iface, 13, 7, "i32", &real),
+        coop(h, x, row.iface, 15, 7, "i32", &real),
         Verdict::Answered(-22),
-        "the op-13 sweep must get past the handle resolve into admission"
+        "the op-15 sweep must get past the handle resolve into admission"
     );
 }

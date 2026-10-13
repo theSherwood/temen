@@ -1,26 +1,25 @@
 //! §14 **separate-module children on the JIT**, differentially vs. the interpreter — the
 //! "plugin-in-plugin" story end to end. The host verifies a *different* module, grants both backends
 //! an identical `Module` capability (iface 8), and the parent guest spawns a child domain running
-//! that module via the `Instantiator`'s module ops (5/6/7). On the JIT the child module is resolved
-//! through `temen_run::module_resolver` (a host callback, never guest-reachable) and **compiled at
-//! `instantiate`** — §14's "nesting cost paid at setup" for foreign code. Both backends must agree on
-//! the child's result, its data segments materializing into the carve, the lazy (fault-driven)
-//! supply of those segments for demand children, validation (`-EINVAL` / `CapFault`), and the final
-//! parent window bytes.
+//! that module through a v1 record (op 17). On the JIT the child module is resolved through
+//! `temen_run::module_resolver` (a host callback, never guest-reachable) and **compiled at the
+//! spawn** — §14's "nesting cost paid at setup" for foreign code. Both backends must agree on the
+//! child's result (its data segments seeded into its own window), the entry a parent addresses by
+//! export name, a forged module handle's `CapFault`, and the final parent window bytes.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::SpawnRec;
-use temen_jit::JitOutcome;
+use temen_jit::{JitOutcome, TrapKind};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
 type BothOut = (Result<Vec<Value>, Trap>, Vec<u8>, JitOutcome, Vec<u8>);
 
-/// The child ("plugin") module — see `separate_module.rs`: 64 KiB window, `data 16484 "VM"` (above the NULL guard the carve reserves, #1206), an entry
-/// that reads its data byte, stores a marker at 0, and returns `byte + 1000`.
+/// The child ("plugin") module [`both`] grants: a 64 KiB window, `data 16484 "VM"` (above the NULL
+/// guard, #1206), and an entry that reads its data byte, stores a marker, and returns `byte + 1000`.
 fn child_src() -> &'static str {
     "memory 16
 data 16484 \"VM\"
@@ -169,56 +168,6 @@ block 0 (v0: i32, v1: i32) {{
     assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
 }
 
-#[test]
-fn jit_module_child_matches_interp() {
-    if !temen_jit::fiber_supported() {
-        return; // no JIT nesting runtime on this target
-    }
-    // instantiate_module(module, entry 0, off 64 KiB, size 2^16, fuel 0) → join → child's result.
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  return v7
-  }
-}
-";
-    let (ir, imem, jo, jmem) = both(parent);
-    let ival = ir.expect("interp ran ok").pop().expect("one result");
-    assert_eq!(ival, Value::I64(86 + 1000), "interp module-child result");
-    assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[86 + 1000]),
-        "jit: {jo:?}"
-    );
-    // The escape-oracle over a foreign module: byte-identical parent windows — its data segment and
-    // marker in the carve, everything outside it exactly as seeded.
-    assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
-    const CHILD: u64 = 64 << 10;
-    assert_eq!(
-        &jmem[(CHILD + 16484) as usize..(CHILD + 16486) as usize],
-        b"VM"
-    );
-    assert_eq!(
-        jmem[(CHILD + 16384) as usize],
-        7,
-        "child marker missing on the JIT"
-    );
-    let init: Vec<u8> = (0..(128u64 << 10))
-        .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
-        .collect();
-    for i in 0..CHILD {
-        assert_eq!(
-            jmem[i as usize], init[i as usize],
-            "module child escaped to parent byte {i}"
-        );
-    }
-}
-
 /// #1720 — a module nests **as built**: a powerbox `_start` (no params — how every program is built
 /// to start) is a module child on the JIT exactly as on the interpreter. An `i32` status joins
 /// sign-extended (the JIT's trampoline stores it as an interpreter `Reg` holds it), and an empty
@@ -282,54 +231,36 @@ block 0 () {
     }
 }
 
-/// Validation parity: a carve that doesn't equal the module's declared memory is `-EINVAL`, and a
-/// forged module handle (the Instantiator handle passed as a Module handle) is a `CapFault` — on
-/// both backends.
+/// Validation parity: a forged module handle — the parent's `Instantiator` named as the record's
+/// module — is a `CapFault` on both backends. (A window size other than the module's declared memory
+/// is `instantiate_record.rs`'s `a_v1_record_with_size_zero_gets_the_declared_window`.)
 #[test]
-fn jit_module_child_validation_matches_interp() {
+fn a_forged_module_handle_faults_on_both_backends() {
     if !temen_jit::fiber_supported() {
         return;
     }
-    // (a) wrong carve size → -EINVAL.
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 12
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+    let parent = format!(
+        "memory 17
+data 16640 \"budget\"
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
+  rma = i64.const 17432
+  i32.store rma v0
+  vnp = i64.const 16640
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  rba = i64.const 17436
+  i32.store rba vb
+  rp = i64.const 17408
+  v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
   v7 = i64.extend_i32_s v6
   return v7
-  }
-}
-";
-    let (ir, _i, jo, _j) = both(parent);
-    let ival = ir.expect("interp ran ok").pop().expect("one result");
-    assert_eq!(ival, Value::I64(-22), "interp: carve ≠ declared memory");
-    assert!(
-        matches!(jo, JitOutcome::Returned(ref s) if s == &[-22]),
-        "jit: {jo:?}"
+  }}
+}}
+{}",
+        rec::segment(17408, &SpawnRec::v1(0))
     );
-
-    // (b) forged module handle → CapFault.
-    let parent = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v0
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = i64.extend_i32_s v6
-  return v7
-  }
-}
-";
-    let (ir, _i, jo, _j) = both(parent);
-    assert!(
-        matches!(ir, Err(Trap::CapFault)),
-        "interp: forged module handle must CapFault, got {ir:?}"
-    );
-    assert!(matches!(jo, JitOutcome::Trapped(_)), "jit: {jo:?}");
+    let (ir, _i, jo, _j) = both(&parent);
+    assert_eq!(ir, Err(Trap::CapFault), "interp: a forged module handle");
+    assert_eq!(jo, JitOutcome::Trapped(TrapKind::CapFault), "jit");
 }

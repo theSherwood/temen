@@ -325,9 +325,9 @@ fn the_code_origin_column_matches_what_a_unit_and_the_base_module_actually_get()
 /// The `Instantiator` row's two routes, pinned as specific facts so a change names itself instead of
 /// just moving a cell (#1578, #1726).
 ///
-/// From the base module, on the same host with the same handle, `instantiate` (0),
-/// `instantiate_module_named` (13) and `child_offer` (14) each answer `-EINVAL` probeably, and
-/// `join` (1) gives the forgery trap for its forged child handle. An **installed** unit gets exactly
+/// From the base module, on the same host with the same handle, `instantiate_detached` (15, refused
+/// for want of a `Budget`) and `child_offer` (14) each answer `-EINVAL` probeably, and `join` (1)
+/// gives the forgery trap for its forged child handle. An **installed** unit gets exactly
 /// those answers — it runs in the caller's frames. An **invoked** unit gets a `CapFault` for every
 /// one: the §22 seam-free leaf has no `Instantiator` (the cross-engine differential for a real spawn
 /// is `crates/temen/tests/unit_instantiator.rs`).
@@ -347,8 +347,7 @@ fn the_instantiator_row_by_route() {
     };
     // (op, the arity that reaches its lowering arm, what the base module answers).
     for (op, argc, base_says) in [
-        (0u32, 4usize, Verdict::Answered(-22)),
-        (13, 7, Verdict::Answered(-22)),
+        (15u32, 7usize, Verdict::Answered(-22)),
         (14, 2, Verdict::Answered(-22)),
         (1, 1, Verdict::Trapped("ThreadFault".into())),
     ] {
