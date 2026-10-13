@@ -425,12 +425,17 @@ cross-backend contract). The **wasm-JIT** twin is lazy (#1301): `Host::jit_unit_
 too:** the dispatch table is a per-run transient (§12.4), so a unit's `install` occupancy — `(slot,
 unit)` + the `call.dyn` table reservation — is recorded on the domain (on `install`, dropped on
 `uninstall`, on both backends' install ops), rides Section 5 (codec v17), and is **re-applied** when
-the thaw run builds its table (interp `DomainTable::install_at` at run entry; native via
-`reconstruct_jit_units` → `CompiledModule::install_at`, which also carries an installed unit whose
-`CompiledCode` handle was released). So a `call.dyn` through an installed slot resolves after a
-freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_freeze_thaw`(`_native`)
+the thaw run builds its table (interp `DomainTable::install` at the recorded slot, at run entry;
+native via `reconstruct_jit_units` → `CompiledModule::install_at`, which also carries an installed
+unit whose `CompiledCode` handle was released). So a `call.dyn` through an installed slot resolves
+after a freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_freeze_thaw`(`_native`)
 (install → freeze → restore → `call.dyn` ≡ 42, both backends) and
-`jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize).
+`jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize). A unit that names
+its own functions (DESIGN.md §22 "Unit-own funcrefs") also fills a slot per function, and the
+occupancy records only its entry's: the thaw installs its functions again in the first free slots
+(the interpreter as it re-applies the unit's install, the native tier as `reconstruct_jit_units`
+re-compiles it), which is where they were only when nothing was installed before the unit. Pinned
+for that case by `durable_guest_jit.rs::durable_jit_install_own_funcref_survives_freeze_thaw`.
 
 > **Retiring:** this describes the carve path, which is being deleted (INVARIANTS #13, 2026-09-29).
 > The detached equivalent: a detached child's units ride Section 5 of its own root-shaped artifact
@@ -1317,10 +1322,10 @@ construction. What's stored:
   That mutation is B2 `install` of guest-JIT units. **Install-durability (§12.5) now captures it:**
   the occupancy — `(slot, unit)` per installed unit, plus the table reservation `table_log2` — is
   recorded on the domain (`JitTableState.installed`, not the per-run table), rides Section 5 beside
-  the units, and is **re-applied** when a run builds its table (`DomainTable::install_at` at run
-  entry; the native tier via `temen_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
-  `call.dyn` through an installed slot resolves after a freeze/thaw. The identity slots stay a
-  pure function of the module (not stored).
+  the units, and is **re-applied** when a run builds its table (`DomainTable::install` at the
+  recorded slot, at run entry; the native tier via `temen_run::reconstruct_jit_units` →
+  `CompiledModule::install_at`), so a `call.dyn` through an installed slot resolves after a
+  freeze/thaw. The identity slots stay a pure function of the module (not stored).
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
