@@ -1363,8 +1363,9 @@ first tier; optimized-code inspection is sidestepped entirely). `DapServer::hand
 [messages]` covers the acceptance loop: `initialize` (+ `initialized` event), `launch` (parse IR,
 attach the `Inspector`), `setBreakpoints` (source line → IR pc via a reverse `(file,line)→pc` index
 over `debug.loc`, snapping forward to the next line with code), `configurationDone`,
-`threads`/`stackTrace`/`scopes`/`variables` (frames carry the source location; locals enumerate
-`debug.var` and resolve through `read_var`), `continue`/`next`/`stepIn`/`stepOut`, `disconnect`, and
+`threads`/`stackTrace`/`scopes`/`variables` (frames carry the source location, and `stackTrace` resolves
+only the `startFrame`/`levels` window it is asked for, #2304; locals enumerate `debug.var` and resolve
+through `read_var`), `continue`/`next`/`stepIn`/`stepOut`, `disconnect`, and
 the `stopped`/`terminated` events. JSON is hand-rolled (no serde — matching the workspace's
 dependency ethos); `run_stdio` is the `Content-Length`-framed wire loop a real client (VS Code)
 connects to, and the `temen-dap` binary is the server. Test (`dap.rs`): a scripted conversation sets a
