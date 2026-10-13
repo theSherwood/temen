@@ -20487,19 +20487,31 @@ pub fn maps_pool() -> u64 {
 /// the pool (`check`) — a [`BudgetTree::force_charge`] takes it regardless.
 fn maps_take(n: u64, check: bool) -> bool {
     n == 0
-        || MAPS_IN_USE
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                let now = used.saturating_add(n);
-                (!check || now <= maps_pool()).then_some(now)
-            })
-            .is_ok()
+        || maps_update(|used| {
+            let now = used.saturating_add(n);
+            (!check || now <= maps_pool()).then_some(now)
+        })
 }
 
 /// #2268 — hand `n` back to [`maps_pool`].
 fn maps_give(n: u64) {
-    let _ = MAPS_IN_USE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-        Some(used.saturating_sub(n))
-    });
+    maps_update(|used| Some(used.saturating_sub(n)));
+}
+
+/// #2268 — make [`MAPS_IN_USE`] what `f` makes of it, atomically: `false`, with nothing changed, when
+/// `f` refuses. A compare-exchange loop, as `fetch_update` is deprecated on current nightly and
+/// `try_update` is newer than the crate's minimum Rust.
+fn maps_update(f: impl Fn(u64) -> Option<u64>) -> bool {
+    let mut used = MAPS_IN_USE.load(Ordering::Acquire);
+    loop {
+        let Some(now) = f(used) else {
+            return false;
+        };
+        match MAPS_IN_USE.compare_exchange_weak(used, now, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(seen) => used = seen,
+        }
+    }
 }
 
 /// #2268 — the limits a charge to the budget tree must fit.
