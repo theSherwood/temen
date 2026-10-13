@@ -36,7 +36,7 @@ use temen_interp::{
 // `WinShmBacking`) the JIT aliases into the window for §13.
 #[cfg(any(unix, windows))]
 use temen_interp::SharedBacking;
-use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOSPC};
+use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOMEM, ENOSPC};
 use temen_ir::{FuncIdx, FuncType, Module, ValType};
 
 // Re-export the value type so embedders (and the CLI) need not also depend on `temen-interp`.
@@ -3818,8 +3818,8 @@ fn host_page_size() -> u64 {
 /// lets cap-buffer borrows (§7) **fail closed** (`-EFAULT`) on an unmapped/RO page instead of
 /// faulting the host outside the guarded call, and bounds growth to the reserved mask domain —
 /// keeping this backend bit-identical to the interpreter's paged `Mem` (the §18 oracle, enforced by
-/// `jit_diff`'s differential). The page-map model is portable; only the three hardware primitives
-/// (`hw_commit_rw`/`hw_apply`/`hw_release_hint`) differ per OS.
+/// `jit_diff`'s differential). The page-map model is portable; only the hardware primitives
+/// (`hw_protect`/`hw_release_hint`/`hw_unalias`, and `zero_private`'s drop) differ per OS.
 ///
 /// # Safety
 /// `base` must point at the JIT guest window: `[base, base+mapped)` initially RW and the whole
@@ -4016,40 +4016,75 @@ impl MprotectWindow {
         }
     }
 
-    // ---- the three hardware primitives (the only per-OS part) -----------------------------------
-    // All take a **page-aligned** `[off, off+len)` already validated `⊆ reserved` by `prot_pages`.
+    /// The maximal runs of §13 alias pages in `pages`, as `(first, last)` page indices.
+    fn alias_runs(&self, pages: std::ops::RangeInclusive<u64>) -> Vec<(u64, u64)> {
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (&page, _) in map
+            .range(pages)
+            .filter(|(_, p)| matches!(p, PageState::Backed { .. }))
+        {
+            match runs.last_mut() {
+                Some((_, last)) if *last + 1 == page => *last = page,
+                _ => runs.push((page, page)),
+            }
+        }
+        runs
+    }
 
-    /// Make `[off, off+len)` **committed and read-write** (so a following zero-fill / protection
-    /// change lands). On unix the reservation is `MAP_NORESERVE`, so `mprotect(RW)` suffices and the
-    /// kernel demand-zeroes; on windows the tail is reserved-but-uncommitted, so `VirtualAlloc(
-    /// MEM_COMMIT)` is required (it zero-fills only *newly* committed pages — callers zero explicitly
-    /// when they need it).
-    #[cfg(unix)]
-    fn hw_commit_rw(&self, off: u64, len: u64) {
-        // SAFETY: `[base+off, +len)` is within the reserved mapping (validated), owned for the call.
-        unsafe {
-            libc::mprotect(
-                self.base.add(off as usize) as *mut c_void,
-                len as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-            );
+    /// `protect`'s page-map update for one page. A §13 alias stays an alias — only its writability
+    /// changes — exactly the interpreter's `Mem::protect`; a `protect(none)` has dropped it already
+    /// ([`MprotectWindow::drop_aliases`]).
+    fn protect_page(&mut self, page: u64, prot: i32) {
+        match self.prot_get(page) {
+            Some(PageState::Backed { region, off, .. }) => self.prot_set(
+                page,
+                PageState::Backed {
+                    region,
+                    off,
+                    writable: prot & 2 != 0,
+                },
+            ),
+            _ => self.set_prot(page, prot, true),
         }
     }
-    #[cfg(windows)]
-    fn hw_commit_rw(&self, off: u64, len: u64) {
-        // The JIT window is a **placeholder** reservation (`temen-jit`'s `mem::pal`), so a plain
-        // `VirtualAlloc(MEM_COMMIT)` cannot commit a tail page — it must split the placeholder and
-        // replace-commit it. Reuse the JIT's own primitive so the two stay byte-for-byte identical;
-        // it is idempotent (an already-committed page is just re-asserted RW, never re-zeroed).
-        // SAFETY: `[base+off, +len)` is within the reservation that produced `self.base` (validated).
-        unsafe { temen_jit::win_commit_rw(self.base.add(off as usize), len as usize) }
+
+    /// Drop every §13 alias in `pages`, as the interpreter's page ops do when they end one: a run
+    /// loses its access in the page map, then [`MprotectWindow::hw_unalias`] makes it the window's
+    /// own again — private, zero, inaccessible — so nothing the op does next reaches the region,
+    /// which every other mapping of it still reads (#1707). `0`, or the `-errno` of a refusal.
+    fn drop_aliases(&mut self, pages: std::ops::RangeInclusive<u64>) -> i64 {
+        for (first, last) in self.alias_runs(pages) {
+            for page in first..=last {
+                self.set_prot(page, 0, false);
+            }
+            let e = self.hw_unalias(first * self.page, (last + 1 - first) * self.page);
+            if e != 0 {
+                return e;
+            }
+        }
+        0
     }
 
-    /// Apply cap `prot` bits (`0` none / `1` read / `3` read-write) to the committed `[off, off+len)`
-    /// without touching its contents — `mprotect` on unix, `VirtualProtect` on windows. `none` maps
-    /// to `PROT_NONE`/`PAGE_NOACCESS` (the page stays committed but faults on access).
+    // ---- the hardware primitives (the only per-OS part) -----------------------------------------
+    // All take a **page-aligned** `[off, off+len)` already validated `⊆ reserved` by `prot_pages`, and
+    // say whether the OS applied the change. It can refuse one (`ENOMEM` once the process holds
+    // `vm.max_map_count` mappings, #2268), leaving the old protection or, over several mappings, a
+    // mix of old and new. So a page op never lets the page map grant more than the hardware might:
+    // a page losing access loses it in the map *before* the hardware call ([`MprotectWindow::narrow`]),
+    // and one gaining access gains it only once the call succeeded. Host code trusts the map (a §7
+    // borrow check, then a plain copy), so a map ahead of the hardware would fault the host outside
+    // any guarded call. A refused op returns `-ENOMEM`.
+
+    /// Give `[off, off+len)` the cap `prot` bits (`0` none / `1` read / `3` read-write) without
+    /// touching its contents. On unix the reservation is `MAP_NORESERVE`, so `mprotect` alone commits
+    /// (a page never touched reads zero). On windows the tail is a **placeholder** reservation
+    /// (`temen-jit`'s `mem::pal`), which a plain `VirtualAlloc(MEM_COMMIT)` cannot commit — it must be
+    /// split and replace-committed — and one `VirtualProtect` cannot span a §13 view; the JIT's own
+    /// primitives do both, so the two stay identical (committing is idempotent: a committed page is
+    /// re-asserted RW, never re-zeroed).
     #[cfg(unix)]
-    fn hw_apply(&self, off: u64, len: u64, prot: i32) {
+    fn hw_protect(&self, off: u64, len: u64, prot: i32) -> bool {
         const PROT_READ: i32 = 1;
         const PROT_WRITE: i32 = 2;
         let hw = if prot & PROT_WRITE != 0 {
@@ -4060,39 +4095,20 @@ impl MprotectWindow {
             libc::PROT_NONE
         };
         // SAFETY: `[base+off, +len)` is within the reserved mapping (validated), owned for the call.
-        unsafe {
-            libc::mprotect(self.base.add(off as usize) as *mut c_void, len as usize, hw);
-        }
+        unsafe { libc::mprotect(self.base.add(off as usize) as *mut c_void, len as usize, hw) == 0 }
     }
     #[cfg(windows)]
-    fn hw_apply(&self, off: u64, len: u64, prot: i32) {
-        use windows_sys::Win32::System::Memory::{
-            VirtualProtect, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
-        };
-        const PROT_READ: i32 = 1;
-        const PROT_WRITE: i32 = 2;
-        let flags: PAGE_PROTECTION_FLAGS = if prot & PROT_WRITE != 0 {
-            PAGE_READWRITE
-        } else if prot & PROT_READ != 0 {
-            PAGE_READONLY
-        } else {
-            PAGE_NOACCESS
-        };
-        let mut old: PAGE_PROTECTION_FLAGS = 0;
-        // SAFETY: `[base+off, +len)` is committed (callers `hw_commit_rw` first) and in-reservation.
+    fn hw_protect(&self, off: u64, len: u64, prot: i32) -> bool {
+        // SAFETY: `[base+off, +len)` is within the reservation that produced `self.base` (validated).
         unsafe {
-            VirtualProtect(
-                self.base.add(off as usize) as *const c_void,
-                len as usize,
-                flags,
-                &mut old,
-            );
+            let p = self.base.add(off as usize);
+            temen_jit::win_commit_rw(p, len as usize)
+                && temen_jit::win_protect(p, len as usize, prot)
         }
     }
 
-    /// Hint the OS to drop the physical backing of the now-inaccessible `[off, off+len)` (a pure
-    /// memory-footprint optimization, *after* the range has been zeroed + protected `none`). `unmap`
-    /// semantics ("re-`map` reads zero") are already guaranteed by the explicit zero, so this need
+    /// Hint the OS to drop the physical backing of `[off, off+len)` after zeros were written over it
+    /// (a pure memory-footprint optimization: the zeros already make a re-`map` read zero), so it need
     /// not be exact: `MADV_DONTNEED` on unix; a no-op on windows (the pages stay committed-but-
     /// `NOACCESS`, which keeps the snapshot's `restore_rw` able to read the backed prefix).
     #[cfg(unix)]
@@ -4109,13 +4125,14 @@ impl MprotectWindow {
     #[cfg(windows)]
     fn hw_release_hint(&self, _off: u64, _len: u64) {}
 
-    /// Make the private (non-§13) pages `[off, off+len)` — committed RW by the caller — read zero,
-    /// and report whether their backing went back to the OS too. On Linux the pages are **dropped**
-    /// with `MADV_DONTNEED`, which is exact on this private anonymous reservation (zero-fill on
-    /// demand), so a fresh commit stays non-resident until the guest touches it (#2267). Elsewhere —
-    /// Darwin treats `MADV_DONTNEED` as advisory, windows keeps committed pages — zeros are written.
-    /// Never call it over a §13 alias: dropping a shared page re-reads the region instead of zeroing.
-    fn zero_private(&self, off: u64, len: u64) -> bool {
+    /// Make the window's own (non-§13) pages `[off, off+len)` read zero (#2267). On Linux they are
+    /// **dropped** with `MADV_DONTNEED`, which is exact on this private anonymous reservation whatever
+    /// the pages' protection (zero-fill on demand), so a fresh commit stays non-resident until the
+    /// guest touches it. Elsewhere — Darwin treats `MADV_DONTNEED` as advisory, windows keeps
+    /// committed pages — zeros are written, and `release` then hints their backing away. `false` if
+    /// the OS refused to make the range writable, so nothing was zeroed. Never call it over a §13
+    /// alias: dropping a shared page re-reads the region instead of zeroing.
+    fn zero_private(&self, off: u64, len: u64, release: bool) -> bool {
         #[cfg(target_os = "linux")]
         {
             // SAFETY: page-aligned, within the reserved mapping (validated), and private anonymous.
@@ -4130,9 +4147,44 @@ impl MprotectWindow {
                 return true;
             }
         }
-        // SAFETY: committed RW (callers `hw_commit_rw` first) and within the reserved mapping.
+        if !self.hw_protect(off, len, 3) {
+            return false;
+        }
+        // SAFETY: the range is committed read-write (just above) and within the reserved mapping.
         unsafe { std::ptr::write_bytes(self.base.add(off as usize), 0, len as usize) };
-        false
+        if release {
+            self.hw_release_hint(off, len);
+        }
+        true
+    }
+
+    /// Before a page op changes the hardware: give each page of `pages` that `apply` leaves with
+    /// *less* access than it has now — `prot` grants less — its new state already (see the hardware
+    /// primitives). The op runs `apply` over every page once the hardware has changed; on the pages
+    /// narrowed here that repeats the same update.
+    fn narrow(
+        &mut self,
+        pages: std::ops::RangeInclusive<u64>,
+        prot: i32,
+        apply: impl Fn(&mut Self, u64),
+    ) {
+        let rank = |access: Option<bool>| match access {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        let new = if prot & 2 != 0 {
+            2
+        } else if prot & 1 != 0 {
+            1
+        } else {
+            0
+        };
+        for page in pages {
+            if new < rank(self.page_access(page)) {
+                apply(self, page);
+            }
+        }
     }
 
     /// Drop the §13 alias over `[off, off+len)`: the range stops being the region's memory and is
@@ -4140,9 +4192,10 @@ impl MprotectWindow {
     /// every other mapping of it. On unix, a fresh private anonymous `MAP_FIXED` mapping replaces
     /// the shared one. On windows the range must be whole views (allocation granules, as `map_region`
     /// placed them): each view is released back to a placeholder, then committed as private memory
-    /// like the rest of the backed prefix, and protected `none`. Returns `false` if the OS refuses.
+    /// like the rest of the backed prefix, and protected `none`. `0`, or the `-errno` of a refusal:
+    /// the caller has already taken the range's access away in the page map.
     #[cfg(unix)]
-    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+    fn hw_unalias(&self, off: u64, len: u64) -> i64 {
         // SAFETY: `[base+off, +len)` is within the reserved mapping (validated); `MAP_FIXED` replaces
         // exactly those pages, which are this window's (the shared view is dropped, not the region).
         let p = unsafe {
@@ -4155,17 +4208,21 @@ impl MprotectWindow {
                 0,
             )
         };
-        p != libc::MAP_FAILED
+        if p == libc::MAP_FAILED {
+            ENOMEM
+        } else {
+            0
+        }
     }
     #[cfg(windows)]
-    fn hw_unalias(&self, off: u64, len: u64) -> bool {
+    fn hw_unalias(&self, off: u64, len: u64) -> i64 {
         use windows_sys::Win32::System::Memory::{
             UnmapViewOfFile2, MEMORY_MAPPED_VIEW_ADDRESS, MEM_PRESERVE_PLACEHOLDER,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         let gran = temen_interp::host_region_granularity();
         if !off.is_multiple_of(gran) || !len.is_multiple_of(gran) {
-            return false;
+            return EINVAL;
         }
         // SAFETY: GetCurrentProcess returns the current-process pseudo-handle; always safe.
         let proc = unsafe { GetCurrentProcess() };
@@ -4177,12 +4234,14 @@ impl MprotectWindow {
             // SAFETY: `addr` is the base of a view `map_region` placed; releasing it with
             // `MEM_PRESERVE_PLACEHOLDER` leaves the placeholder the window's reservation had.
             if unsafe { UnmapViewOfFile2(proc, addr, MEM_PRESERVE_PLACEHOLDER) } == 0 {
-                return false;
+                return EINVAL;
             }
         }
-        self.hw_commit_rw(off, len);
-        self.hw_apply(off, len, 0);
-        true
+        if self.hw_protect(off, len, 0) {
+            0
+        } else {
+            ENOMEM
+        }
     }
 }
 
@@ -4230,27 +4289,20 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        // Commit + make RW so the zero-fill lands, zero (a fresh commit reads zero), then apply the
-        // requested protection. A private range is dropped rather than written, so it stays unbacked
-        // until touched; a range holding a §13 alias keeps the write-through zero (dropping a shared
-        // page would re-read the region, not zero it).
-        self.hw_commit_rw(start, plen);
-        let aliased = self
-            .prot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .range(pages.clone())
-            .any(|(_, p)| matches!(p, PageState::Backed { .. }));
-        if aliased {
-            // SAFETY: the page range is RW and within the reserved mapping (validated).
-            unsafe { std::ptr::write_bytes(self.base.add(start as usize), 0, plen as usize) };
-        } else {
-            self.zero_private(start, plen);
+        // A §13 alias in the range is dropped first: the pages are the window's own from here on.
+        // Then zero them (a fresh commit reads zero; dropped rather than written, so they stay
+        // unbacked until touched) and apply the requested protection.
+        let e = self.drop_aliases(pages.clone());
+        if e != 0 {
+            return e;
+        }
+        self.narrow(pages.clone(), prot, |w, page| w.set_prot(page, prot, false));
+        if !self.zero_private(start, plen, false) || !self.hw_protect(start, plen, prot) {
+            return ENOMEM;
         }
         for page in pages {
             self.set_prot(page, prot, false);
         }
-        self.hw_apply(start, plen, prot);
         0
     }
     /// §3e op 1 `unmap`: decommit the **whole pages** covering `[offset,offset+len)` — any access
@@ -4260,8 +4312,8 @@ impl GuestMem for MprotectWindow {
     /// The range is **zeroed** so a later re-`map` reads zero on every platform: on Linux by
     /// dropping the pages (`MADV_DONTNEED`, exact for private anonymous memory — the next fault
     /// returns a fresh zero page), elsewhere by writing zeros, since Darwin treats `MADV_DONTNEED` as
-    /// advisory (stale bytes survive) and windows keeps the page committed. `hw_release_hint` is then
-    /// a pure footprint optimization for the platforms that wrote.
+    /// advisory (stale bytes survive) and windows keeps the page committed; their backing is then
+    /// hinted away.
     fn unmap(&mut self, offset: u64, len: u64) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -4269,40 +4321,19 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        // A §13 alias is the region's memory, not the window's: drop the alias first, so the range is
-        // the window's own again and the zeroing below never reaches the region — which every other
-        // mapping of it still reads (the oracle's `Mem::unmap` re-points the page at the domain's own
-        // backing). Each maximal run of aliased pages is un-aliased whole.
-        let mut run: Option<(u64, u64)> = None;
-        for page in pages.clone().chain(std::iter::once(*pages.end() + 1)) {
-            let aliased = page <= *pages.end()
-                && matches!(self.prot_get(page), Some(PageState::Backed { .. }));
-            match (aliased, run) {
-                (true, None) => run = Some((page, page)),
-                (true, Some((first, _))) => run = Some((first, page)),
-                (false, Some((first, last))) => {
-                    let (off, len) = (first * self.page, (last + 1 - first) * self.page);
-                    if !self.hw_unalias(off, len) {
-                        return EINVAL;
-                    }
-                    for p in first..=last {
-                        self.set_prot(p, 0, false);
-                    }
-                    run = None;
-                }
-                (false, None) => {}
-            }
+        // A §13 alias is the region's memory, not the window's: it is dropped before the zeroing,
+        // which then never reaches the region (the oracle's `Mem::unmap` re-points the page at the
+        // domain's own backing). Every page loses its access in the page map before the hardware.
+        let e = self.drop_aliases(pages.clone());
+        if e != 0 {
+            return e;
         }
-        // Commit + make RW, zero it (the aliased runs are private again by now), hint the OS to drop
-        // whatever backing the zero did not already release, then protect NONE so any later access
-        // faults (detect-and-kill).
-        self.hw_commit_rw(start, plen);
-        if !self.zero_private(start, plen) {
-            self.hw_release_hint(start, plen);
-        }
-        self.hw_apply(start, plen, 0 /* none */);
         for page in pages {
             self.set_prot(page, 0, false);
+        }
+        // Zero it, then protect NONE so any later access faults (detect-and-kill).
+        if !self.zero_private(start, plen, true) || !self.hw_protect(start, plen, 0) {
+            return ENOMEM;
         }
         0
     }
@@ -4315,10 +4346,9 @@ impl GuestMem for MprotectWindow {
             matches!(p, PageState::Backed { .. })
         })
     }
-    /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism). The
-    /// page is committed first (a no-op on already-committed pages; on windows it makes a never-mapped
-    /// reserved tail page addressable, matching the interpreter's "absent page reads zero" model)
-    /// **without** zeroing live contents, then the protection is applied.
+    /// §3e op 2 `protect`: change protection without touching backing (the D40 RO mechanism). A
+    /// never-mapped reserved tail page becomes addressable (on windows `hw_protect` commits it),
+    /// matching the interpreter's "absent page reads zero" model, and live contents are never zeroed.
     fn protect(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
@@ -4326,24 +4356,20 @@ impl GuestMem for MprotectWindow {
         };
         let start = *pages.start() * self.page;
         let plen = (*pages.end() + 1 - *pages.start()) * self.page;
-        self.hw_commit_rw(start, plen);
-        for page in pages {
-            // A §13 alias stays an alias — only its writability changes, or it is gone if neither
-            // R nor W is left — exactly the interpreter's `Mem::protect`.
-            match self.prot_get(page) {
-                Some(PageState::Backed { region, off, .. }) if prot & 3 != 0 => self.prot_set(
-                    page,
-                    PageState::Backed {
-                        region,
-                        off,
-                        writable: prot & 2 != 0,
-                    },
-                ),
-                Some(PageState::Backed { .. }) => self.set_prot(page, 0, false),
-                _ => self.set_prot(page, prot, true),
+        // Neither R nor W left ends a §13 alias, as in the interpreter: the shared view goes too.
+        if prot & 3 == 0 {
+            let e = self.drop_aliases(pages.clone());
+            if e != 0 {
+                return e;
             }
         }
-        self.hw_apply(start, plen, prot);
+        self.narrow(pages.clone(), prot, |w, page| w.protect_page(page, prot));
+        if !self.hw_protect(start, plen, prot) {
+            return ENOMEM;
+        }
+        for page in pages {
+            self.protect_page(page, prot);
+        }
         0
     }
     /// §3e op 3 `page_size`: the hardware protection granularity (`self.page` = the host page) —
@@ -4412,7 +4438,12 @@ impl GuestMem for MprotectWindow {
                 )
             };
             if p == libc::MAP_FAILED {
-                return EINVAL;
+                // `MAP_FIXED` checks the mapping limit before it replaces anything, so the range is
+                // as it was (#2268).
+                return match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENOMEM) => ENOMEM,
+                    _ => EINVAL,
+                };
             }
             self.mark_backed(pages, region, region_off, writable);
             0
@@ -4496,7 +4527,22 @@ impl GuestMem for MprotectWindow {
                     );
                     if view.Value.is_null() {
                         // Fold GetLastError into the return so a red CI run names the failing call.
-                        return EINVAL - last_error_win();
+                        // The granules before this one alias the region now, and this one may have
+                        // gone back to a placeholder: the page map says so, never more (#2268).
+                        let err = EINVAL - last_error_win();
+                        let (first, per) = (*pages.start(), gran / self.page);
+                        if i > 0 {
+                            self.mark_backed(
+                                first..=first + i * per - 1,
+                                region,
+                                region_off,
+                                writable,
+                            );
+                        }
+                        for page in first + i * per..first + (i + 1) * per {
+                            self.set_prot(page, 0, false);
+                        }
+                        return err;
                     }
                 }
             }

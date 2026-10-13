@@ -160,17 +160,20 @@ unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
 /// every [`FuelCell`] calls through. The trampoline saves whatever the platform call to
 /// [`fuel_refill`] clobbers, so the safepoint that calls it clobbers nothing. Compiled once per
 /// process, by the same ISA configuration as every guest compile, and never freed: every cell points
-/// at it.
+/// at it. The static owns the module, not just the code's address, so the module's own allocations
+/// stay reachable; a `mem::forget` left LeakSanitizer to report them at every exit (#2277).
 fn refill_trampoline() -> usize {
-    static TRAMPOLINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TRAMPOLINE.get_or_init(|| {
-        compile_refill_trampoline().unwrap_or_else(|e| {
-            panic!("the fuel refill trampoline must compile wherever the JIT does: {e:?}")
+    static TRAMPOLINE: std::sync::OnceLock<(crate::OwnedJit, usize)> = std::sync::OnceLock::new();
+    TRAMPOLINE
+        .get_or_init(|| {
+            compile_refill_trampoline().unwrap_or_else(|e| {
+                panic!("the fuel refill trampoline must compile wherever the JIT does: {e:?}")
+            })
         })
-    })
+        .1
 }
 
-fn compile_refill_trampoline() -> Result<usize, crate::JitError> {
+fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitError> {
     use cranelift_codegen::ir::{types::I64, AbiParam, InstBuilder, Signature};
     use cranelift_codegen::isa::CallConv;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -203,9 +206,7 @@ fn compile_refill_trampoline() -> Result<usize, crate::JitError> {
     module.define_function(id, &mut ctx).map_err(backend)?;
     module.finalize_definitions().map_err(backend)?;
     let code = module.get_finalized_function(id) as usize;
-    // The code lives in the module's memory, which must outlive every cell: keep it for the process.
-    std::mem::forget(module);
-    Ok(code)
+    Ok((crate::OwnedJit::new(module), code))
 }
 
 /// `fuel.remaining` (self op 13) on a metered compile: [`FuelCell::can_burn`], `i64::MAX` unmetered.

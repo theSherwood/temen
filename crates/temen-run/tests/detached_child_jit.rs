@@ -789,9 +789,18 @@ block 0 (v0: i64) {
 
 /// `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the `Budget`; `off` is the
 /// child-window offset the region is pre-mapped at (`65536` round-trips; `1 << 17` overruns the
-/// child's window and refuses `-EINVAL`, which the non-joining form returns).
-fn premap_parent(off: u64, join: bool) -> String {
-    let tail = if join {
+/// child's window and refuses `-EINVAL`, which the non-joining form returns). `hand_off` unmaps the
+/// parent's own view after filling the region and before the spawn (#1707), so the parent returns
+/// only the child's result.
+fn premap_parent(off: u64, join: bool, hand_off: bool) -> String {
+    let unmap = if hand_off {
+        "vu = call.cap 4 1 (i64, i64) -> (i64) vrh (vwo, vlen)"
+    } else {
+        ""
+    };
+    let tail = if hand_off {
+        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  return vj"
+    } else if join {
         "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
     } else {
         "vr = i64.extend_i32_s vc\n  return vr"
@@ -809,6 +818,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
+  {unmap}
   vmh = i64.extend_i32_u v2
   vb = i64.extend_i32_u v3
   vz = i64.const 0
@@ -880,7 +890,7 @@ fn run_premap_interp(parent: &temen_ir::Module, child: &temen_ir::Module) -> i64
 
 #[test]
 fn a_pre_mapped_region_round_trips_bulk_data_on_the_jit_as_on_the_interpreter() {
-    let parent = module(&premap_parent(65536, true));
+    let parent = module(&premap_parent(65536, true, false));
     let child = module(PREMAP_CHILD);
     let interp = run_premap_interp(&parent, &child);
     assert_eq!(interp, 42_082, "the oracle's round trip");
@@ -891,9 +901,24 @@ fn a_pre_mapped_region_round_trips_bulk_data_on_the_jit_as_on_the_interpreter() 
     );
 }
 
+/// #1707 — fill a region, unmap your own view of it, hand it on: the child reads what was written.
+/// The JIT's `unmap` used to zero the region through the parent's view, so the child read 0.
+#[test]
+fn a_region_handed_off_after_its_parent_unmaps_it_keeps_its_bytes() {
+    let parent = module(&premap_parent(65536, true, true));
+    let child = module(PREMAP_CHILD);
+    let interp = run_premap_interp(&parent, &child);
+    assert_eq!(interp, 42, "the child reads the parent's 41");
+    assert_eq!(
+        run_premap_jit(&parent, &child),
+        interp,
+        "the JIT matches the oracle"
+    );
+}
+
 #[test]
 fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
-    let parent = module(&premap_parent(1 << 17, false));
+    let parent = module(&premap_parent(1 << 17, false, false));
     let child = module(PREMAP_CHILD);
     assert_eq!(run_premap_interp(&parent, &child), -22);
     assert_eq!(

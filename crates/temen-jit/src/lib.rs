@@ -212,11 +212,11 @@ mod child_exec;
 #[cfg(fiber_rt)]
 mod instantiator_rt;
 
-// The windows placeholder-window commit primitive, reused by `temen-run`'s Memory-cap backend (it
-// commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a
-// placeholder reservation). See `mem::win_commit_rw`.
+// The windows placeholder-window commit and protect primitives, reused by `temen-run`'s Memory-cap
+// backend (it commits/grows tail pages of this same window; a plain `VirtualAlloc(MEM_COMMIT)` cannot
+// commit a placeholder reservation, nor one `VirtualProtect` span a §13 view). See `mem::win_commit_rw`.
 #[cfg(windows)]
-pub use mem::win_commit_rw;
+pub use mem::{win_commit_rw, win_protect};
 
 // The §5 W3 frame-pointer walk, under its own fault recovery — the `trap_walk` fuzz target's entry
 // (#1487). See `mem::walk_trap_frame_chain`.

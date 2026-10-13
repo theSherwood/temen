@@ -94,7 +94,7 @@ impl GuestWindow {
         }
         // SAFETY: commit the backed prefix `[0, rw)` read/write; the tail + guard stay inaccessible
         // so any access past `mapped` faults.
-        unsafe { pal::commit_rw(base, rw) };
+        unsafe { commit_rw_or_panic(base, rw) };
         Some(GuestWindow {
             base,
             mapped,
@@ -150,7 +150,7 @@ impl GuestWindow {
         // SAFETY: `[base, base+commit)` lies in the reservation (≤ total − guard); `commit_rw` makes
         // it committed + RW, so the subsequent `[0, snap)` read is in-bounds and cannot fault.
         unsafe {
-            pal::commit_rw(self.base, commit);
+            commit_rw_or_panic(self.base, commit);
             std::slice::from_raw_parts(self.base, snap).to_vec()
         }
     }
@@ -222,7 +222,7 @@ impl GuestWindow {
                 // SAFETY: `[base+start, base+end)` lies in the reservation below its guard page
                 // (checked above); committed, it takes the `n` image bytes at its offset.
                 unsafe {
-                    pal::commit_rw(self.base.add(start), end - start);
+                    commit_rw_or_panic(self.base.add(start), end - start);
                     std::ptr::copy_nonoverlapping(
                         src.as_ptr(),
                         self.base.add((base + off) as usize),
@@ -288,7 +288,7 @@ impl GuestWindow {
         // The backed prefix in one copy; then each committed tail page, committed in the twin first.
         std::ptr::copy_nonoverlapping(self.base, twin.base, prefix);
         for (&p, _) in prots.range(prefix / page..) {
-            pal::commit_rw(twin.base.add(p * page), page);
+            commit_rw_or_panic(twin.base.add(p * page), page);
             std::ptr::copy_nonoverlapping(self.base.add(p * page), twin.base.add(p * page), page);
         }
         // Put `self` back, and give the twin the same protections.
@@ -459,17 +459,51 @@ pub(crate) fn trailing_guard() -> usize {
     pal::page_size()
 }
 
+/// Commit `[base, base+len)` read/write for the JIT's own window bookkeeping, which has no way to
+/// report a refusal: panic, naming the OS's error.
+///
+/// # Safety
+/// As [`pal::commit_rw`].
+unsafe fn commit_rw_or_panic(base: *mut u8, len: usize) {
+    if !pal::commit_rw(base, len) {
+        panic!(
+            "temen-jit: window commit failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Windows-only: make `[base, base+len)` committed read/write across this window's **placeholder**
 /// reservation — idempotent (see the windows `pal::commit_rw`). Exposed so `temen-run`'s production
 /// `MprotectWindow` Memory-cap backend, which operates on this *same* window, can commit/grow tail
 /// pages without re-implementing the placeholder split/replace dance (a plain `VirtualAlloc(
 /// MEM_COMMIT)` fails on a placeholder). On unix the equivalent is a plain `mprotect`, done inline.
+/// `false` if the OS refused (#2268).
 ///
 /// # Safety
 /// `[base, base+len)` must lie within the JIT guest-window reservation that produced `base`.
 #[cfg(windows)]
-pub unsafe fn win_commit_rw(base: *mut u8, len: usize) {
+pub unsafe fn win_commit_rw(base: *mut u8, len: usize) -> bool {
     pal::commit_rw(base, len)
+}
+
+/// Windows-only: give the committed `[base, base+len)` the cap `prot` bits (`0` none, `1` read,
+/// `2`/`3` read-write), one `VirtualProtect` per allocation the range spans (see the windows
+/// `pal::protect`: a §13 view splits the reservation, and one call cannot span two). Exposed for
+/// `temen-run`'s `MprotectWindow`, beside [`win_commit_rw`]. `false` if the OS refused (#2268).
+///
+/// # Safety
+/// `[base, base+len)` must lie within the JIT guest-window reservation that produced `base`.
+#[cfg(windows)]
+pub unsafe fn win_protect(base: *mut u8, len: usize, prot: i32) -> bool {
+    let prot = if prot & 2 != 0 {
+        Prot::Rw
+    } else if prot & 1 != 0 {
+        Prot::Ro
+    } else {
+        Prot::None
+    };
+    pal::protect(base, len, prot)
 }
 
 // ================================= PAL: unix ==================================================
@@ -548,22 +582,21 @@ mod pal {
     ///
     /// # Safety
     /// `[base, base+len)` must lie within a reservation from [`reserve`].
-    pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) {
-        let rc = libc::mprotect(base as *mut c_void, len, libc::PROT_READ | libc::PROT_WRITE);
-        assert!(rc == 0, "temen-jit: window commit failed");
+    pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) -> bool {
+        libc::mprotect(base as *mut c_void, len, libc::PROT_READ | libc::PROT_WRITE) == 0
     }
 
     /// Set the protection of a committed range `[base, base+len)`.
     ///
     /// # Safety
     /// `[base, base+len)` must be a committed sub-range of a window reservation.
-    pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) {
+    pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) -> bool {
         let p = match prot {
             Prot::Rw => libc::PROT_READ | libc::PROT_WRITE,
             Prot::Ro => libc::PROT_READ,
             Prot::None => libc::PROT_NONE,
         };
-        libc::mprotect(base as *mut c_void, len, p);
+        libc::mprotect(base as *mut c_void, len, p) == 0
     }
 
     /// Release a whole reservation from [`reserve`].
@@ -697,10 +730,11 @@ mod pal {
     /// with `VirtualQuery` is what makes this safe to call on overlapping / growing ranges — the
     /// snapshot path ([`read_low`](super::GuestWindow::read_low)) re-commits a prefix that is already
     /// live, and a plain `VirtualAlloc(MEM_COMMIT)` cannot commit a placeholder at all (it fails).
+    /// `false` if the OS refused a step; the sub-ranges before it stay committed.
     ///
     /// # Safety
     /// `[base, base+len)` must lie within a reservation from [`reserve`].
-    pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) {
+    pub(super) unsafe fn commit_rw(base: *mut u8, len: usize) -> bool {
         let end = base as usize + len;
         let mut addr = base as usize;
         while addr < end {
@@ -710,11 +744,9 @@ mod pal {
                 &mut mbi,
                 core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             );
-            assert!(
-                n != 0,
-                "temen-jit: VirtualQuery failed (err {})",
-                last_error()
-            );
+            if n == 0 {
+                return false;
+            }
             let region_base = mbi.BaseAddress as usize;
             let region_end = region_base + mbi.RegionSize;
             let a = addr.max(region_base);
@@ -722,20 +754,19 @@ mod pal {
             if mbi.State == MEM_COMMIT {
                 // Already committed (private or a mapped view): re-assert RW, keep contents.
                 let mut old: PAGE_PROTECTION_FLAGS = 0;
-                VirtualProtect((a as *const c_void) as _, b - a, PAGE_READWRITE, &mut old);
+                if VirtualProtect((a as *const c_void) as _, b - a, PAGE_READWRITE, &mut old) == 0 {
+                    return false;
+                }
             } else {
                 // Placeholder (`MEM_RESERVE`): carve the exact sub-range, then replace-commit it RW.
-                if a != region_base || b != region_end {
-                    let ok = VirtualFree(
+                if (a != region_base || b != region_end)
+                    && VirtualFree(
                         a as *mut c_void,
                         b - a,
                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-                    );
-                    assert!(
-                        ok != 0,
-                        "temen-jit: placeholder split failed (err {})",
-                        last_error()
-                    );
+                    ) == 0
+                {
+                    return false;
                 }
                 // Replace-commit the placeholder sub-range RW. `MEM_REPLACE_PLACEHOLDER` is atomic
                 // (success → ptr, failure → null leaving the placeholder intact), so retrying a
@@ -756,14 +787,13 @@ mod pal {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5u64 << attempt));
                 }
-                assert!(
-                    !p.is_null(),
-                    "temen-jit: window commit failed (err {})",
-                    last_error()
-                );
+                if p.is_null() {
+                    return false;
+                }
             }
             addr = b;
         }
+        true
     }
 
     /// Set the protection of a committed range `[base, base+len)`.
@@ -774,11 +804,12 @@ mod pal {
     /// fragments + mapped section views). A single spanning call then fails wholesale — leaving
     /// e.g. the #1094 NULL-guard pages `NOACCESS` after `restore_rw`, so the post-run snapshot's
     /// raw window read AVs in host code (the windows `jit_diff` STATUS_ACCESS_VIOLATION).
-    /// Non-committed fragments (placeholders) are skipped — they can't be protected.
+    /// Non-committed fragments (placeholders) are skipped — they can't be protected. `false` if the
+    /// OS refused a step; the regions before it keep the new protection.
     ///
     /// # Safety
     /// `[base, base+len)` must lie within a window reservation.
-    pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) {
+    pub(super) unsafe fn protect(base: *mut u8, len: usize, prot: Prot) -> bool {
         let flags: PAGE_PROTECTION_FLAGS = match prot {
             Prot::Rw => PAGE_READWRITE,
             Prot::Ro => PAGE_READONLY,
@@ -794,13 +825,16 @@ mod pal {
                 core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             ) == 0
             {
-                break;
+                return false;
             }
             let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
             let b = end.min(region_end);
-            if mbi.State == MEM_COMMIT && b > addr {
-                let mut old: PAGE_PROTECTION_FLAGS = 0;
-                VirtualProtect(addr as *const c_void, b - addr, flags, &mut old);
+            let mut old: PAGE_PROTECTION_FLAGS = 0;
+            if mbi.State == MEM_COMMIT
+                && b > addr
+                && VirtualProtect(addr as *const c_void, b - addr, flags, &mut old) == 0
+            {
+                return false;
             }
             addr = if region_end > addr {
                 region_end
@@ -808,6 +842,7 @@ mod pal {
                 addr + page_size()
             };
         }
+        true
     }
 
     /// Release a whole reservation from [`reserve`] — **every fragment of it**. After [`commit_rw`]
@@ -1263,8 +1298,12 @@ mod pal {
     pub(super) unsafe fn reserve(_total: usize) -> *mut u8 {
         core::ptr::null_mut()
     }
-    pub(super) unsafe fn commit_rw(_base: *mut u8, _len: usize) {}
-    pub(super) unsafe fn protect(_base: *mut u8, _len: usize, _prot: Prot) {}
+    pub(super) unsafe fn commit_rw(_base: *mut u8, _len: usize) -> bool {
+        false
+    }
+    pub(super) unsafe fn protect(_base: *mut u8, _len: usize, _prot: Prot) -> bool {
+        false
+    }
     pub(super) unsafe fn release(_base: *mut u8, _total: usize) {}
     pub(super) fn install_guard() {}
     #[allow(clippy::too_many_arguments)]
@@ -1601,9 +1640,9 @@ mod tests {
         // now a mix of committed-private regions and leftover placeholders.
         // SAFETY: every range lies within `[base, base+total)`.
         unsafe {
-            pal::commit_rw(base, page); // prefix
-            pal::commit_rw(base.add(20 * page), page); // a "grown" tail page
-            pal::commit_rw(base.add(40 * page), page); // another, non-adjacent
+            assert!(pal::commit_rw(base, page)); // prefix
+            assert!(pal::commit_rw(base.add(20 * page), page)); // a "grown" tail page
+            assert!(pal::commit_rw(base.add(40 * page), page)); // another, non-adjacent
         }
         // SAFETY: release exactly the reservation created above.
         unsafe { pal::release(base, total) };
