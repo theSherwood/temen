@@ -1334,6 +1334,30 @@ fn a_parent_serves_its_childs_exec_with_its_own_code() {
     }
 }
 
+/// #2284 — the same exec, with the parent's spawn, serve loop and join in a helper (func 3) its entry
+/// calls. A child image keeps every function of its program, so the child's carries that helper,
+/// unreached: a module that, scanned whole, serves and spawns. A driver that serves its children
+/// admits the image as it admits the program, so the child runs there instead of the spawn trapping
+/// `Malformed` while the oracle answers.
+#[test]
+fn a_child_image_that_carries_its_programs_serve_loop_runs_where_the_program_does() {
+    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
+    let (head, rest) = src.split_once("func 0 () -> (i32) {\n").expect("the entry");
+    let (serve, funcs) = rest.split_once("func 1 ").expect("the child entry");
+    let src = format!(
+        "{head}func 0 () -> (i32) {{\nblock 0 () {{\n  vr = call 3 ()\n  return vr\n  }}\n}}\n\
+         func 1 {funcs}func 3 () -> (i32) {{\n{serve}"
+    );
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
+    for b in BACKENDS.map(Some).into_iter().chain([None]) {
+        assert_eq!(
+            run_detached_on(b, &src, 1 << 20, RunConfig::default()),
+            Ok(4_201),
+            "{b:?}: the child runs its image, and the parent serves its exec.run(40, 2)"
+        );
+    }
+}
+
 /// #1217 on the self-serve grant: a child that holds the parent's live offer but finishes without
 /// calling it releases the parent's `svc.wait`, which answers `0` instead of waiting on a caller that
 /// is gone; the parent then joins the child's `7` — `join*100 + served` = `700` on every backend,

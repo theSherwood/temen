@@ -753,6 +753,10 @@ pub struct Compiled {
     /// ([`ModuleSource::debug`]): its §6 info and its per-block value layout. `None` elsewhere, and
     /// for a §22 unit, whose frames are not source-inspectable (#2239).
     debug: Option<std::sync::Arc<ModuleDebug>>,
+    /// #744 — whether this program was admitted for a driver that serves the children it spawns
+    /// ([`compile_module_for`]). A module a child or an exec runs in the same run is admitted the same
+    /// way ([`compile_granted`], #2284).
+    serves_children: bool,
 }
 
 impl Compiled {
@@ -954,6 +958,12 @@ impl ModuleSource {
         std::sync::Arc::clone(&self.mods.lock_unpoisoned().code[0])
     }
 
+    /// Whether the run's driver serves the children its domains spawn: the run's own program was
+    /// admitted that way ([`Compiled::serves_children`]).
+    fn serves_children(&self) -> bool {
+        self.mods.lock_unpoisoned().code[0].serves_children
+    }
+
     /// Module `i` (`0` = primary, `k≥1` = an installed unit), or `None` if out of range.
     fn get(&self, i: usize) -> Option<std::sync::Arc<Compiled>> {
         self.mods.lock_unpoisoned().code.get(i).cloned()
@@ -1109,6 +1119,68 @@ mod module_source_tests {
         assert_ne!(a, b, "another module has its own unit");
         assert_eq!(compiles, 2, "each module compiled once");
         assert_eq!(src.snapshot().len(), 3, "the primary and a unit per module");
+    }
+
+    /// #2284 — a granted module is admitted as the run's own program was. An image that carries
+    /// its program's spawn and serve loop, unreached (here in func 3), compiles on a driver that
+    /// serves its children, as the program does, and is declined on one that does not.
+    #[test]
+    fn a_granted_module_is_admitted_as_the_runs_own_program() {
+        let program = temen_text::parse_module(
+            "memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { run: 0 }
+export 0 interface \"exec\" 1 { run: 2 }
+func () -> (i64) {
+block 0 () {
+  v = call 3 ()
+  return v
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vrec = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
+  vz = i32.const 0
+  vn = svc.wait vz
+  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vr = i64.add vn vj
+  return vr
+  }
+}
+",
+        )
+        .expect("parse");
+        let image = temen_ir::child_image_at(&program, 1).expect("an image");
+        let g = crate::ModuleGrant::of(std::sync::Arc::new(image), false);
+        let host = Host::new();
+        let empty = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
+            .expect("parse");
+        for serves in [true, false] {
+            let src = ModuleSource::new(compile_module_for(&empty, serves).expect("compiles"));
+            assert_eq!(
+                compile_granted(&host, &g, &src).is_some(),
+                serves,
+                "a driver that serves its children: {serves}"
+            );
+            assert_eq!(
+                compile_module_for(&program, serves).is_some(),
+                serves,
+                "as the program itself is admitted"
+            );
+        }
     }
 
     #[test]
@@ -1503,7 +1575,8 @@ impl Seams {
 /// children, a child parked on a call into its parent, a blocking import. Like
 /// [`Seams::bytecode_serves_fork`] the shape is bounded module-wide: no fibers, threads, coroutines
 /// or gc roots, no fork (its own escape) and no timed `svc.wait` (oracle-only).
-fn bytecode_serves_children(m: &Module, s: &Seams) -> bool {
+fn bytecode_serves_children(m: &Module) -> bool {
+    let s = scan_seams(&m.funcs);
     if !(s.has_svc && s.has_instantiate)
         || s.has_fiber
         || s.has_thread
@@ -1688,15 +1761,17 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
     if uses_rec && m.declares_pager() {
         return None;
     }
-    let escape = serves_children && bytecode_serves_children(m, &scan_seams(&m.funcs));
-    compile_module_with(
+    let escape = serves_children && bytecode_serves_children(m);
+    let mut c = compile_module_with(
         &m.funcs,
         &m.types,
         true,
         m.memory.and_then(|x| x.shadow),
         escape,
         None,
-    )
+    )?;
+    c.serves_children = serves_children;
+    Some(c)
 }
 
 /// §3d — validate + **drain** a spawn record's `Budget` at a driver's commit site, returning the
@@ -1876,7 +1951,7 @@ fn granted_program(
     g: &super::ModuleGrant,
 ) -> Result<ChildProgram, Trap> {
     let i = source
-        .unit_of(&g.digest, || compile_granted(host, g, source.debug))
+        .unit_of(&g.digest, || compile_granted(host, g, source))
         .ok_or(Trap::Malformed)?;
     let p = source.get(i).ok_or(Trap::Malformed)?;
     Ok(ChildProgram::Granted(i as u32, p))
@@ -2405,24 +2480,36 @@ fn admit_detached_in_process(
     Ok(Some((child, tierup)))
 }
 
-/// Compile module `g` that `host` granted, for a child or an exec: through the host's memo when its
-/// embedder handed it one ([`Host::set_compile_memo`]), else afresh. The same program either way.
-/// For a `debug` run it is unfused and carries its frame metadata, as the run's own program does
+/// Compile module `g` that `host` granted, for a child or an exec in the run whose units `source`
+/// holds: through the host's memo when its embedder handed it one ([`Host::set_compile_memo`]), else
+/// afresh. The same program either way.
+///
+/// It is admitted as the run's own program was (#2284): on a driver that serves its children, a
+/// module that serves and spawns runs natively when its serve handlers cannot park
+/// ([`bytecode_serves_children`]). A child image keeps every function of its program, so one whose
+/// program serves its children carries that program's serve loop and spawns, unreached.
+///
+/// For a debug run it is unfused and carries its frame metadata, as the run's own program does
 /// (#2239).
-fn compile_granted(host: &Host, g: &super::ModuleGrant, debug: bool) -> Option<Compiled> {
-    let (m, fuse) = (&g.module, !debug);
+fn compile_granted(host: &Host, g: &super::ModuleGrant, source: &ModuleSource) -> Option<Compiled> {
+    let (m, fuse) = (&g.module, !source.debug);
+    let serves_children = source.serves_children();
+    let escape = serves_children && bytecode_serves_children(m);
     let mut c = match host.compile_memo() {
         Some(memo) => compile_module_with(
             &m.funcs,
             &m.types,
             fuse,
             g.shadow(),
-            false,
+            escape,
             Some(&mut memo.lock_unpoisoned()),
         ),
-        None => compile_module_with(&m.funcs, &m.types, fuse, g.shadow(), false, None),
+        None => compile_module_with(&m.funcs, &m.types, fuse, g.shadow(), escape, None),
     }?;
-    c.debug = debug.then(|| std::sync::Arc::new(ModuleDebug::build(m)));
+    c.serves_children = serves_children;
+    c.debug = source
+        .debug
+        .then(|| std::sync::Arc::new(ModuleDebug::build(m)));
     Some(c)
 }
 
@@ -2457,15 +2544,15 @@ pub fn compile_module_unfused(
     compile_module_with(funcs, types, false, shadow, false, None)
 }
 
-/// Lower every function, or `None` if any uses an op outside this slice's subset. `serves_children`:
-/// the module took the [`bytecode_serves_children`] escape, which [`compile_module_for`] decides (it
-/// has the module's impl exports).
+/// Lower every function, or `None` if any uses an op outside this slice's subset. `escape`: the
+/// module took the [`bytecode_serves_children`] escape, which [`compile_module_for`] and
+/// [`compile_granted`] decide (they have the module's impl exports).
 fn compile_module_with(
     funcs: &[Func],
     types: &[temen_ir::TypeEntry],
     fuse: bool,
     shadow: Option<super::ShadowArena>,
-    serves_children: bool,
+    escape: bool,
     mut memo: Option<&mut FuncMemo>,
 ) -> Option<Compiled> {
     // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
@@ -2503,7 +2590,7 @@ fn compile_module_with(
     // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     // #744 — so is a module whose serve handlers cannot park, on a driver that serves its children.
     if (s.has_coro && (s.has_fiber || s.has_thread))
-        || (s.svc_park_veto() && !s.bytecode_serves_fork() && !serves_children)
+        || (s.svc_park_veto() && !s.bytecode_serves_fork() && !escape)
     {
         return None;
     }
@@ -2532,6 +2619,7 @@ fn compile_module_with(
             .collect(),
         table_mask,
         debug: None,
+        serves_children: false,
     })
 }
 
@@ -10901,7 +10989,7 @@ fn exec_image_build(
     let cm = dom
         .source
         .unit_of(&command.0.digest, || {
-            compile_granted(cur_host, &command.0, dom.source.debug)
+            compile_granted(cur_host, &command.0, &dom.source)
         })
         .ok_or(super::EINVAL)?;
     // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
