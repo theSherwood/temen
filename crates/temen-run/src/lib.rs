@@ -160,7 +160,7 @@ struct WindowRegionPurge {
     base: u64,
     reserved: u64,
     /// This run's registry owner id (#1608). Without it the purge — which runs after the reservation
-    /// is released, over the whole 1 TiB range — erased entries belonging to whichever runs had since
+    /// is released, over its whole range — erased entries belonging to whichever runs had since
     /// been handed those addresses, losing their futex wakeups.
     owner: u64,
 }
@@ -1374,7 +1374,7 @@ pub fn jit_cap_run(
     // and its window (with what `init` grew) and main vCPU charged to its node.
     // #2268 — and what its window will hold of the process's mappings, reserved before the window is
     // built: a fresh window's bound, and the runs a thaw's page map adds to it.
-    let fresh = RootWindow::fresh(m);
+    let fresh = RootWindow::fresh(m, reserved_log2);
     let restored = init
         .page_map()
         .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
@@ -2249,7 +2249,7 @@ impl JitSession {
             let mut h = self.host.lock().unwrap_or_else(|e| e.into_inner());
             // #2113 — each prompt is an activation over a fresh window: the session's node pays for
             // it and its main vCPU, and its code draws the default fuel from it.
-            let window = RootWindow::fresh(&self.base);
+            let window = RootWindow::fresh(&self.base, self.reserved_log2);
             let Some(node) = h.begin_activation(temen_interp::DEFAULT_FUEL, window) else {
                 // #2268 — a prompt the process has no room for does not start.
                 return Ok(JitOutcome::Trapped(TrapKind::ThreadFault));
@@ -5541,7 +5541,7 @@ impl PowerboxProgram {
         self.inst.grant_caps(&mut self.host, self.win);
         // #2113 — the run's window and main vCPU, charged to its node, and the default fuel its code
         // draws from it, as `run_powerbox`'s.
-        let window = RootWindow::fresh(&self.inst.module);
+        let window = RootWindow::fresh(&self.inst.module, temen_ir::DEFAULT_RESERVED_LOG2);
         let Some(node) = self
             .host
             .begin_activation(temen_interp::DEFAULT_FUEL, window)
@@ -6692,7 +6692,8 @@ fn jit_run(
     // the default grant's when it names none: the root's cell draws from the host's own node, which
     // pays for its window and main vCPU as an interpreter's does.
     limits.grant(host);
-    let Some(node) = host.begin_activation(limits.fuel(), RootWindow::fresh(m)) else {
+    let window = RootWindow::fresh(m, temen_ir::DEFAULT_RESERVED_LOG2);
+    let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());
     };
     let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));

@@ -164,6 +164,36 @@ fn a_fork_twin_charges_its_parents_nodes() {
     );
 }
 
+/// #2305 — a window's reservation rides the charge that admits it: no ceiling refuses it, every level
+/// holds it, the tree's root holding what the run holds of the process's pool, and a refund returns
+/// it to every level.
+#[test]
+fn a_reservation_rides_its_charge_to_every_level() {
+    let tree = BudgetTree::default();
+    let child = tree.mint(
+        Some(BudgetTree::RUN_NODE),
+        [-1, 1000, -1, -1, -1, -1],
+        [0; BUDGET_DIMS],
+    );
+    let set = [(BUDGET_MEM, 10), (RESERVED, 1 << 20)];
+    assert!(
+        tree.add(child, &set, Fits::All),
+        "no ceiling bounds a reservation"
+    );
+    let held = |tree: &BudgetTree| {
+        let nodes = tree.0.lock_unpoisoned();
+        let pooled = BudgetTree::pooled(&nodes).1;
+        (nodes[child as usize].reserved, nodes[0].reserved, pooled)
+    };
+    assert_eq!(
+        held(&tree),
+        (1 << 20, 1 << 20, 1 << 20),
+        "every level holds it"
+    );
+    tree.refund_set(child, &set);
+    assert_eq!(held(&tree), (0, 0, 0), "a refund returns it to every level");
+}
+
 /// Parent and child charge one tree at once (#1944's concurrency note): one lock makes every chain
 /// charge all or nothing, so however the charges race, the shared ancestor is never overdrawn and
 /// none is lost or doubled.

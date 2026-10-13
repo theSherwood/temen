@@ -141,7 +141,8 @@ unsafe impl Send for ChildTask {}
 impl ChildTask {
     /// Build a task around a compiled detached child. `init` seeds the fresh window (data segments,
     /// payload) and may protect its pages (a detached child's readonly segments); `premap` aliases the op-15 pre-mapped region onto it (`false` ⇒ the child never
-    /// runs: a `CapFault` outcome, as on the OS-thread path it replaces).
+    /// runs: a `CapFault` outcome, as on the OS-thread path it replaces). `Err` hands `teardown` back
+    /// when the child never runs: its window or its pre-map refused.
     ///
     /// # Safety
     /// `code` was compiled by `compile_child_windowed` for exactly `(mapped_log2, reserved_log2)`
@@ -161,7 +162,13 @@ impl ChildTask {
         teardown: Teardown,
         node: Option<Arc<dyn crate::BudgetNode>>,
     ) -> Result<ChildTask, Teardown> {
-        let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
+        // #2305 — a window the address space has no room for refuses the child as a refused pre-map
+        // does: it never runs, and its spawn answers what a refused filing answers.
+        let Some(mut window) =
+            mem::GuestWindow::try_new(1usize << mapped_log2, 1usize << reserved_log2)
+        else {
+            return Err(teardown);
+        };
         let base = window.base();
         init(&mut window);
         // #964/#1733: every child window reserves its own `[0, guard)`, as the interpreter's windows

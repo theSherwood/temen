@@ -1,6 +1,6 @@
 //! **Accesses past a caller-provided backing never reach host memory** (#1191, found by the #1151
 //! `nested_paged` differential). Every Region-backed vCPU path (`Vcpu::new_root_with_powerbox`, the
-//! browser's `Region::shared` reactor / tier-up / threads windows) asks for the 1-TiB
+//! browser's `Region::shared` reactor / tier-up / threads windows) asks for the 128 GiB
 //! `DEFAULT_RESERVED_LOG2` reservation over a backing of the window's size — deliberately (#1153: a
 //! guest's high `vm_map` is admitted so the emitted tier's bounds check turns the first access into a
 //! decline). The confinement bound is the reservation plus the page map; the flat backings' word and

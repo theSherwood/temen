@@ -107,8 +107,9 @@ not let a guest crash its host (owner, #2268): 4 GiB of `mem` and of `channel`, 
 at all, since every run's mappings are already held against the process's own limit. The root is charged to
 it as a child is to its budget, on every engine: its window and main vCPU when an activation opens
 (`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, but
-never past the process's pool of mappings (a run the process cannot hold ends with `ThreadFault`
-before it starts), and everything it makes after, its growth and its processes' windows included. A carve child (ops 0/5/13, v0
+never past the process's pools of mappings and of address space (a run the process cannot hold ends
+with `ThreadFault` before it starts; every domain's window is held against the address-space pool at
+its admission, #2305), and everything it makes after, its growth and its processes' windows included. A carve child (ops 0/5/13, v0
 records) charges no node: `MAX_VCPUS` alone bounds its vCPUs and `MAX_FIBERS` its fibers until #1867
 deletes the carve. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A

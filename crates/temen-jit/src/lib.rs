@@ -264,7 +264,8 @@ pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
-/// not committed memory; `2^40` matches `DESIGN.md` §4's host-configurable example. A real host
+/// not committed memory. `2^40` was the default until #2305 lowered it to 2^37 (`DESIGN.md` §4),
+/// so a window frozen under it still thaws at the reservation its artifact records. A real host
 /// chooses this per its VA budget; the reference just caps it so a fuzzed/oversized request
 /// can't ask for an absurd reservation.
 const MAX_JIT_RESERVED_LOG2: u8 = 40; // 1 TiB of reserved VA (lazy)
@@ -4683,7 +4684,17 @@ impl CompiledModule {
             (twin.window, t.win_size, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
-            let mut window = mem::GuestWindow::new(t.win_mapped, t.win_reserved);
+            // #2305 — a run the address space has no window for ends as one the process cannot hold
+            // (#2268): `ThreadFault` before its first instruction, never a host panic. Nothing ran, so
+            // a snapshot is the window it was handed, unchanged (a session keeps its state).
+            let Some(mut window) = mem::GuestWindow::try_new(t.win_mapped, t.win_reserved) else {
+                t.last_trap_backtrace = Vec::new();
+                t.last_trap_fiber = None;
+                let image = snapshot_cap
+                    .and(init_mem)
+                    .map_or_else(Vec::new, <[u8]>::to_vec);
+                return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), image));
+            };
             let win_size = t.win_size;
             // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
             if let Some(init) = init_mem {
@@ -5961,8 +5972,14 @@ pub(crate) unsafe fn compile_child_and_run(
     let fn_table_ptr = child.fn_table.as_ptr();
 
     // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
-    // child starts from the bytes the parent placed there (the §14 data plane is shared memory).
-    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
+    // child starts from the bytes the parent placed there (the §14 data plane is shared memory). #2305
+    // — one the address space has no room for ends the child as a run it cannot hold: `ThreadFault`
+    // before it starts, its carve untouched.
+    let Some(mut child_window) =
+        mem::GuestWindow::try_new(child_size as usize, child_size as usize)
+    else {
+        return Ok((0, TrapKind::ThreadFault as i64, false));
+    };
     let child_base = child_window.base();
     {
         // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory
@@ -6438,10 +6455,11 @@ fn compile_child_windowed(
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
     // it keeps the invariant local instead of relying on the cross-module parent-size cap). The
-    // reservation may exceed the committed cap (a root's lazy reservation), never the other way.
+    // reservation may exceed the committed cap (a root's lazy reservation), never the other way, and
+    // is capped as a root's is: a thawed child keeps the reservation its artifact records.
     if mapped_log2 > MAX_JIT_WINDOW_LOG2
         || reserved_log2 < mapped_log2
-        || reserved_log2 > temen_ir::DEFAULT_RESERVED_LOG2
+        || reserved_log2 > MAX_JIT_RESERVED_LOG2
     {
         return Err(JitError::Unsupported(
             "child window exceeds the reference JIT's max",

@@ -20522,6 +20522,12 @@ const BUDGET_CHANNEL: usize = 3;
 const BUDGET_LANE: usize = 4;
 /// The `maps` dimension's index: the OS mappings a subtree causes (#2268, [`BudgetState::maps`]).
 const BUDGET_MAPS: usize = 5;
+/// #2305 — no budget's dimension: the address space a use's windows reserve, which rides the charge
+/// set that admits them, so the process's pool of it ([`RESERVED_POOL`]) refuses all of the charge or
+/// none. No ceiling bounds it and no guest reads it: an embedder bounds a run's windows with its
+/// `maps` grant, a domain's [`MAPS_PER_DOMAIN`] each. The tree counts it per node
+/// ([`BudgetNode::reserved`]) only so that a run's end, or a debugger's restore, settles the pool.
+const RESERVED: usize = BUDGET_DIMS;
 
 /// #2268 — the mappings the host keeps for itself out of the OS limit: its libraries, heap and
 /// threads, and its embedder's.
@@ -20541,9 +20547,6 @@ pub const MAPS_PER_DOMAIN: u64 = WINDOW_RUNS + 5 + OFFLOAD_POOL_THREADS as u64 *
 
 /// #2268 — Linux's default `vm.max_map_count`, for a host that cannot read its own.
 const MAPS_LINUX_DEFAULT: u64 = 65530;
-
-/// #2268 — what every run in this process holds of [`maps_pool`] between them.
-static MAPS_IN_USE: AtomicU64 = AtomicU64::new(0);
 
 /// #2268 — how many OS mappings the guests of this process may cause between them: Linux's
 /// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
@@ -20568,33 +20571,66 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2268 — take `n` of [`maps_pool`] for a charge: `false`, taking nothing, when that would pass
-/// the pool (`check`) — a [`BudgetTree::force_charge`] takes it regardless.
-fn maps_take(n: u64, check: bool) -> bool {
-    n == 0
-        || maps_update(|used| {
-            let now = used.saturating_add(n);
-            (!check || now <= maps_pool()).then_some(now)
-        })
-}
+/// #2305 — how much address space the windows of this process's guests may reserve between them:
+/// 64 TiB, half of what a 47-bit host gives a process, so the host's own mappings keep the other
+/// half. Every window reserves its whole mask domain up front, 128 GiB by default
+/// ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
+/// only be refused where it is built, which differs by engine (the interpreter falls back to a
+/// heap-backed window, the JIT cannot); so every domain's window is held against this at its
+/// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
+/// ([`maps_pool`]). A host without a 64-bit address space has no such pool: unbounded.
+pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
+    64 << 40
+} else {
+    u64::MAX
+};
 
-/// #2268 — hand `n` back to [`maps_pool`].
-fn maps_give(n: u64) {
-    maps_update(|used| Some(used.saturating_sub(n)));
-}
+/// #2268, #2305 — what every run in this process holds between them of a resource the process has a
+/// fixed amount of: its OS mappings ([`maps_pool`]) or its address space ([`RESERVED_POOL`]).
+struct Pool(AtomicU64);
 
-/// #2268 — make [`MAPS_IN_USE`] what `f` makes of it, atomically: `false`, with nothing changed, when
-/// `f` refuses. A compare-exchange loop, as `fetch_update` is deprecated on current nightly and
-/// `try_update` is newer than the crate's minimum Rust.
-fn maps_update(f: impl Fn(u64) -> Option<u64>) -> bool {
-    let mut used = MAPS_IN_USE.load(Ordering::Acquire);
-    loop {
-        let Some(now) = f(used) else {
-            return false;
-        };
-        match MAPS_IN_USE.compare_exchange_weak(used, now, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return true,
-            Err(seen) => used = seen,
+/// #2268 — what every run holds of [`maps_pool`].
+static MAPS_IN_USE: Pool = Pool(AtomicU64::new(0));
+/// #2305 — what every run's windows hold of [`RESERVED_POOL`].
+static RESERVED_IN_USE: Pool = Pool(AtomicU64::new(0));
+
+impl Pool {
+    /// Take `n` for a charge: `false`, taking nothing, when that would hold more than `size`
+    /// (`check`). A [`Fits::Forced`] charge takes it regardless.
+    fn take(&self, n: u64, size: u64, check: bool) -> bool {
+        n == 0
+            || self.update(|used| {
+                let now = used.saturating_add(n);
+                (!check || now <= size).then_some(now)
+            })
+    }
+
+    /// Hand `n` back.
+    fn give(&self, n: u64) {
+        self.update(|used| Some(used.saturating_sub(n)));
+    }
+
+    /// What a run's tree holds of this goes from `was` to `now`: a restore putting a tree back.
+    fn settle(&self, was: u64, now: u64) {
+        self.update(|used| Some(used.saturating_add(now).saturating_sub(was)));
+    }
+
+    /// Make what is held what `f` makes of it, atomically: `false`, with nothing changed, when `f`
+    /// refuses. A compare-exchange loop, as `fetch_update` is deprecated on current nightly and
+    /// `try_update` is newer than the crate's minimum Rust.
+    fn update(&self, f: impl Fn(u64) -> Option<u64>) -> bool {
+        let mut used = self.0.load(Ordering::Acquire);
+        loop {
+            let Some(now) = f(used) else {
+                return false;
+            };
+            match self
+                .0
+                .compare_exchange_weak(used, now, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(seen) => used = seen,
+            }
         }
     }
 }
@@ -20602,9 +20638,9 @@ fn maps_update(f: impl Fn(u64) -> Option<u64>) -> bool {
 /// #2268 — the limits a charge to the budget tree must fit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fits {
-    /// Every bounded level's ceiling, and the process's pool of mappings ([`maps_pool`]).
+    /// Every bounded level's ceiling, and the process's pools ([`maps_pool`], [`RESERVED_POOL`]).
     All,
-    /// The pool alone: a use its embedder chose (a run's activation), which no grant refuses but the
+    /// The pools alone: a use its embedder chose (a run's activation), which no grant refuses but the
     /// process must still have room for.
     Pool,
     /// Neither: a use that exists already, accounted again.
@@ -20620,6 +20656,8 @@ struct BudgetNode {
     parent: Option<u32>,
     ceiling: [i64; BUDGET_DIMS],
     used: [i64; BUDGET_DIMS],
+    /// #2305 — the address space its subtree's windows hold ([`RESERVED`]).
+    reserved: u64,
 }
 
 /// #1944 — a run's budget tree, indexed by the id a [`Binding::Budget`] carries (append-only, so an
@@ -20661,13 +20699,14 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// What the lease holds: the window's `bytes` of `mem`, its child's first vCPU ([`VcpuCost`]), and
-    /// its [`Self::maps`].
-    fn cost(&self) -> [(usize, u64); 3] {
+    /// What the lease holds: the window's `bytes` of `mem`, its child's first vCPU ([`VcpuCost`]), its
+    /// [`Self::maps`], and the address space its window reserves ([`Self::reserved`]).
+    fn cost(&self) -> [(usize, u64); 4] {
         [
             (BUDGET_MEM, self.bytes),
             (BUDGET_SPAWN, 1),
             (BUDGET_MAPS, self.maps()),
+            (RESERVED, self.reserved()),
         ]
     }
 
@@ -20676,12 +20715,28 @@ impl Lease {
     fn maps(&self) -> u64 {
         MAPS_PER_VCPU + MAPS_PER_DOMAIN + self.runs.saturating_sub(WINDOW_RUNS)
     }
+
+    /// #2305 — the address space its window reserves: the default mask domain, raised to its size, as
+    /// every engine builds a detached window.
+    fn reserved(&self) -> u64 {
+        reservation(self.bytes, DEFAULT_RESERVED_LOG2)
+    }
+}
+
+/// #2305 — the address space a window of `declared` bytes reserves over a `1 << reserved_log2` mask
+/// domain: the domain, raised to the window's size as every engine raises it. Nothing for no window.
+fn reservation(declared: u64, reserved_log2: u8) -> u64 {
+    if declared == 0 {
+        0
+    } else {
+        declared.max(1 << reserved_log2.min(63))
+    }
 }
 
 /// #2113, #2268 — a domain's half of its window's accounting: what its charges on the budget tree are
 /// for ([`Host::grown`], [`Host::own_window`], [`Host::main_vcpu`], [`Host::runs`], [`Host::maps`],
-/// [`Host::domain_maps`]). What puts the tree back — a debugger's undo, a checkpoint — puts this back
-/// with it.
+/// [`Host::domain_maps`], [`Host::reserved`]). What puts the tree back — a debugger's undo, a
+/// checkpoint — puts this back with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowHeld {
     grown: u64,
@@ -20690,27 +20745,33 @@ pub(crate) struct WindowHeld {
     runs: u64,
     maps: u64,
     domain_maps: u64,
+    reserved: u64,
 }
 
 /// #2113 — the window a run's root opens an activation over ([`Host::begin_activation`]), as the
 /// run's own node pays for it: `declared` bytes, and `grown` past them that it holds committed as its
-/// own. #2268 — and its `runs` of page state, its mappings ([`Host::start_window`]).
+/// own. #2268 — and its `runs` of page state, its mappings ([`Host::start_window`]). #2305 — and the
+/// address space it `reserved`, its whole mask domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RootWindow {
     pub declared: u64,
     pub grown: u64,
     pub runs: u64,
+    pub reserved: u64,
 }
 
 impl RootWindow {
-    /// A fresh run of `m`, before its window is built: its declared memory, nothing grown yet, and the
-    /// most runs its window starts with ([`window_runs_bound`]), which its activation reserves before
-    /// the window exists and the JIT settles once it does ([`Host::start_window`]).
-    pub fn fresh(m: &Module) -> RootWindow {
+    /// A fresh run of `m` over a `1 << reserved_log2` mask domain, before its window is built: its
+    /// declared memory, nothing grown yet, the most runs its window starts with
+    /// ([`window_runs_bound`]), which its activation reserves before the window exists and the JIT
+    /// settles once it does ([`Host::start_window`]), and the address space it will reserve.
+    pub fn fresh(m: &Module, reserved_log2: u8) -> RootWindow {
+        let declared = m.memory.map_or(0, |mc| 1 << mc.size_log2);
         RootWindow {
-            declared: m.memory.map_or(0, |mc| 1 << mc.size_log2),
+            declared,
             grown: 0,
             runs: window_runs_bound(&m.data, false),
+            reserved: reservation(declared, reserved_log2),
         }
     }
 
@@ -20720,18 +20781,19 @@ impl RootWindow {
             declared: m.window.mapped(),
             grown: m.tail_bytes(0, m.window.reserved()).held,
             runs: m.window_runs(),
+            reserved: m.window.reserved(),
         })
     }
 }
 
 impl Drop for BudgetTree {
-    /// #2268 — a run that ends hands the process back every mapping its tree still holds. A use the
-    /// run never refunded (it ended mid-op, or a domain was never released) cannot leak out of the
-    /// pool.
+    /// #2268, #2305 — a run that ends hands the process back every mapping and all the address space
+    /// its tree still holds. A use the run never refunded (it ended mid-op, or a domain was never
+    /// released) cannot leak out of the pools.
     fn drop(&mut self) {
-        maps_give(Self::maps_held(
-            self.0.get_mut().unwrap_or_else(|e| e.into_inner()),
-        ));
+        let (maps, reserved) = Self::pooled(self.0.get_mut().unwrap_or_else(|e| e.into_inner()));
+        MAPS_IN_USE.give(maps);
+        RESERVED_IN_USE.give(reserved);
     }
 }
 
@@ -20749,6 +20811,7 @@ impl Default for BudgetTree {
             parent: None,
             ceiling,
             used: [0; BUDGET_DIMS],
+            reserved: 0,
         }]))
     }
 }
@@ -20769,18 +20832,23 @@ impl BudgetTree {
             parent,
             ceiling,
             used,
+            reserved: 0,
         });
         (nodes.len() - 1) as u32
     }
 
-    /// #2268 — what `nodes` hold of [`maps_pool`]: what each tree root has charged, since every
-    /// charge reaches its root.
-    fn maps_held(nodes: &[BudgetNode]) -> u64 {
+    /// #2268, #2305 — what `nodes` hold of the process's pools, of [`maps_pool`] and of
+    /// [`RESERVED_POOL`]: what each tree root has charged, since every charge reaches its root.
+    fn pooled(nodes: &[BudgetNode]) -> (u64, u64) {
         nodes
             .iter()
             .filter(|n| n.parent.is_none())
-            .map(|n| n.used[BUDGET_MAPS].max(0) as u64)
-            .sum()
+            .fold((0, 0), |(maps, reserved), n| {
+                (
+                    maps + n.used[BUDGET_MAPS].max(0) as u64,
+                    reserved + n.reserved,
+                )
+            })
     }
 
     /// `n` and its ancestors, nearest first. A parent is always minted before its child, so the walk
@@ -20849,7 +20917,7 @@ impl BudgetTree {
 
     /// Charge each `(dimension, amount)` of `set` to `n` and every ancestor, under one lock: all of
     /// them, or — when the limits `fits` names lack the room for one — none. Under [`Fits::All`] a set
-    /// names each dimension once.
+    /// names each dimension once. A set may name [`RESERVED`] too, which no ceiling bounds.
     fn add(&self, n: u32, set: &[(usize, u64)], fits: Fits) -> bool {
         let mut nodes = self.0.lock_unpoisoned();
         if (n as usize) >= nodes.len() {
@@ -20857,23 +20925,35 @@ impl BudgetTree {
         }
         let amount = |a: u64| i64::try_from(a).unwrap_or(i64::MAX);
         let full = |&(d, a): &(usize, u64)| {
-            let room = Self::left(&nodes, n, d);
-            room >= 0 && amount(a) > room
+            d != RESERVED && {
+                let room = Self::left(&nodes, n, d);
+                room >= 0 && amount(a) > room
+            }
         };
         if fits == Fits::All && set.iter().any(full) {
             return false;
         }
-        // #2268 — the process's mappings are every run's to share.
-        let maps = set
-            .iter()
-            .filter(|&&(d, _)| d == BUDGET_MAPS)
-            .map(|&(_, a)| a);
-        if !maps_take(maps.sum(), fits != Fits::Forced) {
+        // #2268, #2305 — the process's mappings and address space are every run's to share.
+        let of = |dim: usize| -> u64 {
+            set.iter()
+                .filter(|&&(d, _)| d == dim)
+                .map(|&(_, a)| a)
+                .sum()
+        };
+        let (maps, reserved, check) = (of(BUDGET_MAPS), of(RESERVED), fits != Fits::Forced);
+        if !MAPS_IN_USE.take(maps, maps_pool(), check) {
+            return false;
+        }
+        if !RESERVED_IN_USE.take(reserved, RESERVED_POOL, check) {
+            MAPS_IN_USE.give(maps);
             return false;
         }
         Self::each_level(&mut nodes, n, |node| {
             for &(d, a) in set {
-                node.used[d] = node.used[d].saturating_add(amount(a));
+                match d {
+                    RESERVED => node.reserved = node.reserved.saturating_add(a),
+                    d => node.used[d] = node.used[d].saturating_add(amount(a)),
+                }
             }
         });
         true
@@ -20916,12 +20996,21 @@ impl BudgetTree {
             return;
         }
         let amount = |a: u64| i64::try_from(a).unwrap_or(i64::MAX);
-        for &(d, a) in set.iter().filter(|&&(d, _)| d == BUDGET_MAPS) {
-            maps_give(amount(a).min(nodes[n as usize].used[d]).max(0) as u64);
+        // #2268, #2305 — the process's pools get back what `n` gives back, never more than it holds.
+        let held = nodes[n as usize];
+        for &(d, a) in set {
+            match d {
+                BUDGET_MAPS => MAPS_IN_USE.give(amount(a).min(held.used[d]).max(0) as u64),
+                RESERVED => RESERVED_IN_USE.give(a.min(held.reserved)),
+                _ => {}
+            }
         }
         Self::each_level(&mut nodes, n, |node| {
             for &(d, a) in set {
-                node.used[d] = node.used[d].saturating_sub(amount(a)).max(0);
+                match d {
+                    RESERVED => node.reserved = node.reserved.saturating_sub(a),
+                    d => node.used[d] = node.used[d].saturating_sub(amount(a)).max(0),
+                }
             }
         });
     }
@@ -23630,6 +23719,10 @@ pub struct Host {
     /// ([`Host::process_powerbox`]), across an exec, as [`Self::own_window`] is. A detached child's
     /// lease holds it instead ([`Lease`]).
     domain_maps: u64,
+    /// #2305 — the address space its window reserves ([`RESERVED`]) while this domain holds it
+    /// itself, as [`Self::domain_maps`]. A detached child's lease holds it instead
+    /// ([`Lease::reserved`]).
+    reserved: u64,
     /// #2220 — this domain has ended: its memory went back ([`Host::release_memory`]), so nothing
     /// more is granted into it ([`Host::grant_running_child`]) — a pipe end granted after its ends
     /// were released would hold its count forever. Set under the domain's lock, so a grant either
@@ -24605,6 +24698,7 @@ impl Host {
             paid_runs: WINDOW_RUNS,
             maps: 0,
             domain_maps: 0,
+            reserved: 0,
             ended: false,
             pipes: Vec::new(),
             lane_cap: -1, // D66 — unbounded by default
@@ -24732,11 +24826,21 @@ impl Host {
     /// fork factory runs, so a refusal registers no process. They go back when the process ends
     /// ([`Self::release_memory`]). `None`, with nothing charged, when a level lacks the room or the
     /// powerbox cannot be duplicated.
+    ///
+    /// #2305 — and the address space its window reserves, held against the process's pool
+    /// ([`RESERVED_POOL`]). A fork copies this domain's window and a spawn builds one of its geometry,
+    /// so it reserves what this domain's does: [`Self::reserved`], or for a detached child, whose
+    /// lease holds its own, the default mask domain raised to its size ([`Lease::reserved`]).
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64, runs: u64) -> Option<Host> {
         let maps = runs.saturating_sub(WINDOW_RUNS);
+        let reserved = match self.reserved {
+            0 => reservation(window, DEFAULT_RESERVED_LOG2),
+            own => own,
+        };
         let cost = [
             (BUDGET_MEM, window + grown),
             (BUDGET_MAPS, MAPS_PER_DOMAIN + maps),
+            (RESERVED, reserved),
         ];
         if !self.budgets.add(self.own_budget, &cost, Fits::All) {
             return None;
@@ -24748,6 +24852,7 @@ impl Host {
         twin.own_window = window;
         twin.grown = grown;
         (twin.runs, twin.maps, twin.domain_maps) = (runs, maps, MAPS_PER_DOMAIN);
+        twin.reserved = reserved;
         Some(twin)
     }
 
@@ -27767,7 +27872,8 @@ impl Host {
     /// #2268 — a freeze carries no `maps` (each process's mappings are its own), so the lease's are
     /// charged again here, past any ceiling: the bound on its window's runs from its program
     /// ([`window_runs_bound`]), which `child`'s window is paid for up to ([`Self::paid_runs`]); what
-    /// it holds past them, its §13 pages among them, is counted once it starts.
+    /// it holds past them, its §13 pages among them, is counted once it starts. #2305 — nor any
+    /// address space, so the lease's is charged again with them.
     pub fn relaunch_lease(&self, child: &mut Host, window_log2: u8) -> Option<Lease> {
         let node = child.budget_node(child.resolve_cap_name("budget")?)?;
         let slot = self
@@ -27781,7 +27887,8 @@ impl Host {
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
-        self.budgets.force_charge(node, BUDGET_MAPS, lease.maps());
+        let held = [(BUDGET_MAPS, lease.maps()), (RESERVED, lease.reserved())];
+        self.budgets.add(node, &held, Fits::Forced);
         child.paid_runs = lease.runs;
         Some(lease)
     }
@@ -27917,11 +28024,13 @@ impl Host {
     }
 
     /// #2268 — hand back what this domain holds of `maps` itself ([`Self::maps`],
-    /// [`Self::domain_maps`]): its window is gone.
+    /// [`Self::domain_maps`]), and (#2305) of address space ([`Self::reserved`]): its window is gone.
     fn release_maps(&mut self) {
         let held = std::mem::take(&mut self.maps) + std::mem::take(&mut self.domain_maps);
-        if held > 0 {
-            self.budgets.refund(self.own_budget, BUDGET_MAPS, held);
+        let reserved = std::mem::take(&mut self.reserved);
+        if held > 0 || reserved > 0 {
+            let set = [(BUDGET_MAPS, held), (RESERVED, reserved)];
+            self.budgets.refund_set(self.own_budget, &set);
         }
         self.runs = WINDOW_RUNS;
     }
@@ -27935,6 +28044,7 @@ impl Host {
             runs: self.runs,
             maps: self.maps,
             domain_maps: self.domain_maps,
+            reserved: self.reserved,
         }
     }
 
@@ -27947,6 +28057,7 @@ impl Host {
             runs: self.runs,
             maps: self.maps,
             domain_maps: self.domain_maps,
+            reserved: self.reserved,
         } = h;
     }
 
@@ -27976,12 +28087,12 @@ impl Host {
     /// a thaw starts with the limit its embedder passes. What an earlier activation's window held goes
     /// back first. Then the root's window and its main vCPU are its own node's, as a child's are its
     /// budget's, charged past any ceiling, since they are what its embedder chose to run: a grant they
-    /// exceed leaves the run room for nothing more. #2268 — but never past the process's pool of
-    /// mappings ([`maps_pool`]): with the domain's own mappings and its window's runs, they are one
-    /// charge, and `None`, with nothing charged, is a run the process has no room for, which every
-    /// engine ends with [`Trap::ThreadFault`] before it starts, its main vCPU refused. Otherwise the
-    /// domain the last activation ended is live again ([`Self::ended`]), and this returns the node its
-    /// vCPUs draw from.
+    /// exceed leaves the run room for nothing more. #2268, #2305 — but never past the process's pools
+    /// of mappings ([`maps_pool`]) and of address space ([`RESERVED_POOL`]): with the domain's own
+    /// mappings, its window's runs and its reservation, they are one charge, and `None`, with nothing
+    /// charged, is a run the process has no room for, which every engine ends with
+    /// [`Trap::ThreadFault`] before it starts, its main vCPU refused. Otherwise the domain the last
+    /// activation ended is live again ([`Self::ended`]), and this returns the node its vCPUs draw from.
     pub fn begin_activation(&mut self, fuel: u64, window: RootWindow) -> Option<NodeRef> {
         let held = std::mem::take(&mut self.grown) + std::mem::take(&mut self.own_window);
         if held > 0 {
@@ -27997,6 +28108,7 @@ impl Host {
         let set: Vec<(usize, u64)> = [
             (BUDGET_MEM, window.declared + window.grown),
             (BUDGET_MAPS, MAPS_PER_DOMAIN + runs),
+            (RESERVED, window.reserved),
         ]
         .into_iter()
         .chain(vcpu.iter().copied())
@@ -28006,6 +28118,7 @@ impl Host {
         }
         (self.own_window, self.grown) = (window.declared, window.grown);
         (self.domain_maps, self.runs, self.maps) = (MAPS_PER_DOMAIN, window.runs, runs);
+        self.reserved = window.reserved;
         self.main_vcpu = true;
         self.ended = false;
         self.budgets.set_fuel_room(self.own_budget, fuel);
@@ -31371,16 +31484,13 @@ impl Host {
         self.budgets.0.lock_unpoisoned().clone()
     }
 
-    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it. #2268 — the
-    /// process's pool of mappings follows what the tree holds of `maps`.
+    /// #1866 — put this run's budget tree back as [`Host::budget_tree`] captured it. #2268, #2305 —
+    /// the process's pools follow what the tree holds of `maps` and of address space.
     pub(crate) fn set_budget_tree(&self, nodes: &[BudgetNode]) {
         let mut tree = self.budgets.0.lock_unpoisoned();
-        let (was, now) = (BudgetTree::maps_held(&tree), BudgetTree::maps_held(nodes));
-        if now > was {
-            maps_take(now - was, false);
-        } else {
-            maps_give(was - now);
-        }
+        let (was, now) = (BudgetTree::pooled(&tree), BudgetTree::pooled(nodes));
+        MAPS_IN_USE.settle(was.0, now.0);
+        RESERVED_IN_USE.settle(was.1, now.1);
         *tree = nodes.to_vec();
     }
 
@@ -31981,8 +32091,9 @@ impl Host {
         host.main_vcpu = std::mem::take(&mut self.main_vcpu);
         // #2268 — and so is the domain's own share of the host's mappings, and its window's: what the
         // caller's held, settled to the image's bound, and to the runs its window starts with once it
-        // does ([`Self::start_window`]).
+        // does ([`Self::start_window`]). #2305 — and the address space the window reserves.
         host.domain_maps = std::mem::take(&mut self.domain_maps);
+        host.reserved = std::mem::take(&mut self.reserved);
         let held = std::mem::take(&mut self.maps);
         if held > need {
             self.budgets
@@ -34096,7 +34207,7 @@ impl Mem {
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
     ///
     /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
-    /// 1-TiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// 128 GiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
     /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
     /// would over the engine's own reservation right up to the first access, which the emitted tier's
     /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
@@ -34635,7 +34746,7 @@ impl Mem {
         // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
         // host) still gets its single covering page marked — confinement keeps its accesses in-window.
         // The **declared** window, not the reservation: a carve's are equal, but a detached window
-        // reserves 2^40 bytes (#1863) — its tail is growth (`vm_map`), never pager-supplied.
+        // reserves 2^37 bytes (#1863) — its tail is growth (`vm_map`), never pager-supplied.
         let pages = self.window.mapped().div_ceil(self.page).max(1);
         let mut space = self.space_write();
         for p in 0..pages {
@@ -37005,6 +37116,7 @@ mod growth_tests {
             declared: 2 * WINDOW,
             grown: GROWTH,
             runs: WINDOW_RUNS,
+            reserved: 1 << 20,
         };
         let _ = root.begin_activation(u64::MAX, wider);
         assert_eq!(
@@ -38027,7 +38139,7 @@ mod mem_fork_tests {
 
     /// #2102 — a window over a backing that grows in place (a cooperative tier-up run's root, or a
     /// detached child's in such a run) forks a twin whose backing grows too: flat and sized to the
-    /// window, on every target, under the 1 TiB reservation the bounded-twin rule above refuses.
+    /// window, on every target, under the 128 GiB reservation the bounded-twin rule above refuses.
     #[test]
     fn a_twin_of_a_window_that_grows_in_place_grows_in_place() {
         let page = host_page_size();
@@ -38048,7 +38160,7 @@ mod mem_fork_tests {
     /// #1145 — the flat primary-backing seam, pinned on the non-unix arm (a forced `Paged` default,
     /// since a unix `Region::new` always comes back flat): a bounded reservation gets an **owned flat**
     /// backing (lock-free, tier-up eligible — the browser bash window), an over-cap reservation keeps
-    /// the `Paged` default (the 1 TiB `DEFAULT_RESERVED_LOG2` engine window), and a flat default (the
+    /// the `Paged` default (the 128 GiB `DEFAULT_RESERVED_LOG2` engine window), and a flat default (the
     /// unix `mmap` arm) is kept as-is (lazy beats an eager buffer). `back.len() == reserved` on the
     /// flat arm, so every confined access stays in bounds.
     #[test]
@@ -38063,7 +38175,7 @@ mod mem_fork_tests {
         );
         assert_eq!(b.len(), bounded, "flat backing spans the whole reservation");
 
-        // Over-cap, non-flat default: keep the Paged default (an eager 1 TiB buffer is infeasible).
+        // Over-cap, non-flat default: keep the Paged default (an eager 128 GiB buffer is infeasible).
         let over = Mem::FLAT_BACKING_CAP * 2;
         let b = Mem::reserved_backing_over(Region::paged(over, page), over, page);
         assert!(

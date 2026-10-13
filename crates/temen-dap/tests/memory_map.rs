@@ -199,7 +199,7 @@ fn memory_map_reports_geometry_and_grown_pages() {
     );
     assert_eq!(
         map.get("reserved").and_then(|v| v.as_i64()),
-        Some(1 << 40),
+        Some(1 << temen_ir::DEFAULT_RESERVED_LOG2),
         "reservation"
     );
     let pages = map

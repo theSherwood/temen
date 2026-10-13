@@ -4468,7 +4468,7 @@ pub fn bash_exec_with(
 
 /// #1145 — the **mask domain** (`1 << N` bytes) a browser bash window runs in. `bash.temen` declares a
 /// 2 MiB window and grows its heap only a little past it (observed ~2.06 MiB), and coreutil twins are
-/// smaller — so a bounded reservation, unlike the 1 TiB [`temen_ir::DEFAULT_RESERVED_LOG2`], lets the
+/// smaller — so a bounded reservation, unlike the 128 GiB [`temen_ir::DEFAULT_RESERVED_LOG2`], lets the
 /// engine back the window with a **flat `Owned` buffer** (lock-free) instead of the per-access-locked
 /// `Paged` fallback wasm otherwise forces (no `mmap`). 32 MiB is generous headroom for a playground
 /// shell while keeping the eager allocation cheap; a guest that outgrows it faults (fail-closed), the

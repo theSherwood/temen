@@ -236,8 +236,8 @@ enum Filed {
     Slot(i32),
     /// The domain is at its §15 live-vCPU ceiling — nothing was taken.
     AtCeiling,
-    /// Admitted, then refused (a task stack or a pre-map alias the platform could not give): the
-    /// child never ran, its teardown already ran, the §15 reservation is released.
+    /// Admitted, then refused (a window, a task stack or a pre-map alias the platform could not
+    /// give): the child never ran, its teardown already ran, the §15 reservation is released.
     Refused,
 }
 
@@ -2605,10 +2605,10 @@ unsafe fn spawn_detached_child(
             *trap_out = TrapKind::ThreadFault as i64;
             0
         }
-        // The child never ran (a refused pre-map alias or task stack) — the one refusal on this
-        // path that happens *after* `budget_mem_take` committed. Its teardown already ran, and that
-        // un-spent the window bytes (#1587), so answer `-EINVAL` like every other admission failure
-        // (INVARIANTS #5).
+        // The child never ran (a refused window, pre-map alias or task stack) — the one refusal on
+        // this path that happens *after* `budget_mem_take` committed. Its teardown already ran, and
+        // that un-spent the window bytes (#1587), so answer `-EINVAL` like every other admission
+        // failure (INVARIANTS #5).
         Filed::Refused => EINVAL as i32,
     }
 }

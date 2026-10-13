@@ -569,7 +569,7 @@ pub(crate) enum FutexKey {
 /// the same virtual address at once, but they reuse it constantly — a freed reservation is handed
 /// straight back out — while the purge runs from the host's teardown, i.e. *after* the reservation is
 /// released. A dying run could therefore forget pages a live one had already recorded, and since a
-/// window purge spans the whole 1 TiB reservation it did not have to be anywhere near the same base
+/// window purge spans its whole reservation it did not have to be anywhere near the same base
 /// to do it.
 ///
 /// That is not hypothetical. `child_exec_jit`'s ping-pong test hangs about 1 run in 10 at

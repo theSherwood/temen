@@ -593,7 +593,7 @@ fn drive_leaf(mut run: bytecode::CoopRun, requests: &CapRequests) -> Ran {
 }
 
 /// A run of `m` over a window **reserved at its declared size**. A root leaf needs a window emitted
-/// code can address flat: unix's lazy `mmap` gives the default 1-TiB reservation one, but elsewhere
+/// code can address flat: unix's lazy `mmap` gives the default 128 GiB reservation one, but elsewhere
 /// (Windows, wasm) that reservation is a sparse table, and only a reservation within the flat-buffer
 /// cap is backed flat — so a run at the default runs its root interpreted there, by design.
 fn coop_with(m: &temen_ir::Module, host: Host, tierup: Option<TierUpConfig>) -> bytecode::CoopRun {
@@ -648,7 +648,7 @@ fn the_root_runs_as_an_emitted_leaf_and_parks_on_declared_caps() {
         "one tier-up at the entry, two parks inside it, one resume of its frames"
     );
 
-    // Every constructor that holds the image offers it: `CoopRun::new` too, whose default 1-TiB
+    // Every constructor that holds the image offers it: `CoopRun::new` too, whose default 128 GiB
     // reservation only unix's lazy `mmap` backs flat (elsewhere that root interprets, by design).
     #[cfg(unix)]
     {
