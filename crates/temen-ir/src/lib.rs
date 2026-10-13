@@ -5347,6 +5347,45 @@ pub enum LinkError {
     NotLoadable(&'static str),
 }
 
+/// The reason in a C linker's words where one applies, so an embedder can show it as it stands (#2297).
+impl core::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LinkError::DuplicateSymbol(name) => write!(f, "multiple definition of `{name}`"),
+            LinkError::BadExport { symbol, index } => {
+                write!(
+                    f,
+                    "export `{symbol}` names function {index}, past the unit's functions"
+                )
+            }
+            LinkError::Unresolved(name) => write!(f, "undefined reference to `{name}`"),
+            LinkError::BadDataPtr { at } => {
+                write!(
+                    f,
+                    "a data pointer slot at {at:#x} lies outside the unit's data segments"
+                )
+            }
+            LinkError::BadImportIndex(i) => {
+                write!(
+                    f,
+                    "a call names import {i}, which the unit does not declare"
+                )
+            }
+            LinkError::ImportShapeMismatch(why) => f.write_str(why),
+            LinkError::AttachResolved(name) => {
+                write!(
+                    f,
+                    "`{name}` is attached at run time but names an exported function"
+                )
+            }
+            LinkError::TlsMismatch(name) => {
+                write!(f, "`{name}` is thread-local in one unit and not in another")
+            }
+            LinkError::NotLoadable(what) => write!(f, "a loaded unit cannot carry {what}"),
+        }
+    }
+}
+
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
 /// 1–2). Concatenate the units' functions into one list, **reindexing** each unit's internal function
 /// references by its base offset; place each unit's **data** in a non-overlapping window region and
