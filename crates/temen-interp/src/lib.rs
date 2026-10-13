@@ -19442,7 +19442,15 @@ pub use temen_ir::cap_id;
 ///
 /// A seeded shape is also the interface's **op registry**: `cap_dispatch_slots` derives its
 /// unknown-op `CapFault` from `shape.len()`, so an interface with a shape needs no `_ =>` arm.
-fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
+fn preseeded_iface_shapes() -> &'static [(u32, Vec<(&'static str, FuncType)>); 2] {
+    // Built once: every capability call checks its op against it.
+    static SHAPES: std::sync::OnceLock<[(u32, Vec<(&'static str, FuncType)>); 2]> =
+        std::sync::OnceLock::new();
+    SHAPES.get_or_init(seed_iface_shapes)
+}
+
+/// [`preseeded_iface_shapes`]' table, as it is built.
+fn seed_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
     let rw = FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
@@ -19478,7 +19486,7 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
 /// rather than a silently-unified builtin. Consulted before allocating a guest id in
 /// [`Host::intern_interface`].
 fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
-    preseeded_iface_shapes().into_iter().find_map(|(id, ops)| {
+    preseeded_iface_shapes().iter().find_map(|(id, ops)| {
         (ops.len() == sigs.len()
             && ops.len() == names.len()
             && ops
@@ -19486,7 +19494,7 @@ fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
                 .zip(sigs)
                 .zip(names)
                 .all(|(((cn, s), t), n)| s == t && cn == n))
-        .then_some(id)
+        .then_some(*id)
     })
 }
 
@@ -19512,10 +19520,9 @@ pub struct ShapeRefusal {
 /// is [`preseeded_iface_shapes`], so this cannot drift from what `coverage_remap` and
 /// `cap_dispatch_slots` already derive from the same table.
 fn canonical_op_sig(type_id: u32, op: u32) -> Option<FuncType> {
-    builtin_iface_shape(type_id)?
-        .into_iter()
-        .nth(op as usize)
-        .map(|(_, ft)| ft)
+    builtin_iface_ops(type_id)?
+        .get(op as usize)
+        .map(|(_, ft)| ft.clone())
 }
 
 /// Does `declared` bind as the capability whose pinned signature is `expected`?
@@ -19539,9 +19546,14 @@ fn sig_binds_as_capability(declared: &FuncType, expected: &FuncType) -> bool {
 /// Returns `None` for a built-in that is not pre-seeded (handle-typed built-ins, `HOST_PROC`) or an
 /// unknown id.
 pub fn builtin_iface_shape(id: u32) -> Option<Vec<(&'static str, FuncType)>> {
+    builtin_iface_ops(id).map(<[_]>::to_vec)
+}
+
+/// [`builtin_iface_shape`], borrowed: what a capability call checks its op against.
+fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
     preseeded_iface_shapes()
-        .into_iter()
-        .find_map(|(bid, ops)| (bid == id).then_some(ops))
+        .iter()
+        .find_map(|(bid, ops)| (*bid == id).then_some(&ops[..]))
 }
 
 /// Negative-errno values returned by capability ops (§3e D42): `< 0` is `-errno`,
@@ -19921,9 +19933,10 @@ pub enum ClassChange {
 /// pages, which it leaves alone (`(false, false)` and [`ClassChange::Keep`] count the pages as they
 /// are). Pages outside the span keep their runs, so an op changes the window's mappings by
 /// `after - before`. A page absent from the map takes the region default: no access below `guard`
-/// (the JIT keeps its NULL guard outside its map), read-write below `mapped`, none above. One pass
-/// over the map's entries in the span, however large it is, and nothing allocated: a page op pays
-/// it before every op.
+/// (the JIT keeps its NULL guard outside its map), read-write below `mapped`, none above. Nothing
+/// is allocated, and a page op pays it before every op: a span of a few pages (a one-page op and its
+/// two neighbours) is classed page by page, and a longer one walked as the map's entries in it and
+/// the gaps between them, in one pass however large it is. Either looks into the map once.
 pub fn page_runs<S>(
     map: &BTreeMap<u64, S>,
     pages: core::ops::RangeInclusive<u64>,
@@ -19943,6 +19956,8 @@ pub fn page_runs<S>(
             }
         }
     }
+    /// The spans classed page by page: up to this many pages.
+    const FEW: u64 = 4;
     let (first, last) = (*pages.start(), *pages.end());
     // The pages `change` reaches: `[from, to)`.
     let (from, to) = (
@@ -19961,41 +19976,67 @@ pub fn page_runs<S>(
             PageClass::Own(_) => PageClass::own(prot),
         },
     };
-    let (mut before, mut after) = (Runs::default(), Runs::default());
-    // Pages `[a, b)` of class `c`: before as they are, after as `change` leaves each part.
-    let mut piece = |c: PageClass, a: u64, b: u64| {
-        if a >= b {
-            return;
-        }
-        before.push(c);
-        for (part, (x, y)) in [
-            (c, (a, b.min(from))),
-            (changed(c), (a.max(from), b.min(to))),
-            (c, (a.max(to), b)),
-        ] {
-            if x < y {
-                after.push(part);
+    // The span as the map's entries and the gaps between them.
+    let walk = || {
+        let (mut before, mut after) = (Runs::default(), Runs::default());
+        // Pages `[a, b)` of class `c`: before as they are, after as `change` leaves each part.
+        let mut piece = |c: PageClass, a: u64, b: u64| {
+            if a >= b {
+                return;
             }
+            before.push(c);
+            for (part, (x, y)) in [
+                (c, (a, b.min(from))),
+                (changed(c), (a.max(from), b.min(to))),
+                (c, (a.max(to), b)),
+            ] {
+                if x < y {
+                    after.push(part);
+                }
+            }
+        };
+        // The absent pages `[a, b)`, split where the default changes.
+        fn gap(
+            piece: &mut impl FnMut(PageClass, u64, u64),
+            (guard, mapped): (u64, u64),
+            a: u64,
+            b: u64,
+        ) {
+            piece(PageClass::Own(0), a, b.min(guard));
+            piece(PageClass::Own(2), a.max(guard), b.min(mapped));
+            piece(PageClass::Own(0), a.max(guard).max(mapped), b);
         }
+        let mut next = first;
+        for (&p, s) in map.range(first..).take_while(|&(&p, _)| p <= last) {
+            gap(&mut piece, (guard, mapped), next, p);
+            piece(class(p, s), p, p + 1);
+            next = p + 1;
+        }
+        gap(&mut piece, (guard, mapped), next, last + 1);
+        (before.1, after.1)
     };
-    // The absent pages `[a, b)`, split where the default changes.
-    fn gap(
-        piece: &mut impl FnMut(PageClass, u64, u64),
-        (guard, mapped): (u64, u64),
-        a: u64,
-        b: u64,
-    ) {
-        piece(PageClass::Own(0), a, b.min(guard));
-        piece(PageClass::Own(2), a.max(guard), b.min(mapped));
-        piece(PageClass::Own(0), a.max(guard).max(mapped), b);
+    if last.saturating_sub(first) >= FEW {
+        return walk();
     }
-    let mut next = first;
-    for (&p, s) in map.range(pages) {
-        gap(&mut piece, (guard, mapped), next, p);
-        piece(class(p, s), p, p + 1);
-        next = p + 1;
+    let (mut before, mut after) = (Runs::default(), Runs::default());
+    let mut entries = map.range(first..).peekable();
+    for p in first..=last {
+        let c = match entries.next_if(|&(&q, _)| q == p) {
+            Some((_, s)) => class(p, s),
+            None => PageClass::Own(if p < guard || p >= mapped { 0 } else { 2 }),
+        };
+        before.push(c);
+        after.push(if (from..to).contains(&p) {
+            changed(c)
+        } else {
+            c
+        });
     }
-    gap(&mut piece, (guard, mapped), next, last + 1);
+    debug_assert_eq!(
+        (before.1, after.1),
+        walk(),
+        "a few pages, classed one by one, count as the walk does"
+    );
     (before.1, after.1)
 }
 
@@ -25196,7 +25237,7 @@ impl Host {
         // than in each constructor: the slot becomes **unbound**, so a call through it gets the
         // same fail-closed `CapFault` an never-attached rebindable slot gets. No new mechanism.
         for b in &mut bindings {
-            if let Some(shape) = builtin_iface_shape(b.type_id) {
+            if let Some(shape) = builtin_iface_ops(b.type_id) {
                 if b.op as usize >= shape.len() {
                     b.bound = false;
                 }
@@ -28484,8 +28525,12 @@ impl Host {
     /// `None` for a handle-typed built-in (no pre-seeded shape) or an unknown id. Read-only,
     /// authority-neutral reflection (D46: reflection ≠ amplification).
     pub fn iface_schema(&self, type_id: u32) -> Option<Vec<(String, FuncType)>> {
-        if let Some(ops) = builtin_iface_shape(type_id) {
-            return Some(ops.into_iter().map(|(n, ft)| (n.to_string(), ft)).collect());
+        if let Some(ops) = builtin_iface_ops(type_id) {
+            return Some(
+                ops.iter()
+                    .map(|(n, ft)| (n.to_string(), ft.clone()))
+                    .collect(),
+            );
         }
         let i = type_id.checked_sub(cap_id::GUEST_IMPL_BASE)? as usize;
         let (names, sigs) = self.iface_intern.get(i)?;
@@ -32298,7 +32343,7 @@ impl Host {
         // the import layer already gives an out-of-range consumer op above. Interfaces with no
         // seeded shape keep their per-arm answer until their signature convention is pinned and
         // they are seeded; then this one check covers them with no arm to touch.
-        if let Some(shape) = builtin_iface_shape(type_id) {
+        if let Some(shape) = builtin_iface_ops(type_id) {
             if op as usize >= shape.len() {
                 return Err(Trap::CapFault);
             }
