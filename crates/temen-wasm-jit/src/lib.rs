@@ -1011,6 +1011,18 @@ pub fn outline_nested_cap_calls(m: &mut Module) {
 }
 
 fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<ValType>, Error> {
+    block_value_types_with(m, b, nested_caps, |_| {})
+}
+
+/// [`block_value_types`], telling `defined` after each instruction how many values the block has
+/// so far: instruction `j` defines the values from the previous count (the block's params, for the
+/// first) up to this one.
+fn block_value_types_with(
+    m: &Module,
+    b: &Block,
+    nested_caps: bool,
+    mut defined: impl FnMut(usize),
+) -> Result<Vec<ValType>, Error> {
     let mut tys: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
         match inst {
@@ -1123,8 +1135,83 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
             }
             _ => return Err(Error::Unsupported("instruction outside the v1 subset")),
         }
+        defined(tys.len());
     }
     Ok(tys)
+}
+
+/// Each value of `b`, with its type and its **slot**: its index in its type's pool of locals
+/// ([`emit_func`]). Values whose live ranges are disjoint share a slot (#2281): V8's baseline compiler
+/// walks every local at every merge, so a function that gave each of its thousand values a local of
+/// its own compiled many times slower per byte.
+///
+/// One backward pass over the block. A value takes a free slot at its last read, or at its
+/// definition when nothing reads it, and gives it back at its definition. An instruction's operands
+/// take theirs while its results still hold theirs, so a result never shares a slot with an operand
+/// of its own instruction: a lowering may write a result before it has read every operand. The
+/// terminator's operands are live to the end of the block, and every param holds a slot from its
+/// start, since each edge into the block writes them all.
+fn block_slots(
+    m: &Module,
+    b: &Block,
+    nested_caps: bool,
+    scratch: &mut SlotScratch,
+) -> Result<(Vec<ValType>, Vec<u32>), Error> {
+    let SlotScratch { ends, free } = scratch;
+    ends.clear();
+    let tys = block_value_types_with(m, b, nested_caps, |n| ends.push(n))?;
+    free.iter_mut().for_each(Vec::clear);
+    let mut next = [0u32; NTYPES];
+    let mut slot = vec![u32::MAX; tys.len()];
+    let mut take = |v: usize, slot: &mut [u32], free: &mut [Vec<u32>; NTYPES]| {
+        if slot[v] == u32::MAX {
+            let t = val_type_slot(tys[v]);
+            slot[v] = free[t].pop().unwrap_or_else(|| {
+                next[t] += 1;
+                next[t] - 1
+            });
+        }
+    };
+    b.term
+        .for_each_operand(&mut |v| take(*v as usize, &mut slot, free));
+    for (j, inst) in b.insts.iter().enumerate().rev() {
+        let defs = j.checked_sub(1).map_or(b.params.len(), |p| ends[p])..ends[j];
+        inst.for_each_operand(&mut |v| take(*v as usize, &mut slot, free));
+        for r in defs.clone() {
+            take(r, &mut slot, free); // a result nothing reads still writes its local
+        }
+        for r in defs {
+            free[val_type_slot(tys[r])].push(slot[r]);
+        }
+    }
+    for v in 0..b.params.len() {
+        take(v, &mut slot, free); // a param nothing reads is still written by every edge in
+    }
+    Ok((tys, slot))
+}
+
+/// [`block_slots`]' buffers, reused across a function's blocks: where each instruction's results
+/// end, and each pool's free slots.
+#[derive(Default)]
+struct SlotScratch {
+    ends: Vec<usize>,
+    free: [Vec<u32>; NTYPES],
+}
+
+/// One pool of locals per [`ValType`] variant: I32, I64, F32, F64, V128, Ref, Cap.
+const NTYPES: usize = 7;
+
+/// The pool a value of type `t` takes its local from.
+fn val_type_slot(t: ValType) -> usize {
+    match t {
+        ValType::I32 => 0,
+        ValType::I64 => 1,
+        ValType::F32 => 2,
+        ValType::F64 => 3,
+        ValType::V128 => 4,
+        ValType::Ref => 5,
+        ValType::Cap => 6,
+    }
 }
 
 // ---- tiering analysis (slice 3): which functions the JIT tier emits vs. leaves to the interp ------
@@ -4926,34 +5013,22 @@ fn emit_func(
     // Sharing is safe because the only cross-block local write, `emit_edge`, pushes **all** branch
     // args onto the operand stack before storing any target param, so a target param slot that aliases
     // a source value slot still reads the old value first (the same property that already made a
-    // param-permuting self-branch safe). Within a block each value keeps a distinct slot (assigned by
-    // per-type rank), so no live value is clobbered.
-    let per_block_types: Vec<Vec<ValType>> = f
+    // param-permuting self-branch safe). Within a block, values whose live ranges are disjoint share
+    // a slot too ([`block_slots`]), so a type needs only as many locals as it has values live at once.
+    let mut scratch = SlotScratch::default();
+    let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
         .blocks
         .iter()
-        .map(|b| block_value_types(m, b, nested_caps))
-        .collect::<Result<_, _>>()?;
-    // Pool size per type = the max count of that type in any single block.
-    const NTYPES: usize = 7; // I32, I64, F32, F64, V128, Ref, Cap (the ValType variants)
-    let type_slot = |t: ValType| -> usize {
-        match t {
-            ValType::I32 => 0,
-            ValType::I64 => 1,
-            ValType::F32 => 2,
-            ValType::F64 => 3,
-            ValType::V128 => 4,
-            ValType::Ref => 5,
-            ValType::Cap => 6, // §3.5 i32-width handle marker
-        }
-    };
+        .map(|b| block_slots(m, b, nested_caps, &mut scratch))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    // Pool size per type = the most slots of that type any single block uses.
     let mut pool: [u32; NTYPES] = [0; NTYPES];
-    for tys in &per_block_types {
-        let mut per_block = [0u32; NTYPES];
-        for t in tys {
-            per_block[type_slot(*t)] += 1;
-        }
-        for i in 0..NTYPES {
-            pool[i] = pool[i].max(per_block[i]);
+    for (tys, slots) in per_block_types.iter().zip(&per_block_slots) {
+        for (t, s) in tys.iter().zip(slots) {
+            let i = val_type_slot(*t);
+            pool[i] = pool[i].max(s + 1);
         }
     }
     // Lay the pools out contiguously; `base[t]` is the first local index (past the wasm params) of
@@ -4980,22 +5055,14 @@ fn emit_func(
             local_types.push(t);
         }
     }
-    // Map each block's values to pool slots: value `v` of type `t` gets `base[t] + (its rank among
-    // same-typed values in the block)`. Reused across blocks — block B's slots overlap block A's.
-    let local_of: Vec<Vec<u32>> = per_block_types
-        .iter()
-        .map(|tys| {
-            let mut used = [0u32; NTYPES];
-            tys.iter()
-                .map(|t| {
-                    let s = type_slot(*t);
-                    let idx = n_params + base[s] + used[s];
-                    used[s] += 1;
-                    idx
-                })
-                .collect()
-        })
-        .collect();
+    // Map each block's values to pool slots: value `v` of type `t` gets `base[t] + its slot`. Reused
+    // across blocks — block B's slots overlap block A's.
+    let mut local_of = per_block_slots;
+    for (tys, slots) in per_block_types.iter().zip(&mut local_of) {
+        for (t, s) in tys.iter().zip(slots.iter_mut()) {
+            *s += n_params + base[val_type_slot(*t)];
+        }
+    }
     let next_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
     let ea_l = n_params + local_types.len() as u32;
@@ -5174,32 +5241,21 @@ fn emit_split_group(
 ) -> Result<Vec<u8>, Error> {
     let n_params = 3u32; // win, env, entry
     let nblocks = f.blocks.len();
-    let per_block_types: Vec<Vec<ValType>> = f
+    let mut scratch = SlotScratch::default();
+    let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
         .blocks
         .iter()
-        .map(|b| block_value_types(m, b, nested_caps))
-        .collect::<Result<_, _>>()?;
-    const NTYPES: usize = 7;
-    let type_slot = |t: ValType| -> usize {
-        match t {
-            ValType::I32 => 0,
-            ValType::I64 => 1,
-            ValType::F32 => 2,
-            ValType::F64 => 3,
-            ValType::V128 => 4,
-            ValType::Ref => 5,
-            ValType::Cap => 6,
-        }
-    };
-    // Pool per type = max count in any of THIS group's blocks (a group is smaller than the whole func).
+        .map(|b| block_slots(m, b, nested_caps, &mut scratch))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    // Pool per type = the most slots any of THIS group's blocks uses (a group is smaller than the
+    // whole func).
     let mut pool: [u32; NTYPES] = [0; NTYPES];
     for &gb in group_blocks {
-        let mut per_block = [0u32; NTYPES];
-        for t in &per_block_types[gb] {
-            per_block[type_slot(*t)] += 1;
-        }
-        for i in 0..NTYPES {
-            pool[i] = pool[i].max(per_block[i]);
+        for (t, s) in per_block_types[gb].iter().zip(&per_block_slots[gb]) {
+            let i = val_type_slot(*t);
+            pool[i] = pool[i].max(s + 1);
         }
     }
     let mut base = [0u32; NTYPES];
@@ -5226,23 +5282,16 @@ fn emit_split_group(
     }
     // local_of is indexed by GLOBAL block index; only this group's blocks get slot maps (others empty,
     // never referenced here — inter-group edges read the *source* group's locals, all in-group).
-    let local_of: Vec<Vec<u32>> = (0..nblocks)
-        .map(|bi| {
-            if split.block_group[bi] != split.block_group[group_blocks[0]] {
-                return Vec::new();
-            }
-            let mut used = [0u32; NTYPES];
-            per_block_types[bi]
-                .iter()
-                .map(|t| {
-                    let s = type_slot(*t);
-                    let idx = n_params + base[s] + used[s];
-                    used[s] += 1;
-                    idx
-                })
-                .collect()
-        })
-        .collect();
+    let mut local_of = per_block_slots;
+    for (bi, slots) in local_of.iter_mut().enumerate() {
+        if split.block_group[bi] != split.block_group[group_blocks[0]] {
+            slots.clear();
+            continue;
+        }
+        for (t, s) in per_block_types[bi].iter().zip(slots.iter_mut()) {
+            *s += n_params + base[val_type_slot(*t)];
+        }
+    }
     let next_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I32);
     let ea_l = n_params + local_types.len() as u32;
@@ -6698,13 +6747,13 @@ fn emit_edge(
 fn last_uses(b: &Block, n_vals: usize) -> Vec<usize> {
     let mut last = vec![0; n_vals];
     for (j, inst) in b.insts.iter().enumerate() {
-        inst.clone().for_each_operand_mut(&mut |v| {
+        inst.for_each_operand(&mut |v| {
             if let Some(l) = last.get_mut(*v as usize) {
                 *l = j;
             }
         });
     }
-    b.term.clone().for_each_operand_mut(&mut |v| {
+    b.term.for_each_operand(&mut |v| {
         if let Some(l) = last.get_mut(*v as usize) {
             *l = b.insts.len();
         }
