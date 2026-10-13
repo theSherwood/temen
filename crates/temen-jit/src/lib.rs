@@ -2556,6 +2556,77 @@ mod trap_capture_tests {
     }
 }
 
+/// #2312 — a nursery holds the module's own program only for a module that names an
+/// `Instantiator`, the only code that spawns a self child of it. One stood up for §22 units alone,
+/// as for every image temen-run compiles, copies none of the module's code: a unit's self child
+/// runs the unit's program (`crates/temen/tests/unit_instantiator.rs`).
+#[cfg(all(test, fiber_rt))]
+mod nursery_program_tests {
+    use super::{CompiledModule, INERT_CAP_THUNK};
+
+    fn nursery_program(text: &str, table_reserve_log2: u8) -> (usize, usize) {
+        let m = temen_text::parse_module(text).expect("parse");
+        let cm = CompiledModule::compile(
+            &m,
+            0,
+            INERT_CAP_THUNK,
+            core::ptr::null_mut(),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            table_reserve_log2,
+        )
+        .expect("compile");
+        let n = cm._nursery.as_ref().expect("a nursery");
+        (n.funcs().len(), n.types().len())
+    }
+
+    #[test]
+    fn a_nursery_for_units_alone_holds_no_program() {
+        let text = "memory 17
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 7
+  return v0
+  }
+}
+";
+        assert_eq!(nursery_program(text, 10), (0, 0));
+    }
+
+    #[test]
+    fn a_module_that_spawns_keeps_its_program() {
+        let text = "memory 17
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  v2 = i64.extend_i32_s v1
+  v3 = i64.const 0
+  v4 = i64.const 65536
+  v5 = i64.const 16
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  return v7
+  }
+}
+func () -> () {
+block 0 () {
+  return
+  }
+}
+";
+        let m = temen_text::parse_module(text).expect("parse");
+        assert_eq!(
+            nursery_program(text, 0),
+            (m.funcs.len(), m.types.len()),
+            "its own code spawns self children of it"
+        );
+    }
+}
+
 /// Owner decision 2026-07-24 — **domain-teardown semantics** (DESIGN.md §12; ISSUES.md I37; D37
 /// death-is-revocation): `exit(n)` / any trap from ANY vCPU, and the **root vCPU's completion**
 /// (plain clean return included), tear the whole domain down — PARKED siblings included — and the
@@ -3555,42 +3626,51 @@ impl CompiledModule {
         // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
         // today, so the nursery is touched only on the calling thread.
         #[cfg(fiber_rt)]
+        let spawns = module_uses_instantiator(m);
+        #[cfg(fiber_rt)]
         // #1726: also for a module that can **install** §22 units (a reserved `call.dyn` table): an
         // installed unit that instantiates runs in this module's frames, so it needs this nursery
         // even when the module itself names no `Instantiator` (it may only pass the handle on).
-        let nursery: Option<Box<instantiator_rt::Nursery>> =
-            if module_uses_instantiator(m) || table_reserve_log2 > 0 {
-                Some(Box::new(instantiator_rt::Nursery::new(
-                    m.funcs.clone().into(),
-                    m.types.clone().into(),
-                    cap_thunk,
-                    cap_ctx,
-                    resolve_module,
-                    epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
-                    fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
-                    // The run's thread `Domain` (always stood up for a nesting module, above): children
-                    // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
-                    // the parent rendezvous in one table.
-                    domain
-                        .as_ref()
-                        .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
-                        .unwrap_or(0),
-                    0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
-                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
-                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
-                    // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
-                    // (same module) compiles with serve trampolines and can be a child_offer target.
-                    m.impl_exports
-                        .iter()
-                        .flat_map(|e| e.ops.iter().copied())
-                        .collect::<Vec<u32>>()
-                        .into_boxed_slice(),
-                    shadow,
-                    None, // the run's own child executor
-                )))
+        let nursery: Option<Box<instantiator_rt::Nursery>> = if spawns || table_reserve_log2 > 0 {
+            // The module's own program, which a self child of its own code runs (and a thaw re-runs).
+            // Only a module that names an `Instantiator` has such code: a unit's self child runs the
+            // unit's program, so a nursery stood up for units alone holds none (#2312).
+            let (funcs, types) = if spawns {
+                (m.funcs.clone().into(), m.types.clone().into())
             } else {
-                None
+                (Vec::new().into(), Vec::new().into())
             };
+            Some(Box::new(instantiator_rt::Nursery::new(
+                funcs,
+                types,
+                cap_thunk,
+                cap_ctx,
+                resolve_module,
+                epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
+                // The run's thread `Domain` (always stood up for a nesting module, above): children
+                // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
+                // the parent rendezvous in one table.
+                domain
+                    .as_ref()
+                    .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
+                    .unwrap_or(0),
+                0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
+                // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
+                // (same module) compiles with serve trampolines and can be a child_offer target.
+                m.impl_exports
+                    .iter()
+                    .flat_map(|e| e.ops.iter().copied())
+                    .collect::<Vec<u32>>()
+                    .into_boxed_slice(),
+                shadow,
+                None, // the run's own child executor
+            )))
+        } else {
+            None
+        };
         // #964: a marked module's carves may not dip into the reserved NULL region (the host
         // seeds/copies carves outside the guarded call).
         #[cfg(fiber_rt)]
