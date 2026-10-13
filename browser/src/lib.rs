@@ -417,7 +417,8 @@ pub const STATUS_DECODE_ERR: i32 = 1;
 pub const STATUS_UNSUPPORTED: i32 = 2;
 /// The guest trapped (masking/confinement violation, fuel exhaustion, explicit trap, …).
 pub const STATUS_TRAP: i32 = 3;
-/// The guest returned, but not a single `i64` (compute-only v1 only surfaces `i64`).
+/// The guest returned a result the entry cannot report: not a single `i64` for the compute entries,
+/// not an integer for a program run ([`PbOutcome::ended`]).
 pub const STATUS_BAD_RESULT: i32 = 4;
 
 /// Most recent status (a `STATUS_*` code), read via [`temen_status`] after any run entry.
@@ -3371,6 +3372,82 @@ pub struct PbOutcome {
     pub fault_addr: Option<u64>,
 }
 
+impl PbOutcome {
+    /// A run that never started (a decode, verify or setup failure): its `status` and nothing else.
+    fn refused(status: i32) -> PbOutcome {
+        PbOutcome {
+            status,
+            value: 0,
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            framebuffer: None,
+            trap: None,
+            fault_addr: None,
+        }
+    }
+
+    /// How a run ended, as every browser run reports it (#1414 S4-1). `ran` is the engine's answer,
+    /// `None` when the module is outside its subset (`STATUS_UNSUPPORTED`).
+    /// - A return is `STATUS_OK`, its value the first result widened to `i64` (`0` when there is
+    ///   none), or `STATUS_BAD_RESULT` when that result is not an integer.
+    /// - A guest `exit` is `STATUS_EXIT` with its code.
+    /// - Any other trap is `STATUS_TRAP`. The outcome keeps the trap, and a memory fault's
+    ///   window-relative address.
+    fn ended(ran: Option<Result<Vec<Value>, Trap>>, stdout: Vec<u8>, stderr: Vec<u8>) -> PbOutcome {
+        let mut out = PbOutcome {
+            stdout,
+            stderr,
+            ..PbOutcome::refused(STATUS_OK)
+        };
+        match ran {
+            None => out.status = STATUS_UNSUPPORTED,
+            Some(Ok(vals)) => match vals.first() {
+                None => {}
+                Some(Value::I64(x)) => out.value = *x,
+                Some(Value::I32(x)) => out.value = i64::from(*x),
+                Some(_) => out.status = STATUS_BAD_RESULT,
+            },
+            Some(Err(Trap::Exit(code))) => {
+                out.status = STATUS_EXIT;
+                out.exit_code = code;
+            }
+            Some(Err(t)) => {
+                out.status = STATUS_TRAP;
+                if matches!(t, Trap::MemoryFault) {
+                    out.fault_addr = temen_interp::last_capture_fault_addr();
+                }
+                out.trap = Some(t);
+            }
+        }
+        out
+    }
+
+    /// Hand the report to the page (#1414 S4-1): `temen_status`, the stdout and stderr captures,
+    /// `temen_exit_code`, `temen_run_value`, the trap's name, the fault address and the framebuffer.
+    /// Every slot is written, so nothing an earlier run left is read as this run's. Returns the
+    /// run's value.
+    fn publish(self) -> i64 {
+        let (fb, fb_w, fb_h) = self
+            .framebuffer
+            .map_or((Vec::new(), 0, 0), |f| (f.rgba, f.width, f.height));
+        // SAFETY: single-threaded wasm; the slots are read back only through the export accessors.
+        unsafe {
+            LAST_STATUS = self.status;
+            stash(&mut *core::ptr::addr_of_mut!(OUT), self.stdout);
+            stash(&mut *core::ptr::addr_of_mut!(ERR), self.stderr);
+            stash(&mut *core::ptr::addr_of_mut!(FB), fb);
+            FB_W = fb_w;
+            FB_H = fb_h;
+            EXIT_CODE = self.exit_code;
+            RUN_VALUE = self.value;
+            LAST_TRAP = self.trap.as_ref().map_or("", Trap::name);
+            FAULT_ADDR = self.fault_addr.map_or(-1, |a| a as i64);
+        }
+        self.value
+    }
+}
+
 /// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
 /// powerbox guest resolves against via `self.resolve` (F7) / labels via `self.label` (F9). The
 /// browser ABI grants `(stdout, stdin, exit, stderr, clock)` by arity (its set differs from `temen-run`'s
@@ -3422,27 +3499,9 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         }
     }
     let mut fuel = DEFAULT_FUEL;
-    let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host) {
-            None => (STATUS_UNSUPPORTED, 0, 0),
-            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-            Some(Err(_)) => (STATUS_TRAP, 0, 0),
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-                _ => (STATUS_BAD_RESULT, 0, 0),
-            },
-        };
-    PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value,
-        exit_code,
-        stdout: host.take_stdout(),
-        stderr: host.take_stderr(),
-        framebuffer: None, // the browser-corpus powerbox grants no `display` cap
-    }
+    let ran = bytecode::compile_and_run_with_host(m, 0, &slots, &mut fuel, &mut host);
+    // The browser-corpus powerbox grants no `display` cap, so there is no framebuffer.
+    PbOutcome::ended(ran, host.take_stdout(), host.take_stderr())
 }
 
 /// Whether the **on-ramp powerbox** would bind a manifest import named `name`, given the handle set
@@ -4254,19 +4313,9 @@ fn onramp_run(
     nested: bool,
     memo: Option<std::sync::Arc<std::sync::Mutex<temen_interp::bytecode::FuncMemo>>>,
 ) -> PbOutcome {
-    let unsupported = || PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status: STATUS_UNSUPPORTED,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
     set_last_notes(Vec::new());
     if onramp_check(m).is_err() {
-        return unsupported();
+        return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
     let mut host = Host::new();
     if let Some(t) = tee {
@@ -4303,36 +4352,13 @@ fn onramp_run(
     // (no OS threads — so this runs on the wasm32 cdylib, unlike the tree-walker's thread pool). A
     // C guest that grows a large heap with sub-64-KiB `vm_map`s runs unchanged now that the interp's
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
-    let mut trap = None;
-    let (status, value, exit_code) = match bytecode::compile_and_run_seeded_with_host(
-        entry, 0, args, &mut fuel, &init, &mut host,
-    ) {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-        Some(Err(t)) => {
-            trap = Some(t);
-            (STATUS_TRAP, 0, 0)
-        }
-        Some(Ok(vals)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_BAD_RESULT, 0, 0),
-        },
-    };
-    let framebuffer = frame.lock().unwrap().take();
+    let ran =
+        bytecode::compile_and_run_seeded_with_host(entry, 0, args, &mut fuel, &init, &mut host);
     set_last_notes(host.take_notes());
+    let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
-        trap,
-        fault_addr: match trap {
-            Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr(),
-            _ => None,
-        },
-        status,
-        value,
-        exit_code,
-        stdout: host.take_stdout(),
-        stderr: host.take_stderr(),
         framebuffer,
+        ..PbOutcome::ended(ran, host.take_stdout(), host.take_stderr())
     }
 }
 
@@ -4364,18 +4390,8 @@ pub fn onramp_jit_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// Runs on the **bytecode** engine (the browser's interpreter tier), the same engine [`onramp_exec`]
 /// uses; the personality's `HostProc` dispatches through the guest window `bytecode` hands it.
 pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    let unsupported = || PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status: STATUS_UNSUPPORTED,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
     if onramp_check(m).is_err() {
-        return unsupported();
+        return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
     let mut host = Host::new();
     // The personality's `malloc` hands out the top 64 KiB of the guest window (window offsets, as the
@@ -4385,30 +4401,12 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let (px_h, posix) = temen_posix::grant(&mut host, heap_base, win, stdin.to_vec());
     // Bind every manifest import to the personality by name; fail closed on a non-POSIX import.
     if !temen_posix::bind(m, &mut host, px_h) {
-        return unsupported();
+        return PbOutcome::refused(STATUS_UNSUPPORTED);
     }
     let mut fuel = DEFAULT_FUEL;
-    let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
-            None => (STATUS_UNSUPPORTED, 0, 0),
-            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-            Some(Err(_)) => (STATUS_TRAP, 0, 0),
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-                _ => (STATUS_BAD_RESULT, 0, 0),
-            },
-        };
-    PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value,
-        exit_code,
-        stdout: posix.stdout(),
-        stderr: posix.stderr(),
-        framebuffer: None, // the personality grants no `display` cap
-    }
+    let ran = bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host);
+    // The personality owns the shell's fd 1/2, and grants no `display` cap.
+    PbOutcome::ended(ran, posix.stdout(), posix.stderr())
 }
 
 /// Run the **real GNU bash** binary (#802 / #1080) in the browser: the whole-program bash module the
@@ -4488,16 +4486,6 @@ fn bash_run_over_compiled(
     stdin: &[u8],
     commands: &[(PreparedModule, Vec<&str>)],
 ) -> PbOutcome {
-    let unsupported = |status: i32| PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
     let env = bash_env(false);
     let run = PosixRun {
         argv,
@@ -4508,10 +4496,10 @@ fn bash_run_over_compiled(
         loader: false,
     };
     let Some((mut host, posix, init_mem)) = posix_host_build(m, &run) else {
-        return unsupported(STATUS_UNSUPPORTED);
+        return PbOutcome::refused(STATUS_UNSUPPORTED);
     };
     let mut fuel = DEFAULT_FUEL;
-    let (status, value, exit_code) = match bytecode::run_capture_reserved_over_compiled_with_host(
+    let ran = bytecode::run_capture_reserved_over_compiled_with_host(
         m,
         compiled,
         0,
@@ -4520,27 +4508,9 @@ fn bash_run_over_compiled(
         &init_mem,
         BASH_RESERVED_LOG2,
         &mut host,
-    ) {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
-        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
-        Some((Ok(vals), _)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_OK, 0, 0), // bash's `main` may return void through `_start`
-        },
-    };
+    );
     // The personality owns bash's fd 1/2 — its captured streams are the run's output.
-    PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value,
-        exit_code,
-        stdout: posix.stdout(),
-        stderr: posix.stderr(),
-        framebuffer: None,
-    }
+    PbOutcome::ended(ran.map(|(r, _)| r), posix.stdout(), posix.stderr())
 }
 
 /// #1144 — a cross-Run **program cache** slot: the decoded, verified `Module` + its `Arc<Compiled>`
@@ -4841,27 +4811,8 @@ pub fn posix_shell_exec_with(
         posix.register_command(n, *h, *wl);
     }
     let mut fuel = 200_000_000u64;
-    let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-                _ => (STATUS_OK, 0, 0), // a shell that loops to EOF returns nothing meaningful
-            },
-            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-            Some(Err(_)) => (STATUS_TRAP, 0, 0),
-            None => (STATUS_UNSUPPORTED, 0, 0),
-        };
-    PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value,
-        exit_code,
-        stdout: posix.stdout(),
-        stderr: posix.stderr(),
-        framebuffer: None,
-    }
+    let ran = bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host);
+    PbOutcome::ended(ran, posix.stdout(), posix.stderr())
 }
 
 /// Build the §3e powerbox args blob — `{ argc:u32-LE, envc:u32-LE }` then packed NUL-terminated
@@ -4999,26 +4950,16 @@ fn onramp_fs_run(
     argv: &[&[u8]],
     stdin: &[u8],
 ) -> PbOutcome {
-    let unsupported = |status: i32| PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value: 0,
-        exit_code: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        framebuffer: None,
-    };
     let (mut host, init_mem, _fs) = match pg_setup(m, image, argv) {
         Ok(setup) => setup,
-        Err(status) => return unsupported(status),
+        Err(status) => return PbOutcome::refused(status),
     };
     host.stdin = stdin.to_vec();
     let Some(compiled) = compiled.or_else(|| bytecode::compile_reserved(m)) else {
-        return unsupported(STATUS_UNSUPPORTED);
+        return PbOutcome::refused(STATUS_UNSUPPORTED);
     };
     let mut fuel = DEFAULT_FUEL;
-    let (status, value, exit_code) = match bytecode::run_capture_reserved_over_compiled_with_host(
+    let ran = bytecode::run_capture_reserved_over_compiled_with_host(
         m,
         compiled,
         0,
@@ -5027,26 +4968,8 @@ fn onramp_fs_run(
         &init_mem,
         temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
-    ) {
-        None => (STATUS_UNSUPPORTED, 0, 0),
-        Some((Err(Trap::Exit(code)), _)) => (STATUS_EXIT, 0, code),
-        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
-        Some((Ok(vals), _)) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_BAD_RESULT, 0, 0),
-        },
-    };
-    PbOutcome {
-        trap: None,
-        fault_addr: None,
-        status,
-        value,
-        exit_code,
-        stdout: host.take_stdout(),
-        stderr: host.take_stderr(),
-        framebuffer: None,
-    }
+    );
+    PbOutcome::ended(ran.map(|(r, _)| r), host.take_stdout(), host.take_stderr())
 }
 
 /// **Boot Postgres in wasm.** Decode + verify the module at `[mod_ptr, mod_len)`, mount the data image
@@ -5062,7 +4985,6 @@ pub extern "C" fn temen_run_pg(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
@@ -5073,26 +4995,12 @@ pub extern "C" fn temen_run_pg(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
     if temen_verify::verify_module(&m).is_err() {
-        set(STATUS_VERIFY_ERR);
-        return 0;
+        return PbOutcome::refused(STATUS_VERIFY_ERR).publish();
     }
-    let out = pg_exec(&m, image, stdin);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    pg_exec(&m, image, stdin).publish()
 }
 
 /// The built-in playground libc headers, seeded under `/include` for the C-compiler card (SELFHOST_C.md
@@ -5462,37 +5370,20 @@ pub extern "C" fn temen_run_onramp_fs(
     src_len: usize,
     flags: i32,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let src = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
     // #1144 — the compiler is the same `chibicc.temen` every Run: decode, verify and compile it once.
     let (m, compiled) = match cached_program(chibicc_slot(), bytes) {
         Ok(p) => p,
-        Err(status) => {
-            set(status);
-            return 0;
-        }
+        Err(status) => return PbOutcome::refused(status).publish(),
     };
     let image = match chibicc_card_image(img_ptr, img_len, src) {
         Ok(image) => image,
-        Err(status) => {
-            set(status);
-            return 0;
-        }
+        Err(status) => return PbOutcome::refused(status).publish(),
     };
     let argv = chibicc_card_argv(flags);
-    let out = onramp_fs_run(m, Some(compiled), &image, &argv, &[]);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_fs_run(m, Some(compiled), &image, &argv, &[]).publish()
 }
 
 /// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.temen` in
@@ -5513,7 +5404,6 @@ pub extern "C" fn temen_selfhost_emit_object_fs(
     tu_len: usize,
     debug_info: i32,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let image = unsafe { core::slice::from_raw_parts(img_ptr, img_len) };
@@ -5521,23 +5411,10 @@ pub extern "C" fn temen_selfhost_emit_object_fs(
     // The C card's compiler slot (#1144): one decode, verify and compile across the card's TUs.
     let (m, compiled) = match cached_program(chibicc_slot(), bytes) {
         Ok(p) => p,
-        Err(status) => {
-            set(status);
-            return 0;
-        }
+        Err(status) => return PbOutcome::refused(status).publish(),
     };
     let argv = chibicc_selfhost_argv(tu, debug_info != 0);
-    let out = onramp_fs_run(m, Some(compiled), image, &argv, &[]);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_fs_run(m, Some(compiled), image, &argv, &[]).publish()
 }
 
 // ==== persistent interactive Postgres session (the browser console) ===============================
@@ -5583,13 +5460,13 @@ fn pg_close_session() {
 }
 
 /// Advance the session's vCPU to its next stop. Returns [`STATUS_OK`] when it parks at a stdin read
-/// (ready for the next query), [`STATUS_EXIT`] on a clean guest exit, [`STATUS_TRAP`] on a trap, and
-/// [`STATUS_UNSUPPORTED`] for any other event (a `--single` backend spawns/JITs nothing). Marks the
-/// session `ended` on anything but a park.
+/// (ready for the next query), [`STATUS_EXIT`] when the backend ends cleanly (it returns, or calls
+/// `exit`: #2288), [`STATUS_TRAP`] on a trap, and [`STATUS_UNSUPPORTED`] for any other event (a
+/// `--single` backend spawns/JITs nothing). Marks the session `ended` on anything but a park.
 fn pg_pump(s: &mut PgSession) -> i32 {
     match s.vcpu.run() {
         bytecode::VcpuEvent::StdinPark => STATUS_OK,
-        bytecode::VcpuEvent::Done(_) => {
+        bytecode::VcpuEvent::Done(_) | bytecode::VcpuEvent::Trapped(Trap::Exit(_)) => {
             s.ended = true;
             STATUS_EXIT
         }
@@ -7483,10 +7360,10 @@ pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     }
 }
 
-/// Captured stdout / stderr of the most recent [`temen_run_pb`], as cdylib-managed allocations
-/// `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the next
-/// [`temen_run_pb`] replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the
-/// next call and never frees it itself.
+/// Captured stdout / stderr of the most recent run ([`PbOutcome::publish`]), as cdylib-managed
+/// allocations `(ptr, len)`. Each is a leaked boxed slice (exact length, alignment 1) freed when the
+/// next run replaces it — so the host reads it via the `*_ptr`/`*_len` exports *before* the next call
+/// and never frees it itself.
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
@@ -7508,10 +7385,10 @@ static mut SNAP: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// The §12 save-state artifact of the most recent [`temen_onramp_freeze`] (same cdylib-managed
 /// lifetime as `OUT`: valid until the next freeze; read via `temen_onramp_artifact_ptr`/`_len`).
 static mut ARTIFACT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
-/// Captured framebuffer (RGBA) the most recent [`temen_run_onramp`] guest presented via the `display`
-/// capability, plus its dimensions. `(null, 0)` / `0`×`0` when the guest presented no frame. Same
-/// cdylib-managed lifetime as `OUT` (valid until the next `temen_run_onramp`; the host reads it via the
-/// `temen_framebuffer_*` exports and never frees it).
+/// Captured framebuffer (RGBA) the most recent run's guest presented via the `display` capability,
+/// plus its dimensions. `(null, 0)` / `0`×`0` when the guest presented no frame. Same cdylib-managed
+/// lifetime as `OUT` (valid until the next run; the host reads it via the `temen_framebuffer_*` exports
+/// and never frees it).
 static mut FB: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut FB_W: u32 = 0;
 static mut FB_H: u32 = 0;
@@ -7579,7 +7456,6 @@ pub extern "C" fn temen_run_pb(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -7589,22 +7465,9 @@ pub extern "C" fn temen_run_pb(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
-    let out = powerbox_exec(&m, stdin);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    powerbox_exec(&m, stdin).publish()
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run function 0 under the **on-ramp powerbox** (see
@@ -7622,7 +7485,6 @@ pub extern "C" fn temen_run_onramp(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -7632,29 +7494,9 @@ pub extern "C" fn temen_run_onramp(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
-    let out = onramp_exec_with_tee(&m, stdin, &run_env(), None);
-    set(out.status);
-    let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => (Vec::new(), 0, 0),
-    };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
-        FB_W = fb_w;
-        FB_H = fb_h;
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_exec_with_tee(&m, stdin, &run_env(), None).publish()
 }
 
 // The **live host import** for streamed stdout: the page's `temen_host.stdout_chunk` — called once per
@@ -7694,7 +7536,6 @@ pub extern "C" fn temen_run_onramp_stream(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -7704,29 +7545,9 @@ pub extern "C" fn temen_run_onramp_stream(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
-    let out = onramp_exec_with_tee(&m, stdin, &run_env(), stream_tee());
-    set(out.status);
-    let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => (Vec::new(), 0, 0),
-    };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
-        FB_W = fb_w;
-        FB_H = fb_h;
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_exec_with_tee(&m, stdin, &run_env(), stream_tee()).publish()
 }
 
 // ===== warm-runtime snapshot: init once, restore-per-Run for a two-phase on-ramp guest ============
@@ -8086,27 +7907,11 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         temen_ir::DEFAULT_RESERVED_LOG2,
         Some(s.warm.page_map()),
     );
-    let (status, value, exit_code) = match ran {
-        Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
-        Err(_) => (STATUS_TRAP, 0, 0),
-        Ok(vals) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-            _ => (STATUS_OK, 0, 0),
-        },
-    };
     // Track the eval's high-water so the next restore zeroes exactly what it dirtied — both the brk
     // it advanced and any page it `vm_map`-grew past the warm extent (freshly-mapped pages are
     // zeroed at map time, but the guest may have written them).
     s.note_eval(committed_end(eval_pages.as_deref().unwrap_or(&[])));
-    set(status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.take_stdout());
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.take_stderr());
-        EXIT_CODE = exit_code;
-    }
-    value
+    PbOutcome::ended(Some(ran), host.take_stdout(), host.take_stderr()).publish()
 }
 
 /// Tear down the warm session (free its window), if any. Idempotent; the next [`temen_warm_open`] starts
@@ -8559,7 +8364,6 @@ pub extern "C" fn temen_run_onramp_posix(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -8569,22 +8373,9 @@ pub extern "C" fn temen_run_onramp_posix(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
-    let out = onramp_posix_exec(&m, stdin);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_posix_exec(&m, stdin).publish()
 }
 
 /// A **registry blob** of `entries` ([`blob_entries`] reads one): the framing a host uses to hand
@@ -8666,7 +8457,6 @@ pub extern "C" fn temen_run_shell(
     cmds_ptr: *const u8,
     cmds_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
@@ -8676,10 +8466,7 @@ pub extern "C" fn temen_run_shell(
     };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
     // The PATH registry (`__stage` + external commands). A truncated/undecodable blob is non-fatal:
     // `parse_shell_cmds` drops the bad entries and the shell runs with whatever registered.
@@ -8690,17 +8477,7 @@ pub extern "C" fn temen_run_shell(
         parse_shell_cmds(cb)
     };
     let cmds: Vec<(&str, &temen_ir::Module)> = owned.iter().map(|(n, m)| (n.as_str(), m)).collect();
-    let out = posix_shell_exec_with(&m, stdin, &cmds);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    posix_shell_exec_with(&m, stdin, &cmds).publish()
 }
 
 /// Decode the module at `[mod_ptr, mod_len)` and run it as **real GNU bash** (see [`bash_exec_with`]) —
@@ -8726,7 +8503,6 @@ pub extern "C" fn temen_run_bash(
     bins_ptr: *const u8,
     bins_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
         if p.is_null() || n == 0 {
             &[]
@@ -8740,10 +8516,7 @@ pub extern "C" fn temen_run_bash(
     // are free.
     let (m, compiled) = match cached_bash_program(slice(mod_ptr, mod_len)) {
         Ok(p) => p,
-        Err(status) => {
-            set(status);
-            return 0;
-        }
+        Err(status) => return PbOutcome::refused(status).publish(),
     };
     let cmd = slice(cmd_ptr, cmd_len);
     let stdin = slice(stdin_ptr, stdin_len);
@@ -8755,17 +8528,7 @@ pub extern "C" fn temen_run_bash(
         .iter()
         .map(|(n, cm)| (prepare(cm), vec![n.as_str()]))
         .collect();
-    let out = bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &commands);
-    set(out.status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    bash_run_over_compiled(m, compiled, &[b"bash", b"-c", cmd], stdin, &commands).publish()
 }
 
 /// #1122 — the live interactive bash session's control block, shared between the **session
@@ -9362,17 +9125,22 @@ impl LinkFailure {
             message: message.into(),
         }
     }
+
+    /// The report of a run the link never started: its status, and why on stderr.
+    fn report(self) -> PbOutcome {
+        PbOutcome {
+            stderr: self.message.into_bytes(),
+            ..PbOutcome::refused(self.status)
+        }
+    }
 }
 
-/// Report a failed link entry: its status in [`temen_status`] and its reason on the stderr slot.
-/// Returns the status, for the entry to hand back in its own convention.
+/// Report a failed link entry: its status in [`temen_status`], its reason on the stderr slot, and
+/// nothing of an earlier run. Returns the status, for the entry to hand back in its own convention.
 fn link_failed(f: LinkFailure) -> i32 {
-    // SAFETY: single-threaded wasm; the slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(ERR), f.message.into_bytes());
-        LAST_STATUS = f.status;
-    }
-    f.status
+    let status = f.status;
+    f.report().publish();
+    status
 }
 
 fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> {
@@ -9956,16 +9724,7 @@ pub fn link_run_units(
     };
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),
-        Err(f) => PbOutcome {
-            trap: None,
-            fault_addr: None,
-            status: f.status,
-            value: 0,
-            exit_code: 0,
-            stdout: Vec::new(),
-            stderr: f.message.into_bytes(),
-            framebuffer: None,
-        },
+        Err(f) => f.report(),
     }
 }
 
@@ -10003,17 +9762,7 @@ fn link_run_stash(
         }
     };
 
-    let out = onramp_run(&module, stdin, &run_env(), None, true, memo);
-    // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
-    unsafe {
-        LAST_STATUS = out.status;
-        stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
-        EXIT_CODE = out.exit_code;
-        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
-    }
-    out.value
+    onramp_run(&module, stdin, &run_env(), None, true, memo).publish()
 }
 
 /// A [`LinkSet`]'s compile memo, as a run takes it.
@@ -12179,7 +11928,7 @@ pub extern "C" fn temen_stderr_ptr() -> *const u8 {
 pub extern "C" fn temen_stderr_len() -> usize {
     unsafe { (*core::ptr::addr_of!(ERR)).1 }
 }
-/// Exit code from the most recent [`temen_run_pb`] (valid when [`temen_status`] is [`STATUS_EXIT`]).
+/// Exit code from the most recent run (valid when [`temen_status`] is [`STATUS_EXIT`]).
 #[no_mangle]
 pub extern "C" fn temen_exit_code() -> i32 {
     unsafe { EXIT_CODE }
@@ -14859,8 +14608,7 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             stash(&mut *core::ptr::addr_of_mut!(ERR), err);
         }
     }
-    let mut trap = None;
-    let (status, value, exit_code, ev) = match ev {
+    let (ran, ev) = match ev {
         bytecode::CoopEvent::TierUp {
             module,
             func,
@@ -14916,17 +14664,9 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             s.jit_wasm = Some(wasm);
             return COOP_RUN_JIT_INVOKE;
         }
-        bytecode::CoopEvent::Done(vals) => match vals.first() {
-            Some(Value::I64(x)) => (STATUS_OK, *x, 0, COOP_RUN_DONE),
-            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0, COOP_RUN_DONE),
-            None => (STATUS_OK, 0, 0, COOP_RUN_DONE),
-            _ => (STATUS_BAD_RESULT, 0, 0, COOP_RUN_DONE),
-        },
-        bytecode::CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, COOP_RUN_DONE),
-        bytecode::CoopEvent::Trapped(t) => {
-            trap = Some(t);
-            (STATUS_TRAP, 0, 0, COOP_RUN_TRAP)
-        }
+        bytecode::CoopEvent::Done(vals) => (Ok(vals), COOP_RUN_DONE),
+        bytecode::CoopEvent::Trapped(t @ Trap::Exit(_)) => (Err(t), COOP_RUN_DONE),
+        bytecode::CoopEvent::Trapped(t) => (Err(t), COOP_RUN_TRAP),
         bytecode::CoopEvent::Paused => return COOP_RUN_PAUSED,
         bytecode::CoopEvent::CapPark { id } => {
             let words = cap_park_words(&s.caps, &s.requests, id).unwrap_or_default();
@@ -14935,10 +14675,10 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             return COOP_RUN_CAP_PARK;
         }
         // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
-        // is the bash coop session's driver, below). Fail closed rather than spin.
-        bytecode::CoopEvent::Idle => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+        // is the bash coop session's driver, below). Fail closed rather than spin, as a run with
+        // nothing left to wake it does.
+        bytecode::CoopEvent::Idle => (Err(Trap::ThreadFault), COOP_RUN_TRAP),
     };
-    s.value = value;
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next
     // restore zeroes exactly what this eval dirtied: the brk it advanced plus any page it left
     // committed past the warm extent (mirrors [`temen_warm_eval`]'s tracking, off the finished
@@ -14966,31 +14706,17 @@ fn coop_pump(budget: Option<u64>) -> i32 {
             )
         }
     };
-    let fb = s.frame.lock().unwrap().take();
-    let (fb_rgba, fb_w, fb_h) = match fb {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => (Vec::new(), 0, 0),
+    let mut out = PbOutcome {
+        framebuffer: s.frame.lock().unwrap().take(),
+        ..PbOutcome::ended(Some(ran), stdout, stderr)
     };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
-        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
-        FB_W = fb_w;
-        FB_H = fb_h;
-        EXIT_CODE = exit_code;
-        RUN_VALUE = value;
-        LAST_STATUS = status;
-        // Which trap ended the run, and where a memory fault faulted — as the one-shot run reports.
-        LAST_TRAP = trap.as_ref().map_or("", Trap::name);
-        FAULT_ADDR = match trap {
-            Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr()
-                .or(s.jit_fault)
-                .map_or(-1, |a| a as i64),
-            _ => -1,
-        };
-        stash(&mut *core::ptr::addr_of_mut!(FS_IMAGE), fs);
+    // A fault in emitted code left its address with the session (#2126).
+    if matches!(out.trap, Some(Trap::MemoryFault)) {
+        out.fault_addr = out.fault_addr.or(s.jit_fault);
     }
+    s.value = out.publish();
+    // SAFETY: single-threaded wasm; the image is read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(FS_IMAGE), fs) };
     ev
 }
 
@@ -16276,15 +16002,11 @@ pub extern "C" fn temen_detached_oracle_run(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
     let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
     let m = match temen_encode::decode_module(bytes) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
+        Err(_) => return PbOutcome::refused(STATUS_DECODE_ERR).publish(),
     };
     let mut host = Host::new();
     if !stdin_ptr.is_null() && stdin_len != 0 {
@@ -16305,29 +16027,12 @@ pub extern "C" fn temen_detached_oracle_run(
         temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
     );
-    let (status, value, code) = match outcome {
-        Some((Ok(vals), _)) => (
-            STATUS_OK,
-            vals.first().map_or(0, |v| match v {
-                Value::I64(x) => *x,
-                Value::I32(x) => *x as i64,
-                _ => 0,
-            }),
-            0,
-        ),
-        Some((Err(Trap::Exit(c)), _)) => (STATUS_EXIT, 0, c),
-        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
-        None => (STATUS_UNSUPPORTED, 0, 0),
-    };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.take_stdout());
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.take_stderr());
-        EXIT_CODE = code;
-        RUN_VALUE = value;
-    }
-    set(status);
-    value
+    PbOutcome::ended(
+        outcome.map(|(r, _)| r),
+        host.take_stdout(),
+        host.take_stderr(),
+    )
+    .publish()
 }
 
 #[cfg(test)]

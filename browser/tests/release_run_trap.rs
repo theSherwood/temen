@@ -8,7 +8,8 @@
 //! exports. Fail-soft: SKIPs if `chibicc.temen` isn't built.
 
 use temen_browser::{
-    onramp_exec, onramp_fs_exec, playground_include_files, STATUS_EXIT, STATUS_OK, STATUS_TRAP,
+    onramp_exec, onramp_fs_exec, playground_include_files, STATUS_DECODE_ERR, STATUS_EXIT,
+    STATUS_OK, STATUS_TRAP,
 };
 use temen_interp::Trap;
 
@@ -98,4 +99,67 @@ fn a_clean_run_reports_no_trap() {
     assert_eq!(run.status, STATUS_OK);
     assert_eq!(run.trap, None);
     assert_eq!(run.fault_addr, None);
+}
+
+/// Every browser run reports through one mapping (#1414 S4-1), so the file-system run (the C card's
+/// compiler, the one-shot Postgres) names its trap and fault address as the plain run does. It
+/// reported neither.
+#[test]
+fn a_file_system_run_reports_its_trap_too() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let m = compile(&chibicc, "int main() { int *p = 0; return *p; }\n");
+    let image = temen_fs::encode_image(&[], &[]);
+    let run = onramp_fs_exec(&m, &image, &[b"prog"], b"");
+    assert_eq!(run.status, STATUS_TRAP);
+    assert_eq!(run.trap, Some(Trap::MemoryFault));
+    assert_eq!(run.fault_addr, Some(0));
+}
+
+fn trap_name() -> String {
+    let (ptr, len) = (
+        temen_browser::temen_trap_ptr(),
+        temen_browser::temen_trap_len(),
+    );
+    // SAFETY: the trap name is a static string the cdylib owns.
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
+}
+
+fn stdout() -> String {
+    let (ptr, len) = (
+        temen_browser::temen_stdout_ptr(),
+        temen_browser::temen_stdout_len(),
+    );
+    if ptr.is_null() || len == 0 {
+        return String::new();
+    }
+    // SAFETY: a live cdylib allocation, valid until the next run replaces it.
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
+}
+
+/// An export's report replaces the last run's in every slot (#1414 S4-1). A run refused before it
+/// started (bytes that do not decode) left the earlier run's output, trap name and fault address to
+/// be read as its own.
+#[test]
+fn a_refused_run_reports_nothing_of_the_last_one() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let src = "#include <stdio.h>\nint main() { printf(\"hi\\n\"); fflush(stdout); int *p = 0; return *p; }\n";
+    let m = temen_encode::encode_module(&compile(&chibicc, src));
+    temen_browser::temen_run_onramp(m.as_ptr(), m.len(), std::ptr::null(), 0);
+    assert_eq!(temen_browser::temen_status(), STATUS_TRAP);
+    assert_eq!(trap_name(), "MemoryFault");
+    assert_eq!(temen_browser::temen_fault_addr(), 0);
+    assert_eq!(stdout(), "hi\n");
+
+    let junk = b"not a module";
+    temen_browser::temen_run_onramp(junk.as_ptr(), junk.len(), std::ptr::null(), 0);
+    assert_eq!(temen_browser::temen_status(), STATUS_DECODE_ERR);
+    assert_eq!(trap_name(), "", "no trap: the run never started");
+    assert_eq!(temen_browser::temen_fault_addr(), -1);
+    assert_eq!(stdout(), "", "and no output of its own");
 }
