@@ -506,7 +506,7 @@ fn main() {
     let main_stem = temen_run::nim_module_suffix(prog, &temen_run::NIMONY_TREE_PATHS);
     let linked = posix.read_file(&format!("{cache}{main_stem}.temen/{out_name}"));
     dump_cache(&posix, &cache, dump);
-    let (Ok(()), Some(linked)) = (&outcome, linked) else {
+    let (Ok(_), Some(linked)) = (&outcome, linked) else {
         eprint!(
             "--- stdout ---\n{}--- stderr ---\n{}",
             String::from_utf8_lossy(&posix.stdout()),

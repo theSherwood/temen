@@ -5893,6 +5893,10 @@ pub struct ExecGrants<'a> {
 /// admit is an error here. (Its exec'd images need no such check: the engine compiles each one, and
 /// refuses the exec rather than fall back.)
 ///
+/// Returns how the program ended: its exit status ([`Outcome::Exited`]) or what `_start` returned.
+/// Any ending counts. A driver that quits with a failure status ended ordinarily, and judging the
+/// status is the caller's: a differential needs a clean exit, a build asks what it wrote.
+///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
 pub fn nim_noc_run(
@@ -5905,8 +5909,8 @@ pub fn nim_noc_run(
     exec: &ExecGrants,
     backend: Backend,
     jit_code: Option<&JitCodeCache>,
-) -> Result<(), String> {
-    if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits_reserved(&module) {
+) -> Result<Outcome, String> {
+    if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits(&module) {
         return Err(
             "the bytecode engine does not admit this module (it would run on the tree-walker)"
                 .to_string(),
@@ -5957,6 +5961,7 @@ pub fn nim_noc_run(
         }
     };
     inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))
+        .map(|run| run.outcome)
         .map_err(|e| {
             let err = posix.stderr();
             if err.is_empty() {
@@ -5967,8 +5972,7 @@ pub fn nim_noc_run(
                     String::from_utf8_lossy(&err)
                 )
             }
-        })?;
-    Ok(())
+        })
 }
 
 /// The `demos/shell` **import vocabulary** — link-time symbol resolution for the shim's own names
@@ -6641,16 +6645,28 @@ fn run_interp_untraced(
             .0
         }
         (Backend::Bytecode, Some(mem)) => {
-            match temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
-                m,
-                func,
-                args,
-                fuel,
-                mem,
-                temen_ir::DEFAULT_RESERVED_LOG2,
-                host,
-            ) {
-                Some((r, _snap)) => r,
+            // A durable run takes the durable seam, which refuses `thread.*` (it would freeze one
+            // vCPU of several). Any other run takes the seeded entry, which drives everything a plain
+            // run does, threads included, as the browser's on-ramp runs do. Every seeded run used to
+            // take the durable seam, so a threaded program given an argv ran on the tree-walker (#2282).
+            let ran = if host.is_durable() {
+                temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
+                    m,
+                    func,
+                    args,
+                    fuel,
+                    mem,
+                    temen_ir::DEFAULT_RESERVED_LOG2,
+                    host,
+                )
+                .map(|(r, _snap)| r)
+            } else {
+                temen_interp::bytecode::compile_and_run_seeded_with_host(
+                    m, func, args, fuel, mem, host,
+                )
+            };
+            match ran {
+                Some(r) => r,
                 None => {
                     run_capture_reserved_with_host(
                         m,

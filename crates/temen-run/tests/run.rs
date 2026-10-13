@@ -930,6 +930,43 @@ fn the_spawn_grant_contains_a_powerbox_thread_bomb() {
     );
 }
 
+/// #2282 — a threaded program given an argv runs on the bytecode engine. A run with an argv or an
+/// environment seeds its window, and every seeded bytecode run used to take the engine's durable
+/// seam, which refuses `thread.*`. So a threaded program fell back to the tree-walker, and
+/// `nim_noc_run`, which refuses rather than fall back, would not run it on bytecode at all.
+#[test]
+fn a_threaded_program_given_an_argv_runs_on_the_bytecode_engine() {
+    // `_start` spawns a vCPU and joins it.
+    let m = load(
+        "memory 16\n\
+         export 0 func \"_start\" 0\n\
+         func () -> () {\n\
+         block 0 () {\n\
+         \x20 v0 = i64.const 5\n\
+         \x20 v1 = thread.spawn 1 v0 v0\n\
+         \x20 v2 = thread.join v1\n\
+         \x20 return\n\
+           }\n\
+         }\n\
+         func (i64, i64) -> (i64) {\n\
+         block 0 (vsp: i64, varg: i64) {\n\
+         \x20 return varg\n\
+           }\n\
+         }\n",
+    );
+    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    let run = temen_run::nim_noc_run(
+        m,
+        &posix,
+        std::sync::Arc::new(make),
+        &["prog".to_string()],
+        &temen_run::ExecGrants::default(),
+        temen_run::Backend::Bytecode,
+        None,
+    );
+    assert_eq!(run, Ok(Outcome::Returned(vec![])));
+}
+
 // ----------------------------------------------------------------------------
 // §7 named capability imports (manifest binding, IMPORTS.md phase 4): a frontend
 // declares `extern`-style capability imports by name in the module manifest; the

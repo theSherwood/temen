@@ -77,7 +77,7 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let mods = program_modules(&dir.join("nimcache"), "prog");
+    let mods = program_modules(&dir.join("nimcache"), "prog", "x");
     assert!(
         mods.iter().any(|(s, _)| s.starts_with("sysv")),
         "expected the system module among {:?}",
@@ -88,12 +88,14 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
 }
 
 /// The Leng modules of the program nimony built as `output` (its binary's file name), as
-/// `(stem, x_nif_text)`: the `.x.nif` of every object its link manifest names. One `nimcache` holds
+/// `(stem, nif_text)`: for every object its link manifest names, the module at NIF stage `nif`. That
+/// is `"x"` for hexer's per-module output, every proc, or `"c"` for what is left after the
+/// program's dead-code pass, the files `temen-link` links. One `nimcache` holds
 /// more than that program. A macro is a plugin program built there, and so is a `const` nimony
 /// evaluates at compile time (and `std/macros` routes `parsegen`/`regex` through plugins of its own).
 /// Each helper has its own `<stem>/<stem>.linkmanifest.nif`, and sweeping its modules in too fails
 /// the link with `DuplicateSymbol("main")`. Empty when no manifest names `output`.
-fn program_modules(nimcache: &std::path::Path, output: &str) -> Vec<(String, String)> {
+fn program_modules(nimcache: &std::path::Path, output: &str, nif: &str) -> Vec<(String, String)> {
     let manifest = std::fs::read_dir(nimcache)
         .into_iter()
         .flatten()
@@ -113,15 +115,16 @@ fn program_modules(nimcache: &std::path::Path, output: &str) -> Vec<(String, Str
         .filter_map(|f| f.split('"').next()?.strip_suffix(".o"))
         .filter_map(|f| std::path::Path::new(f).file_name()?.to_str())
         .map(|stem| {
-            // The program's own module is compiled in its build directory, the rest in `nimcache`.
-            let x_nif = [build_dir.as_path(), nimcache]
-                .map(|d| d.join(format!("{stem}.x.nif")))
+            // A program's `.c.nif` are all in its build directory. Of its `.x.nif`, only its own
+            // module's is; the rest are in `nimcache`.
+            let file = [build_dir.as_path(), nimcache]
+                .map(|d| d.join(format!("{stem}.{nif}.nif")))
                 .into_iter()
                 .find(|p| p.exists())
-                .unwrap_or_else(|| panic!("`{output}` links {stem}.o, but no {stem}.x.nif"));
+                .unwrap_or_else(|| panic!("`{output}` links {stem}.o, but no {stem}.{nif}.nif"));
             // NIF is bytes, not UTF-8 text: a `char` literal at or above 0x80 is a lone byte (the
             // sweep hit one on `strutils`).
-            let bytes = std::fs::read(&x_nif).unwrap();
+            let bytes = std::fs::read(&file).unwrap();
             (stem.to_string(), temen_leng::nif_text(&bytes).into_owned())
         })
         .collect()
@@ -1273,7 +1276,7 @@ fn try_compile_to_leng(
             msg.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
         ));
     }
-    let mods = program_modules(&dir.join("nimcache"), "prog");
+    let mods = program_modules(&dir.join("nimcache"), "prog", "x");
     let _ = std::fs::remove_dir_all(&dir);
     Ok(mods)
 }
@@ -1950,9 +1953,11 @@ fn real_unsigned_32bit_halves_match_native() {
 // ---------------------------------------------------------------------------
 
 /// Build and run `src` with the **native** toolchain (`nimony c --isMain --run`), returning what it
-/// printed — the oracle — and every module's Leng (`.x.nif`). The native binary is lowered from those
-/// same `.x.nif` files (hexer → dce → lengc → cc), so the Temen run starts from exactly the frontend
-/// output the oracle was built from, and each case is compiled once rather than once per side.
+/// printed — the oracle — and the program's Leng after its dead-code pass (`.c.nif`). The native
+/// binary is compiled from those same files (lengc → cc). `nimony t` would hand them to `temen-link`:
+/// its pipeline is the C backend's up to them, byte for byte (`patches/nimony/temen-backend.patch`).
+/// So the Temen run starts from exactly what the oracle was built from, as a user's build does, and
+/// each case is compiled once rather than once per side.
 /// `Err` carries the compiler's own diagnostic, so a corpus program outside nimony's subset says so
 /// rather than looking like a Temen failure.
 fn native_build(
@@ -1970,7 +1975,7 @@ fn native_build(
         .env("PATH", nim_path)
         .output()
         .map_err(|e| e.to_string())?;
-    let mods = program_modules(&dir.join("nimcache"), "prog");
+    let mods = program_modules(&dir.join("nimcache"), "prog", "c");
     let _ = std::fs::remove_dir_all(&dir);
     if !out.status.success() {
         return Err(format!(
@@ -2027,52 +2032,61 @@ fn import_sig_dbg(
 
 /// The engines every corpus program runs on, each held to native's bytes on its own. So the corpus
 /// is also the engines' differential over real Nim programs: an engine bug shows as that engine
-/// diverging from native.
+/// diverging from native. [`temen_run::nim_noc_run`] runs each one or refuses: it never hands a
+/// module the bytecode engine declines to the tree-walker.
 const ENGINES: [temen_run::Backend; 3] = [
     temen_run::Backend::TreeWalk,
     temen_run::Backend::Bytecode,
     temen_run::Backend::Jit,
 ];
 
-/// Run a program's Leng on **Temen** and diff it against `want`, native's output: link it with
-/// `link_nim_powerbox` against the guest libc, then run `_start` under the standard powerbox on each
-/// of [`ENGINES`]. Returns each way Temen diverged, so an empty list means every engine printed
-/// exactly `want` and exited cleanly. Every failure mode (link, verify, trap) is a divergence with
-/// its reason, so the differential reports *where* a program diverged rather than panicking on the
-/// first one.
+/// Run a program's Leng on **Temen** the way a user's build does, and diff it against `want`,
+/// native's output: link it as `temen-link` does ([`temen_link`]), then run it with
+/// [`temen_run::nim_noc_run`], the route every no-C driver takes, under a fresh POSIX personality on
+/// each of [`ENGINES`]. Returns each way Temen diverged, so an empty list means every engine printed
+/// exactly `want` and exited cleanly. Every failure mode (link, verify, an unbound import, a trap) is
+/// a divergence with its reason, so the differential reports *where* a program diverged rather than
+/// panicking on the first one.
 ///
 /// A divergence names how the run ended, because a program that produces no output has told you
-/// nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing), `Exited(127)`
-/// (panicked through `cAbort`) and a trap are three different bugs that a bare `""` renders
-/// identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
+/// nothing about *why*: `Exited(0)` (ran to completion and printed nothing), `Exited(127)` (panicked
+/// through `cAbort`) and a trap are three different bugs that a bare `""` renders identical. That
+/// ambiguity is what made the v0.6.2 empty-output blocker expensive.
 fn temen_divergences(
     libc: &[u8],
     name: &str,
     mods: &[(String, String)],
     want: &str,
 ) -> Vec<String> {
-    let inst = match temen_instance(libc, name, mods) {
-        Ok(inst) => inst,
+    let m = match temen_link(libc, name, mods) {
+        Ok(m) => m,
         Err(e) => return vec![format!("{e}  (native prints {:?})", elide(want))],
     };
-    let config = temen_run::RunConfig::default();
     ENGINES
         .iter()
         .filter_map(|&engine| {
-            let run = match inst.run_with_caps(engine, &config, &[]) {
-                Ok(run) => run,
+            let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+            let outcome = match temen_run::nim_noc_run(
+                m.clone(),
+                &posix,
+                std::sync::Arc::new(make),
+                &[name.to_string()],
+                &temen_run::ExecGrants::default(),
+                engine,
+                None,
+            ) {
+                Ok(outcome) => outcome,
                 Err(e) => {
                     return Some(format!(
-                        "{engine:?}: run: {e}  (native prints {:?})",
+                        "{engine:?}: {e}  (native prints {:?})",
                         elide(want)
                     ))
                 }
             };
-            let got = String::from_utf8_lossy(&run.stdout);
-            let outcome = format!("{:?}", run.outcome);
+            let got = String::from_utf8_lossy(&posix.stdout()).into_owned();
             if got != want {
                 Some(format!(
-                    "{engine:?}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
+                    "{engine:?}: OUTPUT DIFFERS ({outcome:?})\n       temen: {:?}\n      native: {:?}",
                     elide(&got),
                     elide(want)
                 ))
@@ -2083,7 +2097,7 @@ fn temen_divergences(
                 // `Exited(127)` is what a nim panic looks like once `cAbort` reaches the stubbed
                 // `kill`, and a program that panics after printing its output would otherwise pass.
                 Some(format!(
-                    "{engine:?}: output matches but the run ended {outcome} (native exits 0)"
+                    "{engine:?}: output matches but the run ended {outcome:?} (native exits 0)"
                 ))
             } else {
                 None
@@ -2092,37 +2106,23 @@ fn temen_divergences(
         .collect()
 }
 
-/// Link a program's Leng with `link_nim_powerbox` against the guest libc and instantiate it under
-/// the standard powerbox, or say why it cannot run.
-fn temen_instance(
-    libc: &[u8],
-    name: &str,
-    mods: &[(String, String)],
-) -> Result<temen_run::Instance, String> {
+/// Link a program's `.c.nif` as `temen-link` does: the call it makes (`link_command`),
+/// [`temen_leng::link_nim_posix`] against the personality's vtable and the guest libc, a release build.
+/// `nimony t` hands `temen-link` these same files, so this is the module a user's build produces.
+fn temen_link(libc: &[u8], name: &str, mods: &[(String, String)]) -> Result<Module, String> {
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units, Some(libc)).map_err(|e| format!("link: {e}"))?;
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), Some(libc), false)
+        .map_err(|e| format!("link: {e}"))?;
     dump_module(name, &m);
-    let extra: Vec<&str> = m
-        .imports
-        .iter()
-        .map(|i| i.name.as_str())
-        .filter(|n| !POWERBOX_MANIFEST.contains(n))
-        .collect();
-    if !extra.is_empty() {
-        // An unbound bottom-edge leaf. The program would trap at run with nothing to say, so name it
-        // here — this is how the missing half of libm surfaced (#1375).
-        return Err(format!("unbound leaves: {}", extra.join(", ")));
-    }
-    // The instance `run_powerbox` builds, verified the same way, with the engine left to the run.
-    temen_run::instantiate(m)
+    Ok(m)
 }
 
 /// **The nim differential corpus** — every `tests/nim_diff/*.nim` built once by native nimony and run
-/// natively and on each of Temen's [`ENGINES`], with each Temen output diffed byte for byte against
-/// native's.
+/// natively and, as a user's build would link it, on each of Temen's [`ENGINES`], with each Temen
+/// output diffed byte for byte against native's.
 ///
 /// This exists because the wrong-answer bugs keep being found by accident. `$3.14` printing
 /// `17.966570549813729` (#1472) sat in `main` behind a suite that only ever asserted `formatFloat`;
@@ -2272,8 +2272,9 @@ fn corpus_case(
 /// Did the Temen run end the way a normally-terminating program does — `main` returning 0, or an
 /// explicit `quit(0)`? Anything else (a non-zero status from `cExit`/`cAbort`, a returned non-zero)
 /// is a divergence from the native oracle, which by construction exited 0.
-fn is_clean_exit(outcome: &str) -> bool {
-    outcome == "Returned([I32(0)])" || outcome == "Exited(0)"
+fn is_clean_exit(outcome: &temen_run::Outcome) -> bool {
+    *outcome == temen_run::Outcome::Exited(0)
+        || *outcome == temen_run::Outcome::Returned(vec![Value::I32(0)])
 }
 
 /// `nim_diff/MATRIX.md` is the conformance matrix (#956): a row per feature, the corpus cases that
@@ -2642,7 +2643,10 @@ fn nim_shells_out_through_the_posix_sh() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert!(
+            run.as_ref().is_ok_and(is_clean_exit),
+            "{engine:?}: the parent ran to completion: {run:?}"
+        );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
             "child:hi|parent:3|from hi",
@@ -2725,7 +2729,10 @@ fn a_nim_process_that_polls_its_child_sleeps() {
             engine,
             None,
         );
-        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert!(
+            run.as_ref().is_ok_and(is_clean_exit),
+            "{engine:?}: the parent ran to completion: {run:?}"
+        );
         let out = String::from_utf8_lossy(&posix.stdout()).into_owned();
         let polls = out
             .split("polls:")
@@ -2826,7 +2833,10 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert!(
+            run.as_ref().is_ok_and(is_clean_exit),
+            "{engine:?}: the parent ran to completion: {run:?}"
+        );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
             "child:hi|grower:3|12|parent:4",
@@ -2887,7 +2897,10 @@ fn nim_reads_a_commands_output_through_execcmdex() {
             engine,
             None,
         );
-        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert!(
+            run.as_ref().is_ok_and(is_clean_exit),
+            "{engine:?}: the parent ran to completion: {run:?}"
+        );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
             "parent:3|child:hi\n",
@@ -2959,7 +2972,10 @@ fn nim_forks_and_execs_a_nim_program() {
             engine,
             None,
         );
-        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert!(
+            run.as_ref().is_ok_and(is_clean_exit),
+            "{engine:?}: the parent ran to completion: {run:?}"
+        );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
             "child:hi|parent:7",
@@ -3107,7 +3123,7 @@ fn nifler2_links_through_leng() {
         .file_name()
         .and_then(|n| n.to_str())
         .expect("binary name");
-    let mods = program_modules(&root.join("nimcache"), bin);
+    let mods = program_modules(&root.join("nimcache"), bin, "x");
     assert!(
         !mods.is_empty(),
         "no link manifest in the nimcache names `{bin}`"

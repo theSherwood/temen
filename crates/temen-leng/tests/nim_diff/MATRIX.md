@@ -4,8 +4,10 @@ Which Nim features run on Temen (#956). Each row is a feature, the corpus cases 
 its status:
 
 - **✅**: the cases are in this directory. `nim_differential_corpus` (`../nim_e2e.rs`) builds each one
-  with native nimony, runs it on each of Temen's engines (the tree-walker, bytecode and the JIT), and
-  fails if any engine's output differs from native's by a byte.
+  with native nimony and links the same build as a user's would be linked: the program's `.c.nif`,
+  linked as `temen-link` links them, run under the POSIX personality. It runs that module on each of
+  Temen's engines (the tree-walker, bytecode and the JIT), and fails if any engine's output differs
+  from native's by a byte.
 - **❌ #N**: the case is in [`known_gaps/`](known_gaps/), its header names issue #N, and it still
   diverges. The corpus fails when it matches on every engine, so the row and the issue get updated.
 - **n/a**: nimony itself rejects the construct, so there is no native output to compare. The note
@@ -51,7 +53,7 @@ means adding it to a row.
 | Variant (`case`) objects | `objects_variant`, `objects_variant_string` | ✅ |
 | Lifetime hooks: `=destroy`, `=copy` | `hooks` | ✅ |
 | Methods: dynamic dispatch with overrides | `methods_dispatch` | ✅ |
-| Inheritance: a derived type with no method override of its own | `objects_inheritance` | ❌ #2260 |
+| Inheritance: a derived type with no method override of its own | `objects_inheritance` | ✅ |
 | Copying a derived value object whose base has a `string` field | — | n/a: nimony reports `expected expression but got: (baseobj …)` |
 
 ## Control flow and procs

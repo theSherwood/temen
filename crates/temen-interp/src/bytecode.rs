@@ -6040,13 +6040,6 @@ pub fn admits(m: &Module) -> bool {
     compile_module_for(m, true).is_some()
 }
 
-/// Whether this engine runs `m` at all on the reserved-window path — the question a caller that
-/// must not silently fall back to the tree-walker has to ask first (the answer
-/// [`compile_and_run_capture_reserved_with_host`] gives as `None`, after the fact).
-pub fn admits_reserved(m: &Module) -> bool {
-    !outside_reserved_subset(m) && compile_module_for(m, true).is_some()
-}
-
 /// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
 /// entry) can **cache the `Arc<Compiled>` across Runs** and skip the ~200 ms per-Run recompile of a
 /// large module. `None` if the module is outside the bytecode subset (same gate as

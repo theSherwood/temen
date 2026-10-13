@@ -2431,7 +2431,7 @@ from nearly every function, so hexer instrumented grew about 6×, 339K to 2.0M i
 what the tier emits.) **Scheduling:** a leaf runs as one slice between parks — nothing else in the
 tree runs meanwhile, a schedule the interpreter could also have chosen. A leaf that instead
 busy-waits on another process's effect through ops that do not park (polling for a file, say) never
-sees it and spins where the interpreter would complete: tracked debt on #1896.
+sees it and spins where the interpreter would complete: tracked debt on #2280.
 
 **The root as a leaf; parks on the embedder (#1954).** The run's own image is offered the same way,
 at its entry (`root_leaf`, module 0), under the same predicate. It isn't offered when the run is
