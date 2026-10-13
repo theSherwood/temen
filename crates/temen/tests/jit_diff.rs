@@ -1335,12 +1335,13 @@ fn jit_cap_shared_region_aliases_differential() {
     );
 }
 
-/// #1707 — a §3e op that ends a §13 alias ends it on the JIT as on the interpreter: the page is the
+/// #1707 — an op that ends a §13 alias ends it on the JIT as on the interpreter: the page is the
 /// window's own from then on, and the region keeps its bytes for every other mapping of it. The guest
-/// aliases the region at A and B and stores `MARKER` through A, then ends A's alias two ways — a
-/// `Memory.map` over it, and (re-aliased) a `Memory.protect(none)` followed by a `map` — writing
-/// through A after each. B, which still aliases the region, must read `MARKER` both times, and A must
-/// read zero right after the `map`. The JIT used to zero the region through A and keep writing it.
+/// aliases the region at A and B, then ends A's alias each way there is — a `Memory.map` over it, a
+/// `Memory.protect(none)` (then a `map`), a `Memory.unmap`, a `SharedRegion.unmap` — after storing a
+/// value through A, and writing through A again where it can. B, which still aliases the region,
+/// must read the value stored before each end, and A must read zero right after the `map`. The JIT
+/// used to zero the region through A (`unmap` until #2139, `map` until now) and keep writing it.
 #[cfg(any(unix, windows))]
 #[test]
 fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
@@ -1351,7 +1352,7 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
     const MARKER: i64 = 0x0123_4567_89ab_cdefu64 as i64;
     let src = format!(
         "memory 18\n\
-         func (i32, i32) -> (i64, i64, i64) {{\n\
+         func (i32, i32) -> (i64, i64, i64, i64, i64) {{\n\
          block 0 (vr: i32, vm: i32) {{\n\
          \x20 vg = call.cap 4 3 () -> (i64) vr ()\n\
          \x20 v0 = i64.const 0\n\
@@ -1374,7 +1375,17 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
          \x20 vy = i64.const 34\n\
          \x20 i64.store va vy\n\
          \x20 r3 = i64.load vb\n\
-         \x20 return r1 r2 r3\n\
+         \x20 m7 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vrw)\n\
+         \x20 vk2 = i64.const 51\n\
+         \x20 i64.store va vk2\n\
+         \x20 m8 = call.cap 5 1 (i64, i64) -> (i64) vm (va, vg)\n\
+         \x20 r4 = i64.load vb\n\
+         \x20 m9 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vr (va, v0, vg, vrw)\n\
+         \x20 vk3 = i64.const 68\n\
+         \x20 i64.store va vk3\n\
+         \x20 m10 = call.cap 4 1 (i64, i64) -> (i64) vr (va, vg)\n\
+         \x20 r5 = i64.load vb\n\
+         \x20 return r1 r2 r3 r4 r5\n\
            }}\n\
          }}\n"
     );
@@ -1405,7 +1416,7 @@ fn jit_cap_ending_an_alias_leaves_the_region_alone_differential() {
     )
     .expect("jit compiles");
 
-    let want = [0, MARKER, MARKER];
+    let want = [0, MARKER, MARKER, 51, 68];
     assert_eq!(
         interp.expect("interp runs"),
         want.map(Value::I64).to_vec(),
