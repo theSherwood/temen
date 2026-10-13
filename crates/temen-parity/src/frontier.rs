@@ -436,15 +436,16 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         ],
 
         // An immutable instantiable artifact: shared into the child (FORK.md §8.6). Durable only when
-        // the granting host attested it **freezable** (§4) — then the artifact names it by content
-        // digest and the restoring host re-grants the bytes (#1361).
+        // the restoring host grants it again — an embedder's grant it attested **freezable** (§4,
+        // #1361), or the running program's child image (#2245) — and the artifact names it by
+        // content digest.
         Capability::Module => [
             F,
             Cell {
                 status: Status::Conditional,
-                note: "durable iff the grant is attested freezable (#1361): the artifact carries the \
-                       §4 content digest and the restoring host re-grants the module. An un-attested \
-                       grant is still NonDurableKind::Module",
+                note: "durable iff the restoring host grants it again: an attested-freezable grant \
+                       (#1361) or the running program's child image (#2245). The artifact carries \
+                       the §4 content digest. Any other grant is still NonDurableKind::Module",
             },
             B,
             U,

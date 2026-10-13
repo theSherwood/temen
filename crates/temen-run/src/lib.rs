@@ -5661,8 +5661,8 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     let inst = h.grant_instantiator(0, win);
     h.register_cap_name("instantiator", inst);
     // The by-name spawn set, only for a guest that spawns detached (`temen_ir::spawns_detached`):
-    // a `Module` grant is non-durable, so granting it everywhere would make every snapshot-taking
-    // guest unfreezable.
+    // the `"module"` grant is non-durable, so granting it everywhere would make every
+    // snapshot-taking guest unfreezable.
     if h.self_module_spawns_detached() {
         let by_handle = h.self_module_spawns_by_module_handle();
         h.grant_detached_spawn_caps(win, by_handle);

@@ -1343,7 +1343,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
-| `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
+| `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants, or its program's child image (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant or the running program's child image (#2245) |
 | `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
 | `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
 | `SharedRegion { region }` (#2025, v39) | the region's number in the depth-0 artifact's Section 11 | the depth-0 restore rebuilds each region once (`Host::rebuild_region`: the embedder's region factory, else a heap backing) with the frozen bytes; each domain adopts the ones it names (`Host::adopt_region`) and its handles and `Backed` pages re-open on them, so a region shared across the tree stays shared. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
@@ -1355,7 +1355,8 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 `Host::drain_non_durable`, below):
 
 `Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
-granting host did **not** attest freezable (#1361, below). *(The §22 `JitTable`/`JitCode` handles were here until
+granting host did **not** attest freezable and that is not its program's child image (#1361,
+#2245, below). *(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is
@@ -1376,13 +1377,28 @@ was only ever needed because the handle could not ride; no shipping embedder use
 `durable_nesting.rs`.) It is the same seam as `NamedCapRefused` and `BudgetRefused`:
 the artifact names what it needs, the restoring host decides what to grant (INVARIANTS #3).
 
-It is **conditional**, like `Named`: durable iff the grant carries the §4 freezability attestation
-(`grant_durable_module`). An un-attested grant stays `NonDurableKind::Module` and still drains — a
-durable domain may not instantiate one anyway (§4), so there is no authority a thaw could reconstruct.
+It is **conditional**, like `Named`: durable iff the restoring host has a rule to grant the module
+again. For an embedder's grant that is the §4 freezability attestation (`grant_durable_module`). An
+un-attested grant stays `NonDurableKind::Module` and still drains — a durable domain may not
+instantiate one anyway (§4), so there is no authority a thaw could reconstruct.
 Pinned by `roundtrip.rs::{a_freezable_module_handle_survives_freeze_and_thaw_at_a_different_index,
 a_thaw_that_was_not_re_granted_the_module_fails_closed, an_unattested_module_grant_still_refuses_the_freeze}`
 — the first re-grants the module at a *different* index on the thaw host, so a binding that carried the
 index rather than the digest fails it.
+
+**The program's child image rides too (#2245).** The powerbox grants a program that exports `_child`
+its child image as `"child"` (`Host::grant_child_image`, #2219). It is not attested, but it is a
+pure function of the program, which the artifact already binds, so the restoring powerbox derives
+the same image again when it grants the same program. A handle to it rides as `Module { digest }`
+and re-pins to that image (`Host::module_rides_freeze`); no other grant of the same bytes satisfies
+it, and a thaw whose powerbox derived no such image fails `ModuleUnresolved`. Before this, a domain
+holding the grant could not be frozen at all, so once #2219 retires self-spawn a reactor that spawns
+copies of itself could take no save-state. A durable domain still cannot *spawn* the image: an
+instrumented image is #2245's other half. Pinned by
+`handle_durability.rs::{the_programs_child_image_rides_a_freeze,
+a_thaw_without_the_programs_image_fails_closed, only_the_running_programs_image_rides_a_freeze}`
+and, end to end through a reactor's freeze and thaw,
+`browser/tests/reactor_moment.rs::every_powerbox_capability_re_grants_into_a_child_fresh_and_thawed`.
 
 **Named host capabilities — `HostProc` left the non-durable set (#1455, v21).** A `HostProc` is an
 embedder closure: its code address is process-local and its captured state is the provider's, so

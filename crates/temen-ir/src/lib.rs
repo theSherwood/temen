@@ -3864,8 +3864,8 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// (the only spelling — an executor op reaches its seam through a static `call.cap`, never a
 /// manifest-bound `call.sym`; chibicc's `__vm_instantiate_detached` emits exactly that). The two
 /// reference powerboxes grant the by-name spawn set (`"module"`, `"budget"`) **only** to such a
-/// guest — least authority, and a `Module` grant is non-durable, so a guest that never spawns keeps
-/// a powerbox a warm snapshot can freeze.
+/// guest — least authority, and the `"module"` grant is non-durable, so a guest that never spawns
+/// keeps a powerbox a warm snapshot can freeze.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
@@ -3884,7 +3884,7 @@ pub fn detached_size_log2(requested: i64, declared: Option<u8>) -> i64 {
 /// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
 /// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
 /// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
-/// warm snapshot can freeze (a `Module` grant is non-durable).
+/// warm snapshot can freeze (the `"module"` grant is non-durable).
 pub fn spawns_by_module_handle(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_by_module_handle)
 }

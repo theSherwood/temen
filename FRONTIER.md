@@ -67,7 +67,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *nesting* ⛔ — not re-grantable by name: a child's own budget is the node its spawn charged (#1944)
 
 **`Module`**
-- *durability* 🔶 — durable iff the grant is attested freezable (#1361): the artifact carries the §4 content digest and the restoring host re-grants the module. An un-attested grant is still NonDurableKind::Module
+- *durability* 🔶 — durable iff the restoring host grants it again: an attested-freezable grant (#1361) or the running program's child image (#2245). The artifact carries the §4 content digest. Any other grant is still NonDurableKind::Module
 
 **`ModuleLoader`**
 - *nesting* ⛔ — not in `can_regrant`: a child that may mint modules must be granted one explicitly

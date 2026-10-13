@@ -571,3 +571,139 @@ fn a_drain_keeps_a_budget() {
         "the budget is untouched by the drain"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #2245 — the running program's child image rides a freeze. `grant_child_image` derives it from the
+// program, so a restoring powerbox that runs the same program derives the same image, and the
+// handle re-pins to it by digest. Before this a domain holding the grant could not be frozen at
+// all.
+// ---------------------------------------------------------------------------------------------
+
+/// A program that spawns copies of itself: its `_child` export names func 1, where its image
+/// starts.
+fn child_program(answer: i64) -> std::sync::Arc<temen_ir::Module> {
+    let src = format!(
+        r#"export 0 func "_start" 0
+export 1 func "_child" 1
+func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 0
+  return v0
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  v1 = i64.const {answer}
+  return v1
+  }}
+}}
+"#
+    );
+    std::sync::Arc::new(temen_text::parse_module(&src).expect("parse"))
+}
+
+/// The digest a handle to `program`'s child image is carried by.
+fn image_digest(program: &temen_ir::Module) -> [u8; 32] {
+    let image = temen_ir::child_image(program)
+        .expect("exports `_child`")
+        .expect("an image");
+    temen_interp::module_digest(&image)
+}
+
+/// A freeze carries the image by its digest and a drain keeps it. The thaw's powerbox derives the
+/// image again, here at another `modules` index, and the handle re-pins to it.
+#[test]
+fn the_programs_child_image_rides_a_freeze() {
+    let program = child_program(7);
+    let mut a = Host::new();
+    a.set_self_module(&program);
+    a.grant_clock();
+    a.grant_child_image();
+    let child = a.resolve_cap_name("child").expect("the image is granted");
+
+    let captured = a
+        .capture_durable_handles()
+        .expect("the child image no longer refuses a freeze");
+    assert_eq!(
+        captured
+            .iter()
+            .find(|h| h.slot == (child as u32) & 0xff)
+            .map(|h| h.binding),
+        Some(DurableBinding::Module {
+            digest: image_digest(&program)
+        }),
+        "the image rides by its digest"
+    );
+    assert!(a.drain_non_durable().is_empty(), "a drain keeps it");
+
+    let mut b = Host::new();
+    b.set_self_module(&child_program(7)); // the same program, as a thaw reads it back
+    b.grant_clock();
+    b.grant_module(&child_program(9)); // another module first, so the image's index differs
+    b.grant_child_image();
+    b.check_modules_for_thaw(&captured)
+        .expect("the restoring powerbox derived the same image");
+    b.restore_durable_handles(&captured);
+    assert_eq!(
+        b.capture_durable_handles().unwrap(),
+        captured,
+        "the handle is back, on the image the thaw derived"
+    );
+}
+
+/// The re-pin is to the image the restoring powerbox derives from its own program, and to nothing
+/// else: no image, another program's, or the same bytes granted as a plain module, fails the thaw
+/// closed before any slot is pinned.
+#[test]
+fn a_thaw_without_the_programs_image_fails_closed() {
+    let program = child_program(7);
+    let mut a = Host::new();
+    a.set_self_module(&program);
+    a.grant_child_image();
+    let captured = a.capture_durable_handles().expect("freeze");
+    let want = image_digest(&program);
+
+    let mut none = Host::new();
+    none.set_self_module(&program);
+    let mut other = Host::new();
+    other.set_self_module(&child_program(9));
+    other.grant_child_image();
+    let mut plain = Host::new();
+    plain.set_self_module(&program);
+    plain.grant_module(&temen_ir::child_image(&program).unwrap().unwrap());
+    for (what, b) in [
+        ("no image", none),
+        ("another program's", other),
+        ("a plain grant", plain),
+    ] {
+        assert_eq!(
+            b.check_modules_for_thaw(&captured).map_err(|e| e.digest),
+            Err(want),
+            "{what}: the thaw refuses, naming the image"
+        );
+    }
+}
+
+/// Only the running program's own image rides: the same bytes granted as a plain module still
+/// refuse the freeze, and so does an image of a program the host no longer runs.
+#[test]
+fn only_the_running_programs_image_rides_a_freeze() {
+    let program = child_program(7);
+    let mut plain = Host::new();
+    plain.set_self_module(&program);
+    plain.grant_module(&temen_ir::child_image(&program).unwrap().unwrap());
+    assert_eq!(
+        plain.capture_durable_handles().map_err(|h| h.kind),
+        Err(NonDurableKind::Module)
+    );
+
+    let mut moved = Host::new();
+    moved.set_self_module(&program);
+    moved.grant_child_image();
+    moved.set_self_module(&child_program(9));
+    assert_eq!(
+        moved.capture_durable_handles().map_err(|h| h.kind),
+        Err(NonDurableKind::Module),
+        "the image is not the running program's any more"
+    );
+}

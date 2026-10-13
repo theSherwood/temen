@@ -83,11 +83,11 @@ fn grant_io_powerbox(
     let declared = host.grant_declared_host_caps(&m.imports, host_caps, parked);
     // #1528 — the §14 **by-name spawn set**, the same frontier the two reference powerboxes present
     // (`temen-run`'s `grant_powerbox_prefix` caller and the browser's `grant_onramp_caps`): an
-    // `Instantiator` over the guest's own window under `"instantiator"`, and — only for a guest that
-    // can spawn detached (`temen_ir::spawns_detached`; a `Module` grant is non-durable) — `"module"`
-    // (itself, spawnable) and `"budget"` (the detached-window allowance). Without these a §5/§14
-    // guest resolved nothing under the debugger and could not be stepped at all, while the same
-    // source ran on both Run paths — the INVARIANTS #14 frontier gap, not a policy difference.
+    // `Instantiator` over the guest's own window under `"instantiator"`, and — only for a guest
+    // that can spawn detached (`temen_ir::spawns_detached`; the `"module"` grant is non-durable) —
+    // `"module"` (itself, spawnable) and `"budget"` (the detached-window allowance). Without these
+    // a §5/§14 guest resolved nothing under the debugger and could not be stepped at all, while the
+    // same source ran on both Run paths — the INVARIANTS #14 frontier gap, not a policy difference.
     // Granted **last**, so every handle above keeps its value (a reverse-`seek` rebuild replays the
     // recorded cap tape against the same numbering) — the browser on-ramp orders it the same way.
     host.set_self_module(&std::sync::Arc::new(m.clone()));

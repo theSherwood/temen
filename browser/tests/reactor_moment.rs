@@ -449,11 +449,13 @@ fn packed(s: &str) -> i64 {
     i64::from_le_bytes(b)
 }
 
-/// A reactor whose `tick` spawns a §14 child (func 2, detached in a window of its own, paid from the
-/// by-name `"budget"`) with exactly one capability, `cap`, re-granted by name, joins it, and writes the
-/// low byte of the child's result to stdout (`?` if the child could not resolve `cap`). A grant the
-/// parent may not re-grant fails the spawn closed — op 17 traps `CapFault` on every engine.
-/// `child_body` runs in the child with the resolved handle in `vh2: i32` and returns an `i64`.
+/// A reactor whose `tick` spawns its child image (#2219: the program exports func 2 as `_child`,
+/// and the host grants the image as `"child"`) detached, in a window of its own, paid from the
+/// by-name `"budget"`, with exactly one capability, `cap`, re-granted by name. It joins the child
+/// and writes the low byte of its result to stdout (`?` if the child could not resolve `cap`). A
+/// grant the parent may not re-grant fails the spawn closed — op 17 traps `CapFault` on every
+/// engine. `child_body` runs in the child with the resolved handle in `vh2: i32` and returns an
+/// `i64`.
 fn regrant_reactor(cap: &str, child_body: &str) -> temen_ir::Module {
     let len = cap.len();
     let src = format!(
@@ -462,8 +464,10 @@ data 16384 "instantiator"
 data 16400 "{cap}"
 data 16416 "stdout"
 data 16496 "budget"
+data 16512 "child"
 export 0 func "_start" 0
 export 1 func "tick" 1
+export 2 func "_child" 2
 
 func () -> (i64) {{
 block 0 () {{
@@ -483,6 +487,9 @@ block 0 (vsp: i64) {{
   vbp0 = i64.const 16496
   vbl = i64.const 6
   vbud = self.resolve vbp0 vbl
+  vchp = i64.const 16512
+  vchl = i64.const 5
+  vchild = self.resolve vchp vchl
   ; the grant record at 17536: {{name_off, name_len, handle, flags}}
   vg0 = i64.const 17536
   vgn = i32.const 16400
@@ -492,15 +499,15 @@ block 0 (vsp: i64) {{
   i32.store vg0 vcap offset=8
   vgz = i32.const 0
   i32.store vg0 vgz offset=12
-  ; the v1 spawn record at 17408 (temen_ir::SpawnRec): entry 2 of the running module (-1), its
-  ; declared window, no pager or pre-mapped region, paid from `budget`, one grant
+  ; the v1 spawn record at 17408 (temen_ir::SpawnRec): the child image, at its bootstrap (entry 0,
+  ; which calls func 2), its declared window, no pager or pre-mapped region, paid from `budget`,
+  ; one grant
   vr0 = i64.const 17408
-  vf0 = i64.const 8589934593
+  vf0 = i64.const 1
   i64.store vr0 vf0
   vf2 = i64.const -4294967296
   i64.store vr0 vf2 offset=16
-  vself = i32.const -1
-  i32.store vr0 vself offset=24
+  i32.store vr0 vchild offset=24
   i32.store vr0 vbud offset=28
   i64.store vr0 vg0 offset=40
   vn = i64.const 1

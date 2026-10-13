@@ -3875,7 +3875,7 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set, only for a guest that spawns detached: a `Module` grant is
+        // The by-name spawn set, only for a guest that spawns detached: the `"module"` grant is
         // non-durable, so granting it everywhere would make every reactor that saves a warm
         // snapshot unfreezable.
         if temen_ir::spawns_detached(m) {
