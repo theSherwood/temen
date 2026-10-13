@@ -22,7 +22,7 @@
 //!
 //! Reproduce the fixture: see the fixtures README §"Regenerating (floats)".
 
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 /// `(int)((3.14 + sqrt(2) + (10.5 % 3.0) + 1500.25) * 1000.0)` — pinned against a native build.
 const EXPECT: i32 = 1506304;

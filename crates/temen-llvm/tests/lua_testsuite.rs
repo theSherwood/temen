@@ -14,7 +14,7 @@
 //! string↔number bitwise coercions with `_ENV = nil`; `pm` the full pattern-matching engine
 //! (`find`/`match`/`gmatch`/`gsub`, captures, anchors, `%b`, `%f`).
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(

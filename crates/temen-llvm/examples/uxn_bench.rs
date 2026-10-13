@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 fn main() {
     let frames: usize = std::env::var("UXN_BENCH_FRAMES")

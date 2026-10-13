@@ -13,7 +13,7 @@
 //! `luaL_requiref`'d library, the only path reachable on the on-ramp (no filesystem / dynamic loader
 //! for the file and C-library searchers). See the fixtures README.
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(

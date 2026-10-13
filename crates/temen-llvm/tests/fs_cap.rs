@@ -13,7 +13,7 @@
 //!   pre-seeds `seed.txt`, the guest verifies it and leaves `out.txt` behind, and the test asserts
 //!   the bytes really landed on disk.
 
-use temen_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{fs, Backend, Outcome, RunConfig, Value};
 
 fn instance() -> temen_run::Instance {
     let bc = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fs_probe.ll");

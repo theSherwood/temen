@@ -1,7 +1,7 @@
 //! Throwaway: translate a `.ll` and run it through the powerbox on the **tree-walker** (Memory
 //! granted), printing the outcome. Validates Lua first light — `main` runs a pure-compute script and
 //! returns the result. Pass `jit`/`bytecode` as a 2nd arg to pick another backend.
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 fn main() {
     let path = std::env::args()

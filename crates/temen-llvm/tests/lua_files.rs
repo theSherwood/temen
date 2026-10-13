@@ -16,7 +16,7 @@
 //!   same unmodified guest drives real disk I/O end to end (and leaves the root clean afterwards —
 //!   files.lua removes everything it creates).
 
-use temen_run::{fs, Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{fs, Backend, Outcome, RunConfig, Value};
 
 fn instance() -> temen_run::Instance {
     let bc = concat!(

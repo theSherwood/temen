@@ -18,7 +18,7 @@
 //! needed; the coroutine machinery itself is the stackless setjmp/longjmp path (no fibers), proven by
 //! the sibling `lua_coroutine` differential.
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(

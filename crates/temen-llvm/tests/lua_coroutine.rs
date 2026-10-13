@@ -15,7 +15,7 @@
 //! involved — the on-ramp's existing `SetJmp`/`LongJmp` core ops (proven by every working `pcall`)
 //! carry it, and no translator or libc change was needed here.
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(

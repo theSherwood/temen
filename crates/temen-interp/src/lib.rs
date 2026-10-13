@@ -20460,9 +20460,8 @@ pub const DEFAULT_CHANNEL: u64 = 64 << 30;
 /// #2113 — the root's `spawn` grant when its embedder names none: [`MAX_VCPUS`] live vCPUs.
 pub const DEFAULT_SPAWN: u64 = MAX_VCPUS as u64;
 /// #2268 — the root's `maps` grant when its embedder names none: unbounded (`u64::MAX`, as an
-/// unlimited fuel is), so the process-wide pool ([`maps_pool`]) is what bounds a run by default. A
-/// guest can then never take the process down by its mappings, and an embedder hosting several runs
-/// grants each its share to keep one from starving the others.
+/// unlimited fuel is), so the process-wide pool ([`maps_pool`]) is what bounds a run by default. An
+/// embedder hosting several runs grants each its share, to keep one from starving the others.
 pub const DEFAULT_MAPS: u64 = u64::MAX;
 
 /// #1877, #2268 — what a detached child's admission charges the budget that funds it for its window
@@ -20477,15 +20476,20 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// What the lease holds: the window's `bytes` of `mem`; its child's first vCPU ([`VcpuCost`]); and
-    /// the domain's mappings ([`MAPS_PER_DOMAIN`]) and its window's runs past [`WINDOW_RUNS`].
+    /// What the lease holds: the window's `bytes` of `mem`, its child's first vCPU ([`VcpuCost`]), and
+    /// its [`Self::maps`].
     fn cost(&self) -> [(usize, u64); 3] {
-        let window = MAPS_PER_DOMAIN + self.runs.saturating_sub(WINDOW_RUNS);
         [
             (BUDGET_MEM, self.bytes),
             (BUDGET_SPAWN, 1),
-            (BUDGET_MAPS, MAPS_PER_VCPU + window),
+            (BUDGET_MAPS, self.maps()),
         ]
+    }
+
+    /// The mappings it holds: its child's first vCPU's ([`MAPS_PER_VCPU`]), its domain's
+    /// ([`MAPS_PER_DOMAIN`]), and its window's runs past [`WINDOW_RUNS`].
+    fn maps(&self) -> u64 {
+        MAPS_PER_VCPU + MAPS_PER_DOMAIN + self.runs.saturating_sub(WINDOW_RUNS)
     }
 }
 
@@ -27602,8 +27606,7 @@ impl Host {
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
-        let maps = lease.cost().into_iter().filter(|&(d, _)| d == BUDGET_MAPS);
-        self.budgets.add(node, &maps.collect::<Vec<_>>(), false);
+        self.budgets.force_charge(node, BUDGET_MAPS, lease.maps());
         Some(lease)
     }
 

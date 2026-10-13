@@ -13,7 +13,7 @@
 //! Unlike the earlier Lua tests (which check a return value), this asserts the exact **stdout bytes** —
 //! the first end-to-end demonstration of Lua producing real output through the powerbox.
 
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 /// The exact stdout of a native build of the same core + libraries + script.
 const EXPECT: &str = "hello from lua on the on-ramp\n\

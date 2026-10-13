@@ -10,7 +10,7 @@
 //! `io.write`/`os.date`/`coroutine` all work; file I/O (`io.open`) degrades gracefully to `nil` since
 //! this run grants no `fs` capability — see the `hc` guard in `lua_files_stdio.c`.
 
-use temen_run::{Backend, Limits, RunConfig};
+use temen_run::{Backend, RunConfig};
 
 /// A small script covering what a first-time user reaches for across the editor's libraries: `print`,
 /// `string.format` (runtime format — the `lua_fmt` guest snprintf), `table.sort`/`concat`, `io.write`

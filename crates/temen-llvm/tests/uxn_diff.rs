@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 const FRAMES: u32 = 120;
 

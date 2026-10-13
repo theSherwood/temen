@@ -15,7 +15,7 @@
 //! and **sign-extended narrow signed ops** (`ashr`/`sdiv`/`srem` on `i8`/`i16` — the bug that had
 //! dropped Lua's `getobjname` operand name in error messages).
 
-use temen_run::{Backend, Limits, Outcome, RunConfig, Value};
+use temen_run::{Backend, Outcome, RunConfig, Value};
 
 fn run(backend: Backend) -> temen_run::Run {
     let bc = concat!(

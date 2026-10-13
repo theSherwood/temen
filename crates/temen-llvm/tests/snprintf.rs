@@ -6,7 +6,7 @@
 //! destination buffer.
 
 use std::process::Command;
-use temen_run::{Backend, Limits, Outcome, RunConfig};
+use temen_run::{Backend, Outcome, RunConfig};
 
 /// Compile `src` (a `main` program returning a byte) to bitcode + a native exe, translate it, and run
 /// it through the powerbox on `backend`; assert the result equals the native exit code. Skips cleanly
