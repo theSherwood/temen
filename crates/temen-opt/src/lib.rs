@@ -2414,14 +2414,10 @@ pub fn map_term_operands(t: &mut Terminator, f: &mut impl FnMut(ValIdx) -> ValId
     t.for_each_operand_mut(&mut |v| *v = f(*v));
 }
 
-/// Visit (read-only) every value operand of an instruction. Implemented on a throwaway clone
-/// through [`map_operands`], so there is a single source of truth for "what the operands are".
+/// Visit (read-only) every value operand of an instruction. Thin adapter over
+/// [`temen_ir::Inst::for_each_operand`], the reading twin of `map_operands`' traversal (#913).
 pub(crate) fn each_operand(inst: &Inst, mut visit: impl FnMut(ValIdx)) {
-    let mut tmp = inst.clone();
-    map_operands(&mut tmp, &mut |v| {
-        visit(v);
-        v
-    });
+    inst.for_each_operand(&mut |v| visit(*v));
 }
 
 /// Remove dead values from one block: a backward liveness sweep marks every value used by a
