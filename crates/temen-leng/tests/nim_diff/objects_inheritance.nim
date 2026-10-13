@@ -1,9 +1,6 @@
-# KNOWN GAP — #2260: a derived `ref object` with no method override of its own. nimony lifts a
-# `=copy` hook for `Dog.Obj` whose inlined call binds the `var` dest without `haddr`. The hook is
-# ill-formed and dead (nimony's C backend drops it), but leng translates every proc, so the link fails.
-#
 # Object inheritance without methods: `of` tests the runtime type, and a checked conversion
-# (`Dog(a)`) reads the derived field.
+# (`Dog(a)`) reads the derived field. nimony lifts an ill-formed `=copy` hook for `Dog.Obj` (#2260),
+# but it is dead, and the program's dead-code pass drops it before the link sees it.
 import std/syncio
 type
   Animal = ref object of RootObj

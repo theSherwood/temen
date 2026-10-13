@@ -447,8 +447,8 @@ plumbing. Five workstreams, roughly independent:
   - **Measured from the language side (#956).** The feature→status matrix is
     [`crates/temen-leng/tests/nim_diff/MATRIX.md`](crates/temen-leng/tests/nim_diff/MATRIX.md), over
     the differential corpus: a row per feature, each case built by native nimony and diffed byte for
-    byte against the same build run on each of Temen's engines, each gap with its issue, and the
-    constructs nimony itself rejects. A toolchain-free test keeps it in step with the corpus. Rows
+    byte against the same build linked as `temen-link` links it and run on each of Temen's engines,
+    each gap with its issue, and the constructs nimony itself rejects. A toolchain-free test keeps it in step with the corpus. Rows
     that took translator work: method **dynamic dispatch** (#979: the `Rtti` vtable's `mt` method
     table is materialized as funcref relocs); **exceptions** (#980: hexer lowers `raise`/`try`/
     `except` to nimony's **error-flag model**, where a can-raise proc returns an `(ErrorCode, value)`

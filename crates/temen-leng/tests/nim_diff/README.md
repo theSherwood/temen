@@ -1,8 +1,11 @@
 # The nim differential corpus
 
-Each `.nim` file here is built once by native `nimony c --run` and run natively and, from that
-build's Leng, on each of Temen's engines (the tree-walker, bytecode and the JIT). Each engine's
-output is diffed byte for byte against native's by `nim_differential_corpus` in `../nim_e2e.rs`.
+Each `.nim` file here is built once by native `nimony c --run` and run natively. The same build's
+Leng then runs on Temen the way a user's build does: the program's `.c.nif` (what is left after its
+dead-code pass, the files `nimony t` hands `temen-link`), linked as `temen-link` links them, run
+under the POSIX personality on each of Temen's engines (the tree-walker, bytecode and the JIT). Each
+engine's output is diffed byte for byte against native's by `nim_differential_corpus` in
+`../nim_e2e.rs`.
 
 **Adding a case is adding a file**, and naming it in a row of [`MATRIX.md`](MATRIX.md), the
 feature→status matrix the corpus backs (#956). There is no expected value to write down: the native
