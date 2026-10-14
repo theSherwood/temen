@@ -407,8 +407,13 @@ property, so in practice:
   (`SchedCore::on_stop`, as on the cooperative pump), and the task's thread runs it on its Worker
   before it steps the task on. Each Worker keeps the coop driver's emitted tier (`emittedTier`), so
   its `WebAssembly.Table` follows the run's dispatch table by its generation and a unit's
-  `call.dyn` reaches what any thread installed (B6-3b). The coop emit for regions (paged included)
-  and detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
+  `call.dyn` reaches what any thread installed (B6-3b). Regions and units are the coop driver's
+  emit (`coop_emit_for` and its unit emitter): the run is of the module that emit outlined, and
+  units mask against the run's window and table. A paged emit checks each access against its
+  thread's page-state table, rebuilt from the task's page map when it moves (B6-3b-4b). A spilling
+  emit pushes its frames' live words to its thread's spill stack, and a `gc.roots` in a bounce scans
+  them with the task beneath (B6-3b-4c).
+  Detached children on their own memories (B6-3c) follow; then it replaces the per-Worker `Vcpu`
   driver (B6-4).
 
 ### Known wrinkles — all resolved in `4c-wasm`

@@ -185,7 +185,7 @@ fn bounce_whole_call(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     };
     let mut io = [0i64; 8];
     io[..call.argv.len()].copy_from_slice(call.argv);
-    let n = (call.bounce)(func, &mut io)?;
+    let n = (call.bounce)(func, &mut io, 0)?;
     call.results = io[..n].to_vec();
     Ok(())
 }
@@ -194,6 +194,8 @@ fn tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatform {
     ThreadPlatform {
         tier: Some(ThreadTier {
             eligible: count_eligible(),
+            page_checked: false,
+            spill: 0,
             run,
         }),
         ..ThreadPlatform::OS
@@ -465,6 +467,8 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
     ThreadPlatform {
         tier: Some(ThreadTier {
             eligible: Arc::from([false, false]),
+            page_checked: false,
+            spill: 0,
             run,
         }),
         ..ThreadPlatform::OS
@@ -525,4 +529,231 @@ fn an_invoke_over_a_window_with_no_flat_span_runs_interpreted() {
 fn a_trap_in_an_emitted_invoke_traps_its_task() {
     let ran = run_invokes(invoke_tier(|_| Err(Trap::DivByZero)), true, flat_window());
     assert_eq!(ran, Err(Trap::DivByZero));
+}
+
+/// The first page past the window's null guard ([`temen_ir::POWERBOX_NULL_GUARD`]).
+fn guarded_page() -> u64 {
+    temen_ir::POWERBOX_NULL_GUARD.max(temen_interp::host_page_size())
+}
+
+/// Run `src` on the parallel driver under a page-checked tier that runs function 2 with `run`, over
+/// a flat window, with whole-window memory authority at the handle `{mem}`. `{addr}` is the
+/// [`guarded_page`] and `{page}` the page size.
+fn run_paged(
+    src: &str,
+    run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
+) -> Result<Vec<Value>, Trap> {
+    let mut host = Host::new();
+    let mem = host.grant_memory();
+    let src = src
+        .replace("{mem}", &mem.to_string())
+        .replace("{addr}", &guarded_page().to_string())
+        .replace("{page}", &temen_interp::host_page_size().to_string());
+    host.set_thread_platform(ThreadPlatform {
+        tier: Some(ThreadTier {
+            eligible: count_eligible(),
+            page_checked: true,
+            spill: 0,
+            run,
+        }),
+        ..ThreadPlatform::OS
+    });
+    let mut fuel = 50_000_000;
+    bytecode::compile_and_run_capture_over_parallel_with_host(
+        &module(&src),
+        0,
+        &[],
+        &mut fuel,
+        &[],
+        flat_window(),
+        &mut host,
+    )
+    .expect("the parallel driver runs the module")
+    .0
+}
+
+/// The page-state table a page-checked call reads now: a byte per page, up to its coverage.
+fn pagestate_now(call: &EmittedCall<'_>) -> Vec<u8> {
+    let at = call
+        .pagestate()
+        .expect("a page-checked call carries a page-state table");
+    let pages = (call.mapped_now() / temen_interp::host_page_size()) as usize;
+    // SAFETY: the table holds a byte per page of its coverage, and lives for the call.
+    unsafe { std::slice::from_raw_parts(at, pages) }.to_vec()
+}
+
+/// The root seeds the cell at `{addr}` with 7, protects its page read-only, spawns a thread that
+/// reads the cell through function 2, joins it, reads the cell through function 2 itself, and
+/// returns the sum.
+const PROTECT_THEN_READ: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vp = i64.const {addr}
+  v7 = i64.const 7
+  i64.store vp v7
+  vas = i32.const {mem}
+  vlen = i64.const {page}
+  vprot = i32.const 1
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vp, vlen, vprot)
+  vz = i64.const 0
+  t0 = thread.spawn 1 vz vz
+  j0 = thread.join t0
+  va = call 2 (vp)
+  vs = i64.add j0 va
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vp = i64.const {addr}
+  vl = call 2 (vp)
+  return vl
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+";
+
+static TABLES: std::sync::Mutex<Vec<(Vec<u8>, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn record_table(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let table = pagestate_now(call);
+    TABLES.lock().unwrap().push((table, call.mapped));
+    bounce_whole_call(call)
+}
+
+#[test]
+fn each_page_checked_call_reads_its_tasks_page_map() {
+    assert_eq!(
+        run_paged(PROTECT_THEN_READ, record_table),
+        Ok(vec![Value::I64(14)])
+    );
+    let tables = TABLES.lock().unwrap();
+    assert_eq!(
+        tables.len(),
+        2,
+        "the thread's call and the root's tiered up"
+    );
+    let page = temen_interp::host_page_size();
+    let at = (guarded_page() / page) as usize;
+    for (table, mapped) in tables.iter() {
+        assert_eq!(table[at], 2, "the protected page is read-only");
+        assert_eq!(table[at + 1], 1, "the page after it is read-write");
+        assert_eq!(
+            *mapped,
+            table.len() as u64 * page,
+            "the call is bounded by the table's coverage"
+        );
+    }
+}
+
+/// The root seeds the cell at `{addr}` with 7 and reads it through function 2, whose emitted code
+/// first calls function 3, which protects its page read-only.
+const PROTECT_IN_A_BOUNCE: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vp = i64.const {addr}
+  v7 = i64.const 7
+  i64.store vp v7
+  va = call 2 (vp)
+  return va
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  return varg
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vl = i64.load v0
+  return vl
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vas = i32.const {mem}
+  vlen = i64.const {page}
+  vprot = i32.const 1
+  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (v0, vlen, vprot)
+  return vr
+  }
+}
+";
+
+static AROUND_THE_BOUNCE: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+fn protect_in_a_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let before = pagestate_now(call);
+    let mut io = [0i64; 8];
+    io[0] = call.argv[0];
+    (call.bounce)(3, &mut io, 0)?;
+    let after = pagestate_now(call);
+    AROUND_THE_BOUNCE.lock().unwrap().extend([before, after]);
+    bounce_whole_call(call)
+}
+
+#[test]
+fn a_bounce_that_moves_the_page_map_rebuilds_the_calls_table() {
+    assert_eq!(
+        run_paged(PROTECT_IN_A_BOUNCE, protect_in_a_bounce),
+        Ok(vec![Value::I64(7)])
+    );
+    let around = AROUND_THE_BOUNCE.lock().unwrap();
+    assert_eq!(around.len(), 2);
+    let at = (guarded_page() / temen_interp::host_page_size()) as usize;
+    assert_eq!(around[0][at], 1, "before the bounce the page is read-write");
+    assert_eq!(
+        around[1][at], 2,
+        "after it, the call's table has it read-only"
+    );
+}
+
+/// A collecting guest: the root spawns 4 threads, and each task calls function 1 with `0x9100`. It
+/// derives `0x9108`, which never leaves it, calls the collector (function 2: `gc.roots` over
+/// `[0x9000, 0xA000)`), and returns the count plus 8. The tasks' results are summed.
+const GC_FROM_THREADS: &str = include_str!("fixtures/threads_gc_spill.temt");
+
+/// Emitted code for function 1 that spills what it holds live across its call to the collector, its
+/// argument and the word it derived, then makes that call through its bounce.
+fn spill_then_collect(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let (base, words) = call
+        .spill()
+        .expect("a spilling tier gives each thread a spill stack");
+    assert!(words >= 2);
+    let v0 = call.argv[0];
+    // SAFETY: the thread's spill stack holds `words` words, and nothing else writes it meanwhile.
+    unsafe {
+        base.write(v0 as u64);
+        base.add(1).write(v0 as u64 + 8);
+    }
+    let mut io = [0i64; 8];
+    (call.bounce)(2, &mut io, 2)?;
+    call.results = vec![io[0] + 8];
+    Ok(())
+}
+
+#[test]
+fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
+    let m = module(GC_FROM_THREADS);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(
+        interpreted,
+        Ok(vec![Value::I64(55)]),
+        "5 tasks, each counting 3 roots, plus 8"
+    );
+    let spilling = ThreadPlatform {
+        tier: Some(ThreadTier {
+            eligible: Arc::from([false, true, false, false]),
+            page_checked: false,
+            spill: 64,
+            run: spill_then_collect,
+        }),
+        ..ThreadPlatform::OS
+    };
+    assert_eq!(run_over(&m, spilling, flat_window()), interpreted);
 }
