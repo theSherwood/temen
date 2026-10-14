@@ -126,3 +126,34 @@ fn keep_list_and_source_name_precedence() {
         "existing source name is not overwritten"
     );
 }
+
+/// #2219 — `_child` is kept as `_start` is: the host builds the program's child image from it
+/// ([`temen_ir::child_image`]), so a stripped program can still spawn copies of itself.
+#[test]
+fn the_child_export_is_always_kept() {
+    let mut m = parse_module(
+        "memory 16\n\
+         export 0 func \"_start\" 0\n\
+         export 1 func \"_child\" 1\n\
+         export 2 func \"helper\" 1\n\
+         func () -> (i32) {\n\
+         block 0 () {\n\
+         \x20 v0 = i32.const 0\n\
+         \x20 return v0\n\
+           }\n\
+         }\n\
+         func (i64, i64) -> (i64) {\n\
+         block 0 (v0: i64, v1: i64) {\n\
+         \x20 return v0\n\
+           }\n\
+         }\n",
+    )
+    .expect("parse text IR");
+    verify_module(&m).expect("verify");
+    assert_eq!(demote_exports(&mut m, &[]), 1, "only `helper` is demoted");
+    assert_eq!(m.resolve_export("_child"), Some(1));
+    assert!(
+        temen_ir::child_image(&m).is_some_and(|image| image.is_ok()),
+        "the host still builds its child image"
+    );
+}

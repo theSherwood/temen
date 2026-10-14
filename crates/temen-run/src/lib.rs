@@ -1651,6 +1651,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 reserved_log2,
                 funcs: r.funcs,
                 types: r.types,
+                impl_exports: r.module.impl_exports.clone(),
                 shadow: r
                     .shadow
                     .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
@@ -2464,8 +2465,8 @@ pub unsafe extern "C" fn module_resolver_locked(
     resolve_module_into(&host, handle, out)
 }
 
-/// The body of both resolvers: fill `out` with the views of the module a spawn's operand names
-/// ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
+/// The body of both resolvers: fill `out` with the module a spawn's operand names and what its grant
+/// records ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
 ///
 /// # Safety
 /// `out` is a writable [`temen_jit::ResolvedModule`].
@@ -2475,26 +2476,10 @@ unsafe fn resolve_module_into(
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     match host.resolve_module_parts(handle) {
-        Some((
-            funcs,
-            n_funcs,
-            memory_log2,
-            data,
-            n_data,
-            types,
-            n_types,
-            shadow,
-            durable,
-            digest,
-        )) => {
+        Some((m, memory_log2, shadow, durable, digest)) => {
             *out = temen_jit::ResolvedModule {
-                funcs,
-                n_funcs,
+                module: m,
                 memory_log2,
-                data,
-                n_data,
-                types,
-                n_types,
                 shadow,
                 durable,
                 digest,
@@ -5043,21 +5028,23 @@ pub use temen_ir::is_named_powerbox_entry;
 /// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
 /// `temen-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
 /// shipped `.temen` carries thousands of export entries nothing ever resolves; only the ones in `keep`
-/// (plus `_start`, always — it is the powerbox-entry *marker*, [`is_named_powerbox_entry`]) are
+/// (plus, always, `_start`, the powerbox-entry *marker* ([`is_named_powerbox_entry`]), and
+/// `_child`, where the host's child image of the program starts ([`temen_ir::CHILD_EXPORT`])) are
 /// semantic. Each export not kept is removed from [`Module::exports`] and its name recorded in
 /// [`temen_ir::DebugInfo::func_names`] instead — the strippable, verifier-ignored §6 name waist that
 /// backtraces and the wasm-JIT emitter's name section already read — so demotion changes **no**
 /// diagnostic output, only what [`Module::resolve_export`] can reach. An existing `func_names` entry
 /// (a `-g` source name) is never overwritten. Returns the number of exports demoted.
 ///
-/// Only sound as an explicit **per-artifact** choice for a known-single-module artifact: a parent
-/// guest can resolve any child export by name through the Module capability, so a linking or
-/// child-module artifact must keep everything it publishes.
+/// Only sound as an explicit **per-artifact** choice: an embedder that calls a function by its
+/// export name (a reactor's `tick`, say) names it in `keep`, and a linking artifact must keep
+/// everything it publishes.
 pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
-    // `_start` (the powerbox-entry marker) is a semantic the host resolves — always kept, never
-    // demotable to a diagnostic name. (#1094: the `__null_guard` marker is retired; the NULL guard is
-    // unconditional now, so no export needs preserving for it — a stale one in an old asset is inert.)
-    let semantic = |name: &str| name == "_start";
+    // `_start` (the powerbox-entry marker) and `_child` (#2219: the host builds the program's child
+    // image from it) are semantics the host resolves — always kept, never demotable to a diagnostic
+    // name. (#1094: the `__null_guard` marker is retired; the NULL guard is unconditional now, so
+    // no export needs preserving for it — a stale one in an old asset is inert.)
+    let semantic = |name: &str| name == "_start" || name == temen_ir::CHILD_EXPORT;
     let kept: Vec<temen_ir::Export> = module
         .exports
         .iter()
