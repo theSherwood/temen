@@ -269,6 +269,22 @@ pub fn served_shape_ok(type_id: u32, op: u32, sig: &FuncType) -> bool {
     }
 }
 
+/// The slot of a join table of `len` slots a thread or child handle names, on every engine: what
+/// `join`, `poll`, `detach`, `kill`, `child_offer` and `grant` act on (#2400). A handle is a slot,
+/// masked to the table's power-of-two span; `live` says whether a slot still holds a child not
+/// joined or detached. #773 defense-in-depth: a **negative** value is never a handle — it is a
+/// forged one or (the real footgun) a failed-spawn errno the guest forwarded to `join`/`poll`/
+/// `detach` without checking — so it names nothing rather than fold onto a live slot (e.g. a
+/// background server), which would wedge the join on a child that never exits. `None` is the
+/// `ThreadFault` a join answers.
+pub fn join_slot(len: usize, handle: i32, live: impl Fn(usize) -> bool) -> Option<usize> {
+    if handle < 0 || len == 0 {
+        return None;
+    }
+    let slot = (handle as u32 as usize) & (len.next_power_of_two() - 1);
+    (slot < len && live(slot)).then_some(slot)
+}
+
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
 /// own error path (INVARIANTS #5: "errors are values"). **One definition** here, in the wire-IR
 /// crate every host crate already depends on, so the values and their **sign** cannot drift between

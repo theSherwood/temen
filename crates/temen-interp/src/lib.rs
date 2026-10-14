@@ -11951,20 +11951,8 @@ fn fiber_sig() -> FuncType {
 /// forgeable, so it is **masked** into the power-of-two-padded table, then bounds- and
 /// liveness-checked: out of range or an already-joined (`None`) slot is inert ([`Trap::ThreadFault`]).
 fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> {
-    // #773 defense-in-depth: a join handle is a small non-negative slot; a **negative** value is never
-    // one — it is a forged handle or (the real footgun) a failed-spawn errno the guest forwarded to
-    // `join`/`poll`/`detach` without checking. Reject it (invariant 5: a trap for forgery) rather than
-    // let the `& mask` fold it onto a live slot (e.g. a background server), which would wedge the join
-    // on a child that never exits. `threads.is_empty()` alone missed this.
-    if handle < 0 || threads.is_empty() {
-        return Err(Trap::ThreadFault);
-    }
-    let mask = threads.len().next_power_of_two() - 1;
-    let slot = (handle as u32 as usize) & mask;
-    if slot >= threads.len() || threads[slot].is_none() {
-        return Err(Trap::ThreadFault);
-    }
-    Ok(slot)
+    temen_ir::join_slot(threads.len(), handle, |slot| threads[slot].is_some())
+        .ok_or(Trap::ThreadFault)
 }
 
 /// Join child `handle`: take its entry out of `children` and retire the slot, by the
