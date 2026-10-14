@@ -118,7 +118,8 @@ bounds its vCPUs and `MAX_FIBERS` its fibers until #1867 deletes the carve. A pi
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
 for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
-stream's queue; a job's output; a table of names, descriptors, listings or mappings) is `channel` of
+stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
+listings or mappings) is `channel` of
 the node of the domain the capability's state was granted to, and every ancestor, plus one `maps` for
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling
 (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed back as it shrinks or
@@ -127,8 +128,8 @@ goes (#2306). A descriptor a guest causes holds one of the process's pool over i
 host memory (the bytecode engine's register file) is `mem` of its vCPU's domain past the
 `FIBER_STACK` the vCPU's own charge pays for, plus its one `maps` from 128 KiB, and growing past a
 ceiling is `StackOverflow` (#2336). What a capability keeps per guest with no budget dimension of
-its own has a fixed bound and an errno past it: a POSIX process's descriptors, environment and the
-personality's process table (#2306, #2345), a spawn's grant list (#2349). A
+its own has a fixed bound and an errno past it: a POSIX process's descriptors and the personality's
+process table (#2306, #2345), a spawn's grant list (#2349). A
 fiber `cont.new` makes is `FIBER_STACK` (256 KiB) of its domain's `mem` while it lives: charged to
 the domain's node and every ancestor, `FiberFault` past a ceiling, and handed back when the fiber
 returns or its domain ends. A freeze hands it back as it flattens the fiber, and the thaw re-charges

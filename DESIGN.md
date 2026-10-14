@@ -2498,7 +2498,8 @@ child's grants is exactly the party positioned to observe their use.
   makes. No code can use more than the grant above it (INVARIANTS #3).
 - **What a capability holds for its guest is metered too (#2306).** Host memory a
   guest grows through a capability (a file's bytes; a pipe's, socket's or captured
-  stream's queue; a job's output; a table of names, descriptors, listings or
+  stream's queue; a job's output; a process's environment, which a fork twin
+  shares until either writes (#2345); a table of names, descriptors, listings or
   mappings) is `channel` of the node of the domain the capability's state was
   granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
   the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
