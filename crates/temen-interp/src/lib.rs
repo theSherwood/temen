@@ -14866,27 +14866,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // 7–8): bytes of this domain's window copied to the child's
                             // `module_args_base()` before start — the detached twin of the op-13
                             // convention (a parent data segment landing inside the carve), which has
-                            // no analogue across windows. The 7-arg form seeds nothing; an over-long
-                            // payload refuses probeably.
-                            let payload: Option<Vec<u8>> = match (args.get(7), args.get(8)) {
-                                _ if rec.is_some() => match rec.as_ref().map(|r| r.args) {
-                                    Some((ptr, len)) if len > 0 => {
-                                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                        Some(m.read_window(ptr, len as usize)?)
-                                    }
-                                    _ => None,
-                                },
-                                (Some(&p), Some(&l)) => {
-                                    let ptr = get(&frames[top].vals, p)?.i64() as u64;
-                                    let len = get(&frames[top].vals, l)?.i64() as usize;
-                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                    Some(m.read_window(ptr, len)?)
+                            // no analogue across windows. The 7-arg form seeds nothing. An over-long
+                            // payload refuses probeably, before anything is read: its length is the
+                            // guest's (#2338).
+                            let payload_at: Option<(u64, u64)> = match (args.get(7), args.get(8)) {
+                                _ if rec.is_some() => {
+                                    rec.as_ref().map(|r| r.args).filter(|&(_, len)| len > 0)
                                 }
+                                (Some(&p), Some(&l)) => Some((
+                                    get(&frames[top].vals, p)?.i64() as u64,
+                                    get(&frames[top].vals, l)?.i64() as u64,
+                                )),
                                 _ => None,
                             };
-                            let payload_ok = payload.as_ref().is_none_or(|p| {
-                                p.len() as u64
-                                    <= temen_ir::module_args_end() - temen_ir::module_args_base()
+                            let payload_ok = payload_at.is_none_or(|(_, len)| {
+                                len <= temen_ir::module_args_end() - temen_ir::module_args_base()
                             });
                             // Optional **pre-mapped region** `(region, child_off)` (args 9–10): a
                             // `SharedRegion` of this domain aliased whole, read-write, into the
@@ -14914,6 +14908,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .lock_unpoisoned()
                                 .resolve_spawn_module(mh, unit)?
                                 .clone();
+                            // The payload is read after the module resolves, as every engine reads
+                            // it, so a forged module faults the same way beside a bad payload.
+                            let payload = match payload_at {
+                                Some((ptr, len)) if payload_ok => {
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    Some(m.read_window(ptr, len as usize)?)
+                                }
+                                _ => None,
+                            };
                             // Named grants (the op-11 record format), pre-validated fail-closed. A
                             // detached spawn may carry #744's live self-serve grant, from a v1
                             // record or op 15's positional form alike.
@@ -34680,7 +34683,9 @@ impl Mem {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let abs = self.confine_checked(addr, 0, len as u32)?;
+        // The whole span, at its full width: an access width is a `u32`, so confining `len` as one
+        // would check only `len mod 2^32` bytes before the read below allocates `len` (#2338).
+        let abs = self.confine_span(addr, len as u64)?;
         if self.has_regions.load(Ordering::Relaxed) {
             return Ok(self.read_abs(abs, len));
         }

@@ -2085,12 +2085,16 @@ fn admit_detached_child(
         0
     };
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    // An over-long payload refuses before anything is read: its length is the guest's (#2338).
+    let payload_ok = s
+        .args
+        .is_none_or(|(_, len)| len <= temen_ir::module_args_end() - temen_ir::module_args_base());
     let payload: Vec<u8> = match s.args {
-        Some((ptr, len)) => pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?,
-        None => Vec::new(),
+        Some((ptr, len)) if payload_ok => {
+            pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?
+        }
+        _ => Vec::new(),
     };
-    let payload_ok =
-        payload.len() as u64 <= temen_ir::module_args_end() - temen_ir::module_args_base();
     // The op-11 record format: `{name_off u32, name_len u32, handle i32, _ u32}`, fail-closed on a
     // handle the parent may not grant. #744 — a live self-serve grant calls back into the spawner
     // through its own cell: honored when it sits in one (every domain of the cooperative driver),
