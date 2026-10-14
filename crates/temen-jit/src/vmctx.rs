@@ -14,10 +14,11 @@
 //! confinement mask is an immediate on the hot path), the table mask, the thunk *functions* (process
 //! globals), and whether each check is emitted at all (a compile armed with no kill-path, fuel budget
 //! or signal source emits no check, so its code is byte-identical to before). The §12 thread
-//! `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it. A compile's other
-//! per-instance runtimes (the §14 `Nursery`, the `setjmp` table, a §22 unit's program) are still
-//! baked; a module that has none is **instance-independent** — the property a fork twin sharing its
-//! parent's code, and a compile cache, rely on (#1825).
+//! `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it, and so does the
+//! §14 `Nursery` the `Instantiator` sites spawn through (temen#2168), so every spawn of a child runs
+//! one compile of its code. A compile's other per-instance runtimes (the `setjmp` table, a §22
+//! unit's program) are still baked; a module that has none is **instance-independent** — the
+//! property a fork twin sharing its parent's code, and a compile cache, rely on (#1825).
 //!
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
@@ -60,6 +61,9 @@ pub struct VmCtx {
     /// and unwinds. It is apart from the trap cell because a successful `call.cap` resets that cell to
     /// `0`, which would erase a stop that landed during the call.
     pub stop: AtomicI64,
+    /// temen#2168 — the §14 `Nursery` (`instantiator_rt::Nursery`) the instance's `Instantiator`
+    /// sites spawn and join through: its own, which holds its children. Null when it has none.
+    pub nursery: *const c_void,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -74,10 +78,12 @@ pub struct InstanceAddrs {
     pub sig_ctx: *mut c_void,
     pub embedder: *mut c_void,
     pub sched: *const c_void,
+    pub nursery: *const c_void,
 }
 
 impl InstanceAddrs {
-    /// No powerbox, no kill-path, no fuel, no signals, no embedder state, no thread domain.
+    /// No powerbox, no kill-path, no fuel, no signals, no embedder state, no thread domain, no
+    /// nursery.
     pub const NONE: InstanceAddrs = InstanceAddrs {
         cap_ctx: core::ptr::null_mut(),
         epoch: core::ptr::null(),
@@ -86,6 +92,7 @@ impl InstanceAddrs {
         sig_ctx: core::ptr::null_mut(),
         embedder: core::ptr::null_mut(),
         sched: core::ptr::null(),
+        nursery: core::ptr::null(),
     };
 }
 
@@ -102,6 +109,7 @@ impl VmCtx {
             embedder: a.embedder,
             sched: a.sched,
             stop: AtomicI64::new(0),
+            nursery: a.nursery,
         }
     }
 
@@ -137,6 +145,7 @@ pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32
 pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
 pub(crate) const STOP: i32 = core::mem::offset_of!(VmCtx, stop) as i32;
+pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
