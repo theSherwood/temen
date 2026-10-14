@@ -846,7 +846,7 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// bounce passes operands and results through unconverted, so a call is lowered only when it is
 /// declared with its import's exact widths: `join: (i32 child) -> (i64 status, i64 value)`,
 /// `instantiate_rec: (i64 record) -> i32`. Every other Instantiator call stays out-of-subset
-/// (fail-closed), interpreted, where the shared contract (`temen_ir::instantiator_contract`)
+/// (fail-closed), interpreted, where the shared contract (`temen_ir::served_contract`)
 /// answers it: the retired carve spawns (ops 0 and 13, #1867) trap `CapFault` there, and the fixed
 /// `env.instantiate` import slot is unused.
 fn is_nested_cap(type_id: u32, op: u32, sig: &FuncType) -> bool {

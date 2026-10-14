@@ -1416,6 +1416,13 @@ instances of this mechanism. A capability interface is just **data + host code**
   types; a result may be `handle<…>`/`funcref<…>` for attenuation). It lives in the
   **guest module's own type section** (§3a), so the verifier statically type-checks
   every `call.cap` with zero host knowledge — self-contained and verifiable.
+  The verifier checks a call only against the signature it *declares*, so a call can declare a
+  shape the op doesn't have. Every engine answers it one way (#2361):
+  - An op an engine serves itself (the Instantiator's, `Jit.install`/`uninstall`, the self ops
+    it runs) is held to its contract (`temen_ir::served_contract`): any other shape traps
+    `CapFault` before the op runs.
+  - A call the host serves defines each result it declares: the host's results in order, then
+    zero.
 - **Implementation** — a method table (vtable, §3c) of handler pointers registered
   **host-side**, entirely outside the guest/verifier/TCB.
 

@@ -326,16 +326,11 @@ fn build_probe(
         "i32" => ("i32", "  vw = i64.extend_i32_s vr\n  return vw"),
         _ => ("i64", "  return vr"),
     };
-    // An Instantiator op answers the results its contract names (`temen_ir::instantiator_contract`),
-    // and every engine traps a call declaring any other count `CapFault` before the op is reached. So
-    // the probe declares that many, `result` the first's type and the rest `i64`, and returns the
-    // first: `join` answers `(status, value)` (#2066).
-    let extra = match iface {
-        temen_ir::cap_id::INSTANTIATOR => {
-            temen_ir::instantiator_contract(op).map_or(0, |(_, r)| r.len().saturating_sub(1))
-        }
-        _ => 0,
-    };
+    // An op an engine serves itself answers the results its contract names
+    // (`temen_ir::served_contract`), and every engine traps a call declaring any other count
+    // `CapFault` before the op is reached. So the probe declares that many, `result` the first's type
+    // and the rest `i64`, and returns the first: `join` answers `(status, value)` (#2066).
+    let extra = temen_ir::served_contract(iface, op).map_or(0, |(_, r)| r.len().saturating_sub(1));
     let names: String = (0..extra).map(|i| format!(", vx{i}")).collect();
     let call_res = format!("{call_res}{}", ", i64".repeat(extra));
     // The only difference between the two entry shapes: a unit is handed its handle widened (the

@@ -7841,40 +7841,55 @@ fn lower_block(
             args,
         } = inst
         {
-            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
-                                                        // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
-                                                        // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
-                                                        // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
-                                                        // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
-                                                        // value the tree-walker does under the differential oracle (which arms counted fuel on
-                                                        // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
-                                                        // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
-                                                        // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
-            if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
-                if !sig.results.is_empty() {
-                    let v = if lower.fuel {
-                        // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
-                        // budget chain's room, asked of the cell (word 2).
-                        let addr = vmctx_load(b, lower, vmctx::FUEL);
-                        let rsig = {
-                            let mut s = Signature::new(lower.frontend_config.default_call_conv);
-                            s.params.push(AbiParam::new(I64)); // the cell
-                            s.returns.push(AbiParam::new(I64)); // the remaining fuel
-                            b.import_signature(s)
-                        };
-                        let remaining = b.ins().load(
-                            I64,
-                            MemFlags::trusted(),
-                            addr,
-                            crate::fuel::REMAINING_OFF,
-                        );
-                        let call = b.ins().call_indirect(rsig, remaining, &[addr]);
-                        b.inst_results(call)[0]
-                    } else {
-                        b.ins().iconst(I64, i64::MAX)
-                    };
-                    vals.push(v);
+            // #922: resolve interned call type index.
+            let sig = sig_of(lower.type_section, *sig);
+            // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a
+            // verifier-valid module can call an op an engine serves itself with any shape. Held to
+            // the op's contract (`temen_ir::served_contract`), as every engine holds it: a call
+            // that doesn't match, or an Instantiator op that isn't live, lowers to an
+            // unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
+            // rejection of a verified module (#2066, #2361). (Found by the libFuzzer `diff`
+            // target: Instantiator ops 5/6/7 with short args made the compile fail `Malformed`,
+            // crashing the differential — nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.)
+            if !temen_ir::served_shape_ok(*type_id, *op, sig) {
+                emit_trap_set(b, lower, TrapKind::CapFault);
+                emit_trap_propagate(b, lower);
+                // Dead at runtime (the cell is already set), but keep the verifier's value
+                // accounting for the rest of the block: push zeros of the *declared* result types.
+                for t in &sig.results {
+                    let z = zero_of(b, clif_ty(*t));
+                    vals.push(z);
                 }
+                continue;
+            }
+            // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
+            // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
+            // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
+            // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
+            // value the tree-walker does under the differential oracle (which arms counted fuel on
+            // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
+            // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
+            // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
+            if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
+                let v = if lower.fuel {
+                    // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
+                    // budget chain's room, asked of the cell (word 2).
+                    let addr = vmctx_load(b, lower, vmctx::FUEL);
+                    let rsig = {
+                        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+                        s.params.push(AbiParam::new(I64)); // the cell
+                        s.returns.push(AbiParam::new(I64)); // the remaining fuel
+                        b.import_signature(s)
+                    };
+                    let remaining =
+                        b.ins()
+                            .load(I64, MemFlags::trusted(), addr, crate::fuel::REMAINING_OFF);
+                    let call = b.ins().call_indirect(rsig, remaining, &[addr]);
+                    b.inst_results(call)[0]
+                } else {
+                    b.ins().iconst(I64, i64::MAX)
+                };
+                vals.push(v);
                 continue;
             }
             // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
@@ -10164,28 +10179,11 @@ fn lower_instantiator(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a verifier-valid
-    // module can call iface 6 with any `(op, sig)` shape. This lowering dispatches on `op`
-    // **statically** and can neither index missing args nor pass mistyped values through the fixed
-    // thunk ABIs, so it checks the declared shape against the one contract every engine checks
-    // (`temen_ir::instantiator_contract`, #2066). A call that doesn't match, or whose op isn't live,
-    // lowers to an unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
-    // rejection of a verified module. (Found by the libFuzzer `diff` target: ops 5/6/7 with short
-    // args made the compile fail `Malformed`, crashing the differential — nightlies Jun 19 / Jul 2 /
-    // Jul 4, ISSUES.md I16.) The contract is width-tolerant: the per-arg coercions below
+    // This lowering dispatches on `op` **statically** and can neither index missing args nor pass
+    // mistyped values through the fixed thunk ABIs. The `call.cap` lowering has held the call to
+    // its op's contract (`temen_ir::served_contract`) before routing it here, so every arg the
+    // contract names is present. The contract is width-tolerant: the per-arg coercions below
     // (`slot_i64`/`slot_i32`/`result_as`) reconcile the declared widths with each thunk's fixed ABI.
-    let shape_ok = temen_ir::instantiator_shape_ok(op, sig);
-    if !shape_ok {
-        emit_trap_set(b, lower, TrapKind::CapFault);
-        emit_trap_propagate(b, lower);
-        // Dead at runtime (the cell is already set), but keep the verifier's value accounting for
-        // the rest of the block: push zeros of the *declared* result types.
-        for t in &sig.results {
-            let z = zero_of(b, clif_ty(*t));
-            vals.push(z);
-        }
-        return Ok(());
-    }
     // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
     let nursery = vmctx_load(b, lower, vmctx::NURSERY);
     let mem_base = b.use_var(lower.mem_var);

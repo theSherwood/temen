@@ -194,13 +194,15 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
     let self_ty = temen_ir::CAP_SELF_TYPE_ID;
     let leaf = cell(Status::Declines, LEAF);
     match (type_id, op) {
-        // §14 executor children — every live op (`temen_ir::instantiator_contract`): join (1) /
+        // §14 executor children — every live op (`temen_ir::served_contract`): join (1) /
         // poll (9) / detach (10) / kill (12) / child_offer (14) / instantiate_detached (15) /
         // instantiate_rec (17) / grant (19): native on both interpreters (`Op::InstantiateRec`/
         // `InstantiateDetached`/`InstJoin`/`ChildCtl`/`ChildOffer`) and on Cranelift
         // (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp. (The bytecode
         // engine's resumable `Vcpu`, whose host runs the children, traps when 9/10/12/19 run: #2083.)
-        (capcall::INSTANTIATOR, o) if temen_ir::instantiator_contract(o).is_some() => {
+        (capcall::INSTANTIATOR, o)
+            if temen_ir::served_contract(capcall::INSTANTIATOR, o).is_some() =>
+        {
             [F, F, F, leaf]
         }
 
