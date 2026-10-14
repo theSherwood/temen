@@ -521,13 +521,15 @@ block 2 (vh2: i32) {
 
   detached: {
     mode: 'onramp',
-    debug: true, // steppable: the debug scheduler services op 15 (#1528), under the on-ramp powerbox
-    bp: 38, // a breakpoint just past the join, where `vj` holds what the detached child returned
-    desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
+    debug: true, // steppable: the debug scheduler services the spawn (#1528), under the on-ramp powerbox
+    bp: 44, // a breakpoint just past the join, where `vj` holds what the detached child returned
+    desc: '§5 detached child + a **pre-mapped SharedRegion**: the parent mints a ' +
       '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **a copy of itself** ' +
       '(its child image, which starts at its `_child` export) as a DETACHED child — a fresh 128 KiB window ' +
       'of its own, nothing of the parent addressable — with ' +
-      'the region pre-mapped at 65536 of the child’s window before it starts. The child needs no ' +
+      'the region pre-mapped at 65536 of the child’s window before it starts. The spawn is an op-17 ' +
+      '**spawn record** the parent lays in its own window: the child’s module, its window size, the ' +
+      '`Budget` that pays for it, the region and where it maps; no pager, grants or args. The child needs no ' +
       'handle, no `map`, no page-size query: it reads 41 at 65536, stores 82 at 65544, returns 42. After ' +
       '`join` the parent reads 82 back through its own mapping and returns 1000 × 42 + 82 = **42082**. ' +
       'The parent finds its `instantiator`, `addrspace`, `budget` (the detached-window allowance) and ' +
@@ -563,13 +565,19 @@ block 0 () {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vchild
-  vz = i64.const 0
-  vent = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
+  ; the spawn record (op 17), 88 bytes at 20544; a field left 0 is none
+  vrec = i64.const 20544
+  vver = i32.const 1
+  i32.store vrec vver ; @0 version 1
+  vlog = i32.const 17
+  i32.store vrec vlog offset=16 ; @16 a 128 KiB window
+  vnone = i32.const -1
+  i32.store vrec vnone offset=20 ; @20 no pager
+  i32.store vrec vchild offset=24 ; @24 the module: this program's child image
+  i32.store vrec vbud offset=28 ; @28 the Budget its window spends
+  i32.store vrec vrh offset=72 ; @72 the region, pre-mapped ...
+  i64.store vrec vwo offset=80 ; @80 ... at 65536 of the child's window
+  vc = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk
@@ -1281,15 +1289,15 @@ int main(void) {
     mode: 'io',
     desc: 'The **IR card above, in C**: `main` mints a SharedRegion, maps it into its own window, fills it ' +
       'with 1…8, and spawns `square.c` — a program of its own, below the `//// child:` line, which the page ' +
-      'compiles separately and grants as `square` — as a **detached** child (`Instantiator` op 15, the ' +
-      '11-arg form) with the region **pre-mapped** into the child’s fresh window. The child squares the ' +
+      'compiles separately and grants as `square` — as a **detached** child (`Instantiator` op 17, a ' +
+      '`struct vm_spawn_rec` from `<temen.h>`) with the region **pre-mapped** into the child’s fresh window. The child squares the ' +
       'numbers in place through plain pointer access — it holds no handle and calls no capability — and ' +
       'after `join` the parent prints the results it reads back through its own mapping. Everything the ' +
       'parent needs comes by name from the powerbox (`__vm_resolve`: `instantiator`, `budget`, `square`) ' +
       'plus the `<temen.h>` builtins — the region ops, `__vm_budget_read`, and the spawn/join themselves, ' +
       'each a static `call.cap` on the handle it names. Compiled by chibicc in your browser, linked against ' +
       'the prebuilt libc, run on the bytecode engine.',
-    src: `// A detached child that shares memory with its parent: the op-15 pre-mapped SharedRegion.
+    src: `// A detached child that shares memory with its parent: a pre-mapped SharedRegion.
 //
 // The parent mints a SharedRegion, maps it into its own window, fills it with numbers, and spawns
 // square.c (below, a program of its own) as a DETACHED child: a fresh window of its own, with nothing
@@ -1314,8 +1322,14 @@ int main(void) {
   long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
   __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
   for (int i = 0; i < N; i++) p[i] = i + 1;
-  // Entry 0 (square.c's own start), size 0 (its declared window), the region at CHILD_OFF.
-  long h = __vm_instantiate_detached(inst, budget, square, 0, 0, 0, 0, 0, 0, region, CHILD_OFF);
+  // The spawn record: square.c, run from its own start in its declared window (size 0), paid from
+  // budget, with the region at CHILD_OFF. Every field VM_SPAWN_REC_INIT leaves is none.
+  struct vm_spawn_rec rec = VM_SPAWN_REC_INIT;
+  rec.module = square;
+  rec.budget = budget;
+  rec.region = region;
+  rec.child_off = CHILD_OFF;
+  long h = __vm_instantiate_rec(inst, (long)&rec);
   if (h < 0) {
     printf("spawn refused: %ld\\n", h);
     return 1;

@@ -481,7 +481,7 @@ different things depending on which pair you compare:
   **§14 `instantiate` confined children on the multi-vCPU engine (slice 15a).** *(Retired: slices
   15a–15c debug carve children, and every engine now traps the carve spawn — INVARIANTS #13; #1867.
   These slices are history, and their tests are deleted. The detached equivalent is
-  `dbg_instantiate_detached`: op 15's child as a `DbgEnv` over its own `Mem`, joined like a confined
+  `dbg_instantiate_detached`: a detached spawn's child as a `DbgEnv` over its own `Mem`, joined like a confined
   child.)* `instantiate` (op 0) is
   no longer declined on the scheduled engine: `ScheduledDebugRun` grew a per-task `env` (the debug-engine
   counterpart of the production `TaskSlot::env`) and an `extra_envs: Vec<DbgEnv>`. A new `dbg_instantiate`
@@ -637,7 +637,7 @@ different things depending on which pair you compare:
   separate-module, single-vCPU *and* on the multi-vCPU scheduler with the coroutine's vCPU pinned), and
   **§14 `instantiate` / `instantiate_module`** confined children as scheduled vCPUs nesting to any depth
   (slices 14b/14c, 15a/15b/15c, 16; both since retired, the coroutines by #2069 and the carve spawns by
-  #1867, leaving the detached children of op 15/17 — #1866), and **source-variable inspection inside a separate-module child body**
+  #1867, leaving the detached children of op 17 — #1866), and **source-variable inspection inside a separate-module child body**
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the

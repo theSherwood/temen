@@ -94,21 +94,6 @@ fn by_record(ptr: u64, len: u64, forged: bool) -> Module {
     )
 }
 
-/// A parent spawning by op 15's positional form, its payload `(ptr, len)`.
-fn by_op15(ptr: u64, len: i64) -> Module {
-    parent(
-        &format!(
-            "  vb64 = i64.extend_i32_u vb
-  vm64 = i64.extend_i32_u vmod
-  vz64 = i64.const 0
-  vap = i64.const {ptr}
-  val = i64.const {len}
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb64, vm64, vz64, vz64, vz64, vz64, vz64, vap, val)"
-        ),
-        "",
-    )
-}
-
 /// The parent's powerbox: an `Instantiator`, the child module, and a `Budget` its window spends.
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
@@ -169,7 +154,11 @@ fn a_length_past_the_args_region_refuses_before_anything_is_read() {
         EINVAL,
     );
     each_engine("args_len 2^63", &by_record(PAYLOAD, 1 << 63, false), EINVAL);
-    each_engine("op 15's args_len -1", &by_op15(PAYLOAD, -1), EINVAL);
+    each_engine(
+        "args_len 2^64 - 1",
+        &by_record(PAYLOAD, u64::MAX, false),
+        EINVAL,
+    );
     each_engine(
         "args_len one past the region",
         &by_record(PAYLOAD, ROOM + 1, false),
@@ -201,5 +190,4 @@ fn a_payload_the_window_does_not_hold_faults_after_the_module_resolves() {
 #[test]
 fn a_payload_the_region_holds_reaches_the_child() {
     each_engine("a one-byte payload", &by_record(PAYLOAD, 1, false), Ok(42));
-    each_engine("op 15's one-byte payload", &by_op15(PAYLOAD, 1), Ok(42));
 }

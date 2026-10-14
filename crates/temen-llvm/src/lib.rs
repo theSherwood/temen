@@ -4201,9 +4201,9 @@ const HOST_PROC_TYPE_ID: u32 = 13;
 /// numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 /// The `Instantiator` interface id (`temen_interp::cap_id::INSTANTIATOR`) — the §14 VM-in-VM spawner,
-/// reached from a guest via `__vm_instantiate_rec` (op 17, the v1 spawn record),
-/// `__vm_instantiate_detached` (op 15) and `__vm_join` (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `instantiator_type_id_matches`
-/// test locks the two together.
+/// reached from a guest via `__vm_instantiate_rec` (op 17, the v1 spawn record) and `__vm_join`
+/// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s
+/// `instantiator_type_id_matches` test locks the two together.
 const INSTANTIATOR_TYPE_ID: u32 = 6;
 /// The `ModuleLoader` interface id (`temen_interp::cap_id::MODULE_LOADER`) — the §14 authority to
 /// promote guest bytes to a spawnable `Module`, reached from a guest via `__vm_module_from_bytes`
@@ -13290,37 +13290,6 @@ fn lower_vm_builtin(
                 sig,
                 handle,
                 args: vec![rec],
-            });
-            ctx.bind_dest(&c.dest, r);
-            Ok(true)
-        }
-        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
-        // long grants_ptr, long grants_n, long entry, long size_log2, long args_ptr, long args_len)` →
-        // `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n, entry, size_log2, 0,
-        // args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the child runs the
-        // host-granted `module` in a window **of its own** (`size_log2` must equal the module's
-        // declared memory), not a carve of the spawner's, with the same named-grant records as
-        // `__vm_instantiate_rec` and a spawn-time args payload copied to its `module_args_base()`
-        // (length 0 seeds nothing). `budget` is a `Budget` handle the child's resources are drawn
-        // from, its fuel included: op 15's retired `quota` slot is always 0 (#1944 slice 3). Returns
-        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
-        "__vm_instantiate_detached" => {
-            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
-            let mut args = (1..9)
-                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
-                .collect::<Result<Vec<_>, _>>()?;
-            args.insert(6, ctx.push(Inst::ConstI64(0))); // the retired `quota`
-            let sig = temen_ir::FuncType {
-                params: vec![ValType::I64; 9],
-                results: vec![ValType::I64],
-            };
-            let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
-                type_id: INSTANTIATOR_TYPE_ID,
-                op: 15,
-                sig,
-                handle,
-                args,
             });
             ctx.bind_dest(&c.dest, r);
             Ok(true)

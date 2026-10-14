@@ -1,9 +1,10 @@
-//! Op-15 **pre-mapped region** — the 11-arg `instantiate_detached(…, region, child_off)` form: a
-//! `SharedRegion` of the parent aliased whole, read-write, into the detached child's private window at
-//! `child_off` before it starts. The child sees plain memory at a fixed offset — no `self.resolve`, no
-//! `page_size` query, no `map` call — and the parent reads the child's output back through its own
-//! mapping of the same region after `join`. This is the bulk data plane between a parent and a child
-//! whose memory it cannot otherwise address (DESIGN.md §13 / DETACHED_JIT.md §3.4), minus the ceremony.
+//! A spawn record's **pre-mapped region** — the `region` and `child_off` fields of a v1
+//! `instantiate_rec` record (op 17): a `SharedRegion` of the parent aliased whole, read-write, into
+//! the detached child's private window at `child_off` before it starts. The child sees plain memory
+//! at a fixed offset — no `self.resolve`, no `page_size` query, no `map` call — and the parent
+//! reads the child's output back through its own mapping of the same region after `join`. This is
+//! the bulk data plane between a parent and a child whose memory it cannot otherwise address
+//! (DESIGN.md §13 / DETACHED_JIT.md §3.4), minus the ceremony.
 //!
 //! Pinned on both interpreter engines (the tree-walk oracle and the resumable bytecode engine, driven
 //! through its `VcpuEvent::InstantiateDetached` protocol): the alias round-trip, the probeable `-EINVAL`
@@ -11,8 +12,12 @@
 //! nothing, no child spawned), and the `CapFault` a wrong-kind handle raises (invariant 5: forgery
 //! traps, geometry refuses).
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Region, Trap, Value};
+use temen_ir::SpawnRec;
 
 fn module(text: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(text).expect("parse");
@@ -44,13 +49,19 @@ block 0 (v0: i64) {
 /// child's 128 KiB window.
 const CHILD_OFF: u64 = 65536;
 
-/// The parent: `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the detached-spawn
-/// `Budget`. Mints a 64 KiB region, maps it at 65536 in its own window, stores the input word 41 at
-/// region byte 0, spawns the child detached with the region pre-mapped at `off` (`reg` names the
-/// handle expression — the region, or a wrong-kind handle for the forgery probe). `join` then also
-/// joins the child and returns `1000 × result + the word the child wrote at region byte 8`; otherwise
-/// it returns the spawn's own result (the refusal probes).
+/// The parent: `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the
+/// detached-spawn `Budget`. Mints a 64 KiB region, maps it at 65536 in its own window, stores the
+/// input word 41 at region byte 0, spawns the child detached from its v1 record at 17408 with the
+/// region pre-mapped at `off` (`reg` names the handle the parent stores into the record — the
+/// region, or a wrong-kind handle for the forgery probe). `join` then also joins the child and
+/// returns `1000 × result + the word the child wrote at region byte 8`; otherwise it returns the
+/// spawn's own result (the refusal probes).
 fn parent(off: u64, reg: &str, join: bool) -> String {
+    let child = SpawnRec {
+        size_log2: 17,
+        child_off: off,
+        ..SpawnRec::v1()
+    };
     let tail = if join {
         "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
     } else {
@@ -69,17 +80,19 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vmh = i64.extend_i32_u v2
-  vb = i64.extend_i32_u v3
-  vz = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u {reg}
-  voff = i64.const {off}
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  vma = i64.const 17432
+  i32.store vma v2
+  vba = i64.const 17436
+  i32.store vba v3
+  vra = i64.const 17480
+  i32.store vra {reg}
+  vrp = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   {tail}
   }}
 }}
-"#
+{rec}"#,
+        rec = rec::segment(17408, &child),
     )
 }
 

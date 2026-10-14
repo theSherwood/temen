@@ -69,11 +69,12 @@ const SEVEN: &str = "  pr = i64.const 7\n";
 const PARENT_ROOM: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vf = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) v2 (vf)

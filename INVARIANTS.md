@@ -82,7 +82,7 @@ fuel is charged up the chain like the window: a domain's vCPUs draw it in chunks
 pays for the domain (the run's root node, or the budget named in a detached spawn), each draw charged
 to every level, and a vCPU that ends or freezes refunds the unburned rest of its chunk. So no subtree
 burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
-one on op 15 or a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
+one in a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
 (`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
 budgets below it, since what is left of it differs by engine (each draws on its own schedule). Every
 host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
@@ -357,21 +357,22 @@ frontier's own repair, never parked. Until it is gone:
   of an artifact frozen around a carve child still re-creates one, until the nested freeze goes.
 - **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
   detached, with the spawn-time args payload and the pre-mapped region as fields. The v0 carve record
-  is retired (it traps `CapFault`), and op 15's positional form retires too (#2067); the version word,
-  always 1 now, is that migration's scaffolding (#2091). The window is always the child module's
+  is retired (it traps `CapFault`), and so is op 15's positional form (#2067): every engine traps it
+  `CapFault`, and no producer emits it. The version word, always 1 now, is that migration's
+  scaffolding (#2091). The window is always the child module's
   declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
   module it did not build need not know its size — any other value must equal it. A query for the
   size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
 - **A child runs a module, never a function of its spawner** (owner, 2026-10-08, #2219): the
   record's `module` is a `Module` handle the spawner holds, and the child starts at that module's
   function 0, its child bootstrap. `module = -1`, which once named the spawner's own program, is a
-  forged handle like any other, and the record's word at 4, once the entry, must be 0, as must op
-  15's entry operand: each traps `CapFault` on every engine (`self_spawn_refused.rs`). "A copy of
+  forged handle like any other, and the record's word at 4, once the entry, must be 0: each traps
+  `CapFault` on every engine (`self_spawn_refused.rs`). "A copy of
   myself" is the host granting the program's child image (`"child"`). Every child binds its manifest
   strictly; one that leaves an import empty on purpose says so with a `VM_EMPTY` grant.
-- **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
-  `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
-  spawn-time args payload; results ride the join and the region.
+- **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (the record's
+  `region` and `child_off`), with futex keyed on the region's canonical identity. Argv rides the
+  record's spawn-time args payload; results ride the join and the region.
 - **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
   its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
   freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
@@ -430,7 +431,7 @@ child is the detached case.) Placement is therefore orthogonal to durability, an
 ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**
 ancestor-confidential at once. A detached child freezes as its own root-shaped artifact (the one codec
 form, R3); a subtree snapshot is a consistent cut over the parent's artifact and each detached child's,
-coordinated by the authority holder. This makes the op-15 durable refusal an **un-wired-support** gap
+coordinated by the authority holder. This makes the detached spawn's durable refusal an **un-wired-support** gap
 (*in flight* — the run driver cannot yet reach a detached child's `Mem`+`Host` at quiesce, and a thaw
 must restore a child's `Attestation`, O14's remaining plumbing), **not** a placement-derived decline
 this invariant would forbid; it becomes "refuse unless a freeze-authority holder is registered for this
@@ -439,7 +440,7 @@ child" once that lands.
 **Amendment — R1's spawn lift is deferred until the capture exists (2026-09-14, #1412):** R1's *end
 state* stands and is unchanged: freeze authority is a per-grant capability, placement is orthogonal to
 durability, and a durable parent will spawn detached children whose freeze **captures** them. What is
-withdrawn is the slice-1 lift of the op-15 `!durable` gate, which ran ahead of two things it depends on.
+withdrawn is the slice-1 lift of the detached spawn's `!durable` gate, which ran ahead of two things it depends on.
 It was applied to the tree-walk oracle alone, leaving the resumable engine and the native thunk refusing
 what the oracle admitted — a live invariant-9 divergence that stood six days unwitnessed. And the
 safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap::ThreadFault`: a

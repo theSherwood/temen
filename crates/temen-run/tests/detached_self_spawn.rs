@@ -2,15 +2,16 @@
 //! every engine: a plain powerbox guest resolves `instantiator`, `addrspace`, `budget` and `child` by
 //! name, mints a `SharedRegion`, maps it into its own window, and spawns **a copy of itself** (its
 //! child image, which starts at its `_child` export) as a §5 detached child with the region
-//! pre-mapped (`Instantiator` op 15, the 11-arg form) — no grant list, no `map` in the child. The
-//! child reads the parent's word through the alias, writes its answer beside it, returns; the parent
-//! reads the answer back after `join`.
+//! pre-mapped (`Instantiator` op 17, from a spawn record that names the region) — no grant list, no
+//! `map` in the child. The child reads the parent's word through the alias, writes its answer beside
+//! it, returns; the parent reads the answer back after `join`.
 //!
 //! Three things this pins: the by-name spawn grants both reference powerboxes make
 //! (`Host::grant_detached_spawn_caps` — `"child"` is the program's child image, `"budget"` a window's
-//! worth of detached memory); the cooperative executor servicing op 15 as a fresh-window task (the
-//! bytecode engine's `drive`, what the browser on-ramp runs on); and the CLI's JIT resolving a
-//! `Module` grant for the spawn (`module_resolver`). The tree-walk oracle is the reference.
+//! worth of detached memory); the cooperative executor servicing the record spawn as a fresh-window
+//! task (the bytecode engine's `drive`, what the browser on-ramp runs on); and the CLI's JIT
+//! resolving a `Module` grant for the spawn (`module_resolver`). The tree-walk oracle is the
+//! reference.
 
 use std::sync::Arc;
 use temen_interp::{bytecode, run_with_host, Host, Value};
@@ -46,13 +47,19 @@ block 0 () {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vb = i64.extend_i32_u vbud
-  vmh = i64.extend_i32_u vchild
-  vz = i64.const 0
-  vent = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
+  ; the spawn record (op 17), 88 bytes at 20544; a field left 0 is none
+  vrec = i64.const 20544
+  vver = i32.const 1
+  i32.store vrec vver ; @0 version 1
+  vlog = i32.const 17
+  i32.store vrec vlog offset=16 ; @16 a 128 KiB window
+  vnone = i32.const -1
+  i32.store vrec vnone offset=20 ; @20 no pager
+  i32.store vrec vchild offset=24 ; @24 the module: this program's child image
+  i32.store vrec vbud offset=28 ; @28 the Budget its window spends
+  i32.store vrec vrh offset=72 ; @72 the region, pre-mapped ...
+  i64.store vrec vwo offset=80 ; @80 ... at 65536 of the child's window
+  vc = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk

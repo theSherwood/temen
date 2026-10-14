@@ -83,7 +83,7 @@ try {
     : fail(`hello run: ${JSON.stringify(hello)}`);
 
   // The `detached` card: a §5 detached child spawned from the guest's OWN module over a pre-mapped
-  // SharedRegion (Instantiator op 15, 11-arg form) on the on-ramp recipe — the parent reads the
+  // SharedRegion (Instantiator op 17, a v1 spawn record) on the on-ramp recipe — the parent reads the
   // child's answer back through its own mapping: 1000 × 42 + 82.
   await runCard(page, 'detached', 30_000);
   const det = await page.evaluate((sel) => ({
@@ -95,7 +95,7 @@ try {
     ? ok('detached child over a pre-mapped region (Temen text, on-ramp recipe) → 42082')
     : fail(`detached run: ${JSON.stringify(det)}`);
 
-  // #1528 — the same card under the **debugger**. The debug scheduler used to decline op 15
+  // #1528 — the same card under the **debugger**. The debug scheduler used to decline the spawn
   // (`-EINVAL`), so the spawn refused and the card could not be stepped at all; it now spawns the
   // child as a task of its own and joins it through the shared seam, and the DAP session runs under
   // the on-ramp powerbox so `self.resolve` finds `instantiator` / `child` / `budget` exactly as the

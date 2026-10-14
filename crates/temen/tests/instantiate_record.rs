@@ -110,54 +110,21 @@ block 0 (v0: i64) {{
     )
 }
 
-/// [`granted_client_program`] in both spawn spellings: the op-17 records, and op 15's positional
-/// form (retiring, #2067). Every engine runs both natively (#744).
-fn granted_client_programs(guest: &str) -> [String; 2] {
-    let rec = granted_client_program(guest);
-    // `dst = instantiate_detached(budget, module, grants_ptr, grants_n, 0, 17, 0)`, its operands
-    // named with `x` so the two spawns' names stay distinct.
-    let op15 = |dst: &str, x: &str, module: &str, grants_ptr: u64, grants_n: u64| {
-        format!(
-            "vb{x} = i64.extend_i32_u vb\n  vm{x} = i64.extend_i32_u {module}\n  \
-             vgp{x} = i64.const {grants_ptr}\n  vgn{x} = i64.const {grants_n}\n  \
-             ve{x} = i64.const 0\n  vsl{x} = i64.const 17\n  vq{x} = i64.const 0\n  \
-             {dst} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 \
-             (vb{x}, vm{x}, vgp{x}, vgn{x}, ve{x}, vsl{x}, vq{x})"
-        )
-    };
-    let positional = rec
-        .replace(
-            "vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)",
-            &op15("vs", "s15", "vserver", 0, 0),
-        )
-        .replace(
-            "vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)",
-            &op15("vg", "g15", "vguest", 16640, 1),
-        );
-    assert_eq!(
-        positional.matches("call.cap 6 15").count(),
-        2,
-        "both spawns respelled"
-    );
-    [rec, positional]
-}
-
 /// The healthy exchange, pinning the program shape: the guest resolves `"fork"` and calls it once
 /// (the handler returns 7), the server's `svc.wait` counts 1, the root returns 1.
 #[test]
 fn granted_client_that_calls_once_is_served() {
-    for src in granted_client_programs(
+    let src = granted_client_program(
         "  vnp = i64.const 16684
   vl4 = i64.const 4
   vfork = self.resolve vnp vl4
   vz8 = i64.const 0
   vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
   return vr",
-    ) {
-        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-        for b in BACKENDS {
-            assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
-        }
+    );
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1, "{b:?}");
     }
 }
 
@@ -165,11 +132,10 @@ fn granted_client_that_calls_once_is_served() {
 /// returns `0` (never parks forever), it returns, and the root's `join` delivers `0`.
 #[test]
 fn granted_client_that_dies_before_calling_releases_the_server() {
-    for src in granted_client_programs("  unreachable") {
-        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-        for b in BACKENDS {
-            assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
-        }
+    let src = granted_client_program("  unreachable");
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 0, "{b:?}");
     }
 }
 
@@ -184,24 +150,23 @@ fn granted_client_that_dies_before_calling_releases_the_server() {
 /// for its deadlock verdict (#2173, #1820), to the identical outcome.
 #[test]
 fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
-    for base in granted_client_programs("  unreachable") {
-        // Re-spell the wait-once server (func 1) as an unconditional `loop { svc.wait }` daemon.
-        let src = base.replace(
-            "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
-            "block 0 (v0: i64) {\n  br 1()\n  }\nblock 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()\n  }",
-        );
+    let base = granted_client_program("  unreachable");
+    // Re-spell the wait-once server (func 1) as an unconditional `loop { svc.wait }` daemon.
+    let src = base.replace(
+        "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
+        "block 0 (v0: i64) {\n  br 1()\n  }\nblock 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()\n  }",
+    );
+    assert!(
+        src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
+        "the daemon rewrite must apply"
+    );
+    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
+    for b in BACKENDS {
+        let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
         assert!(
-            src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
-            "the daemon rewrite must apply"
+            e.contains("ThreadFault"),
+            "{b:?}: the all-parked join-deadlock traps ThreadFault, got: {e}"
         );
-        assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-        for b in BACKENDS {
-            let e = run_detached(b, &src).expect_err("the join-deadlock must trap, not hang");
-            assert!(
-                e.contains("ThreadFault"),
-                "{b:?}: the all-parked join-deadlock traps ThreadFault, got: {e}"
-            );
-        }
     }
 }
 
@@ -218,25 +183,23 @@ fn a_call_nothing_will_serve_deadlocks_to_threadfault() {
   vz8 = i64.const 0
   vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
   return vr";
-    for base in granted_client_programs(guest) {
-        let server =
-            "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }";
+    let base = granted_client_program(guest);
+    let server = "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }";
+    assert!(
+        base.contains(server),
+        "the server's body is the rewrite target"
+    );
+    let src = base.replace(
+        server,
+        "block 0 (v0: i64) {\n  va = i64.const 16392\n  vexp = i32.const 0\n  vinf = i64.const -1\n  \
+         vst = i32.atomic.wait va vexp vinf\n  vst64 = i64.extend_i32_u vst\n  return vst64\n  }",
+    );
+    for b in BACKENDS {
+        let e = run_detached(b, &src).expect_err("the deadlock must trap, not hang");
         assert!(
-            base.contains(server),
-            "the server's body is the rewrite target"
+            e.contains("ThreadFault"),
+            "{b:?}: the all-parked deadlock traps ThreadFault, got: {e}"
         );
-        let src = base.replace(
-            server,
-            "block 0 (v0: i64) {\n  va = i64.const 16392\n  vexp = i32.const 0\n  vinf = i64.const -1\n  \
-             vst = i32.atomic.wait va vexp vinf\n  vst64 = i64.extend_i32_u vst\n  return vst64\n  }",
-        );
-        for b in BACKENDS {
-            let e = run_detached(b, &src).expect_err("the deadlock must trap, not hang");
-            assert!(
-                e.contains("ThreadFault"),
-                "{b:?}: the all-parked deadlock traps ThreadFault, got: {e}"
-            );
-        }
     }
 }
 
@@ -393,8 +356,7 @@ fn channel_budget_bounds_a_spawned_childs_pipe_mints() {
 /// grant is a named-grant record whose `handle` carries `GRANT_SERVE_LIVE_TAG` over the parent's
 /// impl-export index (export 0 here, interface `"exec"` with one op `run`) — the record's reserved
 /// `flags` word stays 0 and ignored, as the ABI promises. The parent spawns `"child"` detached
-/// (`positional`: through op 15's argument form instead of a v1 record); the spawn installs into
-/// the CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
+/// through a v1 record; the spawn installs into the CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
 /// `"exec"` by name and calls `run(40, 2)` — which parks it until the PARENT's `svc.wait` serve
 /// loop runs handler func 2 over the parent's live world and replies `42`. The parent joins the
 /// child and returns `join*100 + served` = `42*100 + 1` = `4201`. The parent never holds a
@@ -403,22 +365,11 @@ fn channel_budget_bounds_a_spawned_childs_pipe_mints() {
 ///
 /// `handle` is a parameter so the fail-closed edge is pinned too: a tag over an impl-export the
 /// parent does not have is refused at spawn (`CapFault`) before any child state is built.
-fn serve_live_program(handle: i32, positional: bool) -> String {
+fn serve_live_program(handle: i32) -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
         ..SpawnRec::v1()
-    };
-    let spawn = if positional {
-        "vb64 = i64.extend_i32_s vb
-  vmod = i64.extend_i32_u vchild
-  vgp = i64.const 16640
-  vg1 = i64.const 1
-  vz64 = i64.const 0
-  vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vh (vb64, vmod, vgp, vg1, vz64, vz64, vz64)"
-    } else {
-        "vrp = i64.const 17408
-  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)"
     };
     format!(
         "\
@@ -448,7 +399,8 @@ block 0 () {{
   i32.store vma vchild
   ; the one grant record at 16640, its handle `TAG | export`
   vgh = i32.const {handle}
-{exec_grant}  {spawn}
+{exec_grant}  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vz = i32.const 0
   vneg = i32.lt_s vch vz
   br_if vneg 2(vch) 1(vh, vch)
@@ -502,7 +454,7 @@ block 0 (va: i64, vb: i64) {{
 /// cell: the Cranelift JIT, the cooperative bytecode driver and the parallel driver (`None`).
 #[test]
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
-    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
+    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32);
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
     for b in BACKENDS.map(Some).into_iter().chain([None]) {
         // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
@@ -529,7 +481,7 @@ fn a_parent_serves_its_childs_exec_with_its_own_code() {
 /// `Malformed` while the oracle answers.
 #[test]
 fn a_child_image_that_carries_its_programs_serve_loop_runs_where_the_program_does() {
-    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false);
+    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32);
     let (head, rest) = src.split_once("func 0 () -> (i32) {\n").expect("the entry");
     let (serve, funcs) = rest.split_once("func 1 ").expect("the child entry");
     let src = format!(
@@ -552,7 +504,7 @@ fn a_child_image_that_carries_its_programs_serve_loop_runs_where_the_program_doe
 /// whichever of the child's end and the parent's wait comes first.
 #[test]
 fn a_child_that_never_calls_releases_its_parents_wait() {
-    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, false).replace(
+    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32).replace(
         "  vr = call.cap 268435456 0 (i64, i64) -> (i64) vexec (va, vb)\n  return vr\n",
         "  v7 = i64.const 7\n  return v7\n",
     );
@@ -572,7 +524,7 @@ fn a_child_that_never_calls_releases_its_parents_wait() {
 /// state is built, never a dangling live offer.
 #[test]
 fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
-    let src = serve_live_program((temen_interp::GRANT_SERVE_LIVE_TAG | 7) as i32, false);
+    let src = serve_live_program((temen_interp::GRANT_SERVE_LIVE_TAG | 7) as i32);
     assert!(
         runs_on_bytecode(&src),
         "the cooperative driver refuses it itself"
@@ -582,22 +534,6 @@ fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
         assert!(
             matches!(&r, Err(e) if e.contains("CapFault")),
             "{b:?}: a live self-serve grant of a nonexistent export fails the spawn closed: {r:?}"
-        );
-    }
-}
-
-/// Op 15's positional form (retiring, #2067) carries the tag too: every detached spawn follows one
-/// rule. The Cranelift JIT and the cooperative bytecode driver run this serving parent natively, over
-/// a shared cell it can be called back through.
-#[test]
-fn op_15_carries_a_live_self_serve_grant_too() {
-    let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32, true);
-    assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            4201,
-            "{b:?}: our handler answered the child's exec over op 15 too"
         );
     }
 }
@@ -711,7 +647,7 @@ block 0 (vsp: i64, varg: i64) {
     }
 }
 
-// ---- #1863: the v1 (detached) record — op 15 as data ----
+// ---- #1863: the v1 (detached) record ----
 
 /// Stores building an 88-byte v1 record at `at` from the i64 values `vr0`..`vr80` in scope (one per
 /// 8-byte word, named by offset).

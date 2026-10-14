@@ -76,6 +76,7 @@ int main(int argc, char **argv){
 /// detached record: the command's own window, paid from the `Budget`) + `join`. Its argv travels as the
 /// spawn's args payload.
 const SHELL: &str = r#"
+#include <temen.h>
 long __px_write(int h, long fd, void *buf, long n);
 long __px_exec_lookup(int h, void *name, long len);
 long __px_exec_stdout(int h);
@@ -83,9 +84,6 @@ int  __px_argc(int h);
 long __px_argv(int h, long i, void *buf, long cap);
 long __px_exec_win(int h, long module);
 long __spawn_rec(int inst, long rec);
-long __vm_instantiate_join(int inst, long child, long *status);
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
 /* Discover the handle of interface `want` from the domain's own capability table
    (cap.self reflection — the discovery tier IMPORTS.md keeps). */
@@ -109,7 +107,7 @@ static int __budget(void) { if (__h_budget < 0) __h_budget = __capof(14); return
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
 static int rec[4];
 static char nm[8];
-static long spawn[11];      /* the 88-byte op-17 v1 record */
+static struct vm_spawn_rec spawn; /* the op-17 v1 record */
 static char args[4096];
 int main(void){
   int n = __px_argc(__px());
@@ -141,18 +139,16 @@ int main(void){
     for (long k = 0; k < L; k++) *p++ = tmp[k];
     *p++ = 0;
   }
-  int *w = (int *)spawn;
-  w[0] = 1;                                   /* version 1: detached; entry 0 */
-  w[4] = (int)__px_exec_win(__px(), mod);     /* size_log2 = the command's declared window */
-  w[5] = -1;                                  /* no pager */
-  w[6] = (int)mod;
-  w[7] = __budget();
-  spawn[5] = (long)rec;                       /* grants */
-  spawn[6] = 1;
-  spawn[7] = (long)args;                      /* args payload */
-  spawn[8] = p - args;
-  w[18] = -1;                                 /* no pre-mapped region */
-  long child = __spawn_rec(__inst(), (long)spawn);
+  struct vm_spawn_rec init = VM_SPAWN_REC_INIT;
+  spawn = init;
+  spawn.size_log2 = (unsigned int)__px_exec_win(__px(), mod); /* the command's declared window */
+  spawn.module = (int)mod;
+  spawn.budget = __budget();
+  spawn.grants_ptr = (long)rec;
+  spawn.grants_n = 1;
+  spawn.args_ptr = (long)args;
+  spawn.args_len = p - args;
+  long child = __spawn_rec(__inst(), (long)&spawn);
   if (child < 0) return 126;
   long st;
   long r = __vm_instantiate_join(__inst(), child, &st);

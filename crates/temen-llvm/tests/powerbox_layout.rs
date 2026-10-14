@@ -1,6 +1,6 @@
 //! A library (no `main`) that becomes a powerbox program only after translation — a separately
 //! linked runtime given an entry by `synth_manifest_child_start` — keeps its globals clear of the
-//! argument area, so a detached spawn's payload (op 15) never lands on them. Every translation lays
+//! argument area, so a detached spawn's args payload never lands on them. Every translation lays
 //! its globals out from `stack_page` (#1777); #1776 first made this an opt-in
 //! `TranslateOptions::powerbox_layout`, and these were its tests. The translator cannot know a unit
 //! will be wrapped, so the opt-in's off state was only ever the bug.
@@ -21,21 +21,50 @@ define i64 @entry() {
 }
 "#;
 
-/// The parent: spawns the child detached with a 16-byte payload `{35, 0}` and joins it.
+/// The parent: spawns the child detached with a 16-byte payload `{35, 0}` and joins it. The spawn
+/// record (`temen_ir::SpawnRec`) is laid on its stack as eleven words: version 1, the child's window
+/// and no pager, the module and the budget, the payload, no region; every other word is 0, none.
 fn parent(child_log2: u8) -> String {
+    let window_no_pager = i64::from(child_log2) | (i64::from(u32::MAX) << 32);
     format!(
         r#"
-declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
+declare i64 @__vm_instantiate_rec(i32, i64)
 declare i64 @__vm_join(i32, i64, ptr)
 
 define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {{
   %buf = alloca [2 x i64]
+  %rec = alloca [11 x i64]
   %st = alloca i64
   store i64 35, ptr %buf
   %hi = getelementptr i64, ptr %buf, i64 1
   store i64 0, ptr %hi
   %p = ptrtoint ptr %buf to i64
-  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 {child_log2}, i64 %p, i64 16)
+  store i64 1, ptr %rec
+  %w1 = getelementptr i64, ptr %rec, i64 1
+  store i64 0, ptr %w1
+  %w2 = getelementptr i64, ptr %rec, i64 2
+  store i64 {window_no_pager}, ptr %w2
+  %m = and i64 %module, 4294967295
+  %b = shl i64 %budget, 32
+  %mb = or i64 %m, %b
+  %w3 = getelementptr i64, ptr %rec, i64 3
+  store i64 %mb, ptr %w3
+  %w4 = getelementptr i64, ptr %rec, i64 4
+  store i64 0, ptr %w4
+  %w5 = getelementptr i64, ptr %rec, i64 5
+  store i64 0, ptr %w5
+  %w6 = getelementptr i64, ptr %rec, i64 6
+  store i64 0, ptr %w6
+  %w7 = getelementptr i64, ptr %rec, i64 7
+  store i64 %p, ptr %w7
+  %w8 = getelementptr i64, ptr %rec, i64 8
+  store i64 16, ptr %w8
+  %w9 = getelementptr i64, ptr %rec, i64 9
+  store i64 4294967295, ptr %w9
+  %w10 = getelementptr i64, ptr %rec, i64 10
+  store i64 0, ptr %w10
+  %ri = ptrtoint ptr %rec to i64
+  %h = call i64 @__vm_instantiate_rec(i32 %inst, i64 %ri)
   %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
   ret i64 %r
 }}

@@ -404,9 +404,9 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                  seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
             ),
             conditional(
-                "join/instantiate_rec/instantiate_detached run on the debug scheduler through the \
-                 executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op \
-                 14) reaches the debug scheduler and is declined",
+                "join/instantiate_rec run on the debug scheduler through the executor's \
+                 admission (#1855), and so does grant (op 19, #2220); child_offer (op 14) reaches \
+                 the debug scheduler and is declined",
             )],
 
         // Declines on nesting as a re-grant (a grant list cannot carry one): a child's own `"budget"` is

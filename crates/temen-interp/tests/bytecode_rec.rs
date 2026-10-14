@@ -158,7 +158,7 @@ fn pager_capable_record_module_declines_to_the_oracle() {
 }
 
 /// A dangling budget handle refuses the detached spawn probeably (`-EINVAL`) on both engines,
-/// natively: op 15's rule, which a v1 record follows (a non-`Budget` arg refuses). This test pinned
+/// natively: a v1 record's `budget` must name a `Budget` (anything else refuses). This test pinned
 /// `CapFault` while its record spawned `module = -1` from a host that registered no program: the
 /// module failed to resolve before the budget was looked at (#2219).
 #[test]

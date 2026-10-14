@@ -34,22 +34,39 @@ int __vm_cap(int i);
 // re-grant …
 long __vm_resolve(const char *name, long len);
 //
-// **Spawning a §5 detached child** (`Instantiator` op 15, the 11-arg pre-mapped form): `module`, a
-// `Module` the host granted you — another program, built to run as a child — runs from its function 0
-// (`entry` must be 0, #2219) in a fresh window of `1 << size_log2` bytes (0: its declared memory)
-// minted from `budget` (which also bounds the child's fuel), with
-// `region` (a SharedRegion of yours) aliased whole into its window at `child_off` before it starts
-// — the bulk data plane with a child whose memory you cannot address. `grants_ptr`/`grants_n` is
-// the op-11 grant-record list (0, 0 for none), `args_ptr`/`args_len` a spawn-time payload (0, 0
-// for none). Returns the child handle (join it with `__vm_instantiate_join`) or -errno. The
-// powerbox names `"instantiator"` and `"budget"` for a program that spawns detached:
-// `int inst = (int)__vm_resolve("instantiator", 12);` etc. The playground grants a card's
-// `//// child: NAME.c` program, compiled and linked to run as a child, as `"NAME"`. A program that
-// exports a `_child` entry is also granted `"child"`, its child image: this program with a bootstrap
-// at function 0 that runs `_child`, so a copy of it spawned at entry 0 starts there (#2219).
-long __vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
-                               long entry, long size_log2, long args_ptr, long args_len, long region,
-                               long child_off);
+// **Spawning a §5 detached child** (`Instantiator` op 17): lay a `struct vm_spawn_rec` in your own
+// memory and pass its address to `__vm_instantiate_rec`, which returns the child handle (join it with
+// `__vm_instantiate_join`) or -errno. Start from `VM_SPAWN_REC_INIT`, every field at its "none" value,
+// and set what you use. `module`, a `Module` the host granted you — another program, built to run as
+// a child — runs from its function 0 in a fresh window of `1 << size_log2` bytes (0: its declared
+// memory) minted from `budget`, which also bounds the child's fuel. `region`, a SharedRegion of
+// yours, is aliased whole into the child's window at `child_off` before it starts: the bulk data plane
+// with a child whose memory you cannot address. `grants_ptr`/`grants_n` is the grant-record list
+// below, `args_ptr`/`args_len` a spawn-time payload. The powerbox names `"instantiator"` and
+// `"budget"` for a program that spawns detached: `int inst = (int)__vm_resolve("instantiator", 12);`
+// etc. The playground grants a card's `//// child: NAME.c` program, compiled and linked to run as a
+// child, as `"NAME"`. A program that exports a `_child` entry is also granted `"child"`, its child
+// image: this program with a bootstrap at function 0 that runs `_child` (#2219).
+struct vm_spawn_rec {      // `temen_ir::SpawnRec`: little-endian, pointers into your window
+  unsigned int version;    // @0: 1
+  unsigned int reserved0;  // @4: 0
+  unsigned long reserved1; // @8: 0
+  unsigned int size_log2;  // @16: the child's window, `1 << size_log2` bytes; 0: its declared memory
+  unsigned int pager;      // @20: an impl export that pages the child's window, or -1 (none)
+  int module;              // @24: the `Module` the child runs
+  int budget;              // @28: the `Budget` its window and fuel are paid from
+  long reserved2;          // @32: 0 (the retired fuel quota, #1944)
+  long grants_ptr;         // @40: the grant records, and how many (0: none)
+  long grants_n;           // @48
+  long args_ptr;           // @56: the spawn-time payload, and its length (0: none)
+  long args_len;           // @64
+  int region;              // @72: a SharedRegion pre-mapped into the child, or -1 (none)
+  unsigned int reserved3;  // @76: 0
+  long child_off;          // @80: where `region` maps in the child's window
+};
+_Static_assert(sizeof(struct vm_spawn_rec) == 88, "temen_ir::SPAWN_REC_LEN");
+#define VM_SPAWN_REC_INIT {.version = 1, .pager = -1, .region = -1}
+long __vm_instantiate_rec(int inst, long rec);
 // `__vm_instantiate_join` waits for the child to end and returns its result, with `*status` 0; a
 // child that ended in a trap (out of fuel, a fault, `kill`, `exit(n)`) returns 0 with `*status` its
 // trap's wire code (`temen_ir::trap_code`: the kind in the low 32 bits, an exit's status in the

@@ -917,7 +917,7 @@ pub(crate) enum Entry<'a> {
 /// that only sleeps on a futex — nim's `nanosleep` — is single-threaded, and can fork). Or it has
 /// a service point: the JIT's one serve loop runs over the locked cell, root or child (#2166). Or
 /// its detached children can call it back (#744): it declares an impl-export and spawns detached
-/// (op 15 or 17), so a spawn may grant the child a live offer into the root's cell.
+/// (op 17), so a spawn may grant the child a live offer into the root's cell.
 pub(crate) fn locked(m: &Module) -> bool {
     m.funcs.iter().any(|f| f.uses_fibers_or_threads())
         || crate::has_service_point(m)

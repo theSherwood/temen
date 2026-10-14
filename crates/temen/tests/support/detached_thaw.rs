@@ -3,28 +3,32 @@
 //! by `durable_detached_thaw_guards.rs` (#1733) and `thaw_pool.rs` (#2318).
 #![allow(dead_code)] // each including binary uses a different subset
 
+#[path = "../../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use temen_durable::{
-    begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
-    write_state, STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
+use temen_ir::SpawnRec;
 use temen_jit::{JitError, JitOutcome};
 
 pub const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 pub const PARENT_LOG2: u8 = 18;
 
-/// Spawn the child detached (op 15: budget, module, no grants, entry 0, `size_log2` 17, no quota),
-/// join it, return `status * 1000 + value`: what it returns, or its trap's wire code times 1000
-/// (#2066).
+/// Spawn the child detached through the v1 record at 65536 ([`parent_of`] lays it), its module and
+/// budget stored there, join it, return `status * 1000 + value`: what it returns, or its trap's wire
+/// code times 1000 (#2066).
 pub const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 1000
   vs = i64.mul vr_st vk
@@ -88,9 +92,21 @@ pub fn parent() -> temen_ir::Module {
     parent_of(PARENT)
 }
 
-/// A parent from its source, instrumented as [`PARENT`] is.
+/// A parent from its source, instrumented as [`PARENT`] is, with the spawn record every parent here
+/// spawns through: at 65536, above the shadow arena, for the child's 128 KiB window.
 pub fn parent_of(src: &str) -> temen_ir::Module {
-    verified(transform_module(&parse(src)).expect("transform"))
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::v1()
+    };
+    parent_with(src, &spawn)
+}
+
+/// [`parent_of`] with `spawn` as the record. A parent stores the module and budget in its record, so
+/// it takes the confined transform, as a child does.
+pub fn parent_with(src: &str, spawn: &SpawnRec) -> temen_ir::Module {
+    let src = format!("{src}{}", rec::segment(65536, spawn));
+    verified(transform_module_assume_confined(&parse(&src)).expect("transform"))
 }
 
 /// The child touches memory, so it takes the confined transform: its data sits above the arena, and

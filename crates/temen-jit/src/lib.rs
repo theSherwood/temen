@@ -797,7 +797,7 @@ pub struct GrantChild {
     pub parent_lane_cap: i64,
 }
 
-/// The host callback for **`instantiate_detached`** (Instantiator op 15) and a record (op 17): build a
+/// The host callback for a **detached spawn** (Instantiator op 17, the record): build a
 /// fresh child powerbox from `grants_n` 16-byte records `{name_off, name_len, handle, flags}` at
 /// window-relative `grants_ptr` (bounded to `[0, mem_size)`), re-granting each record's copyable
 /// handle **under its name** (the child finds them by `self.resolve`), plus what the admission
@@ -878,8 +878,8 @@ pub type BudgetMemGiver = unsafe extern "C" fn(
     runs: u64,
 );
 
-/// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
-/// child_off)`): may the parent's `SharedRegion` `region` be aliased whole into a child window of
+/// The **pre-map admission** (the parent side of a spawn record's `region` and `child_off`): may the
+/// parent's `SharedRegion` `region` be aliased whole into a child window of
 /// `child_size` bytes at `child_off`? `1` admitted, `0` refused (bad geometry — the spawn answers
 /// `-EINVAL`, charging nothing), `-1` with `*trap_out` set for a forged handle. Runs **before** the
 /// budget take. Host-side it is the interpreter's `Host::premap_admit`, so the two backends admit
@@ -895,7 +895,7 @@ pub type PremapAdmit = unsafe extern "C" fn(
     trap_out: *mut i64,
 ) -> i32;
 
-/// Op-15 **pre-map staging**: re-grant `region` from the parent into the built child powerbox
+/// Spawn **pre-map staging**: re-grant `region` from the parent into the built child powerbox
 /// (`child_ctx`, a [`GrantChild::ctx`]) and record the pending alias at `child_off` — the interpreter's
 /// `Host::stage_premap`. Nonzero on success.
 ///
@@ -911,7 +911,7 @@ pub type PremapStage = unsafe extern "C" fn(
 /// The embedder's hook over a fresh window once it is seeded and protected, before its guest runs: a
 /// root's ([`CompiledModule::set_window_ready`]) and a detached child's (the nursery's, on the child
 /// thread). `ro` lists the `[start, end)` byte ranges its `readonly` data segments made read-only, for
-/// the embedder's page map to record as the interpreter's own does (#2268); then an op-15 pre-map, or
+/// the embedder's page map to record as the interpreter's own does (#2268); then a spawn's pre-map, or
 /// a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside `reserved`) — the
 /// interpreter's `Host::apply_premap` through the host's own window backend, i.e. the same
 /// `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's guest never
@@ -949,7 +949,7 @@ pub struct GrantChildHooks {
     pub budget_mem_give: BudgetMemGiver,
     /// D66 — return a reaped detached child's lane (see [`LaneGiver`]).
     pub lane_give: LaneGiver,
-    /// Op-15 pre-mapped region — the host sides of one child-side `map` (see [`PremapAdmit`],
+    /// A spawn's pre-mapped region — the host sides of one child-side `map` (see [`PremapAdmit`],
     /// [`PremapStage`]), the last applied as the child's window starts ([`WindowReady`], which every
     /// detached child's window is handed to).
     pub premap_admit: PremapAdmit,
@@ -4245,7 +4245,7 @@ impl CompiledModule {
     /// #2025 — run `hook` over each fresh root window once it is seeded and protected, before the
     /// guest runs ([`WindowReady`], with `ctx` the root's powerbox): the embedder's page map records
     /// the read-only data pages (#2268), and a durable thaw's §13 pages are aliased back onto their
-    /// regions, as a child's op-15 pre-map is. `0` from it fails the run.
+    /// regions, as a child's pre-map is. `0` from it fails the run.
     pub fn set_window_ready(&mut self, hook: Option<(WindowReady, *mut core::ffi::c_void)>) {
         self.window_ready = hook;
     }
@@ -6598,17 +6598,13 @@ struct InstEnv {
     poll_thunk: i64,
     detach_thunk: i64,
     kill_thunk: i64,
-    // §3c — the config-record spawn (op 17): parse + delegate to op 15's thunk.
+    // §3c — the config-record spawn (op 17), the one spawn form.
     instantiate_rec_thunk: i64,
     // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
     // child's nursery-retained shared powerbox.
     child_offer_thunk: i64,
     // #2220 — op 19 (`grant`): grant a capability into that powerbox while the child runs.
     child_grant_thunk: i64,
-    // PROCESS.md §5 / #1287 — op 15 (`instantiate_detached`): a separate-module child in its **own**
-    // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
-    // `Budget`; argv rides as the optional spawn-time payload.
-    instantiate_detached_thunk: i64,
 }
 
 impl InstEnv {
@@ -6622,7 +6618,6 @@ impl InstEnv {
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
             child_grant_thunk: 0,
-            instantiate_detached_thunk: 0,
         }
     }
     /// The env that lowers a compile's `Instantiator` calls to its instance's nursery, for code of
@@ -6641,7 +6636,6 @@ impl InstEnv {
             instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
             child_grant_thunk: instantiator_rt::child_grant as *const () as i64,
-            instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
         }
     }
 
@@ -9674,8 +9668,7 @@ fn lower_instantiator(
         17 => {
             // §3c instantiate_rec(nursery, mem_base, mem_size:i64, handle:i32, record_ptr:i64,
             //   trap_out:i64) -> handle:i32 — the config-record spawn: the thunk parses the
-            //   record from the window (`mem_size` bounds the read) and delegates to op 15's
-            //   thunk. Pager records CapFault (sound: modules with impl exports fold to the
+            //   record from the window (`mem_size` bounds the read) and spawns it. Pager records CapFault (sound: modules with impl exports fold to the
             //   oracle).
             //
             // #826: the bound is the **reserved** mask domain, not the compile-time `mapped` — a
@@ -9728,77 +9721,6 @@ fn lower_instantiator(
             let call =
                 b.ins()
                     .call_indirect(tref, thunk, &[nursery, mem_base, h, child, arg, trap_out]);
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
-        15 => {
-            // PROCESS.md §5 / #1287 instantiate_detached(nursery, mem_base, mem_size, handle:i32,
-            //   budget:i64, module:i64, grants_ptr:i64, grants_n:i64, entry:i64, size_log2:i64,
-            //   fuel:i64, args_ptr:i64, args_len:i64, trap_out:i64) -> handle:i32. The fresh-window
-            // spawn: no carve — the thunk mints a root-shaped window (declared size committed, a
-            // lazy reservation above it), seeds the module's data + the argv payload, and runs the
-            // child there. Grant records and the payload are read from THIS window (reserved-bounded,
-            // as op 17's record). The 7-arg form passes `(0, 0)` for the payload — no seed. The optional
-            // `(region, child_off)` (args 9–10) pre-maps a `SharedRegion` into the child's window
-            // (`premap_region:i64, premap_off:i64` before `trap_out`; `-1` ⇒ none).
-            let h = slot_i32(b, get(vals, handle)?);
-            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-            let mem_size = b.ins().iconst(I64, win_reserved as i64);
-            let a = |b: &mut FunctionBuilder, i: usize| -> Result<Value, JitError> {
-                Ok(slot_i64(
-                    b,
-                    get(vals, *args.get(i).ok_or(JitError::Malformed)?)?,
-                ))
-            };
-            let budget = a(b, 0)?;
-            let modh = a(b, 1)?;
-            let grants_ptr = a(b, 2)?;
-            let grants_n = a(b, 3)?;
-            let entry = a(b, 4)?;
-            let size_log2 = a(b, 5)?;
-            let fuel = a(b, 6)?;
-            let (args_ptr, args_len) = if args.len() >= 9 {
-                (a(b, 7)?, a(b, 8)?)
-            } else {
-                (b.ins().iconst(I64, 0), b.ins().iconst(I64, 0))
-            };
-            let (premap_region, premap_off) = if args.len() >= 11 {
-                (a(b, 9)?, a(b, 10)?)
-            } else {
-                (b.ins().iconst(I64, -1), b.ins().iconst(I64, 0))
-            };
-            let mut tsig = module.make_signature();
-            for t in [
-                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
-            ] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.instantiate_detached_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery,
-                    mem_base,
-                    mem_size,
-                    h,
-                    budget,
-                    modh,
-                    grants_ptr,
-                    grants_n,
-                    entry,
-                    size_log2,
-                    fuel,
-                    args_ptr,
-                    args_len,
-                    premap_region,
-                    premap_off,
-                    trap_out,
-                ],
-            );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

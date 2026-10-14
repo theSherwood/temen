@@ -1,9 +1,16 @@
-//! #1361 step 4 — a durable parent frozen on the **JIT** while its detached child (op 15) is live,
-//! through the embedder's path (`temen_run::jit_cap_run`) and the §12 codec: the freeze rings the
-//! child's own freeze word, the child unwinds in its own window, and the harvest puts its window and
-//! powerbox on the `Host` as a `CapturedDetached` — the interpreter's form, so one artifact serves
-//! both engines. The thaw re-launches the child at its join slot under `REWINDING`, on the JIT and on
-//! the interpreter alike, and the parent's join delivers the uninterrupted total.
+//! #1361 step 4 — a durable parent frozen on the **JIT** while its detached child (spawned through a
+//! v1 record) is live, through the embedder's path (`temen_run::jit_cap_run`) and the §12 codec: the
+//! freeze rings the child's own freeze word, the child unwinds in its own window, and the harvest
+//! puts its window and powerbox on the `Host` as a `CapturedDetached` — the interpreter's form, so
+//! one artifact serves both engines. The thaw re-launches the child at its join slot under
+//! `REWINDING`, on the JIT and on the interpreter alike, and the parent's join delivers the
+//! uninterrupted total.
+//!
+//! Every spawner here stores the module and budget into its spawn record, a write to its window, so
+//! each takes the confined transform, its record above the shadow arena.
+
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module,
@@ -11,26 +18,43 @@ use temen_durable::{
 };
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Value};
 use temen_ir::durable_abi::ShadowArena;
+use temen_ir::SpawnRec;
 use temen_jit::{JitError, JitOutcome};
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
-/// Spawn the child detached (op 15, 7-arg form: budget, module, no grants, entry 0, `size_log2` 17,
-/// no quota), join it, return what it returns.
+/// Spawn the child detached through the v1 record at 65536 ([`parent`] lays it), its module and
+/// budget stored there, join it, return what it returns.
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }
 }
 ";
+
+/// A v1 spawn record at `at` for a 128 KiB child, as a `data` line: the spawner stores the module and
+/// the budget in it before the spawn.
+fn spawn_rec(at: u64) -> String {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::v1()
+    };
+    rec::segment(at, &spawn)
+}
+
+/// [`PARENT`] with its spawn record, instrumented.
+fn parent() -> temen_ir::Module {
+    confined(&format!("{PARENT}{}", spawn_rec(65536)))
+}
 
 /// Sums `0..100` with a back-edge poll per iteration — 4950 uninterrupted. The zero-length `unmap`
 /// through its `AddressSpace` (refused, its answer unused) is what gives the loop its poll: a function
@@ -69,8 +93,8 @@ fn instrument(src: &str) -> temen_ir::Module {
     inst
 }
 
-/// A durable powerbox granting what op 15 needs — freeze authority over detached progeny included —
-/// and the handle values as JIT entry slots.
+/// A durable powerbox granting what the spawn needs — freeze authority over detached progeny
+/// included — and the handle values as JIT entry slots.
 fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
@@ -88,17 +112,18 @@ fn returned(o: JitOutcome) -> Vec<i64> {
     }
 }
 
-/// Spawns its own program's child image (`"child"`, from its `_child` export: func 1) detached, and
-/// returns what the spawn answered.
+/// Spawns its own program's child image (`"child"`, from its `_child` export: func 1) detached,
+/// through the [`spawn_rec`] at 65536, and returns what the spawn answered.
 const SELF_SPAWN: &str = "memory 17 shadow 16448 65536
 export 0 func \"_child\" 1
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vb = i64.extend_i32_u v1
-  vimg = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vimg, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v2
+  vrb = i64.const 65564
+  i32.store vrb v1
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vc
   return vr
   }
@@ -117,7 +142,7 @@ block 0 (v0: i64) {
 /// before #2219, taking it for durable.
 #[test]
 fn a_durable_domain_refuses_its_own_program_detached() {
-    let m = instrument(SELF_SPAWN);
+    let m = confined(&format!("{SELF_SPAWN}{}", spawn_rec(65536)));
     let powerbox = || {
         let mut host = Host::new();
         host.set_durable(true);
@@ -160,7 +185,7 @@ fn a_durable_domain_refuses_its_own_program_detached() {
 
 #[test]
 fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
-    let parent = instrument(PARENT);
+    let parent = parent();
     let child = instrument(CHILD);
 
     // Control: uninterrupted on the JIT.
@@ -299,7 +324,7 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
 /// child re-launched on the JIT from the interpreter's capture of it.
 #[test]
 fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
-    let parent = instrument(PARENT);
+    let parent = parent();
     let child = instrument(CHILD);
     let (mut fhost, fargs) = powerbox(&child);
     let iargs: Vec<Value> = fargs.iter().map(|&a| Value::I32(a as i32)).collect();
@@ -347,9 +372,10 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 /// #2010 — the root of a depth-2 durable tree: `v0` its `Instantiator`, `v1` the [`NEST`] module,
 /// `v2` a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]),
 /// `v3` freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout, and
-/// `v6`, `v7` the programs of the child's own children ([`Nest`]). It spawns `NEST` detached at
-/// entry 0 with four named grants (#2018): the authority as `"freeze"`, so the durable child may
-/// spawn in turn, `v6` and `v7` as `"nest"` and `"nest2"`, and its stdout as `"stdout"` (#2054). It
+/// `v6`, `v7` the programs of the child's own children ([`Nest`]). It spawns `NEST` detached through
+/// the v1 record at 70144 ([`nest_root`] lays it) with four named grants (#2018): the authority as
+/// `"freeze"`, so the durable child may spawn in turn, `v6` and `v7` as `"nest"` and `"nest2"`, and
+/// its stdout as `"stdout"` (#2054). It
 /// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking
 /// 1 ms a time (a durable run on the oracle has one worker, so a waiter must give it up), then the
 /// settle time. Then one fiber resume: the run's only fiber safepoint, where
@@ -394,13 +420,12 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32)
   i32.store vr10 vl3
   vr11 = i64.const 70088
   i32.store vr11 v5
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vgp = i64.const 70032
-  vgn = i64.const 4
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
+  vrm = i64.const 70168
+  i32.store vrm v1
+  vrb = i64.const 70172
+  i32.store vrb v2
+  vrp = i64.const 70144
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   br 1(v0, v2, vc, v4)
 }
 block 1 (vi: i32, vbu: i32, vch: i32, vms: i32) {
@@ -444,9 +469,22 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
-/// #2010 — the child [`NEST_ROOT`] spawns (entry 0) resolves its `"budget"` and `"nest"`, spawns
-/// `"nest"` (its func 1's image) detached, joins it, and returns 100 more than it. The grandchild
-/// waits a second on a futex nothing notifies, so it is live when the freeze lands, then returns 7.
+/// [`NEST_ROOT`] with its spawn record at 70144: the child's 128 KiB window and the four grants the
+/// root writes at 70032.
+fn nest_root() -> String {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 70032,
+        grants_n: 4,
+        ..SpawnRec::v1()
+    };
+    format!("{NEST_ROOT}{}", rec::segment(70144, &spawn))
+}
+
+/// #2010 — the child [`NEST_ROOT`] spawns resolves its `"budget"` and `"nest"`, spawns `"nest"` (its
+/// func 1's image) detached through the record at 90240 ([`nest`] lays it), joins it, and returns 100
+/// more than it. The grandchild waits a second on a futex nothing notifies, so it is live when the
+/// freeze lands, then returns 7.
 const NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
@@ -459,12 +497,13 @@ block 0 (v0: i64, v1: i64) {
   vmp = i64.const 90120
   vml = i64.const 4
   vm = self.resolve vmp vml
-  vbw = i64.extend_i32_u vb
-  vmw = i64.extend_i32_u vm
-  vz = i64.const 0
-  vlog = i64.const 17
+  vrm = i64.const 90264
+  i32.store vrm vm
+  vrb = i64.const 90268
+  i32.store vrb vb
+  vrp = i64.const 90240
   vinst = i32.wrap_i64 v0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vz, vlog, vz)
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
@@ -482,6 +521,11 @@ block 0 (v0: i64, v1: i64) {
   }
 }
 ";
+
+/// [`NEST`] with its spawn record.
+fn nest() -> String {
+    format!("{NEST}{}", spawn_rec(90240))
+}
 
 /// What [`NEST_ROOT`] returns uninterrupted: the grandchild's 7, plus 100 from the child.
 const NEST_TOTAL: i64 = 107;
@@ -650,9 +694,9 @@ block 0 (v0: i64, v1: i64) {
 ";
 
 /// #2054 — the same one level down: a child that re-grants the grandchild (`"nest"`, its func 1's
-/// image) the stdout it inherited, joins it, and returns 100 more than it. The grandchild resolves
-/// that stdout, waits a second, writes `X` to it and returns 7, so its bytes reach the root through
-/// the child's stream.
+/// image) the stdout it inherited, spawning it through the record at 90240 ([`print_grand_nest`]
+/// lays it), joins it, and returns 100 more than it. The grandchild resolves that stdout, waits a
+/// second, writes `X` to it and returns 7, so its bytes reach the root through the child's stream.
 const PRINT_GRAND_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
@@ -675,13 +719,13 @@ block 0 (v0: i64, v1: i64) {
   vgh = i64.const 90152
   vo64 = i64.extend_i32_u vo
   i64.store vgh vo64
-  vbw = i64.extend_i32_u vb
-  vmw = i64.extend_i32_u vm
-  vz = i64.const 0
-  vgn = i64.const 1
-  vlog = i64.const 17
+  vrm = i64.const 90264
+  i32.store vrm vm
+  vrb = i64.const 90268
+  i32.store vrb vb
+  vrp = i64.const 90240
   vinst = i32.wrap_i64 v0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vga, vgn, vz, vlog, vz)
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
@@ -708,12 +752,25 @@ block 0 (v0: i64, v1: i64) {
 }
 ";
 
+/// [`PRINT_GRAND_NEST`] with its spawn record at 90240: the grandchild's 128 KiB window and the
+/// stdout grant the child writes at 90144.
+fn print_grand_nest() -> String {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 90144,
+        grants_n: 1,
+        ..SpawnRec::v1()
+    };
+    format!("{PRINT_GRAND_NEST}{}", rec::segment(90240, &spawn))
+}
+
 /// #2041 — the same one level down: a child that spawns a grandchild that returns at once
-/// (`"nest"`, its func 1's image), waits for it to end without joining it, then spawns two that
-/// wait a second (`"nest2"`, its func 2's image), and joins those first. Its tree settles with the
-/// child and the slow two live, which it reaches only after the quick one has ended: the freeze
-/// finds the child live, with the quick one completed but not joined. It returns 100 more than the
-/// quick one's 7 and the slow ones' 0.
+/// (`"nest"`, its func 1's image) through the record at 90240, waits for it to end without joining
+/// it, then spawns two that wait a second (`"nest2"`, its func 2's image) through the one at 90336,
+/// and joins those first ([`completed_nest`] lays both). Its tree settles with the child and the
+/// slow two live, which it reaches only after the quick one has ended: the freeze finds the child
+/// live, with the quick one completed but not joined. It returns 100 more than the quick one's 7 and
+/// the slow ones' 0.
 const COMPLETED_NEST: &str = "memory 17 shadow 16448 65536
 data 90112 \"budget\"
 data 90120 \"nest\"
@@ -731,16 +788,16 @@ block 0 (v0: i64, v1: i64) {
   vsp = i64.const 90128
   vsl = i64.const 5
   vs = self.resolve vsp vsl
-  vbw = i64.extend_i32_u vb
-  vmw = i64.extend_i32_u vm
-  vsw = i64.extend_i32_u vs
-  vz = i64.const 0
-  vlog = i64.const 17
+  vqm = i64.const 90264
+  i32.store vqm vm
+  vqb = i64.const 90268
+  i32.store vqb vb
+  vqr = i64.const 90240
   vinst = i32.wrap_i64 v0
-  vq = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vz, vlog, vz)
-  br 1(vinst, vbw, vsw, vq)
+  vq = call.cap 6 17 (i64) -> (i32) vinst (vqr)
+  br 1(vinst, vb, vs, vq)
 }
-block 1 (vi: i32, vbw1: i64, vsw1: i64, vq1: i32) {
+block 1 (vi: i32, vb1: i32, vs1h: i32, vq1: i32) {
   vwa = i64.const 66000
   vwe = i32.const 0
   vwt = i64.const 1000000
@@ -748,13 +805,16 @@ block 1 (vi: i32, vbw1: i64, vsw1: i64, vq1: i32) {
   vst = call.cap 6 9 (i32) -> (i32) vi (vq1)
   vz32 = i32.const 0
   vended = i32.ne vst vz32
-  br_if vended 2(vi, vbw1, vsw1, vq1) 1(vi, vbw1, vsw1, vq1)
+  br_if vended 2(vi, vb1, vs1h, vq1) 1(vi, vb1, vs1h, vq1)
 }
-block 2 (vi2: i32, vbw2: i64, vsw2: i64, vq2: i32) {
-  vz2 = i64.const 0
-  vlog2 = i64.const 17
-  vs1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
-  vs2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
+block 2 (vi2: i32, vb2: i32, vs2h: i32, vq2: i32) {
+  vsm = i64.const 90360
+  i32.store vsm vs2h
+  vsb = i64.const 90364
+  i32.store vsb vb2
+  vsr = i64.const 90336
+  vs1 = call.cap 6 17 (i64) -> (i32) vi2 (vsr)
+  vs2 = call.cap 6 17 (i64) -> (i32) vi2 (vsr)
   vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) vi2 (vs1)
   vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) vi2 (vs2)
   vjq_st, vjq = call.cap 6 1 (i32) -> (i64, i64) vi2 (vq2)
@@ -782,6 +842,11 @@ block 0 (v0: i64, v1: i64) {
   }
 }
 ";
+
+/// [`COMPLETED_NEST`] with its two spawn records, the quick grandchild's and the slow ones'.
+fn completed_nest() -> String {
+    format!("{COMPLETED_NEST}{}{}", spawn_rec(90240), spawn_rec(90336))
+}
 
 /// `src` parsed and instrumented. Every module here touches memory, so each takes the confined
 /// transform.
@@ -831,9 +896,9 @@ impl Nest {
     }
 }
 
-/// [`NEST_ROOT`] and [`Nest::of`]`(child)`.
+/// [`nest_root`] and [`Nest::of`]`(child)`.
 fn nest_modules(child: &str) -> (temen_ir::Module, Nest) {
-    (confined(NEST_ROOT), Nest::of(child))
+    (confined(&nest_root()), Nest::of(child))
 }
 
 /// [`NEST_ROOT`]'s powerbox: its `Instantiator`, the [`Nest`] modules, a `Budget` of 1 MiB, freeze
@@ -1103,7 +1168,7 @@ fn rides_every_engine(
 /// before any parked task is poisoned, and the child's join is left parked for the grandchild's end.
 #[test]
 fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
-    rides_every_engine(NEST, 2, carried, &[1], (Ok(NEST_TOTAL), ""));
+    rides_every_engine(&nest(), 2, carried, &[1], (Ok(NEST_TOTAL), ""));
 }
 
 /// #2010 — **the JIT's freeze reaches a grandchild through the joins.** The embedder's
@@ -1114,7 +1179,7 @@ fn a_durable_childs_grandchild_rides_its_freeze_on_every_engine() {
 /// return, and be joined rather than carried.
 #[test]
 fn a_controller_freeze_reaches_a_grandchild_through_the_joins_on_the_jit() {
-    controller_freeze(NEST, |host| {
+    controller_freeze(&nest(), |host| {
         assert_eq!(
             carried(host),
             vec![1],
@@ -1185,7 +1250,7 @@ fn controller_freeze(child: &str, check: impl FnOnce(&Host)) {
 /// claims slot 0 too. The residue stays on the host for a thaw on the interpreter.
 #[test]
 fn a_jit_thaw_refuses_two_detached_children_at_one_join_slot() {
-    let (root, nest) = nest_modules(NEST);
+    let (root, nest) = nest_modules(&nest());
     let (mut fhost, args) = nest_powerbox(&nest, 0, 2);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     arm_freeze_after(&mut win, 1);
@@ -1297,7 +1362,7 @@ fn a_detached_childs_inherited_stdout_rides_its_freeze_on_every_engine() {
 /// so its thaw aliases it to the child's stream, which the child's own thaw aliased to the root's.
 #[test]
 fn a_grandchilds_inherited_stdout_rides_its_freeze_on_every_engine() {
-    rides_every_engine(PRINT_GRAND_NEST, 2, carried, &[1], (Ok(NEST_TOTAL), "X"));
+    rides_every_engine(&print_grand_nest(), 2, carried, &[1], (Ok(NEST_TOTAL), "X"));
 }
 
 /// #2041 — **the same one level down.** The freeze captures the child live, joining its slow
@@ -1307,7 +1372,7 @@ fn a_grandchilds_inherited_stdout_rides_its_freeze_on_every_engine() {
 #[test]
 fn a_captured_childs_completed_child_rides_its_freeze_on_every_engine() {
     rides_every_engine(
-        COMPLETED_NEST,
+        &completed_nest(),
         3,
         completed_grandchildren,
         &[1],
@@ -1315,12 +1380,13 @@ fn a_captured_childs_completed_child_rides_its_freeze_on_every_engine() {
     );
 }
 
-/// #2044 — [`NEST_ROOT`] with a second fiber safepoint before its `join`: a thaw from the first can be
+/// #2044 — [`nest_root`] with a second fiber safepoint before its `join`: a thaw from the first can be
 /// armed to freeze again at the second, with the child still unjoined.
 fn refreeze_root() -> String {
     let once = "  vs, vx = cont.resume vk vz2\n";
-    assert!(NEST_ROOT.contains(once));
-    NEST_ROOT.replace(
+    let root = nest_root();
+    assert!(root.contains(once));
+    root.replace(
         once,
         &format!("{once}  vsp2 = i64.const 220000\n  vk2 = cont.new vf vsp2\n  vs2, vx2 = cont.resume vk2 vz2\n"),
     )

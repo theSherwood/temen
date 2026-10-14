@@ -28,8 +28,8 @@
 //!
 //! ## Why the arity sweep
 //!
-//! The lowering's arms are arity-guarded (`(INSTANTIATOR, 15) if args.len() >= 7`), so calling an op
-//! with too few arguments makes it look unsupported when it is merely miscalled. The question the
+//! The lowering's arms are arity-guarded, so calling an op with too few arguments makes it look
+//! unsupported when it is merely miscalled. The question the
 //! column asks is "**can** the debug tier run this op", so each op is tried across a range of
 //! arities and the **best** verdict wins. Argument *values* are all zero and deliberately so: a
 //! `-EINVAL` or a trap is a serviced answer — the op reached its seam and the engine drove it —
