@@ -6447,8 +6447,8 @@ pub struct JitOnrampRun {
     emitted_wasm: std::sync::Arc<[u8]>,
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    /// The emitted `f0`'s trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
-    /// 4); the warm+JIT `eval_run` entry (WASM_AOT.md) carries one `I64` — the powerbox `sp` — here.
+    /// The emitted entry's trailing `...slots` args: its declared params. Empty for the paramless
+    /// `_start` (IMPORTS.md phase 4); a §14 child entry's starter handles.
     slots: Vec<Value>,
     last_trap: Option<String>,
     /// Set when a cross-tier bounce returns `Trap::Exit(code)` (the guest called `exit`), unwinding the
@@ -6475,10 +6475,7 @@ pub struct JitOnrampRun {
     /// each bounce (the `driveCoopTierupRun` pattern). Each bounce reserves `DEFAULT_RESERVED_LOG2`, exactly
     /// as the interpreter oracle does, so a `vm_map` that lands past the window yields the same result the
     /// oracle gives and the emitted access then declines (see [`run_cross_tier`](Self::run_cross_tier)).
-    /// `grow` gates all of this: the single-shot on-ramp path sets it (no pre-size, real growth); the
-    /// warm+JIT path leaves it `false`, keeps its pre-sized window, and carries no page state
-    /// between bounces.
-    grow: bool,
+    ///
     /// The page map carried forward between cross-tier bounces: the on-ramp's `protect`ed rodata and
     /// any `vm_map`-grown tail, together with the committed prefix those entries are relative to (the
     /// previous bounce's `MemMapInfo.1` — a grown tail the seed folded into the prefix lives there,
@@ -6503,10 +6500,6 @@ pub struct JitOnrampRun {
     /// frame, so a `Jit.install` a child makes in one bounce is reachable from the next. Sized by the
     /// host's `jit_table_log2` (the reservation a re-granted `Jit` carried in; `0` ⇒ natural).
     table: std::sync::Arc<bytecode::SharedSlots>,
-    /// #1734 — warm+JIT: the end of the highest page a bounce committed past the emitted window
-    /// ([`committed_end`](fn@committed_end)). Such a commit stops the run, and the next restore
-    /// zeroes the page. Reset per eval by [`reset_warm`](Self::reset_warm).
-    committed_end: u64,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -6949,134 +6942,12 @@ impl JitOnrampRun {
             exited: false,
             returned_value: 0,
             trapped: false,
-            grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
             prots: Some(temen_interp::PageMap::empty()),
             mapped,
             paged,
             pagestate,
             table,
-            committed_end: 0,
         })
-    }
-
-    /// Open a **warm+JIT** `eval_run` run (WASM_AOT.md warm+JIT) over the caller-owned warm-session
-    /// window. Three differences from [`open_shared_run`]: the emit is rooted at the module's `eval_run`
-    /// export (not `_start`), the window is **not** re-seeded with data segments (the caller restores the
-    /// warm image before each drive), and the entry's `sp` rides along as the emitted `f0`'s trailing
-    /// slot. Returns [`STATUS_UNSUPPORTED`] if `eval_run` isn't wasm-drivable — the caller then evaluates
-    /// on the interpreter warm path ([`temen_warm_eval`]).
-    ///
-    /// # Safety
-    /// `back` must alias the live warm-session window `[win_ptr, 1 << win_log2)`, kept valid until the
-    /// run is dropped (it is owned by the [`WarmSession`] that holds this run, freed in `temen_warm_close`).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn open_warm_eval(
-        m: &temen_ir::Module,
-        back: std::sync::Arc<temen_interp::Region>,
-        win_ptr: *mut u8,
-        win_log2: u8,
-        shared_memory: bool,
-        eval_fn: temen_ir::FuncIdx,
-        entry_sp: u64,
-    ) -> Result<JitOnrampRun, i32> {
-        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let win_base = win_ptr as usize;
-        let mut module = m.clone();
-        temen_wasm_jit::outline_cap_calls(&mut module);
-        // The warm module already declares the mapped window; keep the belt-and-braces enlarge for parity
-        // with `open_over_run` (a no-op when `size_log2 == win_log2`).
-        if let Some(mc) = module.memory.as_mut() {
-            if (mc.size_log2 as u32) < win_log2 as u32 {
-                mc.size_log2 = win_log2;
-            }
-        }
-        // The powerbox the interpreter warm path grants (`temen_warm_eval`) — a fresh host is re-granted per
-        // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
-        let mut host = Host::new();
-        let frame = grant_onramp_caps(&mut host, &module, None, None).frame;
-        // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
-        let program = std::sync::Arc::new(
-            bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
-        );
-        // Emit rooted at `eval_run` (not `_start`); the reachable-set / concurrency gates are unchanged,
-        // so a driver whose eval can suspect or leaves the subset declines to the interpreter.
-        let artifact = temen_wasm_jit::compile_jit(
-            &module,
-            temen_wasm_jit::Shape::Batch { entry: eval_fn },
-            shared_memory,
-        )
-        .map_err(|_| STATUS_UNSUPPORTED)?;
-        let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
-            return Err(STATUS_UNSUPPORTED);
-        };
-        let (mut emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
-        // #1120 Slice 2c (opt-in, default off): re-emit with the hottest large function **outlined** into
-        // block-group wasm functions, so V8 TurboFans the hot path on the first Run instead of after
-        // several. The emit is WasmDriven-rooted at `eval_run`, exactly like the `compile_jit` above; the
-        // split changes only that one function's internal shape, so the `emitted` bitmap is unchanged and
-        // the interpreter oracle / confinement are untouched. Falls back to the unsplit emit on any error.
-        if WARM_JIT_SPLIT.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Ok((split_wasm, _)) = temen_wasm_jit::compile_module_reactor_split(
-                &module,
-                eval_fn,
-                shared_memory,
-                WARM_JIT_SPLIT_MIN_BYTES,
-                WARM_JIT_SPLIT_GROUP_BYTES,
-            ) {
-                emitted_wasm = split_wasm;
-            }
-        }
-        let table = program.dispatch_table(host.jit_table_log2());
-        Ok(JitOnrampRun {
-            module: std::sync::Arc::new(module),
-            program,
-            host,
-            _backing: None,
-            back,
-            win_base,
-            emitted_wasm: std::sync::Arc::from(emitted_wasm),
-            emitted,
-            frame,
-            slots: vec![Value::I64(entry_sp as i64)],
-            last_trap: None,
-            exit_code: 0,
-            exited: false,
-            returned_value: 0,
-            trapped: false,
-            // Warm+JIT keeps its pre-sized window and carries no page state between bounces
-            // (`grow: false`), so `prots` is inert here. `mapped` is the window the eval was
-            // emitted over: a bounce that commits a page past it stops the run (#1734).
-            grow: false,
-            prots: Some(temen_interp::PageMap::empty()),
-            mapped: 1u64 << win_log2,
-            paged: false,
-            pagestate: Vec::new(),
-            table,
-            committed_end: 0,
-        })
-    }
-
-    /// Reset a cached warm+JIT run for a fresh Run: rebuild the powerbox (a clean `Host` + `grant_onramp_
-    /// caps`, so captured streams and the frame cell start empty) and clear the finish flags. The caller
-    /// restores the warm image into the window separately (`temen_warm_jit_prepare`); together they give the
-    /// same fresh-per-Run state the interpreter warm path gets, so no guest state crosses Runs.
-    fn reset_warm(&mut self, stdin: Vec<u8>) {
-        let mut host = Host::new();
-        host.stdin = stdin;
-        // Live-stream stdout from the warm+JIT eval's cross-tier `write` bounces (#1142) — same tee as
-        // the interpreter warm path; a no-op unless the page has a streaming sink active.
-        if let Some(t) = stream_tee() {
-            host.set_stdout_tee(t);
-        }
-        let frame = grant_onramp_caps(&mut host, &self.module, None, None).frame;
-        self.host = host;
-        self.frame = frame;
-        self.exit_code = 0;
-        self.exited = false;
-        self.returned_value = 0;
-        self.trapped = false;
-        self.last_trap = None;
-        self.committed_end = 0;
     }
 
     /// The emitted wasm (the host compiles + instantiates it, then calls `f0(win, env, ...slots)` once).
@@ -7087,9 +6958,8 @@ impl JitOnrampRun {
     pub fn win_base(&self) -> usize {
         self.win_base
     }
-    /// The emitted `f0`'s trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
-    /// 4 — capabilities arrive via the manifest slot bindings); the warm+JIT `eval_run` entry carries one
-    /// `I64` (the powerbox `sp`), passed by the warm-JIT driver as the emitted `f0`'s third argument.
+    /// The emitted entry's trailing `...slots` args. Empty for the paramless `_start` (IMPORTS.md phase
+    /// 4 — capabilities arrive via the manifest slot bindings).
     pub fn slots(&self) -> &[Value] {
         &self.slots
     }
@@ -7108,97 +6978,67 @@ impl JitOnrampRun {
     /// `exit`) so `f0` unwinds and the run reports `STATUS_EXIT` with that code.
     pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
         let mut fuel = DEFAULT_FUEL;
-        let r = if self.grow {
-            // #1153 single-shot on-ramp: run the bounce over the PERSISTED page map (so a prior `vm_map`
-            // grow's committed pages survive the fresh-`Mem`-per-bounce shape), and re-capture the grown
-            // map + new committed extent — so the next bounce sees the growth and the JS driver can
-            // re-sync the emitted `"mapped"` global. The reservation is `DEFAULT_RESERVED_LOG2`, exactly
-            // as the interpreter oracle ([`onramp_fs_exec`]) uses — NOT clamped to the window. A guest
-            // whose `malloc` `vm_map`s at a high address (chibicc's compiled programs place their heap at
-            // 256 MiB) must get the SAME `vm_map` result the oracle gives: the map succeeds, the emitted
-            // access to that page then faults (wasm out-of-bounds past the linear-memory window), and the
-            // JS driver declines to the interpreter (invariant 9 — trap, don't run wrong). Clamping the
-            // reservation to the window instead made the `vm_map` fail `-EINVAL`, so `malloc` returned
-            // null and the run completed with WRONG output (a silent divergence) rather than declining.
-            // A `None` page map = a §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run
-            // closed (the caller declines to the interpreter, which handles §13). On-ramp guests are not
-            // granted a `SharedRegion`, so this is defensive.
-            let (r, info, mapped) = self.program.run_over_grown_info(
-                func,
-                args,
-                &mut fuel,
-                self.back.clone(),
-                &mut self.host,
-                false,
-                temen_ir::DEFAULT_RESERVED_LOG2,
-                self.prots.as_ref(),
-                Some(&self.table), // #1296: installs persist across this run's bounces
-            );
-            match info {
-                Some(info) => {
-                    if self.paged {
-                        // #1201: the paged contract — the table from the live map, `"mapped"` = its
-                        // coverage (never the reserved domain, nor past the backing), so the emitted
-                        // bound check traps everything above the table where the interpreter faults
-                        // and the page states refine within it.
-                        let (table, cover) =
-                            bytecode::build_pagestate_table(&info, self.back.len());
-                        self.pagestate = table;
-                        self.mapped = cover;
-                    } else {
-                        self.mapped = mapped;
-                    }
-                    // Rebuild the carry with the prefix its entries are now relative to — one value,
-                    // so the two cannot drift apart.
-                    self.prots = temen_interp::PageMap::from_entries(
-                        temen_interp::host_page_size(),
-                        info.1,
-                        &info.3,
-                    );
-                    if self.prots.is_none() {
-                        return Err(Trap::CapFault); // a §13 `Backed` entry — unrestorable, fail closed
-                    }
+        // #1153 single-shot on-ramp: run the bounce over the PERSISTED page map (so a prior `vm_map`
+        // grow's committed pages survive the fresh-`Mem`-per-bounce shape), and re-capture the grown
+        // map + new committed extent — so the next bounce sees the growth and the JS driver can
+        // re-sync the emitted `"mapped"` global. The reservation is `DEFAULT_RESERVED_LOG2`, exactly
+        // as the interpreter oracle ([`onramp_fs_exec`]) uses — NOT clamped to the window. A guest
+        // whose `malloc` `vm_map`s at a high address (chibicc's compiled programs place their heap at
+        // 256 MiB) must get the SAME `vm_map` result the oracle gives: the map succeeds, the emitted
+        // access to that page then faults (wasm out-of-bounds past the linear-memory window), and the
+        // JS driver declines to the interpreter (invariant 9 — trap, don't run wrong). Clamping the
+        // reservation to the window instead made the `vm_map` fail `-EINVAL`, so `malloc` returned
+        // null and the run completed with WRONG output (a silent divergence) rather than declining.
+        // A `None` page map = a §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run
+        // closed (the caller declines to the interpreter, which handles §13). On-ramp guests are not
+        // granted a `SharedRegion`, so this is defensive.
+        let (r, info, mapped) = self.program.run_over_grown_info(
+            func,
+            args,
+            &mut fuel,
+            self.back.clone(),
+            &mut self.host,
+            false,
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            self.prots.as_ref(),
+            Some(&self.table), // #1296: installs persist across this run's bounces
+        );
+        match info {
+            Some(info) => {
+                if self.paged {
+                    // #1201: the paged contract — the table from the live map, `"mapped"` = its
+                    // coverage (never the reserved domain, nor past the backing), so the emitted
+                    // bound check traps everything above the table where the interpreter faults
+                    // and the page states refine within it.
+                    let (table, cover) = bytecode::build_pagestate_table(&info, self.back.len());
+                    self.pagestate = table;
+                    self.mapped = cover;
+                } else {
+                    self.mapped = mapped;
                 }
-                None => {
-                    self.prots = None;
-                    return Err(Trap::CapFault);
+                // Rebuild the carry with the prefix its entries are now relative to — one value,
+                // so the two cannot drift apart.
+                self.prots = temen_interp::PageMap::from_entries(
+                    temen_interp::host_page_size(),
+                    info.1,
+                    &info.3,
+                );
+                if self.prots.is_none() {
+                    return Err(Trap::CapFault); // a §13 `Backed` entry — unrestorable, fail closed
                 }
             }
-            // #1285: a detached child's backing is its own foreign memory — grow it to cover the new
-            // committed extent (the interpreter bounds accesses to the backing, #1191; the emitted tier
-            // to `"mapped"`). A refused grow fails the run closed rather than running short.
-            if self.back.is_foreign() && !self.back.grow_to(self.mapped) {
+            None => {
                 self.prots = None;
                 return Err(Trap::CapFault);
             }
-            r
-        } else {
-            // Warm+JIT (pre-sized window): no persisted page state, no re-sync. A page a bounce
-            // commits past the window the eval was emitted over is one its emitted code cannot
-            // address: it masks to the window, whose base the grow may also have moved. So the run
-            // stops there, before emitted code runs again, the eval falls back to the interpreter,
-            // and the next restore zeroes the page (#1734). A commit inside the window records no
-            // page-map entry, and needs none: a guest maps a page before it reads it, and a map
-            // zero-fills.
-            let (r, pages, _) = self.program.run_over_grown(
-                func,
-                args,
-                &mut fuel,
-                self.back.clone(),
-                &mut self.host,
-                false,
-                temen_ir::DEFAULT_RESERVED_LOG2,
-                None,
-            );
-            // `None`: the bounce aliased a §13 page, which a WasmDriven eval never does. Fail
-            // closed.
-            let end = pages.as_deref().map_or(u64::MAX, committed_end);
-            self.committed_end = self.committed_end.max(end);
-            if end > self.mapped {
-                return Err(Trap::MemoryFault);
-            }
-            r
-        };
+        }
+        // #1285: a detached child's backing is its own foreign memory — grow it to cover the new
+        // committed extent (the interpreter bounds accesses to the backing, #1191; the emitted tier
+        // to `"mapped"`). A refused grow fails the run closed rather than running short.
+        if self.back.is_foreign() && !self.back.grow_to(self.mapped) {
+            self.prots = None;
+            return Err(Trap::CapFault);
+        }
         if let Err(Trap::Exit(code)) = &r {
             self.exit_code = *code;
             self.exited = true;
@@ -7212,11 +7052,6 @@ impl JitOnrampRun {
     /// coop tier's `temen_coop_mapped`.
     pub fn mapped(&self) -> u64 {
         self.mapped
-    }
-
-    /// #1734 — warm+JIT: the end of the highest page this eval's bounces left committed.
-    fn committed_end(&self) -> u64 {
-        self.committed_end
     }
 
     /// #1201 — whether the run emitted **paged** (the module `unmap`s/`protect`s); the driver then
@@ -7597,21 +7432,9 @@ struct WarmSession {
     /// #964: the module's NULL guard (`0` = legacy layout) — a marked module's powerbox low scratch
     /// (heap bump words included) sits one guard up, so every brk read/seed offsets by this.
     scratch: u64,
-    /// The cached warm+JIT run (WASM_AOT.md warm+JIT): `eval_run` emitted to wasm **once**, then driven
-    /// per Run over the restored warm image. `None` until [`temen_warm_jit_open`]; reusing the emit across
-    /// Runs is what keeps a warm+JIT Run off the ~one-time cdylib emit. Held here (not in a global) so
-    /// [`temen_warm_close`] tears it down while its window alias is still valid, before the window is freed.
-    jit: Option<Box<JitOnrampRun>>,
-    /// #1312: the window base [`jit`](Self::jit) was built against. The warm+JIT run bakes a
-    /// `win_base`, and a *warm-coop* eval on the same session can grow — and so relocate — the
-    /// window underneath it. Compared on each [`temen_warm_jit_open`]; a mismatch rebuilds rather
-    /// than driving emitted code through a stale base.
-    jit_win_base: usize,
-    /// #816 item 4 — the cached **warm-coop** artifact: the coop tier-up emit (leaves + wrappers)
-    /// plus the outlined module's compiled program, built once by [`temen_warm_coop_open`] and
-    /// reused by every [`temen_warm_coop_prepare`]. The tier a **page-managing / InterpDriven**
-    /// `eval_run` runs on — where the WasmDriven [`temen_warm_jit_open`] declines, the coop drive
-    /// interprets the eval and tiers its eligible leaves up onto emitted wasm.
+    /// #816 item 4 — the cached **warm-coop** artifact: the outlined module's compiled program, and
+    /// the region emit once an eval needs it, built by [`temen_warm_coop_open`] and reused by every
+    /// [`temen_warm_coop_prepare`]: the warm session's emitted tier (#1414 S4-3c).
     coop: Option<Box<WarmCoop>>,
 }
 
@@ -7619,9 +7442,9 @@ impl WarmSession {
     /// Restore the warm image and zero the tail any prior eval grew the heap into, so this Run sees
     /// byte-identical warm state (fresh-per-Run isolation).
     ///
-    /// One body, three callers (batch eval, streaming eval, warm+JIT eval). It was three identical
-    /// copies, which is the second position INVARIANTS #15 is about — and the kind that bites quietly,
-    /// since a fourth entry point would have been written by copying a third.
+    /// One body for the interpreter's eval and the pump's. It was three identical copies, which is
+    /// the second position INVARIANTS #15 is about — and the kind that bites quietly, since a fourth
+    /// entry point would have been written by copying a third.
     fn restore_warm_window(&self) {
         let image = self.warm.bytes();
         // SAFETY: `win_ptr` owns `win >= dirty_end` bytes; no engine run is in flight (every caller
@@ -7635,7 +7458,7 @@ impl WarmSession {
 
     /// Raise [`dirty_end`](Self::dirty_end) over what the eval that just ended may have written:
     /// the brk it advanced, and every page it left committed, up to `committed_end`
-    /// ([`committed_end`](fn@committed_end)). One body for the three warm tiers (#1734).
+    /// ([`committed_end`](fn@committed_end)). One body for both warm tiers (#1734).
     fn note_eval(&mut self, committed_end: u64) {
         let win = self.win() as usize;
         // SAFETY: `win_ptr` owns `win` bytes; the eval has ended, so no run is in flight.
@@ -7847,12 +7670,9 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
             warm,
             // #1734: the pages warmup left committed above its brk are part of the image's
             // geometry, so an eval can write them and the next eval read them without mapping them
-            // first. Every restore zeroes them, on every tier: the interpreter's eval reports them
-            // in its page map, but a warm+JIT bounce cannot.
+            // first. Every restore zeroes them, on every tier.
             dirty_end: live.max(committed_end(&prots).min(win) as usize),
             scratch,
-            jit: None,
-            jit_win_base: 0,
             coop: None,
         });
     }
@@ -7931,276 +7751,16 @@ pub extern "C" fn temen_warm_close() {
             {
                 temen_coop_close();
             }
-            // #1312: the window is a `Region` now, so dropping the session frees it (together with
-            // the cached warm+JIT run, which holds its own `Arc` to the same region).
+            // #1312: the window is a `Region` now, so dropping the session frees it.
             drop(s);
         }
     }
 }
 
-// ===== warm+JIT: run the warm session's `eval_run` on the emitted-wasm tier ========================
+// ===== warm-coop: the warm session's emitted tier (#816 item 4, #1414 S4-3c) ======================
 //
-// WASM_AOT.md warm+JIT. The interpreter warm path ([`temen_warm_eval`]) already skips the QuickJS runtime
-// rebuild, but evaluates on the bytecode interpreter — so a compute-heavy program still pays interpreter
-// speed for the eval itself. This tier emits the module's `eval_run` to wasm **once** and drives it over
-// the restored warm image each Run, so the eval runs near-native while init stays paid-once. The emit is
-// cached in the [`WarmSession`] (a warm+JIT Run never re-pays the cdylib emit); only the powerbox host +
-// the window image are reset per Run, preserving the card's fresh-per-Run isolation. Cross-tier bounces
-// (`write`/`read`/`exit`) route to the run's interpreter over the same window, exactly as the single-shot
-// JIT run does. The JS driver is the single-shot one (`wasmjit-module.js`'s `driveDetachedRun`), but
-// passes the entry `sp` as the emitted `f0`'s third argument (an `i64` slot) and reuses the cached
-// compiled Module across Runs.
-
-/// Borrow the open warm session's cached warm+JIT run, if built.
-fn warm_jit_ref() -> Option<&'static JitOnrampRun> {
-    // SAFETY: single-threaded wasm; the run is touched only by these export accessors, no run in flight.
-    unsafe {
-        (*core::ptr::addr_of!(WARM_SESSION))
-            .as_ref()
-            .and_then(|s| s.jit.as_deref())
-    }
-}
-
-/// Emit the open warm session's `eval_run` to wasm and cache it for the warm+JIT drive. Idempotent — a
-/// second call reuses the cached emit (returns `0`). `shared != 0` ⇒ the emitted module imports a shared
-/// memory (the cross-origin-isolated threads build), matching the memory the host instantiates it against.
-/// Returns `0`, else a negative `STATUS_*` (also in [`LAST_STATUS`]): [`STATUS_UNSUPPORTED`] if no warm
-/// session is open or `eval_run` isn't wasm-drivable (the page then evaluates via [`temen_warm_eval`]).
-/// #1120 Slice 2c — opt-in hot-function outlining for the warm+JIT emit. Default off (shipping warm
-/// cards are byte-identical). When on, [`temen_warm_jit_open`] re-emits `eval_run` with the hottest large
-/// function split into block-group wasm functions (see [`temen_wasm_jit::compile_module_reactor_split`]).
-static WARM_JIT_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Only outline a function whose estimated emitted body clears this — small functions already TurboFan on
-/// run 1, so splitting them is pure overhead.
-const WARM_JIT_SPLIT_MIN_BYTES: usize = 512 * 1024;
-/// Target emitted bytes per outlined group (K ≈ est_body / this) — each group tiers up quickly.
-const WARM_JIT_SPLIT_GROUP_BYTES: usize = 384 * 1024;
-
-/// Toggle the warm+JIT hot-function outlining (#1120 Slice 2c). `on != 0` enables it for the **next**
-/// [`temen_warm_jit_open`] (call before pre-warm / the first Run); `0` restores the default (off). Lets
-/// the playground A/B the first-Run tier-up win on the real card without a rebuild.
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_set_split(on: i32) {
-    WARM_JIT_SPLIT.store(on != 0, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_open(shared: i32) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    };
-    if s.jit.is_some() {
-        // #1312: reuse the cached run only if it still names the live window. A warm-coop eval may
-        // have `vm_map`-grown the session window since, which reallocates and can move it; the
-        // emitted run's baked `win_base` would then address freed memory. Rebuilding is correct and
-        // costs one emit, which only a session that mixes both tiers ever pays.
-        if s.jit_win_base == s.win_ptr() as usize {
-            set(STATUS_OK);
-            return 0;
-        }
-        s.jit = None;
-    }
-    // SAFETY: `s.back` aliases the live session window `[s.win_ptr(), s.win())`, valid for the session's life.
-    let built = unsafe {
-        JitOnrampRun::open_warm_eval(
-            &s.module,
-            s.back.clone(),
-            s.win_ptr(),
-            WARM_MAPPED_LOG2,
-            shared != 0,
-            s.eval_fn,
-            s.entry_sp,
-        )
-    };
-    match built {
-        Ok(run) => {
-            s.jit_win_base = run.win_base(); // #1312: the base this emit is bound to
-            s.jit = Some(Box::new(run));
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
-}
-
-/// Restore the warm image into the window and reset the cached warm+JIT run's powerbox for a fresh Run
-/// (seeding stdin from `[stdin_ptr, stdin_len)`). Call before each drive. Returns `0`, else
-/// `-STATUS_UNSUPPORTED` if no warm+JIT run is open.
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    };
-    if s.jit.is_none() {
-        set(STATUS_UNSUPPORTED);
-        return -STATUS_UNSUPPORTED;
-    }
-    // Restore the program-independent warm image, zeroing any tail a prior eval grew into — byte-identical
-    // warm state each Run (identical to [`temen_warm_eval`]'s restore).
-    s.restore_warm_window();
-    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
-        Vec::new()
-    } else {
-        // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
-        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
-    };
-    s.jit.as_mut().unwrap().reset_warm(stdin);
-    set(STATUS_OK);
-    0
-}
-
-/// Pointer / length of the emitted `eval_run` wasm bytes (valid until the warm session is closed).
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_wasm_ptr() -> *const u8 {
-    warm_jit_ref().map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
-}
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_wasm_len() -> usize {
-    warm_jit_ref().map_or(0, |r| r.emitted_wasm().len())
-}
-/// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win` arg.
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_win_ptr() -> usize {
-    warm_jit_ref().map_or(0, |r| r.win_base())
-}
-/// The entry `sp` the emitted entry takes as its trailing `i64` slot (the powerbox data-stack base).
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_entry_sp() -> i64 {
-    warm_jit_ref().map_or(0, |r| match r.slots().first() {
-        Some(Value::I64(x)) => *x,
-        Some(Value::I32(x)) => *x as i64,
-        _ => 0,
-    })
-}
-
-/// The emitted **export index of the warm+JIT entry** — the driver must call `f{this}`, NOT `f0`. The
-/// emit exports one `f{temen_idx}` per Temen function, and the warm+JIT emit is rooted at the module's
-/// `eval_run` (not the cold `_start`, which is func 0). So the entry export is `f{eval_fn}` where
-/// `eval_fn` is `eval_run`'s Temen function index. Driving `f0` instead runs the cold `_start`
-/// (init + eval), which for a driver whose init re-runs on the restored image traps or diverges (#865).
-/// Valid after [`temen_warm_jit_open`]; 0 (a harmless `f0`) if no warm session is open.
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_entry_func() -> u32 {
-    // SAFETY: single-threaded wasm; shared read of the session static.
-    unsafe {
-        (*core::ptr::addr_of!(WARM_SESSION))
-            .as_ref()
-            .map_or(0, |s| s.eval_fn)
-    }
-}
-
-/// **Cross-tier bounce** for the warm+JIT run — the emitted `f0`'s `env.call_interp(func, args_ptr)`
-/// relays here (identical contract to [`temen_onramp_jit_run_call_interp`], over the warm run's
-/// window/powerbox).
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: single-threaded wasm; exclusive access to the run for this call.
-    let Some(run) = (unsafe {
-        (*core::ptr::addr_of_mut!(WARM_SESSION))
-            .as_mut()
-            .and_then(|s| s.jit.as_deref_mut())
-    }) else {
-        return STATUS_UNSUPPORTED;
-    };
-    let (params, results) = {
-        let (p, r) = run.func_sig(func);
-        (p.to_vec(), r.to_vec())
-    };
-    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env scratch).
-    let args: Vec<Value> = params
-        .iter()
-        .zip(slot_offs(&params))
-        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
-        .collect();
-    match run.run_cross_tier(func, &args) {
-        Ok(vals) => {
-            let offs = slot_offs(&results);
-            for (i, v) in vals.iter().enumerate() {
-                if i >= results.len() {
-                    break;
-                }
-                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay arg slots).
-                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
-                    return STATUS_TRAP;
-                }
-            }
-            0
-        }
-        Err(Trap::Exit(_)) => STATUS_EXIT,
-        Err(t) => {
-            run.set_last_trap(format!("{t:?}"));
-            STATUS_TRAP
-        }
-    }
-}
-
-/// Record how the emitted warm `f0` finished (see [`temen_onramp_jit_run_report`]). Call before
-/// [`temen_warm_jit_finish`].
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_report(threw: i32, value: i64) {
-    // SAFETY: single-threaded wasm; exclusive access to the run.
-    if let Some(run) = unsafe {
-        (*core::ptr::addr_of_mut!(WARM_SESSION))
-            .as_mut()
-            .and_then(|s| s.jit.as_deref_mut())
-    } {
-        run.record_outcome(threw != 0, value);
-    }
-}
-
-/// Capture the finished warm+JIT run's streams / exit / value into the shared `OUT`/`ERR`/`EXIT_CODE`/
-/// `RUN_VALUE` slots (read via the usual `temen_stdout_*` / `temen_exit_code` / `temen_run_value` accessors),
-/// and advance the session's heap high-water so the next [`temen_warm_jit_prepare`] zeroes the right tail.
-/// Same status contract as [`temen_onramp_jit_run_finish`] — so warm+JIT and the interpreter warm path
-/// agree on result + exit + trap (INVARIANT 9). Call once after `f0` returns/unwinds (and after
-/// [`temen_warm_jit_report`]). Returns the `STATUS_*`.
-#[no_mangle]
-pub extern "C" fn temen_warm_jit_finish() -> i32 {
-    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
-    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() }) else {
-        return STATUS_UNSUPPORTED;
-    };
-    let Some(run) = s.jit.as_deref() else {
-        return STATUS_UNSUPPORTED;
-    };
-    let stdout = run.stdout().to_vec();
-    let stderr = run.stderr().to_vec();
-    let (status, code, value) = if run.exited() {
-        (STATUS_EXIT, run.exit_code(), 0)
-    } else if run.trapped() {
-        (STATUS_TRAP, 0, 0)
-    } else {
-        (STATUS_OK, 0, run.returned_value())
-    };
-    // Track the eval's high-water so the next restore zeroes what it dirtied: its brk, and any page
-    // a bounce committed past the window (#1734).
-    let end = run.committed_end();
-    s.note_eval(end);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), stderr);
-        EXIT_CODE = code;
-        RUN_VALUE = value;
-        LAST_STATUS = status;
-    }
-    status
-}
-
-// ===== warm-coop: cooperative tier-up over the warm session (#816 item 4) =========================
-//
-// The warm+JIT tier above requires a `WasmDriven` `eval_run` — a **page-managing** eval (it
-// `vm_map`-grows, `protect`s, streams …) is `InterpDriven` and used to fall back to the pure
-// interpreter warm path. This tier runs an eval on the **cooperative tier-up driver**:
+// The interpreter warm path ([`temen_warm_eval`]) skips the runtime rebuild but evaluates on the
+// bytecode interpreter. This tier runs the eval on the **cooperative tier-up driver**, the pump:
 // [`temen_warm_coop_open`] outlines and compiles the module once, and each Run's
 // [`temen_warm_coop_prepare`] restores the warm image, re-establishes the captured page map, and
 // arms a [`bytecode::CoopRun`] at `eval_run` over the session window — after which the host drives

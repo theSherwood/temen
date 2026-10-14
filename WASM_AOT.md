@@ -197,20 +197,18 @@ post-init guest memory, and **restore the snapshot per Run**, evaluating only th
   contiguous committed extent is captured alongside the image and re-established — without re-zeroing —
   before every eval (`SharedProgram::run_over_grown`, `browser/tests/warm_grow.rs`). A warmup that
   leaves page state one bound can't represent (sparse/`Ro`/`Unmapped`) fails closed at open. The
-  whole-eval warm+JIT tier still opens only for `WasmDriven` (no-page-op) evals; a **page-managing
-  eval now takes the warm-coop tier instead** (#816 item 4, `temen_warm_coop_open`/`_prepare` +
-  the standard `temen_coop_*` pump): the module's leaves + cap wrappers are emitted once and cached
-  in the session, and each Run restores the image, re-establishes the captured page map
-  (`SharedProgram::coop_run_over_grown`), and drives `eval_run` on the cooperative scheduler —
-  the interpreter owns the eval, eligible pure leaves run on emitted wasm, and the per-event
-  `mapped`/page-state sync carries the warm image's grown heap and protected rodata
+  emitted warm tier is the **warm-coop** tier (#816 item 4, `temen_warm_coop_open`/`_prepare` +
+  the standard `temen_coop_*` pump): each Run restores the image, re-establishes the captured page
+  map (`SharedProgram::coop_run_over_grown`), and drives `eval_run` on the cooperative scheduler,
+  the per-event `mapped`/page-state sync carrying the warm image's grown heap and protected rodata
   (`browser/tests/coop_tierup_driver.rs::warm_coop_evals_a_page_managing_guest_with_leaf_tierup`).
-  **#1414 S4-3c:** the warm-coop open now offers `eval_run` whole first, as a cold run's root is
-  offered, so one open serves every warm eval: QuickJS's runs whole as the pump's leaf, page-checked
-  over its protected rodata (#2302), and an eval the emitter declines whole (Lua's and MicroPython's,
-  past a setjmp) runs with its regions emitted, the region emit made on the first such eval.
-  `runWarmCoop` is the page's one warm+JIT driver; `runWarmJit` and the single-shot warm emit retire
-  next (`warm_coop_runs_eval_run_whole_as_a_root_leaf`, `warm_root_leaf_traps_a_store_to_protected_rodata`).
+  **#1414 S4-3c:** the open offers `eval_run` whole first, as a cold run's root is offered, so one
+  open serves every warm eval: QuickJS's runs whole as the pump's leaf, page-checked over its
+  protected rodata (#2302), and an eval the emitter declines whole (Lua's and MicroPython's, past a
+  setjmp) runs with its regions emitted, the region emit made on the first such eval
+  (`warm_coop_runs_eval_run_whole_as_a_root_leaf`, `warm_root_leaf_traps_a_store_to_protected_rodata`).
+  `runWarmCoop` is the page's one warm+JIT driver: the single-shot warm emit (`runWarmJit`,
+  `temen_warm_jit_*`), which ran `eval_run` mask-only, is retired.
 - **Measured native** (`crates/temen-llvm/examples/qjs_snapshot.rs`, release, bytecode interpreter, the
   same QuickJS on-ramp module as the playground): warmup once ~23 ms; **live warm image ~4.1 MiB**;
   restore ~3.5 ms (memcpy the live prefix).

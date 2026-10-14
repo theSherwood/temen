@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**377 exports** in 39 families — 328 referenced from JS, 49 referenced by nothing, 23 behind a `cfg`.
+**366 exports** in 39 families — 317 referenced from JS, 49 referenced by nothing, 23 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -42,7 +42,7 @@
 | `stderr` | 2 | 2 | 0 |
 | `stdout` | 2 | 2 | 0 |
 | `trap` | 2 | 2 | 0 |
-| `warm` | 16 | 16 | 0 |
+| `warm` | 5 | 5 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
 | `x2` | 13 | 13 | 13 |
 
@@ -502,17 +502,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_warm_coop_open`
 - `temen_warm_coop_prepare`
 - `temen_warm_eval`
-- `temen_warm_jit_call_interp`
-- `temen_warm_jit_entry_func`
-- `temen_warm_jit_entry_sp`
-- `temen_warm_jit_finish`
-- `temen_warm_jit_open`
-- `temen_warm_jit_prepare`
-- `temen_warm_jit_report`
-- `temen_warm_jit_set_split`
-- `temen_warm_jit_wasm_len`
-- `temen_warm_jit_wasm_ptr`
-- `temen_warm_jit_win_ptr`
 - `temen_warm_open`
 
 ### `wasmjit`

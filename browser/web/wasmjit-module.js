@@ -6,51 +6,25 @@
 // stderr and exit code land in the shared slots, read through the usual `temen_stdout_*` /
 // `temen_exit_code` accessors exactly as after the interpreter's `temen_run_onramp`.
 //
-// `runWarmJit` and `driveDetachedRun` still drive a **single-shot** run: the cdylib emits one entry and
-// this module calls `f0(win, env, ...slots)` once against linear memory, servicing the cross-tier
-// helpers through `env.call_interp`, then `temen_*_finish` captures the outcome.
+// `driveDetachedRun` still drives a **single-shot** run: the cdylib emits one entry and this module
+// calls `f0(win, env, ...slots)` once against the child's memory, servicing the cross-tier helpers
+// through `env.call_interp`, then `temen_onramp_jit_run_finish` captures the outcome.
 
 import {
-  cacheGet, cachePut, jitCacheStats, moduleCacheClear, JIT_MODULE_CACHE_MAX, driveCoopTierupRun,
-  suspendsLeaves,
+  cacheGet, cachePut, jitCacheStats, moduleCacheClear, driveCoopTierupRun, suspendsLeaves,
 } from './coop-driver.js';
 
 export { jitCacheStats, driveCoopTierupRun, suspendsLeaves };
 
-// A parallel cross-Run cache of the **instantiated** emitted module (issue #803). The compiled Module
-// skips V8 codegen; caching the instance additionally skips the per-Run `WebAssembly.instantiate` of the
-// ~12.7 MB emitted module *and* the copy of its bytes out of wasm memory (only read on a compile miss).
-// Safe because the emitted entry `f0(win, env, ...slots)` takes win/env/sp as **arguments** and holds no
-// state between calls — the reactor already reuses one instance across every frame the same way — and its
-// linear memory is the imported (stable) engine memory. Keyed by the same stable module identity as
-// `jitModuleCache`; a fresh `win`/`sp` and the dynamic cross-tier bounce are supplied per Run by the
-// caller, so a reused instance always runs against current state.
-const jitInstanceCache = new Map();
 export function jitCacheClear() {
   moduleCacheClear();
-  jitInstanceCache.clear();
 }
 
-// Get-or-build the emitted module's instance for `cacheKey`, reusing it across Runs. `readEmitted` is
-// invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
-// the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
-// Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
-// `reuseInstance = false` (#1285, a detached child): reuse the compiled Module by `cacheKey` but always
-// instantiate afresh — an Instance is bound to its imported memory, and each detached child has its own.
-async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entryName = 'f0', reuseInstance = true) {
-  // The emit exports one `f{temen_idx}` per Temen function; `entryName` picks the one this run drives. The
-  // single-shot `_start` path is `f0`; the warm+JIT path drives `eval_run`'s export (`f{eval_fn}`), NOT
-  // `f0` (= the cold `_start`) — see `runWarmJit` (#865).
-  const pick = (instance) => {
-    const f = instance.exports[entryName];
-    if (typeof f !== 'function') throw new Error(`emitted module has no ${entryName} export`);
-    return f;
-  };
-  const cached = cacheKey === undefined || !reuseInstance ? undefined : jitInstanceCache.get(cacheKey);
-  if (cached) {
-    jitCacheStats.hits++;
-    return { f0: pick(cached.instance), instance: cached.instance };
-  }
+// Compile the emitted module for `cacheKey` (reusing the compiled Module across Runs), then instantiate
+// it over `memory` with `callInterp` as its `env.call_interp`. `readEmitted` is invoked **only on a
+// compile miss**, so a hit skips the byte copy. The instance is never reused: an Instance is bound to
+// its imported memory, and each detached child has its own (#1285). Returns the emitted `f0`.
+async function instantiateF0(memory, cacheKey, readEmitted, callInterp) {
   let module = cacheGet(cacheKey);
   if (module === undefined) {
     module = await WebAssembly.compile(readEmitted());
@@ -60,13 +34,8 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
   const instance = await WebAssembly.instantiate(module, {
     env: { memory, trap: () => {}, call_interp: callInterp },
   });
-  if (cacheKey !== undefined && reuseInstance) {
-    if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
-      jitInstanceCache.delete(jitInstanceCache.keys().next().value);
-    }
-    jitInstanceCache.set(cacheKey, { instance });
-  }
-  return { f0: pick(instance), instance };
+  if (typeof instance.exports.f0 !== 'function') throw new Error('emitted module has no f0 export');
+  return { f0: instance.exports.f0, instance };
 }
 
 // Drive an opened **detached** single-shot run (#1285, DETACHED_JIT.md §3.1): the emitted `_start`
@@ -99,7 +68,7 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey) {
   };
   let f0, instance;
   try {
-    ({ f0, instance } = await cachedInstanceF0(
+    ({ f0, instance } = await instantiateF0(
       childMemory,
       cacheKey,
       () => {
@@ -115,8 +84,6 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey) {
         if (st !== 0) throw new Error('cross-tier stop');
         syncGlobals();
       },
-      'f0',
-      false,
     ));
   } catch (e) {
     ex.temen_dealloc(scratch, envBytes);
@@ -275,79 +242,6 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   return driveCoopTierupRun(ex, memory, { cacheKey });
 }
 
-// Run the warm session's `eval_run` on the **warm+JIT** tier (WASM_AOT.md warm+JIT). The warm snapshot
-// (`temen_warm_open`) has already paid the QuickJS runtime init once; this evaluates the user's code on
-// emitted wasm over the restored warm image, so a compute-heavy program runs the eval near-native while
-// init stays paid-once. The engine emits `eval_run` on the first Run and caches it (a warm+JIT Run never
-// re-pays the cdylib emit); the compiled `WebAssembly.Module` is cached across Runs too (keyed by
-// `cacheKey`). The single-shot run's contract over the warm accessors, passing the entry `sp` as the
-// emitted `f0`'s third argument (an i64 slot ⇒ a BigInt). Assumes `temen_warm_open` already
-// succeeded for this module. Returns the run status (0 = returned, 5 = exited); throws if `eval_run`
-// isn't wasm-drivable or the run traps (the caller falls back to the interpreter warm path).
-export async function runWarmJit(ex, memory, stdinBytes, cacheKey, shared = 1) {
-  const u8 = () => new Uint8Array(memory.buffer);
-  // Emit `eval_run` (idempotent — cached in the warm session after the first Run).
-  if (ex.temen_warm_jit_open(shared) !== 0) {
-    throw new Error(`warm-JIT open failed: status ${ex.temen_status()} (2 = eval_run not emittable)`);
-  }
-  // Per-Run: restore the warm image + reset the run's powerbox, feeding the editor text as stdin.
-  let stdinP = 0;
-  const stdinLen = stdinBytes ? stdinBytes.length : 0;
-  if (stdinLen) {
-    stdinP = Number(ex.temen_alloc(stdinLen));
-    u8().set(stdinBytes, stdinP);
-  }
-  const prepared = ex.temen_warm_jit_prepare(stdinP, stdinLen);
-  if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
-  if (prepared !== 0) throw new Error(`warm-JIT prepare failed: status ${ex.temen_status()}`);
-
-  const win = Number(ex.temen_warm_jit_win_ptr());
-  const sp = ex.temen_warm_jit_entry_sp(); // i64 export ⇒ BigInt; passed straight as the entry's i64 slot
-  const envBytes = ex.temen_onramp_jit_run_env_bytes();
-  // Drive the emitted `eval_run` export — `f{eval_fn}`, NOT `f0` (#865). `f0` is the cold `_start`
-  // (init + eval); driving it re-runs the guest's init over the restored warm image, which for Tcl
-  // re-enters `Tcl_FindExecutable` → an encoding-proc `call_indirect` trap (and for any driver defeats
-  // the "init paid once" warm contract). The entry export index comes from the engine.
-  const entryName = `f${ex.temen_warm_jit_entry_func()}`;
-
-  // Reuse the instance across Runs (issue #803): a hit skips both the byte copy and instantiate, so a
-  // warm Run collapses to `prepare` + the eval. The emit is stable and window-independent (`win`/`sp` are
-  // passed per Run), so one instance serves every Run of this warm session.
-  const { f0: entry } = await cachedInstanceF0(
-    memory,
-    cacheKey,
-    () => {
-      const wptr = Number(ex.temen_warm_jit_wasm_ptr());
-      const wlen = ex.temen_warm_jit_wasm_len();
-      return u8().slice(wptr, wptr + wlen);
-    },
-    (func, argsPtr) => {
-      if (ex.temen_warm_jit_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
-    },
-    entryName,
-  );
-
-  const env = Number(ex.temen_alloc(envBytes));
-  new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget
-  let threw = 0;
-  let value = 0n;
-  let trapError = null;
-  try {
-    // entry(win, env, sp) — runs `eval_run(sp)` over the restored warm image on emitted wasm. Its return
-    // is the guest's top-level result (an i32/i64); normalize to i64.
-    const r = entry(win, env, sp);
-    value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch (e) {
-    threw = 1;
-    trapError = e; // keep it — the trap kind + wasm location live here (issue #865)
-  }
-  ex.temen_dealloc(env, envBytes);
-  ex.temen_warm_jit_report(threw, value);
-  const status = ex.temen_warm_jit_finish();
-  if (status === 3 /* STATUS_TRAP */) throw warmJitTrapError(trapError);
-  return status;
-}
-
 // Run the warm session's `eval_run` on the **warm-coop** tier (#816 item 4): the cooperative
 // tier-up drive over the restored warm image. `eval_run` is offered whole as a leaf first, as a cold
 // module's root is (#1414 S4-3c); when the emitter declines it (it can park, or a function leaves the
@@ -373,33 +267,6 @@ export async function runWarmCoop(ex, memory, stdinBytes, cacheKey, shared = 1) 
   if (stdinP) ex.temen_dealloc(stdinP, stdinLen);
   if (prepared !== 0) throw new Error(`warm-coop prepare failed: status ${ex.temen_status()} (2 = nothing emittable)`);
   return driveCoopTierupRun(ex, memory, { cacheKey });
-}
-
-// The last warm+JIT trap, captured for diagnosis (issue #865) — `{ kind, frames }` where `frames` are the
-// emitted wasm frames `fN@0xoff` (innermost first), or `null` if the last run didn't trap. Test/telemetry
-// hook: a decline used to be a bare "trapped" with no location; this exposes the trap KIND (the V8
-// RuntimeError message, e.g. "null function or function signature mismatch" = a `call_indirect` to a
-// null/mismatched table slot) and WHERE (which emitted functions), the way the bytecode tier reports.
-export let lastWarmJitTrap = null;
-
-// Build a diagnosable decline error from the caught `f0` trap. A wasm-level trap is a `WebAssembly.
-// RuntimeError` whose message is the trap kind and whose stack carries `wasm-function[N]:0xoff` frames
-// (the emitted function index + byte offset). Our own cross-tier unwind (`env.call_interp` returned
-// nonzero → we threw 'cross-tier stop') has no wasm location — the real trap is on the interpreter side,
-// recorded by `temen_warm_jit_call_interp`'s `last_trap`.
-function warmJitTrapError(e) {
-  if (e instanceof WebAssembly.RuntimeError) {
-    const frames = String(e.stack || '')
-      .split('\n')
-      .map((l) => l.match(/wasm-function\[(\d+)\]:0x([0-9a-fA-F]+)/))
-      .filter(Boolean)
-      .map((m) => `f${m[1]}@0x${m[2]}`);
-    lastWarmJitTrap = { kind: e.message, frames };
-    const where = frames.length ? ` at ${frames[0]}${frames.length > 1 ? ` (from ${frames.slice(1, 6).join(' ← ')})` : ''}` : '';
-    return new Error(`emitted warm run trapped: ${e.message}${where}`);
-  }
-  lastWarmJitTrap = { kind: (e && e.message) || 'cross-tier stop', frames: [] };
-  return new Error(`emitted warm run trapped (declined to the interpreter): ${(e && e.message) || e}`);
 }
 
 // **Pre-warm** the warm+JIT `eval_run` for `cacheKey` — emit + `WebAssembly.compile` + instantiate **and

@@ -135,7 +135,7 @@ import is a **fresh** `WebAssembly.Memory` created for it, not the engine's shar
   detached children unchanged (`OP13_CHILD_EMIT` keys on the module hash only; `env.memory` is
   imported with min 0). Nothing in `temen-wasm-jit`'s
   codegen changes for this slice. What *does* degrade: a `WebAssembly.Instance` binds its
-  memory at instantiate, so `jitInstanceCache` collapses to compiled-`Module` reuse — one
+  memory at instantiate, so only the compiled `Module` is reused (`instantiateF0`) — one
   `instantiate` per child, cheap next to the ~2 s compile.
 - **`shared`**: `emit_for_run(…, true)` emits `shared: 0x03`, so the per-child memory must be
   `{shared: true, maximum}` — which is also **forced** on the Worker path (a non-shared

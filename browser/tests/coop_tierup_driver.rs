@@ -4255,14 +4255,13 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
 }
 
 // ============================================================================================
-// #816 item 4: the **warm-coop** tier — a page-managing warm session evaluates on the
-// cooperative tier-up drive. `temen_warm_jit_open` requires a WasmDriven `eval_run`; a
-// page-managing eval (the QuickJS shape: the warmup `vm_map`-grows the heap AND `protect`s
-// rodata) is InterpDriven and used to fall back to the pure interpreter warm path. Now
-// `temen_warm_coop_open` emits the module's leaves once (cached in the session) and each Run's
-// `temen_warm_coop_prepare` restores the warm image + re-establishes the captured page map +
+// #816 item 4: the **warm-coop** tier — a warm session evaluates on the cooperative tier-up
+// drive, including a page-managing eval (the QuickJS shape: the warmup `vm_map`-grows the heap
+// AND `protect`s rodata). `temen_warm_coop_open` outlines and compiles the module once, and each
+// Run's `temen_warm_coop_prepare` restores the warm image + re-establishes the captured page map +
 // arms `eval_run` on the coop scheduler, after which the standard event pump (this harness's
-// `CoopB2Driver`, wasmi playing `driveCoopTierupRun`) services the eligible leaf on emitted wasm.
+// `CoopB2Driver`, wasmi playing `driveCoopTierupRun`) runs `eval_run` whole as a leaf (#1414
+// S4-3c) or services its eligible leaves on emitted wasm.
 // ============================================================================================
 
 /// The page-managing two-phase guest (the QuickJS shape in miniature). `warmup(sp)`: plant a
@@ -4643,8 +4642,8 @@ fn warm_coop_runs_eval_run_whole_as_a_root_leaf() {
 
 /// **A warm leaf traps a store to the rodata its warmup protected** (#2302, #1414 S4-3c): each Run
 /// re-establishes the warm image's `Ro` page, the interpreter warm path traps the store, and the
-/// leaf, page-checked over that page, ends the run with the same `MemoryFault`. The warm+JIT tier
-/// emitted `eval_run` mask-only and ran on past it.
+/// leaf, page-checked over that page, ends the run with the same `MemoryFault`. The single-shot
+/// warm emit this replaced ran `eval_run` mask-only, past the store.
 #[test]
 fn warm_root_leaf_traps_a_store_to_protected_rodata() {
     let _g = ffi_guard();

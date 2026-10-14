@@ -189,9 +189,9 @@ executes only the user's code.
   warm `eval_run` matches the cold `_start` **byte-for-byte** across a breadth of programs (print,
   comprehension, dict, recursion, float, exception, a 200k loop), and **fresh-per-Run isolation
   holds** (a global bound in one Run raises `NameError` in the next). Confirmed in headless Chromium
-  through the snapshot worker (`browser-play-editor-test.mjs`). warm+JIT declines cleanly to
-  warm-interp — `eval_run` reaches `mp_embed_exec_str`'s nlr setjmp ⇒ `InterpDriven`, exactly like
-  Tcl (`#1081`).
+  through the snapshot worker (`browser-play-editor-test.mjs`). The warm emitted tier declines
+  `eval_run` whole — it reaches `mp_embed_exec_str`'s nlr setjmp ⇒ `InterpDriven`, exactly like Tcl
+  (`#1081`) — and runs it with its regions emitted (#1414 S4-3c).
 - **Frozen stdlib (follow-on):** at `MICROPY_CONFIG_ROM_LEVEL_MINIMUM` there is little importable
   stdlib to freeze; freezing modules in (MicroPython's native frozen-module mechanism, no filesystem)
   pairs naturally with raising the ROM level and is tracked as continuing #1327 work.

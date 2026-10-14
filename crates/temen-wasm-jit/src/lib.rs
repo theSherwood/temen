@@ -2653,58 +2653,6 @@ pub fn compile_module_reactor(
     compile_module_reactor_capped(m, entry, shared_memory, MAX_EMITTED_FUNC_BYTES)
 }
 
-/// #1120 Slice 2c — the **where-to-cut heuristic**: pick the single hot function whose outlining pays
-/// off most, and how many groups to cut it into. Choose the largest reachable, in-subset function by
-/// [`est_emitted_size`] (a static estimate — the biggest estimate is the biggest emitted body); only if
-/// it clears `min_bytes` (small functions already TurboFan on run 1, so splitting them is pure overhead).
-/// K targets ~`target_group_bytes` per group. Returns `None` when no function is worth splitting.
-pub fn pick_split_target(
-    m: &Module,
-    entry: u32,
-    min_bytes: usize,
-    target_group_bytes: usize,
-) -> Option<(usize, usize)> {
-    let a = analyze_from(m, entry);
-    let mut best: Option<(usize, usize)> = None; // (fidx, est)
-    for i in 0..m.funcs.len() {
-        if a.reachable[i] && a.in_subset[i] {
-            let est = est_emitted_size(&m.funcs[i]);
-            if best.is_none_or(|(_, b)| est > b) {
-                best = Some((i, est));
-            }
-        }
-    }
-    let (fidx, est) = best?;
-    if est < min_bytes || m.funcs[fidx].blocks.len() < 2 {
-        return None;
-    }
-    let k = est.div_ceil(target_group_bytes.max(1)).max(2);
-    Some((fidx, k))
-}
-
-/// #1120 Slice 2c — [`compile_module_reactor`], but the hottest large function (per [`pick_split_target`])
-/// is emitted **split** into block-group wasm functions so V8 TurboFans the hot path on the first Run
-/// instead of after several. `min_bytes`/`target_group_bytes` tune the heuristic. When nothing is worth
-/// splitting, this is exactly `compile_module_reactor` (byte-identical). Correctness is unchanged — the
-/// split is invisible to the interpreter oracle and the confinement lowering (INVARIANTS #9, I2).
-pub fn compile_module_reactor_split(
-    m: &Module,
-    entry: u32,
-    shared_memory: bool,
-    min_bytes: usize,
-    target_group_bytes: usize,
-) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    let target = pick_split_target(m, entry, min_bytes, target_group_bytes);
-    compile_module_reactor_budgeted(
-        m,
-        entry,
-        shared_memory,
-        MAX_EMITTED_FUNC_BYTES,
-        MAX_EST_EMITTED_MODULE_BYTES,
-        target,
-    )
-}
-
 /// [`compile_module_reactor`] with an explicit emitted-body byte cap. The public wrapper passes V8's
 /// [`MAX_EMITTED_FUNC_BYTES`]; the parameter exists so the exclusion loop can be differential-tested
 /// with a small cap (and a small module) instead of a genuine multi-megabyte function. `usize::MAX`
@@ -2716,42 +2664,21 @@ pub fn compile_module_reactor_capped(
     shared_memory: bool,
     cap: usize,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_reactor_budgeted(
-        m,
-        entry,
-        shared_memory,
-        cap,
-        MAX_EST_EMITTED_MODULE_BYTES,
-        None,
-    )
+    compile_module_reactor_budgeted(m, entry, shared_memory, cap, MAX_EST_EMITTED_MODULE_BYTES)
 }
 
 /// [`compile_module_reactor_capped`] with an explicit **module-total** emit budget (#1038 — see
 /// [`MAX_EST_EMITTED_MODULE_BYTES`], which the public entries pass). The parameter exists so the
 /// budget decline can be tested with a small module instead of a genuine 104 MiB one.
-///
-/// `split_target = Some((fidx, k))` (#1120 Slice 2c) additionally emits function `fidx` **split** into
-/// `k` block-group wasm functions when it lands in the emitted set — so the giant hot function TurboFans
-/// on the first Run. `None` is byte-identical to before.
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn compile_module_reactor_budgeted(
     m: &Module,
     entry: u32,
     shared_memory: bool,
     cap: usize,
     module_budget: usize,
-    split_target: Option<(usize, usize)>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_reactor_inner(
-        m,
-        entry,
-        shared_memory,
-        cap,
-        module_budget,
-        split_target,
-        None,
-    )
+    compile_module_reactor_inner(m, entry, shared_memory, cap, module_budget, None)
 }
 
 /// #1201 — [`compile_module_reactor`] in **paged** mode (#750): the wasm-driven, entry-rooted emit whose
@@ -2774,19 +2701,16 @@ pub fn compile_module_reactor_paged(
         shared_memory,
         MAX_EMITTED_FUNC_BYTES,
         MAX_EST_EMITTED_MODULE_BYTES,
-        None,
         Some(page_log2),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compile_module_reactor_inner(
     m: &Module,
     entry: u32,
     shared_memory: bool,
     cap: usize,
     module_budget: usize,
-    split_target: Option<(usize, usize)>,
     paged: Option<u8>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #1546: no wasm emit of a module that can reach `gc.roots`, from any entry — a rooted emit is
@@ -2845,19 +2769,6 @@ fn compile_module_reactor_inner(
                 "estimated emitted module exceeds the engine memory budget",
             ));
         }
-        // #1120 Slice 2c: split the designated hot function into K block-group wasm functions — but only
-        // when it's actually in the emitted set (not pulled cross-tier for size) and has ≥2 blocks.
-        let mut split_plan: Vec<Option<Vec<usize>>> = Vec::new();
-        if let Some((fidx, k)) = split_target {
-            if fidx < n && wasm_of[fidx].is_some() {
-                let nb = m.funcs[fidx].blocks.len();
-                let kk = k.clamp(1, nb.max(1));
-                if nb >= 2 && kk >= 2 {
-                    split_plan = vec![None; n];
-                    split_plan[fidx] = Some((0..nb).map(|i| i * kk / nb).collect());
-                }
-            }
-        }
         let wasm = emit_module(
             m,
             shared_memory,
@@ -2869,7 +2780,7 @@ fn compile_module_reactor_inner(
             paged,
             emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
-            &split_plan,
+            &[],
             &[],
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
@@ -4229,7 +4140,7 @@ fn emit_module(
     // Name section (custom id 0, "name", function-names subsection) — names each emitted wasm function by
     // its **export symbol name** (`lua_checkstack`, `JS_CallInternal` …), plus the cross-tier trampolines
     // (`xtramp_gfN`) and the `()->()` trap stub (`TRAP_STUB`). Diagnostic-only and cheap: a V8 wasm stack
-    // trace — e.g. a `temen_warm_jit` decline (issue #865) — then names the culprit function instead of a
+    // trace — e.g. an emitted run's decline (issue #865) — then names the culprit function instead of a
     // bare `wasm-function[N]`. `wasm_of[fi]` is the final wasm index (it already accounts for the function
     // imports), so it is the name-section funcidx directly; `env.trap`/`env.call_interp` are always
     // imports 0/1.
