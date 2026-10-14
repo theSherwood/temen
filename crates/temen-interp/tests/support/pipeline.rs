@@ -169,8 +169,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vq = i64.const 0
   vp = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve0, vlog, vq)
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vch, vgp, vgn, ve0, vlog, vq)
-  vjp = call.cap 6 1 (i32) -> (i64) v0 (vp)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjp_st, vjp = call.cap 6 1 (i32) -> (i64, i64) v0 (vp)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 100
   vm = i64.mul vjp vk
   vs = i64.add vm vjc

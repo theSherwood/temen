@@ -9,14 +9,15 @@
 
 use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Trap, Value};
 use temen_ir::Module;
-use temen_jit::{JitError, JitOutcome, TrapKind};
+use temen_jit::{JitError, JitOutcome};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
 const PARENT_LOG2: u8 = 18;
 
 /// The parent (256 KiB, args `(instantiator, child module, budget)`): spawn the child detached with a
-/// 64 KiB window, join it, and return what it returns (a child trap propagates at the join).
+/// 64 KiB window, join it, and return `status * 1000 + value`: what the child returns, or its trap's
+/// wire code times 1000 (#2066).
 const PARENT: &str = "memory 18
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32) {
@@ -25,8 +26,11 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   gz = i64.const 0
   sl = i64.const 16
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  vk = i64.const 1000
+  vs = i64.mul vr_st vk
+  vt = i64.add vs vr
+  return vt
   }
 }
 ";
@@ -130,15 +134,16 @@ fn a_detached_child_writes_its_writable_segment() {
     }
 }
 
-/// A store to the readonly segment faults on both engines.
+/// A store to the readonly segment faults on both engines, which the parent's join answers.
 #[test]
 fn a_detached_childs_store_to_its_readonly_segment_faults() {
     let c = parse(&child(
         "  va = i64.const 16384\n  vz = i32.const 7\n  i32.store va vz\n",
         16384,
     ));
-    assert_eq!(oracle(&c), Err(Trap::MemoryFault), "oracle");
+    let faulted = temen_ir::trap_code::MEMORY_FAULT * 1000;
+    assert_eq!(oracle(&c), Ok(faulted), "oracle");
     if let Some(o) = cranelift(&c) {
-        assert_eq!(o, JitOutcome::Trapped(TrapKind::MemoryFault), "Cranelift");
+        assert_eq!(o, JitOutcome::Returned(vec![faulted]), "Cranelift");
     }
 }

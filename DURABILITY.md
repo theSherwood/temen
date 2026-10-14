@@ -632,7 +632,7 @@ word `NORMAL` and thaw word `REWINDING`. The child records its program on its ow
 (the import-binding hook sets `self_module`), which is how the harvest names it by digest. A child
 that completed but was not joined rides as its `join` outcome (`FrozenDetached`), and a thaw
 re-creates it at its join slot as a finished child, so the rewound `join` reloads the value or
-re-raises the trap without spawning the child again (#2041). A thawed run frozen again before that
+answers the trap without spawning the child again (#2041). A thawed run frozen again before that
 `join` carries the outcome again (#2044): the interpreter's spawner remembers each `(slot, task)` it
 was delivered, and the JIT's nursery marks the child, so the next freeze records it as completed as
 it did the first time. A thaw can be armed for that next freeze: a context's `REWINDING` is its own
@@ -2178,17 +2178,15 @@ traps under an inherited freeze no longer counts as unwound: it finished, with i
 `durable_nesting_jit.rs::jit_freeze_carries_a_finished_unjoined_childs_result`.
 
 **A trapped child's outcome rides the artifact (#1674, v31).** A child's `join` outcome is its value
-*or its trap*: `join` re-raises a finished child's trap in the parent. `completed_result` on
-`FrozenNested` and `FrozenDetached` now carries either, so a child that finished with a trap before the
-cut rides the freeze like one that finished cleanly, and the thawed parent's `join` re-raises the same
-trap. On the wire the outcome is `0` none | `1` + value | `2` + the trap's code. `Trap::code` is the one
+*or its trap*: `join` answers a finished child's trap as `(trap code, 0)` (#2066; it re-raised the
+trap in the parent when this landed). `completed_result` on `FrozenNested` and `FrozenDetached` now
+carries either, so a child that finished with a trap before the cut rides the freeze like one that
+finished cleanly, and the thawed parent's `join` answers the same trap. On the wire the outcome is `0` none | `1` + value | `2` + the trap's code. `Trap::code` is the one
 stable numbering, shared with the JIT's trap cell (`TrapKind`, `Exit` as `7 | code << 32`). This retires
 the interpreter's `ChildTrapped` decline cause and the JIT's fail-closed `ThreadFault` for the same shape.
 (A `thread.spawn` thread has no such state: its trap tears down the whole domain on both engines.) Pinned
-by `durable_nesting.rs::freeze_with_trapped_unjoined_child_rides_and_the_thawed_join_re_raises_it`
-(through the codec, byte-identical re-freeze), `durable_nesting_jit.rs::{jit_freeze_carries_a_trapped_unjoined_childs_trap,
-jit_freeze_carries_a_trapped_unjoined_grandchilds_trap}`, the detached round trip in
-`temen-snapshot/tests/roundtrip.rs`, and `trap_code_tests`.
+by the detached round trip in `temen-snapshot/tests/roundtrip.rs` and `trap_code_tests`; the end-to-end
+pins over the carve placement went with it (#1867).
 
 **A request that races the run's end (4A.3, #1748).** `request_freeze` and the run's `retire` exclude
 each other through the controller's `base` word (a request holds `STORING` across its store; retire

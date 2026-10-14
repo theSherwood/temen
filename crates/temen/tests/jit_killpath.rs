@@ -225,7 +225,7 @@ block 0 () {
   i32.store vrm vc
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  v6 = call.cap 6 1 (i32) -> (i64) vi (v5)
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) vi (v5)
   v7 = i32.wrap_i64 v6
   return v7
   }

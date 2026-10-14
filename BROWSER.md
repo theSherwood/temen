@@ -318,8 +318,8 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
   the grandchild from its own budget, #1944), a two-arg child managing its own pages via an
   attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
-  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
-  sub-guests inside the wasm sandbox.
+  (`-22`), and a child trap its `join` answers rather than raises (the `unreachable` code, #2066). So
+  a guest can spin up isolated sub-guests inside the wasm sandbox.
 - [x] **§12 fibers.** Cooperative continuation switching — the engine's signature.
   *Fibers* (`cont.new`/`cont.resume`/`suspend`, no powerbox → the plain `temen_run0` path): run-to-
   completion (`107`), suspend round-trip (`36`), multi-suspend loop (`19`), and forged-handle / root-

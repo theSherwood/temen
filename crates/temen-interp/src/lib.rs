@@ -3614,7 +3614,8 @@ fn drive_over_cell(
     *fuel = host_shared.lock_unpoisoned().fuel_left();
     *mem = out.mem;
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
-    // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
+    // which for a trap the root ended in on another's behalf — a sibling's teardown, a child's trap
+    // its join answered (#2066) — names where the root was, not the origin. `None` ⇒ nothing trapped
     // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
     let origin = trap_origin.unwrap_or(TrapOrigin {
         bt: out.trap_bt,
@@ -3724,9 +3725,9 @@ thread_local! {
         const { core::cell::RefCell::new(Vec::new()) };
 }
 
-/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if that run
-/// finished cleanly or none has happened. This is the **trap-origin** capture (first vCPU to trap),
-/// so a child domain's trap names the child's frames, not the parent's join site.
+/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if nothing
+/// in that run trapped or none has happened. This is the **trap-origin** capture (first vCPU to
+/// trap), so a child domain's trap names the child's frames, not the parent's join site.
 pub fn last_capture_backtrace() -> Vec<IrPc> {
     LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
 }
@@ -3740,9 +3741,11 @@ thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
-/// The window-relative address of the last run's `MemoryFault` (a NULL deref is `0`); `None` if that
-/// run did not fault on an address. For a nested (op-13) child it is relative to the child's own
-/// carve — the frame its backtrace is already in.
+/// The window-relative address of the last run's first `MemoryFault` (a NULL deref is `0`); `None`
+/// if no vCPU of that run faulted on an address. It rides the first-wins trap-origin capture, so a
+/// §14 child's fault counts though its parent's join answers it (#2066): a root that ends in the
+/// trap it was answered reports where the child faulted, relative to the child's own window — the
+/// frame its backtrace is already in.
 ///
 /// Worth more than it looks next to a backtrace: a **small** address says the pointer was never
 /// initialized, a **wild** one says the arithmetic that produced it was wrong. Those point at
@@ -5365,8 +5368,8 @@ struct Outcome {
     trap_fiber: Option<i64>,
     /// The **window-relative address** this vCPU's `MemoryFault` named, when it trapped on one
     /// (#1591). Read off the vCPU's own [`Mem`] before it is dropped, so a *child* domain's fault
-    /// address survives the join propagation that flattens its trap to a bare `Err(Trap)` — the
-    /// parent's window has no record of it. `None` on a clean finish or a non-address trap.
+    /// address survives the join that answers its trap as a bare code (#2066) — the parent's window
+    /// has no record of it. `None` on a clean finish or a non-address trap.
     trap_fault: Option<u64>,
 }
 
@@ -5567,9 +5570,9 @@ enum Blocked {
 
 /// Set on a parked vCPU before it is re-enqueued, telling its driver how to finish the op on resume.
 enum Pending {
-    /// Finish a `thread.join`: take the child's result from `threads[slot]`. With `wait`
-    /// (`Instantiator.wait`, op 18), push how the child ended instead ([`join_delivery`]).
-    Join { slot: usize, wait: bool },
+    /// Finish a join of the child at `threads[slot]`: a `thread.join`, or with `status` a §14
+    /// child's (`Instantiator.join`, op 1), which pushes how the child ended ([`join_delivery`]).
+    Join { slot: usize, status: bool },
     /// Finish a `reap` (FORK.md §8.6 — servicer-side `wait()`): take the twin's outcome from the
     /// scheduler by `TaskId` and push its **exit status** (a clean `Ok(first i64)`; a trapped twin
     /// becomes a nonzero crash status — never a propagated trap, so the waiting shell survives).
@@ -6611,11 +6614,12 @@ struct Sched {
     /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
     freeze_fault: Option<Trap>,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
-    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
-    /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
-    /// join), so the root's own outcome would name the join site, not the origin. `drive` reads this
-    /// instead, so the trap diagnostic names *where the guest actually trapped* — the interpreter
-    /// counterpart to the JIT's `Domain` trap-capture handoff. `None` on a clean run.
+    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A thread's trap ends its
+    /// domain, the root's with the same trap where it stood, and a child's trap reaches its joiner as
+    /// a bare code (#2066) that a root may end the run in, so the root's own outcome would name where
+    /// the root was, not the origin. `drive` reads this instead, so the trap diagnostic names *where
+    /// the guest actually trapped* — the interpreter counterpart to the JIT's `Domain` trap-capture
+    /// handoff. `None` when nothing trapped.
     trap_origin: Option<TrapOrigin>,
     /// #1665 — every **fork twin** that trapped this run, in completion order. A twin's trap never
     /// propagates — reap is not join; it becomes the crash status its parent `wait`s on — so it is
@@ -7641,27 +7645,24 @@ enum ReapOutcome {
     Retry,
 }
 
-/// What a finished child's outcome `res` gives the vCPU that joined it (`join`, op 1, or
-/// `thread.join`) or waited on it (`Instantiator.wait`, op 18), and whether the child stays in its
-/// slot. `join` takes the child: its first value, or its trap to re-raise. `wait` answers how it
-/// ended without inheriting a trap: 0 for a child that returned, which stays for its `join` (its
-/// value), else its trap's wire code ([`Trap::code`]), the child taken — a trapped child has nothing
-/// left to join. One rule for every driver.
+/// The registers a finished child's outcome `res` gives the vCPU that joined it, in result order.
+/// A §14 child's `join` (`Instantiator` op 1, `status`) answers how it ended as two results:
+/// `(0, its first value)` if it returned, `(its trap's wire code, 0)` if not ([`Trap::code`]). A
+/// child's end is never its parent's trap (INVARIANTS #5, #2066). A `thread.join` answers the
+/// thread's first value, and a thread's trap is its joiner's: a trap ends the whole domain
+/// (INVARIANTS #6). Either way the child is reaped. One rule for every driver.
 pub(crate) fn join_delivery(
     res: &Result<Vec<Value>, Trap>,
-    wait: bool,
-) -> (Result<Reg, Trap>, bool) {
-    match (res, wait) {
-        (Ok(_), true) => (Ok(Reg::from_i64(0)), true),
-        (Ok(vals), false) => (
-            Ok(Reg::from_value(
-                vals.first().copied().unwrap_or(Value::I64(0)),
-            )),
-            false,
-        ),
-        (Err(t), true) => (Ok(Reg::from_i64(t.code())), false),
-        (Err(t), false) => (Err(*t), false),
-    }
+    status: bool,
+) -> Result<impl Iterator<Item = Reg>, Trap> {
+    let value = |vals: &[Value]| Reg::from_value(vals.first().copied().unwrap_or(Value::I64(0)));
+    let (first, second) = match (res, status) {
+        (Ok(vals), true) => (Reg::from_i64(0), Some(value(vals))),
+        (Err(t), true) => (Reg::from_i64(t.code()), Some(Reg::from_i64(0))),
+        (Ok(vals), false) => (value(vals), None),
+        (Err(t), false) => return Err(*t),
+    };
+    Ok(core::iter::once(first).chain(second))
 }
 
 /// FORK.md §8.6 — a twin's exit status for servicer-side `wait()`. A clean finish yields the twin's
@@ -7950,9 +7951,9 @@ fn kill_child_locked(s: &mut Sched, flag: &AtomicBool, host: Option<&Arc<Mutex<H
 }
 
 /// Kill one vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24):
-/// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` re-raises
-/// (I37 supervision mechanics) — keeping `mem`/`fuel` residue (the root's is read back by
-/// [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
+/// record `Err(reason)` as its outcome — the owner's `poll` sees status 2, its `join` the trap's
+/// code (I37 supervision mechanics, #2066) — keeping `mem`/`fuel` residue (the root's is read back
+/// by [`drive_arc`] when a sibling's trap ended the run), wake any cross-domain joiner, free its
 /// durable shadow context, and kill its own §14 children (ownership anchors *their* lifetime too —
 /// the owner's death propagates as the S3 kill, [`kill_child_locked`]). Returns the dispatch tickets the vCPU had admitted but not replied
 /// (`handler_parks` / `serve_run`) so the caller can errno-wake their cross-domain callers (D37).
@@ -8057,7 +8058,7 @@ fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<It
 /// [`Sched::dead`]. Cross-domain callers parked *through* the dying domain — its queued
 /// dispatches and its in-flight handler tickets — complete with a probeable errno, never a hang
 /// (D37). Only vCPUs OF the dying domain are killed; for a §14 live child the run continues and
-/// the owner observes the outcomes (`poll` → 2, `join` re-raises).
+/// the owner observes the outcomes (`poll` → 2, `join` → the trap's code).
 fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<Host>>) {
     if s.dead.contains_key(&key) {
         return; // already down (a second member's trap raced the sweep)
@@ -9217,9 +9218,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     Vec::new()
                 };
                 let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
-                // #1591: and the address it faulted on, off this vCPU's own window. A nested (op-13)
-                // child's `Mem` dies with its outcome, so reading it here is the only chance — the
-                // join propagation that reaches `drive` carries a bare `Err(Trap)`.
+                // #1591: and the address it faulted on, off this vCPU's own window. A child's `Mem`
+                // dies with its outcome, so reading it here is the only chance — the join that
+                // answers its trap carries a bare code (#2066).
                 let trap_fault = result
                     .is_err()
                     .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
@@ -9327,8 +9328,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     wake_pipe_writers_locked(&mut s, *pipe);
                 }
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
-                // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
-                // true origin. A clean finish leaves it untouched.
+                // backtrace + fiber, so the root's later trap on its behalf (a teardown, or a child's
+                // trap its join answered) can't overwrite the true origin. A clean finish leaves it
+                // untouched.
                 //
                 // #1665 — except a **fork twin's**: it does not propagate (its parent reaps a crash
                 // status), so it is recorded apart, with the frames and fault a bare status 128 would
@@ -10227,7 +10229,7 @@ impl DetState {
 }
 
 /// Reap one explorer vCPU at a teardown (DESIGN.md §12 "Domain lifetime & teardown", owner
-/// 2026-07-24): record `Err(reason)` — the owner's `poll` sees 2, `join` re-raises (I37) — and
+/// 2026-07-24): record `Err(reason)` — the owner's `poll` sees 2, `join` its code (I37) — and
 /// wake any cross-domain joiner. The explorer's single-threaded, so unlike the executor's
 /// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
@@ -11209,7 +11211,7 @@ pub struct FrozenNested {
     pub module_digest: Option<[u8; 32]>,
     /// `Some(outcome)` for a **completed-but-unjoined** child — one that finished before the freeze
     /// point, so its `thread.join` outcome must survive in the artifact (its continuation is gone; the
-    /// scheduler result cell isn't captured): its value, or the trap its `join` re-raises (#1674).
+    /// scheduler result cell isn't captured): its value, or the trap its `join` answers (#1674).
     /// The thaw delivers this straight into the parent's join table **without re-running** the child
     /// (reload-not-reissue — no double side effects); its carve gets no `UNWINDING` broadcast (nothing
     /// to unwind). `None` for a still-running child (re-attached + rewound on thaw).
@@ -11234,7 +11236,7 @@ pub struct FrozenDetached {
     /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
     pub slot: usize,
     /// The child's `thread.join` outcome: its value (an `i32` result is sign-extended at capture), or
-    /// the trap its `join` re-raises (#1674).
+    /// the trap its `join` answers (#1674).
     pub completed_result: Result<i64, Trap>,
 }
 
@@ -13363,7 +13365,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let mut svc_timed_out = false;
     // Resuming from a park: finish the op the scheduler woke us for.
     match v.pending.take() {
-        Some(Pending::Join { slot, wait }) => {
+        Some(Pending::Join { slot, status }) => {
             let child = v
                 .threads
                 .get(slot)
@@ -13371,17 +13373,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 .ok_or(Trap::ThreadFault)?;
             // #1904 — a **detached** child the freeze unwound is not joined: it keeps its slot, and its
             // result (its window) is left for the harvest, so it rides the artifact. The join is
-            // re-issued on thaw against the re-launched child.
+            // re-issued on thaw against the re-launched child, so its results here are placeholders.
             let detached = v.child_hosts.contains_key(&slot)
                 && !v.nested_children.iter().any(|c| c.slot == slot);
             if v.durable && detached && v.sched.unwound(child) {
                 abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.push(Reg::from_i64(0));
-            } else if wait && v.sched.outcome_code(child) == Some(0) {
-                // op 18 on a child that returned: it stays for its `join` ([`join_delivery`]).
-                let top = v.frames.len() - 1;
-                v.frames[top].vals.push(Reg::from_i64(0));
+                let n = if status { 2 } else { 1 };
+                v.frames[top]
+                    .vals
+                    .extend(core::iter::repeat_n(Reg::from_i64(0), n));
             } else {
                 v.threads[slot] = None; // a handle is joined once
                 forget_child(
@@ -13400,10 +13401,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     abandon_for_freeze(&mut v.mem, v.durable_sp_ctx);
                 }
                 let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
-                // A child trap propagates as this vCPU's trap, but to a `wait` it is a value.
-                let r = join_delivery(&out.result, wait).0?;
+                // A thread's trap is this vCPU's; a §14 child's end is a value (#2066).
+                let regs = join_delivery(&out.result, status)?;
                 let top = v.frames.len() - 1;
-                v.frames[top].vals.push(r);
+                v.frames[top].vals.extend(regs);
             }
         }
         Some(Pending::ReapPid { pid }) => {
@@ -14684,9 +14685,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: cap_id::INSTANTIATOR,
                     op,
+                    sig,
                     handle,
                     args,
-                    ..
                 } => {
                     // #1578 — DESIGN §22: an **invoked** unit is a seam-free leaf, so the whole
                     // `Instantiator` is unavailable inside a `Jit.invoke` (a non-empty `below` — the
@@ -14695,6 +14696,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // never installed, and its handle names this transient vCPU's child, which no
                     // one can join. An *installed* unit spawns like the base module (#1726).
                     if !below.is_empty() {
+                        return Err(Trap::CapFault);
+                    }
+                    // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
+                    // every engine: an op that isn't live, or a call that would number a result this
+                    // arm doesn't push, is a `CapFault` (#2066).
+                    if !temen_ir::instantiator_shape_ok(*op, call_sig(&cur_types, *sig)) {
                         return Err(Trap::CapFault);
                     }
                     let h = get_i32(&frames[top].vals, *handle)?;
@@ -14743,23 +14750,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         o => o,
                     };
                     match op {
-                        // join(child) -> result: park only this fiber until the child finishes (its
-                        // result/trap is delivered on resume via `Pending::Join`); siblings run on.
-                        //
-                        // wait(child) -> 0 | trap code (op 18): park as `join` does, then answer how
-                        // the child ended: 0 if it returned (it stays for its `join`), else its trap's
-                        // wire code (`temen_ir::trap_code`), the child reaped ([`join_delivery`]). So
-                        // a spawner learns its child ran out of fuel, or crashed, without inheriting
-                        // the trap (INVARIANTS #5).
-                        1 | 18 => {
+                        // join(child) -> (status, value): park only this fiber until the child ends,
+                        // then answer how it ended — `(0, its first result)` or `(its trap's wire
+                        // code, 0)`, the child reaped ([`join_delivery`], on resume via
+                        // `Pending::Join`). Siblings run on. A spawner learns its child ran out of
+                        // fuel, crashed, was killed or exited without inheriting it (INVARIANTS #5).
+                        1 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                            *pending = Some(Pending::Join {
-                                slot,
-                                wait: op == 18,
-                            });
+                            *pending = Some(Pending::Join { slot, status: true });
                             return Ok(Inner::Park(Blocked::Join { child }));
                         }
                         // poll(child) -> 0 running | 1 returned | 2 trapped (PROCESS.md S3). Never
@@ -14810,10 +14811,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i32(0));
                         }
                         // kill(child) -> 0 (PROCESS.md S3, #2074): end the child and everything under
-                        // it, running or parked, with `ThreadFault` (`poll` → 2, `wait` → its code).
-                        // Idempotent; killing an already-finished child is a harmless success. The
-                        // parent then `wait`s or `poll`s (a `join` re-raises the trap). A forged or
-                        // joined handle is a `ThreadFault`.
+                        // it, running or parked, with `ThreadFault` (`poll` → 2, `join` → its code).
+                        // Idempotent; killing an already-finished child is a harmless success. A
+                        // forged or joined handle is a `ThreadFault`.
                         12 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
@@ -17123,7 +17123,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let slot = resolve_thread(threads, h)?;
                     let child = threads[slot].ok_or(Trap::ThreadFault)?;
-                    *pending = Some(Pending::Join { slot, wait: false });
+                    *pending = Some(Pending::Join {
+                        slot,
+                        status: false,
+                    });
                     return Ok(Inner::Park(Blocked::Join { child }));
                 }
                 // §12 futex wait: validate the address (confine/align/prot — traps surface here), then

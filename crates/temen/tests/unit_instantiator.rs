@@ -79,7 +79,7 @@ block 0 (vi64: i64) {
   i32.store vbp vb
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }
@@ -128,7 +128,7 @@ block 0 (vi64: i64) {
   vgp = i64.const 17480
   i32.store vgp vnone
   vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
   return vr

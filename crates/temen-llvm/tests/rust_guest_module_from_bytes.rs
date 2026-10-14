@@ -74,7 +74,7 @@ static CHILD_BYTES: [u8; {n}] = [{bytes_lit}
 extern "C" {{
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
     fn __vm_module_from_bytes(loader: i32, ptr: i64, len: i64) -> i64;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }}
 
 #[no_mangle]
@@ -97,7 +97,12 @@ pub extern "C" fn run() -> i64 {{
             return -2;
         }}
         let child = vm_spawn(inst, budget, mh as i32, &[(b"fs", fs)], &[]);
-        __vm_join(inst, child)
+        let mut st = 0i64;
+        let r = __vm_join(inst, child, &mut st);
+        if st != 0 {{
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }}
+        r
     }}
 }}
 {vm_spawn}"##,

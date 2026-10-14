@@ -251,7 +251,7 @@ block 0 () {
   vw9 = i64.const 4294967295
   i64.store vrec vw9 offset=72
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vsl = i64.const 35840
   i64.store vsl vj
   vop = i64.const 40992

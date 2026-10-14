@@ -280,7 +280,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
   q2a9 = i64.const 17768
   i32.store q2a9 vnone
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -762,14 +762,15 @@ pub const PAR_JIT_INVOKE: i32 = 8;
 /// own Worker over its own memory — the reason this is a Worker event and not an in-Rust one.
 pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
 
-/// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
-/// `i64`s the host reads via [`temen_par_ev_a`]–[`temen_par_ev_d`]).
+/// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to five
+/// `i64`s the host reads via [`temen_par_ev_a`]–[`temen_par_ev_e`]).
 pub struct ParVcpu {
     inner: bytecode::Vcpu<'static>,
     a: i64,
     b: i64,
     c: i64,
     d: i64,
+    e: i64,
     /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
     /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
     tierup_argv: Vec<i64>,
@@ -837,6 +838,7 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         b: 0,
         c: 0,
         d: 0,
+        e: 0,
         tierup_argv: Vec::new(),
         jit_argv: Vec::new(),
         jit_code: 0,
@@ -1588,7 +1590,8 @@ pub extern "C" fn temen_par_inst_pagestate_sync(v: *mut ParVcpu) {
 /// it. `args_ptr` is the env scratch (i64 slots, args → results in place). On a paged unit the
 /// page-state table is then re-synced ([`inst_sync_pagestate`]) so the emitted accesses that follow
 /// admit exactly what the interpreter would. Returns `0` on success, `1` on a trap (the Worker
-/// throws, unwinding the emitted entry; the child's slot reads trapped).
+/// throws, unwinding the emitted entry; the child's slot reads trapped, with the trap's wire code
+/// staged in [`temen_par_ev_e`] for its joiner).
 #[no_mangle]
 pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: `v` is a live `ParVcpu` owned by this Worker; the host passes the env scratch, at least
@@ -1604,7 +1607,10 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
             }
             0
         }
-        Err(_) => 1,
+        Err(t) => {
+            v.e = t.code();
+            1
+        }
     }
 }
 
@@ -1615,7 +1621,8 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
 /// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and `(module << 32) | entry`
 /// in `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
 /// refusal, which the emitted parent reads as the spawn's result; `0` for a trap, which the Worker
-/// raises. Once the child's Worker is started, file it with [`temen_par_inst_file_child`].
+/// raises, its wire code staged in [`temen_par_ev_e`]. Once the child's Worker is started, file it
+/// with [`temen_par_inst_file_child`].
 #[no_mangle]
 pub extern "C" fn temen_par_inst_instantiate_rec(v: *mut ParVcpu, inst: i32, rec: i64) -> i64 {
     // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
@@ -1627,7 +1634,10 @@ pub extern "C" fn temen_par_inst_instantiate_rec(v: *mut ParVcpu, inst: i32, rec
             ticket(child)
         }
         Ok(None) => temen_ir::errno::EINVAL,
-        Err(_) => 0,
+        Err(t) => {
+            v.e = t.code();
+            0
+        }
     }
 }
 
@@ -1643,11 +1653,19 @@ pub extern "C" fn temen_par_inst_file_child(v: *mut ParVcpu, token: i64) -> i32 
 /// #1865 — an emitted `join`: resolve `handle` in `v`'s child table by the oracle's rule
 /// ([`bytecode::Vcpu::join_child`]) and return the child's token (its completion slot) for the
 /// Worker to wait on, then [`temen_par_inst_end_join`]. `0` (no slot is at address 0) for the trap
-/// the interpreted join raises on a spent, negative or unissued handle.
+/// the interpreted join raises on a spent, negative or unissued handle, its wire code staged in
+/// [`temen_par_ev_e`].
 #[no_mangle]
 pub extern "C" fn temen_par_inst_join(v: *mut ParVcpu, handle: i32) -> i64 {
     // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
-    unsafe { (*v).inner.join_child(handle) }.map_or(0, |t| t as i64)
+    let v = unsafe { &mut *v };
+    match v.inner.join_child(handle) {
+        Ok(t) => t as i64,
+        Err(t) => {
+            v.e = t.code();
+            0
+        }
+    }
 }
 
 /// #1865 — the child an emitted join waited on has ended: its window's bytes go back to the budget
@@ -2653,7 +2671,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
 
 /// Stage `t` as a [`PAR_TRAP`]'s operands: `a` = the exit code and `b` = 1 when the guest called
 /// `exit` (an on-ramp program's normal way out), else `b` = 0; `c`/`d` = pointer/length of the
-/// trap's name.
+/// trap's name; `e` = its wire code ([`Trap::code`]), which a child's Worker leaves in its completion
+/// slot for its joiner (#2066).
 fn par_trap(v: &mut ParVcpu, t: &Trap) -> i32 {
     let (code, exited) = match t {
         Trap::Exit(code) => (*code as i64, 1),
@@ -2664,6 +2683,7 @@ fn par_trap(v: &mut ParVcpu, t: &Trap) -> i32 {
     v.b = exited;
     v.c = name.as_ptr() as i64;
     v.d = name.len() as i64;
+    v.e = t.code();
     PAR_TRAP
 }
 
@@ -2681,6 +2701,7 @@ par_ev_getter!(temen_par_ev_a, a);
 par_ev_getter!(temen_par_ev_b, b);
 par_ev_getter!(temen_par_ev_c, c);
 par_ev_getter!(temen_par_ev_d, d);
+par_ev_getter!(temen_par_ev_e, e);
 
 /// Deliver the host's token for the child a `PAR_SPAWN` or `PAR_INSTANTIATE_DETACHED` announced, once
 /// its Worker is started: the engine issues the guest's handle, and a join of it hands the token back
@@ -2698,14 +2719,18 @@ pub extern "C" fn temen_par_deliver_code(v: *mut ParVcpu, code: i32) {
     unsafe { (*v).inner.deliver_code(code) };
 }
 
-/// Deliver a joined child's result (after `PAR_JOIN`): `val` is its first return value, or — if
-/// `is_trap != 0` — the child trapped and the joiner traps on its next `temen_par_run`.
+/// Deliver how a joined child ended (after `PAR_JOIN`): `val` is its first return value, or — if
+/// `is_trap != 0` — the wire code of the trap it ended in, which its Worker left in its completion
+/// slot ([`par_trap`]). A child its host ended without one (a Worker that failed) ended in a
+/// `ThreadFault`. The engine answers a §14 join `(status, value)` and has a thread's trap end its
+/// joiner ([`bytecode::Vcpu::deliver_join`], #2066).
 #[no_mangle]
 pub extern "C" fn temen_par_deliver_join(v: *mut ParVcpu, val: i64, is_trap: i32) {
     // SAFETY: `v` is a live `ParVcpu` awaiting a delivery.
     let v = unsafe { &mut *v };
     if is_trap != 0 {
-        v.inner.deliver_join(Err(Trap::ThreadFault));
+        v.inner
+            .deliver_join(Err(Trap::from_code(val).unwrap_or(Trap::ThreadFault)));
     } else {
         v.inner.deliver_join(Ok(vec![Value::I64(val)]));
     }
@@ -4319,6 +4344,8 @@ fn onramp_run(
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
     let ran =
         bytecode::compile_and_run_seeded_with_host(entry, 0, args, &mut fuel, &init, &mut host);
+    // A nested card's root answers how the card ended; the run's outcome is the card's (#2066).
+    let ran = ran.map(|r| if nest.is_some() { plan::outcome(r) } else { r });
     set_last_notes(host.take_notes());
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
@@ -10362,7 +10389,9 @@ static mut OP13_JIT: Option<Op13JitDriver> = None;
 /// A minimal op-13 driver (`memory 16`, entry `(Instantiator, Module, Budget)`): it resolves its
 /// `"fs"` by name, writes one grant record re-granting it as `"fs"` (at 17536, the name at 18432 — both
 /// above the NULL guard), spawns the child module detached through an op-17 v1 record at 17408 (its
-/// declared window, paid from the budget) and returns the child's join result.
+/// declared window, paid from the budget) and returns the value its join answers — or traps if the
+/// child ended in a trap, which its join answers as a status (#2066), so the driver still reports
+/// `OP13JIT_TRAP` for a child that trapped.
 fn op13_mini_driver() -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
@@ -10385,8 +10414,16 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   i32.store vgh vfs
 {stores}  vr = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr)
-  vres = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vres
+  vres_st, vres = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  vz = i64.const 0
+  vok = i64.eq vres_st vz
+  br_if vok 1(vres) 2()
+}}
+block 1 (vret: i64) {{
+  return vret
+}}
+block 2 () {{
+  unreachable
   }}
 }}
 "#
@@ -10721,11 +10758,12 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
 
 /// **A child the driver cannot service is a value at the parent's `join`, never a trap.** The
 /// result a leaf runner banks when the child reaches an event that runner does not service
-/// (threads, tier-up, a cap or stdin park inside a leaf). `Vcpu::deliver_join(Err(t))` sets the
-/// *parent's* trap, so returning `Err(Trap::Malformed)` here — as every leaf did — killed the parent
-/// domain for a limitation of the host, not for anything either guest did. INVARIANTS #5: a
-/// lifecycle event from another party is never a domain-killing surprise. A child's *own* trap still
-/// propagates (`deliver_join`'s documented contract); this is only the driver's decline.
+/// (threads, tier-up, a cap or stdin park inside a leaf). Every leaf used to bank
+/// `Err(Trap::Malformed)`, which the parent's join then raised, killing the parent domain for a
+/// limitation of the host, not for anything either guest did. INVARIANTS #5: a lifecycle event from
+/// another party is never a domain-killing surprise. A child's *own* trap reaches the parent's join
+/// as its code (#2066); this is only the driver's decline, which the join reads as the child
+/// returning `-EINVAL`.
 ///
 /// The value is `-EINVAL`, the same answer a driver gives a declined op (#1415; every bytecode
 /// driver services op 15 since #1528, but the shape stands) —

@@ -116,7 +116,7 @@ pub fn nester(orphan: bool) -> String {
         )
     } else {
         (
-            "vj = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
+            "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
             "v7 = i64.const 7\n  return v7",
         )
     };

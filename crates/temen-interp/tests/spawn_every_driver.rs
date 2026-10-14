@@ -62,8 +62,20 @@ block 1 (ve: i32) {
   return vr
 }
 block 2 (vi2: i32, vch2: i32) {
-  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
   return vr
+  }
+}
+";
+
+/// #2066 — the tail of a parent that `join`s its child and returns `status * 1000 + value`: how the
+/// child ended (0 if it returned, else its trap's wire code, `temen_ir::trap_code`) beside its result.
+const JOIN_BOTH: &str = "\
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k = i64.const 1000
+  s1 = i64.mul js k
+  s2 = i64.add s1 jv
+  return s2
   }
 }
 ";
@@ -394,17 +406,14 @@ fn a_detached_child_gets_the_caps_granted_it_by_name() {
     );
 }
 
-/// A `ro` data segment is read-only in the child's fresh window. `Vcpu`'s hosts used to seed the
-/// window themselves, writably.
+/// A `ro` data segment is read-only in the child's fresh window: the child's write faults, and its
+/// parent's join answers `MEMORY_FAULT`. `Vcpu`'s hosts used to seed the window themselves,
+/// writably.
 #[test]
 fn a_detached_childs_read_only_data_stays_read_only() {
-    let m = module(&op15(false));
+    let m = module(&op15_then(false, 0, JOIN_BOTH));
     let child = module(CHILD_WRITES_RO);
-    let want = Ran {
-        result: Err(Trap::MemoryFault),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
+    let want = ok(temen_ir::trap_code::MEMORY_FAULT * 1000);
     agree_on_every_driver(
         "op 15, a write to ro data",
         &m,
@@ -533,11 +542,11 @@ fn trapped(t: Trap) -> Ran {
 }
 
 /// #1944 slice 3 — on every driver, a detached child burns the fuel of the budget that paid for it:
-/// a node's fuel ceiling ends a child that loops past it, though its parent has fuel to spare (the
-/// join hands the child's trap to the parent), and a node with room lets it finish.
+/// a node's fuel ceiling ends a child that loops past it, though its parent has fuel to spare (its
+/// join answers the child's `OUT_OF_FUEL`), and a node with room lets it finish.
 #[test]
 fn a_detached_childs_fuel_is_capped_by_its_budget() {
-    let m = module(&op15(false));
+    let m = module(&op15_then(false, 0, JOIN_BOTH));
     let child = module(CHILD_LOOPS);
     agree_on_every_driver(
         "op 15, a fuel ceiling with room",
@@ -555,7 +564,7 @@ fn a_detached_childs_fuel_is_capped_by_its_budget() {
         "op 15, a fuel ceiling the child loops past",
         &m,
         &op15_fuel_setup(&child, PAYLOAD / 2),
-        &trapped(Trap::OutOfFuel),
+        &ok(temen_ir::trap_code::OUT_OF_FUEL * 1000),
     );
 }
 
@@ -631,9 +640,9 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
     )
 }
 
-/// Join handle `h` (a text-IR operand) into `dst`.
+/// Join handle `h` (a text-IR operand): its value into `dst`, its status into `{dst}_st`.
 fn join(dst: &str, h: &str) -> String {
-    format!("  {dst} = call.cap 6 1 (i32) -> (i64) vinst ({h})\n")
+    format!("  {dst}_st, {dst} = call.cap 6 1 (i32) -> (i64, i64) vinst ({h})\n")
 }
 
 /// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
@@ -737,7 +746,7 @@ block 0 (vinst: i32, vc1: i32, vc2: i32) {{
   i32.store mf vc1
 {g2}  rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   k = i64.const 100
   vr = i64.add vj k
   return vr
@@ -767,7 +776,7 @@ block 1 (ve: i32) {{
   return vr
   }}
 block 2 (vi: i32, vh: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   k = i64.const 20
   vr = i64.add vj k
   return vr
@@ -823,7 +832,7 @@ block 0 (vinst: i32, vmod: i32) {{
   i32.store mf vmod
   rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   return vj
   }}
 }}
@@ -1039,13 +1048,15 @@ block 0 (vsp: i64, varg: i64) {
 ";
 
 /// On every driver, a detached child's threads are `spawn`s of the budget that pays for it while they
-/// live: a child whose ceiling is one vCPU fills it itself, so its first `thread.spawn` traps, and one
-/// whose ceiling is two runs a thread, joins it, and runs another in its place.
+/// live: a child whose ceiling is one vCPU fills it itself, so its first `thread.spawn` traps (its
+/// parent's join answers `THREAD_FAULT`), and one whose ceiling is two runs a thread, joins it, and
+/// runs another in its place.
 #[test]
 fn a_detached_childs_threads_are_capped_by_its_budget() {
-    let m = module(&op15(false));
+    let m = module(&op15_then(false, 0, JOIN_BOTH));
     let child = module(CHILD_SPAWNS_THREADS_IN_TURN);
-    for (spawn, want) in [(1, trapped(Trap::ThreadFault)), (2, ok(11 + 21))] {
+    let thread_fault = temen_ir::trap_code::THREAD_FAULT * 1000;
+    for (spawn, want) in [(1, ok(thread_fault)), (2, ok(11 + 21))] {
         let setup = || {
             let (mut h, mut args) = op15_setup(&child, 1 << 20)();
             args[2] = Value::I32(h.grant_budget(-1, 1 << 20, spawn));
@@ -1060,36 +1071,13 @@ fn a_detached_childs_threads_are_capped_by_its_budget() {
     }
 }
 
-// ---- #2053: `wait` (op 18) — how a child ended, without inheriting its trap ----
+// ---- #2066: `join` answers how a child ended, without inheriting its trap ----
 
-/// The tail of a parent that `wait`s for its child and returns the answer.
-const WAIT: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  return w1
-  }
-}
-";
-
-/// The tail of a parent that `wait`s twice, then `join`s: `(first * 1000 + second) * 1000 + value`.
-const WAIT_WAIT_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  w2 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  k = i64.const 1000
-  s1 = i64.mul w1 k
-  s2 = i64.add s1 w2
-  s3 = i64.mul s2 k
-  s4 = i64.add s3 jr
-  return s4
-  }
-}
-";
-
-/// The tail of a parent that `wait`s, then `join`s the same handle.
-const WAIT_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  return jr
+/// The tail of a parent that `join`s the same handle twice.
+const JOIN_JOIN: &str = "\
+  j1s, j1 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  j2s, j2 = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return j2
   }
 }
 ";
@@ -1103,37 +1091,51 @@ block 0 (v0: i64) {
 }
 ";
 
-/// #2053 — on every driver, `wait` parks until the child ends and answers how: 0 for a child that
-/// returned, which stays for its `join` (a second `wait` answers 0 again, and the `join` still gets its
-/// value); else the child's trap's wire code, and the parent runs on — a child that loops past its
-/// node's fuel ceiling answers `OUT_OF_FUEL`, one that reaches `unreachable` answers `UNREACHABLE`. A
-/// trapped child has nothing left to join: the wait reaps it, so a `join` after it is a spent handle.
+/// #2066 — on every driver, `join` parks until the child ends and answers how, as `(status, value)`:
+/// `(0, its result)` for a child that returned; else `(its trap's wire code, 0)`, and the parent runs
+/// on — a child that loops past its node's fuel ceiling answers `OUT_OF_FUEL`, one that reaches
+/// `unreachable` answers `UNREACHABLE`, and one that calls `exit(7)` answers `exit(7)`, its status in
+/// the high 32 bits. Either way the join reaps the child, so a second `join` of it is a spent handle.
 #[test]
-fn wait_answers_how_a_detached_child_ended() {
+fn join_answers_how_a_detached_child_ended() {
     use temen_ir::trap_code;
     let loops = module(CHILD_LOOPS);
     let crashes = module(CHILD_UNREACHABLE);
+    let both = module(&op15_then(false, 0, JOIN_BOTH));
     agree_on_every_driver(
-        "wait, wait, join on a child that returned",
-        &module(&op15_then(false, 0, WAIT_WAIT_JOIN)),
+        "a child that returned",
+        &both,
         &op15_fuel_setup(&loops, 2 * PAYLOAD),
         &ok(7),
     );
     agree_on_every_driver(
-        "wait on a child past its fuel ceiling",
-        &module(&op15_then(false, 0, WAIT)),
+        "a child past its fuel ceiling",
+        &both,
         &op15_fuel_setup(&loops, PAYLOAD / 2),
-        &ok(trap_code::OUT_OF_FUEL),
+        &ok(trap_code::OUT_OF_FUEL * 1000),
     );
     agree_on_every_driver(
-        "wait on a child that reaches unreachable",
-        &module(&op15_then(false, 0, WAIT)),
+        "a child that reaches unreachable",
+        &both,
         &op15_setup(&crashes, 1 << 20),
-        &ok(trap_code::UNREACHABLE),
+        &ok(trap_code::UNREACHABLE * 1000),
+    );
+    let exits = module(DETACHED_CALLS_EXIT);
+    let base = op15_setup(&exits, 1 << 20);
+    let granted_exit = || {
+        let (mut h, mut args) = base();
+        args[3] = Value::I32(h.grant_exit());
+        (h, args)
+    };
+    agree_on_every_driver(
+        "a child that exits",
+        &module(&op17_granting_then(&[("exit", None)], JOIN_BOTH)),
+        &granted_exit,
+        &ok(trap_code::exit(7) * 1000),
     );
     agree_on_every_driver(
-        "join after a wait reaped a trapped child",
-        &module(&op15_then(false, 0, WAIT_JOIN)),
+        "a second join of a child that trapped",
+        &module(&op15_then(false, 0, JOIN_JOIN)),
         &op15_fuel_setup(&loops, PAYLOAD / 2),
         &trapped(Trap::ThreadFault),
     );
@@ -1153,51 +1155,69 @@ block 1 () {
 }
 ";
 
-/// The tail of a parent that `kill`s the child it just spawned, then `wait`s:
-/// `kill * 1000 + wait`.
-const KILL_WAIT: &str = "\
+/// The tail of a parent that `kill`s the child it just spawned, then `join`s it:
+/// `(kill * 1000 + status) * 1000 + value`.
+const KILL_JOIN: &str = "\
   k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   k2 = i64.extend_i32_s k1
   k = i64.const 1000
   s1 = i64.mul k2 k
-  s2 = i64.add s1 w1
-  return s2
-  }
-}
-";
-
-/// The tail of a parent that `wait`s, `poll`s, then `join`s: `(wait * 1000 + poll) * 1000 + value`.
-const WAIT_POLL_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  p1 = call.cap 6 9 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  p2 = i64.extend_i32_s p1
-  k = i64.const 1000
-  s1 = i64.mul w1 k
-  s2 = i64.add s1 p2
+  s2 = i64.add s1 js
   s3 = i64.mul s2 k
-  s4 = i64.add s3 jr
+  s4 = i64.add s3 jv
   return s4
   }
 }
 ";
 
-/// The tail of a parent that `wait`s, then `detach`es, then `join`s the spent handle.
-const WAIT_DETACH_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
-  d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  return jr
+/// The tail of a parent that `poll`s its child until it has ended, then runs `rest` in a block with
+/// `vinst` and `vch` rebound and the last `poll`'s answer in `p1` (1 returned, 2 trapped).
+fn polled_until_it_ends(rest: &str) -> String {
+    format!(
+        "\
+  br 1(vinst, vch)
+}}
+block 1 (vinst: i32, vch: i32) {{
+  p = call.cap 6 9 (i32) -> (i32) vinst (vch)
+  z = i32.const 0
+  running = i32.eq p z
+  br_if running 1(vinst, vch) 2(vinst, vch, p)
+}}
+block 2 (vinst: i32, vch: i32, p1: i32) {{
+{rest}"
+    )
+}
+
+/// After [`polled_until_it_ends`]: `join`, and return `poll * 1000 + value`.
+const POLL_THEN_JOIN: &str = "\
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  p2 = i64.extend_i32_s p1
+  k = i64.const 1000
+  s1 = i64.mul p2 k
+  s2 = i64.add s1 jv
+  return s2
   }
 }
 ";
 
-/// The tail of a parent that `wait`s, then `kill`s the child that has already ended, then `join`s.
-const WAIT_KILL_JOIN: &str = "\
-  w1 = call.cap 6 18 (i32) -> (i64) vinst (vch)
+/// After [`polled_until_it_ends`]: `kill` the child that has ended, then `join` it, and return
+/// `status * 1000 + value`.
+const POLL_THEN_KILL_JOIN: &str = "\
   k1 = call.cap 6 12 (i32) -> (i32) vinst (vch)
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  js, jv = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  k = i64.const 1000
+  s1 = i64.mul js k
+  s2 = i64.add s1 jv
+  return s2
+  }
+}
+";
+
+/// The tail of a parent that `detach`es, then `join`s the spent handle.
+const DETACH_JOIN: &str = "\
+  d1 = call.cap 6 10 (i32) -> (i32) vinst (vch)
+  jr_st, jr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return jr
   }
 }
@@ -1205,7 +1225,7 @@ const WAIT_KILL_JOIN: &str = "\
 
 /// #2068, #2074 — `poll`, `detach` and `kill` answer as the tree-walker's do on every driver that
 /// schedules its own children:
-/// - a kill ends a child that would spin forever, and `wait` answers `THREAD_FAULT` (a kill that
+/// - a kill ends a child that would spin forever, and its `join` answers `THREAD_FAULT` (a kill that
 ///   did nothing would run the child into its node's fuel ceiling: `OUT_OF_FUEL`);
 /// - `poll` on a child that returned answers 1, and leaves it for its `join`;
 /// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
@@ -1220,26 +1240,38 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
     let loops = module(CHILD_LOOPS);
     // The spinning child's node holds 10M fuel, so a kill that did nothing fails in seconds, not
     // at the run's ceiling; the kill reaches it long before.
-    let cases: [(&str, &str, &Module, i64, Ran); 4] = [
+    let cases: [(&str, String, &Module, i64, Ran); 4] = [
         (
-            "kill, then wait",
-            KILL_WAIT,
+            "kill, then join",
+            KILL_JOIN.into(),
             &spins,
             10_000_000,
-            ok(trap_code::THREAD_FAULT),
+            ok(trap_code::THREAD_FAULT * 1000),
         ),
-        ("wait, poll, join", WAIT_POLL_JOIN, &loops, -1, ok(1007)),
         (
-            "wait, detach, join",
-            WAIT_DETACH_JOIN,
+            "poll until it ends, then join",
+            polled_until_it_ends(POLL_THEN_JOIN),
+            &loops,
+            -1,
+            ok(1007),
+        ),
+        (
+            "detach, join",
+            DETACH_JOIN.into(),
             &loops,
             -1,
             trapped(Trap::ThreadFault),
         ),
-        ("wait, kill, join", WAIT_KILL_JOIN, &loops, -1, ok(7)),
+        (
+            "poll until it ends, kill, join",
+            polled_until_it_ends(POLL_THEN_KILL_JOIN),
+            &loops,
+            -1,
+            ok(7),
+        ),
     ];
     for (what, tail, child, fuel, want) in cases {
-        let m = module(&op15_then(false, 0, tail));
+        let m = module(&op15_then(false, 0, &tail));
         let setup = op15_fuel_setup(child, fuel);
         agree_on(&SCHEDULING, what, &m, &setup, &want);
         assert_eq!(
@@ -1252,7 +1284,7 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
 
 /// A parent that `join`s, with a `kill` on a branch it never takes.
 const JOIN_THEN_DEAD_KILL: &str = "\
-  jr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  jr_st, jr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   z = i32.const 0
   br_if z 1(vinst, vch) 2(jr)
 }
@@ -1392,6 +1424,11 @@ fn data_segment(at: u64, bytes: &[u8]) -> String {
 /// handle grants `out` under the name; `Some(h)` writes `h` as the record's handle, such as
 /// `GRANT_EMPTY`.
 fn op17_granting(grants: &[(&str, Option<u32>)]) -> String {
+    op17_granting_then(grants, JOIN_OR_ERRNO)
+}
+
+/// [`op17_granting`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
+fn op17_granting_then(grants: &[(&str, Option<u32>)], tail: &str) -> String {
     const REC: u64 = 17536;
     const GRANTS: u64 = 17664;
     const NAMES: u64 = 17920;
@@ -1428,7 +1465,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
   i32.store vba vbud
 {stores}  vrp = i64.const {REC}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-{JOIN_OR_ERRNO}{segments}",
+{tail}{segments}",
         ma = REC + rec::MODULE_AT,
         ba = REC + rec::BUDGET_AT,
     )
@@ -1485,18 +1522,13 @@ fn an_empty_grant_satisfies_an_import_nothing_else_does() {
 }
 
 /// An emptied import is bound to nothing, so the child faults when it calls it, as a withheld slot
-/// does. The child's `CapFault` reaches the parent through its `join` (until #2066 makes `join`
-/// report it instead).
+/// does. The parent's `join` answers the child's `CAP_FAULT` (#2066).
 #[test]
 fn an_emptied_import_faults_on_use() {
     let child = module(DETACHED_CALLS_EXIT);
     let setup = op15_setup(&child, 1 << 20);
-    let m = module(&op17_granting(&[("exit", EMPTY)]));
-    let faulted = Ran {
-        result: Err(Trap::CapFault),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
+    let m = module(&op17_granting_then(&[("exit", EMPTY)], JOIN_BOTH));
+    let faulted = ok(temen_ir::trap_code::CAP_FAULT * 1000);
     agree_on_every_driver("calls an emptied import", &m, &setup, &faulted);
 }
 

@@ -13352,31 +13352,41 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        // §14 join: `long __vm_join(int inst, long child)` → `call.cap INSTANTIATOR 1 inst (child)` — the
-        // happens-before that publishes the child's window writes and returns its result. `inst` is the
-        // Instantiator handle, `child` the handle a spawn returned.
+        // §14 join: `long __vm_join(int inst, long child, long *status)` → `status, value = call.cap
+        // INSTANTIATOR 1 inst (child)` — park until the child ends, then answer how it ended: `*status`
+        // 0 and its first result returned, or `*status` its trap's wire code (`temen_ir::trap_code`)
+        // and 0 returned. A child's end is never the caller's trap (#2066), so a spawner outlives a
+        // child that crashed, ran out of fuel, was killed or exited. The join is the happens-before
+        // that publishes the child's window writes. `inst` is the Instantiator handle, `child` the
+        // handle a spawn returned, `status` a writable `long` (as `__vm_fiber_resume`'s `done`).
         "__vm_join" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let child = ctx.operand_i64(vm_arg(c, 1)?)?;
+            let status = ctx.operand_i64(vm_arg(c, 2)?)?; // `long *status`
             let sig = temen_ir::FuncType {
                 params: vec![ValType::I64],
-                results: vec![ValType::I64],
+                results: vec![ValType::I64, ValType::I64],
             };
             let sig = ctx.intern_sig(sig); // #922
-            let r = ctx.push(Inst::CapCall {
-                type_id: INSTANTIATOR_TYPE_ID,
-                op: 1,
-                sig,
-                handle,
-                args: vec![child],
+            let rs = ctx.push_multi(
+                Inst::CapCall {
+                    type_id: INSTANTIATOR_TYPE_ID,
+                    op: 1,
+                    sig,
+                    handle,
+                    args: vec![child],
+                },
+                2,
+            ); // (status, value)
+            ctx.push_effect(Inst::Store {
+                op: StoreOp::I64,
+                addr: status,
+                value: rs[0],
+                offset: 0,
             });
-            ctx.bind_dest(&c.dest, r);
+            ctx.bind_dest(&c.dest, rs[1]);
             Ok(true)
         }
-        // `long __vm_wait(int inst, long child)` → `call.cap INSTANTIATOR 18 inst (child)`: join's
-        // park, answering how the child ended — 0 if it returned (it stays for `__vm_join`), else its
-        // trap's wire code (`temen_ir::trap_code`), the child reaped. A spawner's way to outlive a
-        // child that crashed or ran out of fuel.
         // PROCESS.md S3 (#1706): `long __vm_poll(int inst, long child)` → `call.cap INSTANTIATOR 9`
         // (0 running, 1 returned, 2 trapped; never parks), `__vm_detach` → op 10 (drop the join
         // claim), `__vm_kill` → op 12 (end the child and its subtree, running or parked: #2074). A
@@ -13384,7 +13394,7 @@ fn lower_vm_builtin(
         // #2220: `long __vm_grant(int inst, long child, long handle)` → op 19 (grant `handle` into
         // the running child, answering the child's handle of it, which the spawner hands the child
         // itself, or `-errno`).
-        "__vm_wait" | "__vm_poll" | "__vm_detach" | "__vm_kill" | "__vm_grant" => {
+        "__vm_poll" | "__vm_detach" | "__vm_kill" | "__vm_grant" => {
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
             let n = if name == "__vm_grant" { 2 } else { 1 }; // the child, then what is granted
             let args = (1..=n)
@@ -13401,8 +13411,7 @@ fn lower_vm_builtin(
                     "__vm_poll" => 9,
                     "__vm_detach" => 10,
                     "__vm_kill" => 12,
-                    "__vm_grant" => 19,
-                    _ => 18,
+                    _ => 19, // `__vm_grant`
                 },
                 sig,
                 handle,

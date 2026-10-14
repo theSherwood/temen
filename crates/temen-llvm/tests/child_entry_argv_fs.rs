@@ -170,9 +170,8 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
     // The child returned the byte count it copied (== the input length), joined back.
     let n = input.len() as i64;
     let got = match r.as_slice() {
-        [Value::I64(m)] => *m,
-        [Value::I32(m)] => *m as i64,
-        other => panic!("unexpected join result: {other:?}"),
+        [Value::I64(0), Value::I64(m)] => *m,
+        other => panic!("the child did not return: {other:?}"),
     };
     assert_eq!(
         got, n,

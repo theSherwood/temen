@@ -64,7 +64,7 @@ block 0 (vinst: i32, vout: i32, vbud: i32) {{
   i32.store rrb vbud
   rra0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
-  r = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return r
   }}
 }}

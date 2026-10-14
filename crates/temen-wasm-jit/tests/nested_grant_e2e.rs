@@ -72,7 +72,7 @@ block 0 (v0: i32, v1: i32) {{
   i32.store vma v1
   vrp = i64.const {REC_AT}
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }}
 }}
@@ -153,8 +153,9 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
         .func_wrap(
             "env",
             "join",
-            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> i64 {
-                caller.data().children[child as usize]
+            // The child ran to its return at its spawn: `(status 0, its result)` (#2066).
+            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> (i64, i64) {
+                (0, caller.data().children[child as usize])
             },
         )
         .unwrap();

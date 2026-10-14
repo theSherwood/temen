@@ -115,3 +115,14 @@ fn a_child_cannot_read_the_parents_memory() {
         assert_eq!(out, "4242 \n0 \n4242 \n", "{backend:?}");
     }
 }
+
+/// #2066 — a sandboxed program that faults ends only its sandbox: `sandbox` returns the wire code of
+/// the trap the child ended in, here `MEMORY_FAULT` (8) for a load from its NULL guard, and the parent
+/// runs on. Before, the child's trap ended the parent too.
+#[test]
+fn a_sandbox_that_faults_returns_its_trap() {
+    for backend in TIERS {
+        let (out, _) = run(backend, "s\" 0 @ . cr\" sandbox . cr\n7 . cr\n");
+        assert_eq!(out, "8 \n7 \n", "{backend:?}");
+    }
+}

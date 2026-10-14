@@ -320,7 +320,7 @@ block 0 () {
   a10 = i64.const 17616
   i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }

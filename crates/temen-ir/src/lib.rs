@@ -100,17 +100,14 @@ pub mod cap_id {
     /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
     /// memory half of the `Instantiator`: a guest carves a child's window from its own.
     pub const ADDRESS_SPACE: u32 = 5;
-    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
-    /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
-    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running the
-    /// same module's `entry` (which returns one `i64` and takes one or two — its starter caps)
-    /// confined to `[base+off, base+off+2^size_log2)` with an **attenuated** powerbox over the child's
-    /// own window: an `Instantiator` (so it can recurse — confinement composes to any depth) and an
-    /// `AddressSpace` (so it can manage its own pages), passed as the entry's arguments. A fuel quota
-    /// caps it; returns immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
-    /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
-    /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
-    /// child can only get what the parent sub-allocates).
+    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
+    /// window of its own (VM-in-VM), and manage it. The live ops ([`super::instantiator_contract`]
+    /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`]
+    /// (15 is its retiring positional form, #2067); 1 `join(child) -> (status, value)` parks only
+    /// the calling fiber until the child ends, then answers how it ended, never as a trap of the
+    /// joiner's (#2066); 9 `poll`, 10 `detach` and 12 `kill` supervise it (PROCESS.md S3); 14
+    /// `child_offer` and 19 `grant` reach into it while it runs. Every other op is retired and traps
+    /// `CapFault`. Holding the handle is the authority to nest.
     pub const INSTANTIATOR: u32 = 6;
     /// `ModuleLoader` — the authority to **promote guest bytes to a spawnable `Module`** (§14 slice:
     /// run-in-guest). op 0 `from_bytes(ptr, len) -> module_handle | -errno` reads a wire-encoded module
@@ -213,6 +210,46 @@ pub mod cap_id {
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
     /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
+}
+
+/// The shape of each live [`cap_id::INSTANTIATOR`] op: the scalar-int argument prefix it reads and
+/// the results it answers. The verifier checks a `call.cap` against its *declared* signature only,
+/// so a verified module can call the Instantiator with any shape. Every engine checks the declared
+/// one against this table before running the op ([`instantiator_shape_ok`]), and a call that
+/// doesn't match, or names an op that isn't live, traps `CapFault`. One table, so no engine numbers
+/// a result that another doesn't deliver (#2066).
+///
+/// | op | | args | results |
+/// |---|---|---|---|
+/// | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
+/// | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
+/// | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
+/// | 15 | `instantiate_detached` | budget, module, grants ptr and count, entry, size_log2, quota | child or `-errno` |
+/// | 17 | `instantiate_rec` | record pointer | child or `-errno` |
+pub fn instantiator_contract(op: u32) -> Option<(&'static [ValType], &'static [ValType])> {
+    use ValType::{I32, I64};
+    match op {
+        1 => Some((&[I32], &[I64, I64])),
+        9 | 10 | 12 => Some((&[I32], &[I32])),
+        14 | 19 => Some((&[I32, I64], &[I32])),
+        15 => Some((&[I64; 7], &[I32])),
+        17 => Some((&[I64], &[I32])),
+        _ => None,
+    }
+}
+
+/// Whether an Instantiator `call.cap` of `op` declared as `sig` matches [`instantiator_contract`].
+/// Width-tolerant: an `i32` or an `i64` matches either, since every engine reads an arg as an
+/// `i64` and coerces a result to its declared type (a chibicc guest widens every scalar to `i64`).
+/// Args past the contract's prefix are tolerated (op 15's optional args payload and region).
+pub fn instantiator_shape_ok(op: u32, sig: &FuncType) -> bool {
+    let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
+    instantiator_contract(op).is_some_and(|(args, results)| {
+        sig.params.len() >= args.len()
+            && sig.params[..args.len()].iter().all(int)
+            && sig.results.len() == results.len()
+            && sig.results.iter().all(int)
+    })
 }
 
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its

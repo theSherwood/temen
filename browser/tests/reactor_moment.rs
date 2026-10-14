@@ -515,7 +515,7 @@ block 0 (vsp: i64) {{
   vf9 = i64.const 4294967295
   i64.store vr0 vf9 offset=72
   vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vgot = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vgot_st, vgot = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vbp = i64.const 16432
   i64.store vbp vgot
   vop = i64.const 16416

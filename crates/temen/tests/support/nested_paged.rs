@@ -260,7 +260,7 @@ fn run_nested_paged(m0: &temen_ir::Module, tail: &[i64]) -> (Outcome, Vec<u8>, u
         .func_wrap(
             "env",
             "join",
-            |_: Caller<'_, Driver>, _i: i32, _c: i32| -> i64 { unreachable!("no join") },
+            |_: Caller<'_, Driver>, _i: i32, _c: i32| -> (i64, i64) { unreachable!("no join") },
         )
         .unwrap();
     linker

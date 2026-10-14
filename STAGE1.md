@@ -315,12 +315,11 @@ Stage 1 only *composes* existing, fuzzed primitives.
 
 ## Resolved — `poll` is WNOHANG; its terminal status is backend-portable
 
-A crashing command must not crash the shell, which needs `poll` (op 9:
-`0` running / `1` returned / `2` trapped) to detect a trapped child and
-`detach` instead of `join` (a `join` propagates the child's trap to the
-parent). A caller that would rather block uses `wait` (op 18, #2053): it parks
-until the child ends and answers `0` (returned; `join` takes the value) or the
-trap's wire code (the child reaped). The original concern was that an *immediate* `poll` after a
+A crashing command must not crash the shell, and it does not: `join` (op 1)
+parks until the child ends and answers how it ended — `(0, value)` if it
+returned, else `(trap code, 0)` — reaping it either way, and never traps the
+parent (#2066). A caller that must not block probes with `poll` (op 9: `0`
+running / `1` returned / `2` trapped). The original concern was that an *immediate* `poll` after a
 synchronous spawn reads differently across backends: the interpreter's M:N
 scheduler defers a child (so an immediate `poll` reads `0` running); the JIT
 runs it eagerly on its own OS thread (so an immediate `poll` may already read

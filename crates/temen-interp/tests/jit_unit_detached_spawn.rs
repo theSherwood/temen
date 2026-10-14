@@ -83,7 +83,7 @@ block 0 (v0: i64) {{
 fn joining_unit_src() -> String {
     unit_src().replace(
         "  vr = i64.extend_i32_s vh\n  return vr",
-        "  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  return vr",
+        "  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)\n  return vr",
     )
 }
 

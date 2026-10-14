@@ -6073,9 +6073,9 @@ pub fn nim_noc_run(
 /// bind against the personality like any other command's, so it needs no linking at all.
 pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     let cap = match name {
-        // The shell's own `Instantiator` ops (STAGE1.md §5).
+        // The shell's own `Instantiator` spawn (STAGE1.md §5). Its join is chibicc's
+        // `__vm_instantiate_join` builtin: op 1 answers two results, which a linked import can't (#2066).
         "__spawn_rec" => temen_ir::ResolvedCap { type_id: 6, op: 17 },
-        "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
         // The ring-pipeline surface (STAGE1.md item 6): mint a region (`AddressSpace` op 5) and
         // alias/query it (`SharedRegion` ops 0/1/3) — the shell pumps stage-0 output into a mapped
         // ring; the `__stage` filter runner maps its granted rings the same way.
@@ -6092,10 +6092,12 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
 /// so the child runs in a window of its own (its declared memory: `size_log2 = 0`), paid from a `Budget`
 /// and returned to it when the child ends — with `caps` re-granted to it by name and `argv` as the
 /// spawn's args payload (`{argc, envc = 0}` + packed NUL-terminated strings, landing at the child's
-/// [`temen_ir::module_args_base`]), then join it and return its status. A refused spawn returns its
-/// `-errno` instead of joining.
+/// [`temen_ir::module_args_base`]), then join it and return how it ended, `(status, value)` as the join
+/// answers it (#2066): `(0, its result)` if it returned, `(its trap's wire code, 0)` if not — an
+/// `exit(n)` is `trap_code::exit(n)`. A refused spawn answers `(-errno, 0)` instead of joining: a trap's
+/// code is never negative.
 ///
-/// Entry: `(Instantiator, Module, Budget, cap_0, …, cap_{n-1}) -> i64`, where `cap_i` is the handle
+/// Entry: `(Instantiator, Module, Budget, cap_0, …, cap_{n-1}) -> (i64, i64)`, where `cap_i` is the handle
 /// re-granted as `caps[i]`. Every nested-phase harness (the nim chain, nifler, the child-entry tests)
 /// spawns through this one program (INVARIANTS #15); [`grant_conductor`] grants its first three args.
 /// Its own scratch — the record, the grant records and their names, the payload — sits above the
@@ -6150,7 +6152,7 @@ fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
     }
     format!(
         r#"memory {CONDUCTOR_LOG2}
-{data}func ({sig}) -> (i64) {{
+{data}func ({sig}) -> (i64, i64) {{
 block 0 ({params}) {{
 {body}  r = i64.const {rec}
   w0 = i64.const 1
@@ -6176,11 +6178,12 @@ block 0 ({params}) {{
   }}
 block 1 (e: i32) {{
   e64 = i64.extend_i32_s e
-  return e64
+  none = i64.const 0
+  return e64, none
   }}
 block 2 (inst: i32, c: i32) {{
-  st = call.cap 6 1 (i32) -> (i64) inst (c)
-  return st
+  st, v = call.cap 6 1 (i32) -> (i64, i64) inst (c)
+  return st, v
   }}
 }}
 "#,
@@ -8745,7 +8748,7 @@ block 0 (vh: i32) {
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
   vz = i32.const 0
   vn = call.cap 4294967295 10 () -> (i64) vz ()
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vs = i64.add vn vj
   return vs
   }
@@ -8784,7 +8787,7 @@ block 0 (vh: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) voff (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vs = i64.add vr vj
   return vs
   }

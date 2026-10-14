@@ -99,7 +99,7 @@ fn child_entry_module_is_instantiable() {
             .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
         assert_eq!(
             ran.result,
-            Ok(vec![Value::I64(42)]),
+            Ok(vec![Value::I64(0), Value::I64(42)]),
             "{driver:?}: the child-entry Rust module was spawned and its main status (42) joined back"
         );
     }

@@ -22,7 +22,8 @@ const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
 /// Spawn the child detached (op 15: budget, module, no grants, entry 0, `size_log2` 17, no quota),
-/// join it, return what it returns (a child trap propagates at the join).
+/// join it, return `status * 1000 + value`: what it returns, or its trap's wire code times 1000
+/// (#2066).
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -31,8 +32,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  vk = i64.const 1000
+  vs = i64.mul vr_st vk
+  vt = i64.add vs vr
+  return vt
   }
 }
 ";
@@ -292,10 +296,13 @@ fn a_thawed_detached_child_cannot_unmap_its_null_guard() {
     check(UNMAP_GUARD, Out::Ret(EINVAL));
 }
 
-/// #1733: a NULL load faults after a thaw as before it.
+/// #1733: a NULL load faults after a thaw as before it, which the parent's join answers.
 #[test]
 fn a_thawed_detached_childs_null_load_faults() {
-    check(NULL_LOAD, Out::Trap("MemoryFault".into()));
+    check(
+        NULL_LOAD,
+        Out::Ret(temen_ir::trap_code::MEMORY_FAULT * 1000),
+    );
 }
 
 /// [`PARENT`], returning instead the room left in its budget (`v2`) once it has joined the child.
@@ -307,7 +314,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vf = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) v2 (vf)
   return vroom
@@ -342,10 +349,11 @@ fn a_thawed_detached_childs_end_hands_its_window_back() {
     check_with(&parent_of(PARENT_ROOM), &child(RO_LOAD), Out::Ret(1 << 20));
 }
 
-/// A store to the readonly segment faults after a thaw as before it.
+/// A store to the readonly segment faults after a thaw as before it, which the parent's join
+/// answers.
 #[test]
 fn a_thawed_detached_childs_store_to_its_readonly_segment_faults() {
-    check(RO_STORE, Out::Trap("MemoryFault".into()));
+    check(RO_STORE, Out::Ret(temen_ir::trap_code::MEMORY_FAULT * 1000));
 }
 
 /// #1854: a child that grows the first page past its declared 128 KiB (into its window's reserved
@@ -402,7 +410,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
   vt = thread.spawn 1 vz vz
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vj = thread.join vt
   vs = i64.add vr vj
   return vs
@@ -609,7 +617,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   ve = i32.const 0
   vto = i64.const 200000000
   vw = i32.atomic.wait va ve vto
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }
 }
@@ -836,7 +844,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vgn = i64.const 1
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }}
 }}
