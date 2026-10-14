@@ -872,11 +872,11 @@ fn module_uses_rec(m: &Module) -> bool {
 }
 
 /// #816: can this module ever run as (or spawn) a **same-module §14 child** — a task whose window
-/// is a carve *smaller* than the emit-time window? Any `Instantiator` `call.cap` qualifies
-/// (conservative: ops 0/11/17 spawn same-module children directly; the rest are kept in the
-/// predicate so a new spawn op fails closed rather than eliding). When true, [`emit_module`] turns
-/// bound-check **elision** off, because an elision proof against the emit-time window is no floor
-/// for a child carve — see `elide_bound` there.
+/// is a carve *smaller* than the emit-time window? Any `Instantiator` `call.cap` qualifies. No op
+/// spawns one any more: the carve ops are retired (#1867) and so is op 17's `module = -1` (#2219),
+/// so the gate is conservative only, and goes with #1867's wasm-JIT carve gates. When true,
+/// [`emit_module`] turns bound-check **elision** off, because an elision proof against the
+/// emit-time window is no floor for a child carve — see `elide_bound` there.
 fn module_can_spawn_same_module(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
         f.blocks.iter().any(|b| {
