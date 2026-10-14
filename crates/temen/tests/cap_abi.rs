@@ -156,6 +156,10 @@ fn a_process_waiting_on_itself_is_echild() {
     assert_eq!(bc, Some(want), "bytecode");
 }
 
+/// One call to make: its type, op, the place of its handle in the powerbox, and its args (type,
+/// value).
+type Call<'a> = (u32, u32, usize, &'a [(&'a str, i64)]);
+
 /// A guest making one `call.cap {type_id} {op}` on the powerbox handle at `cap`, with constant
 /// `args` (type, value), declaring `results` `i64` results. It returns the second result when it
 /// declares two, else `7777`, a value defined after the call.
@@ -201,8 +205,8 @@ fn one_call(
 #[test]
 fn every_engine_defines_the_results_a_call_declares() {
     use temen_ir::{cap_id, trap_code::CAP_FAULT, CAP_SELF_TYPE_ID as SELF};
-    // Each op with its handle's place in the powerbox and the args its contract reads.
-    let served: [(u32, u32, usize, &[(&str, i64)]); 11] = [
+    // Each op with the args its contract reads.
+    let served: [Call; 11] = [
         (cap_id::JIT, 3, 14, &[("i64", 5)]),
         (cap_id::JIT, 4, 14, &[("i64", 999)]),
         (cap_id::INSTANTIATOR, 1, 3, &[("i32", 7)]),
@@ -226,7 +230,7 @@ fn every_engine_defines_the_results_a_call_declares() {
         }
     }
     // A stream write, the clock, the address space's page size, a `Jit.release`: one result each.
-    let host_served: [(u32, u32, usize, &[(&str, i64)]); 4] = [
+    let host_served: [Call; 4] = [
         (cap_id::STREAM, 1, 0, &[("i64", 4096), ("i64", 0)]),
         (cap_id::CLOCK, 0, 8, &[]),
         (cap_id::ADDRESS_SPACE, 3, 4, &[]),
