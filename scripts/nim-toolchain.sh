@@ -8,7 +8,7 @@
 # writes into <out>:
 #   nimony/          nimony's tree, laid out as nimony's own is (`bin/ lib/ src/ doc/`), its `bin/`
 #                    holding the phases step 1 builds
-#   nimony.temen nifmake.temen nifler2.temen nimsem.temen hexer.temen
+#   nimony.temen nifmake.temen nifler2.temen nimsem.temen shoggoth.temen
 #                    the tools, through the POSIX edge; nimsem's build in the tree's own nimcache,
 #                    each other's in `nimcache-<tool>/`
 #   sh.ir            /bin/sh: the POSIX build of demos/shell
@@ -37,21 +37,25 @@ W="$(cd "$1" && pwd)"
 # file absolute.
 N="$W/nimony"
 mkdir -p "$N"
-cp -r "$ROOT/nimony/bin" "$ROOT/nimony/lib" "$ROOT/nimony/src" "$ROOT/nimony/doc" "$N/"
+# The sources as the pin has them (`git archive`), not as the checkout is: hastur's build fetches
+# git-ignored files into it (Nim's parser for classic nifler, Nim's cycle collectors for
+# `--mm:orc`), which no tool here imports, and the card's pack ships the tree's `lib/` and `src/`.
+cp -r "$ROOT/nimony/bin" "$N/"
+git -C "$ROOT/nimony" archive HEAD lib src doc | tar -x -C "$N"
 for p in "$ROOT"/patches/nimony/*.patch; do (cd "$N" && git apply "$p"); done
 cargo build --release -q -p temen-run --example build_nim_temen
 B=target/release/examples
 
-echo "[toolchain 1/3] the phases, native: nimony builds nifler2, nimsem and hexer"
+echo "[toolchain 1/3] the phases, native: nimony builds nifler2, nimsem and shoggoth"
 # `nimony/bin`'s phases are built by classic Nim — a different compiler, whose hash tables iterate in
 # another order (#1753) — so nimony builds each again from the tree, and those replace them: they are
 # the reference every artifact is held to, and the compiler of step 2. The driver and nifmake only
 # sequence work; theirs stay as they are.
 pids=()
-for p in nifler2/nifler2 nimony/nimsem hexer/hexer; do
+for p in nifler2/nifler2 nimony/nimsem lengc/shoggoth/shoggoth; do
   n="$(basename "$p")"
   (cd "$N" && nimony c --isMain --nimcache:"$W/native-$n" "src/$p.nim" >/dev/null \
-    && cp "$(ls "$W/native-$n"/*/"$n" | head -1)" "bin/$n") &
+    && cp "$(ls "$W/native-$n"/c/*/"$n" | head -1)" "bin/$n") &
   pids+=($!)
 done
 for pid in "${pids[@]}"; do wait "$pid"; done
@@ -63,7 +67,7 @@ build() { NIMONY_BIN="$N/bin" "$B/build_nim_temen" --posix --root "$N" "$@"; }
 pids=()
 build src/nimony/nimsem.nim "$W/nimsem.temen" &
 pids+=($!)
-for p in nifler2/nifler2 hexer/hexer nimony/nimony nifmake/nifmake; do
+for p in nifler2/nifler2 lengc/shoggoth/shoggoth nimony/nimony nifmake/nifmake; do
   n="$(basename "$p")"
   build --nimcache "$W/nimcache-$n" "src/$p.nim" "$W/$n.temen" &
   pids+=($!)

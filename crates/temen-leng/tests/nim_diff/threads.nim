@@ -1,6 +1,8 @@
 # Threads (`std/rawthreads`): four threads each sum a disjoint range into their own slot, and are
 # joined before the total is read, so the result does not depend on how they interleave.
 import std/[rawthreads, syncio]
+# Each thread writes its own slot, read only after every join: shared, but never raced.
+{.feature: "assumeSync".}
 var parts: array[4, int]
 var ids: array[4, int]
 proc work(p: pointer) =

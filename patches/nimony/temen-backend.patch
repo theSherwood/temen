@@ -9,7 +9,7 @@ flags, so every artifact up to there is byte-identical to `nimony c`'s), then ON
 node in place of lengc + cc + link: `temen-link -o:<prog.temen> <every module's .c.nif, main
 first>`, which writes one verified Temen module. It sits beside the web backends (`backendWasm` /
 `backendJs`, whose whole-program tool is jorogumo): the same shape, an output-naming helper beside
-theirs (`temenFile`), and its own backend directory (`<main>.temen/`). A Temen module runs under a Temen host, so `nimony t -r`
+theirs (`temenFile`), and its own backend directory (`t/<main>/`, beside `c/<main>/`; nim-lang/nimony#2616). A Temen module runs under a Temen host, so `nimony t -r`
 runs it only where nimony itself runs on one: it execs it there, as a native nimony execs its
 executable, and refuses anywhere else. `temen-link` itself lives in this repo
 (`crates/temen-run/demos/temen_link`).
@@ -25,34 +25,38 @@ setup build with `t`, and nimony found with `findTool`, as `semos` finds it, sin
 serves no `/proc/self/exe` and `getAppDir()` is empty there. Where the plugin's platform is the outer
 build's (no target triple, as on Temen), it builds as compile-time evaluation builds its program, in
 the outer cache with the outer command line, instead of compiling the library again in a cache of
-its own (#2049); its executable is `<stem>.plugin`, since `<stem>` (`<stem>.temen` for `t`) is the
-plugin module's backend directory there. `nimsem e` (`buildGraphForEval`) still plans the C
+its own (#2049); its executable is `<stem>.plugin`, since a `t` build's `-o:` adds `.temen` to a
+path with no extension. `nimsem e` (`buildGraphForEval`) still plans the C
 toolchain itself; no build uses it.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (6ca46f17).
+vendored `nimony/` submodule is never modified. Against the submodule pin (650bebb2).
 Drop it when upstream nimony has a Temen backend — it is written to be upstreamed as is.
+diff --git a/src/gear2/modnames.nim b/src/gear2/modnames.nim
+index 580e27ea..cc1bd779 100644
 --- a/src/gear2/modnames.nim
 +++ b/src/gear2/modnames.nim
-@@ -39,6 +39,7 @@ const
-   BackendDirNative* = ".n" ## `nimony n`
-   BackendDirWasm* = ".wasm" ## `nimony w`
-   BackendDirJs* = ".js"     ## `nimony j`
-+  BackendDirTemen* = ".temen" ## `nimony t`
+@@ -41,6 +41,7 @@ const
+   BackendDirNative* = "n"  ## `nimony n`
+   BackendDirWasm* = "w"    ## `nimony w`
+   BackendDirJs* = "j"      ## `nimony j`
++  BackendDirTemen* = "t"   ## `nimony t`
  
  proc moduleSuffix*(path: string; searchPaths: openArray[string]): string =
    # `getCurrentDir`/`relativePath` are `.raises`, but the only reason they can
+diff --git a/src/nimony/deps.nim b/src/nimony/deps.nim
+index 09607460..12ace69a 100644
 --- a/src/nimony/deps.nim
 +++ b/src/nimony/deps.nim
-@@ -97,6 +97,7 @@ proc backendDirName(config: NifConfig; f: FilePair): string =
-   of backendNative: result.add BackendDirNative
-   of backendWasm: result.add BackendDirWasm
-   of backendJs: result.add BackendDirJs
-+  of backendTemen: result.add BackendDirTemen
+@@ -82,6 +82,7 @@ proc backendTag(config: NifConfig): string =
+   of backendNative: BackendDirNative
+   of backendWasm: BackendDirWasm
+   of backendJs: BackendDirJs
++  of backendTemen: BackendDirTemen
  
- proc hexedFile(config: NifConfig; f: FilePair): string = config.nifcachePath / f.modname & ".x.nif"
- proc lengcFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
-@@ -154,6 +155,21 @@ proc jsFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+ proc backendDirName(config: NifConfig; f: FilePair): string =
+   ## Name (relative to the nimcache) of the per-main-module directory that
+@@ -149,6 +150,21 @@ proc jsFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
    else:
      base / baseName.addFileExt("js")
  
@@ -74,7 +78,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
  proc genFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
    case config.backend
    of backendC: config.cFile(f, backendDir)
-@@ -161,6 +177,7 @@ proc genFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
+@@ -156,6 +172,7 @@ proc genFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
    of backendNative: config.asmFile(f, backendDir)
    of backendWasm: config.lengcFile(f, backendDir)  # jorogumo `w` reads Leng directly
    of backendJs: config.lengcFile(f, backendDir)    # jorogumo `j` reads the same file
@@ -82,7 +86,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
  proc objFile(config: NifConfig; f: FilePair; backendDir: string = ""): string =
    let base = if backendDir.len > 0: config.nifcachePath / backendDir else: config.nifcachePath
    base / f.modname & ".o"
-@@ -1143,6 +1160,11 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1154,6 +1171,11 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
      let wholeProgTool = "jorogumo"
      var webRenderer = "j"
      if wasm: webRenderer = "w"
@@ -94,7 +98,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      let useOptimizer = c.config.optLevel in {optSpeed, optSize}
      let native = c.config.backend == backendNative
      # A native program that uses the `.compile`/`{.build…}` pragma (in ANY module)
-@@ -1187,6 +1209,17 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1194,6 +1216,17 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
          b.withTree "input":
            b.addIntLit 0
            b.addIntLit 0
@@ -112,7 +116,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      elif native:
        # Native backend: arkham (Leng -> typed asm-NIF) replaces lengc. Output is
        # passed as the single token `-o:<path>` (the colon form; `addFilename`
-@@ -1528,6 +1561,22 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1542,6 +1575,22 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
                b.addStrLit c.config.wasmFile(c.rootNode.files[0], backend)
              else:
                b.addStrLit c.config.jsFile(c.rootNode.files[0], backend)
@@ -135,7 +139,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
        elif customLinkerName.len > 0 or (not native and not nativeSysLink):
          # Manifest-based link. The plain C/LLVM backend links through the default
          # `link` command (== `niflink`); a `{.bundle.}` module overrides it with
-@@ -1665,7 +1714,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1679,7 +1728,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
        # source) don't depend on the user's project. A plain native build has no
        # such TUs (arkham/nifasm go straight to machine code); only a native build
        # that uses the `.compile` pragma (`nativeSysLink`) compiles them.
@@ -144,7 +148,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
          for cfile in c.toBuild:
            let obj = sharedObjFile(cfile, ccKey)
            if not objFiles.containsOrIncl(obj):
-@@ -1689,7 +1738,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1703,7 +1752,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
                  discard
  
        for i, v in pairs c.nodes:
@@ -153,7 +157,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
            let obj = c.config.objFile(v.files[0], backend)
            if not objFiles.containsOrIncl(obj):
              b.withTree "do":
-@@ -1722,7 +1771,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
+@@ -1741,7 +1790,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC,
          else:
            lengcInput = c.config.lengcFile(v.files[0], backend)
  
@@ -162,7 +166,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
            discard  # no per-module codegen: the single whole-program node
                     # (see "Link executable" above) consumes the .c.nif
          elif native:
-@@ -2321,6 +2370,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
+@@ -2424,6 +2473,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
        exeOutPath = c.config.wasmFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
      elif c.config.backend == backendJs:
        exeOutPath = c.config.jsFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
@@ -171,7 +175,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      let exeOutDir = exeOutPath.parentDir
      if exeOutDir.len > 0:
        onRaiseQuit createDir(path(exeOutDir))
-@@ -2372,5 +2423,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
+@@ -2480,5 +2531,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
          # around it — node runs the file as it stands.
          exec "node " &
               quoteShell(c.config.jsFile(c.rootNode.files[0], backend)) & executableArgs
@@ -185,6 +189,8 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
 +               " under a Temen host"
        else:
          exec c.config.exeFile(c.rootNode.files[0], backend) & executableArgs
+diff --git a/src/nimony/macro_plugin.nim b/src/nimony/macro_plugin.nim
+index 12efa19a..7c3104b6 100644
 --- a/src/nimony/macro_plugin.nim
 +++ b/src/nimony/macro_plugin.nim
 @@ -12,11 +12,12 @@ import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
@@ -206,8 +212,8 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
  
  proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
 -  result = nifcachePath / macroFileStem(macroSym)
-+  # Not the bare stem: built in the outer cache, the plugin module's backend
-+  # directory is `<stem>/` (`<stem>.temen/` for `t`). `-o:` keeps an extension.
++  # With an extension: a `t` build's `-o:` adds `.temen` to a path that has
++  # none (`deps.temenFile`), and the plugin would not be where this looks.
 +  result = nifcachePath / macroFileStem(macroSym) & ".plugin"
    when defined(windows):
      result.add ".exe"
@@ -313,6 +319,8 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
              " --nimcache:" & quoteShell(pluginCache) &
              " -o:" & quoteShell(exePath) &
              " s " & quoteShell(progfile)
+diff --git a/src/nimony/nifconfig.nim b/src/nimony/nifconfig.nim
+index dfcc7c41..85046a23 100644
 --- a/src/nimony/nifconfig.nim
 +++ b/src/nimony/nifconfig.nim
 @@ -106,6 +106,7 @@ type
@@ -323,9 +331,11 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
  
    OptLevel* = enum
      optDebug   # default: -O1 (debug-friendly but avoids dumb codegen)
+diff --git a/src/nimony/nimony.nim b/src/nimony/nimony.nim
+index 8c4253af..fe2a70a4 100644
 --- a/src/nimony/nimony.nim
 +++ b/src/nimony/nimony.nim
-@@ -169,9 +169,22 @@ proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
+@@ -171,9 +171,22 @@ proc dispatchBasicCommand(key: string; config: var NifConfig): Command =
      # as for wasm: the two backends share one 32-bit freestanding model.
      config.backend = backendJs
      FullProject
@@ -348,7 +358,7 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      SemCheckNif
    of "doc":
      DocProject
-@@ -415,6 +428,13 @@ proc compileProgram(c: var CmdOptions) =
+@@ -419,6 +432,13 @@ proc compileProgram(c: var CmdOptions) =
      discard c.config.setTargetOS("standalone")
      c.config.bits = 32
      c.commandLineArgs.add " --cpu:wasm32 --os:standalone --bits:32"
@@ -360,11 +370,13 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
 +    c.config.addDefine "temen"
 +    c.commandLineArgs.add " --define:temen"
    let nativeBackend = c.config.backend == backendNative
-   let optOutAll = c.config.isDefined("useLibc")
-   if nativeBackend or not (optOutAll or c.config.isDefined("useMimalloc")):
+   if c.config.isDefined("illumos") and (nativeBackend or c.config.isDefined("nimNoLibc")):
+     quit "illumos requires libc; use the C backend without -d:nimNoLibc"
+diff --git a/src/nimony/semdecls.nim b/src/nimony/semdecls.nim
+index c6110597..b36d9c3d 100644
 --- a/src/nimony/semdecls.nim
 +++ b/src/nimony/semdecls.nim
-@@ -1314,7 +1314,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
+@@ -1329,7 +1329,7 @@ proc semProcImpl(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
    if kind == MacroY and pass == checkBody:
      let macroDecl = cursorAt(dest, declStart)
      let macroBinPath = compileMacroPlugin(c.g.config.nifcachePath, macroDecl, symId, info,
@@ -373,6 +385,8 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
      if macroBinPath.len > 0:
        c.compiledMacros[symId] = macroBinPath
  
+diff --git a/src/nimony/semos.nim b/src/nimony/semos.nim
+index 9bbe4a6d..766dfad3 100644
 --- a/src/nimony/semos.nim
 +++ b/src/nimony/semos.nim
 @@ -28,6 +28,12 @@ import nimony_model, symtabs, builtintypes, decls, asthelpers,
@@ -397,20 +411,20 @@ Drop it when upstream nimony has a Temen backend — it is written to be upstrea
    cmd.add quoteShell(nf)
    exec cmd
    if not vfsMoveInto(staging, exefile):
-@@ -776,7 +782,11 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
+@@ -839,7 +845,11 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
    if result.exitCode != 0: return
  
    let modname = extractModuleSuffix(file)
--  let exe = nimcachePath / modname / splitFile(file).name.addFileExt(ExeExt)
+-  let exe = nimcachePath / BackendDirC / modname / splitFile(file).name.addFileExt(ExeExt)
 +  # Where `nimony s` put the program: its backend's output for the main module.
 +  let exe = when defined(temen):
-+      nimcachePath / modname & BackendDirTemen / splitFile(file).name.addFileExt("temen")
++      nimcachePath / BackendDirTemen / modname / splitFile(file).name.addFileExt("temen")
 +    else:
-+      nimcachePath / modname / splitFile(file).name.addFileExt(ExeExt)
++      nimcachePath / BackendDirC / modname / splitFile(file).name.addFileExt(ExeExt)
    # The child may start in `sourceDir`; keep the exe path absolute so it
    # still resolves against the outer compile's cwd, not the module dir.
    var exeToRun = exe
-@@ -805,7 +815,7 @@ proc buildWriteNifModule(c: var SemContext): string =
+@@ -868,7 +878,7 @@ proc buildWriteNifModule(c: var SemContext): string =
    let nimonyExe = findTool("nimony")
    let cmd = quoteShell(nimonyExe) & c.commandLineArgs &
      " --nimcache:" & quoteShell(c.g.config.nifcachePath) &

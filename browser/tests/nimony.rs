@@ -253,7 +253,7 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
     let mut host = temen_interp::Host::new();
     let (_px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
     let executable = temen_encode::encode_module(&module(SEVEN));
-    let files: [(&str, &[u8]); 14] = [
+    let files: [(&str, &[u8]); 15] = [
         ("/w/lib/std/sys.nim", b"proc x() = discard"),
         ("/w/src/lib/nifcore.nim", b"proc y() = discard"),
         ("/w/prog.nim", b"echo 1"),
@@ -275,10 +275,13 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
         ("/w/nimcache/pro2.s.nif", b"sem"),
         // A plugin the library declares, which nimony links into the cache's root.
         ("/w/nimcache/regex", &executable),
-        ("/w/nimcache/sys1.temen/sys1.c.nif", b"lowered"),
-        ("/w/nimcache/pro2.temen/sys1.c.nif", b"lowered for pro2"),
-        // The program: an executable too, but in its own backend directory.
-        ("/w/nimcache/pro2.temen/prog.temen", &executable),
+        // The Temen backend's directory (nim-lang/nimony#2616): every module's `.x.nif`, and a
+        // directory for each program built.
+        ("/w/nimcache/t/sys1.x.nif", b"lowered"),
+        ("/w/nimcache/t/sys1/sys1.c.nif", b"lowered for sys1"),
+        ("/w/nimcache/t/pro2/sys1.c.nif", b"lowered for pro2"),
+        // The program: an executable too, but in its own directory.
+        ("/w/nimcache/t/pro2/prog.temen", &executable),
     ];
     for (path, bytes) in files {
         posix.write_file(path, bytes);
@@ -295,7 +298,8 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
             "/w/nimcache/sys1.s.nif",
             "/w/nimcache/nif3.s.nif",
             "/w/nimcache/regex",
-            "/w/nimcache/sys1.temen/sys1.c.nif",
+            "/w/nimcache/t/sys1.x.nif",
+            "/w/nimcache/t/sys1/sys1.c.nif",
             "/w/nimcache/sys1.p.nif",
         ]
     );
@@ -345,7 +349,7 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
     let tool = |t: &str| format!("{cwd}/bin/{t}\n/bin/{t}");
     assert_eq!(
         paths,
-        ["nimony", "nifmake", "nimsem", "nifler2", "hexer"]
+        ["nimony", "nifmake", "nimsem", "nifler2", "shoggoth"]
             .map(tool)
             .into_iter()
             .chain(["/bin/sh".to_string()])

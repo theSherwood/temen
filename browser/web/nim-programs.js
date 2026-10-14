@@ -31,12 +31,18 @@ echo toUpperAscii("temen")
 # repeated ones with sequtils, and sort them with std/algorithm.
 import std/[syncio, strutils, tables, sets, sequtils, algorithm]
 
-let text = "the cat sat on the mat and the dog sat on the log"
-var counts = initTable[string, int]()
+let words = "the cat sat on the mat and the dog sat on the log".split(' ')
+
+proc tally(words: seq[string]): Table[string, int] =
+  result = initTable[string, int]()
+  for w in words: result[w] = result.getOrDefault(w) + 1
+
+# A \`let\`, so the procs below may read it: a proc may not touch a mutable
+# global unless it says how that is synchronized.
+let counts = tally(words)
 var seen = initHashSet[string]()
 var order: seq[string] = @[]
-for w in text.split(' '):
-  counts[w] = counts.getOrDefault(w) + 1
+for w in words:
   if not seen.contains(w):
     seen.incl(w)
     order.add w
@@ -46,7 +52,7 @@ proc byCount(a, b: string): int =
   let d = counts.getOrDefault(b) - counts.getOrDefault(a)
   if d != 0: d else: cmp(a, b)
 
-echo "words: ", text.split(' ').len, ", distinct: ", seen.len
+echo "words: ", words.len, ", distinct: ", seen.len
 for w in order.filter(repeated).sorted(byCount):
   echo w, ": ", counts.getOrDefault(w)
 `,
@@ -119,8 +125,10 @@ import std/[syncio, rawthreads]
 
 const Threads = 4
 const Span = 25_000
-var counts: array[Threads, int]
-var ids: array[Threads, int]
+
+type Job = object
+  lo, hi: int   # the range a thread counts in
+  primes: int   # its count, read once the thread is joined
 
 proc isPrime(n: int): bool =
   if n < 2: return false
@@ -131,24 +139,25 @@ proc isPrime(n: int): bool =
   true
 
 proc work(p: pointer) =
-  let i = cast[ptr int](p)[]
-  for n in i * Span ..< (i + 1) * Span:
-    if isPrime(n): inc counts[i]
+  let job = cast[ptr Job](p)
+  for n in job.lo ..< job.hi:
+    if isPrime(n): inc job.primes
 
 proc main() =
+  var jobs = default(array[Threads, Job])
   var ths {.noinit.}: array[Threads, RawThread]
   try:
     for i in 0 ..< Threads:
-      ids[i] = i
-      create ths[i], work, addr(ids[i])
+      jobs[i] = Job(lo: i * Span, hi: (i + 1) * Span, primes: 0)
+      create ths[i], work, addr(jobs[i])
   except:
     echo "could not start a thread"
     return
   for i in 0 ..< Threads: ths[i].join()
   var total = 0
   for i in 0 ..< Threads:
-    echo "thread ", i, ": ", counts[i], " primes below ", (i + 1) * Span
-    total += counts[i]
+    echo "thread ", i, ": ", jobs[i].primes, " primes below ", jobs[i].hi
+    total += jobs[i].primes
   echo "total: ", total
 
 main()
