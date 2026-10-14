@@ -78,7 +78,7 @@ block 6 (vs6: i64, vi6: i64, vbud: i32) {{
   vlog = i64.const 16
   vdl = i64.const 8
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vz, vlog, vz, vdp, vdl)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vs7 = i64.add vs6 vj
   vone = i64.const 1
   vi7 = i64.add vi6 vone

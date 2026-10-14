@@ -37,9 +37,10 @@ fn module(src: &str) -> Module {
 
 /// A root that splits a node from its `Budget` and closes its handle [`SPLITS`] times, counting the
 /// splits that fail; then splits a node with a fuel ceiling of [`CHILD_FUEL`], spawns func 1's child
-/// image from it (the record at 17408), closes the node's handle, reads the closed handle, and waits
-/// for the child, which loops past that ceiling. It returns `failed * 10^9 + closes * 10^6 + (read +
-/// 100) * 10^3 + wait`, where `closes` sums what every close answered.
+/// image from it (the record at 17408), closes the node's handle, reads the closed handle, and joins
+/// the child, which loops past that ceiling. It returns `failed * 10^9 + closes * 10^6 + (read +
+/// 100) * 10^3 + status`, where `closes` sums what every close answered and `status` is how the join
+/// answers the child's end (#2066).
 fn src() -> String {
     format!(
         "memory 16
@@ -79,7 +80,7 @@ block 2 (vf: i64, vcs: i64, vi2: i32, vb2: i32) {{
   vcs2 = i64.add vcs vcl
   vfield = i64.const 0
   vread = call.cap 14 1 (i64) -> (i64) vch32 (vfield)
-  vwait = call.cap 6 18 (i32) -> (i64) vi2 (vkid)
+  vwait, vjv = call.cap 6 1 (i32) -> (i64, i64) vi2 (vkid)
   vg = i64.const 1000000000
   vm = i64.const 1000000
   vk = i64.const 1000
@@ -161,7 +162,7 @@ fn on_the_jit(m: &Module) -> Result<Vec<Value>, Trap> {
 /// closes [`SPLITS`] nodes, more than its table holds, and every split succeeds and every close
 /// answers 0. Then it spawns a child from a node with a small fuel ceiling and closes that node's
 /// handle at once: a read through it answers `-EBADF`, and the child still runs out of the node's
-/// fuel (`wait` answers `OUT_OF_FUEL`).
+/// fuel (its `join` answers `OUT_OF_FUEL`).
 #[test]
 fn a_closed_budget_frees_its_slot_and_its_node_still_caps_a_child() {
     let m = module(&src());

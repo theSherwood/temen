@@ -33,7 +33,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vlog = i64.const 15
   vq = i64.const 0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -239,7 +239,7 @@ block 0 (v0: i32, v1: i32, v2: i32, vin: i32, vout: i32) {
   vlog = i64.const 15
   vq = i64.const 0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vg0, vgn, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vb1 = i64.const 16392
   vr1 = call.cap 0 0 (i64, i64) -> (i64) vin (vb1, vone)
   vc = i64.load vb1
@@ -391,8 +391,8 @@ block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {
   vhr = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmr64, vg1, vgn, ve, vlog, vq)
   vcr = call.cap 0 2 () -> (i64) vrd ()
   vcw = call.cap 0 2 () -> (i64) vwr ()
-  vjr = call.cap 6 1 (i32) -> (i64) v0 (vhr)
-  vjw = call.cap 6 1 (i32) -> (i64) v0 (vhw)
+  vjr_st, vjr = call.cap 6 1 (i32) -> (i64, i64) v0 (vhr)
+  vjw_st, vjw = call.cap 6 1 (i32) -> (i64, i64) v0 (vhw)
   vk = i64.const 1000
   vs = i64.mul vjr vk
   vt = i64.add vs vjw

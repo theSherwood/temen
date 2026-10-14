@@ -2580,7 +2580,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 i32.store vra v2 offset={module_at}\n\
          \x20 i32.store vra v3 offset={budget_at}\n\
          \x20 vch = call.cap 6 17 (i64) -> (i32) v1 (vra)\n\
-         \x20 vj = call.cap 6 1 (i32) -> (i64) v1 (vch)\n\
+         \x20 vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v1 (vch)\n\
          \x20 return vj\n\
            }}\n\
          }}\n\

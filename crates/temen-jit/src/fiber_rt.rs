@@ -361,7 +361,7 @@ pub(crate) enum ParkOn {
     Futex(Arc<crate::os_thread_rt::WaitCell>),
     /// #2010 — a `thread.join`: it also ends on the joiner's own freeze word, as a futex wait does.
     Thread,
-    /// #2010 — an `Instantiator.join` (or `wait`): the joined child's end re-offers it.
+    /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
 }
 

@@ -53,7 +53,7 @@ block 0 () {
   vlog = i64.const 17
   vreg = i64.extend_i32_u vrh
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk
   vob = i64.const 65544

@@ -39,14 +39,26 @@ long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
 /* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
    itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a v1 detached record) /
-   `__join` (op 1) — dispatched on the reflection-discovered `Instantiator` handle (`__inst()`), like
-   every import here; each child's window is paid from the reflection-discovered `Budget`. */
+   `join_status` (op 1, below) — dispatched on the reflection-discovered `Instantiator` handle
+   (`__inst()`), like every import here; each child's window is paid from the reflection-discovered
+   `Budget`. */
 long __px_exec_lookup(int cap, long name, long len);
 long __px_exec_win(int cap, long module);
 long __px_exec_stdout(int cap);
 long __px_exec_stdin(int cap, long buf, long len);
 long __spawn_rec(int inst, long rec);
-long __join(int inst, long child);
+/* chibicc's builtin for the join (op 1): it answers two results, which no linked import can (#2066). */
+long __vm_instantiate_join(int inst, long child, long *status);
+/* A command's exit status from its join: what its `main` returned, `n` for an `exit(n)`, or 128 for
+   any other trap — the crash status the POSIX build's `waitpid` reaps (FORK.md §8.6). The command's
+   end is never the shell's own. */
+static long join_status(long child) {
+  long st;
+  long r = __vm_instantiate_join(__inst(), child, &st);
+  if (st == 0) return r;
+  if ((st & 0xffffffff) == 7) return (st >> 32) & 0xff; /* `trap_code::EXIT`, the status in the high half */
+  return 128;
+}
 /* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into
    this window (`SharedRegion` ops 0/1/3), dispatched on the reflection-discovered handles below. */
 long __as_region(int cap, long len);

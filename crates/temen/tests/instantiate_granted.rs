@@ -54,7 +54,7 @@ block 0 (vinst: i32, vstream: i32, vbud: i32, vmod: i32) {\n\
   i32.store rrb vbud\n\
   rra0 = i64.const 20544\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
-  vres = call.cap 6 1 (i32) -> (i64) vinst (vch)\n\
+  vres_st, vres = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n\
   return vres\n\
   }\n\
 }\n\

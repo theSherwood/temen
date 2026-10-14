@@ -60,7 +60,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   gz = i64.const 0
   sl = i64.const {child_log2}
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   return vr
   }}
 }}

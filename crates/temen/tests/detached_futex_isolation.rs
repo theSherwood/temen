@@ -75,8 +75,8 @@ block 0 (vinst: i32, vwait: i32, vnote: i32, vbud: i32) {
   sl = i64.const 16
   hw = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, mw, gz, gz, gz, sl, gz)
   hn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, mn, gz, gz, gz, sl, gz)
-  jw = call.cap 6 1 (i32) -> (i64) vinst (hw)
-  jn = call.cap 6 1 (i32) -> (i64) vinst (hn)
+  jw_st, jw = call.cap 6 1 (i32) -> (i64, i64) vinst (hw)
+  jn_st, jn = call.cap 6 1 (i32) -> (i64, i64) vinst (hn)
   vk = i64.const 10000
   vhi = i64.mul jw vk
   vr = i64.add vhi jn
@@ -97,7 +97,7 @@ block 0 (vinst: i32, vwait: i32, vnote: i32, vbud: i32) {
   gz = i64.const 0
   sl = i64.const 16
   hw = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, mw, gz, gz, gz, sl, gz)
-  jw = call.cap 6 1 (i32) -> (i64) vinst (hw)
+  jw_st, jw = call.cap 6 1 (i32) -> (i64, i64) vinst (hw)
   return jw
   }
 }

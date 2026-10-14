@@ -120,7 +120,7 @@ fn parent(n: usize) -> Module {
     for i in 0..n {
         body += &format!(
             "  c{i} = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)\n  \
-             r{i} = call.cap 6 1 (i32) -> (i64) vinst (c{i})\n  \
+             r{i}_st, r{i} = call.cap 6 1 (i32) -> (i64, i64) vinst (c{i})\n  \
              s{} = i64.add s{i} r{i}\n",
             i + 1
         );

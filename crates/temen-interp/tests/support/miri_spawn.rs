@@ -71,8 +71,8 @@ block 0 (vinst: i32, vas: i32, vmod: i32, vbud: i32) {{
   i32.store vpb vrb offset={r}
   vha = call.cap 6 17 (i64) -> (i32) vinst (vpa)
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vpb)
-  vja = call.cap 6 1 (i32) -> (i64) vinst (vha)
-  vjb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) vinst (vha)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) vinst (vhb)
   vxa = i32.load8_u vwa
   vxb = i32.load8_u vwb
   vya = i64.extend_i32_u vxa

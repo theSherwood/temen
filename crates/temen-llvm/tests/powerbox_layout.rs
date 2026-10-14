@@ -26,16 +26,17 @@ fn parent(child_log2: u8) -> String {
     format!(
         r#"
 declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
-declare i64 @__vm_join(i32, i64)
+declare i64 @__vm_join(i32, i64, ptr)
 
 define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {{
   %buf = alloca [2 x i64]
+  %st = alloca i64
   store i64 35, ptr %buf
   %hi = getelementptr i64, ptr %buf, i64 1
   store i64 0, ptr %hi
   %p = ptrtoint ptr %buf to i64
   %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 {child_log2}, i64 %p, i64 16)
-  %r = call i64 @__vm_join(i32 %inst, i64 %h)
+  %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
   ret i64 %r
 }}
 "#

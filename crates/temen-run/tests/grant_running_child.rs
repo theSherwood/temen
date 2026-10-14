@@ -330,7 +330,7 @@ fn a_running_child_maps_a_region_its_parent_granted_it() {
     let body = format!(
         "{}{}  vword = i64.const 4242\n  vwat = i64.const {GRANTED}\n  i64.store vwat vword\n\
          {}{}{}  wn = i64.const 100\n  br 1(wn)\n}}\n{}block 5 (vready: i32) {{\n{}{}{}\
-         \x20 vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+         \x20 vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
         image("i", 0, "child", "vmod"),
@@ -358,7 +358,7 @@ fn a_running_child_maps_a_region_its_parent_granted_it() {
 fn a_detached_child_grants_into_its_own_running_child() {
     let held = ["vinst", "vch", "vreg"];
     let root = format!(
-        "{}{}{}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+        "{}{}{}{}  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
         image("c", 0, "child", "vcm"),
         image("g", 1, "grandchild", "vgm"),
         rec::grant("gl", GRANTS, NAMES + 16, "grandchild".len(), "vgm"),
@@ -379,7 +379,7 @@ block 0 (v0: i64, v1: i64) {{
   br 1(wn)
 }}
 {}block 5 (vready: i32) {{
-{}{}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+{}{}{}  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return vr
   }}
 }}
@@ -414,8 +414,8 @@ block 0 (v0: i64, v1: i64) {{
 #[test]
 fn two_running_children_rendezvous_on_a_region_their_parent_granted_both() {
     let body = format!(
-        "{}{}{}{}{}{}{}{}{}{}  vja = call.cap 6 1 (i32) -> (i64) vinst (vca)\n\
-         \x20 vjb = call.cap 6 1 (i32) -> (i64) vinst (vcb)\n  vk = i64.const 1000\n\
+        "{}{}{}{}{}{}{}{}{}{}  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) vinst (vca)\n\
+         \x20 vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) vinst (vcb)\n  vk = i64.const 1000\n\
          \x20 vx = i64.mul vja vk\n  vr = i64.add vx vjb\n",
         mint_and_map("m", "vm", MAILBOX),
         mint_and_map("g", "vreg", GRANTED),
@@ -502,16 +502,29 @@ fn grant_between(before: &str, after: &str) -> String {
     )
 }
 
-/// #2220 — a grant to a child that has ended fails `-EINVAL`: one that returned, which a `wait` saw end
-/// and left for its `join` (`grant * 1000 + join`), and one that was killed, which the `wait` reaped
-/// (`grant * 1000 + wait`, the `wait` answering `THREAD_FAULT`).
+/// `poll` the child `vch` until it has ended, leaving it for its `join`; what follows runs in a block
+/// that keeps `vinst`, `vch` and `vreg`.
+const POLL_UNTIL_IT_ENDS: &str = "  br 1(vinst, vch, vreg)
+}
+block 1 (vinst: i32, vch: i32, vreg: i32) {
+  vp = call.cap 6 9 (i32) -> (i32) vinst (vch)
+  vz = i32.const 0
+  vrun = i32.eq vp vz
+  br_if vrun 1(vinst, vch, vreg) 2(vinst, vch, vreg)
+}
+block 2 (vinst: i32, vch: i32, vreg: i32) {
+";
+
+/// #2220 — a grant to a child that has ended fails `-EINVAL`: one that returned, which `poll` saw end
+/// and left for its `join` (`grant * 1000 + value`), and one that was killed, which its `join` reaped
+/// (`grant * 1000 + status`, the join answering `THREAD_FAULT`, #2066).
 #[test]
 fn a_grant_to_an_ended_child_fails() {
     let returned = module(&parent(
         &[(REC_A, SpawnRec::v1(0))],
         &grant_between(
-            "  vw = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
-            "  vj = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+            POLL_UNTIL_IT_ENDS,
+            "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
         ),
         &[("child", CHILD_RETURNS_7)],
     ));
@@ -524,7 +537,7 @@ fn a_grant_to_an_ended_child_fails() {
         &[(REC_A, SpawnRec::v1(0))],
         &grant_between(
             "  vk1 = call.cap 6 12 (i32) -> (i32) vinst (vch)\n\
-             \x20 vj = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
+             \x20 vj, vj_v = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
             "",
         ),
         &[("child", CHILD_SPINS)],
@@ -555,7 +568,7 @@ fn a_handle_no_spawn_could_grant_faults() {
         ),
     ] {
         let body = format!(
-            "  vzero = i32.const 0\n{}{}{handle}{}  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
+            "  vzero = i32.const 0\n{}{}{handle}{}  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
             image("i", 0, "child", "vmod"),
             spawn("s", REC_A, "vmod", None, "vch"),
             grant("q", "vch", "vforged", "vgot"),
@@ -592,7 +605,7 @@ block 2 (vi2: i32, vc2: i32, vh2: i32, vn2: i64) {{
 }}
 block 3 (vi3: i32, vc3: i32, vg3: i32, vn4: i64) {{
   vgo = i32.const 1
-{}  vj = call.cap 6 1 (i32) -> (i64) vi3 (vc3)
+{}  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi3 (vc3)
   vg64 = i64.extend_i32_s vg3
   vmil = i64.const 1000000000
   vx = i64.mul vg64 vmil

@@ -434,7 +434,8 @@ different things depending on which pair you compare:
   `bytecode_fiber_plus_thread_tick_replays_deterministically`) and `dap_over_bytecode_fiber_on_a_spawned_
   thread` (over DAP). `debug_advance_fiber` is now the single shared per-op driver for both engines.
 
-  **§14 same-module coroutines on the single-vCPU engine (slice 14a).** `debug_advance_fiber` now also
+  **§14 same-module coroutines on the single-vCPU engine (slice 14a; retired with the coroutine ops,
+  #2065).** `debug_advance_fiber` now also
   drives §14 **coroutines** inline — exactly as production `run_inner` does, never via the thread
   scheduler: `spawn_coroutine` builds the confined child in `vt.coroutines`, `resume` drives it via
   `resume_coro` (delivering yields / supplying demand-fault pages / collecting the return), and a leaked
@@ -460,7 +461,8 @@ different things depending on which pair you compare:
   (breakpoint-inside-the-body, step-descends, step-over-runs-the-coroutine, confined-window inspection,
   and body-position tick-replay), with the slice-14a oracle-parity suites unchanged (result-identical).
 
-  **§14 separate-module coroutines on the single-vCPU engine (slice 14c).** `spawn_coroutine_module`
+  **§14 separate-module coroutines on the single-vCPU engine (slice 14c; retired with the coroutine
+  ops, #2065).** `spawn_coroutine_module`
   (op 6 / demand op 7) is no longer declined: a new `spawn_coroutine_module` helper (the debug-engine
   counterpart of `Vcpu::service_coroutine_module`) resolves the host-granted `Module` from the powerbox,
   compiles it, **pushes it to the shared source** (the mutable-`Domain` step that was the blocker),
@@ -584,8 +586,8 @@ different things depending on which pair you compare:
   deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
   the single-vCPU engine does.
 
-  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled).** Stepping into
-  a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
+  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled; its
+  coroutine half retired with the coroutine ops, #2065).** Stepping into a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
   variables — the `FrameReader`'s module-0 gate + per-module debug metadata that were the 14c/15b/15c
   follow-up. The granted child module already retained its whole `Module` (`ModuleGrant.module`, for §3.6),
   so `spawn_coroutine_module` builds a `ModuleDebug` from it (its `-g` info + per-`(func, block)` slot base
