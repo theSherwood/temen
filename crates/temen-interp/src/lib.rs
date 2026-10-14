@@ -945,7 +945,7 @@ struct SeekInit {
     /// [`attach_scheduled_seeded`]: Inspector::attach_scheduled_seeded
     seed: Option<u64>,
     /// The module's NULL-guard extent (#964/#1094): `POWERBOX_NULL_GUARD` for every module (the guard
-    /// is unconditional; `0` only for a sub-window smaller than the guard). Captured from the module at
+    /// is unconditional; `0` only for a window smaller than the guard). Captured from the module at
     /// attach so `seek`'s freshly-rebuilt `Mem` re-seeds `[0, guard)` `Unmapped` — a NULL deref traps
     /// identically on a debugger attach and
     /// its replay, not only on a direct run (the bare funcs/data the harness rebuilds from carry no
@@ -1266,7 +1266,8 @@ impl Inspector {
     ) -> Box<VCpu> {
         // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads the
         // module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a debugger
-        // attach/seek exactly as on a direct run (unconditional; `0` only for a sub-window).
+        // attach/seek exactly as on a direct run (unconditional; `0` only for a window smaller than the
+        // guard).
         let mem = memory.map(|mc| {
             Mem::from_spec(WindowSpec {
                 reserved_log2: DEFAULT_RESERVED_LOG2,
@@ -3588,42 +3589,6 @@ pub fn run_capture_reserved_with_host_prots(
     (r, snap, prots)
 }
 
-/// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
-/// parent of `parent_bytes` (the child runs over the parent's `Region`; `size = 1 << size_log2` is
-/// the module's declared memory). The confinement unit ([`temen_mask::Window::sub`]) bounds every child
-/// access to its slice (faulting otherwise), so a *verified* guest reaches only `[base, base+size)`. This is the
-/// interpreter side of the **sub-window escape-oracle**: pair it with the JIT's
-/// [`temen_jit::compile_and_run_capture_sub`] and byte-compare the whole parent — every byte outside
-/// the slice must stay as seeded (confinement) and the slice must match the JIT (codegen). `init_mem`
-/// seeds the whole parent; the returned `Vec` is the whole parent window (`parent_bytes` bytes).
-pub fn run_capture_sub(
-    m: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    fuel: &mut u64,
-    init_mem: &[u8],
-    base: u64,
-    parent_bytes: u64,
-) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
-    let mut host = Host::new();
-    if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new());
-    }
-    let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes, mc.shadow);
-        mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
-        mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
-        mm.seed_null_guard(temen_ir::module_null_guard()); // #964
-        mm
-    });
-    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, &mut host);
-    let snap = mem
-        .as_ref()
-        .map(|mm| mm.snapshot_parent(parent_bytes))
-        .unwrap_or_default();
-    (r, snap)
-}
-
 /// Run a module under the **deterministic explorer** (§18) with scheduling decisions driven by
 /// `seed`: a single OS thread interleaves the guest's vCPUs (green threads) cooperatively, so the run
 /// is fully reproducible and sweeping seeds enumerates distinct interleavings. This is the
@@ -5100,12 +5065,10 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum FutexKey {
     /// A normal (anonymous) window page — keyed by `(backing identity, backing-absolute address)`.
-    /// The address alone is **not** a sound identity across domains (#1283): every detached window
-    /// (op 15) and the root have `window.base() == 0`, and all of a run's domains share one
-    /// `wait_waiters`, so two detached siblings waiting on the same guest offset would rendezvous. The
-    /// backing identity (the `Arc<Region>` allocation address, stable while the window lives) separates
-    /// them; a §14 nested child shares its parent's `Arc<Region>` and its confined absolute address is
-    /// already backing-absolute, so parent↔nested-child rendezvous on anonymous memory is unchanged.
+    /// The address alone is **not** a sound identity across domains (#1283): every window starts at 0
+    /// of its own backing, and all of a run's domains share one `wait_waiters`, so two detached
+    /// siblings waiting on the same guest offset would rendezvous. The backing identity (the
+    /// `Arc<Region>` allocation address, stable while the window lives) separates them.
     Anon(u64, u64),
     /// A §13 `SharedRegion`-aliased page — keyed by `(backing identity, byte offset within the
     /// region)`, so every alias of the same region byte maps to the same key regardless of which
@@ -5350,7 +5313,7 @@ struct ExecReq {
     /// command's entry takes two params (§14 child-entry ABI).
     entry_args: Vec<Value>,
     /// The command module's NULL-guard extent (#1059/#1094): `POWERBOX_NULL_GUARD` for every command
-    /// (unconditional; `0` only for a sub-window smaller than the guard). The exec args region rides
+    /// (unconditional; `0` only for a window smaller than the guard). The exec args region rides
     /// it (`exec_window`), so a command's `_start` finds argv where it reads it (`module_args_base` =
     /// `guard + 128`).
     null_guard: u64,
@@ -9178,18 +9141,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // settle the request before its sink exists.
                 let (ticket, pager_id) = {
                     let m = v.mem.as_ref().expect("a demand child has a window");
-                    let rel = addr - m.window.base();
-                    let page = rel / m.page * m.page;
+                    let page = addr / m.page * m.page;
                     let sink = PageSink {
                         child: m.fork_for_thread(),
                         page,
                         len: m.page.min(m.window.mapped() - page),
-                        off: rel - page,
+                        off: addr - page,
                     };
                     let mut s = sched.lock();
                     let mut cg = pb.cell.lock_unpoisoned();
                     let id = cg.domain_id();
-                    let t = cg.svc_enqueue(pb.export, 0, vec![rel as i64]);
+                    let t = cg.svc_enqueue(pb.export, 0, vec![addr as i64]);
                     if let Some(t) = t {
                         s.page_sinks.insert((id as usize, t), sink);
                     }
@@ -33042,7 +33004,7 @@ struct Mem {
     /// #964/#1094 trap-on-NULL: the reserved NULL extent — `[0, null_guard)` is seeded `Unmapped` for
     /// every module ([`Mem::seed_null_guard`]) and **permanently refused** to the page ops
     /// (`prot_pages` returns `EINVAL` below it, the `mmap_min_addr` analogue — what keeps the tiers'
-    /// baked guard constant sound). `0` only for a sub-window smaller than the guard. A guard fault
+    /// baked guard constant sound). `0` only for a window smaller than the guard. A guard fault
     /// is **fatal**, never a §14 recoverable page fault (a demand parent could not legally map it).
     null_guard: u64,
     /// The module-declared durable **shadow arena** (INVARIANTS.md #16): where a freeze/thaw run
@@ -33289,34 +33251,6 @@ impl Mem {
         }
     }
 
-    /// A fully-mapped **§14 sub-window**: a `1 << size_log2`-byte child window at absolute offset
-    /// `base` inside a parent backing of `parent_bytes` bytes (the child runs over the parent's
-    /// `Region`). The confinement unit ([`temen_mask::Window::sub`], fuzzed as the escape hinge) bounds
-    /// every child access to `[base, base + size)` (faulting otherwise), so the child can reach **only
-    /// its slice** — never
-    /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
-    /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
-    /// `[0, base + size)`.
-    fn sub_window(base: u64, size_log2: u8, parent_bytes: u64, shadow: Option<ShadowArena>) -> Mem {
-        let window = Window::sub(base, size_log2, 1u64 << size_log2.min(63));
-        let page = host_page_size();
-        let need = window.base().saturating_add(window.reserved());
-        Mem {
-            back: Arc::new(Region::new(parent_bytes.max(need), page)),
-            window,
-            page,
-            space: Arc::new(RwLock::new(AddrSpace::default())),
-            has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
-            map_version: Arc::new(AtomicU64::new(0)),
-            last_fault: AtomicU64::new(NO_FAULT),
-            fault_report: AtomicU64::new(NO_FAULT),
-            writes: 0,
-            null_guard: 0,
-            shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
-    }
-
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
     /// panics while holding it) rather than propagating the panic.
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
@@ -33376,8 +33310,7 @@ impl Mem {
     /// FORK.md PR 1 increment 3b — a **private** window copy for a live `fork()` twin: a fresh `Mem`
     /// with its **own** backing (a new `Region`) holding a byte-for-byte copy of this window's mapped
     /// prefix, and its own empty address space. Unlike [`fork_for_thread`](Mem::fork_for_thread) (shares
-    /// the `Arc<Region>` bytes) and [`nested_view`](Mem::nested_view) (shares bytes, confines), the twin
-    /// does **not** alias the parent's memory — a write by either copy after the fork is invisible to
+    /// the `Arc<Region>` bytes), the twin does **not** alias the parent's memory — a write by either copy after the fork is invisible to
     /// the other (POSIX-fork semantics). Requires a [`snapshot_safe`](Mem::snapshot_safe) window (no §13
     /// region aliasing, no non-prefix page protections — the shape [`Host::fork_powerbox`] already
     /// restricts a forkable domain to); returns `None` otherwise, fail-closed.
@@ -33435,19 +33368,17 @@ impl Mem {
             twin.space_write().prot = prot_copy;
         }
         // The `vm_map`-committed tail pages (collected above): copy the parent's bytes into the twin's
-        // own fresh backing — base-relative on both sides, like [`snapshot`](Mem::snapshot). Every byte
-        // of each page is written, so no zeroing first. The prot entries came over in `prot_copy`.
-        let base = self.window.base();
-        let tbase = twin.window.base();
+        // own fresh backing, like [`snapshot`](Mem::snapshot). Every byte of each page is written, so
+        // no zeroing first. The prot entries came over in `prot_copy`.
         if let Some(&last) = tail_pages.last() {
-            if !twin.back.grow_to(tbase + (last + 1) * self.page) {
+            if !twin.back.grow_to((last + 1) * self.page) {
                 return None;
             }
         }
         for &pg in &tail_pages {
             let off = pg * self.page;
             for i in 0..self.page {
-                twin.set_byte(off + i, self.byte(base + off + i));
+                twin.set_byte(off + i, self.byte(off + i));
             }
         }
         // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
@@ -33496,40 +33427,6 @@ impl Mem {
         default
     }
 
-    /// Build the memory view a **§14 nested child** runs over: it shares this (parent's) `Arc<Region>`
-    /// bytes — so the parent intrinsically sees all of the child's bytes (the superset, §14) — but
-    /// **confines** the child to the fully-mapped sub-window `[abs_base, abs_base + 2^size_log2)`
-    /// (window-absolute, in the shared backing's coordinates). The child sees a zero-based `[0, size)`
-    /// and cannot learn it is nested; trap-confinement ([`Window::sub`]) bounds the child to its slice.
-    ///
-    /// Unlike [`fork_for_thread`](Mem::fork_for_thread), the child gets its **own** address space (a
-    /// fresh, empty page-protection map + §13 region set), *not* the parent's: page protections are a
-    /// per-domain view, and the prot map is keyed window-relative, so a shared map would alias the
-    /// child's pages onto the parent's (a child `unmap` of *its* page 0 would hit the parent's). The
-    /// domains share **bytes**, not page-protection state — cross-domain memory sharing is §13, and
-    /// lazy paging is the parent fielding the child's faults (co-fiber), not a shared map.
-    fn nested_view(&self, abs_base: u64, size_log2: u8, shadow: ShadowArena) -> Mem {
-        let mut v = Mem {
-            shadow,
-            window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
-            page: self.page,
-            back: Arc::clone(&self.back),
-            space: Arc::new(RwLock::new(AddrSpace::default())),
-            has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
-            map_version: Arc::new(AtomicU64::new(0)),
-            last_fault: AtomicU64::new(NO_FAULT),
-            fault_report: AtomicU64::new(NO_FAULT),
-            writes: 0,
-            null_guard: 0,
-        };
-        // #964/#1094/#1206: a §14 child's carve reserves `[0, POWERBOX_NULL_GUARD)` like any window —
-        // the one canonical layout, on every engine's nested arm (this is the chokepoint they share).
-        // A carve smaller than the guard skips (`seed_null_guard`), so a tiny grandchild stays usable.
-        v.seed_null_guard(temen_ir::module_null_guard());
-        v
-    }
-
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed. A page
     /// absent from the map takes its region default — read+write in the initial prefix
     /// `[0, mapped)`, unmapped in the reserved tail (growth must be an explicit `map`).
@@ -33548,11 +33445,7 @@ impl Mem {
     /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
     /// unprotected windows pay nothing.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
-        // `base` is the *absolute* confined address; the page-map and `mapped` bound are
-        // window-relative (`rel == base` for a top-level window; offset by the sub-window base for a
-        // §14 child).
-        let rel = base.wrapping_sub(self.window.base());
-        let last = rel + width as u64 - 1;
+        let last = base + width as u64 - 1;
         // Lock-free fast path: the address space has never been mutated, so every page is in its
         // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
         // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
@@ -33563,7 +33456,7 @@ impl Mem {
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        for page in (rel / self.page)..=(last / self.page) {
+        for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 // A **recoverable** in-window page fault: record the confined address so a §14
                 // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
@@ -33663,15 +33556,13 @@ impl Mem {
     pub(crate) fn seed_pages(&mut self, mapped: u64, entries: &[(u64, u8)]) {
         let reserved = self.window.reserved();
         let mut high = self.window.mapped().max(mapped.min(reserved));
-        if self.window.base() == 0 {
-            for &(off, kind) in entries {
-                if kind == 1 && off == high {
-                    high = high.saturating_add(self.page).min(reserved);
-                }
+        for &(off, kind) in entries {
+            if kind == 1 && off == high {
+                high = high.saturating_add(self.page).min(reserved);
             }
-            if high > self.window.mapped() {
-                self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
-            }
+        }
+        if high > self.window.mapped() {
+            self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
         }
         if entries.is_empty() {
             return;
@@ -33693,12 +33584,6 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// #964/#1094 trap-on-NULL: seed the reserved NULL region for a module (unconditional guard) —
-    /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
-    /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
-    /// the JIT tiers' baked guard constant sound). `guard = 0` (a sub-window smaller than the guard) is
-    /// a no-op — those fast paths stay lock-free. The guard is a multiple of every supported page size
-    /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
     /// The module-declared shadow arena ([`ShadowArena::EMPTY`] when it declared none).
     pub(crate) fn shadow_arena(&self) -> ShadowArena {
         self.shadow
@@ -33732,13 +33617,17 @@ impl Mem {
         )
     }
 
+    /// #964/#1094 trap-on-NULL: seed the reserved NULL region for a module (unconditional guard) —
+    /// `[0, guard)` becomes `Unmapped` (a guest access traps exactly like native) and `prot_pages`
+    /// permanently refuses the page ops below `guard` (the `mmap_min_addr` analogue, which keeps
+    /// the JIT tiers' baked guard constant sound). `guard = 0` is a no-op — those fast paths stay
+    /// lock-free.
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
         // Page-exact or skip: on a host whose page exceeds the guard (e.g. 64 KiB aarch64), a
         // page-map seed would swallow live scratch above the guard — so the guard disengages, and
         // the native tier's `mprotect` seeding skips identically (per-platform trap parity). A
-        // window smaller than the guard (a tiny §14 sub-window of a marked module) also skips —
-        // seeding would unmap the whole window, and the native tier could not mirror it without
-        // protecting past the carve.
+        // window smaller than the guard (a module that declares less memory) also skips, as the
+        // native tier does: seeding would unmap the whole window.
         if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.window.mapped() {
             return;
         }
@@ -33769,9 +33658,8 @@ impl Mem {
         }
     }
 
-    /// The window-relative guest address of the run's last **fatal** memory fault (`base −
-    /// window.base()`; a top-level window's base is `0`, so a NULL deref reads back as `0`), for the
-    /// debugger to report a segfault's address (#1190). Reads the dedicated [`fault_report`] field
+    /// The guest address of the run's last **fatal** memory fault (a NULL deref reads back as `0`), for
+    /// the debugger to report a segfault's address (#1190). Reads the dedicated [`fault_report`] field
     /// (set by the NULL-guard arm of [`check_prot`]) first, then falls back to [`last_fault`] — which
     /// a top-level unmapped/read-only fault leaves set at the offending address (a satisfied §14
     /// recoverable fault clears it via `take_fault`, so no stale value survives). Non-clearing, so it
@@ -33786,18 +33674,18 @@ impl Mem {
         };
         match raw {
             NO_FAULT => None,
-            base => Some(base.wrapping_sub(self.window.base())),
+            base => Some(base),
         }
     }
 
-    /// Mark **every** page of this window unmapped — demand-paging it (§14 lazy paging): a coroutine
-    /// child started this way faults on first access of each page, suspending to the parent, which
-    /// supplies the page and resumes. The parent virtualizes the whole sub-window.
+    /// Mark **every** page of this window's declared extent unmapped — demand-paging it (§14 lazy
+    /// paging): a child started this way faults on first access of each page, and its pager supplies
+    /// the page (#1862/#1863).
     fn demand_page(&self) {
-        // `div_ceil` so a child smaller than one host page (e.g. a 4 KiB sub-window on a 16 KiB-page
-        // host) still gets its single covering page marked — confinement keeps its accesses in-window.
-        // The **declared** window, not the reservation: a carve's are equal, but a detached window
-        // reserves 2^37 bytes (#1863) — its tail is growth (`vm_map`), never pager-supplied.
+        // `div_ceil` so a window smaller than one host page (e.g. 4 KiB on a 16 KiB-page host) still
+        // gets its single covering page marked — confinement keeps its accesses in-window. The
+        // **declared** window, not the reservation: a detached window reserves 2^37 bytes (#1863) —
+        // its tail is growth (`vm_map`), never pager-supplied.
         let pages = self.window.mapped().div_ceil(self.page).max(1);
         let mut space = self.space_write();
         for p in 0..pages {
@@ -33810,9 +33698,8 @@ impl Mem {
     /// the page mapped before its bytes are in place. The write goes straight to the backing: the
     /// page is `Unmapped` until this call maps it.
     fn supply_page(&self, page: u64, bytes: &[u8]) {
-        let base = self.window.base() + page;
         for (k, b) in bytes.iter().enumerate() {
-            self.set_byte(base + k as u64, *b);
+            self.set_byte(page + k as u64, *b);
         }
         self.space_write()
             .prot
@@ -33879,7 +33766,7 @@ impl Mem {
     /// [`Self::exec_window`] carries over, so the new image's `_start` reads its own argv there.
     /// Only ever called once the exec is committed; the personality bounded the blob to the region.
     fn write_exec_args(&self, blob: &[u8]) {
-        self.write_run(self.window.base() + temen_ir::module_args_base(), blob);
+        self.write_run(temen_ir::module_args_base(), blob);
     }
 
     /// **Trap-confinement** (§4): bounds-check the `width`-byte access and reject any that leaves the
@@ -33891,14 +33778,13 @@ impl Mem {
     /// [`Window::checked`]) so a wild `addr+offset` that would overflow `u64` faults rather than
     /// wrapping into a valid offset.
     fn confine_checked(&self, addr: u64, offset: u64, width: u32) -> Result<u64, Trap> {
-        // `confine` returns the **absolute** address `base + (addr+offset)` (`base == 0` for a
-        // top-level window, the sub-window base for a §14 child); the guest `addr`/`offset` are
-        // window-relative, so the bound is on `addr+offset` directly. The returned absolute address
-        // indexes the (possibly parent-sized) backing.
-        self.last_fault.store(NO_FAULT, Ordering::Relaxed); // fresh: clear any prior page fault
-                                                            // The reserved-bound overflow-free arithmetic is temen-mask's (the one fuzzed reference). An
-                                                            // out-of-window fault is a real trap (not a recoverable page fault), so `last_fault` stays
-                                                            // cleared and `take_fault` returns `None` for the coroutine path to propagate the trap.
+        // Every window starts at 0 of its own backing (§14: a child owns a window of its own), so the
+        // guest `addr+offset` is both what is bounded and the backing index returned. A fresh check
+        // clears any prior page fault.
+        self.last_fault.store(NO_FAULT, Ordering::Relaxed);
+        // The reserved-bound overflow-free arithmetic is temen-mask's (the one fuzzed reference). An
+        // out-of-window fault is a real trap (not a recoverable page fault), so `last_fault` stays
+        // cleared and `take_fault` returns `None`.
         self.window
             .checked_reserved(addr, offset, width)
             .ok_or_else(|| self.report_out_of_window(addr, offset))
@@ -33932,8 +33818,7 @@ impl Mem {
     /// ([`Self::peek_fault_rel`]): an out-of-window refusal's, or the address the emitted tier's
     /// guard left for a fault in emitted code (#2126, #2275).
     pub(crate) fn report_fault_rel(&self, rel: u64) {
-        self.fault_report
-            .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
+        self.fault_report.store(rel, Ordering::Relaxed);
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -33989,8 +33874,7 @@ impl Mem {
     /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
     /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
     fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
-        let rel = base.wrapping_sub(self.window.base());
-        let last = rel + (len - 1);
+        let last = base + (len - 1);
         if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
             return Ok(());
         }
@@ -33998,7 +33882,7 @@ impl Mem {
         if space.prot.is_empty() && last < self.window.mapped() {
             return Ok(());
         }
-        for page in (rel / self.page)..=(last / self.page) {
+        for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(self.page_fault(base)),
                 Some(false) if write => return Err(self.page_fault(base)),
@@ -34197,8 +34081,8 @@ impl Mem {
     }
 
     /// §12 atomics share the confinement + page-protection path with `load`/`store`, and add a
-    /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). The
-    /// window base and reserved domain are width-aligned, so checking the confined address suffices.
+    /// **natural-alignment** requirement: a misaligned effective address traps (`MemoryFault`). A
+    /// window starts at 0 of its own backing, so checking the confined address suffices.
     /// Single-threaded, an atomic's *value* semantics equal the non-atomic op; the JIT lowers these
     /// to hardware atomics so they stay correct once threads exist (§12). All operate on the full
     /// `ty` width (`i32`/`i64`).
@@ -34228,9 +34112,7 @@ impl Mem {
         let space = self.space_read();
         let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(base.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(base / self.page))
         else {
             return None;
         };
@@ -34282,12 +34164,11 @@ impl Mem {
     /// and byte offset of a §13-aliased page, else the address.
     fn futex_site(&self, base: u64) -> FutexSite {
         if self.has_regions.load(Ordering::Relaxed) {
-            let rel = base.wrapping_sub(self.window.base());
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = self.space_read().prot.get(&(rel / self.page))
+            }) = self.space_read().prot.get(&(base / self.page))
             {
-                return FutexSite::Region(*region, region_off + rel % self.page);
+                return FutexSite::Region(*region, region_off + base % self.page);
             }
         }
         FutexSite::Anon(base)
@@ -34314,8 +34195,8 @@ impl Mem {
     }
 
     /// The identity of this window's anonymous backing for the futex key (#1283): the `Arc<Region>`
-    /// allocation address. Equal across every `Mem` that shares the backing (a `thread.spawn` fork, a §14
-    /// `nested_view`), distinct for every independently-minted window (root, detached, fork twin).
+    /// allocation address. Equal across every `Mem` that shares the backing (a `thread.spawn` fork),
+    /// distinct for every independently-minted window (root, detached child, fork twin).
     fn backing_ident(&self) -> u64 {
         Arc::as_ptr(&self.back) as *const u8 as u64
     }
@@ -34407,10 +34288,9 @@ impl Mem {
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
     /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
-        // `offset` is **guest-relative** — the zero-based window the guest sees (the whole `GuestMem`
-        // surface speaks guest coordinates; a §14 child names its own `[0, size)`, never its position
-        // in the parent). The prot map is keyed by the same relative pages
-        // (`check_prot`/`page_access`); only backing-store accesses add `window.base()`.
+        // `offset` is the guest's — every window starts at 0 of its own backing (a §14 child owns a
+        // window of its own) — so it keys the prot map (`check_prot`/`page_access`) and indexes the
+        // backing alike.
         if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
         }
@@ -34431,10 +34311,8 @@ impl Mem {
     /// range stays unbacked until the guest touches it — one call per range, never one per page.
     fn zero_pages(&self, pages: core::ops::RangeInclusive<u64>) {
         let (first, last) = pages.into_inner();
-        self.back.zero(
-            self.window.base() + first * self.page,
-            (last + 1 - first) * self.page,
-        );
+        self.back
+            .zero(first * self.page, (last + 1 - first) * self.page);
     }
 
     /// #2370 — `set` on each page of `pages` that a change to `prot` can alter ([`changed_runs`]),
@@ -34485,20 +34363,12 @@ impl Mem {
     /// don't fault). RO protection is page-granular, so a producer keeps RO data on its own pages
     /// (the verifier already bounds each segment to `[0, size)`).
     fn init_data(&mut self, data: &[Data]) {
-        self.init_data_at(data, 0);
-    }
-
-    /// Like [`init_data`], but place each (child-relative) segment at `win_base + offset` — the §14
-    /// sub-window's slice base, so segment bytes and their read-only protections land in the child's
-    /// region of the parent backing (matching trap-confinement, which confines child accesses to
-    /// `[win_base, win_base + size)`). `win_base == 0` is the ordinary top-level window.
-    fn init_data_at(&mut self, data: &[Data], win_base: u64) {
         // Byte writes first. No §13 regions exist at init, so each segment is one bulk write into
         // the backing — a single call even through a `Region::Foreign` (a detached child's own
         // `WebAssembly.Memory`), where a byte at a time is a host call per byte...
         let aliased = self.has_regions.load(Ordering::Relaxed);
         for d in data {
-            let at = win_base + d.offset;
+            let at = d.offset;
             if aliased {
                 for (i, &b) in d.bytes.iter().enumerate() {
                     self.set_byte(at + i as u64, b);
@@ -34507,13 +34377,11 @@ impl Mem {
                 self.back.write_from(at, &d.bytes);
             }
         }
-        // ...then the read-only protections, under one address-space write lock. The prot map is
-        // keyed by window-relative page (trap-confinement confines accesses to this window, and
-        // `check_prot` looks up relative pages), so fold the window base out of the absolute address.
+        // ...then the read-only protections, under one address-space write lock.
         let mut space = self.space_write();
         for d in data {
             if d.readonly && !d.bytes.is_empty() {
-                let first = (win_base + d.offset).wrapping_sub(self.window.base());
+                let first = d.offset;
                 let last = first + d.bytes.len() as u64 - 1;
                 for page in (first / self.page)..=(last / self.page) {
                     space.prot.insert(page, PageProt::Ro);
@@ -34541,12 +34409,11 @@ impl Mem {
     }
 
     /// Borrow-validate a `(ptr, len)` capability buffer (§7): every page of `[ptr, ptr+len)` must be
-    /// committed, and writable to `write` it. Returns where the buffer starts in the (possibly
-    /// parent-shared) backing, which is indexed absolutely, or `None` (→ `-EFAULT`). Confinement
-    /// holds regardless; this explicit check is the recoverable guest-bug path, not a safety boundary.
+    /// committed, and writable to `write` it. Returns where the buffer starts in the backing, or
+    /// `None` (→ `-EFAULT`). Confinement holds regardless; this explicit check is the recoverable
+    /// guest-bug path, not a safety boundary.
     fn buffer(&self, ptr: u64, len: u64, write: bool) -> Option<u64> {
-        self.range_committed(ptr, len, write)
-            .then(|| self.window.base() + ptr)
+        self.range_committed(ptr, len, write).then_some(ptr)
     }
 
     /// Read a capability buffer ([`Mem::buffer`]) one relaxed atomic byte at a time, which stays
@@ -34759,13 +34626,10 @@ impl Mem {
         }
         let idx = (off % self.page) as usize;
         let space = self.space_read();
-        // The prot map is keyed by window-relative page (base folds out; the within-page `idx` is
-        // unchanged since the base is page-aligned).
+        // The prot map is keyed by the window's own page.
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(off.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(off / self.page))
         {
             return space
                 .regions
@@ -34810,9 +34674,7 @@ impl Mem {
         let space = self.space_read();
         if let Some(PageProt::Backed {
             region, region_off, ..
-        }) = space
-            .prot
-            .get(&(off.wrapping_sub(self.window.base()) / self.page))
+        }) = space.prot.get(&(off / self.page))
         {
             // §13 aliased page: write through to the shared region backing.
             if let Some(r) = space.regions.get(region).and_then(Weak::upgrade) {
@@ -34836,15 +34698,10 @@ impl Mem {
         self.write_run(0, &init[..n]);
     }
 
-    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent). Reads are
-    /// **window-base-relative**: [`byte`](Mem::byte) indexes the shared backing *absolutely*, so a
-    /// nested view (`window.base() != 0` — a §14 carve) must offset by its base, or the snapshot would
-    /// capture the wrong slice of the backing (e.g. the parent's low memory). For a top-level window
-    /// (`base == 0`) this is identical to the old `byte(i)`. Fixes `fork_private` of a nested guest:
-    /// the twin now inherits the carve's high-offset globals, not zeros (FORK.md §8.6).
+    /// Snapshot the low `n` bytes of the window (clamped to the backed `mapped` extent).
     fn snapshot(&self, n: u64) -> Vec<u8> {
         // The per-run window capture and `fork_private`'s `window_snapshot` both flow through here.
-        self.read_run(self.window.base(), n.min(self.window.mapped()))
+        self.read_run(0, n.min(self.window.mapped()))
     }
 
     /// Whether the live memory state is **fully captured** by a [`window_snapshot`](Mem::window_snapshot)
@@ -34938,19 +34795,11 @@ impl Mem {
     }
 
     /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
-    /// base plus the window's absolute base offset — or `None` when the backing is non-flat (`Sparse`,
-    /// `Paged` or `Foreign`: no contiguous address, so the emitted tier cannot serve this window and it stays
-    /// interpreted — the fail-closed arm of the tier-up eligibility gate). For a §14 nested child
-    /// this is the parent backing's base plus the carve offset, so the same pointer arithmetic the
-    /// emitted `win + addr` accesses perform lands exactly where the interpreter's confined
-    /// accesses do.
+    /// base — or `None` when the backing is non-flat (`Sparse`, `Paged` or `Foreign`: no contiguous
+    /// address, so the emitted tier cannot serve this window and it stays interpreted — the
+    /// fail-closed arm of the tier-up eligibility gate).
     pub(crate) fn flat_win_base(&self) -> Option<*const u8> {
-        // `window.base() + reserved <= back.len()` by construction (`with_reservation*` size the
-        // backing to cover the window; `nested_view` carves are `carve_fits`-checked inside the
-        // parent window); `raw_base_at` re-checks the offset bound regardless.
-        self.back
-            .raw_base_at(self.window.base())
-            .map(|p| p as *const u8)
+        self.back.raw_base_at(0).map(|p| p as *const u8)
     }
 
     /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to
@@ -34958,12 +34807,9 @@ impl Mem {
     /// *not* the reservation: a cooperative run reserves `DEFAULT_RESERVED_LOG2` (the oracle's, so a
     /// guest `vm_map` past the declared window is admitted rather than `-EINVAL`) over a backing that
     /// starts at the declared size and grows on demand. Reporting the reservation there would tell a
-    /// driver to mirror a terabyte. For a §14 child carve the two agree — the parent backing covers
-    /// the whole carve — so this only ever narrows where narrowing is correct.
+    /// driver to mirror a terabyte.
     pub(crate) fn win_flat_len(&self) -> u64 {
-        self.window
-            .reserved()
-            .min(self.back.len().saturating_sub(self.window.base()))
+        self.window.reserved().min(self.back.len())
     }
 
     /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
@@ -34991,8 +34837,8 @@ impl Mem {
     /// the mapped prefix, extended to cover any grown reserved-tail page present in the map — so a
     /// `map`-grown heap is captured;
     /// uncommitted/unmapped pages inside it read zero (the demand-zeroed backing, and `map`/`unmap`
-    /// zero on commit), matching a fresh window. Only for the **root** window (`base == 0`); nested
-    /// children ride in the root capture.
+    /// zero on commit), matching a fresh window. Any domain's window: the root's, or a §14 child's
+    /// own (#1866).
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
         let high = self.high_water(&space);
@@ -35002,9 +34848,7 @@ impl Mem {
         // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
         // rather than millions of calls; the per-byte arm is a window that aliased a region, which a
         // reactor's §12 save-state (#2051) and a debugger checkpoint (#2026) capture, reading through
-        // it. Offset `0`, not
-        // `window.base()`, exactly as the per-byte arm's `self.byte(i)` indexes: this capture is
-        // root-only (see the doc above), where the two agree.
+        // it. Offset `0`, exactly as the per-byte arm's `self.byte(i)` indexes.
         let bytes = if !self.has_regions.load(Ordering::Relaxed) {
             let mut out = vec![0u8; high as usize];
             self.back.read_into(0, &mut out);
@@ -35050,50 +34894,6 @@ impl Mem {
         // taken keeps its bytes out of the restore (#2059). Same root-only offset convention as
         // `layout_snapshot`.
         self.back.write_from(0, &layout.bytes);
-    }
-
-    /// Capture just this window's page-protection map (window-relative page ⇒ state) for checkpointing a
-    /// §14 **child** window — a coroutine or `instantiate` child, whose *bytes* live in the parent backing
-    /// (shared via [`nested_view`](Mem::nested_view)) and ride in the parent's [`layout_snapshot`], but
-    /// whose page map is its own (a fresh `AddrSpace`, not the parent's). Precondition:
-    /// [`layout_snapshot_safe`](Mem::layout_snapshot_safe) (no §13 regions). Reinstated with
-    /// [`install_prot`](Mem::install_prot).
-    fn prot_snapshot(&self) -> Vec<(u64, PageProt)> {
-        let space = self.space.read_unpoisoned();
-        space.prot.iter().map(|(&pg, &p)| (pg, p)).collect()
-    }
-
-    /// Install a [`prot_snapshot`](Mem::prot_snapshot) into this freshly built child window — the page-map
-    /// half of a child restore (the byte half is the parent reseed the child's `nested_view` shares). No
-    /// reseed: the child's bytes are already correct in the shared backing.
-    fn install_prot(&self, prot: &[(u64, PageProt)]) {
-        if !prot.is_empty() {
-            self.space_write().prot = prot.iter().copied().collect();
-        }
-    }
-
-    /// Whether this child window's full extent `[base, base + reserved)` lies within `parent`'s mapped
-    /// prefix `[0, mapped)` — i.e. the child's bytes are wholly covered by the parent's
-    /// [`layout_snapshot`] (which reaches at least `parent.mapped`), so a child checkpoint need only carry
-    /// the child's page map. A child carved into the parent's uncommitted reserved tail is *not* covered
-    /// and stays outside the checkpointable subset.
-    fn nested_within_prefix(&self, parent: &Mem) -> bool {
-        self.window.base().saturating_add(self.window.reserved()) <= parent.window.mapped()
-    }
-
-    /// Seed the **whole parent backing** of a §14 sub-window (parent-absolute bytes), so the
-    /// escape-oracle starts with non-zero bytes *outside* the child's slice — a child write that
-    /// escaped its `[base, base+size)` slice would then perturb a byte the snapshot catches.
-    fn seed_parent(&self, init: &[u8]) {
-        for (i, &b) in init.iter().enumerate() {
-            self.set_byte(i as u64, b);
-        }
-    }
-
-    /// Snapshot the **whole parent backing** `[0, parent_bytes)` of a §14 sub-window (paired with
-    /// the JIT's `compile_and_run_capture_sub`, which returns the full parent window).
-    fn snapshot_parent(&self, parent_bytes: u64) -> Vec<u8> {
-        (0..parent_bytes).map(|i| self.byte(i)).collect()
     }
 
     /// Snapshot the low `min(reserved, max(mapped, snap_cap))` bytes for the escape-oracle —
@@ -35248,11 +35048,7 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        if self.back.can_grow()
-            && !self
-                .back
-                .grow_to(self.window.base() + (pages.end() + 1) * self.page)
-        {
+        if self.back.can_grow() && !self.back.grow_to((pages.end() + 1) * self.page) {
             return ENOMEM;
         }
         let runs = self.change_pages(pages, prot, |map, page| {
@@ -37566,7 +37362,7 @@ mod fork_powerbox_tests {
 mod mem_fork_tests {
     //! FORK.md PR 1 increment 3b — `Mem::fork_private`, the twin's **private** window copy. It copies
     //! the parent's mapped bytes into a fresh backing that does **not** alias the parent (POSIX-fork
-    //! memory semantics), distinct from `fork_for_thread`/`nested_view`, which share the backing bytes.
+    //! memory semantics), distinct from `fork_for_thread`, which shares the backing bytes.
     use super::*;
 
     #[test]
@@ -38209,59 +38005,10 @@ mod prot_tests {
         assert_eq!(child.load(tail, 0, LoadOp::I64), Err(Trap::MemoryFault));
     }
 
-    /// §14 nesting (interp `Mem` plumbing) under **trap-confinement**: a sub-window child admits an
-    /// access iff it lies within its own slice `[base, base + size)` of the parent backing and **faults**
-    /// on any out-of-child address (no aliasing back into the slice); every parent byte outside the slice
-    /// is therefore unreachable (stays zero). This is the interpreter half of running a guest in a nested
-    /// child window.
-    #[test]
-    fn sub_window_child_confined_to_its_slice() {
-        let base = 1u64 << 16; // child at 64 KiB
-        let size_log2 = 12u8; // 4 KiB child
-        let size = 1u64 << size_log2;
-        let parent = 1u64 << 17; // 128 KiB parent backing
-        let mut mem = Mem::sub_window(base, size_log2, parent, None);
-
-        // A store at child offset 8 lands at absolute base+8; a far offset (size+8) now **faults**
-        // (trap-confinement: no wrap), leaving the earlier write intact.
-        assert!(mem.store(8, 0, StoreOp::I64, Value::I64(0x1111)).is_ok());
-        assert_eq!(
-            mem.store(size + 8, 0, StoreOp::I64, Value::I64(0x2222)),
-            Err(Trap::MemoryFault),
-            "an out-of-child store faults, it does not wrap"
-        );
-        assert_eq!(mem.load(8, 0, LoadOp::I64), Ok(Value::I64(0x1111))); // untouched by the faulted store
-        assert_eq!(mem.confine_checked(8, 0, 8), Ok(base + 8)); // confined to the child's slice
-
-        // In-child offsets confine to `[base, base+size)`; every out-of-child address **faults**
-        // (never aliased back in).
-        assert_eq!(mem.confine_checked(0, 0, 1), Ok(base));
-        assert_eq!(mem.confine_checked(size - 1, 0, 1), Ok(base + size - 1));
-        for &a in &[size, size * 1000, u64::MAX, base, parent] {
-            assert_eq!(
-                mem.confine_checked(a, 0, 1),
-                Err(Trap::MemoryFault),
-                "out-of-child address {a:#x} must fault, not alias into the slice"
-            );
-        }
-
-        // Decisive: every parent byte *outside* the child's slice is untouched (unreachable).
-        for i in 0..parent {
-            if i < base || i >= base + size {
-                assert_eq!(
-                    mem.back.byte(i),
-                    0,
-                    "child wrote outside its slice at {i:#x}"
-                );
-            }
-        }
-    }
-
     /// #1283 (PROCESS.md S1c): the anonymous futex key is **per backing**, not per address. Two
-    /// independently-minted windows — the root and a detached child, or two detached siblings — all have
-    /// `window.base() == 0`, so the same guest offset is the same confined absolute address; keying on
-    /// the address alone made them share a wait queue. A §14 nested child shares its parent's backing
-    /// and must keep rendezvousing with it at the same backing-absolute byte.
+    /// independently-minted windows — the root and a detached child, or two detached siblings — name
+    /// the same guest offset by the same address; keying on the address alone made them share a wait
+    /// queue.
     #[test]
     fn anon_futex_key_is_per_backing() {
         let off = 2048u64;
@@ -38272,58 +38019,6 @@ mod prot_tests {
             a.futex_key(off),
             b.futex_key(off),
             "two independent windows at the same offset must not share a futex queue"
-        );
-        let parent = Mem::with_reservation(20, 17, None);
-        let child = parent.nested_view(1 << 16, 12, ShadowArena::EMPTY);
-        let abs = (1u64 << 16) + 8;
-        assert_eq!(
-            parent.futex_key(abs),
-            child.futex_key(abs),
-            "a nested child shares its parent's backing: same byte, same key"
-        );
-    }
-
-    /// §14 nesting: a child's `AddressSpace`-style `map`/`unmap` (page protection) now works on a
-    /// sub-window `Mem`. The prot map is keyed window-relative, so the base folds out consistently —
-    /// before the fix, `unmap` on a sub-window `-EINVAL`'d (its absolute address was bounded against
-    /// the child's window-relative `reserved`). A page unmapped via its **absolute** (§14-shifted)
-    /// address faults a later plain access; re-`map` recommits it zeroed; and an address below the
-    /// child's base or past its top is out of range.
-    #[test]
-    fn sub_window_page_protection_is_window_relative() {
-        let base = 1u64 << 16; // child at 64 KiB
-        let size_log2 = 16u8; // 64 KiB child (≥ one host page, so a whole page fits)
-        let parent = 1u64 << 18; // 256 KiB parent backing
-        let p = page();
-        let mut mem = Mem::sub_window(base, size_log2, parent, None);
-
-        // Initially fully mapped: a store/load at child offset 0 works.
-        assert!(mem.store(0, 0, StoreOp::I64, Value::I64(0xABCD)).is_ok());
-        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0xABCD)));
-
-        // Unmap the child's first page via its **guest-relative** offset 0 (the whole `GuestMem`
-        // surface speaks the zero-based window the guest sees; the page lands at `base` in the
-        // shared parent backing).
-        assert_eq!(mem.unmap(0, p), 0, "sub-window unmap should succeed");
-        assert_eq!(
-            mem.load(0, 0, LoadOp::I64),
-            Err(Trap::MemoryFault),
-            "an access to the child's unmapped page must fault"
-        );
-        // A different page still within the child is unaffected.
-        assert!(mem.store(p, 0, StoreOp::I64, Value::I64(0x1234)).is_ok());
-
-        // Re-map recommits the page, zeroed — and the backing byte that changed is the *parent's*
-        // byte at `base` (the child's slice), not the parent's page 0.
-        assert_eq!(mem.map(0, p, PROT_WRITE), 0);
-        assert_eq!(mem.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
-
-        // The child cannot name anything at/past its own window top — its reserved domain is
-        // `[0, size)`, wherever that sits in an ancestor's window.
-        assert_eq!(
-            mem.unmap(1u64 << size_log2, p),
-            EINVAL,
-            "at/after the child's window top is out of range"
         );
     }
 

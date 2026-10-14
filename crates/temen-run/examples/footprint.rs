@@ -55,8 +55,7 @@ fn jit_compile(m: &Module) -> (temen_jit::CompiledModule, usize) {
         0,
         temen_jit::INERT_CAP_THUNK,
         std::ptr::null_mut::<c_void>(),
-        28,   // reserved_log2: a virtual range only; doesn't affect code size or resident pages
-        None, // sub
+        28,
         None, // resolve_module
         None, // interrupt
         None, // fuel

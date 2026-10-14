@@ -61,8 +61,9 @@ Grounding the proposal in what already exists (verified against the tree):
   (`PageProt`) and bulk snapshot-read (`read_into`, `SNAP_CAP`) already exist for the
   escape-oracle. **Restore (write pages back + re-establish prots) does not exist yet
   and is new escape-TCB code** — see §6/§9.
-- **Nesting is real.** A child window is a power-of-two sub-range of the parent's via
-  `Window::sub()` (`crates/temen-mask/src/lib.rs`). This is the §4 subtree.
+- **Nesting is real.** A child window was a power-of-two sub-range of the parent's via
+  `Window::sub()` (`crates/temen-mask/src/lib.rs`), the §4 subtree. *(Retired: every §14 child now
+  has a window of its own, and `Window::sub` is deleted, #1867.)*
 - **The oracle is production machinery.** `crates/temen/tests/jit_diff.rs` and
   `fuzz/fuzz_targets/diff.rs` already run every program on interp and JIT and assert
   equivalence. The new snapshot property (§7) plugs straight in.
@@ -296,7 +297,7 @@ is a parser over attacker-controlled frames in the host.
   verification, so guest-driven JIT composes for free.
 - **Snapshot unit = the domain, closed over its nesting subtree (§14).** State lives
   in the domain (window, vCPUs/fibers, handle/dispatch tables); a **nested** child's window
-  is a power-of-two sub-range of the parent's (`Window::sub`), and a fault-suspended child
+  was a power-of-two sub-range of the parent's (`Window::sub`, deleted with the carve, #1867), and a fault-suspended child
   can only be drained-then-unwound if its code is instrumented. A **detached** child (its own
   window, not a sub-range — §14 / DETACHED_JIT.md) is *not* covered by this subtree freeze:
   under the freeze-authority ruling (INVARIANTS #14, #1289 R1) it freezes as its own
