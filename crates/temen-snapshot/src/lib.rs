@@ -261,7 +261,11 @@ use temen_ir::Module;
 /// v41 (#2268): a budget vector in Section 10 has a sixth field, `maps`, the OS mappings its subtree
 /// causes the host. Its charge rides as 0, like `channel`'s: the thaw re-charges every window, vCPU
 /// and region it rebuilds.
-const FORMAT_VERSION: u16 = 41;
+/// v42 (#2365): a capability handle is `(generation << 10) | slot`, its generation 21 bits, where it
+/// was `<< 8` and 24 bits: a domain's table has 1,024 slots. The records are unchanged, but the
+/// window image holds the guest's handle values, which a v41 artifact wrote in the old layout and a
+/// thaw would decode to the wrong slots; so a v41 artifact is refused.
+const FORMAT_VERSION: u16 = 42;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.

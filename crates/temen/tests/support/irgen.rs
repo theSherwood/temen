@@ -1184,9 +1184,9 @@ pub mod detached_probe;
 
 /// The handle value of the **first** `grant_memory` on a fresh `Host`: the encoding is
 /// `(generation << CAP_LOG2) | slot` with the generation bumped to 1 on the first grant and slot
-/// 0, i.e. `1 << 8`. The generator emits valid Memory `call.cap`s against this constant, and the
+/// 0, i.e. `1 << 10`. The generator emits valid Memory `call.cap`s against this constant, and the
 /// harness asserts the grant actually yields it (so a change to the encoding fails loudly here).
-const MEMORY_HANDLE: i32 = 1 << 8;
+const MEMORY_HANDLE: i32 = 1 << 10;
 
 fn to_slot(v: Value) -> i64 {
     match v {
