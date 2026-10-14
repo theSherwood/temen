@@ -225,10 +225,11 @@ pub fn rows() -> Vec<Row> {
                 (h, x)
             }),
         ),
+        // op 3 is `close` (#2384).
         row(
             Capability::Budget,
             c::BUDGET,
-            &[0, 1],
+            &[0, 1, 3],
             Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_budget(-1, 1 << 16, 4);
@@ -325,6 +326,18 @@ fn build_probe(
         "i32" => ("i32", "  vw = i64.extend_i32_s vr\n  return vw"),
         _ => ("i64", "  return vr"),
     };
+    // An Instantiator op answers the results its contract names (`temen_ir::instantiator_contract`),
+    // and every engine traps a call declaring any other count `CapFault` before the op is reached. So
+    // the probe declares that many, `result` the first's type and the rest `i64`, and returns the
+    // first: `join` answers `(status, value)` (#2066).
+    let extra = match iface {
+        temen_ir::cap_id::INSTANTIATOR => {
+            temen_ir::instantiator_contract(op).map_or(0, |(_, r)| r.len().saturating_sub(1))
+        }
+        _ => 0,
+    };
+    let names: String = (0..extra).map(|i| format!(", vx{i}")).collect();
+    let call_res = format!("{call_res}{}", ", i64".repeat(extra));
     // The only difference between the two entry shapes: a unit is handed its handle widened (the
     // `Jit.invoke` marshalling ABI is i64-only), so it narrows it back before the call.
     let (sig, narrow) = match entry {
@@ -336,7 +349,7 @@ fn build_probe(
     };
     let src = format!(
         "memory 16\nfunc {sig}\n{narrow}{body}  \
-         vr = call.cap {iface} {op} ({params}) -> ({call_res}) vh ({args})\n{tail}\n  }}\n}}\n"
+         vr{names} = call.cap {iface} {op} ({params}) -> ({call_res}) vh ({args})\n{tail}\n  }}\n}}\n"
     );
     let m = temen_text::parse_module(&src).expect("the generated module parses");
     temen_verify::verify_module(&m).expect("the generated module verifies");

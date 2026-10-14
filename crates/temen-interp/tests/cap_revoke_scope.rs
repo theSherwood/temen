@@ -46,7 +46,7 @@ block 0 (v0: i32, vin: i32, vout: i32, vbud: i32, vmod: i32) {
   vma = i64.const 16400
   vm = i64.load vma
   vtj = thread.join vt
-  vk = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vk_st, vk = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vmil = i64.const 1000000000
   vmm = i64.mul vm vmil
   vthou = i64.const 1000

@@ -195,7 +195,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -250,7 +250,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.import 0 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -345,7 +345,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 9
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vr = i64.extend_i32_s v7
   vs = i64.add vr vj
   return vs
@@ -452,8 +452,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i32.store vrbb v1
   vrpb = i64.const 17760
   vB = call.cap 6 17 (i64) -> (i32) v0 (vrpb)
-  vjB = call.cap 6 1 (i32) -> (i64) v0 (vB)
-  vjA = call.cap 6 1 (i32) -> (i64) v0 (vA)
+  vjB_st, vjB = call.cap 6 1 (i32) -> (i64, i64) v0 (vB)
+  vjA_st, vjA = call.cap 6 1 (i32) -> (i64, i64) v0 (vA)
   vk = i64.const 100
   vm = i64.mul vjA vk
   vs = i64.add vm vjB

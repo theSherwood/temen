@@ -10,9 +10,9 @@ once it closes.
 > modes live natively and across real Web Workers (spawn/join + futex + atomics, §22 JIT, §14
 > children, shared-`Host` I/O, the playground). Threads-touching work since then lives in its
 > owning docs: **per-Worker wasm-JIT tier-up** of the parallel driver's vCPUs
-> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `vcpu_tierup.rs`, `threads-spawn.mjs
-> TEMEN_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
-> per-Worker codegen and the `VcpuReactor` frame loop over the resumable vCPU) in `BROWSER.md`;
+> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `threads-spawn.mjs TEMEN_TIERUP=1` → 4000
+> with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14 per-Worker codegen) in
+> `BROWSER.md`;
 > `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
 > in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
 > the cross-domain futex for async §14 children) in `PROCESS.md`.
@@ -264,7 +264,8 @@ property, so in practice:
       children, each compiled+pushed, data materialized, run, joined → oracle's value) and a
       `instantiate_module` case in `parallel_instantiate_miri.rs` (data-materialization + cross-thread
       access over the pushed module, race/UB-clean).
-    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)**: resolve + compile + push the granted module,
+    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)** *(retired with the coroutine ops, #2065)*:
+      resolve + compile + push the granted module,
       materialize its data segments (demand-page for op 7), and build the `Coro` in the vCPU's
       coroutine set — driven **inline** by `resume` (no thread), so it then runs exactly as a
       same-module coroutine already does in this driver. With this, **every** multi-vCPU `VcpuStop` is
@@ -278,7 +279,8 @@ property, so in practice:
       during `resume`, so the resumable vCPU must carry a **real powerbox** (not the deny-all default)
       — [`Vcpu::new_root_with_powerbox`]. With the grant in its own host, a §14 op is then serviced
       *internally* (no host-serviced event, unlike JIT C1).
-      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`**: serviced inside `Vcpu::run`
+      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`** *(retired with the
+        coroutine ops, #2065)*: serviced inside `Vcpu::run`
         (resolve the granted module from the vCPU's own powerbox, build the inline `Coro`), so the host
         sees no §14 event; the coroutine then runs inline via `resume`. Proven by
         `bytecode_vcpu_coroutine_module.rs` (a powerbox-carrying root vCPU builds + resumes 8

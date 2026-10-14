@@ -174,7 +174,7 @@ fn code_naming_an_object_one_instance_owns_is_not_shared() {
     let nests = "memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = call.cap 6 1 (i32) -> (i64) v0 (v0)
+  v1_st, v1 = call.cap 6 1 (i32) -> (i64, i64) v0 (v0)
   return v1
   }
 }

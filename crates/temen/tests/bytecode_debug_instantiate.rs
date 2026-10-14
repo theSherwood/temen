@@ -53,7 +53,7 @@ block 0 (v0: i32, vb: i32, vc1: i32, vc2: i32) {
   i32.store ga gz offset=12
   rp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (rp)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   return v6
   }
 }
@@ -75,7 +75,7 @@ block 0 (v0: i64) {
   i32.store cm hg
   cp = i64.const 17536
   v8 = call.cap 6 17 (i64) -> (i32) v1 (cp)
-  v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
+  v9_st, v9 = call.cap 6 1 (i32) -> (i64, i64) v1 (v8)
   return v9
   }
 }

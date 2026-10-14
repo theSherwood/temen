@@ -17,7 +17,8 @@ use temen_text::parse_module;
 /// Root `(instantiator, module, budget, stdout) -> i64`: spawns the child (op 15, entry 0, a 64 KiB
 /// window its budget pays for) with its stdout re-granted as `"stdout"`. Then 8 times it stores in
 /// its window the budget's `mem` room, which the child's window charges; then it joins the child and
-/// returns what it returns.
+/// returns `status * 1000 + value`: what the child returned, or its trap's wire code times 1000
+/// (#2066).
 const ROOT: &str = r#"memory 17
 data 17472 "stdout"
 func (i32, i32, i32, i32) -> (i64) {
@@ -50,8 +51,11 @@ block 1 (vi: i32, vbu: i32, vch: i32, vn: i64) {
   br_if vmore 1(vi, vbu, vch, vn2) 2(vi, vch)
 }
 block 2 (vi2: i32, vch2: i32) {
-  vj = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
+  vk = i64.const 1000
+  vs = i64.mul vj_st vk
+  vt = i64.add vs vj
+  return vt
   }
 }
 "#;
@@ -187,9 +191,9 @@ fn a_live_detached_child_rides_every_checkpoint() {
     let (result, out) = rides_every_checkpoint(CHILD);
     assert_eq!(
         (result.as_str(), out.as_str()),
-        ("Err(MemoryFault)", "0123"),
+        ("Ok([I64(8000)])", "0123"),
         "the uninterrupted run: the child's last load faults on the page it unmapped, and its join \
-         re-raises the fault"
+         answers `MEMORY_FAULT`"
     );
 }
 
@@ -313,7 +317,7 @@ block 0 (v0: i32, v1: i32, v2: i32, vout: i32) {
   vlog = i64.const 16
   vq = i64.const 0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vg, vgn, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vz = i64.const 0
   br 1(vout, vz)
 }
@@ -415,7 +419,7 @@ block 0 (vi: i32, vbud: i32, vmod: i32) {
   a10 = i64.const 17616
   i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }
@@ -721,7 +725,7 @@ block 0 (vi: i64, vas: i64) {
   a10 = i64.const 17616
   i64.store a10 vz
   vh = call.cap 6 17 (i64) -> (i32) vi (a0)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }
 }

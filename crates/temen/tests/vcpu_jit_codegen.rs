@@ -9,7 +9,7 @@
 //! services each `JitInvoke` by computing the unit on a standalone bytecode run (exactly what the
 //! emitted region computes) and delivering the i64 result slots — then asserts the whole-vCPU result
 //! is **identical** to servicing the same event the interpreter way. So the codegen marshalling (args
-//! in, results out, resume) is exact, the same contract `vcpu_tierup.rs` holds for the tier-up seam.
+//! in, results out, resume) is exact, the same contract `coop_tierup.rs` holds for the tier-up seam.
 
 use std::sync::{Arc, Mutex};
 use temen_interp::{bytecode, Host, Region, Trap, Value};

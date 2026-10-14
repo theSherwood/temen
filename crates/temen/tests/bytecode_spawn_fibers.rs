@@ -74,7 +74,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   gz = i64.const 0
   sl = i64.const {CHILD_LOG2}
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
   k = i64.const 1000
@@ -193,7 +193,7 @@ block 1 (i1: i32, c1: i32) {
   br_if more 1(i1, c1) 2(i1, c1)
   }
 block 2 (i2: i32, c2: i32) {
-  vr = call.cap 6 1 (i32) -> (i64) i2 (c2)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) i2 (c2)
   return vr
   }
 }

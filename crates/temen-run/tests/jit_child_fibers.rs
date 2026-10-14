@@ -72,7 +72,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   gz = i64.const 0
   sl = i64.const {CHILD_LOG2}
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
   k = i64.const 1000
@@ -162,7 +162,8 @@ fn a_detached_child_has_its_own_fiber_registry_on_the_jit() {
     );
 }
 
-/// A parent with no fibers of its own: spawns the child, returns its join status.
+/// A parent with no fibers of its own: spawns the child, joins it, and returns `status * 1000 +
+/// value` (#2066).
 fn spawner_src() -> String {
     format!(
         "memory {PARENT_LOG2}
@@ -173,8 +174,11 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   gz = i64.const 0
   sl = i64.const {CHILD_LOG2}
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  vk = i64.const 1000
+  vsk = i64.mul vr_st vk
+  vt = i64.add vsk vr
+  return vt
   }}
 }}"
     )
@@ -194,8 +198,11 @@ block 0 (vs: i64) {{
   }}
 }}"
     );
-    let got = parity(&spawner_src(), &child);
-    assert!(got != Ok(7), "the suspend did not fault");
+    assert_eq!(
+        parity(&spawner_src(), &child),
+        Ok(temen_ir::trap_code::FIBER_FAULT * 1000),
+        "the suspend faults, and the parent's join answers it"
+    );
 }
 
 /// The child's fiber waits on a window word with a 1 ms timeout. Its `cont.resume` reports

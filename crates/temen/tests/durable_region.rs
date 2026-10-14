@@ -488,7 +488,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vrh: i32) {
   vlen = i64.const 65536
   vprot = i64.const 3
   vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vrh (vwin, gz, vlen, vprot)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   vq = i64.const 131088
   vy = i64.load vq
   vy2 = i64.add vy vy
@@ -797,7 +797,7 @@ FLIP
   vwoke = atomic.notify vwin vone
   vgat = i64.const 196608
   vm2 = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vgr (vgat, gz, vlen, vprot)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   vq = i64.const 196624
   vy = i64.load vq
   vy2 = i64.add vy vy

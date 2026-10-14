@@ -6,7 +6,9 @@
 //! page edge — so the table carries interleaved `Unmapped`/`Rw`/`Ro` runs, holes, and re-committed
 //! pages, and the access straddles every kind of state transition. The emitted check must trap
 //! `MemoryFault` exactly where the interpreter's `check_prot`/`check_prot_span` does, with identical
-//! window bytes. A crash is a page-check confinement miscompile. The stable `pagestate_diff` test
+//! window bytes, both when the leaf tiers up and when the guest runs whole as the pump's root leaf
+//! (its page ops bounced, the table rebuilt after each). A crash is a page-check confinement
+//! miscompile. The stable `pagestate_diff` test
 //! drives the *same* `fuzz_one_pagestate` from seeds; INVARIANTS #2/#9, AGENTS.md ("fuzz the masking
 //! lowering as its own unit").
 //!

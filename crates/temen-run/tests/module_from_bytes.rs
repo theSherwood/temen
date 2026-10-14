@@ -62,7 +62,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vnone = i32.const -1
   i32.store vr0 vnone offset=72
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }

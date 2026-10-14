@@ -83,7 +83,7 @@ int  __px_argc(int h);
 long __px_argv(int h, long i, void *buf, long cap);
 long __px_exec_win(int h, long module);
 long __spawn_rec(int inst, long rec);
-long __join(int inst, long child);
+long __vm_instantiate_join(int inst, long child, long *status);
 int __vm_cap_count(void);
 int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
@@ -154,13 +154,16 @@ int main(void){
   w[18] = -1;                                 /* no pre-mapped region */
   long child = __spawn_rec(__inst(), (long)spawn);
   if (child < 0) return 126;
-  return __join(__inst(), child);
+  long st;
+  long r = __vm_instantiate_join(__inst(), child, &st);
+  return st == 0 ? r : 128;                    /* a command's trap is a crash status, not ours */
 }
 "#;
 
 /// Link the shim's import names — the shell demo's one resolver ([`temen_run::shell_demo_resolver`]):
-/// `__px_*` through [`temen_posix::resolve`], `__spawn_rec`/`__join` the shell's own `Instantiator`
-/// ops (17 / 1). No handle is baked at link: each lowered `call.cap` dispatches on the guest's own
+/// `__px_*` through [`temen_posix::resolve`], `__spawn_rec` the shell's own `Instantiator` op 17 (its
+/// join is chibicc's `__vm_instantiate_join` builtin, op 1). No handle is baked at link: each lowered
+/// `call.cap` dispatches on the guest's own
 /// handle operand, discovered at run time via `__vm_cap_count`/`__vm_cap_at` reflection (§3c
 /// protection at the boundary, IMPORTS.md §2.3 dynamic mode).
 fn link_shim(name: &str) -> Option<Resolved> {

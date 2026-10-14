@@ -49,7 +49,7 @@ block 0 (vinst: i32, vbud: i32, vmod: i32) {{
   i32.store rb vnode
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   one = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) vnode (one)
   k = i64.const 1000000

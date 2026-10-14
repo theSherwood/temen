@@ -23,7 +23,7 @@ const GUEST = process.argv[3] ?? 'corpus/threads.temenc';
 const EXPECT = BigInt(process.argv[4] ?? 4000);
 
 const STACK = 1 << 20; // per-Worker stack
-const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
+const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8, a trapped child's trap wire code]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 // Event codes (must match browser/src/lib.rs PAR_*).
@@ -113,6 +113,7 @@ async function worker() {
       return;
     }
     if (ev === TRAP) {
+      i64()[(slot + 8) >> 3] = ex.temen_par_ev_e(v); // the trap's wire code, for the joiner (#2066)
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
       // A root-domain member's trap ends the run (DESIGN.md §12, I37); see web/worker.js.

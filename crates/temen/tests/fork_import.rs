@@ -78,7 +78,7 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   i32.store qgb vbud
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }

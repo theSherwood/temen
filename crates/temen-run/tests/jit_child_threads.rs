@@ -17,8 +17,9 @@ use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 const PARENT_LOG2: u8 = 23;
 const CHILD_LOG2: u8 = 16;
 
-/// The parent (args `(instantiator, child module, budget)`): spawns the child detached and returns
-/// its join status.
+/// The parent (args `(instantiator, child module, budget)`): spawns the child detached, joins it, and
+/// returns `status * 1000 + value`: what the child returned, or its trap's wire code times 1000
+/// (#2066).
 fn parent_src() -> String {
     format!(
         "memory {PARENT_LOG2}
@@ -29,8 +30,11 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   gz = i64.const 0
   sl = i64.const {CHILD_LOG2}
   ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  vk = i64.const 1000
+  vsk = i64.mul vr_st vk
+  vt = i64.add vsk vr
+  return vt
   }}
 }}"
     )
@@ -238,7 +242,7 @@ block 0 (vsp: i64, varg: i64) {{
 }
 
 /// A trap in a child's vCPU ends the child's domain — its root, parked in the join, included — and
-/// the parent's join of the child reports it, as on the oracle.
+/// the parent's join of the child answers it, as on the oracle: the thread's `1 / 0`.
 #[test]
 fn a_trap_in_a_childs_thread_ends_the_child() {
     let child = format!(
@@ -260,8 +264,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    let got = parity(&child);
-    assert!(got.is_err(), "the child's trap surfaces: {got:?}");
+    assert_eq!(parity(&child), Ok(temen_ir::trap_code::DIV_BY_ZERO * 1000));
 }
 
 /// A child's root that returns while a vCPU it spawned still runs: the child's outcome is the

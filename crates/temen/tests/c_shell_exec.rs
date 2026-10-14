@@ -109,7 +109,9 @@ int main(int argc, char **argv){
   g[0].name = "stdout";
   g[0].handle = (int)out;
   long child = vm_spawn(mod, 17, g, 1, ab, p - ab, scratch);
-  return (int)vm_join(child);
+  long st;
+  long r = vm_join(child, &st);
+  return st == 0 ? (int)r : 128;   /* a command that ended in a trap: a crash status, not ours */
 }
 "#;
 
@@ -142,10 +144,11 @@ int main(int argc, char **argv){
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = (int)out;
+  long st;
   long a = vm_spawn(mod, 17, g, 1, 0, 0, scratch);
-  long ra = vm_join(a);
+  long ra = vm_join(a, &st);
   long b = vm_spawn(mod, 17, g, 0, 0, 0, scratch);
-  long rb = vm_join(b);
+  long rb = vm_join(b, &st);
   return (int)(ra * 10 + rb);
 }
 "#;

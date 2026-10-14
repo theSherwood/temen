@@ -73,9 +73,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vh1 = ${OP15}vb1, vl)
   vh2 = ${OP15}vb2, vl)
   vh3 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr0 = call.cap 6 1 (i32) -> (i64) v0 (vh0)
-  vr1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
-  vr2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vr0_st, vr0 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh0)
+  vr1_st, vr1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
+  vr2_st, vr2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vs0 = i64.add vr0 vr1
   vs1 = i64.add vs0 vr2
   vh3x = i64.extend_i32_s vh3
@@ -143,7 +143,7 @@ block 0 (v0: i32, vm: i32, vbud: i32) {
   vnone = i32.const -1
   i32.store vr9 vnone
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }
@@ -178,7 +178,7 @@ block 0 (v0: i32) {
   vslog = i64.const 16
   vq = i64.const 0
   vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ve, voff, vslog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }

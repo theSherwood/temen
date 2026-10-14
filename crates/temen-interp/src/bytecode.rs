@@ -12,16 +12,13 @@
 //! capability seam (generic `call.cap` + `self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
-//! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
-//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window — including the
-//! separate-**module** and **demand** (fault-driven-yield, lazy-paged) variants) and §14 **executor
-//! children** (`Instantiator.instantiate`/`join` + the separate-module variant, scheduler-driven over
-//! a confined child env with an attenuated `Instantiator`+`AddressSpace` powerbox and a `quota`
-//! sub-budget) — §14 is fully covered (ops 0–7). Faithful for the
-//! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
-//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an installed unit) over a
-//! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
-//! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
+//! ([`drive`]) over one shared `Mem`; and §14 **executor children** (the `Instantiator`'s op-17
+//! spawn and its `join`/`poll`/`detach`/`kill`/`child_offer`/`grant`, scheduler-driven over a child
+//! env with a window of its own and an attenuated `Instantiator`+`AddressSpace` powerbox, paid from a
+//! `Budget`). Faithful for the interleaving-invariant programs the oracle uses; and §22
+//! **guest-driven JIT units** (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an
+//! installed unit) over a multi-module [`Domain`] (a runtime dispatch table spanning `mods`;
+//! `invoke` runs a unit nested over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call.dyn`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
@@ -37,8 +34,8 @@
 //! via `run_fast`/`run_with_host_fast` (and, with a trap-time backtrace, `run_with_host_fast_traced`).
 //! Correctness is gated by exact-equality harnesses against the tree-walker (`bytecode_diff.rs` — which
 //! also checks trap-backtrace parity on every trapping generated module, `bytecode_{caps,fibers,threads,
-//! coroutines,instantiate,separate_module,demand_coroutine,tailcall,debug,traced,gc_roots,durable,
-//! dynlink}.rs`; `gc_roots` checks soundness rather than equality; `durable` checks freeze/thaw artifact
+//! instantiate,separate_module,tailcall,debug,traced,gc_roots,durable,dynlink}.rs`; `gc_roots` checks
+//! soundness rather than equality; `durable` checks freeze/thaw artifact
 //! + round-trip equality; `traced` checks trap-time backtrace `IrPc`-equality with `run_with_host_traced`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
@@ -551,16 +548,14 @@ enum Op {
         rec: u32,
         dst: u32,
     },
-    /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` finishes; its result
-    /// (or trap) lands at `dst`. `handle` is the Instantiator cap (authority). The join itself reuses
-    /// the §12 thread machinery — children share one handle namespace (`threads`) with `thread.spawn`.
-    /// With `wait` it is `Instantiator.wait` (op 18): how the child ended lands at `dst` instead
-    /// ([`super::join_delivery`]).
+    /// §14 `Instantiator.join(child)` (op 1): park until executor child `child` ends; how it ended
+    /// lands at `dst` and `dst + 1`, `(status, value)` ([`super::join_delivery`]). `handle` is the
+    /// Instantiator cap (authority). The join itself reuses the §12 thread machinery — children share
+    /// one handle namespace (`threads`) with `thread.spawn`.
     InstJoin {
         handle: u32,
         child: u32,
         dst: u32,
-        wait: bool,
     },
     /// §12 `memory.wait`: futex wait (`ty`-wide) on `addr` while it equals `expected`, up to
     /// `timeout` ns; the status (0/1/2) lands at `dst`. Scheduler-driven.
@@ -635,9 +630,10 @@ enum Op {
         want_results: Box<[ValType]>,
     },
     Unreachable,
-    /// A `CapFault` trap: an `Instantiator` op the oracle has no arm for, which it refuses after the
-    /// handle resolves (a forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5
-    /// and 13, #1867) and the deleted coroutine ops (#2069).
+    /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
+    /// (`temen_ir::instantiator_contract`), which the oracle refuses after the handle resolves (a
+    /// forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5 and 13, #1867), `wait`
+    /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
     /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
@@ -1191,7 +1187,7 @@ block 0 () {
   vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
   vz = i32.const 0
   vn = svc.wait vz
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vr = i64.add vn vj
   return vr
   }
@@ -1664,15 +1660,14 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
             }
             for inst in &b.insts {
                 match inst {
-                    // ops 1/18 = join/wait, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // ops 9/10/12 = poll/detach/kill, ops 14/19 = child_offer/grant (all executor
-                    // children, scheduler-driven). Every other INSTANTIATOR op traps `CapFault`
+                    // Every live op (`temen_ir::instantiator_contract`) drives executor children,
+                    // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
                     // (`Op::CapFault`), so it is no seam.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19,
+                        op,
                         ..
-                    } => s.has_instantiate = true,
+                    } if temen_ir::instantiator_contract(*op).is_some() => s.has_instantiate = true,
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         ..
@@ -2353,20 +2348,14 @@ fn compile_module_with(
     escape: bool,
     mut memo: Option<&mut FuncMemo>,
 ) -> Option<Compiled> {
-    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
-    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
-    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
-    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
-    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
-    // are different: they run on the scheduler like threads, not inline — so they classify as
-    // scheduler-driven, not as coroutines — and they combine with `cont.*` fibers too: every driver
-    // gives each confined child domain its own fiber registry (the cooperative `ChildEnv::fibers`,
-    // which the parallel driver shares, and the debugger's `DbgEnv::fibers`), as the oracle does. Plain coroutine /
-    // fiber / thread / instantiate modules are each fine, as are instantiate+thread,
-    // instantiate+coroutine and instantiate+fiber.
+    // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
+    // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
+    // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
+    // debugger's `DbgEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
-    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // calling vCPU's continuation (`vt.active` + `vt.chain`) **plus the run-shared
     // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
     // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
     // registry fiber's frames", `crates/temen/tests/gc_roots.rs`). Neither engine scans a *sibling
@@ -2375,12 +2364,11 @@ fn compile_module_with(
     // `crates/temen/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
     // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
     // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
-    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
-    // scanned.)
+    // tree-walker's. (`gc.roots` + fibers was always fine — those continuations are scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
-    // module (futex waits / threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+    // module (futex waits / threads, fibers, nested instantiate, setjmp/longjmp — a
     // `longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
     // spawn-bound imports, gc.roots) falls the whole module back to the tree-walk oracle, whose
     // serve arm has the fiber-park machinery (slice 5b).
@@ -2935,20 +2923,28 @@ fn compile_inst(
             use super::cap_id;
             // #2353 — the driver-served ops below deliver exactly one result, at `dst`. A call that
             // declares another shape has no such slot (with none, `dst` lies past its frame), so it
-            // declines to the oracle rather than writing where its frame does not reach.
+            // declines to the oracle rather than writing where its frame does not reach. The
+            // `Instantiator`'s are held to their contract instead (the first arm), which gives `join`
+            // its two result slots.
             let one = view.sig(*sig).results.len() == 1;
             match (*type_id, *op) {
-                // op 18 = wait: join's park, delivering how the child ended (`join_delivery`).
-                (cap_id::INSTANTIATOR, op @ (1 | 18)) if one && !args.is_empty() => Op::InstJoin {
+                // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
+                // every engine: an op that isn't live, or a call shaped otherwise, traps `CapFault`
+                // (#2066). Past this arm every Instantiator call has its op's arg prefix.
+                (cap_id::INSTANTIATOR, op)
+                    if !temen_ir::instantiator_shape_ok(op, view.sig(*sig)) =>
+                {
+                    Op::CapFault
+                }
+                (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
-                    wait: op == 18,
                 },
                 // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
                 // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
                 // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
-                (cap_id::INSTANTIATOR, 15) if one && args.len() >= 7 => Op::InstantiateDetached {
+                (cap_id::INSTANTIATOR, 15) => Op::InstantiateDetached {
                     handle: g(*handle),
                     budget: g(args[0]),
                     module: g(args[1]),
@@ -2962,36 +2958,32 @@ fn compile_inst(
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
                 // arg; every other spawn parameter is data in the record, read at exec time.
-                (cap_id::INSTANTIATOR, 17) if one && !args.is_empty() => Op::InstantiateRec {
+                (cap_id::INSTANTIATOR, 17) => Op::InstantiateRec {
                     handle: g(*handle),
                     rec: g(args[0]),
                     dst,
                 },
-                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if one && !args.is_empty() => {
-                    Op::ChildCtl {
-                        handle: g(*handle),
-                        child: g(args[0]),
-                        dst,
-                        ctl: match op {
-                            9 => ChildCtl::Poll,
-                            10 => ChildCtl::Detach,
-                            _ => ChildCtl::Kill,
-                        },
-                    }
-                }
+                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) => Op::ChildCtl {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    dst,
+                    ctl: match op {
+                        9 => ChildCtl::Poll,
+                        10 => ChildCtl::Detach,
+                        _ => ChildCtl::Kill,
+                    },
+                },
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
                 // child's live env, so the op surfaces to the driver; the compile only marshals
                 // `(child, arg)`.
-                (cap_id::INSTANTIATOR, op @ (14 | 19)) if one && args.len() >= 2 => {
-                    Op::ChildOffer {
-                        handle: g(*handle),
-                        child: g(args[0]),
-                        arg: g(args[1]),
-                        dst,
-                        grant: op == 19,
-                    }
-                }
+                (cap_id::INSTANTIATOR, op @ (14 | 19)) => Op::ChildOffer {
+                    handle: g(*handle),
+                    child: g(args[0]),
+                    arg: g(args[1]),
+                    dst,
+                    grant: op == 19,
+                },
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
@@ -3022,13 +3014,7 @@ fn compile_inst(
                         .into(),
                     results: view.sig(*sig).results.clone().into(),
                 },
-                // Every Instantiator op the oracle has no arm for traps `CapFault` there (#1867,
-                // #2069). A known op with too few args declines: the oracle's answer is `Malformed`.
-                (cap_id::INSTANTIATOR, op)
-                    if !matches!(op, 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19) =>
-                {
-                    Op::CapFault
-                }
+                // A live op this lowering has no arm for declines to the oracle.
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
                 // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
@@ -3335,14 +3321,14 @@ pub fn compile_and_run_seeded_with_host(
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
-    // embedder of a plain run could not say *where* a segfault was. Cleared on any other outcome,
-    // so a later clean run never reports an earlier run's fault. The scheduler records the
-    // trap-origin task's address as it traps (#1720: a joined child's, not the joiner's window).
-    let origin = super::last_capture_fault_addr();
-    let fault = match &r {
-        Err(Trap::MemoryFault) => origin.or_else(|| mem.as_ref().and_then(|m| m.peek_fault_rel())),
+    // embedder of a plain run could not say *where* a segfault was. The scheduler records the
+    // trap-origin task's address as it traps, first-wins, as the tree-walker's capture does (#1720):
+    // a child's too, whose trap its parent's join answers (#2066), so a root that ends in the trap
+    // it was answered names the child's window, not its own. The slot was cleared at the start.
+    let fault = super::last_capture_fault_addr().or_else(|| match &r {
+        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
         _ => None,
-    };
+    });
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
     Some(r)
 }
@@ -4070,10 +4056,21 @@ impl Reactor {
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point). See [`VcpuReactor::window_layout`] for
-    /// why a reactor moment needs no continuation; the two reactors delegate to the one capture.
+    /// keyframe: time travel, a save-state, a branch point).
+    ///
+    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
+    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
+    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
+    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
+    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
+    ///
+    /// A page that aliases a §13 `SharedRegion` is captured as the region it names (#2051): a §12
+    /// save-state carries the region and re-aliases it, and a moment, which cannot, refuses such a
+    /// layout ([`Moment::capture`]). `None` for a memory-less module.
+    ///
+    /// [`Moment::capture`]: crate::moment::Moment::capture
     pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
+        Some(self.mem.as_ref()?.layout_snapshot())
     }
 
     /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window, its §13 pages
@@ -4083,30 +4080,16 @@ impl Reactor {
         restore_window_of(self.mem.as_mut(), layout, host)
     }
 
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
+    /// This window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
+    /// artifact records alongside the committed image so a thaw restores a window that can grow as far
+    /// again. `None` for a memory-less module.
     pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
+        let (_, _, reserved, _) = self.mem.as_ref()?.map_info();
+        Some(reserved.trailing_zeros() as u8)
     }
 }
 
-/// Capture a reactor's window, or `None` for a memory-less module. A page that aliases a §13
-/// `SharedRegion` is captured as the region it names (#2051): a §12 save-state carries the region and
-/// re-aliases it, and a moment, which cannot, refuses such a layout ([`Moment::capture`]).
-///
-/// [`Moment::capture`]: crate::moment::Moment::capture
-fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
-    Some(mem?.layout_snapshot())
-}
-
-/// A reactor window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
-/// artifact records alongside the committed image so a thaw restores a window that can grow as far
-/// again. `None` for a memory-less module.
-fn window_reserved_log2_of(mem: Option<&Mem>) -> Option<u8> {
-    let (_, _, reserved, _) = mem?.map_info();
-    Some(reserved.trailing_zeros() as u8)
-}
-
-/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]), each §13
+/// Reinstate `layout` into a live window (the write half of [`Reactor::window_layout`]), each §13
 /// page aliased back onto the region of `host` it names — the thaw of a save-state, whose restore
 /// rebuilt the regions on `host` (#2051). `false` with no window, or for a page naming no region of
 /// `host`.
@@ -4117,193 +4100,6 @@ fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout, host: &Host) -> 
             host.realias_regions(m, &layout.dense_prots())
         }
         None => false,
-    }
-}
-
-/// A persistent single-vCPU reactor driven through the **resumable [`Vcpu`]** — the vehicle the
-/// browser wasm-JIT **tier-up** rides (BROWSER.md § "wasm-JIT tier"). Like [`Reactor`], it keeps the
-/// guest window live across frames (globals, BSS, and the `vm_map`-grown heap, with its address-space
-/// commit state), but each frame runs on a `Vcpu` instead of the one-shot [`run`]: a direct `Call` to
-/// a [`with_jit_eligible`](Vcpu::with_jit_eligible) function surfaces as a [`VcpuEvent::TierUp`] the
-/// caller services (the browser runs the emitted `f{func}` on the raw window; a native driver runs the
-/// callee on the interpreter) instead of interpreting it. With no eligibility set it is a faithful,
-/// interpreter-only substitute for [`Reactor`] — the differential the reactor tests assert.
-///
-/// The window lives in the caller-provided `back` [`Region`] (a `Region::shared` over the host's
-/// linear memory in the browser; a leaked buffer natively), sized to hold the guest's grown heap. The
-/// `Host` is shared (a `Mutex<Host>`) so its capabilities — `display`/`keyboard`/`fs`, stdout —
-/// persist across frames and are serviced inline during each frame's `call.cap`s.
-pub struct VcpuReactor {
-    prog: VcpuProgram,
-    /// The live window, carried across per-frame vCPUs via [`Vcpu::take_mem`]. `None` only for a
-    /// memory-less module.
-    mem: Option<Mem>,
-    /// The tier-up eligibility bitmap (`None` ⇒ everything interprets — the pure-substitute mode).
-    eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 **paged tier-up**: the eligible set was emitted with the software page-check
-    /// (`compile_module_tierup_paged`). Frames then surface tier-up regardless of the window's
-    /// scalar representability, and each `TierUp` hands `service` the live [`MemMapInfo`] to build
-    /// its page-state table from ([`build_pagestate_table`]).
-    page_checked: bool,
-}
-
-impl VcpuReactor {
-    /// Open over the persistent window `back`: compile `m`, then run `_start` (func 0) once over a
-    /// freshly seeded + data-initialised window to bootstrap the guest, keeping the window live for
-    /// the per-frame [`frame`](VcpuReactor::frame) calls. `call.cap`s in `_start` (e.g. Doom's WAD
-    /// read through `fs`) are serviced inline against `host`. `Err` if `m` is outside the engine's
-    /// subset (`Malformed`) or `_start` traps.
-    pub fn open(
-        m: &Module,
-        back: std::sync::Arc<super::Region>,
-        host: &std::sync::Mutex<Host>,
-        start_args: &[Value],
-    ) -> Result<VcpuReactor, Trap> {
-        let prog = VcpuProgram::compile(m).ok_or(Trap::Malformed)?;
-        let mem;
-        {
-            let mut vcpu = Vcpu::new_root(&prog, 0, start_args, back, &[])?.with_shared_host(host);
-            // `_start` runs to completion in one `run`: `call.cap`s are serviced inline (shared host),
-            // and a reactor is single-vCPU with no tier-up during open — so no spawn/join/wait/JIT/
-            // tier-up event can occur (a `thread.spawn`ing guest is out of scope).
-            match vcpu.run() {
-                VcpuEvent::Done(_) => {}
-                VcpuEvent::Trapped(t) => return Err(t),
-                // Out of a reactor's scope, named rather than `_` (see `VcpuEvent`): a `_start` that
-                // spawns, joins, waits, JITs, tiers up, parks on a cap or on stdin is not a reactor.
-                VcpuEvent::TierUp { .. }
-                | VcpuEvent::Spawn { .. }
-                | VcpuEvent::Join { .. }
-                | VcpuEvent::Wait { .. }
-                | VcpuEvent::Notify { .. }
-                | VcpuEvent::JitInstall { .. }
-                | VcpuEvent::JitUninstall { .. }
-                | VcpuEvent::JitInvoke { .. }
-                | VcpuEvent::InstantiateDetached { .. }
-                | VcpuEvent::CapPending { .. }
-                | VcpuEvent::StdinPark => return Err(Trap::Malformed),
-            }
-            mem = vcpu.take_mem();
-        }
-        Ok(VcpuReactor {
-            prog,
-            mem,
-            eligible: None,
-            page_checked: false,
-        })
-    }
-
-    /// Enable wasm-JIT tier-up: a direct `Call` to a function `f` with `eligible[f] == true` surfaces
-    /// as [`VcpuEvent::TierUp`] for the `frame` caller to service. `None` (the default) interprets
-    /// everything — the faithful [`Reactor`] substitute.
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> VcpuReactor {
-        self.eligible = Some(eligible);
-        self
-    }
-
-    /// #750 paged tier-up: mark the eligible set as page-checked (see [`Vcpu::with_jit_page_checked`]).
-    /// Each frame's `TierUp` then carries the live [`MemMapInfo`] to `service` so the driver can
-    /// refresh its page-state table ([`build_pagestate_table`]) before running emitted code.
-    pub fn with_jit_page_checked(mut self) -> VcpuReactor {
-        self.page_checked = true;
-        self
-    }
-
-    /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
-    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped, map_info)` — return the
-    /// callee's i64 result slots (or an `Err(Trap)` to propagate the emitted region's trap).
-    /// `mapped` is the window's scalar committed extent at call entry: `service` MUST write it to
-    /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-    /// `map_info` is `Some` only on a [`with_jit_page_checked`](Self::with_jit_page_checked)
-    /// reactor: the live page map, from which `service` builds its page-state table
-    /// ([`build_pagestate_table`]) and writes the returned coverage to `"mapped"` **instead** of
-    /// the event's value (#750). With no eligibility set, `service` is never called. The window
-    /// persists after the call (reclaimed for the next frame).
-    pub fn frame<F>(
-        &mut self,
-        func: FuncIdx,
-        args: &[Value],
-        host: &std::sync::Mutex<Host>,
-        mut service: F,
-    ) -> Result<Vec<Value>, Trap>
-    where
-        F: FnMut(u32, &[i64], u64, Option<MemMapInfo>) -> Result<Vec<i64>, Trap>,
-    {
-        let mem = self.mem.take();
-        let result;
-        let reclaimed;
-        {
-            let mut vcpu =
-                Vcpu::with_mem(&self.prog, func, args, mem, Host::new())?.with_shared_host(host);
-            if let Some(e) = &self.eligible {
-                vcpu = vcpu.with_jit_eligible(e.clone());
-            }
-            if self.page_checked {
-                vcpu = vcpu.with_jit_page_checked();
-            }
-            result = loop {
-                match vcpu.run() {
-                    VcpuEvent::Done(v) => break Ok(v),
-                    VcpuEvent::Trapped(t) => break Err(t),
-                    VcpuEvent::TierUp { func, argv, mapped } => {
-                        // Paged reactors snapshot the live page map for the driver's table build;
-                        // computed only here (page state is frozen while emitted code runs).
-                        let info = if self.page_checked {
-                            vcpu.mem_map_info()
-                        } else {
-                            None
-                        };
-                        match service(func, &argv, mapped, info) {
-                            Ok(vals) => vcpu.deliver_tierup(&vals),
-                            Err(t) => vcpu.deliver_tierup_trap(t),
-                        }
-                    }
-                    // A reactor frame is one vCPU over one window, serviced only for tier-up: it
-                    // runs no threads or futex waits, spawns no §14 children, hosts no §22 guest
-                    // JIT, and has no embedder to complete a host call or feed a blocking stdin.
-                    VcpuEvent::Spawn { .. }
-                    | VcpuEvent::Join { .. }
-                    | VcpuEvent::Wait { .. }
-                    | VcpuEvent::Notify { .. }
-                    | VcpuEvent::InstantiateDetached { .. }
-                    | VcpuEvent::JitInstall { .. }
-                    | VcpuEvent::JitUninstall { .. }
-                    | VcpuEvent::JitInvoke { .. }
-                    | VcpuEvent::CapPending { .. }
-                    | VcpuEvent::StdinPark => break Err(Trap::Malformed),
-                }
-            };
-            reclaimed = vcpu.take_mem();
-        }
-        self.mem = reclaimed;
-        result
-    }
-
-    /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point).
-    ///
-    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
-    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
-    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
-    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
-    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
-    ///
-    /// `None` when there is nothing faithfully capturable — see [`window_layout_of`].
-    pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
-    }
-
-    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window — the window
-    /// this reactor keeps across frames, so the next `frame` runs over the restored state — its §13
-    /// pages aliased back onto the regions `host` holds. `false` for a memory-less module (nothing to
-    /// restore into), or a page naming no region of `host`.
-    pub fn restore_window(&mut self, layout: &MemLayout, host: &Host) -> bool {
-        restore_window_of(self.mem.as_mut(), layout, host)
-    }
-
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
-    pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
     }
 }
 
@@ -4319,7 +4115,7 @@ impl VcpuReactor {
 pub enum VcpuEvent {
     /// The vCPU finished with these results.
     Done(Vec<Value>),
-    /// The vCPU trapped (a child-join trap propagates here too).
+    /// The vCPU trapped (a joined thread's trap propagates here too; a §14 child's, its join answers).
     Trapped(Trap),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): the interpreter reached a direct `Call`
     /// to the eligible function `func` (see [`Vcpu::with_jit_eligible`]). The host runs the emitted
@@ -4508,7 +4304,7 @@ pub struct Vcpu<'p> {
     /// interpreter would, and a bounced leaf's `call.cap` resolves them on this vCPU. Empty on the
     /// other constructors.
     entry_args: Vec<Value>,
-    /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
+    /// A trap to surface on the next `run` (a joined thread's trap propagates to the joiner).
     trap: Option<Trap>,
     /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
     /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
@@ -4543,8 +4339,9 @@ pub struct Vcpu<'p> {
     /// The child whose join is in flight, whose charges go back on
     /// [`deliver_join`](Self::deliver_join).
     joining: Option<VcpuChild>,
-    /// The slot of the child a `wait` (op 18) has in flight, where a child that returned goes back.
-    join_wait: Option<usize>,
+    /// Whether the join in flight is a §14 child's (`Instantiator.join`), which answers how the child
+    /// ended ([`super::join_delivery`]), rather than a `thread.join`.
+    join_status: bool,
 }
 
 /// A child in a [`Vcpu`]'s table: the host's token for it, a detached child's window lease, and a
@@ -4555,8 +4352,6 @@ struct VcpuChild {
     token: u64,
     lease: Option<Lease>,
     live: LiveVcpu,
-    /// The outcome a `wait` (op 18) received for this child, which returned: its `join` takes it.
-    ended: Option<Result<Vec<Value>, Trap>>,
 }
 
 /// A child that a [`VcpuEvent::InstantiateDetached`] (§5, ops 15 and 17) announced, as the engine
@@ -4654,8 +4449,9 @@ impl<'p> Vcpu<'p> {
     /// Like [`new_root`](Vcpu::new_root), but the vCPU carries a **powerbox** (its own `Host`) instead
     /// of the deny-all default — the seam §14 needs (THREADS.md 4c-domain §14-D). Unlike §22 JIT
     /// (whose ops hand the raw cap handle to the host to resolve), §14 resolves its `Instantiator`
-    /// authority **in-Vm** during `resume`, so the grant must live in this vCPU's own host; with it,
-    /// `spawn_coroutine_module` is then serviced entirely inside [`run`](Vcpu::run) (no host event).
+    /// authority **in-Vm**, so the grant must live in this vCPU's own host: the engine admits a spawn
+    /// against it and hands the host only the admitted child to run
+    /// ([`VcpuEvent::InstantiateDetached`]).
     /// Grant only the non-I/O caps (`Instantiator`/`Module`) — the resumable path still has no host
     /// I/O, so an I/O `call.cap` remains an inert `CapFault`.
     pub fn new_root_with_powerbox(
@@ -4835,7 +4631,7 @@ impl<'p> Vcpu<'p> {
             pending_live: LiveVcpu::none(),
             opens: None,
             joining: None,
-            join_wait: None,
+            join_status: false,
         })
     }
 
@@ -4891,7 +4687,7 @@ impl<'p> Vcpu<'p> {
             pending_live: LiveVcpu::none(),
             opens: None,
             joining: None,
-            join_wait: None,
+            join_status: false,
         })
     }
 
@@ -4986,15 +4782,6 @@ impl<'p> Vcpu<'p> {
     /// identical between two tier-ups with no intervening page-op). `0` for a memory-less module.
     pub fn mem_map_version(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.map_version())
-    }
-
-    /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
-    /// the window (globals, BSS, and the `vm_map`-grown heap, with its address-space commit state)
-    /// alive across per-frame vCPUs: build a vCPU over the persistent [`Mem`] with
-    /// [`with_mem`](Vcpu::with_mem), run one frame to `Done`, then `take_mem` it back for the next
-    /// frame. `None` for a memory-less module (or if already taken).
-    pub(crate) fn take_mem(&mut self) -> Option<Mem> {
-        self.mem.take()
     }
 
     /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session). A
@@ -5126,9 +4913,10 @@ impl<'p> Vcpu<'p> {
             self.pending.is_none(),
             "deliver the last event before resuming"
         );
-        // Loop so §14 `spawn_coroutine_module` (serviced in-Rust against this vCPU's own powerbox)
+        // Loop so a stop serviced in-Rust against this vCPU's own powerbox (a §14 `child_offer`)
         // never surfaces to the orchestrating host — it only ever sees the multi-vCPU events
-        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `Instantiate` (+ `done`/`trap`).
+        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `InstantiateDetached` (+
+        // `done`/`trap`).
         loop {
             // A §14 confined child dispatches through its OWN domain (own natural table, no parent
             // install slots); everything else through the program's shared one. Host access goes
@@ -5290,34 +5078,18 @@ impl<'p> Vcpu<'p> {
                         vcpu: self.prog.take_vcpu_id(),
                     };
                 }
-                Ok(VcpuStop::Join { handle, dst, wait }) => {
-                    let slot = match super::resolve_thread(&self.children, handle) {
-                        Ok(slot) => slot,
-                        Err(t) => return VcpuEvent::Trapped(t),
-                    };
-                    // A child a `wait` found returned keeps its outcome here for its `join`: the
-                    // host handed its token back once already, so it is delivered without one.
-                    if let Some(res) = self.children[slot].as_ref().and_then(|c| c.ended.clone()) {
-                        let (out, keep) = super::join_delivery(&res, wait);
-                        if !keep {
-                            self.joining = self.children[slot].take();
-                            self.end_join();
-                        }
-                        match out {
-                            Ok(r) => self.vt.active.set(dst, r),
-                            Err(t) => return VcpuEvent::Trapped(t),
-                        }
-                    } else {
-                        match self.join_child(handle) {
-                            Ok(child) => {
-                                self.pending = Some(dst);
-                                self.join_wait = wait.then_some(slot);
-                                return VcpuEvent::Join { child };
-                            }
-                            Err(t) => return VcpuEvent::Trapped(t),
-                        }
+                Ok(VcpuStop::Join {
+                    handle,
+                    dst,
+                    status,
+                }) => match self.join_child(handle) {
+                    Ok(child) => {
+                        self.pending = Some(dst);
+                        self.join_status = status;
+                        return VcpuEvent::Join { child };
                     }
-                }
+                    Err(t) => return VcpuEvent::Trapped(t),
+                },
                 Ok(VcpuStop::CapPending { id, dst }) => {
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
@@ -5500,7 +5272,6 @@ impl<'p> Vcpu<'p> {
             token,
             lease: self.pending_lease.take(),
             live: std::mem::replace(&mut self.pending_live, LiveVcpu::none()),
-            ended: None,
         }));
         handle
     }
@@ -5601,23 +5372,18 @@ impl<'p> Vcpu<'p> {
         self.vt.active.set(dst, Reg::from_i32(v));
     }
 
-    /// Deliver a joined child's result (after `Join`): its first value lands in the joiner's dst, or a
-    /// child trap propagates (the joiner traps on its next `run`).
+    /// Deliver how a joined child ended (after `Join`), as the host saw it: what it gives the joiner
+    /// lands from the joiner's dst — a §14 child's `(status, value)`, a thread's first value — or a
+    /// thread's trap propagates (the joiner traps on its next `run`) ([`super::join_delivery`]).
     pub fn deliver_join(&mut self, res: Result<Vec<Value>, Trap>) {
-        let wait = self.join_wait.take();
-        let (out, keep) = super::join_delivery(&res, wait.is_some());
-        match wait {
-            // A `wait` on a child that returned: it goes back to its slot for its `join`.
-            Some(slot) if keep => {
-                let mut child = self.joining.take().expect("a join in flight");
-                child.ended = Some(res);
-                self.children[slot] = Some(child);
-            }
-            _ => self.end_join(),
-        }
+        self.end_join();
         let dst = self.pending.take().expect("deliver with no pending event");
-        match out {
-            Ok(r) => self.vt.active.set(dst, r),
+        match super::join_delivery(&res, std::mem::take(&mut self.join_status)) {
+            Ok(regs) => {
+                for (i, r) in regs.enumerate() {
+                    self.vt.active.set(dst + i as u32, r);
+                }
+            }
             Err(t) => self.trap = Some(t),
         }
     }
@@ -8194,9 +7960,13 @@ fn service_advance(
                     complete(tasks, ti, Err(t));
                 }
             }
-            Outcome::ThreadJoin { handle, dst, wait } => {
+            Outcome::ThreadJoin {
+                handle,
+                dst,
+                status,
+            } => {
                 *turn += 1;
-                join_child(tasks, ti, handle, dst, wait);
+                join_child(tasks, ti, handle, dst, status);
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
@@ -10929,12 +10699,12 @@ enum Outcome {
         dst: u32,
         module: usize,
     },
-    /// `thread.join`: park until child `handle` finishes; its result (or trap) lands at `dst` — or,
-    /// with `wait` (`Instantiator.wait`, op 18), how it ended ([`super::join_delivery`]).
+    /// A join (`thread.join`, or with `status` a §14 child's `Instantiator.join`, op 1): park until
+    /// child `handle` ends; what it gives the joiner lands from `dst` ([`super::join_delivery`]).
     ThreadJoin {
         handle: i32,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
     /// §3.6 (I36 slice 2) — a caller's `call.cap` through a live-callee offer. The dispatch is
     /// already enqueued on the callee (the op exec holds the callee `Arc`); the driver parks this
@@ -12762,7 +12532,7 @@ enum VcpuStop {
     Join {
         handle: i32,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
@@ -13010,8 +12780,16 @@ fn step_vcpu(
                     module: module as u32,
                 })
             }
-            Outcome::ThreadJoin { handle, dst, wait } => {
-                return Ok(VcpuStop::Join { handle, dst, wait })
+            Outcome::ThreadJoin {
+                handle,
+                dst,
+                status,
+            } => {
+                return Ok(VcpuStop::Join {
+                    handle,
+                    dst,
+                    status,
+                })
             }
             // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
             // qualification veto keeps them out of fiber contexts, so no registry state is live.
@@ -13378,6 +13156,13 @@ impl TaskSlot {
     fn deliver(&mut self, dst: u32, value: Reg) {
         self.vm.parked_frame().set(dst, value);
     }
+
+    /// [`deliver`](Self::deliver) each of `values` in turn, from `dst`: a join's results.
+    fn deliver_from(&mut self, dst: u32, values: impl IntoIterator<Item = Reg>) {
+        for (i, v) in values.into_iter().enumerate() {
+            self.deliver(dst + i as u32, v);
+        }
+    }
 }
 
 /// A task's VM state: what its executor steps, as opposed to what the scheduler decides about it.
@@ -13434,13 +13219,13 @@ fn refund_ended_windows(
 #[derive(Clone)]
 enum TaskState {
     Runnable,
-    /// Parked on `thread.join` of task `child`; deliver its result to `dst` and wake (with `wait`,
-    /// how it ended: [`super::join_delivery`]).
+    /// Parked on a join of task `child` (with `status`, a §14 child's); deliver what it gives the
+    /// joiner from `dst` ([`super::join_delivery`]) and wake.
     BlockedJoin {
         child: usize,
         slot: usize,
         dst: u32,
-        wait: bool,
+        status: bool,
     },
     /// Parked on `memory.wait` at address `addr` of its own window until notified or `deadline`
     /// (logical clock). It waits at `site`, taken at the park as the oracle takes its key; a `notify`
@@ -14020,6 +13805,18 @@ fn park_task(
     tasks[ti].state = state;
 }
 
+/// The child envs (§14 children and fork twins) whose domains have finished, as [`settle_wakes`]
+/// releases them.
+#[derive(Default)]
+struct Released {
+    /// FORK.md §8.6 / #1807 — the envs whose pipe ends were released at their domain's finish.
+    /// Released once: the release decrements the shared end counts.
+    envs: std::collections::BTreeSet<usize>,
+    /// #2359 — the powerbox each is left holding: one empty `Host` for the run rather than a fresh
+    /// one apiece, whose handle table alone is kilobytes.
+    host: DomainCell,
+}
+
 /// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
 /// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
 /// child environments, the fork/teardown bookkeeping, and the logical clock.
@@ -14048,9 +13845,8 @@ struct SchedCore {
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
-    /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
-    /// their domain's finish. Released once: the release decrements the shared end counts.
-    released_envs: std::collections::BTreeSet<usize>,
+    /// The child envs whose domains have finished ([`Released`]).
+    released: Released,
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
@@ -14219,7 +14015,7 @@ fn settle_wakes(
     fibers: &[FiberState],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &mut std::collections::BTreeSet<usize>,
-    released_envs: &mut std::collections::BTreeSet<usize>,
+    released: &mut Released,
     root: &DomainCell,
 ) {
     // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
@@ -14283,7 +14079,7 @@ fn settle_wakes(
     }
     let mut finished: Vec<usize> = Vec::new();
     for k in 0..extra_envs.len() {
-        if seen[k] && !live[k] && released_envs.insert(k) {
+        if seen[k] && !live[k] && released.envs.insert(k) {
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
@@ -14333,11 +14129,13 @@ fn settle_wakes(
     // A finished domain gives back what it held — its window, its powerbox, its frames — now
     // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
     // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
-    // build that forks and execs a compiler per module grew by a window per process.
+    // build that forks and execs a compiler per module grew by a window per process. The env is
+    // left holding the run's one empty powerbox (#2359): a fresh one apiece grew a run by its
+    // handle table per child.
     for k in finished {
         let env = &mut extra_envs[k];
         env.mem = None;
-        env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+        env.host = std::sync::Arc::clone(&released.host);
         env.fibers = FiberTables::default();
         for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
             t.vm.vt.release();
@@ -14571,7 +14369,6 @@ impl SchedCore {
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let released_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         Ok(SchedCore {
             tasks,
             extra_envs,
@@ -14581,7 +14378,7 @@ impl SchedCore {
             dead_envs,
             forked_twins,
             hooked_twins,
-            released_envs,
+            released: Released::default(),
             clock,
         })
     }
@@ -14706,7 +14503,7 @@ impl CoopSched {
                 dead_envs,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 clock,
             } = &mut *core;
             let EmitTier {
@@ -14773,7 +14570,7 @@ impl CoopSched {
                 fibers,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 root,
             );
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
@@ -15065,9 +14862,9 @@ impl CoopSched {
             );
 
             charge_slice(slice_left, ctx.fuel.can_burn());
-            // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's trap
-            // re-raises at its joiner, whose window is not the one that faulted, so the run's
-            // `last_capture_fault_addr` must be read here, from the trapping task's own.
+            // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's trap is
+            // answered at its joiner (#2066), whose window is not the one that faulted, so the
+            // run's `last_capture_fault_addr` must be read here, from the trapping task's own.
             let fault = match &stop {
                 Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
                 _ => None,
@@ -15962,7 +15759,11 @@ impl SchedCore {
                 let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
-            Ok(VcpuStop::Join { handle, dst, wait }) => join_child(tasks, ti, handle, dst, wait),
+            Ok(VcpuStop::Join {
+                handle,
+                dst,
+                status,
+            }) => join_child(tasks, ti, handle, dst, status),
             Ok(VcpuStop::Wait {
                 base,
                 expected,
@@ -17535,11 +17336,11 @@ fn drive_threads(
     *host = std::mem::take(&mut *root.lock_unpoisoned());
     *fuel = host.fuel_left();
     let result = over.unwrap_or(Err(Trap::ThreadFault));
-    // #1720: the trap-origin fault address, as the pump records it.
-    let fault = match &result {
-        Err(Trap::MemoryFault) => fault.or_else(|| mem.as_ref().and_then(|m| m.peek_fault_rel())),
+    // #1720: the trap-origin fault address, first-wins, as the pump records it.
+    let fault = fault.or_else(|| match &result {
+        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
         _ => None,
-    };
+    });
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
     (result, mem)
 }
@@ -17914,7 +17715,7 @@ impl ThreadRun {
             &core.fibers,
             &mut core.forked_twins,
             &mut core.hooked_twins,
-            &mut core.released_envs,
+            &mut core.released,
             &self.root,
         );
         interrupt_parks(&mut core.tasks, &core.extra_envs, &self.root);
@@ -18091,9 +17892,10 @@ impl ThreadRun {
     }
 }
 
-/// Mark task `ti` finished with `res`, then wake any vCPU parked on `thread.join` of it: an `Ok`
-/// result is delivered into the joiner's `dst` (it becomes runnable); a trap propagates — the joiner
-/// completes with the same trap (transitively, via the worklist).
+/// Mark task `ti` finished with `res`, then wake any vCPU parked on a join of it: what the end gives
+/// the joiner is delivered from its `dst` and it becomes runnable ([`super::join_delivery`]), or a
+/// thread's trap propagates — its joiner completes with the same trap (transitively, via the
+/// worklist).
 fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     let mut work = vec![(ti, res)];
     while let Some((done, res)) = work.pop() {
@@ -18104,7 +17906,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                 child,
                 slot,
                 dst,
-                wait,
+                status,
             } = t.state
             else {
                 continue;
@@ -18112,13 +17914,10 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
             if child != done {
                 continue;
             }
-            let (out, keep) = super::join_delivery(&res, wait);
-            if !keep {
-                t.threads[slot] = None;
-            }
-            match out {
-                Ok(r) => {
-                    t.deliver(dst, r);
+            t.threads[slot] = None;
+            match super::join_delivery(&res, status) {
+                Ok(regs) => {
+                    t.deliver_from(dst, regs);
                     t.state = TaskState::Runnable;
                 }
                 Err(trap) => work.push((j, Err(trap))),
@@ -18127,10 +17926,10 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
     }
 }
 
-/// `thread.join` of child handle `handle` (`wait`: [`super::join_delivery`]'s mode). A child that
-/// already finished delivers its result into `dst` now, or its trap completes the joiner; else the
-/// joiner parks on it until [`complete`] wakes it. A bad handle completes the joiner with its trap.
-fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bool) {
+/// A join of child handle `handle` (`status`: [`super::join_delivery`]'s mode). A child that already
+/// finished delivers now, or its trap completes the joiner; else the joiner parks on it until
+/// [`complete`] wakes it. A bad handle completes the joiner with its trap.
+fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, status: bool) {
     let slot = match super::resolve_thread(&tasks[ti].threads, handle) {
         Ok(s) => s,
         Err(t) => return complete(tasks, ti, Err(t)),
@@ -18138,12 +17937,10 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
     let child = tasks[ti].threads[slot].expect("resolve_thread checked liveness");
     match &tasks[child].state {
         TaskState::Done(res) => {
-            let (out, keep) = super::join_delivery(res, wait);
-            if !keep {
-                tasks[ti].threads[slot] = None;
-            }
+            let out = super::join_delivery(res, status);
+            tasks[ti].threads[slot] = None;
             match out {
-                Ok(r) => tasks[ti].deliver(dst, r),
+                Ok(regs) => tasks[ti].deliver_from(dst, regs),
                 Err(t) => complete(tasks, ti, Err(t)),
             }
         }
@@ -18152,7 +17949,7 @@ fn join_child(tasks: &mut [TaskSlot], ti: usize, handle: i32, dst: u32, wait: bo
                 child,
                 slot,
                 dst,
-                wait,
+                status,
             }
         }
     }
@@ -18537,7 +18334,7 @@ fn time_out_waits(tasks: &mut [TaskSlot], clock: u64) {
 /// world its `env` names (`None` = the root + its `thread.spawn` threads; `Some(k)` = a §14
 /// child + its threads). Fixpoint: find a domain with a `Done(Err)` member and a still-live
 /// member, kill every live member with the same trap (via [`complete`], so a cross-domain joiner
-/// re-raises and a `poll` reports status 2 — the I37 supervision mechanics), then errno-wake
+/// is answered its code and a `poll` reports status 2 — the I37 supervision mechanics), then errno-wake
 /// cross-domain callers parked through the dying child (D37 death-is-revocation: cancellation is
 /// a value, never a hang); repeat until no such domain remains (a kill that propagates into a
 /// joiner may fell *its* domain next). The root domain's death is read by the caller's loop-top
@@ -20233,7 +20030,7 @@ impl Vm {
                     return Ok(Outcome::ThreadJoin {
                         handle,
                         dst,
-                        wait: false,
+                        status: false,
                     });
                 }
                 // §14 executor children — the Instantiator authority `(ibase, isize)` is resolved here
@@ -20418,21 +20215,20 @@ impl Vm {
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
                 // (executor children live in the same `threads` handle namespace as `thread.spawn`).
-                Op::InstJoin {
-                    handle,
-                    child,
-                    dst,
-                    wait,
-                } => {
+                Op::InstJoin { handle, child, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?; // authority
                     let handle = r!(*child).i32();
-                    let (dst, wait) = (*dst, *wait);
+                    let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::ThreadJoin { handle, dst, wait });
+                    return Ok(Outcome::ThreadJoin {
+                        handle,
+                        dst,
+                        status: true,
+                    });
                 }
                 Op::MemoryWait {
                     ty,

@@ -1577,14 +1577,14 @@ static int gen_builtin_exec_module(Node *node) {
   return r;
 }
 
-// #1509 — `__vm_instantiate_rec(inst, rec_ptr)` / `__vm_instantiate_join(inst, child)`: the §14
-// config-record spawn (`Instantiator` op 17) and `join` (op 1), lowered as a *static* `call.cap` on the
-// caller's `Instantiator` handle — the same shape as `__vm_exec_module` above, and for the same reason: an
-// executor op reaches its seam only through a static `call.cap` (a manifest-bound `call.sym` dispatches
-// generically and cannot spawn). `posix_libc/spawn.c` wraps them: `vm_spawn` fills the record and its
+// #1509 — `__vm_instantiate_rec(inst, rec_ptr)`: the §14 config-record spawn (`Instantiator` op 17),
+// lowered as a *static* `call.cap` on the caller's `Instantiator` handle — the same shape as
+// `__vm_exec_module` above, and for the same reason: an executor op reaches its seam only through a
+// static `call.cap` (a manifest-bound `call.sym` dispatches generically and cannot spawn).
+// `posix_libc/spawn.c` wraps it and `__vm_instantiate_join` below: `vm_spawn` fills the record and its
 // grant list, `vm_join` collects the child. The handle is the i32 the guest discovered by reflection
-// (`__vm_cap_at`); the record pointer / child handle widen to i64; the i32 child handle / i64 join result
-// come back as the `long` the C prototype declares (both backends coerce the declared width).
+// (`__vm_cap_at`); the record pointer widens to i64; the i32 child handle comes back as the `long` the
+// C prototype declares (both backends coerce the declared width).
 static int gen_builtin_instantiator(Node *node, int op, const char *who) {
   Node *a = node->args;
   if (!a || !a->next || a->next->next)
@@ -1602,7 +1602,8 @@ static int gen_builtin_instantiator(Node *node, int op, const char *who) {
 // entry, size_log2, args_ptr, args_len, region, child_off)` is `Instantiator` op 15 (the §5 detached
 // spawn, 11-arg pre-mapped form, its retired `quota` 0 at position 6) — an executor op, so it must
 // be a static `call.cap` for the same reason as the record spawn above; `__vm_budget_read(budget,
-// field)` is `Budget` op 1 (iface 14): how much of a quota field remains (0 fuel, 1 mem, 2 spawn).
+// field)` is `Budget` op 1 (iface 14): how much of a quota field remains (0 fuel, 1 mem, 2 spawn);
+// `__vm_budget_close(budget)` is its op 3, which gives the handle up (#2384).
 // Every operation arg widens to the host-ABI i64; the result is the `long` the prototype declares.
 static int gen_builtin_cap_call(Node *node, int iface, int op, int n, int zero_at,
                                 const char *who) {
@@ -1709,6 +1710,25 @@ static int gen_builtin_fiber_new(Node *node) {
   int r = nv++;
   cg("  v%d = cont.new v%d v%d\n", r, fn32, sp);
   return r; // i64 fiber handle (16-bit slot + 48-bit generation)
+}
+
+// `__vm_instantiate_join(inst, child, status)`: the §14 `join` (`Instantiator` op 1), a static
+// `call.cap` like the spawn above. It answers two results, as `cont.resume` does: the value is the
+// return, the status is stored through `status` (a `long *`) — 0 if the child returned, which its
+// first result is the value of, else its trap's wire code (`temen_ir::trap_code`) and a 0 value. The
+// child's end is never the caller's trap (#2066).
+static int gen_builtin_join(Node *node) {
+  Node *a = node->args;
+  if (!a || !a->next || !a->next->next || a->next->next->next)
+    error_tok(node->tok, "codegen_ir: __vm_instantiate_join(inst, child, status) expects 3 arguments");
+  int h = gen_expr(a);                                  // i32 Instantiator handle
+  int child = widen_i64(gen_expr(a->next), a->next->ty); // child handle (i64)
+  int status_ptr = gen_expr(a->next->next);             // long* — where to store the status
+  int status = nv++;
+  int value = nv++;
+  cg("  v%d, v%d = call.cap 6 1 (i64) -> (i64, i64) v%d (v%d)\n", status, value, h, child);
+  cg("  i64.store v%d v%d\n", status_ptr, status);
+  return value;
 }
 
 static int gen_builtin_fiber_resume(Node *node) {
@@ -2218,11 +2238,13 @@ static int gen_expr(Node *node) {
         if (!strcmp(fname, "__vm_instantiate_rec"))
           return gen_builtin_instantiator(node, 17, "__vm_instantiate_rec");
         if (!strcmp(fname, "__vm_instantiate_join"))
-          return gen_builtin_instantiator(node, 1, "__vm_instantiate_join");
+          return gen_builtin_join(node);
         if (!strcmp(fname, "__vm_instantiate_detached"))
           return gen_builtin_cap_call(node, 6, 15, 10, 6, "__vm_instantiate_detached");
         if (!strcmp(fname, "__vm_budget_read"))
           return gen_builtin_cap_call(node, 14, 1, 1, -1, "__vm_budget_read");
+        if (!strcmp(fname, "__vm_budget_close"))
+          return gen_builtin_cap_call(node, 14, 3, 0, -1, "__vm_budget_close");
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))

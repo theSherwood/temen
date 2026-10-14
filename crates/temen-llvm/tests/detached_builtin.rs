@@ -7,11 +7,12 @@ use temen_ir::Inst;
 
 const LL: &str = r#"
 declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
-declare i64 @__vm_join(i32, i64)
+declare i64 @__vm_join(i32, i64, ptr)
 
 define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {
+  %st = alloca i64
   %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 0, i64 0)
-  %r = call i64 @__vm_join(i32 %inst, i64 %h)
+  %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
   ret i64 %r
 }
 "#;
@@ -41,11 +42,12 @@ fn it_lowers_to_instantiator_op_15_with_nine_arguments() {
 
 const LL_REC: &str = r#"
 declare i64 @__vm_instantiate_rec(i32, i64)
-declare i64 @__vm_join(i32, i64)
+declare i64 @__vm_join(i32, i64, ptr)
 
 define i64 @spawn(i32 %inst, i64 %rec) {
+  %st = alloca i64
   %h = call i64 @__vm_instantiate_rec(i32 %inst, i64 %rec)
-  %r = call i64 @__vm_join(i32 %inst, i64 %h)
+  %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
   ret i64 %r
 }
 "#;
@@ -71,48 +73,58 @@ fn the_record_spawn_lowers_to_instantiator_op_17() {
     assert_eq!(caps, vec![(6, 17, 1), (6, 1, 1)], "spawn, then join");
 }
 
-const LL_WAIT_BUDGET: &str = r#"
+const LL_JOIN_BUDGET: &str = r#"
 declare i64 @__vm_budget_split(i32, i64, i64, i64)
 declare i64 @__vm_budget_read(i32, i64)
 declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
-declare i64 @__vm_wait(i32, i64)
-declare i64 @__vm_join(i32, i64)
+declare i64 @__vm_join(i32, i64, ptr)
 
 define i64 @spawn(i32 %inst, i32 %budget, i64 %module) {
+  %st = alloca i64
   %node = call i64 @__vm_budget_split(i32 %budget, i64 1000, i64 -1, i64 -1)
   %room = call i64 @__vm_budget_read(i32 %budget, i64 0)
   %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %node, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 0, i64 0)
-  %w = call i64 @__vm_wait(i32 %inst, i64 %h)
-  %r = call i64 @__vm_join(i32 %inst, i64 %h)
+  %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
+  %w = load i64, ptr %st
   %s = add i64 %w, %r
   %t = add i64 %s, %room
   ret i64 %t
 }
 "#;
 
-/// #2053 — a spawner bounds a child's fuel and outlives its running out: `__vm_budget_split` lowers
-/// to `call.cap BUDGET 0` (three ceilings), `__vm_budget_read` to `call.cap BUDGET 1` (the field), and
-/// `__vm_wait` to `call.cap INSTANTIATOR 18` with the child handle, as `__vm_join` is op 1.
+/// #2053, #2066 — a spawner bounds a child's fuel and outlives its running out: `__vm_budget_split`
+/// lowers to `call.cap BUDGET 0` (three ceilings), `__vm_budget_read` to `call.cap BUDGET 1` (the
+/// field), and `__vm_join` to `call.cap INSTANTIATOR 1` answering two results, `(status, value)`:
+/// the value is the builtin's return and the status is stored through its third argument.
 #[test]
-fn budget_split_read_and_wait_lower_to_their_ops() {
-    let t = temen_llvm::translate_ll_str(LL_WAIT_BUDGET).expect("translate");
+fn budget_split_read_and_join_lower_to_their_ops() {
+    let t = temen_llvm::translate_ll_str(LL_JOIN_BUDGET).expect("translate");
     temen_verify::verify_module(&t.module).expect("verify");
-    let caps: Vec<(u32, u32, usize)> = t
+    let caps: Vec<(u32, u32, usize, usize)> = t
         .module
         .funcs
         .iter()
         .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
         .filter_map(|i| match i {
             Inst::CapCall {
-                type_id, op, args, ..
-            } => Some((*type_id, *op, args.len())),
+                type_id,
+                op,
+                args,
+                sig,
+                ..
+            } => {
+                let temen_ir::TypeEntry::Func(f) = &t.module.types[*sig as usize] else {
+                    panic!("a call.cap's sig names a function type");
+                };
+                Some((*type_id, *op, args.len(), f.results.len()))
+            }
             _ => None,
         })
         .collect();
     assert_eq!(
         caps,
-        vec![(14, 0, 3), (14, 1, 1), (6, 15, 9), (6, 18, 1), (6, 1, 1)],
-        "split, read, spawn detached, wait, join"
+        vec![(14, 0, 3, 1), (14, 1, 1, 1), (6, 15, 9, 1), (6, 1, 1, 2)],
+        "split, read, spawn detached, join (two results)"
     );
 }
 
@@ -132,7 +144,7 @@ define i64 @supervise(i32 %inst, i64 %h) {
 "#;
 
 /// #1706 — a spawner supervises its children: `__vm_poll`, `__vm_kill` and `__vm_detach` lower to
-/// `call.cap INSTANTIATOR` ops 9, 12 and 10 with the child handle, as `__vm_wait` is op 18.
+/// `call.cap INSTANTIATOR` ops 9, 12 and 10 with the child handle, as `__vm_join` is op 1.
 #[test]
 fn poll_kill_and_detach_lower_to_their_ops() {
     let t = temen_llvm::translate_ll_str(LL_SUPERVISE).expect("translate");
