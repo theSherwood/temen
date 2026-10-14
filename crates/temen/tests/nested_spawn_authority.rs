@@ -67,10 +67,10 @@ fn middle(spawn: Spawn) -> String {
             SpawnRec {
                 grants_ptr: 16384,
                 grants_n: 1,
-                ..SpawnRec::v1(0)
+                ..SpawnRec::v1()
             },
         ),
-        _ => (String::new(), SpawnRec::v1(0)),
+        _ => (String::new(), SpawnRec::v1()),
     };
     format!(
         "memory 17
@@ -101,7 +101,7 @@ fn root() -> String {
     let rec = SpawnRec {
         grants_ptr: 16384,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "memory 17

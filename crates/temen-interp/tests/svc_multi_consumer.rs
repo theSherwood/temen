@@ -190,7 +190,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// [`SEP_CALLER`] with its spawn record: the module's entry 0 in its declared window.
 fn sep_caller() -> String {
-    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::v1(0)))
+    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::v1()))
 }
 
 const SEP_SERVER_TWO_WORKERS: &str = r#"

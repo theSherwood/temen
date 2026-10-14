@@ -6,8 +6,8 @@
 //! journal records none of a detached child's writes, so each of its anchors carries the child's
 //! window the same way (#2058); and stdio a child's re-grant promoted into a shared cell is
 //! captured and rewound there (#2055). A line breakpoint in the debuggee's program binds in a child
-//! image of it too, whose frames read against the image's own §6 debug info (#2239); a child of a
-//! child's own program runs that child's unit (#2076). A debugger edit while a child is focused
+//! image of it too, whose frames read against the image's own §6 debug info (#2239); a grandchild's
+//! env is rebuilt under its spawner's (#2076). A debugger edit while a child is focused
 //! lands in the child's window, live and on every replay (#2072).
 
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun, ScheduledWrite};
@@ -184,7 +184,7 @@ fn finish(run: &mut ScheduledDebugRun) -> (String, String) {
 /// promoted stdout (#2055).
 #[test]
 fn a_live_detached_child_rides_every_checkpoint() {
-    let (result, out) = rides_every_checkpoint(CHILD);
+    let (result, out) = rides_every_checkpoint(|| session(ROOT, CHILD, false));
     assert_eq!(
         (result.as_str(), out.as_str()),
         ("Err(MemoryFault)", "0123"),
@@ -193,11 +193,11 @@ fn a_live_detached_child_rides_every_checkpoint() {
     );
 }
 
-/// Checkpoint a run of [`ROOT`] spawning `child` at every turn, restore each checkpoint into a fresh
-/// run, and check the restore lands where the uninterrupted run stood and replays forward exactly as
-/// it did. Returns the uninterrupted run's result and output.
-fn rides_every_checkpoint(child: &str) -> (String, String) {
-    let mut refr = session(ROOT, child, false);
+/// Checkpoint a run `session` makes at every turn, restore each checkpoint into a fresh one, and
+/// check the restore lands where the uninterrupted run stood and replays forward exactly as it did.
+/// Returns the uninterrupted run's result and output.
+fn rides_every_checkpoint(session: impl Fn() -> ScheduledDebugRun) -> (String, String) {
+    let mut refr = session();
     let mut fuel = FUEL;
     let mut want = vec![observe(&mut refr)];
     let mut snaps = vec![refr.snapshot()];
@@ -213,7 +213,7 @@ fn rides_every_checkpoint(child: &str) -> (String, String) {
             wrong.push(format!("turn {c}: no checkpoint"));
             continue;
         };
-        let mut warm = session(ROOT, child, false);
+        let mut warm = session();
         warm.restore(c as u64, snap);
         let mut i = c;
         if observe(&mut warm) != want[i] {
@@ -680,47 +680,45 @@ fn the_journal_records_only_the_root_windows_writes() {
     }
 }
 
-/// A child `(instantiator, address space) -> i64` that spawns a copy of its own program with the
-/// budget its spawn paid with, `"budget"` (an op-17 v1 record, `module = -1`), and returns what the
-/// copy returns. The copy, func 1, adds 1 to a word of its own window 20 times and returns it.
-const SPAWNING_CHILD: &str = r#"memory 16
-data 16400 "budget"
-func (i64, i64) -> (i64) {
-block 0 (vi: i64, vas: i64) {
-  vp = i64.const 16400
-  vl = i64.const 6
-  vbud = self.resolve vp vl
+/// A root `(instantiator, budget, child, grand) -> i64` that spawns `child`, its func 1's image,
+/// granting it `grand`, its func 2's image, as `"grand"`, and joins it. The child spawns `"grand"`
+/// with the budget its spawn paid with, `"budget"`, and returns what the grandchild returns; the
+/// grandchild adds 1 to a word of its own window 20 times and returns it.
+const NESTED: &str = r#"memory 17
+data 17472 "grand"
+data 17480 "budget"
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (vi: i32, vbud: i32, vchild: i32, vgrand: i32) {
+  vg = i64.const 17408
+  vw = i64.const 21474853952
+  i64.store vg vw
+  vgh = i64.const 17416
+  vgr = i64.extend_i32_u vgrand
+  i64.store vgh vgr
+  vb = i64.extend_i32_u vbud
+  vmh = i64.extend_i32_u vchild
+  vgn = i64.const 1
   vz = i64.const 0
-  r0 = i64.const 4294967297
-  a0 = i64.const 17536
-  i64.store a0 r0
-  a1 = i64.const 17544
-  i64.store a1 vz
-  r2 = i64.const -4294967296
-  a2 = i64.const 17552
-  i64.store a2 r2
-  vb64 = i64.extend_i32_u vbud
-  v32 = i64.const 32
-  vbs = i64.shl vb64 v32
-  vself = i64.const 4294967295
-  r3 = i64.or vbs vself
-  a3 = i64.const 17560
-  i64.store a3 r3
-  a4 = i64.const 17568
-  i64.store a4 vz
-  a5 = i64.const 17576
-  i64.store a5 vz
-  a6 = i64.const 17584
-  i64.store a6 vz
-  a7 = i64.const 17592
-  i64.store a7 vz
-  a8 = i64.const 17600
-  i64.store a8 vz
-  a9 = i64.const 17608
-  i64.store a9 vself
-  a10 = i64.const 17616
-  i64.store a10 vz
-  vh = call.cap 6 17 (i64) -> (i32) vi (a0)
+  vlog = i64.const 17
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb, vmh, vg, vgn, vz, vlog, vz)
+  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vbp = i64.const 17480
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vgp = i64.const 17472
+  vgl = i64.const 5
+  vgrand = self.resolve vgp vgl
+  vb = i64.extend_i32_u vbud
+  vmh = i64.extend_i32_u vgrand
+  vz = i64.const 0
+  vlog = i64.const 17
+  vi = i32.wrap_i64 v0
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb, vmh, vz, vz, vz, vlog, vz)
   vj = call.cap 6 1 (i32) -> (i64) vi (vh)
   return vj
   }
@@ -749,14 +747,26 @@ block 2 () {
 }
 "#;
 
-/// #2076 — a child of a child's own program runs that child's unit, not the root's: the grandchild
-/// runs the child's func 1 and returns its count. And the run checkpoints at every turn, each env
-/// rebuilt under the one that spawned it — the grandchild's powerbox under the child's, the child's
-/// under the root's — with the unit it runs.
+/// A run of [`NESTED`] granting its child's and grandchild's images.
+fn nested_session() -> ScheduledDebugRun {
+    let m = parse_module(NESTED).expect("parse the root");
+    let image = |f| temen_ir::child_image_at(&m, f).expect("a child entry");
+    let mut host = Host::new();
+    let inst = host.grant_instantiator(0, 1 << 17);
+    let budget = host.grant_budget(-1, 1 << 20, -1);
+    let child = host.grant_module(&image(1));
+    let grand = host.grant_module(&image(2));
+    let args = [inst, budget, child, grand].map(Value::I32);
+    ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("in subset")
+}
+
+/// #2076 — a grandchild rides every checkpoint: the run checkpoints at every turn, each env rebuilt
+/// under the one that spawned it — the grandchild's powerbox under the child's, the child's under
+/// the root's — with the unit it runs, and the grandchild returns its count.
 #[test]
-fn a_child_of_a_childs_own_program_rides_every_checkpoint() {
+fn a_grandchild_rides_every_checkpoint() {
     assert_eq!(
-        rides_every_checkpoint(SPAWNING_CHILD),
+        rides_every_checkpoint(nested_session),
         ("Ok([I64(20)])".to_string(), String::new())
     );
 }

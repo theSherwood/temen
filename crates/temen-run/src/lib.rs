@@ -984,7 +984,7 @@ unsafe fn jit_native_op(
             // SAFETY: `cm` is the in-flight run's CompiledModule (jit_cap_run registered it);
             // the guest is suspended in this synchronous call.cap, so this transient re-entry
             // aliases no live reference (run_raw's contract).
-            match (*cm).define_extra(&funcs, &types, Some((compiled.domain, compiled.unit))) {
+            match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     // The unit entry (func 0): trampoline for `invoke`, natural code + type_id
                     // for B2 `install` into the call.dyn table.
@@ -1172,7 +1172,7 @@ unsafe fn jit_native_op(
                 .expect("unit was just stored");
             // SAFETY: identical contract to op 0 — `cm` is the in-flight run's CompiledModule and
             // the guest is suspended in this synchronous call.cap, so the re-entry aliases nothing.
-            match (*cm).define_extra(&funcs, &types, Some((compiled.domain, compiled.unit))) {
+            match (*cm).define_extra(&funcs, &types) {
                 Ok(defs) => {
                     let d = defs[0];
                     host.set_jit_unit_native(
@@ -1647,7 +1647,6 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
         out.push(temen_jit::DetachedSeed::Captured(Box::new(
             temen_jit::CapturedSeed {
                 slot,
-                entry: launch.entry,
                 mapped_log2: r.memory_log2,
                 reserved_log2,
                 funcs: r.funcs,
@@ -1722,7 +1721,7 @@ fn jit_relaunches(host: &Host) -> bool {
 /// the root's, as the oracle's recursive harvest leaves them.
 fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
     let mut unreached = Vec::new();
-    let (captured, completed) = detached_left(cm.take_detached_harvest(), host, &mut unreached);
+    let (captured, completed) = detached_left(cm.take_detached_harvest(), &mut unreached);
     if !captured.is_empty() {
         host.set_captured_detached(captured);
     }
@@ -1743,13 +1742,12 @@ fn join_outcome(outcome: Option<(i64, i64)>) -> Option<Result<i64, temen_interp:
     })
 }
 
-/// [`jit_detached_leave`] for one domain, whose powerbox is `host`: its captured and its completed
-/// children. The unreached ones go to `unreached`, as do a non-captured child's captured children:
-/// it rides no artifact, so their continuations would be lost. Its completed children are dropped,
-/// as their results can reach no one.
+/// [`jit_detached_leave`] for one domain: its captured and its completed children. The unreached ones
+/// go to `unreached`, as do a non-captured child's captured children: it rides no artifact, so their
+/// continuations would be lost. Its completed children are dropped, as their results can reach no
+/// one.
 fn detached_left(
     harvest: Vec<temen_jit::DetachedHarvest>,
-    host: &Host,
     unreached: &mut Vec<temen_interp::PendingDetached>,
 ) -> (
     Vec<temen_interp::CapturedDetached>,
@@ -1779,20 +1777,11 @@ fn detached_left(
         let Some(module) = module else {
             continue;
         };
-        let same_module = host
-            .self_module()
-            .is_some_and(|m| std::sync::Arc::ptr_eq(&m, &module));
         let spawn = temen_interp::DetachedSpawn {
-            entry: h.entry,
             digest: temen_interp::module_digest(&module),
             module: std::sync::Arc::clone(&module),
-            same_module,
         };
-        let (grand_captured, grand_completed) = detached_left(
-            h.children,
-            &child.lock().unwrap_or_else(|e| e.into_inner()),
-            unreached,
-        );
+        let (grand_captured, grand_completed) = detached_left(h.children, unreached);
         let outcome = join_outcome(h.outcome);
         let Some(capture) = h.capture else {
             unreached.extend(grand_captured.into_iter().map(pending_detached));
@@ -1835,10 +1824,8 @@ fn detached_left(
             module,
             launch: temen_interp::DetachedLaunch {
                 task: 0,
-                entry: h.entry,
                 digest: spawn.digest,
                 lane,
-                same_module,
                 names,
             },
         });
@@ -1854,10 +1841,8 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
         child_task: c.launch.task,
         host: c.host,
         spawn: temen_interp::DetachedSpawn {
-            entry: c.launch.entry,
             digest: c.launch.digest,
             module: c.module,
-            same_module: c.launch.same_module,
         },
     }
 }
@@ -2061,7 +2046,7 @@ pub fn recompact_into(
             continue; // no IR retained (cannot happen for a compiled unit) — skip defensively
         };
         let types = host.jit_unit_types(domain, unit).unwrap_or_default();
-        let defs = fresh.define_extra(&funcs, &types, Some((domain, unit)))?;
+        let defs = fresh.define_extra(&funcs, &types)?;
         let d = defs[0];
         host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         if let Some(slots) = code_to_slots.get(&(old_install_code as u64)) {
@@ -2119,7 +2104,7 @@ pub fn reconstruct_jit_units(
                 continue; // no IR retained (cannot happen for a restored unit) — skip defensively
             };
             let types = host.jit_unit_types(domain, unit).unwrap_or_default();
-            let defs = cm.define_extra(&funcs, &types, Some((domain, unit)))?;
+            let defs = cm.define_extra(&funcs, &types)?;
             let d = defs[0];
             host.set_jit_unit_native(domain, unit, d.tramp as usize, d.code as usize, d.type_id);
         }
@@ -2458,10 +2443,9 @@ unsafe fn fast_dispatch(
 pub unsafe extern "C" fn module_resolver(
     ctx: *mut c_void,
     handle: i32,
-    unit: i64,
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
-    resolve_module_into(&*(ctx as *const Host), handle, unit, out)
+    resolve_module_into(&*(ctx as *const Host), handle, out)
 }
 
 /// [`module_resolver`] for the **locked** cap-context shape ([`CapCtx::Locked`]): `ctx` is the
@@ -2472,13 +2456,12 @@ pub unsafe extern "C" fn module_resolver(
 pub unsafe extern "C" fn module_resolver_locked(
     ctx: *mut c_void,
     handle: i32,
-    unit: i64,
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     let host = (*(ctx as *const Mutex<Host>))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    resolve_module_into(&host, handle, unit, out)
+    resolve_module_into(&host, handle, out)
 }
 
 /// The body of both resolvers: fill `out` with the views of the module a spawn's operand names
@@ -2489,10 +2472,9 @@ pub unsafe extern "C" fn module_resolver_locked(
 unsafe fn resolve_module_into(
     host: &Host,
     handle: i32,
-    unit: i64,
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
-    match host.resolve_module_parts(handle, temen_jit::unit_of(unit)) {
+    match host.resolve_module_parts(handle) {
         Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
@@ -2575,7 +2557,7 @@ locked_parent_hook!(
 locked_parent_hook!(
     child_bind_imports_locked,
     child_bind_imports,
-    (child_ctx: *mut c_void, module: i64, unit: i64) -> i32
+    (child_ctx: *mut c_void, module: i64) -> i32
 );
 locked_parent_hook!(
     child_offer_mint_locked,
@@ -3287,24 +3269,14 @@ pub unsafe extern "C" fn child_bind_imports(
     parent_ctx: *mut c_void,
     child_ctx: *mut c_void,
     module: i64,
-    unit: i64,
 ) -> i32 {
     let parent = &*(parent_ctx as *mut Host);
     // 5c.0 — the child powerbox is a shared cell now (`Arc<Mutex<Host>>` raw): lock to bind.
     let child_cell = &*(child_ctx as *const Mutex<Host>);
-    // The child's program: from an installed unit's code, `-1` is the unit's (#2143).
-    if let Some(m) = parent.spawn_module(module as i32, temen_jit::unit_of(unit)) {
-        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL). A
-        // **same-module** child (`module == SELF_MODULE`, #1234) binds leniently instead — its
-        // manifest is the parent's whole import surface, not one written for it, so an unmet
-        // `required` slot is left empty (fail-closed at use) rather than refusing the spawn.
+    if let Some(m) = parent.spawn_module(module as i32) {
+        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
-        let bound = if parent.is_self_module(module as i32) {
-            child.bind_same_module_manifest(&m.imports, &m.types)
-        } else {
-            child.bind_child_manifest(&m.imports, &m.types)
-        };
-        if bound.is_err() {
+        if child.bind_child_manifest(&m.imports, &m.types).is_err() {
             return -22;
         }
         // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
@@ -5668,12 +5640,10 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // name (`grant_onramp_caps`) so both reference hosts present one frontier (INVARIANTS #14).
     let inst = h.grant_instantiator(0, win);
     h.register_cap_name("instantiator", inst);
-    // The by-name spawn set, only for a guest that spawns detached (`temen_ir::spawns_detached`):
-    // the `"module"` grant is non-durable, so granting it everywhere would make every
-    // snapshot-taking guest unfreezable.
+    // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only for
+    // a guest that spawns detached (`temen_ir::spawns_detached`): least authority.
     if h.self_module_spawns_detached() {
-        let by_handle = h.self_module_spawns_by_module_handle();
-        h.grant_detached_spawn_caps(win, by_handle);
+        h.grant_detached_spawn_caps(win);
     }
     v
 }

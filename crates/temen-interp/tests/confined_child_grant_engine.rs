@@ -64,7 +64,7 @@ fn parent() -> String {
     let spawn = SpawnRec {
         grants_ptr: 17408,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!("{PARENT}{}", rec::segment(17536, &spawn))
 }

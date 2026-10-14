@@ -33,7 +33,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    smod, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged, childMem, ticket, start, seedLen } = e.data;
   // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
@@ -200,14 +200,15 @@ self.onmessage = async (e) => {
   let fi32v = new Int32Array(fmem.buffer);
   const fi32 = () => fi32v.byteLength === fmem.buffer.byteLength ? fi32v : (fi32v = new Int32Array(fmem.buffer));
 
-  // Start a §5 detached child the engine admitted (ticket `t`, window `1 << cslog`, `am` =
-  // `(module << 32) | entry`): mint it a fresh shared Memory — one host header page (env cell,
-  // page-state, DETACHED_JIT.md §3.1) + the declared window, growable in place to the detached
-  // ceiling — and post it with the ticket to a new Worker, which starts the child over it; the engine
-  // seeds it there. A shared Memory posts by reference. Returns the child's completion slot. Used for
-  // an interpreted spawn (`PAR_INSTANTIATE_DETACHED`) and one from emitted code (`env.instantiate_rec`).
+  // Start a §5 detached child the engine admitted (ticket `t`, window `1 << cslog`, `am` = its
+  // module, non-zero for a child of the granted unit): mint it a fresh shared Memory — one host
+  // header page (env cell, page-state, DETACHED_JIT.md §3.1) + the declared window, growable in
+  // place to the detached ceiling — and post it with the ticket to a new Worker, which starts the
+  // child over it; the engine seeds it there. A shared Memory posts by reference. Returns the
+  // child's completion slot. Used for an interpreted spawn (`PAR_INSTANTIATE_DETACHED`) and one
+  // from emitted code (`env.instantiate_rec`).
   const postDetached = (t, cslog, am) => {
-    const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+    const csmod = Number(am);
     const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
     const cmem = new WebAssembly.Memory({
       initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
@@ -221,7 +222,7 @@ self.onmessage = async (e) => {
     // it binds the engine memory (a child of the granted unit runs that unit's emit instead).
     self.postMessage({
       kind: 'spawn', role: 'detached', ticket: t.toString(), childMem: cmem, slog: cslog,
-      smod: csmod, entry: centry, win: 0, winSize: 2 ** cslog, tierup: false,
+      smod: csmod, win: 0, winSize: 2 ** cslog, tierup: false,
       slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
     });
     return cslot;
@@ -392,11 +393,12 @@ self.onmessage = async (e) => {
   };
 
   // §14 instantiate real codegen (BROWSER.md slice 5, detached #1865): a §5 detached child of the
-  // granted unit whose entry is eligible runs it on EMITTED WASM here and fills the completion slot
-  // its parent joins. The emit binds the child's OWN `WebAssembly.Memory` (`childMem`; the unit's
-  // `min 0 / max 65536, shared` memory import binds any shared memory): its window starts one header
-  // page in (`fbase`) and its env cell sits at the bottom of that header. The engine sent `smod ≠ 0`
-  // only for a child that runs the granted unit (a child of any other module stays interpreted).
+  // granted unit whose entry, its function 0, is eligible runs it on EMITTED WASM here and fills
+  // the completion slot its parent joins. The emit binds the child's OWN `WebAssembly.Memory`
+  // (`childMem`; the unit's `min 0 / max 65536, shared` memory import binds any shared memory): its
+  // window starts one header page in (`fbase`) and its env cell sits at the bottom of that header.
+  // The engine sent `smod ≠ 0` only for a child that runs the granted unit (a child of any other
+  // module stays interpreted).
   //
   // The child vCPU is built anyway — never `temen_par_run` — to service every `env.call_interp` leaf
   // with the child's OWN powerbox (`temen_par_inst_call_interp` → `bounce_call`), so a leaf may store,
@@ -408,7 +410,7 @@ self.onmessage = async (e) => {
   // grandchildren (`env.instantiate_rec`), its threads run over the same child memory, and a carve
   // spawn traps, as the interpreter's detached vCPU does.
   if (role === 'detached' && smod !== 0 && instCodegen
-      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1) {
+      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible() === 1) {
     const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const envBytes = ex.temen_wasmjit_env_bytes();
@@ -530,7 +532,7 @@ self.onmessage = async (e) => {
     for (let i = 0; i < nargs; i++) args.push(i64()[(aptr >> 3) + i]);
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
     try {
-      const ret = uinst.exports['f' + entry](fbase, envCell, ...args);
+      const ret = uinst.exports.f0(fbase, envCell, ...args); // a child starts at its function 0
       i64()[(slot + 8) >> 3] = BigInt(ret); // publish result...
       Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
       Atomics.notify(i32(), slot >> 2); // ...and wake the joiner

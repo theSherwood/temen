@@ -250,7 +250,7 @@ fn jit_killpath_stops_runaway_child() {
     }
     let src = format!(
         "{PARENT_WITH_RUNAWAY_CHILD}{}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::v1())
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");

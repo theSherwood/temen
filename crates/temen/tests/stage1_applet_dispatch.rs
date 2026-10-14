@@ -43,7 +43,7 @@ fn src(applet: &str, token: &[u8; 3]) -> String {
         grants_ptr: 16384,
         grants_n: 1,
         args: (TOKEN_AT, token.len() as u64),
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let args = module_args_base();
     format!(

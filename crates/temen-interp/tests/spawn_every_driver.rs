@@ -76,7 +76,7 @@ fn op17_granted() -> String {
     let child = SpawnRec {
         grants_ptr: 17600,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "memory 17
@@ -142,7 +142,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i64) {{
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 {JOIN_OR_ERRNO}{rec}",
-        rec = rec::segment(17536, &SpawnRec::v1(0)),
+        rec = rec::segment(17536, &SpawnRec::v1()),
     )
 }
 
@@ -571,7 +571,7 @@ fn a_detached_spawn_with_a_fuel_quota_traps() {
         &op15_setup(&child, 1 << 20),
         &trapped(Trap::CapFault),
     );
-    let mut rec = SpawnRec::v1(0);
+    let mut rec = SpawnRec::v1();
     rec.quota = 5;
     let m = module(&record_spawn(&rec));
     agree_on_every_driver(
@@ -580,7 +580,7 @@ fn a_detached_spawn_with_a_fuel_quota_traps() {
         &generations_setup(&m, &[1]),
         &trapped(Trap::CapFault),
     );
-    let m = module(&record_spawn(&SpawnRec::v1(0)));
+    let m = module(&record_spawn(&SpawnRec::v1()));
     agree_on_every_driver(
         "op 17, a v1 record with no quota",
         &m,
@@ -716,7 +716,7 @@ fn three_generations(mem: i64, spawn: i64) -> String {
     let r1 = SpawnRec {
         grants_ptr: 17600,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "memory 16
@@ -781,7 +781,7 @@ block 0 (va: i64) {{
 }}
 ",
         r1 = rec::segment(17408, &r1),
-        r2 = rec::segment(17504, &SpawnRec::v1(0)),
+        r2 = rec::segment(17504, &SpawnRec::v1()),
         g2 = store_grant("g", 17600, 16400, "g2", "vc2"),
     )
 }
@@ -1398,7 +1398,7 @@ fn op17_granting(grants: &[(&str, Option<u32>)]) -> String {
     let rec = SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let mut segments = rec::segment(REC, &rec);
     let mut stores = String::new();
@@ -1587,7 +1587,7 @@ fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
 }
 
 /// The root spawns a serving child, func 1's image (its second argument), through a v1 record
-/// (`SpawnRec::v1(0)` at 17600) paid from the `Budget` its third argument names. It mints a
+/// (`SpawnRec::v1()` at 17600) paid from the `Budget` its third argument names. It mints a
 /// live-callee offer over the child (`child_offer`) and calls `add(40, 2)` through it. The call parks
 /// the root until the child's `svc.wait` serves it; the child returns how many calls it served, which
 /// the root joins: `1 * 100 + 42`. A fixture, so the browser runs it too, with the child image as the
@@ -1600,7 +1600,7 @@ const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     // Without its newline: a Windows checkout ends the fixture's lines with `\r\n`.
-    let record = rec::segment(17600, &SpawnRec::v1(0));
+    let record = rec::segment(17600, &SpawnRec::v1());
     assert!(
         LIVE_CALLER.contains(record.trim_end()),
         "the fixture's spawn record starts the child image at its entry"

@@ -96,12 +96,12 @@ fn detached_depth_two() -> (temen_ir::Module, Host, [Value; 4]) {
     let r1 = SpawnRec {
         grants_ptr: 16768,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let src = format!(
         "{DETACHED_DEPTH_TWO}{}{}",
         rec::segment(17408, &r1),
-        rec::segment(17536, &SpawnRec::v1(0))
+        rec::segment(17536, &SpawnRec::v1())
     );
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();

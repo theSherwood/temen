@@ -88,7 +88,7 @@ fn by_record(ptr: u64, len: u64, forged: bool) -> Module {
             REC,
             &SpawnRec {
                 args: (ptr, len),
-                ..SpawnRec::v1(0)
+                ..SpawnRec::v1()
             },
         ),
     )

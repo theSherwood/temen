@@ -186,11 +186,11 @@ block 4 (vr: i64, vho: i32, vhj: i32, vc: i64, vs0: i64) {{
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{src}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::v1()),
         rec::segment(17664, &caller)
     )
 }

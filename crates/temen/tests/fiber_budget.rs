@@ -87,7 +87,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 

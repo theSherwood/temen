@@ -73,7 +73,7 @@ fn thread_guest(body: &str, tail: &str) -> String {
 fn child_guest(tail: &str) -> String {
     format!(
         "memory 19\nfunc (i64, i64, i64) -> (i64) {{\nblock 0 (v0: i64, vb: i64, vm: i64) {{\n  vi = i32.wrap_i64 v0\n  vbb = i32.wrap_i64 vb\n  vab = i64.const 17436\n  i32.store vab vbb\n  vmm = i32.wrap_i64 vm\n  vam = i64.const 17432\n  i32.store vam vmm\n  vp = i64.const 17408\n  vc = call.cap 6 17 (i64) -> (i32) vi (vp)\n{tail}\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{SPIN}{}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::v1())
     )
 }
 

@@ -231,7 +231,7 @@ impl Plan {
                 grants_ptr: first_rec[k],
                 grants_n: rec_n[k] as u64,
                 args: (argv_at[k].0, argv_at[k].1 as u64),
-                ..temen_ir::SpawnRec::v1(0)
+                ..temen_ir::SpawnRec::v1()
             };
             let (seg, stores) =
                 spawn_rec_ir(at, &rec, &format!("v{}", 1 + k), &format!("v{}", 1 + n));

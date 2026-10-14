@@ -347,13 +347,19 @@ frontier's own repair, never parked. Until it is gone:
   `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. A thaw
   of an artifact frozen around a carve child still re-creates one, until the nested freeze goes.
 - **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
-  detached, with the spawn-time args payload and the pre-mapped region as fields, `module = -1` the
-  spawner's own program. The v0 carve record is retired (it traps `CapFault`), and op 15's positional form
-  retires too (#2067); the version word, always 1 now, is that migration's scaffolding (#2091).
-  The window is always the child module's
+  detached, with the spawn-time args payload and the pre-mapped region as fields. The v0 carve record
+  is retired (it traps `CapFault`), and op 15's positional form retires too (#2067); the version word,
+  always 1 now, is that migration's scaffolding (#2091). The window is always the child module's
   declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
   module it did not build need not know its size — any other value must equal it. A query for the
   size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
+- **A child runs a module, never a function of its spawner** (owner, 2026-10-08, #2219): the
+  record's `module` is a `Module` handle the spawner holds, and the child starts at that module's
+  function 0, its child bootstrap. `module = -1`, which once named the spawner's own program, is a
+  forged handle like any other, and the record's word at 4, once the entry, must be 0, as must op
+  15's entry operand: each traps `CapFault` on every engine (`self_spawn_refused.rs`). "A copy of
+  myself" is the host granting the program's child image (`"child"`). Every child binds its manifest
+  strictly; one that leaves an import empty on purpose says so with a `VM_EMPTY` grant.
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (op 15's
   `(region, child_off)`), with futex keyed on the region's canonical identity. Argv rides op 15's
   spawn-time args payload; results ride the join and the region.

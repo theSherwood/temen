@@ -190,7 +190,7 @@ fn the_same_harness_runs_a_version_1_spawn() {
             REC + rec::MODULE_AT,
             REC + rec::BUDGET_AT,
         ),
-        &rec::segment(REC, &SpawnRec::v1(0)),
+        &rec::segment(REC, &SpawnRec::v1()),
     );
     for driver in drivers::ALL {
         let ran = drivers::run_on(driver, &m, &setup)

@@ -318,7 +318,7 @@ block 2 (vi2: i32, vs2: i32) {{
 data 20480 "m"
 data 20488 "budget"
 {}"#,
-        rec::segment(24576, &temen_ir::SpawnRec::v1(0))
+        rec::segment(24576, &temen_ir::SpawnRec::v1())
     )
 }
 

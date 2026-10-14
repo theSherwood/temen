@@ -88,7 +88,7 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(0)));
+    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1()));
     check(&src, Ok(vec![Value::I64(0)]));
 }
 
@@ -125,6 +125,6 @@ block 0 (v0: i64) {
 
 #[test]
 fn child_trap_propagates_through_join() {
-    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1(0)));
+    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1()));
     check(&src, Err(()));
 }

@@ -42,11 +42,11 @@ use temen_ir::SpawnRec;
 fn spawning(src: &str) -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{src}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::v1()),
         rec::segment(17664, &guest)
     )
 }

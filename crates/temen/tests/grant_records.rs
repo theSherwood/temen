@@ -25,7 +25,7 @@ fn guest(grants_ptr: i64, grants_n: i64) -> temen_ir::Module {
     let spawn = SpawnRec {
         grants_ptr: grants_ptr as u64,
         grants_n: grants_n as u64,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let src = format!(
         r#"memory 19

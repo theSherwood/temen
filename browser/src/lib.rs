@@ -756,8 +756,8 @@ pub const PAR_JIT_INVOKE: i32 = 8;
 /// The Worker mints the child a fresh shared `Memory` (one host header page + the declared window,
 /// growable to `temen_detached_max_bytes()`) and posts it and the ticket to a new Worker, which starts
 /// the child over it through `Region::Foreign` ([`temen_par_child_detached`] — the engine seeds the
-/// window). `_d` = `(module << 32) | entry` (`detached_operands`): `module` is non-zero only for a
-/// child that runs the run's granted unit, which the Worker may run on the wasm tier. Joined through
+/// window). `_d` = the child's module (`detached_operands`), non-zero only for a child that runs the
+/// run's granted unit, which the Worker may run on the wasm tier from its function 0. Joined through
 /// the same completion-slot protocol as [`PAR_SPAWN`]. Children run **concurrently**, each in its
 /// own Worker over its own memory — the reason this is a Worker event and not an in-Rust one.
 pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
@@ -1429,7 +1429,7 @@ fn par_inst_powerbox(
     module: &std::sync::Arc<temen_ir::Module>,
 ) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    host.set_self_module(module); // a record's `module = -1`
+    host.set_self_module(module);
     let inst = host.grant_instantiator(0, cfg.win_size);
     let mut args = vec![Value::I32(inst)];
     if let Some(m) = &cfg.module {
@@ -1458,8 +1458,8 @@ fn par_inst_powerbox(
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// The granted unit's per-function eligibility ([`temen_wasm_jit::compile_nested`]'s `emitted` bitmap):
-/// `f{i}` is emitted + safe to call directly. A child of the unit whose entry is eligible runs on
-/// wasm; else it interprets.
+/// `f{i}` is emitted + safe to call directly. A child of the unit runs on wasm when its function 0, the
+/// child's entry, is eligible; else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 /// Whether [`INST_UNIT_WASM`] was emitted **paged** (the unit reaches an ADDRESS_SPACE page op) — the
 /// Worker then seeds + re-syncs its `"pagestate"`/`"mapped"` globals from the child vCPU (#1151).
@@ -1543,15 +1543,13 @@ pub extern "C" fn temen_par_inst_unit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).1 }
 }
 
-/// Whether the granted unit's function `entry` is emitted (safe to run `f{entry}` on wasm). `0` when
-/// codegen isn't enabled, `entry` is out of range, or that function is out of the emitter subset.
+/// Whether the granted unit's function 0, where every child starts (#2219), is emitted (safe to run
+/// `f0` on wasm). `0` when codegen isn't enabled or that function is out of the emitter subset.
 #[no_mangle]
-pub extern "C" fn temen_par_inst_eligible(entry: u32) -> i32 {
+pub extern "C" fn temen_par_inst_eligible() -> i32 {
     // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
     let e = unsafe { (*core::ptr::addr_of!(INST_ELIGIBLE)).as_ref() };
-    e.and_then(|v| v.get(entry as usize))
-        .copied()
-        .map_or(0, |b| b as i32)
+    e.and_then(|v| v.first()).copied().map_or(0, |b| b as i32)
 }
 
 /// Whether the run's emitted §14 unit is **paged** (see [`INST_PAGED`]): the Worker must then call
@@ -1612,8 +1610,8 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
 /// its `instantiate_rec` arrived as the Worker's `env.instantiate_rec` bounce. The engine admits it as
 /// the interpreted op ([`bytecode::Vcpu::admit_record`]: `inst` resolved in `v`'s powerbox, the record
 /// read from `v`'s window, a v1 record through the one detached admission) and returns the admitted
-/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and `(module << 32) | entry`
-/// in `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
+/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and its module in
+/// `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
 /// refusal, which the emitted parent reads as the spawn's result; `0` for a trap, which the Worker
 /// raises. Once the child's Worker is started, file it with [`temen_par_inst_file_child`].
 #[no_mangle]
@@ -2253,16 +2251,18 @@ fn ticket(child: bytecode::PendingChild) -> i64 {
     Box::into_raw(Box::new(child)) as usize as i64
 }
 
-/// A detached child's `(module << 32) | entry`, the `_d` operand of [`PAR_INSTANTIATE_DETACHED`].
-/// `module`, the child's index in its spawner's program source, is kept only when the child runs the
-/// run's granted unit — the one module the Workers emit — and is `0` otherwise, so a Worker runs the
-/// emitted unit for exactly the children whose program it is. A child of the root's own module (a
-/// spawn record's `module = -1`) stays interpreted.
+/// A detached child's module, the `_d` operand of [`PAR_INSTANTIATE_DETACHED`]: the child's index in
+/// its spawner's program source, kept only when the child runs the run's granted unit — the one
+/// module the Workers emit — and `0` otherwise, so a Worker runs the emitted unit for exactly the
+/// children whose program it is. Every child starts at its module's function 0 (#2219).
 fn detached_operands(child: &bytecode::PendingChild) -> i64 {
-    let (module, entry) = child.module_entry();
     let unit = par_inst().and_then(|c| c.module.as_ref());
     let runs_unit = unit.is_some() && unit == child.self_module().map(|m| &**m);
-    (if runs_unit { (module as i64) << 32 } else { 0 }) | entry as i64
+    if runs_unit {
+        child.module() as i64
+    } else {
+        0
+    }
 }
 
 /// Start a §5 **detached child** (#1286 slice 3b) from its ticket over its own `WebAssembly.Memory`,
@@ -4086,11 +4086,10 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set, only for a guest that spawns detached: the `"module"` grant is
-        // non-durable, so granting it everywhere would make every reactor that saves a warm
-        // snapshot unfreezable.
+        // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only
+        // for a guest that spawns detached: least authority.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
+            host.grant_detached_spawn_caps(win);
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
@@ -10358,7 +10357,7 @@ fn op13_mini_driver() -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let (seg, stores) = plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     format!(

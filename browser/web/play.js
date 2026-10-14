@@ -335,11 +335,11 @@ block 0 (v0: i32, vbud: i32) {
   vcn = i64.const 16384
   vcl = i64.const 5
   vchild = self.resolve vcn vcl         ; this program's child image, by name
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
   ; Everything else — offset, quota, grants, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
@@ -456,11 +456,11 @@ block 0 () {
   i32.store vg1 vln
   vg2 = i64.const 17544
   i32.store vg2 vout
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
   ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX

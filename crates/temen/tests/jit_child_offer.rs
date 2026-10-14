@@ -133,7 +133,7 @@ block 0 (va: i64, vb: i64) {
 /// `src` with its spawn record (at 17536), and a host for it: the parent's three args, an
 /// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
 fn setup(src: &str) -> (Arc<Module>, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1(0)));
+    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();

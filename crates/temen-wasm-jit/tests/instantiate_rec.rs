@@ -31,7 +31,7 @@ const CHILD_MODULE_HANDLE: i32 = 99;
 /// func 1's image — the module's declared window, no pager, no budget, no fuel cap, no grants —
 /// `instantiate_rec`, `join`, return. Child (func 1): pure compute, returns 9.
 fn rec_parent() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
     let module_at = REC_AT + 24;
     format!(
         r#"memory 16
@@ -68,9 +68,9 @@ fn child_image(m: &temen_ir::Module) -> temen_ir::Module {
     temen_ir::child_image_at(m, 1).expect("the child's image")
 }
 
-fn oracle_child(m: &temen_ir::Module, entry: u32) -> i64 {
+fn oracle_child(m: &temen_ir::Module) -> i64 {
     let mut fuel = u64::MAX;
-    match run(m, entry, &[], &mut fuel) {
+    match run(m, 0, &[], &mut fuel) {
         Ok(v) => match v.first() {
             Some(Value::I64(x)) => *x,
             other => panic!("child oracle: {other:?}"),
@@ -166,7 +166,7 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
 #[test]
 fn record_spawn_bounces_and_matches_interp() {
     let m = parse(&rec_parent());
-    let want = oracle_child(&child_image(&m), 0);
+    let want = oracle_child(&child_image(&m));
     assert_eq!(want, 9, "child oracle");
 
     let wasm = compile_module_nested(&m, false).expect("op-17 entry emits (nested)");
@@ -205,13 +205,13 @@ fn record_spawn_bounces_and_matches_interp() {
                     rec,
                     temen_ir::SpawnRec {
                         modh: CHILD_MODULE_HANDLE,
-                        ..temen_ir::SpawnRec::v1(0)
+                        ..temen_ir::SpawnRec::v1()
                     },
                     "the record the parent built, detached"
                 );
                 caller.data_mut().saw_rec_bounce = true;
                 let image = child_image(&caller.data().module);
-                let r = oracle_child(&image, rec.entry);
+                let r = oracle_child(&image);
                 let st = caller.data_mut();
                 st.children.push(r);
                 (st.children.len() - 1) as i32

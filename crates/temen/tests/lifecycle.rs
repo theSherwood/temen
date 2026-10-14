@@ -27,7 +27,7 @@ use temen_verify::verify_module;
 /// The host also holds a 64 KiB `SharedRegion` the guest can resolve as `"region"`, over an OS
 /// shared-memory object so the JIT can alias it into a child's window.
 fn setup(src: &str) -> (Module, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(0)));
+    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();

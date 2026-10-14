@@ -62,7 +62,7 @@ block 0 () {
 /// module detached through a v1 record (its declared window; an empty grant list — the host binds
 /// `"fs"`), `join`s it, and returns the child's result. Emittable via the `env.instantiate_rec` bounce.
 fn parent() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
     let modh_at = REC_AT + 24;
     format!(
         r#"memory 16
@@ -353,7 +353,7 @@ fn emitted_parent_spawns_granted_child_detached_e2e() {
                     rec,
                     temen_ir::SpawnRec {
                         modh: MODULE_HANDLE,
-                        ..temen_ir::SpawnRec::v1(0)
+                        ..temen_ir::SpawnRec::v1()
                     },
                     "the record the parent built: detached, func 0 of the child module"
                 );

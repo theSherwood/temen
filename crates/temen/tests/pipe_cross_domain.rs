@@ -92,7 +92,7 @@ fn setup() -> (Module, Host, [i32; 5]) {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");

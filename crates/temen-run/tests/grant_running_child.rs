@@ -317,7 +317,7 @@ block 0 (vinst: i32, vas: i32, vbud: i32) {{
 fn mailbox_rec() -> SpawnRec {
     SpawnRec {
         child_off: MAILBOX,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     }
 }
 
@@ -398,7 +398,7 @@ block 0 (v0: i64, v1: i64) {{
     let with_grandchild = SpawnRec {
         grants_ptr: GRANTS,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let m = module(&parent(
         &[(REC_A, with_grandchild), (REC_B, mailbox_rec())],
@@ -508,7 +508,7 @@ fn grant_between(before: &str, after: &str) -> String {
 #[test]
 fn a_grant_to_an_ended_child_fails() {
     let returned = module(&parent(
-        &[(REC_A, SpawnRec::v1(0))],
+        &[(REC_A, SpawnRec::v1())],
         &grant_between(
             "  vw = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
             "  vj = call.cap 6 1 (i32) -> (i64) vinst (vch)\n",
@@ -521,7 +521,7 @@ fn a_grant_to_an_ended_child_fails() {
         &ok(-22 * 1000 + 7),
     );
     let killed = module(&parent(
-        &[(REC_A, SpawnRec::v1(0))],
+        &[(REC_A, SpawnRec::v1())],
         &grant_between(
             "  vk1 = call.cap 6 12 (i32) -> (i32) vinst (vch)\n\
              \x20 vj = call.cap 6 18 (i32) -> (i64) vinst (vch)\n",
@@ -561,7 +561,7 @@ fn a_handle_no_spawn_could_grant_faults() {
             grant("q", "vch", "vforged", "vgot"),
         );
         let m = module(&parent(
-            &[(REC_A, SpawnRec::v1(0))],
+            &[(REC_A, SpawnRec::v1())],
             &body,
             &[("child", CHILD_RETURNS_7)],
         ));

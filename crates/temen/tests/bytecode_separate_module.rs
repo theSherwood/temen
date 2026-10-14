@@ -98,72 +98,8 @@ block 0 (v0: i32, v1: i32) {
 fn forged_module_handle_faults_identically() {
     let forged = SpawnRec {
         modh: 999,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let parent = format!("{PARENT_FORGED}{}", rec::segment(17408, &forged));
     check(&parent, CHILD_SRC, Err(Trap::CapFault));
-}
-
-/// A two-export child ("plugin"): `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1) → `byte+2000`.
-/// Used to prove the bytecode engine drives `Module` op 0 (`resolve_export`, F2) identically to the
-/// tree-walker — name → funcidx through the generic `cap_dispatch_slots` seam.
-const NAMED_CHILD_SRC: &str = r#"memory 16
-data 16484 "VM"
-export 0 func "alpha" 0
-export 1 func "beta" 1
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 16484
-  v2 = i32.load8_u v1
-  v3 = i64.extend_i32_u v2
-  v4 = i64.const 1000
-  v5 = i64.add v3 v4
-  return v5
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i64.const 16484
-  v2 = i32.load8_u v1
-  v3 = i64.extend_i32_u v2
-  v4 = i64.const 2000
-  v5 = i64.add v3 v4
-  return v5
-  }
-}
-"#;
-
-/// The parent resolves "beta" (func 1, in its own data segment) via `Module` op 0, writes that funcidx
-/// into the entry of a v1 record at 17408 with the module and the `"budget"` it resolves, spawns the
-/// child detached → join → the *beta* result (`'V'` 86 + 2000).
-const PARENT_BY_NAME: &str = r#"memory 17
-data 16584 "beta"
-data 16640 "budget"
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.const 16584
-  v3 = i64.const 4
-  v4 = call.cap 8 0 (i64, i64) -> (i64) v1 (v2, v3)
-  ve = i32.wrap_i64 v4
-  rea = i64.const 17412
-  i32.store rea ve
-  rma = i64.const 17432
-  i32.store rma v1
-  vnp = i64.const 16640
-  vnl = i64.const 6
-  vb = self.resolve vnp vnl
-  rba = i64.const 17436
-  i32.store rba vb
-  rp = i64.const 17408
-  v9 = call.cap 6 17 (i64) -> (i32) v0 (rp)
-  v10 = call.cap 6 1 (i32) -> (i64) v0 (v9)
-  return v10
-  }
-}
-"#;
-
-#[test]
-fn module_child_addressed_by_export_name_matches_treewalker() {
-    let parent = format!("{PARENT_BY_NAME}{}", rec::segment(17408, &SpawnRec::v1(0)));
-    check(&parent, NAMED_CHILD_SRC, Ok(vec![Value::I64(2086)]));
 }

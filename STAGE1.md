@@ -24,8 +24,8 @@ glue, not new substrate**:
 - **`Instantiator` (iface 6)** — `instantiate_module` (op 5) spawns a child
   running a **separate host-verified `Module`** confined to a carve of the
   parent's window; `join` (op 1) parks the caller until the child completes and
-  yields its result. Proven on both backends (`separate_module.rs`,
-  `jit_separate_module.rs`), including data-segment materialization and
+  yields its result. Proven on both backends (`jit_separate_module.rs`),
+  including data-segment materialization and
   confinement (a child cannot touch bytes outside its carve).
 - **`Module` (iface 8)** — host-verified code a guest may instantiate. The host
   grants a `Module` capability (`Host::grant_module`); on the JIT the child is

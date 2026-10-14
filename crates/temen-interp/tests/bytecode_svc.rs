@@ -332,7 +332,7 @@ block 0 (va: i64, vb: i64) {
 fn sep_caller() -> String {
     format!(
         "{SEP_CALLER}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
+        rec::segment(17408, &temen_ir::SpawnRec::v1())
     )
 }
 
@@ -540,7 +540,7 @@ block 0 (vx: i64) {
 fn a_live_offer_over_a_thread_is_refused() {
     let m = module(&format!(
         "{OFFER_OVER_A_THREAD}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1(0))
+        rec::segment(17408, &temen_ir::SpawnRec::v1())
     ));
     let run = |entry: Entry| {
         let mut host = Host::new();

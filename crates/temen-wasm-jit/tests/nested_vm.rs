@@ -32,7 +32,7 @@ const REC_AT: u64 = 18432;
 fn spawn_child() -> String {
     format!(
         "{}  vma = i64.const {}\n  vmh = i32.wrap_i64 v1\n  i32.store vma vmh\n",
-        support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0)),
+        support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1()),
         REC_AT + 24
     )
 }

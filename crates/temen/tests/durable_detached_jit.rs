@@ -90,16 +90,17 @@ fn returned(o: JitOutcome) -> Vec<i64> {
     }
 }
 
-/// Spawns its own program (`module = -1`) detached at func 1, and returns what the spawn answered.
+/// Spawns its own program's child image (`"child"`, from its `_child` export: func 1) detached, and
+/// returns what the spawn answered.
 const SELF_SPAWN: &str = "memory 17 shadow 16448 65536
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
+export 0 func \"_child\" 1
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
   vb = i64.extend_i32_u v1
-  vself = i64.const -1
+  vimg = i64.extend_i32_u v2
   vz = i64.const 0
-  ve = i64.const 1
   vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vself, vz, vz, ve, vlog, vz)
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vimg, vz, vz, vz, vlog, vz)
   vr = i64.extend_i32_s vc
   return vr
   }
@@ -112,9 +113,10 @@ block 0 (v0: i64) {
 }
 ";
 
-/// A durable domain spawns detached only a module the host attested freezable (#1501), and `-1`'s
-/// grant is not attested: the spawn refuses `-EINVAL` on the oracle and on the JIT alike. The JIT used
-/// to admit it, taking `-1` for the domain's own durable program.
+/// A durable domain spawns detached only a module the host attested freezable (#1501), and the
+/// `"child"` grant of its own program's image is not attested: the spawn refuses `-EINVAL` on the
+/// oracle and on the JIT alike. The JIT once admitted the domain's own program, which `-1` named
+/// before #2219, taking it for durable.
 #[test]
 fn a_durable_domain_refuses_its_own_program_detached() {
     let m = instrument(SELF_SPAWN);
@@ -125,7 +127,11 @@ fn a_durable_domain_refuses_its_own_program_detached() {
         let inst = host.grant_instantiator(0, 1 << 17);
         let budget = host.grant_budget(-1, 1 << 20, -1);
         host.grant_freeze_authority(FreezeScope::DetachedProgeny);
-        (host, [inst, budget])
+        host.grant_child_image();
+        let image = host
+            .resolve_cap_name("child")
+            .expect("the image is granted");
+        (host, [inst, budget, image])
     };
     let win = init_durable_window(1 << 17, ARENA);
 

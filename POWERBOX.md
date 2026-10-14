@@ -225,7 +225,7 @@ rather than converged:
 | `run_kernel` | bare | none | kernels / bench |
 | `run_c_full` (test) → `Instance::run_diff` (F1) | interp+JIT | fixed | chibicc suite |
 | `JitSession` | JIT | fixed | guest-JIT REPL |
-| §14 nested (`Instantiator`/`Module`, name-addressable F2) | all 3 | object-cap | `instantiate_record.rs`, `separate_module.rs` |
+| §14 nested (`Instantiator`/`Module`) | all 3 | object-cap | `instantiate_record.rs`, `jit_separate_module.rs` |
 
 **Resolved (F2).** The §14 nested path can now address a child's entry **by name**: a `Module`
 capability (iface 8) gained one callable op — `op 0 resolve_export(name_ptr, name_len) -> funcidx |
@@ -237,6 +237,12 @@ JIT `cap_thunk`) — verified by name-addressed-child tests in `separate_module.
 `bytecode_separate_module.rs`, and `jit_separate_module.rs` (each picks a *non-0* export). The name is
 borrowed from the caller's window, fail-closed (`-EFAULT` out of bounds, `-EINVAL` bad UTF-8 / unknown);
 only the funcidx crosses back, never a host pointer.
+
+*Retired (#2219).* A child now starts at its module's function 0, its child bootstrap, so there is
+no entry to look up: `Module` op 0 traps `CapFault` on every engine (`self_spawn_refused.rs`), and a
+`Module` handle has no callable op. A host that wants a child to start at a named export grants that
+export's child image (`temen_ir::child_image_at`). `Module::resolve_export`, the host-side lookup,
+stays for embedders.
 
 **Resolved (F1).** The run paths are converged onto one core:
 - `run_powerbox_inner` no longer carries its own grant/compile/watchdog: it builds an `Instance` (fixed
@@ -404,7 +410,8 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   (`-EFAULT`/`-EINVAL`). Tests: `separate_module.rs`, `bytecode_separate_module.rs`,
   `jit_separate_module.rs` (each resolves a *non-0* export). *Note:* the earlier "func-0-only" framing
   was imprecise — invocation was always by integer `entry`; the real gap was the absence of name→index
-  resolution (exports were dropped at grant), which this closes.
+  resolution (exports were dropped at grant), which this closes. *Retired by #2219:* a child starts at
+  function 0, so the guest-side op went (see above).
 - **F3 — test the named-export call path.** *Landed.* Added
   `powerbox_instantiate.rs::non_start_export_runs_as_bare_kernel` (a `square` kernel at funcidx 1 called
   via `Instance::call`, returning results, interp == jit). **Decision locked:** a non-`_start` export

@@ -58,10 +58,8 @@ impl Fixture {
                 (
                     Arc::new(AtomicBool::new(false)),
                     DetachedSpawn {
-                        entry: 0,
                         digest: module_digest(&m),
                         module: m,
-                        same_module: false,
                     },
                 ),
             );

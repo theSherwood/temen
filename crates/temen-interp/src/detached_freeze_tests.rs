@@ -143,7 +143,6 @@ fn a_live_detached_child_is_captured_and_its_thaw_completes_the_join() {
         (0, 0),
         "the root's first join slot"
     );
-    assert_eq!(c.launch.entry, 0);
     assert_eq!(c.launch.digest, module_digest(&child));
     assert!(
         c.launch.task > 0,

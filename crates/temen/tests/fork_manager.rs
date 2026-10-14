@@ -130,11 +130,11 @@ fn src() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::v1()),
         rec::segment(17664, &guest)
     )
 }
@@ -374,11 +374,11 @@ fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>, i64) {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let src = format!(
         "{BUDGET_SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::v1()),
         rec::segment(17664, &guest)
     );
     let m = Arc::new(parse_module(&src).expect("parse"));

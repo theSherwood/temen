@@ -118,12 +118,12 @@ fn chain() -> String {
     let c1 = SpawnRec {
         grants_ptr: 17760,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{CHAIN}{}{}",
         rec::segment(17536, &c1),
-        rec::segment(17664, &SpawnRec::v1(0))
+        rec::segment(17664, &SpawnRec::v1())
     )
 }
 

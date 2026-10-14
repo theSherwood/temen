@@ -48,7 +48,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {}"#,
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::v1())
     )
 }
 

@@ -110,11 +110,11 @@ fn manager() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{MANAGER}{}{}",
-        rec::segment(17536, &SpawnRec::v1(0)),
+        rec::segment(17536, &SpawnRec::v1()),
         rec::segment(17664, &guest)
     )
 }

@@ -159,12 +159,12 @@ fn build(ro: i64, rt: i64) -> Option<Arc<temen_ir::Module>> {
     let caller = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let src = TEMPLATE
         .replace("__RO__", &ro.to_string())
         .replace("__RT__", &rt.to_string())
-        + &rec::segment(17536, &SpawnRec::v1(0))
+        + &rec::segment(17536, &SpawnRec::v1())
         + &rec::segment(17664, &caller);
     let m = temen_text::parse_module(&src).ok()?;
     temen_verify::verify_module(&m).ok()?;

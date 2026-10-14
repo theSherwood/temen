@@ -160,7 +160,7 @@ block 0 (vaddr: i64) {{
                 pager: 0,
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1(0)
+                ..SpawnRec::v1()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),

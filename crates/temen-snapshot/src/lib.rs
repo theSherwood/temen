@@ -265,7 +265,10 @@ use temen_ir::Module;
 /// was `<< 8` and 24 bits: a domain's table has 1,024 slots. The records are unchanged, but the
 /// window image holds the guest's handle values, which a v41 artifact wrote in the old layout and a
 /// thaw would decode to the wrong slots; so a v41 artifact is refused.
-const FORMAT_VERSION: u16 = 42;
+/// v43 (#2219): a detached child's launch record drops its entry function and its same-module flag. A
+/// child runs a module its spawner holds, from the module's function 0, and binds its manifest
+/// strictly, so neither varies.
+const FORMAT_VERSION: u16 = 43;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1305,10 +1308,8 @@ fn write_detached(
         write_uleb(&mut b, c.parent_task as u64);
         write_uleb(&mut b, c.slot as u64);
         write_uleb(&mut b, l.task);
-        write_uleb(&mut b, l.entry as u64);
         b.extend_from_slice(&l.digest);
         write_uleb(&mut b, l.lane as u64);
-        b.push(l.same_module as u8);
         write_uleb(&mut b, l.names.len() as u64);
         for (name, h) in &l.names {
             write_uleb(&mut b, name.len() as u64);
@@ -1993,17 +1994,11 @@ fn decode_detached(
             return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
         }
         let task = r.uleb()?;
-        let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let digest: [u8; 32] = r
             .take(32)?
             .try_into()
             .expect("take(32) yields exactly 32 bytes");
         let lane = r.uleb()? as i64;
-        let same_module = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(RestoreError::Malformed),
-        };
         let n_names = r.uleb()? as usize;
         let mut names = Vec::with_capacity(n_names.min(64));
         for _ in 0..n_names {
@@ -2031,10 +2026,8 @@ fn decode_detached(
             host: child,
             launch: DetachedLaunch {
                 task,
-                entry,
                 digest,
                 lane,
-                same_module,
                 names,
             },
         });

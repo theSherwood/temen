@@ -105,10 +105,8 @@ fn frozen_root(m: &Module) -> (MemLayout, Host) {
 fn launch(child: &Module) -> DetachedLaunch {
     DetachedLaunch {
         task: 3,
-        entry: 0,
         digest: module_digest(child),
         lane: 2,
-        same_module: false,
         names: vec![("fs".to_string(), 0x0103)],
     }
 }
