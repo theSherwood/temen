@@ -182,7 +182,8 @@ proc isPrime(n: int): bool =
 
 proc countPrimes(n: int): int =
   var flags = newSeq[bool](n)
-  for i in \`||\`(0, n - 1, workload = CpuBound):
+  # \`||\` binds as tightly as \`-\`, so the upper bound takes parentheses.
+  for i in 0 || (n - 1):
     flags[i] = isPrime(i)
   result = 0
   for f in flags:

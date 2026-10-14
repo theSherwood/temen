@@ -74,7 +74,7 @@ means adding it to a row.
 | Inline iterators | `iterators` | ✅ |
 | Closure iterators | `iterators_closure` | ✅ |
 | Threads (`std/rawthreads`) | `threads` | ✅ |
-| Parallel `for` (`std/parfor`'s `||`, on `std/threadpool`) | `parfor` | ✅ |
+| Parallel `for` (`std/parfor`, on `std/threadpool`) | `parfor` | ✅ |
 
 ## Generics and metaprogramming
 
