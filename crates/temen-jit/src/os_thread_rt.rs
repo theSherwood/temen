@@ -2291,13 +2291,14 @@ pub(crate) unsafe extern "C" fn thread_join(
             // handle ⇒ inert trap.
             match dc.get_mut(&cur) {
                 Some(tbl) => {
-                    let n = tbl.cells.len();
-                    let mask = if n == 0 { 0 } else { n.next_power_of_two() - 1 };
-                    let slot = (handle as u32 as usize) & mask;
-                    if slot >= n || tbl.joined[slot] {
+                    // The oracle's rule (`temen_ir::handle_slot`, #2378): a forged, negative or
+                    // already-joined handle is inert.
+                    let Some(slot) =
+                        temen_ir::handle_slot(tbl.cells.len(), handle).filter(|&s| !tbl.joined[s])
+                    else {
                         store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                         return 0;
-                    }
+                    };
                     tbl.joined[slot] = true;
                     tbl.cells[slot].joined.store(true, Ordering::Relaxed);
                     std::sync::Arc::clone(&tbl.cells[slot])
@@ -2310,14 +2311,13 @@ pub(crate) unsafe extern "C" fn thread_join(
         } else {
             drop(dc);
             let mut t = lock(&dom.threads);
-            let n = t.cells.len();
-            let mask = if n == 0 { 0 } else { n.next_power_of_two() - 1 };
-            let slot = (handle as u32 as usize) & mask;
-            // Out-of-range or already-joined handles are inert (trap), like a forged capability index.
-            if slot >= n || t.joined[slot] {
+            // Out-of-range, negative or already-joined handles are inert (trap), like a forged
+            // capability index: the oracle's rule (`temen_ir::handle_slot`, #2378).
+            let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle).filter(|&s| !t.joined[s])
+            else {
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 return 0;
-            }
+            };
             t.joined[slot] = true;
             t.cells[slot].joined.store(true, Ordering::Relaxed);
             std::sync::Arc::clone(&t.cells[slot])

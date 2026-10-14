@@ -15098,9 +15098,9 @@ impl SchedCore {
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
                 let export = arg as u32;
-                let callee = usize::try_from(child)
+                let callee = super::resolve_thread(&tasks[ti].threads, child)
                     .ok()
-                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                    .and_then(|slot| tasks[ti].threads[slot])
                     .and_then(|cidx| tasks[cidx].env)
                     .filter(|&k| Some(k) != tasks[ti].env)
                     .map(|k| std::sync::Arc::clone(&extra_envs[k].host));

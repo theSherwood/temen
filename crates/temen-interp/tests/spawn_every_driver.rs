@@ -609,9 +609,9 @@ block 0 (v0: i64) {
 }
 ";
 
-/// An op-15 parent `(i32 inst, i32 module, i32 budget) -> i64`: spawns three detached children
-/// `vh0..vh2`, child `k` handed payload word `100 + k`, then runs `joins`, which must leave the result
-/// in `vr`.
+/// An op-15 parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64`: spawns three detached
+/// children `vh0..vh2`, child `k` handed payload word `100 + k`, then runs `joins`, which must leave
+/// the result in `vr`. `out` is a stdout stream, a cap a parent may grant into a child.
 fn three_children_then(joins: &str) -> String {
     let spawns: String = (0..3)
         .map(|k| {
@@ -625,8 +625,8 @@ fn three_children_then(joins: &str) -> String {
         .collect();
     format!(
         "memory 17
-func (i32, i32, i32) -> (i64) {{
-block 0 (vinst: i32, vmod: i32, vbud: i32) {{
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
   vm = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
@@ -650,20 +650,26 @@ fn join(dst: &str, h: &str) -> String {
 /// span, and a spent or never-issued slot traps. The `Vcpu`'s hosts each kept their own table and
 /// rule until the engine took it over: the test orchestrator waited forever on a re-join.
 fn joins_agree(what: &str, joins: &str, want: &Ran) {
-    let m = module(&three_children_then(joins));
+    handles_agree(&drivers::ALL, what, joins, want);
+}
+
+/// [`joins_agree`] on `drivers`: `ops` runs after the three spawns and leaves its answer in `vr`.
+fn handles_agree(drivers: &[Driver], what: &str, ops: &str, want: &Ran) {
+    let m = module(&three_children_then(ops));
     let child = module(CHILD_RETURNS_PAYLOAD);
     let setup = |h: &mut Host| {
         let i = h.grant_instantiator(0, 1 << 17);
         let c = h.grant_module(&child);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        vec![Value::I32(i), Value::I32(c), Value::I32(b)]
+        let o = h.grant_stream(StreamRole::Out);
+        vec![Value::I32(i), Value::I32(c), Value::I32(b), Value::I32(o)]
     };
     let setup = || {
         let mut h = Host::new();
         let args = setup(&mut h);
         (h, args)
     };
-    agree_on_every_driver(what, &m, &setup, want);
+    agree_on(drivers, what, &m, &setup, want);
 }
 
 #[test]
@@ -709,6 +715,101 @@ fn a_handle_masks_onto_the_table() {
         "join(5)",
         &format!("  vn = i32.const 5\n{}", join("vr", "vn")),
         &ok(101),
+    );
+}
+
+/// The drivers that answer `child_offer` (op 14): the debug scheduler declines it.
+const OFFERING: [Driver; 4] = [Driver::Oracle, Driver::Coop, Driver::Parallel, Driver::Vcpu];
+
+/// #2378 — every child op resolves a handle by the join's rule, so a spent or forged one gets one
+/// answer on every driver: the oracle's. `join`, `poll`, `detach` and `kill` trap `ThreadFault`;
+/// `child_offer` and `grant` answer `-EINVAL`, the value they give a child they cannot reach. The
+/// handles: child 0 spent by a join, child 0 spent by a detach, a negative one, and 3, past the
+/// table (the span is 4, and slot 3 was never issued). The `Vcpu` has no surface for ops 9, 10, 12
+/// and 19 yet (#2083), so those run on the drivers that schedule their children, and the debug
+/// scheduler declines op 14 ([`OFFERING`]).
+#[test]
+fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
+    let spend = [
+        ("joined", join("vsp", "vh0") + "  vbad = i32.const 0\n"),
+        (
+            "detached",
+            "  vsp = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n".to_string(),
+        ),
+        ("negative", "  vbad = i32.const -1\n".to_string()),
+        ("past the table", "  vbad = i32.const 3\n".to_string()),
+    ];
+    let einval = ok(temen_ir::errno::EINVAL);
+    let faults = trapped(Trap::ThreadFault);
+    // An op answering an `i32` leaves it in `vo`, widened into `vr`.
+    let widen = |call: &str| format!("{call}  vr = i64.extend_i32_s vo\n");
+    let ops: [(&str, String, &[Driver], &Ran); 6] = [
+        ("join", join("vr", "vbad"), &drivers::ALL, &faults),
+        (
+            "poll",
+            widen("  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "detach",
+            widen("  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "kill",
+            widen("  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n"),
+            &SCHEDULING,
+            &faults,
+        ),
+        (
+            "child_offer",
+            widen("  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vinst (vbad, vx)\n"),
+            &OFFERING,
+            &einval,
+        ),
+        (
+            "grant",
+            widen(
+                "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n",
+            ),
+            &SCHEDULING,
+            &einval,
+        ),
+    ];
+    for (handle, prelude) in &spend {
+        for (op, call, drivers, want) in &ops {
+            // Spending a handle by `detach` is itself an op the `Vcpu` has no surface for.
+            let drivers: Vec<Driver> = drivers
+                .iter()
+                .copied()
+                .filter(|d| *handle != "detached" || !matches!(d, Driver::Vcpu))
+                .collect();
+            handles_agree(
+                &drivers,
+                &format!("{op} on a {handle} handle"),
+                &format!("{prelude}{call}"),
+                want,
+            );
+        }
+    }
+}
+
+/// #2378 — a handle past the table that the mask folds onto a live child names that child for every
+/// op, as for `join` ([`a_handle_masks_onto_the_table`]): `detach(5)` detaches child 1, so its own
+/// handle is spent after.
+#[test]
+fn a_masked_handle_detaches_the_child_it_names() {
+    let ops = format!(
+        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n{}",
+        join("vr", "vh1")
+    );
+    handles_agree(
+        &SCHEDULING,
+        "detach(5), then join child 1",
+        &ops,
+        &trapped(Trap::ThreadFault),
     );
 }
 
