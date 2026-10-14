@@ -22488,6 +22488,13 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 /// (DEBUGGING.md W1).
 pub const CAP_SELF_PARALLELISM: u32 = 19;
 
+/// #2349 — the most records a spawn's or an exec's grant list may hold: a child's whole handle table.
+/// A powerbox's list is a handful of names, and a longer one could not fit the child anyway.
+pub const MAX_SPAWN_GRANTS: u64 = CAP as u64;
+
+/// #2349 — the longest name a grant record may carry. A powerbox's names are short words.
+pub const MAX_GRANT_NAME: usize = 255;
+
 /// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
 /// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
 /// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
@@ -22495,14 +22502,19 @@ pub const CAP_SELF_PARALLELISM: u32 = 19;
 /// why), and `handle` is returned as written — tag decoding and the authority check are the caller's
 /// policy, applied to the whole list after it parses.
 ///
-/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` is
-/// untrusted, so nothing is sized from it: the list grows one record at a time and the first
-/// out-of-window record ends it.
+/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` and
+/// each `name_len` are the guest's, so both are bounded before anything is read (#2349): a list of
+/// more than [`MAX_SPAWN_GRANTS`] records, or a name longer than [`MAX_GRANT_NAME`], is malformed,
+/// `CapFault`, as a non-UTF-8 name is. Every engine's spawn and exec reads its list here, so they
+/// refuse it alike.
 pub fn read_grant_records(
     grants_ptr: u64,
     grants_n: u64,
     read: impl Fn(u64, usize) -> Result<Vec<u8>, Trap>,
 ) -> Result<Vec<(String, i32)>, Trap> {
+    if grants_n > MAX_SPAWN_GRANTS {
+        return Err(Trap::CapFault);
+    }
     let mut list = Vec::new();
     for i in 0..grants_n {
         let off = i
@@ -22513,6 +22525,9 @@ pub fn read_grant_records(
         let word = |at: usize| [rec[at], rec[at + 1], rec[at + 2], rec[at + 3]];
         let name_off = u32::from_le_bytes(word(0)) as u64;
         let name_len = u32::from_le_bytes(word(4)) as usize;
+        if name_len > MAX_GRANT_NAME {
+            return Err(Trap::CapFault);
+        }
         let handle = i32::from_le_bytes(word(8));
         let name = String::from_utf8(read(name_off, name_len)?).map_err(|_| Trap::CapFault)?;
         list.push((name, handle));
@@ -37219,6 +37234,58 @@ mod full_table_tests {
             host.cap_dispatch_slots(cap_id::HOST_PROC, 0, personality, &[], None),
             Ok(vec![0]),
             "the caller keeps its personality"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_list_tests {
+    //! #2349 — a spawn's or an exec's grant list is the guest's to size: its length and each name's
+    //! are bounded before anything is read, so a list of 2^33 records or a 4 GiB name refuses at once
+    //! instead of making the host loop or allocate.
+    use super::*;
+
+    /// A window holding `n` records, each naming the 4-byte string at 4096 with `name_len`.
+    fn window(n: usize, name_len: u32) -> Vec<u8> {
+        let mut w = vec![b'x'; 8192];
+        for i in 0..n {
+            let rec = &mut w[i * 16..i * 16 + 16];
+            rec[..4].copy_from_slice(&4096u32.to_le_bytes());
+            rec[4..8].copy_from_slice(&name_len.to_le_bytes());
+            rec[8..12].copy_from_slice(&7i32.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn a_list_past_its_bounds_refuses_before_it_is_read() {
+        let w = window(1, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(read_grant_records(0, 1, read), Ok(vec![("xxxx".into(), 7)]));
+        let reads = std::cell::Cell::new(0);
+        let counted = |o, l| {
+            reads.set(reads.get() + 1);
+            read_slice(&w, o, l)
+        };
+        assert_eq!(
+            read_grant_records(0, 1 << 33, counted),
+            Err(Trap::CapFault),
+            "2^33 records"
+        );
+        assert_eq!(reads.get(), 0, "and nothing was read");
+        let w = window(1, u32::MAX);
+        assert_eq!(
+            read_grant_records(0, 1, |o, l| read_slice(&w, o, l)),
+            Err(Trap::CapFault),
+            "a 4 GiB name"
+        );
+        let w = window(1, MAX_GRANT_NAME as u32);
+        assert!(read_grant_records(0, 1, |o, l| read_slice(&w, o, l)).is_ok());
+        let w = window(MAX_SPAWN_GRANTS as usize, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(
+            read_grant_records(0, MAX_SPAWN_GRANTS, read).map(|l| l.len()),
+            Ok(256)
         );
     }
 }
