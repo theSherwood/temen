@@ -2344,7 +2344,7 @@ accesses confine against the live `mapped` read from the module's exported `mapp
 (self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
 event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
 admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
-(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
+(every pump host, native or in the browser, and the browser Worker's TIERUP handler alike — and the §22
 `Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
 writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
 sparse grow, a non-RW mapping, pages committed past a fixed backing — **declines** emitted execution

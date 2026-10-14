@@ -10,9 +10,9 @@ once it closes.
 > modes live natively and across real Web Workers (spawn/join + futex + atomics, §22 JIT, §14
 > children, shared-`Host` I/O, the playground). Threads-touching work since then lives in its
 > owning docs: **per-Worker wasm-JIT tier-up** of the parallel driver's vCPUs
-> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `vcpu_tierup.rs`, `threads-spawn.mjs
-> TEMEN_TIERUP=1` → 4000 with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14
-> per-Worker codegen and the `VcpuReactor` frame loop over the resumable vCPU) in `BROWSER.md`;
+> (`Vcpu::with_jit_eligible` → `VcpuEvent::TierUp`; `threads-spawn.mjs TEMEN_TIERUP=1` → 4000
+> with 8 tier-ups fired, the Chromium `#tierup` item — plus §22/§14 per-Worker codegen) in
+> `BROWSER.md`;
 > `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
 > in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
 > the cross-domain futex for async §14 children) in `PROCESS.md`.

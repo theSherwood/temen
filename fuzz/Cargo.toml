@@ -215,8 +215,9 @@ bench = false
 
 # #810 randomized page-state table: the paged tier's per-access check over THREE fuzzer-chosen page ops
 # (interleaved Unmapped/Rw/Ro runs, holes, re-commits) with scalar widths 1..16 and bulk walks straddling
-# every state transition — vs the interpreter's `check_prot`. The stable `pagestate_diff` test drives
-# the same `fuzz_one_pagestate` from seeds.
+# every state transition — vs the interpreter's `check_prot`, on the leaf's tier-up and on the guest run
+# whole as the pump's root leaf. The stable `pagestate_diff` test drives the same `fuzz_one_pagestate`
+# from seeds.
 [[bin]]
 name = "pagestate"
 path = "fuzz_targets/pagestate.rs"
