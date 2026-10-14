@@ -21542,21 +21542,26 @@ struct Slot {
     type_id: u32,
 }
 
-/// `log2` of the handle-table capacity. A handle value packs `(generation, slot)`:
+/// `log2` of the handle-table capacity: 1,024 live capabilities a domain holds at once, the
+/// POSIX personality's `FD_MAX` (#2365). A handle value packs `(generation, slot)`:
 /// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2`.
-const CAP_LOG2: u32 = 8;
+const CAP_LOG2: u32 = 10;
 const CAP: usize = 1 << CAP_LOG2;
 
-/// Bits the packed handle carries for the generation counter: the 32-bit `i32`/`u32` handle minus
-/// the `CAP_LOG2` slot bits. `Slot::generation` is a full `u32`, so it is compared **masked to
-/// these bits** (`GEN_MASK`) — otherwise, once the counter passed `2^GEN_BITS` regrants of one slot
-/// the full-width `generation` could no longer equal the truncated value carried in any handle, and
-/// the slot died permanently (a single-slot, fail-closed DoS — reachable via a `Jit.compile`→`release`
-/// loop). Masking lets the slot recycle cleanly on wrap. ABA resistance is `2^GEN_BITS` (~16M)
-/// regrants of one slot; a stale handle that aliased after a full wrap is still inert — it re-selects
-/// one of *this domain's own* current grants, re-checked by `type_id` at the call (D37) — so this is
-/// not an authority escape, only the documented "a forged index is inert" property.
-const GEN_BITS: u32 = 32 - CAP_LOG2;
+/// Bits the packed handle carries for the generation counter: the 31 bits of a **positive** `i32`
+/// minus the `CAP_LOG2` slot bits. Bit 31 stays clear, so a handle is never negative — a guest can
+/// tell it from a `-errno` — and never a grant-record tag ([`GRANT_SERVE_LIVE_TAG`],
+/// [`GRANT_EMPTY`]), both of which set it (#2365). `Slot::generation` is a full `u32`, so it is
+/// compared **masked to these bits** (`GEN_MASK`) — otherwise, once the counter passed
+/// `2^GEN_BITS` regrants of one slot the full-width `generation` could no longer equal the truncated
+/// value carried in any handle, and the slot died permanently (a single-slot, fail-closed DoS —
+/// reachable via a `Jit.compile`→`release` loop). Masking lets the slot recycle cleanly on wrap. ABA
+/// resistance is `2^GEN_BITS` (~2M) regrants of one slot; a stale handle that aliased after a full
+/// wrap is still inert — it re-selects one of *this domain's own* current grants, re-checked by
+/// `type_id` at the call (D37) — so this is not an authority escape, only the documented "a forged
+/// index is inert" property.
+const GEN_BITS: u32 = 31 - CAP_LOG2;
+const _: () = assert!(CAP_LOG2 + GEN_BITS == 31);
 /// DURABILITY.md §13.3 — the process-wide [`Host::domain_id`] mint (uniqueness is all the
 /// runtime needs; a snapshot records the ids it saw and a thaw re-links by record, so the
 /// counter's absolute values never matter).
@@ -26499,6 +26504,11 @@ impl Host {
         let slot = self.table.iter().position(|s| s.entry.is_none())?;
         let s = &mut self.table[slot];
         s.generation = s.generation.wrapping_add(1); // advance per (re)grant (ABA-safe)
+                                                     // A wrap skips generation 0, so no handle is `0`: a spawn record reads a `0` budget as
+                                                     // none (#2365).
+        if s.generation & GEN_MASK == 0 {
+            s.generation = s.generation.wrapping_add(1);
+        }
         s.entry = Some(binding);
         s.type_id = type_id;
         Some((((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32)
@@ -38474,11 +38484,14 @@ mod gen_recycle_tests {
         let slot = (handle0 as u32 as usize) & (CAP - 1);
         assert!(h.resolve(handle0, cap_id::EXIT).is_ok());
 
-        // Force the counter to the last value before wrap, then close + regrant: the new handle is
-        // issued at generation `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case the old
-        // `s.generation == gen` compare got wrong (the slot would have died forever).
-        h.table[slot].generation = (1u32 << GEN_BITS) - 1;
+        // Force the counter to two before the wrap and regrant up to the last generation, then close
+        // + regrant: the counter passes `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case
+        // the old `s.generation == gen` compare got wrong (the slot would have died forever). That
+        // masked 0 is skipped, so the handle is issued at masked generation 1 (#2365).
+        h.table[slot].generation = (1u32 << GEN_BITS) - 2;
         h.close(handle0);
+        let last = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        h.close(last);
         let handle_wrap = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
         assert_eq!(
             (handle_wrap as u32 as usize) & (CAP - 1),
@@ -38487,20 +38500,73 @@ mod gen_recycle_tests {
         );
         assert_eq!(
             h.table[slot].generation,
-            1u32 << GEN_BITS,
-            "counter wrapped past GEN_BITS"
+            (1u32 << GEN_BITS) + 1,
+            "counter wrapped past GEN_BITS, skipping the masked 0"
         );
         assert!(
             h.resolve(handle_wrap, cap_id::EXIT).is_ok(),
             "slot must recycle cleanly when the generation counter wraps"
         );
 
-        // The stale pre-wrap handle is still inert (a forged/stale index re-checks the generation and
-        // faults), so recycling did not reopen a use-after-close hole.
-        assert!(matches!(
-            h.resolve(handle0, cap_id::EXIT),
-            Err(Trap::CapFault)
-        ));
+        // The handle closed before the wrap is still inert (a forged/stale index re-checks the
+        // generation and faults), so recycling did not reopen a use-after-close hole.
+        assert!(matches!(h.resolve(last, cap_id::EXIT), Err(Trap::CapFault)));
+        // A handle a whole cycle stale is the wrap D37 documents: generation 1 again, so it
+        // re-selects the slot's current grant, re-checked by `type_id` at the call.
+        assert_eq!(handle0, handle_wrap, "a full cycle of regrants aliases");
+    }
+
+    /// #2365 — a handle at any generation is positive and nonzero: a guest can tell it from a
+    /// `-errno`, a grant record never reads it as a tag, and a spawn record never reads it as "no
+    /// budget". Checked at the top generation and across the wrap after it, on slot 0, where a wrap
+    /// to masked generation 0 would have made the handle `0`.
+    #[test]
+    fn a_handle_is_positive_nonzero_and_never_a_tag_at_any_generation() {
+        let mut h = Host::new();
+        let first = h.try_grant(cap_id::EXIT, Binding::Exit).expect("grant");
+        assert_eq!(
+            first,
+            1 << CAP_LOG2,
+            "a fresh table's first grant: slot 0, generation 1"
+        );
+        let ok = |handle: i32| {
+            handle > 0 && serve_live_export(handle).is_none() && handle as u32 != GRANT_EMPTY
+        };
+        h.table[0].generation = GEN_MASK - 1;
+        h.close(first);
+        let top = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        assert_eq!(
+            top as u32,
+            GEN_MASK << CAP_LOG2,
+            "the top generation, slot 0"
+        );
+        assert!(ok(top), "{top:#x} at the top generation");
+        h.close(top);
+        let wrapped = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        assert_eq!(wrapped, 1 << CAP_LOG2, "the wrap skips generation 0");
+        assert!(ok(wrapped), "{wrapped:#x} across the wrap");
+        assert!(matches!(h.resolve(top, cap_id::EXIT), Err(Trap::CapFault)));
+    }
+
+    /// #2365 — a domain holds 1,024 live capabilities, and a grant past that is refused, not a
+    /// panic; a close frees a slot for the next grant.
+    #[test]
+    fn a_table_holds_1024_live_capabilities_and_reuses_a_closed_slot() {
+        let mut h = Host::new();
+        let live: Vec<i32> = (0..CAP)
+            .map(|i| {
+                h.try_grant(cap_id::EXIT, Binding::Exit)
+                    .unwrap_or_else(|| panic!("{i}"))
+            })
+            .collect();
+        assert_eq!(live.len(), 1024);
+        assert!(h.try_grant(cap_id::EXIT, Binding::Exit).is_none(), "full");
+        h.close(live[700]);
+        let again = h
+            .try_grant(cap_id::EXIT, Binding::Exit)
+            .expect("a closed slot is reused");
+        assert_eq!((again as u32 as usize) & (CAP - 1), 700);
+        assert_ne!(again, live[700], "with a new generation");
     }
 }
 

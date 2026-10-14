@@ -808,7 +808,7 @@ tag at a *fixed* offset, index at the bottom, an optional generation between:
 |---|---|---|---|---|
 | **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
 | **funcref** | i64 | — | function-table index | none — no generation; `call.dyn` masks `& (len-1)` |
-| **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
+| **import/cap handle** | **i32** | 21 bits | 10-bit slot (`CAP_LOG2`); bit 31 clear, so a handle is never negative or a grant tag (#2365) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
 | **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
 
 Three properties make this coherent rather than four ad-hoc conventions:
