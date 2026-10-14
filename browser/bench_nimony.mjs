@@ -131,7 +131,7 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const tools = await Promise.all(m.tools.map(async (t) => [t, await fetchB(`./nimbench/tool/${t.name}`)]));
   const cmds = blob([['/bin/sh', shMod], ...tools.map(([t, b]) => [t.paths.join('\n'), b])]);
   const tree = blob(await Promise.all(m.files.map(async (p, i) => [p, await fetchB(`./nimbench/file/${i}`)])));
-  const argv = enc.encode(['bin/nimony', 't', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
+  const argv = enc.encode(['bin/nimony', 't', '--novalidate', '--isMain', m.prog].map((a) => `${a}\0`).join(''));
   const driver = tools[0][1];
   const args = [put(driver), put(cmds), put(tree), put(argv), put(enc.encode(m.dir))].flat();
   // #1896: a leaf process that parks on its pipes runs emitted too where JSPI suspends its frames.

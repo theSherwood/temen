@@ -205,17 +205,27 @@ if want nim_card; then
   # plugins its grammar declares (parsegen, regex), which the pack carries built, so a program's
   # macro builds only its own plugin, in the program's cache (#2049). `std/json` costs the pack
   # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070). `rawthreads`, `osproc`
-  # and `cmdline` are what the card's Threads and Processes programs import (#2374). It is built as
+  # and `cmdline` are what the card's Threads and Processes programs import (#2374). `parfor`'s `||`
+  # is a plugin (`std/deps/parfor`): the prelude's parallel for makes the build compile it, so the
+  # pack carries it built, and a parallel-for program builds in seconds (#2375). It is built as
   # `prog.nim`, the program the card builds, so the pack carries that program's options memo
   # (`nimcache/t/<main>/config.nif`, nim-lang/nimony#2616): a card build that found none would rerun
   # its whole backend stage, every module of the library lowered again.
   cat >"$T/card/prog.nim" <<'NIM'
 import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
-  parseutils, bitops, intsets, macros, json, rawthreads, osproc, cmdline]
+  parseutils, bitops, intsets, macros, json, rawthreads, osproc, cmdline, parfor]
 
 proc prelude(s: string): int = s.len
 const atCompileTime = prelude("prebuilt")
-echo "prelude ", atCompileTime
+
+proc squares(n: int): int =
+  var s = newSeq[int](n)
+  for i in `||`(0, n - 1, workload = CpuBound):
+    s[i] = i * i
+  result = 0
+  for x in s: result += x
+
+echo "prelude ", atCompileTime, " ", squares(4)
 NIM
   # The card's tree is nimony's library and nimony's own sources, which the library imports: `std/json`
   # imports `src/lib`, `std/macros` reaches the nifler2 grammar, and a plugin's build puts `src/lib`

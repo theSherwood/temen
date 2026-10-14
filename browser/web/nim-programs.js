@@ -166,6 +166,33 @@ main()
       'thread 2: 2260 primes below 75000\nthread 3: 2199 primes below 100000\ntotal: 9592\n',
   },
   {
+    name: 'Parallel for',
+    src: `# Count the primes below 100,000 with a parallel for: \`||\` splits the range
+# into chunks that a pool of threads runs at once, and the loop ends when all of
+# them have. Each iteration writes only its own slot, so nothing races.
+import std/[parfor, syncio]
+
+proc isPrime(n: int): bool =
+  if n < 2: return false
+  var d = 2
+  while d * d <= n:
+    if n mod d == 0: return false
+    inc d
+  result = true
+
+proc countPrimes(n: int): int =
+  var flags = newSeq[bool](n)
+  for i in \`||\`(0, n - 1, workload = CpuBound):
+    flags[i] = isPrime(i)
+  result = 0
+  for f in flags:
+    if f: inc result
+
+echo "primes below 100000: ", countPrimes(100_000)
+`,
+    expect: 'primes below 100000: 9592\n',
+  },
+  {
     name: 'Processes',
     src: `# The program starts three copies of itself as worker processes, each with a
 # number to sum up to, and reads back their output and exit codes.
