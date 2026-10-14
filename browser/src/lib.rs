@@ -13114,8 +13114,8 @@ fn emit_module(
     shared: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
-    let paged =
-        m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let paged = m.data.iter().any(|d| d.readonly)
+        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let (wasm, emit) =
         temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;
