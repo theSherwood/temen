@@ -2419,7 +2419,7 @@ they redirect to its stream call), a stream read parks on a core pipe end or a b
 stream write on a core pipe end, the address-space ops and the pipe mint never park, and a §12
 concurrency op, a rebindable import, or any other import or cap call, a dynamic one included, may.
 The leaf's window is flat and growable, built as every exec builds its image (`Mem::exec_window`: a
-fresh window of the caller's geometry), and it tiers up at its entry (`CoopEvent::TierUp` naming its
+fresh window of its declared memory), and it tiers up at its entry (`CoopEvent::TierUp` naming its
 program); its delivery ends the process as a return from the entry would. An image that can change
 its page state — an address-space `map`/`unmap`/`protect`, inline or through an import, which the
 image alone does not show — is emitted page-checked (`compile_jit_page_checked`), because a whole

@@ -592,8 +592,9 @@ when an activation opens (#2113).
 spawned process's fresh window are new windows. Each is charged to the node the process shares with
 its parent, the twin's with the growth its copy holds, before the process exists: a level without the
 room refuses the `fork` or `posix_spawn` with `-EAGAIN`, and no personality has registered it. The
-charge goes back when the process ends; an exec keeps it, as the image's window is the caller's
-size. A root's processes pay from the run's own node.
+charge goes back when the process ends; an exec moves it to its image's window, the image's declared
+memory, charging what that needs past the caller's window first and handing back what the caller's
+held past it (#2332). A root's processes pay from the run's own node.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
