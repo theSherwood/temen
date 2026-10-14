@@ -1771,6 +1771,9 @@ mod tests {
         // leaves with `_exit`.
         match unsafe { libc::fork() } {
             0 => {
+                // SAFETY: the child's own alarm: a child that hangs dies of SIGALRM, so the test fails
+                // rather than hangs.
+                unsafe { libc::alarm(60) };
                 // SAFETY: the forked child's own table; two spare mappings, the window's own two.
                 unsafe { fill_mapping_table(max, 2) };
                 let wrong = if GuestWindow::try_new(mapped, reserved).is_none() {
@@ -1792,7 +1795,7 @@ mod tests {
                 assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
                 assert!(
                     libc::WIFEXITED(status),
-                    "the child died of signal {}",
+                    "the child died of signal {}: it faulted, or (SIGALRM) hung",
                     libc::WTERMSIG(status)
                 );
                 match libc::WEXITSTATUS(status) {
@@ -1840,6 +1843,9 @@ mod tests {
         // leaves with `_exit`.
         match unsafe { libc::fork() } {
             0 => {
+                // SAFETY: the child's own alarm: a child that hangs dies of SIGALRM, so the test fails
+                // rather than hangs.
+                unsafe { libc::alarm(60) };
                 // SAFETY: the forked child's own table.
                 unsafe { fill_mapping_table(max, 0) };
                 let mut wrong = 0;
@@ -1877,7 +1883,7 @@ mod tests {
                 assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
                 assert!(
                     libc::WIFEXITED(status),
-                    "the child died of signal {}: a window operation panicked or faulted",
+                    "the child died of signal {}: a window operation panicked, faulted or (SIGALRM) hung",
                     libc::WTERMSIG(status)
                 );
                 let wrong = libc::WEXITSTATUS(status);
