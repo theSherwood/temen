@@ -4,6 +4,9 @@
 //! `#[path]` rather than copying them.
 #![allow(dead_code)] // each including binary uses a different subset
 
+#[path = "../../../temen-interp/tests/support/rec.rs"]
+pub mod rec;
+
 use core::ffi::c_void;
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
@@ -98,4 +101,85 @@ pub fn interp_on_reserved(
     let mut fuel = 50_000_000u64;
     let args = [Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])];
     run_capture_reserved_with_host(parent, 0, &args, &mut fuel, &[], reserved_log2, host).0
+}
+
+/// #1956 — a detached child (`memory 16`) that reads a depth `d` from its payload. While `d > 0` it
+/// spawns the module it was granted as `"nester"` (itself) detached from its own `"budget"`, with
+/// `d - 1` as the payload and `"nester"` granted on, joins it and returns `10 * result + d`; at `d = 0`
+/// it returns 7. `orphan` makes the `d = 1` level return 5 without joining, and the `d = 0` level
+/// count down 200 000 first, so it outlives its parent.
+pub fn nester(orphan: bool) -> String {
+    let (join, leaf) = if orphan {
+        (
+            "vfive = i64.const 5\n  return vfive",
+            "vn = i64.const 200000\n  br 3(vn)",
+        )
+    } else {
+        (
+            "vj = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
+            "v7 = i64.const 7\n  return v7",
+        )
+    };
+    format!(
+        r#"memory 16
+data 20000 "budget"
+data 20016 "nester"
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vab = i64.const {args}
+  vd = i64.load vab
+  vz = i64.const 0
+  vleaf = i64.eq vd vz
+  br_if vleaf 2() 1(v0, vd)
+}}
+block 1 (vi: i64, vd1: i64) {{
+  vone = i64.const 1
+  vnext = i64.sub vd1 vone
+  vpp = i64.const 24576
+  i64.store vpp vnext
+  vnp = i64.const 20000
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vbw = i64.extend_i32_u vb
+  vmp = i64.const 20016
+  vml = i64.const 6
+  vnest = self.resolve vmp vml
+{grant}  vmw = i64.extend_i32_u vnest
+  vgp = i64.const 20032
+  vgn = i64.const 1
+  vzero = i64.const 0
+  vlog = i64.const 16
+  vpl = i64.const 8
+  vinst = i32.wrap_i64 vi
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vzero, vlog, vzero, vpp, vpl)
+  {join}
+}}
+block 2 () {{
+  {leaf}
+}}
+block 3 (vc: i64) {{
+  vdec = i64.const 1
+  vc1 = i64.sub vc vdec
+  vdone = i64.eqz vc1
+  br_if vdone 4() 3(vc1)
+}}
+block 4 () {{
+  v7l = i64.const 7
+  return v7l
+  }}
+}}
+"#,
+        args = temen_ir::module_args_base(),
+        grant = rec::grant("g", 20032, 20016, 6, "vnest"),
+    )
+}
+
+/// Run `f` on a thread of its own: a run that deadlocks fails here instead of hanging the suite.
+pub fn within_a_minute<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{what}: no result within a minute (deadlocked?)"))
 }

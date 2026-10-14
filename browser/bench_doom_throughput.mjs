@@ -12,21 +12,21 @@ try {
   await page.waitForFunction(() => document.getElementById('state').dataset.state === 'ready', { timeout: 30_000 });
   const res = await page.evaluate(async () => {
     const { loadEngine } = await import('/web/par.js');
-    const { openJitReactor } = await import('/web/wasmjit-reactor.js');
+    const { openReactor } = await import('/web/reactor.js');
     const eng = await loadEngine();
     const doom = new Uint8Array(await (await fetch('/web/assets/doom.temen')).arrayBuffer());
     const wad = new Uint8Array(await (await fetch('/web/assets/doom1.wad')).arrayBuffer());
-    const reactor = await openJitReactor(eng.ex, eng.memory, doom, 'doom1.wad', wad);
+    const reactor = openReactor(eng.ex, eng.memory, doom, { name: 'doom1.wad', data: wad });
     // Warm up past the cold regime: V8 must baseline- then optimizing-compile the ~1000-function
     // emitted module, and Doom must run its title screen into the attract-mode demo (the heavy 3D
     // render path). 20 frames is too few — the first Chromium launch can still be in liftoff, which
     // is what made this bench occasionally report a cold-start fluke; 300 frames is safely warm.
-    for (let i = 0; i < 300; i++) reactor.frame();
+    for (let i = 0; i < 300; i++) await reactor.frame(true);
     // Per-frame times over ~10s — long enough to span the title→demo→title cycle, so the tail
     // captures the expensive render frames, not just the cheap static menu.
     const times = [];
     const tEnd = performance.now() + 10000;
-    while (performance.now() < tEnd) { const a = performance.now(); reactor.frame(); times.push(performance.now() - a); }
+    while (performance.now() < tEnd) { const a = performance.now(); await reactor.frame(true); times.push(performance.now() - a); }
     reactor.close();
     times.sort((x, y) => x - y);
     const n = times.length;

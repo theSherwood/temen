@@ -1,5 +1,5 @@
-// Runs on the **emitted tier** — the run-to-completion twins of `wasmjit-reactor.js` (which drives a
-// `tick` per frame). `runJitModule` (a stdin guest), `runJitCompiler` and `runJitSelfhost` (chibicc over
+// Runs on the **emitted tier** — the run-to-completion cards (`reactor.js` runs a reactor's frames).
+// `runJitModule` (a stdin guest), `runJitCompiler` and `runJitSelfhost` (chibicc over
 // a seeded memfs + argv) open the pump, which runs the root whole as a leaf (#1414 S4-3), and drive it
 // with `driveCoopTierupRun`. Each returns the run status (0 = returned, 5 = exited) or throws when the
 // root isn't emittable or the run traps (the caller falls back to the interpreter). The run's stdout,

@@ -377,7 +377,7 @@ fn a_compiled_unit_still_refuses_a_checkpoint() {
 
 /// **#2015, the journal's half.** The undo journal restores into the same run, so it cannot take back
 /// a `compile`: the unit and its `JitCode` handle stay, and a replay would compile again under the
-/// next handle (it returned 258 where the run had 257). An undo across a compile declines, and `seek`
+/// next handle (slot 2's where the run had slot 1's). An undo across a compile declines, and `seek`
 /// serves it; one after the last compile still undoes and agrees.
 #[test]
 fn undo_declines_across_a_compile() {
