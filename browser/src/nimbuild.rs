@@ -12,7 +12,7 @@
 //! ```
 //!
 //! `<toolchain-dir>` holds what `scripts/nim-toolchain.sh` builds: `nimony.temen`, `nifmake.temen`,
-//! `nimsem.temen`, `nifler2.temen`, `hexer.temen`, the shell's `sh.ir`, and the guest libc as
+//! `nimsem.temen`, `nifler2.temen`, `shoggoth.temen`, the shell's `sh.ir`, and the guest libc as
 //! `libc.temeno`. `<tree>` holds `lib/` and `<prog.nim>`; it is seeded at `--at` (by default its
 //! host path, where the lane builds), without its `bin/` or `nimcache/`.
 //!
@@ -35,7 +35,7 @@ use std::time::Instant;
 
 /// The toolchain's guests. `temen-link` is not one of them: [`temen_browser::nim_build`] serves it
 /// natively.
-const TOOLS: [&str; 5] = ["nimony", "nifmake", "nimsem", "nifler2", "hexer"];
+const TOOLS: [&str; 5] = ["nimony", "nifmake", "nimsem", "nifler2", "shoggoth"];
 
 fn read(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -163,7 +163,7 @@ fn main() {
         .expect("the interpreter tier runs nimony");
     let secs = t0.elapsed().as_secs_f64();
 
-    // `nimcache/<main>.temen/<prog>.temen`, `<main>` the driver's stem for the program.
+    // `nimcache/t/<main>/<prog>.temen`, `<main>` the driver's stem for the program.
     let out = format!(
         "/{}.temen",
         Path::new(prog).file_stem().unwrap().to_string_lossy()

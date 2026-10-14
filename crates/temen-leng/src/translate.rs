@@ -3991,6 +3991,16 @@ impl<'a> FuncGen<'a> {
                 }
             }
         }
+        // A **typed `nil`**, `(nil (ptr T))`: nimony types a `nil` by the pointer type it meets
+        // (nim-lang/nimony#2611), and hexer inlines a `ref`'s copy hook with it as the source, so
+        // `fs.f = nil` comes out as `(if (elif (nil (ptr T)) … (addr (dot (deref (nil (ptr T)))
+        // r.00 0)) …))`. The branch never runs; the pointer is null and points at a `T`.
+        if operand.tag() == Some("nil") {
+            if let Some(pointee) = operand.args().first().and_then(ptr_pointee) {
+                let desc = self.t.tydesc(pointee)?;
+                return Ok((self.emit_const(ValType::I64, 0).id, desc));
+            }
+        }
         // `(addr X)` / `(haddr X)` — an address-of IS a pointer expression, and its value is `X`'s
         // address. `(deref (haddr X))` is then the identity, which is how hexer spells an inlined
         // `var` parameter's use site: `off += k` comes out as
@@ -4370,6 +4380,15 @@ impl<'a> FuncGen<'a> {
                 // An aggregate-returning call: hand `daddr` to the callee as its `$sret` pointer, so
                 // it writes the result straight into the destination (no temporary).
                 self.call_sret(rhs, daddr)
+            }
+            Some("conv") => {
+                // `(conv T X)` to an aggregate moves no bits, so the destination takes `X` as it is.
+                // A closure's `default(T)` is `T(nil)` (`system/defaults`), which hexer lowers to
+                // `(conv T (oconstr T (kv fld.0 (nil)) (kv fld.1 (nil))))`.
+                let x = rhs.args().get(1).ok_or_else(|| {
+                    LengError::Malformed("conv needs a type and an operand".into())
+                })?;
+                self.assign_aggregate(daddr, ddesc, x)
             }
             _ => {
                 // Whole-aggregate copy: the rhs is an aggregate lvalue; copy its bytes.

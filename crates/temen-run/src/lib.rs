@@ -6194,7 +6194,8 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
 }
 
 /// A nim program's modules as nimony's backends link them: the DCE'd Leng of each, `<stem>.c.nif`,
-/// from the program's own build directory `<nimcache>/<main>/`, as `(stem, NIF bytes)` by stem — the
+/// from the program's own build directory under the C backend's, `<nimcache>/c/<main>/`
+/// (nim-lang/nimony#2616), as `(stem, NIF bytes)` by stem — the
 /// bytes for `temen_leng::nif_text`, since NIF is not UTF-8 text. It is
 /// what `nimony t` hands `temen-link`, and what `nimony c` hands `lengc`: exactly the program's
 /// modules, whatever else a shared `nimcache` holds — the programs its compile-time evaluation
@@ -6209,7 +6210,7 @@ pub fn nim_program_units(
     search_paths: &[&str],
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let main = nim_module_suffix(src, search_paths);
-    let dir = nimcache.join(&main);
+    let dir = nimcache.join("c").join(&main);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("{src}: no build directory {}: {e}", dir.display()))?;
     let mut units = Vec::new();
@@ -8767,13 +8768,14 @@ mod nim_module_suffix_tests {
     #[test]
     fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
         use super::NIMONY_TREE_PATHS;
-        // Observed verbatim: nimony 6ca46f17, run at the root of its tree, built these programs in
-        // `nimcache/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
+        // Observed verbatim: nimony 650bebb2, run at the root of its tree, built these programs in
+        // `nimcache/c/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
         // walk, one character shorter than the spelling it was given.
         for (prog, stem) in [
             ("src/nifmake/nifmake.nim", "niffw7j0b1"),
             ("src/nifler2/nifler2.nim", "nif6gnbnq1"),
             ("src/nimony/nimony.nim", "nimwe39eh1"),
+            ("src/lengc/shoggoth/shoggoth.nim", "shonb1wwj"),
         ] {
             assert_eq!(nim_module_suffix(prog, &NIMONY_TREE_PATHS), stem, "{prog}");
         }

@@ -186,10 +186,10 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
     return [p, bytes.length];
   };
   const { cwd } = toolchain;
-  // `nimcache/<stem>.temen/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
+  // `nimcache/t/<stem>/prog.temen`, `<stem>` nimony's for `prog.nim`, which lands on the stdout
   // slot (read it only after the call: the slot moves).
   const stemLen = ex.temen_nim_module_suffix(...put(enc.encode('prog.nim')));
-  const program = enc.encode(`${cwd}/nimcache/${text(Number(ex.temen_stdout_ptr()), stemLen)}.temen/prog.temen`);
+  const program = enc.encode(`${cwd}/nimcache/t/${text(Number(ex.temen_stdout_ptr()), stemLen)}/prog.temen`);
   // A build continues in the directory the last one left (#2099), so the program there may be the
   // last build's: remove it, and the program after this build is this build's.
   ex.temen_nim_remove(...put(program));
