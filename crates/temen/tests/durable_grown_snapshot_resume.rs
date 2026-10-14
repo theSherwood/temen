@@ -216,13 +216,12 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
 
     // Recover the restored cap handles from the thawed table (never re-grant — mirrors
     // durable_nesting.rs). The guest granted AddressSpace then Clock, so the caps come back in that
-    // order; the i32 handle is `(generation << 8) | slot`.
+    // order.
     let caps = thost
         .capture_durable_handles()
         .expect("only durable handles restored");
     assert_eq!(caps.len(), 2, "AddressSpace + Clock restored");
-    let handle = |i: usize| ((caps[i].generation << 8) | caps[i].slot) as i32;
-    let (t_space, t_clk) = (handle(0), handle(1));
+    let (t_space, t_clk) = (caps[0].handle(), caps[1].handle());
 
     // Phase 2 — thaw + resume on the restored window, through the real grown-restore seam
     // (`SharedProgram::run_over_grown`, #828/#1127 — the primitive the browser thaw FFI uses): fill a

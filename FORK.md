@@ -998,7 +998,9 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   fork sites. An embedder can keep these compiles past the run (`RunConfig::jit_code`, a
   `JitCodeCache`, #2145). Every run handed the same cache compiles each program once, the root's
   included. Each instance polls its own run's cells, which reach the code through the `vmctx`, so
-  code compiled in one run serves the next. Code that needs
+  code compiled in one run serves the next. The §14 children a tree's processes spawn are compiled
+  once too, in the same cache (temen#2168): a child's code loads its nursery from the `vmctx`, and
+  each of its tasks brings its own fiber runtime and domain. A program's code that needs
   a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
   that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
   waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each

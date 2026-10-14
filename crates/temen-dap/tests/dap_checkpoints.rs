@@ -743,7 +743,7 @@ block 6 (va6: i32) {
 
 /// The `memory` capability's handle in the on-ramp powerbox: the fourth grant of the §3e prefix
 /// (slot 3, first generation).
-const MEMORY_HANDLE: i32 = (1 << 8) | 3;
+const MEMORY_HANDLE: i32 = (1 << 10) | 3;
 
 /// The clock, the stack, and every value [`REGION_LOOP`] keeps: the window counter, both region
 /// handles, and the region counter read through the alias.

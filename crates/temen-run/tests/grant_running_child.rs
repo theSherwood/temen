@@ -571,9 +571,9 @@ fn a_handle_no_spawn_could_grant_faults() {
 
 /// #2220 — a grant into a child whose table is full fails `-EMFILE`: the parent grants one region
 /// into a running child until it is refused, then releases the child (mailbox word 16) and joins
-/// it. It returns `errno * 1_000_000 + grants * 1000 + join`. A fresh detached child holds four of
-/// its table's 256 slots — its `Instantiator`, `AddressSpace`, `"budget"` and the pre-mapped
-/// mailbox — so 252 grants land.
+/// it. It returns `errno * 1_000_000_000 + grants * 1000 + join`. A fresh detached child holds four
+/// of its table's 1,024 slots — its `Instantiator`, `AddressSpace`, `"budget"` and the pre-mapped
+/// mailbox — so 1,020 grants land.
 #[test]
 fn a_grant_into_a_full_table_fails_emfile() {
     let body = format!(
@@ -594,7 +594,7 @@ block 3 (vi3: i32, vc3: i32, vg3: i32, vn4: i64) {{
   vgo = i32.const 1
 {}  vj = call.cap 6 1 (i32) -> (i64) vi3 (vc3)
   vg64 = i64.extend_i32_s vg3
-  vmil = i64.const 1000000
+  vmil = i64.const 1000000000
   vx = i64.mul vg64 vmil
   vk = i64.const 1000
   vy = i64.mul vn4 vk
@@ -629,6 +629,6 @@ block 0 (v0: i64) {{
     agree_everywhere(
         "grants until the child's table is full",
         &m,
-        &ok(-24 * 1_000_000 + 252 * 1000 + 7),
+        &ok(-24 * 1_000_000_000 + 1020 * 1000 + 7),
     );
 }
