@@ -64,11 +64,35 @@ impl Full {
 /// The child's probe: return 7.
 const SEVEN: &str = "  pr = i64.const 7\n";
 
+/// [`PARENT`](detached_thaw::PARENT)'s spawn and join, returning the room left in its budget (1 MiB)
+/// once it has joined the child, times 100, plus the join's status: `0`, or a trap's wire code.
+const PARENT_ROOM: &str = "memory 18 shadow 16448 65536
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vb = i64.extend_i32_u v2
+  vz = i64.const 0
+  vlog = i64.const 17
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
+  vf = i64.const 1
+  vroom = call.cap 14 1 (i64) -> (i64) v2 (vf)
+  vh = i64.const 100
+  vrh = i64.mul vroom vh
+  vt = i64.add vrh vr_st
+  return vt
+  }
+}
+";
+
+/// The budget's whole room, which the parent reads back once the child has ended.
+const ROOM: i64 = 1 << 20;
+
 /// A thawed run of a parent whose detached child was live at the freeze, on each engine, given more
 /// and more of the pool: first it has no room for the run (its activation refuses it, `ThreadFault`
 /// before it starts), then room for the run but not its child, whose relaunch is refused (the
-/// parent's join answers `ThreadFault`), then room for both. Whatever the outcome, everything the
-/// thaw charged goes back with the run.
+/// parent's join answers `ThreadFault`, and the child's window is back in its budget), then room
+/// for both. Whatever the outcome, everything the thaw charged goes back with the run.
 #[test]
 fn a_relaunch_the_pool_has_no_room_for_is_refused_and_holds_nothing() {
     let _pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -77,12 +101,12 @@ fn a_relaunch_the_pool_has_no_room_for_is_refused_and_holds_nothing() {
         eprintln!("skipped: a pool of {pool} mappings is too large to fill");
         return;
     }
-    let parent = parent();
+    let parent = parent_of(PARENT_ROOM);
     let child = child_module(&child(SEVEN));
     let Some((art, args)) = artifact(Engine::Interp, &parent, &child) else {
         return;
     };
-    let refused_child = Out::Ret(THREAD_FAULT * 1000);
+    let (refused_child, ran) = (Out::Ret(ROOM * 100 + THREAD_FAULT), Out::Ret(ROOM * 100));
     for engine in [Engine::Interp, Engine::Jit] {
         let mut full = Full::new();
         let mut seen = Vec::new();
@@ -98,7 +122,7 @@ fn a_relaunch_the_pool_has_no_room_for_is_refused_and_holds_nothing() {
             if seen.last() != Some(&out) {
                 seen.push(out.clone());
             }
-            if out == Out::Ret(7) {
+            if out == ran {
                 break;
             }
         }
@@ -110,7 +134,7 @@ fn a_relaunch_the_pool_has_no_room_for_is_refused_and_holds_nothing() {
             [
                 Out::Trap("ThreadFault".to_string()),
                 refused_child.clone(),
-                Out::Ret(7)
+                ran.clone()
             ],
             "{engine:?}: the run refused, then its child, then neither"
         );
