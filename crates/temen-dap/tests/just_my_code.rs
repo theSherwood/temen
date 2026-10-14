@@ -279,6 +279,29 @@ fn step_in_finds_a_callback_the_library_makes() {
     }
 }
 
+/// A step that leaves a callback returns into the library that called it (to `lib.c:11`, after the
+/// call), and under `justMyCode` goes on out of it to the program's code: `stepOut` and `next` from
+/// the callback both end in `main`, after its call into `lib`.
+#[test]
+fn leaving_a_callback_passes_the_library_that_called_it() {
+    for engine in ENGINES {
+        for (command, line) in [("stepOut", 20), ("next", 21)] {
+            let mut s = session(LIB_CALLBACK_DBG, engine, false, "main.c", line);
+            assert_eq!(
+                step(&mut s, command),
+                ("lib.c:11".to_string(), 2),
+                "{engine:?}: {command} from main.c:{line} without justMyCode"
+            );
+            let mut s = session(LIB_CALLBACK_DBG, engine, true, "main.c", line);
+            assert_eq!(
+                step(&mut s, command),
+                ("main.c:6".to_string(), 1),
+                "{engine:?}: {command} from main.c:{line} with it"
+            );
+        }
+    }
+}
+
 // Startup code with no source (func 0, like a linker's `_start`) calls a library's initialisation
 // (func 1, lib.c:30–31) and then the program's `main` (func 2, main.c:2–3).
 const STARTUP_DBG: &str = r#"

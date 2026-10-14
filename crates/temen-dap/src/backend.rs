@@ -229,12 +229,6 @@ pub trait Debuggee {
         let di = self.debug_info(pc.module)?;
         temen_interp::source_loc_in(&di, pc)
     }
-    /// Whether op `pc` is a library's code: its source file is one of its module's library files
-    /// (`DebugInfo::lib_files`, #2341).
-    fn in_library(&self, pc: IrPc) -> bool {
-        self.debug_info(pc.module)
-            .is_some_and(|di| temen_interp::loc_in(&di, pc).is_some_and(|l| di.is_lib_file(l.file)))
-    }
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue>;
     fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64>;
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap>;

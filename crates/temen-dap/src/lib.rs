@@ -34,8 +34,8 @@ pub struct DapServer {
     session: Option<Session>,
     /// `launch` arg: pause at the entry op instead of running to the first breakpoint.
     stop_on_entry: bool,
-    /// `launch` arg `justMyCode` (#2341): a step does not end in a library's code
-    /// ([`past_library`](DapServer::past_library)).
+    /// `launch` arg `justMyCode` (#2341): a library's code has no source line to step to
+    /// ([`step_position`](DapServer::step_position)), so a step does not end in it.
     just_my_code: bool,
     /// Set once the guest has finished (or the client disconnected).
     terminated: bool,
@@ -172,7 +172,6 @@ impl Session {
 type Event = (&'static str, Json);
 
 /// Which DAP step request is being served: `stepIn` (into calls), `next` (over calls), `stepOut`.
-#[derive(Clone, Copy)]
 enum StepKind {
     In,
     Over,
@@ -819,9 +818,6 @@ impl DapServer {
                 .func_name(pc)
                 .unwrap_or_else(|| format!("func{}", pc.func));
             let source = session.inspector.source_loc(pc);
-            // A library's frame (#2341) reads as one: DAP's `subtle` frame and `deemphasize`d
-            // source, which a client collapses or dims.
-            let library = session.inspector.in_library(pc);
             let mut fields = vec![
                 ("id", Json::i(frame_id as i64)),
                 ("name", Json::s(format!("#{index} {fname}"))),
@@ -839,13 +835,13 @@ impl DapServer {
                     ("name", Json::s(basename(&src.file))),
                     ("path", Json::s(src.file.clone())),
                 ];
-                if library {
+                if src.library {
+                    // A library's frame (#2341) reads as one: DAP's `subtle` frame over
+                    // `deemphasize`d source, which a client collapses or dims.
                     src_fields.push(("presentationHint", Json::s("deemphasize")));
+                    fields.push(("presentationHint", Json::s("subtle")));
                 }
                 fields.push(("source", Json::obj(src_fields)));
-            }
-            if library {
-                fields.push(("presentationHint", Json::s("subtle")));
             }
             out.push(Json::Obj(
                 fields
@@ -1635,64 +1631,30 @@ impl DapServer {
             None => return (false, Json::Null, vec![]),
         };
         let stop = match kind {
-            StepKind::Out => self.session.as_mut().unwrap().inspector.step_out(),
+            StepKind::Out => {
+                let stop = self.session.as_mut().unwrap().inspector.step_out();
+                // Under `justMyCode`, a step out into a library's code (a callback returning to
+                // `qsort`) goes on as a `next` from there would: out of it, to the program's code.
+                if is_step(&stop) && self.step_position().1 {
+                    self.step_source_line(StepKind::Over)
+                } else {
+                    stop
+                }
+            }
             StepKind::In | StepKind::Over if has_debug => self.step_source_line(kind),
             StepKind::In => self.session.as_mut().unwrap().inspector.step(),
             StepKind::Over => self.session.as_mut().unwrap().inspector.step_over(),
         };
-        // Under `justMyCode`, `stepIn` goes on stepping in, so a library calling back into the program
-        // (a `qsort` comparator) still stops there; `next` and `stepOut` step out to the caller.
-        let again: fn(&mut Self) -> Stop = match kind {
-            StepKind::In => |s| s.step_source_line(StepKind::In),
-            StepKind::Over | StepKind::Out => |s| s.session.as_mut().unwrap().inspector.step_out(),
-        };
-        let stop = self.past_library(stop, again);
         (true, Json::Null, self.stop_events(stop))
     }
 
-    /// Under `justMyCode` (#2341), a step does not end in a library's code: while a plain step stop
-    /// leaves the focused thread's innermost frame in a library file, take the step `again`. Anything
-    /// else that ends a step (a breakpoint, a watchpoint, a fault, the end of the run) stops it where
-    /// it is, library code or not, and a step that starts in a library's code ends in the program's.
-    /// Which code is a library's is its module's own (`DebugInfo::lib_files`), so this holds in a
-    /// child module as in the root.
-    fn past_library(&mut self, mut stop: Stop, again: fn(&mut Self) -> Stop) -> Stop {
-        // Each pass is a whole step, and a library's code returns or calls back long before this.
-        const CAP: usize = 100_000;
-        for _ in 0..CAP {
-            let plain = matches!(
-                stop,
-                Stop::Break {
-                    reason: StopReason::Step,
-                    ..
-                }
-            );
-            if !self.just_my_code || !plain || !self.top_in_library() {
-                break;
-            }
-            let before = self.position();
-            stop = again(self);
-            if self.position() == before {
-                break; // nowhere further to go (the start of the run, stepping back)
-            }
-        }
-        stop
-    }
-
     /// Under `justMyCode`, `stopOnEntry` stops on the program's own first line (#2341), as a C
-    /// debugger stops at `main` rather than at `_start`'s first op: step in past the startup code,
-    /// which has no source, and past any library's (its initialisation). A breakpoint, a fault or the
-    /// end of the run on the way reports as itself.
+    /// debugger stops at `main` rather than at `_start`'s first op: a step in from the first op, which
+    /// passes the startup code (it has no source) and any library's initialisation (its code has no
+    /// line). A breakpoint, a fault or the end of the run on the way reports as itself.
     fn enter_program(&mut self) -> Vec<Event> {
         let stop = self.step_source_line(StepKind::In);
-        let stop = self.past_library(stop, |s| s.step_source_line(StepKind::In));
-        if matches!(
-            stop,
-            Stop::Break {
-                reason: StopReason::Step,
-                ..
-            }
-        ) {
+        if is_step(&stop) {
             let mut events = self.output_events();
             events.push(stopped_event("entry", self.stopped_thread_id()));
             return events;
@@ -1700,60 +1662,60 @@ impl DapServer {
         self.stop_events(stop)
     }
 
-    /// Whether the focused thread's innermost frame runs a library's code (#2341).
-    fn top_in_library(&self) -> bool {
-        let Some(s) = self.session.as_ref() else {
-            return false;
-        };
-        s.inspector
-            .frame_pcs()
-            .first()
-            .is_some_and(|&pc| s.inspector.in_library(pc))
-    }
-
     /// Op-step (in / over) until the focused frame's *source line* changes — so DAP `next`/`stepIn`
     /// advance one source line, not one IR op (DEBUGGING.md W5). Stops early on a breakpoint, a
     /// finish, or a generous op cap (defensive against unmapped code). Skips ops with no source line
-    /// and ops still on the starting line.
+    /// and ops still on the starting line. Under `justMyCode` a library's code has no line either
+    /// ([`step_position`](Self::step_position)): `stepIn` op-steps through it, so a callback it makes
+    /// into the program still stops, and `next` leaves it with a step out rather than op-stepping it.
     fn step_source_line(&mut self, kind: StepKind) -> Stop {
         const CAP: usize = 1_000_000;
-        let start = self.current_source_line();
+        let (start, mut in_library) = self.step_position();
         let mut last = Stop::Blocked;
         for _ in 0..CAP {
             last = match self.session.as_mut() {
                 Some(s) => match kind {
                     StepKind::In => s.inspector.step(),
+                    _ if in_library => s.inspector.step_out(),
                     _ => s.inspector.step_over(),
                 },
                 None => return Stop::Blocked,
             };
-            match last {
-                Stop::Break {
-                    reason: StopReason::Step,
-                    ..
-                } => {
-                    let now = self.current_source_line();
-                    if now.is_some() && now != start {
-                        return last; // reached a different source line
-                    }
-                    // else: same line or an unmapped op — keep stepping
-                }
-                _ => return last, // a real breakpoint, finish, or block preempts the line-step
+            if !is_step(&last) {
+                return last; // a real breakpoint, finish, or block preempts the line-step
             }
+            let now;
+            (now, in_library) = self.step_position();
+            if now.is_some() && now != start {
+                return last; // reached a different source line
+            }
+            // else: same line or an unmapped op — keep stepping
         }
         last
     }
 
-    /// The `(file, line)` of the focused thread's innermost frame, if it maps to source. Line 0 is
+    /// Where a line step finds the focused thread's innermost frame: the `(file, line)` it can stop
+    /// on, if any, and whether the frame runs a library's code that `justMyCode` passes. Line 0 is
     /// not a line: the compiler gives it to ops that belong to none (the code around a call), so a
-    /// line step passes them like any unmapped op instead of stopping there.
+    /// line step passes them like any unmapped op instead of stopping there. Under `justMyCode` a
+    /// library's code has no line either (#2341).
+    fn step_position(&self) -> (Option<(String, u32)>, bool) {
+        let Some(src) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inspector.source_loc(*s.inspector.frame_pcs().first()?))
+        else {
+            return (None, false);
+        };
+        let library = self.just_my_code && src.library;
+        let line = (src.line != 0 && !library).then_some((src.file, src.line));
+        (line, library)
+    }
+
+    /// The line a step can stop on at the focused thread's innermost frame, if any
+    /// ([`step_position`](Self::step_position)).
     fn current_source_line(&self) -> Option<(String, u32)> {
-        let s = self.session.as_ref()?;
-        let pc = *s.inspector.frame_pcs().first()?;
-        s.inspector
-            .source_loc(pc)
-            .map(|src| (src.file, src.line))
-            .filter(|&(_, line)| line != 0)
+        self.step_position().0
     }
 
     fn on_step_back(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
@@ -1771,8 +1733,7 @@ impl DapServer {
                 if by_op || s.inspector.debug_info(0).is_none() {
                     s.inspector.step_back()
                 } else {
-                    let stop = self.step_back_source_line();
-                    self.past_library(stop, Self::step_back_source_line)
+                    self.step_back_source_line()
                 }
             }
             _ => return (false, Json::Null, vec![]),
@@ -2331,6 +2292,17 @@ fn var_to_i64(v: &VarValue) -> Option<i64> {
             x as i64
         }
     })
+}
+
+/// Whether `stop` is a step's own: it ran its course, with no breakpoint, fault or finish on the way.
+fn is_step(stop: &Stop) -> bool {
+    matches!(
+        stop,
+        Stop::Break {
+            reason: StopReason::Step,
+            ..
+        }
+    )
 }
 
 /// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference;
