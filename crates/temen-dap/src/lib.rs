@@ -1042,7 +1042,13 @@ impl DapServer {
                 if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
                     let summary = self.place_summary(types, base, tid_ref);
                     let vr = self.alloc_place(module, tid, base, tid_ref);
-                    out.push(var_json(&name, &summary, &ty, vr));
+                    out.push(var_json(
+                        &name,
+                        &summary,
+                        &ty,
+                        vr,
+                        type_info(types, Some(tid_ref)),
+                    ));
                     continue;
                 }
             }
@@ -1069,14 +1075,26 @@ impl DapServer {
                         type_id,
                         rvalue: true,
                     });
-                    out.push(var_json(&name, &format!("0x{addr:x}"), &ty, vr));
+                    out.push(var_json(
+                        &name,
+                        &format!("0x{addr:x}"),
+                        &ty,
+                        vr,
+                        type_info(types, Some(type_id)),
+                    ));
                     continue;
                 }
                 let rendered = match (&val, type_id) {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(types, tid, b),
                     _ => fmt_var(&val),
                 };
-                out.push(var_json(&name, &rendered, &ty, 0));
+                out.push(var_json(
+                    &name,
+                    &rendered,
+                    &ty,
+                    0,
+                    type_info(types, type_id),
+                ));
             }
         }
         Some(out)
@@ -1125,8 +1143,8 @@ impl DapServer {
                 };
                 match ptr {
                     // A null pointer has no pointee; an unreadable one can't be followed.
-                    Ok(0) => return Some(vec![var_json("*", "<null>", "", 0)]),
-                    Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0)]),
+                    Ok(0) => return Some(vec![var_json("*", "<null>", "", 0, None)]),
+                    Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0, None)]),
                     Ok(ptr) => members.push(("*".to_string(), ptr, *pointee)),
                 }
             }
@@ -1139,7 +1157,13 @@ impl DapServer {
             if is_expandable(types, mty) {
                 let summary = self.place_summary(types, addr, mty);
                 let vr = self.alloc_place(module, tid, addr, mty);
-                out.push(var_json(&name, &summary, &ty_name, vr));
+                out.push(var_json(
+                    &name,
+                    &summary,
+                    &ty_name,
+                    vr,
+                    type_info(types, Some(mty)),
+                ));
             } else {
                 let size = type_size(types, mty) as usize;
                 let session = self.session.as_ref()?;
@@ -1147,7 +1171,13 @@ impl DapServer {
                     Ok(bytes) => fmt_scalar(types, mty, &bytes),
                     Err(_) => "<unreadable>".to_string(),
                 };
-                out.push(var_json(&name, &value, &ty_name, 0));
+                out.push(var_json(
+                    &name,
+                    &value,
+                    &ty_name,
+                    0,
+                    type_info(types, Some(mty)),
+                ));
             }
         }
         Some(out)
@@ -1919,15 +1949,8 @@ impl DapServer {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(&debug.types, tid, b),
                     _ => fmt_var(&val),
                 };
-                return (
-                    true,
-                    Json::obj(vec![
-                        ("result", Json::s(rendered)),
-                        ("type", Json::s(var.ty.clone())),
-                        ("variablesReference", Json::i(0)),
-                    ]),
-                    vec![],
-                );
+                let info = type_info(&debug.types, var.type_id);
+                return (true, eval_json(rendered, var.ty.clone(), info), vec![]);
             }
         }
 
@@ -1944,11 +1967,11 @@ impl DapServer {
             frame_idx,
             func,
         };
-        let (result, ty) = match expr::eval(&expr, &mut env) {
-            Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
-            Some(expr::Value::Float(x)) => (x.to_string(), String::new()),
+        let (result, ty, type_id) = match expr::eval(&expr, &mut env) {
+            Some(expr::Value::Int(n)) => (n.to_string(), String::new(), None),
+            Some(expr::Value::Float(x)) => (x.to_string(), String::new(), None),
             // A bare pointer rvalue renders as its address value (navigate it with `->`/`[]`/`*`).
-            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new()),
+            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new(), None),
             Some(expr::Value::Place { addr, type_id }) => {
                 if matches!(
                     types.get(type_id as usize),
@@ -1958,6 +1981,7 @@ impl DapServer {
                     (
                         type_summary(types, type_id),
                         type_render_name(types, type_id),
+                        Some(type_id),
                     )
                 } else {
                     let size = type_size(types, type_id) as usize;
@@ -1965,6 +1989,7 @@ impl DapServer {
                         Ok(bytes) => (
                             fmt_scalar(types, type_id, &bytes),
                             type_render_name(types, type_id),
+                            Some(type_id),
                         ),
                         Err(_) => return fail,
                     }
@@ -1974,11 +1999,7 @@ impl DapServer {
         };
         (
             true,
-            Json::obj(vec![
-                ("result", Json::s(result)),
-                ("type", Json::s(ty)),
-                ("variablesReference", Json::i(0)),
-            ]),
+            eval_json(result, ty, type_info(types, type_id)),
             vec![],
         )
     }
@@ -2312,14 +2333,73 @@ fn var_to_i64(v: &VarValue) -> Option<i64> {
     })
 }
 
-/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference.
-fn var_json(name: &str, value: &str, ty: &str, vref: i64) -> Json {
-    Json::obj(vec![
+/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference;
+/// `info` is the value's [`type_info`], when its type is structured.
+fn var_json(name: &str, value: &str, ty: &str, vref: i64, info: Option<Json>) -> Json {
+    let mut fields = vec![
         ("name", Json::s(name.to_string())),
         ("value", Json::s(value.to_string())),
         ("type", Json::s(ty.to_string())),
         ("variablesReference", Json::i(vref)),
-    ])
+    ];
+    if let Some(info) = info {
+        fields.push(("typeInfo", info));
+    }
+    Json::obj(fields)
+}
+
+/// Build a DAP `evaluate` body: `result`, of type `ty`, with `info` as in [`var_json`].
+fn eval_json(result: String, ty: String, info: Option<Json>) -> Json {
+    let mut fields = vec![
+        ("result", Json::s(result)),
+        ("type", Json::s(ty)),
+        ("variablesReference", Json::i(0)),
+    ];
+    if let Some(info) = info {
+        fields.push(("typeInfo", info));
+    }
+    Json::obj(fields)
+}
+
+/// The structured shape of type `id` (#2341), for a client to render a value by without parsing its
+/// render name (`char *` is a C spelling): its `name`, `kind` (`scalar`, `pointer`, `array`,
+/// `aggregate` — a struct or a union — or `opaque`) and `size`; a scalar's `encoding` (`signed`,
+/// `unsigned`, `float`, `bool`); an array's `count`; and as `target`, the same summary of a
+/// pointer's pointee or an array's element, one level down. `None` with no structured type.
+fn type_info(types: &[TypeDef], id: Option<TypeId>) -> Option<Json> {
+    fn summary(types: &[TypeDef], id: TypeId, outer: bool) -> Option<Json> {
+        let mut fields = vec![("name", Json::s(type_render_name(types, id)))];
+        let (kind, target) = match types.get(id as usize)? {
+            TypeDef::Base { encoding, .. } => {
+                let encoding = match encoding {
+                    Encoding::Signed => "signed",
+                    Encoding::Unsigned => "unsigned",
+                    Encoding::Float => "float",
+                    Encoding::Bool => "bool",
+                };
+                fields.push(("encoding", Json::s(encoding)));
+                ("scalar", None)
+            }
+            TypeDef::Pointer { pointee, .. } => ("pointer", Some(*pointee)),
+            TypeDef::Array { elem, count, .. } => {
+                fields.push(("count", Json::i(*count as i64)));
+                ("array", Some(*elem))
+            }
+            TypeDef::Aggregate { .. } => ("aggregate", None),
+            TypeDef::Opaque { .. } => ("opaque", None),
+        };
+        fields.push(("kind", Json::s(kind)));
+        fields.push(("size", Json::i(type_size(types, id) as i64)));
+        // One level down only: a struct that points at itself would otherwise never end.
+        if let Some(target) = target
+            .filter(|_| outer)
+            .and_then(|t| summary(types, t, false))
+        {
+            fields.push(("target", target));
+        }
+        Some(Json::obj(fields))
+    }
+    summary(types, id?, true)
 }
 
 /// The render name of a structured type (every [`TypeDef`] variant carries one), or `"?"`.

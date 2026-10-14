@@ -1018,6 +1018,63 @@ fn inspect_struct_array_and_pointer_locals() {
 /// used to be skipped by both engines, so the DAP refused the line as unverified. A terminator is a
 /// stop position now: the breakpoint binds, the run stops on line 9 with `sum` readable, and a `next`
 /// from line 8 lands on line 9 rather than running off the end.
+/// **Real `-g` locals say their structured shape (#2341).** `p`, `arr` and `pp` each carry a
+/// `typeInfo` from chibicc's own type table, so a front end renders them without parsing a C spelling:
+/// the struct is an aggregate, the array names its element and count, the pointer its pointee.
+#[test]
+fn real_locals_say_their_type_shape() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, RICH_SRC);
+    let mut s = DapServer::new();
+    launch_at(&mut s, &ir, RICH_BP, false);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let vref = locals_ref(&mut s, 5);
+    let out = s.handle(&req(
+        7,
+        "variables",
+        Json::obj(vec![("variablesReference", Json::i(vref))]),
+    ));
+    let vars = response(&out)
+        .get("body")
+        .and_then(|b| b.get("variables"))
+        .and_then(|v| v.as_array())
+        .expect("variables")
+        .to_vec();
+    let info = |name: &str| {
+        vars.iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|v| v.get("typeInfo"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} has a typeInfo"))
+    };
+    let field = |j: &Json, key: &str| j.get(key).and_then(|k| k.as_str()).map(str::to_owned);
+
+    assert_eq!(field(&info("p"), "kind").as_deref(), Some("aggregate"));
+
+    let arr = info("arr");
+    assert_eq!(field(&arr, "kind").as_deref(), Some("array"));
+    assert_eq!(arr.get("count").and_then(|c| c.as_i64()), Some(3));
+    let elem = arr.get("target").expect("arr's element");
+    assert_eq!(
+        (field(elem, "kind"), field(elem, "encoding")),
+        (Some("scalar".into()), Some("signed".into())),
+        "arr is of int"
+    );
+
+    let pp = info("pp");
+    assert_eq!(field(&pp, "kind").as_deref(), Some("pointer"));
+    let pointee = pp.get("target").expect("pp's pointee");
+    assert_eq!(
+        (field(pointee, "kind"), field(pointee, "name")),
+        (Some("aggregate".into()), Some("struct Point".into())),
+        "pp points at a struct Point"
+    );
+}
+
 #[test]
 fn breakpoint_on_bare_return_line_stops_there() {
     let Some(bytes) = chibicc_temen() else {
