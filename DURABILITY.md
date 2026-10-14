@@ -302,7 +302,7 @@ is a parser over attacker-controlled frames in the host.
   under the freeze-authority ruling (INVARIANTS #14, #1289 R1) it freezes as its own
   root-shaped artifact and a subtree snapshot is a consistent cut over the parent's and each
   detached child's — in-flight plumbing (the run driver must reach the detached child's
-  `Mem`+`Host` at quiesce), which is why a durable op-15 detached spawn refuses today.
+  `Mem`+`Host` at quiesce), which is why a durable detached spawn refused then.
 
 **The cut and its boundary (owner direction, 2026-09-24).** *Everything inside the cut is data;
 only the cut's boundary is an interface, and a boundary edge is recorded and re-bound, never
@@ -396,7 +396,7 @@ as a unit.
 `temen_durable::transform_module` — a compile-mode fact the runtime cannot re-derive from the
 IR, so it is attested like verification; plain `grant_module` grants unmarked). A **durable**
 domain's §14 ops then enforce the rule fail-closed (`-EINVAL`): a spawn — `instantiate` /
-`spawn_coroutine` (module forms 5/6/7) then, the detached spawn (op 15/17) now that every engine
+`spawn_coroutine` (module forms 5/6/7) then, the detached spawn (op 17) now that every engine
 refuses the carve spawn (#1867) — refuses an **unmarked** grant; a **same-module** child
 stays admissible (it runs the parent's own instrumented funcs); and the admitted child
 **inherits durability** — its `Host` + vCPU run durable, so its own spawns/fibers reserve
@@ -571,7 +571,7 @@ live child → serialize → restore into a fresh host → **§12.6 canonical re
 `freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
 
 **Detached children — completed-result residue (v23, #1361 step 2).** The §14 **detached** spawn (op
-15, `instantiate_detached`) gives a child its *own* window rather than a carve in the parent's, so a
+15 then, the op-17 record since #2067) gives a child its *own* window rather than a carve in the parent's, so a
 **live** one at a freeze stays fail-closed: the subtree STW broadcasts `UNWINDING` only into carves
 within *this* window image, never reaching a detached child's separate window (the O6 mid-flight
 capture — step 3). A **completed-but-unjoined** one, though, needs nothing of that separate window:
@@ -581,14 +581,14 @@ only its `thread.join` result crosses, exactly as for a completed nested child. 
 nested count first; since v44, #1867, the nested block is gone and the detached block follows the
 vCPU residue directly, present iff non-empty); a domain that froze no detached child is
 byte-identical to v22 but for the version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
-edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (op 15 is a
+edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (the spawn is a
 `call.cap` checkpoint, so the rewind reloads its spilled slot handle rather than re-running the
 spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
 refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
 completed-result path above; the codec round-trip is pinned by
-`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The op-15 `!durable` admission
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The detached spawn's `!durable` admission
 gate that kept this inert came out with step 4, below.) The module-handle prerequisite was cleared
-first: op 15 takes a *module handle*, which
+first: a detached spawn takes a *module handle*, which
 `capture_durable_handles` used to refuse outright, so a durable parent that spawned a detached child
 could not be frozen at all; an attested-freezable grant is durable as of #1361 (§12.5 above), and no
 post-spawn cap-close op is needed. Under a scratch
@@ -684,7 +684,7 @@ JIT's budget-take hook and the resumable engine all call. A durable detached chi
 authority only if its parent hands it down as one of the spawn's named grants (#2018). Nothing mints
 it, so a durable tree grows only as deep as each holder lets it. The resumable engine hands its child to its
 embedder's driver, so capturing that child is the driver's; the browser's grants neither the authority
-nor an attested module, so its durable reactors refuse op 15 on the same rule. Pinned by
+nor an attested module, so its durable reactors refuse a detached spawn on the same rule. Pinned by
 `temen-interp/src/detached_freeze_tests.rs` (oracle: freeze a live child → harvest → re-launch → the
 join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip.rs` (every field
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
@@ -1297,7 +1297,7 @@ something outside the VM can write (`SharedBacking::outside_writers`, e.g. a hos
 (`temen_ir::PageState`) names the region and offset each aliased page maps, so its capture and its
 artifact are the interpreter's; a JIT thaw starts the window private and, once the window exists
 and before the guest runs, re-aliases each `Backed` run onto the rebuilt region through the same
-`SharedRegion.map` path as the op-15 pre-map (`Host::apply_premap`), on a root's window and on a
+`SharedRegion.map` path as the spawn's pre-map (`Host::apply_premap`), on a root's window and on a
 re-launched child's. A JIT thaw needs an OS-backed region factory (`temen_run::new_shared_region`),
 as a live JIT run does to map a region at all. A bytecode reactor's save-state (#2051) carries them
 the same way: its window is still live at the frame boundary it freezes on, but an interpreter window

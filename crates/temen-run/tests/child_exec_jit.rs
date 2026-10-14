@@ -1,5 +1,6 @@
 //! D66 — **the child-domain executor on the native JIT** (DESIGN.md §23; #1600 slice 2). Detached
-//! children (op 15) are migrating tasks over a lane-bounded worker pool, not one OS thread each:
+//! children (spawned from records, op 17) are migrating tasks over a lane-bounded worker pool, not
+//! one OS thread each:
 //!
 //! * **the dispatch-time bound** — with the parent's lane cap at 1, two spinning children never
 //!   overlap (a shared pre-mapped region carries the running counter they both bump);
@@ -11,8 +12,12 @@
 //! The interpreter (whose lanes landed in slice 4) is the oracle where its scheduling is
 //! deterministic for the program; the executor's own guarantees are pinned directly.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
+use temen_ir::SpawnRec;
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
@@ -26,9 +31,15 @@ fn module(text: &str) -> temen_ir::Module {
 }
 
 /// `v0` Instantiator, `v1` AddressSpace, `v2` child module A, `v3` child module B, `v4` Budget.
-/// Mints a 64 KiB region, maps it at 65536 of its own window, spawns A then B detached with the
-/// region pre-mapped at 65536 of each child's window (2^17), then runs `tail`.
+/// Mints a 64 KiB region, maps it at 65536 of its own window, spawns A then B detached, each from a
+/// record of its own (A's at 17408, B's at 17536), with the region pre-mapped at 65536 of each
+/// child's window (2^17), then runs `tail`.
 fn parent(tail: &str) -> String {
+    let child = SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..SpawnRec::v1()
+    };
     format!(
         r#"memory 17
 func (i32, i32, i32, i32, i32) -> (i64) {{
@@ -40,19 +51,34 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   vro = i64.const 0
   vprot = i32.const 3
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
-  vma = i64.extend_i32_u v2
-  vmb = i64.extend_i32_u v3
-  vb = i64.extend_i32_u v4
-  vz = i64.const 0
-  vlog = i64.const 17
-  vreg = i64.extend_i32_u vrh
-  voff = i64.const 65536
-  vca = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vma, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
-  vcb = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmb, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  vamod = i64.const {a_module}
+  i32.store vamod v2
+  vabud = i64.const {a_budget}
+  i32.store vabud v4
+  vareg = i64.const {a_region}
+  i32.store vareg vrh
+  vbmod = i64.const {b_module}
+  i32.store vbmod v3
+  vbbud = i64.const {b_budget}
+  i32.store vbbud v4
+  vbreg = i64.const {b_region}
+  i32.store vbreg vrh
+  varec = i64.const 17408
+  vca = call.cap 6 17 (i64) -> (i32) v0 (varec)
+  vbrec = i64.const 17536
+  vcb = call.cap 6 17 (i64) -> (i32) v0 (vbrec)
   {tail}
   }}
 }}
-"#
+{rec_a}{rec_b}"#,
+        a_module = 17408 + rec::MODULE_AT,
+        a_budget = 17408 + rec::BUDGET_AT,
+        a_region = 17408 + rec::REGION_AT,
+        b_module = 17536 + rec::MODULE_AT,
+        b_budget = 17536 + rec::BUDGET_AT,
+        b_region = 17536 + rec::REGION_AT,
+        rec_a = rec::segment(17408, &child),
+        rec_b = rec::segment(17536, &child),
     )
 }
 
@@ -552,16 +578,25 @@ fn a_notify_racing_a_tasks_park_is_not_lost() {
     }
 }
 
-/// #1956 — `v0` Instantiator, `v1` AddressSpace, `v2` the [`GRANDCHILD_SPINS`] module, `v3` its
+/// #1956 — `v0` Instantiator, `v1` AddressSpace, `v2` the [`grandchild_spins`] module, `v3` its
 /// grandchild's image, `v4` Budget. Mints a 64 KiB region, maps it at 65536 of its own window and
-/// grants the child that region (`"r"`) and the grandchild's image (`"grandchild"`) by name. The child
-/// hands the region on to the grandchild, which spins over it; the root joins the child, then spins
-/// over the region itself, and returns `1000·VIOL + the child's result`.
-const ROOT_SPINS_BESIDE_GRANDCHILD: &str = r#"memory 17
+/// grants the child that region (`"r"`) and the grandchild's image (`"grandchild"`) by name, in the
+/// grant list of its spawn record at 17408. The child hands the region on to the grandchild, which
+/// spins over it; the root joins the child, then spins over the region itself, and returns
+/// `1000·VIOL + the child's result`.
+fn root_spins_beside_grandchild() -> String {
+    let child = SpawnRec {
+        size_log2: 17,
+        grants_ptr: 18432,
+        grants_n: 2,
+        ..SpawnRec::v1()
+    };
+    format!(
+        r#"memory 17
 data 18464 "r"
 data 18480 "grandchild"
-func (i32, i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   vlen = i64.const 65536
   vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
   vrh = i32.wrap_i64 vrh64
@@ -581,37 +616,37 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vrec4 = i64.const 18456
   vg64 = i64.extend_i32_u v3
   i64.store vrec4 vg64
-  vmh = i64.extend_i32_u v2
-  vb = i64.extend_i32_u v4
-  vz = i64.const 0
+  vma = i64.const {module_at}
+  i32.store vma v2
+  vba = i64.const {budget_at}
+  i32.store vba v4
   vone = i64.const 1
-  vtwo = i64.const 2
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vrec, vtwo, vz, vlog, vz, vz, vz)
+  vrp = i64.const 17408
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vrun = i64.const 65536
   vold = i64.atomic.rmw.add vrun vone
   vge = i64.ge_s vold vone
   br_if vge 1(vj) 2(vj)
-}
-block 1 (vj1: i64) {
+}}
+block 1 (vj1: i64) {{
   vviol = i64.const 65544
   vone1 = i64.const 1
   vx = i64.atomic.rmw.add vviol vone1
   br 2(vj1)
-}
-block 2 (vj2: i64) {
+}}
+block 2 (vj2: i64) {{
   vz2 = i64.const 0
   br 3(vj2, vz2)
-}
-block 3 (vj3: i64, vi: i64) {
+}}
+block 3 (vj3: i64, vi: i64) {{
   vlim = i64.const 1000000
   vlt = i64.lt_u vi vlim
   vone3 = i64.const 1
   vi1 = i64.add vi vone3
   br_if vlt 3(vj3, vi1) 4(vj3)
-}
-block 4 (vj4: i64) {
+}}
+block 4 (vj4: i64) {{
   vrun4 = i64.const 65536
   vneg = i64.const -1
   vd = i64.atomic.rmw.add vrun4 vneg
@@ -621,79 +656,98 @@ block 4 (vj4: i64) {
   vm = i64.mul vv vk
   vr = i64.add vm vj4
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + rec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
+    )
 }
-"#;
 
 /// #1956 — the child (func 0) and the grandchild (func 1, exported as `"grandchild"`) of
-/// [`ROOT_SPINS_BESIDE_GRANDCHILD`]. The child spawns the grandchild's image it was granted as
-/// `"grandchild"` detached from its own `"budget"`, with the region it was granted as `"r"`
-/// pre-mapped at 65536, and returns its handle plus 7 without joining it. The grandchild spins over
-/// the region as [`SPINNER`] does.
-const GRANDCHILD_SPINS: &str = r#"memory 17
+/// [`root_spins_beside_grandchild`]. The child spawns the grandchild's image it was granted as
+/// `"grandchild"` detached from its own `"budget"`, by its record at 17408, with the region it was
+/// granted as `"r"` pre-mapped at 65536, and returns its handle plus 7 without joining it. The
+/// grandchild spins over the region as [`SPINNER`] does.
+fn grandchild_spins() -> String {
+    let grandchild = SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..SpawnRec::v1()
+    };
+    format!(
+        r#"memory 17
 data 20000 "budget"
 data 20016 "r"
 data 20032 "grandchild"
 export 0 func "grandchild" 1
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vnp = i64.const 20000
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  vbw = i64.extend_i32_u vb
   vrp = i64.const 20016
   vrl = i64.const 1
   vr = self.resolve vrp vrl
-  vrw = i64.extend_i32_u vr
   vgp = i64.const 20032
   vgl = i64.const 10
   vgc = self.resolve vgp vgl
-  vgw = i64.extend_i32_u vgc
-  vz = i64.const 0
-  vlog = i64.const 17
-  voff = i64.const 65536
+  vma = i64.const {module_at}
+  i32.store vma vgc
+  vba = i64.const {budget_at}
+  i32.store vba vb
+  vra = i64.const {region_at}
+  i32.store vra vr
+  vrec = i64.const 17408
   vinst = i32.wrap_i64 v0
-  vg = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vgw, vz, vz, vz, vlog, vz, vz, vz, vrw, voff)
+  vg = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vg64 = i64.extend_i32_s vg
   v7 = i64.const 7
   vres = i64.add vg64 v7
   return vres
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
   vrun = i64.const 65536
   vone = i64.const 1
   vold = i64.atomic.rmw.add vrun vone
   vge = i64.ge_s vold vone
   br_if vge 1() 2()
-}
-block 1 () {
+}}
+block 1 () {{
   vviol = i64.const 65544
   vone1 = i64.const 1
   vx = i64.atomic.rmw.add vviol vone1
   br 2()
-}
-block 2 () {
+}}
+block 2 () {{
   vz = i64.const 0
   br 3(vz)
-}
-block 3 (vi: i64) {
+}}
+block 3 (vi: i64) {{
   vlim = i64.const 1000000
   vlt = i64.lt_u vi vlim
   vone3 = i64.const 1
   vi1 = i64.add vi vone3
   br_if vlt 3(vi1) 4()
-}
-block 4 () {
+}}
+block 4 () {{
   vrun2 = i64.const 65536
   vneg = i64.const -1
   vd = i64.atomic.rmw.add vrun2 vneg
   vz4 = i64.const 0
   return vz4
-  }
+  }}
+}}
+{rec}"#,
+        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + rec::BUDGET_AT,
+        region_at = 17408 + rec::REGION_AT,
+        rec = rec::segment(17408, &grandchild),
+    )
 }
-"#;
 
 /// #1956 — **a grandchild is gated on every lane up to the root's**, on the JIT as on the
 /// interpreter. Under a root lane cap of 1 the root and a grandchild it never joins never spin at
@@ -702,8 +756,8 @@ block 4 () {
 /// both unbounded, let them overlap on ≥2 cores — the mutation the pin was checked against.)
 #[test]
 fn a_grandchild_is_gated_on_the_roots_lane_on_the_jit() {
-    let p = module(ROOT_SPINS_BESIDE_GRANDCHILD);
-    let c = module(GRANDCHILD_SPINS);
+    let p = module(&root_spins_beside_grandchild());
+    let c = module(&grandchild_spins());
     let g = temen_ir::child_image_at(&c, 1).expect("the grandchild's image");
     assert_eq!(run_interp(&p, &c, &g, 1), 7, "the oracle");
     for run in 0..3 {

@@ -58,12 +58,12 @@ re-issues.
 
 ## 4. How a parent names a child (the handle model — nesting-friendly by construction)
 
-The Instantiator's spawns (op 15, and its op-17 record; the carve spawns 0 `instantiate` and 5/13
+The Instantiator's spawn (the op-17 record; the carve spawns 0 `instantiate` and 5/13
 `instantiate_module` this section was written against are retired, #1867) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
 (its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is being retired,
-INVARIANTS #13 2026-09-29; an op-15 detached child's handle names its own window). Sibling ops
+INVARIANTS #13 2026-09-29; a detached child's handle names its own window). Sibling ops
 already take it: `join` (1), `poll` (9), `kill` (12), `child_offer` (14). It is **capability-scoped,
 not a global PID table**: a parent only holds handles to children it spawned.
 
@@ -565,7 +565,7 @@ in `c_fork.rs`:
   name. A raw host cap carries no typed interface, so there's no coverage walk — a flat import binds
   op-0 straight to the handle, and the `CAP_IMPORT_TYPE_ID` translation routes the call (with the fs op
   in `args[0]`) to the registered closure. This is the same op-in-arg0 wrapper `c_link.rs` uses at the
-  top level, now reachable through a spawn's grant list (op 13's then, op 15/17's now) so a spawned/exec'd child
+  top level, now reachable through a spawn's grant list (op 13's then, the op-17 record's now) so a spawned/exec'd child
   inherits fs authority.
   The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
   into a child, so the memfs store is shared across the fork.

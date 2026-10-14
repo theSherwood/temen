@@ -250,7 +250,7 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    size 0 asks for exactly that), paid from our `Budget` and returned to it when the child ends. `rec` holds `gn` 16-byte grant records `{name_off, name_len, handle, flags}`;
    argv travels as the spawn's args payload `{argc, envc=0}` + packed argv, which lands at the child's
    `module_args_base`. Returns the child handle, or -errno (an over-long argv, an exhausted budget). */
-static char spawn_rec_buf[88];
+static struct vm_spawn_rec spawn_rec;
 static char spawn_args[LINE_MAX + 16];
 static long spawn_child(long mod, int *rec, long gn, int argc, char **argv) {
   int *hdr = (int *)spawn_args;
@@ -262,24 +262,15 @@ static long spawn_child(long mod, int *rec, long gn, int argc, char **argv) {
     for (long k = 0; k < L; k++) *p++ = s[k];
     *p++ = 0;
   }
-  int *w = (int *)spawn_rec_buf;
-  long *q = (long *)spawn_rec_buf;
-  w[0] = 1;                                  /* @0  version 1: detached */
-  w[1] = 0;                                  /* @4  reserved, 0 */
-  q[1] = 0;                                  /* @8  offset: reserved, 0 */
-  w[4] = 0;                                  /* @16 size_log2 0 = the command's declared window */
-  w[5] = -1;                                 /* @20 no pager */
-  w[6] = (int)mod;                           /* @24 module */
-  w[7] = __budget();                         /* @28 the Budget the window spends */
-  q[4] = 0;                                  /* @32 no fuel quota */
-  q[5] = (long)rec;                          /* @40 grants */
-  q[6] = gn;                                 /* @48 */
-  q[7] = (long)spawn_args;                   /* @56 args payload */
-  q[8] = p - spawn_args;                     /* @64 */
-  w[18] = -1;                                /* @72 no pre-mapped region */
-  w[19] = 0;                                 /* @76 reserved */
-  q[10] = 0;                                 /* @80 child_off */
-  return __spawn_rec(__inst(), (long)spawn_rec_buf);
+  struct vm_spawn_rec init = VM_SPAWN_REC_INIT; /* size_log2 0: the command's declared window */
+  spawn_rec = init;
+  spawn_rec.module = (int)mod;
+  spawn_rec.budget = __budget();                 /* the Budget the window spends */
+  spawn_rec.grants_ptr = (long)rec;
+  spawn_rec.grants_n = gn;
+  spawn_rec.args_ptr = (long)spawn_args;
+  spawn_rec.args_len = p - spawn_args;
+  return __spawn_rec(__inst(), (long)&spawn_rec);
 }
 
 /* The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so

@@ -1,44 +1,7 @@
-//! `__vm_instantiate_detached`: the on-ramp lowers it to `call.cap INSTANTIATOR 15` on the handle in its
-//! first argument, passing the other eight (`budget, module, grants_ptr, grants_n, entry, size_log2,
-//! args_ptr, args_len`) through in order, with op 15's retired `quota` slot 0 (#1944 slice 3) — the
-//! detached spawn (PROCESS.md §5) reachable from C and Rust, beside `__vm_instantiate_rec` (op 17).
+//! The §14 spawn builtins: the on-ramp lowers each to its `call.cap INSTANTIATOR` op on the handle in
+//! its first argument, as chibicc's builtin of the same name.
 
 use temen_ir::Inst;
-
-const LL: &str = r#"
-declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
-declare i64 @__vm_join(i32, i64, ptr)
-
-define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {
-  %st = alloca i64
-  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %budget, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 0, i64 0)
-  %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
-  ret i64 %r
-}
-"#;
-
-#[test]
-fn it_lowers_to_instantiator_op_15_with_nine_arguments() {
-    let t = temen_llvm::translate_ll_str(LL).expect("translate");
-    temen_verify::verify_module(&t.module).expect("verify");
-    let caps: Vec<(u32, u32, usize)> = t
-        .module
-        .funcs
-        .iter()
-        .flat_map(|f| f.blocks.iter().flat_map(|b| b.insts.iter()))
-        .filter_map(|i| match i {
-            Inst::CapCall {
-                type_id, op, args, ..
-            } => Some((*type_id, *op, args.len())),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        caps,
-        vec![(6, 15, 9), (6, 1, 1)],
-        "spawn detached, then join"
-    );
-}
 
 const LL_REC: &str = r#"
 declare i64 @__vm_instantiate_rec(i32, i64)
@@ -76,14 +39,18 @@ fn the_record_spawn_lowers_to_instantiator_op_17() {
 const LL_JOIN_BUDGET: &str = r#"
 declare i64 @__vm_budget_split(i32, i64, i64, i64)
 declare i64 @__vm_budget_read(i32, i64)
-declare i64 @__vm_instantiate_detached(i32, i64, i64, i64, i64, i64, i64, i64, i64)
+declare i64 @__vm_instantiate_rec(i32, i64)
 declare i64 @__vm_join(i32, i64, ptr)
 
-define i64 @spawn(i32 %inst, i32 %budget, i64 %module) {
+define i64 @spawn(i32 %inst, i32 %budget, ptr %rec) {
   %st = alloca i64
   %node = call i64 @__vm_budget_split(i32 %budget, i64 1000, i64 -1, i64 -1)
   %room = call i64 @__vm_budget_read(i32 %budget, i64 0)
-  %h = call i64 @__vm_instantiate_detached(i32 %inst, i64 %node, i64 %module, i64 0, i64 0, i64 0, i64 21, i64 0, i64 0)
+  %at = getelementptr i8, ptr %rec, i64 28
+  %n32 = trunc i64 %node to i32
+  store i32 %n32, ptr %at
+  %ri = ptrtoint ptr %rec to i64
+  %h = call i64 @__vm_instantiate_rec(i32 %inst, i64 %ri)
   %r = call i64 @__vm_join(i32 %inst, i64 %h, ptr %st)
   %w = load i64, ptr %st
   %s = add i64 %w, %r
@@ -94,8 +61,9 @@ define i64 @spawn(i32 %inst, i32 %budget, i64 %module) {
 
 /// #2053, #2066 — a spawner bounds a child's fuel and outlives its running out: `__vm_budget_split`
 /// lowers to `call.cap BUDGET 0` (three ceilings), `__vm_budget_read` to `call.cap BUDGET 1` (the
-/// field), and `__vm_join` to `call.cap INSTANTIATOR 1` answering two results, `(status, value)`:
-/// the value is the builtin's return and the status is stored through its third argument.
+/// field), the record naming the split node as its budget spawns through `call.cap INSTANTIATOR 17`,
+/// and `__vm_join` lowers to `call.cap INSTANTIATOR 1` answering two results, `(status, value)`: the
+/// value is the builtin's return and the status is stored through its third argument.
 #[test]
 fn budget_split_read_and_join_lower_to_their_ops() {
     let t = temen_llvm::translate_ll_str(LL_JOIN_BUDGET).expect("translate");
@@ -123,8 +91,8 @@ fn budget_split_read_and_join_lower_to_their_ops() {
         .collect();
     assert_eq!(
         caps,
-        vec![(14, 0, 3, 1), (14, 1, 1, 1), (6, 15, 9, 1), (6, 1, 1, 2)],
-        "split, read, spawn detached, join (two results)"
+        vec![(14, 0, 3, 1), (14, 1, 1, 1), (6, 17, 1, 1), (6, 1, 1, 2)],
+        "split, read, spawn, join (two results)"
     );
 }
 

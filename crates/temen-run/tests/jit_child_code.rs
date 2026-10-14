@@ -15,14 +15,23 @@ mod detached;
 
 use detached::{module, nester, rec, within_a_minute};
 use temen_interp::{Host, Value};
+use temen_ir::SpawnRec;
 use temen_run::{instantiate, Backend, JitCodeCache, Limits, Outcome, RunConfig};
 
 /// What the nester returns from depth 2 (`10 * (10 * 7 + 1) + 2`), times its four spawns.
 const SUM: i64 = 4 * 712;
 
-/// The root: spawn the nester at depth 2 four times, the last from the `"metered"` budget and the
-/// others from `"pool"`, granting it on as `"nester"`; join each and return the sum of the results.
+/// The root: spawn the nester at depth 2 four times from the record at 17408, the last from the
+/// `"metered"` budget and the others from `"pool"`, granting it on as `"nester"`; join each and return
+/// the sum of the results.
 fn root() -> String {
+    let child = SpawnRec {
+        size_log2: 16,
+        grants_ptr: 20064,
+        grants_n: 1,
+        args: (18432, 8),
+        ..SpawnRec::v1()
+    };
     format!(
         r#"memory 17
 data 20000 "spawner"
@@ -70,14 +79,12 @@ block 6 (vs6: i64, vi6: i64, vbud: i32) {{
   vdp = i64.const 18432
   vd = i64.const 2
   i64.store vdp vd
-{grant}  vbw = i64.extend_i32_u vbud
-  vmw = i64.extend_i32_u vnest
-  vgp = i64.const 20064
-  vgn = i64.const 1
-  vz = i64.const 0
-  vlog = i64.const 16
-  vdl = i64.const 8
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vz, vlog, vz, vdp, vdl)
+{grant}  vma = i64.const {module_at}
+  i32.store vma vnest
+  vba = i64.const {budget_at}
+  i32.store vba vbud
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vs7 = i64.add vs6 vj
   vone = i64.const 1
@@ -85,8 +92,11 @@ block 6 (vs6: i64, vi6: i64, vbud: i32) {{
   br 1(vs7, vi7)
   }}
 }}
-"#,
+{rec}"#,
         grant = rec::grant("g", 20064, 20016, 6, "vnest"),
+        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + rec::BUDGET_AT,
+        rec = rec::segment(17408, &child),
     )
 }
 

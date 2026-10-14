@@ -70,16 +70,17 @@ pub struct Row {
     pub mint: Mint,
 }
 
-/// `instantiate_detached`'s (op 15's) argument slot the probe fills with a real value: the `Module`
-/// handle (argument 1). Argument 0 is the `Budget`, and the rest are grants/entry/size/quota, which
-/// zeros suit.
+/// Where the probe lays `instantiate_rec`'s (op 17's) record: above the durable control words at the
+/// NULL guard's base, in the probe's 64 KiB window.
 ///
-/// With a zero there the call dies at its handle resolve (`CapFault`), so the admission path where the
-/// drivers once differed (#1570, on the retired op 13) goes untested. With it, the sweep reaches
-/// admission — refused for want of a `Budget` — and the two drivers' answers are comparable. It does
-/// not reach a *completed* spawn, so the column's claim is agreement through admission, which is where
-/// the divergence was. Op 17 runs the same admission once it has read its record.
-pub const OP15_MODULE_ARG: usize = 1;
+/// Op 17's one argument is a record pointer, so a real value for it names the record's `Module`
+/// instead: the probe stores a v1 record naming that module here, with every other field none, and
+/// points the call at it. With the sweep's zero the call reads its record from the NULL guard and
+/// faults, so the admission path where the drivers once differed (#1570, on the retired op 13) goes
+/// untested. With it, the sweep reaches admission — refused for want of a `Budget` — and the drivers'
+/// answers are comparable. It does not reach a *completed* spawn, so the column's claim is agreement
+/// through admission, which is where the divergence was.
+pub const RECORD_AT: u64 = 17408;
 
 /// How far past a no-op capability's (empty) interface to probe when checking that nothing on it
 /// reaches either gate.
@@ -163,20 +164,20 @@ pub fn rows() -> Vec<Row> {
                 (h, x)
             }),
         ),
-        // The spawn family: join (1), child_offer (14), instantiate_detached (15) and
-        // instantiate_rec (17). The carve spawns (0/5/13) and the coroutine variants (6/7) are
-        // retired: every engine traps them `CapFault` (#1867, `carve_spawn_refused.rs`).
+        // The spawn family: join (1), child_offer (14) and instantiate_rec (17). The carve spawns
+        // (0/5/13), the coroutine variants (6/7) and op 15's positional spawn are retired: every
+        // engine traps them `CapFault` (#1867, #2067, `carve_spawn_refused.rs`).
         Row {
             cap: Capability::Instantiator,
             iface: c::INSTANTIATOR,
-            ops: &[1, 14, 15, 17],
-            // op 15 takes a real `Module` handle in argument `OP15_MODULE_ARG`; with the sweep's
-            // zero there it never gets past its handle resolve, so admission would go untested.
+            ops: &[1, 14, 17],
+            // Op 17's real value is the `Module` its record names ([`RECORD_AT`]); with the sweep's
+            // zero it never gets past reading its record, so admission would go untested.
             mint: Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_instantiator(0, 1 << 16);
                 let modh = h.grant_module(&a_module());
-                (h, x, vec![(15, OP15_MODULE_ARG, modh as i64)])
+                (h, x, vec![(17, 0, modh as i64)])
             }),
         },
         row(
@@ -239,9 +240,8 @@ pub fn rows() -> Vec<Row> {
     ]
 }
 
-/// Ops are tried across this many arities: the lowering's arms are arity-guarded
-/// (`(INSTANTIATOR, 15) if args.len() >= 7`), so calling an op with too few arguments makes it look
-/// unsupported when it is merely miscalled. The widest arm takes 9.
+/// Ops are tried across this many arities: the lowering's arms are arity-guarded, so calling an op
+/// with too few arguments makes it look unsupported when it is merely miscalled.
 pub const MAX_ARGC: usize = 10;
 
 /// Which entry shape the generated probe wears — the parameter the **code-origin** column varies,
@@ -307,11 +307,22 @@ fn build_probe(
     let mut body = String::new();
     let mut args = String::new();
     let mut params = String::new();
+    let record = iface == temen_ir::cap_id::INSTANTIATOR && op == 17;
     for i in 0..argc {
-        let v = overrides
+        let mut v = overrides
             .iter()
             .find(|(idx, _)| *idx == i)
             .map_or(0, |(_, v)| *v);
+        if record && i == 0 && v != 0 {
+            // A v1 record naming module `v` ([`RECORD_AT`]); every field not stored is 0, none.
+            body.push_str(&format!(
+                "  vrec = i64.const {RECORD_AT}\n  vone = i32.const 1\n  i32.store vrec vone\n  \
+                 vnone = i32.const -1\n  i32.store vrec vnone offset=20\n  \
+                 vmod = i32.const {v}\n  i32.store vrec vmod offset=24\n  \
+                 i32.store vrec vnone offset=72\n"
+            ));
+            v = RECORD_AT as i64;
+        }
         body.push_str(&format!("  va{i} = i64.const {v}\n"));
         if i > 0 {
             args.push_str(", ");

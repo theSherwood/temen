@@ -213,7 +213,7 @@ enum Filed {
 
 /// D66 — **the one child filing** for every §14 child (INVARIANTS #15): reserve the §15 slot, build
 /// the task around `code` in a fresh window (`init` seeds it — data segments + payload, or a thawed
-/// image; `premap` aliases an op-15 region), register it in the join table with its retained
+/// image; `premap` aliases a spawn's region), register it in the join table with its retained
 /// powerbox ref, and hand it to the executor. `teardown` (release the powerbox, return the lane) runs exactly once — after the
 /// task's last residency, or right here if the filing is refused.
 ///
@@ -465,7 +465,7 @@ pub(crate) struct Nursery {
     /// durable detached children, which a freeze of it reaches and captures.
     durable: AtomicBool,
     /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `Budget` taker
-    /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ op 15 is an
+    /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ a spawn is an
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
@@ -473,7 +473,7 @@ pub(crate) struct Nursery {
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
     /// D66 — [`crate::LaneGiver`]: a reaped child task returns its lane to the parent.
     grant_lane_give: std::sync::atomic::AtomicUsize,
-    /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
+    /// Spawn pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
     /// [`crate::WindowReady`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`). The last is
     /// also every detached child's window-ready hook (#2268).
     grant_premap_admit: std::sync::atomic::AtomicUsize,
@@ -1105,7 +1105,7 @@ impl Nursery {
         let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
         let thaw_off = shadow.thaw_state_off(0) as usize;
         // #2025 — its §13 pages, aliased back onto their regions once its window exists, by the
-        // same host hook that applies a spawn's op-15 pre-map.
+        // same host hook that applies a spawn's pre-map.
         let apply_addr = self.grant_premap_apply.load(Ordering::Acquire);
         let premap_apply = (apply_addr != 0)
             .then(|| core::mem::transmute::<usize, crate::WindowReady>(apply_addr));
@@ -1232,20 +1232,19 @@ fn temen_ir_iface_instantiator() -> u32 {
 }
 
 /// CONSOLIDATION.md §3c — the **config-record spawn** (`Instantiator` op 17,
-/// `instantiate_rec(record_ptr)`) on the native JIT tier: parse + validate the record
-/// ([`SpawnRec`]) from the guest window, then **delegate to [`instantiate_detached`]** — a record
-/// is op 15 as data (#1863), so there is exactly one spawn implementation on this tier too. Field
-/// handling mirrors the tree-walker's op-17 arm:
+/// `instantiate_rec(record_ptr)`), the one spawn form (#1863), on the native JIT tier: parse +
+/// validate the record ([`SpawnRec`]) from the guest window, then spawn it ([`spawn_detached`]).
+/// Field handling mirrors the tree-walker's op-17 arm:
 ///
-/// - a version other than 1, or a nonzero reserved field (the word at 4 was the entry, #2219) →
-///   `CapFault` (fail closed).
+/// - a version other than 1, or a nonzero reserved field (the word at 4 was the entry, #2219, and
+///   the word at 32 the fuel quota) → `CapFault` (fail closed).
 /// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
 ///   **with** impl exports to the oracle, so a natively-running module has none — and the
 ///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
 ///
 /// # Safety
-/// Same contract as [`instantiate_detached`]: called from JITted code on the spawning
-/// vCPU's thread with the run's live nursery, window base/size, and a writable `trap_out`.
+/// Called from JITted code on the spawning vCPU's thread with the run's live nursery, window
+/// base/size, and a writable `trap_out`.
 pub(crate) unsafe extern "C" fn instantiate_rec(
     rt: *const Nursery,
     mem_base: u64,
@@ -1282,24 +1281,7 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
-    instantiate_detached(
-        rt,
-        mem_base,
-        mem_size,
-        handle,
-        sr.budget as i64,
-        sr.modh as i64,
-        sr.grants_ptr as i64,
-        sr.grants_n as i64,
-        0, // the record's reserved word at 4 (#2219)
-        sr.size_log2,
-        sr.quota,
-        sr.args.0 as i64,
-        sr.args.1 as i64,
-        sr.region as i64,
-        sr.child_off as i64,
-        trap_out,
-    )
+    spawn_detached(rt, mem_base, mem_size, handle, &sr, trap_out)
 }
 
 /// `join(child_handle) -> result` — block on the child's completion (an async op-0/5/8/11/13 child
@@ -1331,7 +1313,7 @@ unsafe fn spawn_detached_child(
     release: crate::GrantChildReleaser,
     gc: &crate::GrantChild,
     trap_out: *mut i64,
-    // #1587 — the lease `instantiate_detached` already took from the funding budget, `(budget, bytes,
+    // #1587 — the lease `spawn_detached` already took from the funding budget, `(budget, bytes,
     // runs)`, so a spawn that fails *after* that commit can hand it back.
     lease: (i32, u64, u64),
     // #1944 slice 3 — the child's fuel cell, drawing from its own budget node (`None`: un-metered);
@@ -1395,7 +1377,7 @@ unsafe fn spawn_detached_child(
                 w.protect_ro(s.offset, s.bytes.len() as u64);
             }
         },
-        // The child's page map takes its read-only pages, and the op-15 pre-mapped region, if any,
+        // The child's page map takes its read-only pages, and the spawn's pre-mapped region, if any,
         // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.
         |base, mapped, reserved| match window_ready {
             // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
@@ -1474,12 +1456,10 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
     }
 }
 
-/// PROCESS.md §5 / #1287 — `instantiate_detached(budget, module, grants_ptr, grants_n, entry,
-/// size_log2, quota[, args_ptr, args_len[, region, child_off]]) -> child | -EINVAL` on the native JIT:
-/// a separate-module
-/// child in a **fresh window** — `1 << size_log2` committed inside a root-sized lazy reservation, no
-/// carve, no alias — minted through the `Budget` `budget`. Admission is the interpreter's op-15
-/// arm errno-for-errno: child entry shape, the window **equals** the module's declared memory (§14
+/// PROCESS.md §5 / #1287 — the detached spawn a record `sr` names, `-> child | -EINVAL`, on the native
+/// JIT: a separate-module child in a **fresh window** — `1 << size_log2` committed inside a
+/// root-sized lazy reservation, no carve, no alias — minted through the record's `Budget`. Admission
+/// is the interpreter's op-17 arm errno-for-errno: child entry shape, the window **equals** the module's declared memory (§14
 /// transparency), the payload fits the args region, and the budget quota covers the window (a forged /
 /// exhausted budget refuses, charging nothing). The child powerbox is the by-name grant list plus
 /// starter caps spanning the **reservation** (a root's shape, so its `vm_map` grows the window);
@@ -1489,33 +1469,19 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 /// # Safety
 /// `rt`/`mem_base`/`mem_size`/`trap_out` are the instance's nursery, live parent window base,
 /// **reserved** span, and run trap cell, valid for the call.
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn instantiate_detached(
+unsafe fn spawn_detached(
     rt: *const Nursery,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
-    budget: i64,
-    module: i64,
-    grants_ptr: i64,
-    grants_n: i64,
-    entry: i64,
-    size_log2: i64,
-    fuel: i64,
-    args_ptr: i64,
-    args_len: i64,
-    premap_region: i64,
-    premap_off: i64,
+    sr: &SpawnRec,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
-    // other value fails closed, checked first as the tree-walker's op-15 arm does. #2219 — so is
-    // `entry`: a child starts at its module's function 0, the module's child bootstrap.
-    if fuel != 0 || entry != 0 {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
+    let (budget, module) = (i64::from(sr.budget), i64::from(sr.modh));
+    let (grants_ptr, grants_n) = (sr.grants_ptr as i64, sr.grants_n as i64);
+    let (args_ptr, args_len) = (sr.args.0 as i64, sr.args.1 as i64);
+    let size_log2 = sr.size_log2;
     // #1361 step 4 — a durable parent's detached child is captured by the parent's freeze (its window
     // rides the artifact as its own), so it spawns durable: an attested-freezable module with a shadow
     // arena of its own (§4, #1501). The authority half — freeze authority over detached progeny, #1440 —
@@ -1559,7 +1525,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         .first()
         .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // §14 transparency: the detached window equals the module's declared memory (the interpreter's
-    // op-15 `mod_ok`); it grows into its own reservation, so no superset room is needed.
+    // op-17 `mod_ok`); it grows into its own reservation, so no superset room is needed.
     let mod_ok = mod_mem == Some(size_log2 as i32);
     // The optional payload, read from THIS window (reserved-bounded — an out-of-window range is a
     // MemoryFault, as any window read). An over-long one refuses probeably, before anything is read:
@@ -1593,9 +1559,9 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     {
         return EINVAL as i32;
     }
-    // The optional pre-mapped region (`premap_region < 0` ⇒ none): admitted host-side — the
-    // interpreter's `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take.
-    let premap = (premap_region >= 0).then_some((premap_region as i32, premap_off as u64));
+    // The optional pre-mapped region (`region < 0` ⇒ none): admitted host-side — the interpreter's
+    // `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take.
+    let premap = (sr.region >= 0).then_some((sr.region, sr.child_off));
     // #2268 — the child's window-ready hook, which records its read-only pages and applies the
     // pre-map, if any.
     let apply_addr = rt.grant_premap_apply.load(Ordering::Acquire);
