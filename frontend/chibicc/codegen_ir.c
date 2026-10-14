@@ -199,6 +199,17 @@ static int file_index(char *name) {
   return n_dbg_files - 1;
 }
 
+// Whether `path` is a system header: a file found under a directory of the include search path
+// (#2401). The program's own files are the main file and what it includes by a relative path.
+static bool is_system_header(char *path) {
+  for (int i = 0; i < include_paths.len; i++) {
+    int n = strlen(include_paths.data[i]);
+    if (!strncmp(path, include_paths.data[i], n) && path[n] == '/')
+      return true;
+  }
+  return false;
+}
+
 // Accumulated `debug.loc` rows, flushed after the functions (module-level, strippable).
 typedef struct {
   int func, block, inst, file, line, col;
@@ -4117,6 +4128,11 @@ void codegen_ir(Obj *prog, FILE *out) {
   if (opt_g) {
     for (int i = 0; i < n_dbg_files; i++)
       cg("debug.file %d \"%s\"\n", i, dbg_files[i]);
+    // `debug.lib <file>`: a system header's code is library code, as a resident library's is
+    // (#2341, #2401), so a debugger dims its frames and `justMyCode` steps past it.
+    for (int i = 0; i < n_dbg_files; i++)
+      if (is_system_header(dbg_files[i]))
+        cg("debug.lib %d\n", i);
     // `debug.fname <func> "<name>"`: the §6 function-name table, so a backtrace / gdb `bt` / kill
     // message reads `compute` instead of `fn3`. C function names are identifiers (no escaping). The
     // synthetic `_start` (func 0) has no source name and is left to its `fn0` fallback.
