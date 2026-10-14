@@ -986,7 +986,7 @@ impl Env {
         Arc::get_mut(env)
     }
 
-    /// Set `name` to `value` in `env`: `false`, with nothing changed, when `payer` has no room.
+    /// Set `name` to `value` in `env`: `false`, its variables unchanged, when `payer` has no room.
     fn set(
         env: &mut Arc<Env>,
         payer: Option<NodeRef>,
