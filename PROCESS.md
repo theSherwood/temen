@@ -72,7 +72,8 @@ Named gaps (each already a "follow-up" in code comments or docs):
    recompile per spawn — **now cached** (S1, done): `compile_child` bakes only the *size*
    mask and the window **base is a runtime arg**, so one compiled child is
    position-independent and a per-carve cache reuses it across offsets (my earlier note
-   that the JIT "bakes `sub_base` into code" was wrong — corrected).
+   that the JIT "bakes `sub_base` into code" was wrong — corrected). The carve cache went
+   with the carve spawn (#1867); a run now compiles each detached child once (temen#2168).
 5. **No clone entry point**; no dynamic module loading (bytes → verified `Module`); `fs`
    cap has no directory ops.
 
@@ -396,7 +397,8 @@ does **not**: `compile_child` bakes only the *size* mask (`& (2^size_log2 − 1)
 window **base is a runtime argument** to `run_guarded`. So one compiled child runs at
 **any** carve offset, and a per-carve compile cache reuses it across offsets — not merely
 across repeated same-slot spawns. Built and pinned by `crates/temen/tests/jit_instantiate_cache.rs`
-(both since deleted with the carve spawn, #1867; a detached child compiles per spawn):
+(both since deleted with the carve spawn, #1867; a run compiles each detached child once again
+since temen#2168, `ChildCodeCache` below):
 the same `(module, entry, size)` spawned at two different offsets JIT-compiles **once**
 (`temen_jit::child_compiles()` advances by 1), and each spawn still runs correctly confined
 to its carve. Scope: **non-durable** children (the shell-applet common case) are cached;
@@ -404,6 +406,17 @@ durable/nesting children keep the per-call `compile_child_and_run` path (their b
 per-child nursery makes the code un-shareable) — a small, deliberate exclusion, not a gap.
 This also *helps* async children: cached code is read-only executable, so the same blob
 can back N concurrent OS-thread children.
+
+**Detached children, one compile per run (temen#2168).** A detached spawn (op 15, the op-17 v1
+record) recompiled its child's whole module every time, the spawner's own program included.
+The child's code now loads its nursery from its vmctx, as it loads its powerbox, cells and
+thread domain, so it bakes nothing of one spawn: a run compiles each child once per shape
+(`temen_jit::ChildCodeCache`, keyed by the module's digest and every other compile input:
+entry, window, `call.cap` thunk, which cells its instances have, serve handlers, table, run
+kind), and every spawn instantiates that compile over its own powerbox, window, budget cell
+and nursery. Durable and nesting children share it too. A child holding a `Jit` compiles its
+own, since the units it compiles extend its code. An embedder keeps the compiles past the run
+with `RunConfig::jit_code`. Pinned by `crates/temen-run/tests/jit_child_code.rs`.
 
 ### S1 remaining — async children: the architecture, corrected by integration  [design]
 

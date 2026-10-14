@@ -169,7 +169,8 @@ fn no_instance_of_shared_code_can_extend_it() {
 
 #[test]
 fn code_naming_an_object_one_instance_owns_is_not_shared() {
-    // An `Instantiator` site bakes the address of the run's §14 nursery.
+    // A root's `Instantiator` sites spawn through its §14 nursery, which an instance would need its
+    // own of.
     let nests = "memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
