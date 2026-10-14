@@ -19359,7 +19359,8 @@ pub struct TailBytes {
     pub tail: u64,
     /// Of those, the bytes the window holds committed as its own memory: what its budget pays for.
     pub held: u64,
-    /// Of those, the bytes aliased to a §13 region: the region's memory, not the window's.
+    /// Of those, the bytes a `protect` granting access leaves not the window's own: aliased to a §13
+    /// region (the region's memory), or past a growable backing (#1153, #2407: no memory at all).
     pub aliased: u64,
 }
 
@@ -19404,6 +19405,21 @@ pub fn window_tail_bytes<S>(
         tail: (last - first + 1) * page,
         held: count(&held) * page,
         aliased: count(&aliased) * page,
+    }
+}
+
+/// #2407 — [`GuestMem::tail_bytes`] over a growable backing ([`Region::can_grow`]), `len` bytes long
+/// from the window's base: one flat buffer, which holds every byte below its length whatever its
+/// pages' state, and which a commit past it grows over every page up to the span's `end`. So of the
+/// reserved tail up to `end`, it holds what lies below `len`, and what lies past it is what a `map`
+/// granting access grows it over. A `protect` past it grows nothing (#1153), like an alias.
+fn flat_tail_bytes(mapped: u64, len: u64, end: u64) -> TailBytes {
+    let tail = end.saturating_sub(mapped);
+    let held = len.min(end).saturating_sub(mapped);
+    TailBytes {
+        tail,
+        held,
+        aliased: tail - held,
     }
 }
 
@@ -34209,10 +34225,14 @@ impl Mem {
         // of each page is written, so no zeroing first. The prot entries came over in `prot_copy`.
         let base = self.window.base();
         let tbase = twin.window.base();
-        if let Some(&last) = tail_pages.last() {
-            if !twin.back.grow_to(tbase + (last + 1) * self.page) {
-                return None;
-            }
+        // Its backing covers them, and (#2407) a growable one all of mine, which the twin's charge
+        // (my growth) pays for.
+        let mut end = tail_pages.last().map_or(0, |&last| (last + 1) * self.page);
+        if self.back.can_grow() {
+            end = end.max(self.back.len().saturating_sub(base));
+        }
+        if end > 0 && !twin.back.grow_to(tbase + end) {
+            return None;
         }
         for &pg in &tail_pages {
             let off = pg * self.page;
@@ -35736,11 +35756,16 @@ impl Mem {
             .min(self.back.len().saturating_sub(self.window.base()))
     }
 
-    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
+    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map,
+    /// and (#2407) over a growable backing's whole length, which the window holds and pays for, so a
+    /// capture carries what its thaw is charged for.
     fn high_water(&self, space: &AddrSpace) -> u64 {
         let mut high = self.window.mapped();
         if let Some((&max_pg, _)) = space.prot.iter().next_back() {
             high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
+        }
+        if self.back.can_grow() {
+            high = high.max(self.back.len().saturating_sub(self.window.base()));
         }
         high.min(self.window.reserved())
     }
@@ -36007,18 +36032,21 @@ impl GuestMem for Mem {
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
     /// misaligned → `-EINVAL`. Over a **growable** backing ([`Region::can_grow`] — a detached
-    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) the
-    /// backing is asked to cover the pages first; a refusal (the foreign memory's `maximum`, or an
-    /// allocator that cannot serve the buffer) is `-ENOMEM`, probeable, before a byte of protection
-    /// state changes. (A **fixed** backing shorter than the reservation keeps its #1153 contract:
-    /// the op succeeds and accesses past the backing are dropped/read zero —
-    /// `region_backing_bound.rs`.)
+    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) a `map`
+    /// granting access asks the backing to cover the pages first, which [`Host::page_op`] charged
+    /// (#2407: one flat buffer, so it covers every page below them too); a refusal (the foreign
+    /// memory's `maximum`, or an allocator that cannot serve the buffer) is `-ENOMEM`, probeable,
+    /// before a byte of protection state changes. A `map` to no access commits nothing and grows
+    /// nothing. (A **fixed** backing shorter than the reservation keeps its #1153 contract: the op
+    /// succeeds and accesses past the backing are dropped/read zero — `region_backing_bound.rs`.
+    /// So does a `protect` past a growable one.)
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        if self.back.can_grow()
+        if prot & (PROT_READ | PROT_WRITE) != 0
+            && self.back.can_grow()
             && !self
                 .back
                 .grow_to(self.window.base() + (pages.end() + 1) * self.page)
@@ -36051,6 +36079,10 @@ impl GuestMem for Mem {
         let Ok(pages) = self.prot_pages(offset, len) else {
             return TailBytes::default();
         };
+        if self.back.can_grow() {
+            let len = self.back.len().saturating_sub(self.window.base());
+            return flat_tail_bytes(self.window.mapped(), len, (pages.end() + 1) * self.page);
+        }
         let space = self.space_read();
         window_tail_bytes(
             &space.prot,
@@ -37085,6 +37117,91 @@ mod growth_tests {
         assert_eq!(grow(WINDOW), Ok(vec![0]), "the growth fits the grant");
         assert_eq!(grow(WINDOW + GROWTH), Ok(vec![ENOMEM]), "past it");
         assert_eq!(used(&root, BudgetTree::RUN_NODE), (WINDOW + GROWTH) as i64);
+    }
+
+    /// #2407 — a growable backing is one flat buffer, so its window holds the buffer's length,
+    /// whatever its pages' state. Only a `map` granting access grows it, over every page up to the
+    /// span's end, and that growth is charged first, all or nothing. The buffer never shrinks, so
+    /// nothing hands it back before the window ends.
+    #[test]
+    fn a_growable_window_pays_for_its_backings_length() {
+        const RW: i32 = PROT_READ | PROT_WRITE;
+        let page = host_page_size();
+        let mut root = Host::new();
+        root.set_grant((WINDOW + 18 * page) as i64, -1, -1, -1);
+        let (_, space) = root.grant_starter_caps(1 << 20);
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back.clone(), None);
+        let _ = root.begin_activation(u64::MAX, RootWindow::of(Some(&mem)));
+        let run = BudgetTree::RUN_NODE;
+        let op = |root: &mut Host, mem: &mut Mem, op: u32, at: u64, len: u64, prot: i32| {
+            let args = [at as i64, len as i64, prot as i64];
+            root.cap_dispatch_slots(cap_id::ADDRESS_SPACE, op, space, &args, Some(mem))
+                .expect("dispatch")[0]
+        };
+        let held = |root: &Host| (back.len() - WINDOW, used(root, run) - WINDOW as i64);
+        // A map to no access, an unmap and a protect to none of the whole tail grow nothing.
+        let tail = (1 << 20) - WINDOW;
+        for (code, prot) in [(0, 0), (1, 0), (2, 0)] {
+            assert_eq!(op(&mut root, &mut mem, code, WINDOW, tail, prot), 0);
+        }
+        assert_eq!(held(&root), (0, 0));
+        // Nor does a protect granting access past the backing (#1153): its page reads zero and a
+        // store to it is dropped.
+        assert_eq!(op(&mut root, &mut mem, 2, WINDOW, page, RW), 0);
+        assert!(mem.store(WINDOW, 0, StoreOp::I64, Value::I64(7)).is_ok());
+        assert_eq!(mem.load(WINDOW, 0, LoadOp::I64), Ok(Value::I64(0)));
+        assert_eq!(held(&root), (0, 0));
+        // A map granting access a page past the window grows the backing over both pages, exactly.
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW + page, page, RW), 0);
+        assert_eq!(held(&root), (2 * page, 2 * page as i64));
+        // One the grant has no room for is refused before anything grows; one at its edge grows
+        // the backing over the gap below it: sixteen pages for one.
+        assert_eq!(
+            op(&mut root, &mut mem, 0, WINDOW + 18 * page, page, RW),
+            ENOMEM
+        );
+        assert_eq!(held(&root), (2 * page, 2 * page as i64));
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW + 17 * page, page, RW), 0);
+        assert_eq!(held(&root), (18 * page, 18 * page as i64));
+        // Unmapped, its pages are still the buffer's, and mapped again they cost nothing more.
+        assert_eq!(op(&mut root, &mut mem, 1, WINDOW, 18 * page, 0), 0);
+        assert_eq!(op(&mut root, &mut mem, 0, WINDOW, 18 * page, RW), 0);
+        assert_eq!(held(&root), (18 * page, 18 * page as i64));
+        // An activation counts the window the same way, and its end hands it all back.
+        assert_eq!(RootWindow::of(Some(&mem)).grown, 18 * page);
+        root.release_memory();
+        assert_eq!(used(&root, run), 0);
+    }
+
+    /// #2407 — a capture of a growable window reaches its backing's end, though no page up there is
+    /// mapped any more, so the window a thaw rebuilds from it holds what the frozen one was charged.
+    #[test]
+    fn a_flat_windows_capture_carries_what_it_holds() {
+        let page = host_page_size();
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back, None);
+        assert_eq!(mem.map(WINDOW + 7 * page, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.unmap(WINDOW, 8 * page), 0);
+        let held = mem.tail_bytes(0, 1 << 20).held;
+        assert_eq!(held, 8 * page);
+        let image = mem.layout_snapshot();
+        let thawed = MemLayout::from_dense(image.bytes().to_vec(), &image.dense_prots(), WINDOW);
+        assert_eq!(thawed.page_map().grown_bytes(), held);
+    }
+
+    /// #2407 — a fork twin of a growable window holds what its parent's holds, which is what the twin
+    /// is charged ([`Host::fork_powerbox`]), though its parent's top page is no longer mapped.
+    #[test]
+    fn a_flat_windows_fork_twin_holds_what_its_parent_does() {
+        let page = host_page_size();
+        let back = Arc::new(Region::growable(WINDOW, page).expect("allocates"));
+        let mut mem = Mem::with_reservation_over(20, 16, back, None);
+        assert_eq!(mem.map(WINDOW, 8 * page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.unmap(WINDOW + 7 * page, page), 0);
+        let twin = mem.fork_private().expect("a simple window forks");
+        let held = |m: &Mem| m.tail_bytes(0, 1 << 20).held;
+        assert_eq!((held(&mem), held(&twin)), (8 * page, 8 * page));
     }
 
     /// #2113 — a root's fork twin pays for its copy from the root's grant, as a child's twin pays

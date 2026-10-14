@@ -604,6 +604,17 @@ replaces its image. A freeze keeps the charge, and the thaw takes it over. A run
 the run's own node, the embedder's grant, which also pays for its declared window and main vCPU from
 when an activation opens (#2113).
 
+**A flat window holds its whole buffer (#2407).** Some windows are one growable flat buffer: a
+cooperative tier-up run's, a detached child's in such a run, an exec'd leaf image's, and a fork twin
+of one. Such a window holds every byte below the buffer's length, whatever its pages' state, so its
+budget pays for that length past the declared size. Only a `map` granting access grows the buffer:
+over every page up to the span's end, a gap included, charged first, all or nothing. Past a ceiling
+the `map` is `-ENOMEM` and nothing grows. An `unmap` hands nothing back, since the buffer does not
+shrink. A `protect` granting access past the buffer grows nothing: its pages read zero and drop
+stores (#1153). So a flat window can refuse a `map` far past its buffer that a sparse window would
+take, a probeable refusal (INVARIANTS #9). A capture of a flat window reaches the buffer's end, so a
+thaw takes over what the freeze kept charged.
+
 **A process's window spends it too (#2106, #2110).** A fork twin's copy of its parent's window and a
 spawned process's fresh window are new windows. Each is charged to the node the process shares with
 its parent, the twin's with the growth its copy holds, before the process exists: a level without the
