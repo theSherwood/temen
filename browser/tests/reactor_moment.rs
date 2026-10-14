@@ -79,7 +79,7 @@ const LIFE: &[u8] = include_bytes!("fixtures/life.temen");
 const FSREAD: &[u8] = include_bytes!("fixtures/fsread.temen");
 
 /// A stable hash of a presented frame (dims + pixels) — the per-frame equality unit, as in the Doom
-/// differential and `jit_reactor.rs`.
+/// differential.
 fn frame_hash(f: &Frame) -> u64 {
     let mut h = DefaultHasher::new();
     f.width.hash(&mut h);

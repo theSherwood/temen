@@ -374,7 +374,7 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
     // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
     // #1699 — `ctx` is C state nothing here can serialize: `Uncaptured`, so a freeze refuses the
     // capability rather than thaw it with its state lost.
-    let cap = HostCap::host_proc(op, move || -> (HostProc, temen_interp::CapState) {
+    let cap = HostCap::host_proc(op, move |_| -> (HostProc, temen_interp::CapState) {
         let ctx = ctx;
         let h: HostProc = Box::new(
             move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {

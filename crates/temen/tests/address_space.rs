@@ -190,8 +190,8 @@ fn sub_rejects_ranges_outside_the_holder() {
     );
 }
 
-/// Audit #1 — a guest must not be able to crash the host by exhausting the 256-slot handle table.
-/// `AddressSpace.sub` mints a handle each call; this loops it 300 times (past `CAP = 256`). Once the
+/// Audit #1 — a guest must not be able to crash the host by exhausting the handle table.
+/// `AddressSpace.sub` mints a handle each call; this loops it 1,100 times (past `CAP` = 1,024). Once the
 /// table fills, `sub` must return **-EMFILE** (-24), and the run must complete normally on **both**
 /// backends — in particular the JIT path routes `call.cap` through the `extern "C"` thunk, where a
 /// panic (the pre-fix `.expect("handle table full")`) would unwind across the FFI boundary and
@@ -204,7 +204,7 @@ fn minting_past_table_capacity_returns_emfile_not_panic() {
 memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  v1 = i64.const 300
+  v1 = i64.const 1100
   v2 = i64.const 0
   br 1(v0, v1, v2)
 }

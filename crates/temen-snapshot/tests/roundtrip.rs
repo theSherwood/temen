@@ -167,11 +167,11 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
 
     // Thaw: flip to REWINDING and re-enter; the stack rebuilds from the restored window. The
     // guest receives the clock as a handle argument; restore reinstated it at its original
-    // slot/generation, so the same handle value (`(generation << 8) | slot`) still resolves.
+    // slot/generation, so the same handle value still resolves.
     let mut win = window;
     begin_thaw(&mut win, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable");
-    let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let clk = caps[0].handle();
     let mut fuel = 100_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -270,7 +270,7 @@ fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
     let mut win = window;
     begin_thaw(&mut win, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable");
-    let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let clk = caps[0].handle();
     let mut fuel = 100_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -587,10 +587,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     // Both clock reads reload (42, 43 → 95), not re-issue (which would use clock 1000+ → ≠ 95).
     let mut win = window;
     begin_thaw(&mut win, TEST_ARENA, 0);
-    let clk = {
-        let caps = thost.capture_durable_handles().expect("durable");
-        ((caps[0].generation << 8) | caps[0].slot) as i32
-    };
+    let clk = thost.capture_durable_handles().expect("durable")[0].handle();
     let mut fuel = 100_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -732,10 +729,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: the fiber re-seeds and re-parks, the child re-spawns and reloads its clock; result == 57.
     let mut win = window;
     begin_thaw(&mut win, TEST_ARENA, 0);
-    let clk = {
-        let caps = thost.capture_durable_handles().expect("durable");
-        ((caps[0].generation << 8) | caps[0].slot) as i32
-    };
+    let clk = thost.capture_durable_handles().expect("durable")[0].handle();
     let mut fuel = 100_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -1042,10 +1036,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: the grandchild's handle resolves in the child's rebuilt table; all reads reload → 129.
     let mut win = window;
     begin_thaw(&mut win, TEST_ARENA, 0);
-    let clk = {
-        let caps = thost.capture_durable_handles().expect("durable");
-        ((caps[0].generation << 8) | caps[0].slot) as i32
-    };
+    let clk = thost.capture_durable_handles().expect("durable")[0].handle();
     let mut fuel = 100_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -1530,7 +1521,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let seen: CapLog = Default::default();
     let log = std::sync::Arc::clone(&seen);
     let mut thost = Host::new();
-    thost.set_named_cap_registrar(Box::new(move |name, state| {
+    thost.set_named_cap_registrar(Box::new(move |name, state, _payer| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         Some(temen_interp::NamedCapGrant {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![99])),

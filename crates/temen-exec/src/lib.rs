@@ -15,11 +15,12 @@
 //! The contract *reserves* streaming (a future backend may yield output before exit) — guests
 //! must not depend on output being complete before `status` returns 0-EOF reads.
 //!
-//! A handler builder returns a `make: impl Fn() -> HostProc` closure — `temen-run` passes it to
-//! `HostCap::host_proc`, and the browser cdylib grants the `HostProc` directly on its Host.
+//! A handler builder returns a `make: impl Fn(&NodeRef) -> HostProc` closure — `temen-run` passes
+//! it to `HostCap::host_proc`, and the browser cdylib grants the `HostProc` directly on its Host.
+//! The node is the grantee's, which pays for the output its jobs hold (#2306).
 
 use std::sync::Arc;
-use temen_interp::{GuestMem, HostProc};
+use temen_interp::{GuestMem, HostBuffer, HostCharge, HostProc, NodeRef, TABLE_ENTRY};
 use temen_ir::errno::*;
 
 /// `run(argv_ptr, argv_len, stdin_ptr, stdin_len) -> job | -errno` — spawn with `argv`
@@ -71,10 +72,11 @@ pub fn read_bytes(mem: Option<&dyn GuestMem>, ptr: i64, len: i64) -> Result<Vec<
 }
 
 /// One completed job: captured output with read cursors + the exit code. v1 jobs are complete
-/// at creation (`run` is synchronous-to-completion), so reads only ever drain buffers.
+/// at creation (`run` is synchronous-to-completion), so reads only ever drain buffers. Its output
+/// is charged to the table's payer until the job is closed (#2306, [`JobTable::output`]).
 pub struct Job {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub stdout: HostBuffer,
+    pub stderr: HostBuffer,
     pub out_pos: usize,
     pub err_pos: usize,
     pub exit: i64,
@@ -83,14 +85,43 @@ pub struct Job {
 /// Shared per-grant job table + op dispatch: everything except *how a job is produced*.
 /// Both backends (`scripted_exec` here, `host_exec` in `temen-run`) route their non-`run` ops
 /// through this, so read/status/close semantics are backend-identical by construction.
-#[derive(Default)]
 pub struct JobTable {
-    pub jobs: Vec<Option<Job>>,
+    jobs: Vec<Option<Job>>,
+    /// #2306 — the jobs the guest holds, a [`TABLE_ENTRY`] each, charged with their output to the
+    /// domain the capability was granted to.
+    slots: HostCharge,
 }
 
 impl JobTable {
-    /// Install a completed job, returning its handle.
+    /// An empty table, whose jobs `payer` pays for.
+    pub fn new(payer: &NodeRef) -> JobTable {
+        JobTable {
+            jobs: Vec::new(),
+            slots: HostCharge::new(Some(payer.clone())),
+        }
+    }
+
+    /// An empty buffer for a job's output, charged to the table's payer as it fills.
+    pub fn output(&self) -> HostBuffer {
+        HostBuffer::new(self.slots.payer().cloned())
+    }
+
+    /// A job's output holding `bytes`: `-ENOMEM` when the payer has no room for them.
+    pub fn output_of(&self, bytes: &[u8]) -> Result<HostBuffer, i64> {
+        let mut out = self.output();
+        if out.push(bytes) {
+            Ok(out)
+        } else {
+            Err(ENOMEM)
+        }
+    }
+
+    /// Install a completed job, returning its handle: `-ENOMEM`, the job dropped, when the payer has
+    /// no room for another.
     pub fn push(&mut self, job: Job) -> i64 {
+        if !self.slots.resize(self.slots.bytes() + TABLE_ENTRY) {
+            return ENOMEM;
+        }
         match self.jobs.iter().position(Option::is_none) {
             Some(i) => {
                 self.jobs[i] = Some(job);
@@ -137,6 +168,7 @@ impl JobTable {
             EXEC_STATUS => job.exit,
             EXEC_CLOSE => {
                 self.jobs[job_idx] = None;
+                self.slots.resize(self.slots.bytes() - TABLE_ENTRY);
                 0
             }
             _ => EINVAL,
@@ -161,11 +193,11 @@ pub struct ScriptedEntry {
 /// immutable, so re-runs are deterministic.
 pub fn scripted_exec_handler(
     table: Vec<ScriptedEntry>,
-) -> impl Fn() -> HostProc + Send + Sync + 'static {
+) -> impl Fn(&NodeRef) -> HostProc + Send + Sync + 'static {
     let table = Arc::new(table);
-    move || {
+    move |payer| {
         let table = Arc::clone(&table);
-        let mut jobs = JobTable::default();
+        let mut jobs = JobTable::new(payer);
         Box::new(
             move |op: u32,
                   args: &[i64],
@@ -193,15 +225,18 @@ fn scripted_dispatch(
                 .iter()
                 .filter(|e| argv.starts_with(&e.argv_prefix))
                 .max_by_key(|e| e.argv_prefix.len());
-            match hit {
-                Some(e) => jobs.push(Job {
-                    stdout: e.stdout.clone(),
-                    stderr: e.stderr.clone(),
+            let Some(e) = hit else {
+                return EPERM;
+            };
+            match (jobs.output_of(&e.stdout), jobs.output_of(&e.stderr)) {
+                (Ok(stdout), Ok(stderr)) => jobs.push(Job {
+                    stdout,
+                    stderr,
                     out_pos: 0,
                     err_pos: 0,
                     exit: e.exit,
                 }),
-                None => EPERM,
+                _ => ENOMEM,
             }
         }
         Err(e) => e,

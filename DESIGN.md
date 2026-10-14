@@ -808,7 +808,7 @@ tag at a *fixed* offset, index at the bottom, an optional generation between:
 |---|---|---|---|---|
 | **data pointer** | i64 | — | window offset (≤ `reserved_log2` < 56) | none — masking already strips high bits (the `gc.roots` top-byte mask, §21) |
 | **funcref** | i64 | — | function-table index | none — no generation; `call.dyn` masks `& (len-1)` |
-| **import/cap handle** | **i32** | 24 bits | 8-bit slot (`CAP_LOG2`) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
+| **import/cap handle** | **i32** | 21 bits | 10-bit slot (`CAP_LOG2`); bit 31 clear, so a handle is never negative or a grant tag (#2365) | none — the handle lives in the low 32 bits of a 64-bit tagged cell; `call.cap` truncates to `i32`, dropping the top byte |
 | **fiber/thread handle** | i64 | **32 bits** (was 40) | 24-bit slot (`MAX_FIBERS=1<<24`) | generation trimmed 40→32 to vacate the top byte |
 
 Three properties make this coherent rather than four ad-hoc conventions:
@@ -2184,7 +2184,10 @@ One mechanism for every sharing relationship: host↔guest, guest↔guest
 
 - A **`SharedRegion`** is a host-backed memory object (anonymous, `shm`/`memfd`,
   or file-backed). Operations: create, **map into a window** at some offset,
-  unmap, and **grant** the capability to another domain so it can map the same
+  unmap, **grant** the capability to another domain so it can map the same
+  object, and **close** the handle, which gives up the domain's hold: the object
+  goes when no domain holds it (#2358). A window that still maps it refuses the
+  close (`-EBUSY`): a mapping is no hold of its own, so it must not outlive the
   object. Granting `SharedRegion` *is* how two domains come to share memory.
 - The same physical pages appear in each window, possibly at **different
   offsets**. Loads/stores are ordinary masked window accesses → **zero
@@ -2496,6 +2499,19 @@ child's grants is exactly the party positioned to observe their use.
   pool of mappings), and the root is charged
   to that node as a child is to its budget: its window and main vCPU, then all it
   makes. No code can use more than the grant above it (INVARIANTS #3).
+- **What a capability holds for its guest is metered too (#2306).** Host memory a
+  guest grows through a capability (a file's bytes; a pipe's, socket's or captured
+  stream's queue; a job's output; a table of names, descriptors, listings or
+  mappings) is `channel` of the node of the domain the capability's state was
+  granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
+  the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
+  re-granted the capability spends its grantor's. It is charged before it is
+  allocated, refused past a ceiling with the errno a full device gives
+  (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed
+  back as it shrinks or goes. File descriptors are the process's to share, as its
+  mappings and address space are: each one a guest causes holds a slot of a pool
+  over the soft `RLIMIT_NOFILE`, less a host reserve, while it is open, and one
+  past it is `-EMFILE`.
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +

@@ -2085,12 +2085,16 @@ fn admit_detached_child(
         0
     };
     let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    // An over-long payload refuses before anything is read: its length is the guest's (#2338).
+    let payload_ok = s
+        .args
+        .is_none_or(|(_, len)| len <= temen_ir::module_args_end() - temen_ir::module_args_base());
     let payload: Vec<u8> = match s.args {
-        Some((ptr, len)) => pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?,
-        None => Vec::new(),
+        Some((ptr, len)) if payload_ok => {
+            pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?
+        }
+        _ => Vec::new(),
     };
-    let payload_ok =
-        payload.len() as u64 <= temen_ir::module_args_end() - temen_ir::module_args_base();
     // The op-11 record format: `{name_off u32, name_len u32, handle i32, _ u32}`, fail-closed on a
     // handle the parent may not grant. #744 — a live self-serve grant calls back into the spawner
     // through its own cell: honored when it sits in one (every domain of the cooperative driver),
@@ -3700,7 +3704,7 @@ impl SharedProgram {
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
-        mut host: Host,
+        host: Host,
         tierup: Option<TierUpConfig>,
         back: std::sync::Arc<super::Region>,
         reserved_log2: u8,
@@ -3714,7 +3718,7 @@ impl SharedProgram {
             self.source.clone(),
             build_table(self.n_funcs, host.jit_table_log2()),
         );
-        let mut mem = self.mem_size_log2.map(|sl| {
+        let mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::from_spec(WindowSpec {
                 reserved_log2,
                 mapped_log2: sl,
@@ -3726,23 +3730,7 @@ impl SharedProgram {
             mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
-        let root_leaf = tierup
-            .as_ref()
-            .and_then(|t| t.leaf.as_ref())
-            .zip(image)
-            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
-        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
-        let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
-        let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
-        sched.emit.root_leaf = root_leaf;
-        Ok(CoopRun {
-            dom,
-            mem,
-            host: host.into_cell(),
-            fuel,
-            sched,
-        })
+        CoopRun::start(dom, mem, entry, args, fuel, host, tierup, image)
     }
 }
 
@@ -3905,15 +3893,17 @@ impl VcpuProgram {
 /// [`compile_and_run_with_host`]), so I/O guests work — `stdout`, and the `display`/`keyboard` caps
 /// the interactive playground guests (the Doom path) use.
 ///
-/// Single-vCPU: a guest that `thread.spawn`s is out of scope (the live window is not shared with other
-/// vCPUs — use the multi-worker `drive` path for those). The usual shape is `open` → `call(0, …)` to
-/// run the on-ramp `_start` bootstrap once, then `call(tick, …)` once per frame.
+/// A [`call`](Self::call) runs to its end on the cooperative scheduler, threads and fibers included.
+/// [`coop_call`](Self::coop_call) makes the same call a resumable [`CoopRun`] its embedder pumps,
+/// which is what the emitted tier needs: a tier-up surfaces to the embedder that runs emitted code.
+/// The usual shape is `open` → `call(0, …)` to run the on-ramp `_start` bootstrap once, then
+/// `call(tick, …)` once per frame.
 pub struct Reactor {
     /// The compiled program, shared (an `Arc` clone seeds each call's throwaway `Domain`).
     source: std::sync::Arc<ModuleSource>,
     n_funcs: usize,
     /// The live guest window — retained across calls (this is the whole point). `None` for a
-    /// memory-less module.
+    /// memory-less module, and while a [`coop_call`](Self::coop_call) run holds it.
     mem: Option<Mem>,
 }
 
@@ -3921,13 +3911,56 @@ impl Reactor {
     /// Open a reactor over a freshly compiled `m` (`None` if `m` uses an op outside the engine's
     /// subset): build the guest window once (its data segments applied) and keep it live.
     pub fn open(m: &Module) -> Option<Reactor> {
+        Self::open_on(m, None)
+    }
+
+    /// [`open`](Self::open), with the window over `back`: a flat backing the host can hand emitted
+    /// code (a [`Region::growable`](super::Region::growable) the guest's `vm_map` extends), where
+    /// `open` reserves one of its own.
+    pub fn open_over(m: &Module, back: std::sync::Arc<super::Region>) -> Option<Reactor> {
+        Self::open_on(m, Some(back))
+    }
+
+    fn open_on(m: &Module, back: Option<std::sync::Arc<super::Region>>) -> Option<Reactor> {
         let c = compile_module_for(m, true)?;
         let n_funcs = c.progs.len();
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
-            mem: Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]),
+            mem: Mem::root(m, DEFAULT_RESERVED_LOG2, back, &[]),
         })
+    }
+
+    /// #1414 S4-4 — [`call`](Self::call) `func(args)` as a resumable **pump run**: the live window
+    /// moves into the returned [`CoopRun`], the embedder pumps the run to its end, and
+    /// [`end_coop_call`](Self::end_coop_call) moves the window back. Given a leaf emitter in `tierup`
+    /// and `image`, the module this reactor was opened over, the run offers `func` whole as a root
+    /// leaf ([`root_leaf`]), as any run over a module does. `Err` if `func` is out of range, or if the
+    /// activation is refused or scheduling traps; the window then goes with the run.
+    pub fn coop_call(
+        &mut self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+        image: Option<&Module>,
+    ) -> Result<CoopRun, Trap> {
+        if func as usize >= self.n_funcs {
+            return Err(Trap::Malformed);
+        }
+        let dom = Domain::child(
+            self.source.clone(),
+            build_table(self.n_funcs, host.jit_table_log2()),
+        );
+        CoopRun::start(dom, self.mem.take(), func, args, fuel, host, tierup, image)
+    }
+
+    /// Take back the window [`coop_call`](Self::coop_call) lent `run`, and the run's powerbox, once
+    /// the run has ended.
+    pub fn end_coop_call(&mut self, run: &mut CoopRun) -> Host {
+        self.mem = run.mem.take();
+        std::mem::take(&mut *run.host_mut())
     }
 
     /// Call `func(args)` on the **live** window, servicing host caps inline; the window (including a
@@ -10208,8 +10241,9 @@ fn leaf_step(
 /// applied to the run's own image at its entry. Offered when it cannot park, or parks only where its
 /// host suspends the emitted frames ([`image_parks`]), and the host's emitter takes it; a durable run
 /// (whose freeze could not meet emitted frames) and a window emitted code cannot address flat run
-/// interpreted, as before. Every `CoopRun` constructor that holds the image asks it (`assemble`,
-/// `new_reserved_over_compiled`, and a [`SharedProgram`] warm restore given its module, #1414 S4-3c).
+/// interpreted, as before. [`CoopRun::start`] asks it whenever its caller holds the image: a run over
+/// a module, a [`SharedProgram`] warm restore given its module (#1414 S4-3c), and a [`Reactor`] call
+/// given its module (#1414 S4-4).
 #[allow(clippy::too_many_arguments)]
 fn root_leaf(
     emit: &LeafEmitter,
@@ -16084,8 +16118,8 @@ pub struct CoopRun {
 
 /// A session starts with no faulting address recorded: the slot is per run, and the scheduler keeps
 /// the first fault it records, so a leftover from the previous session would stand in for this one's
-/// (and a fault that records none, such as one in emitted code, would report it). Both of
-/// [`CoopRun`]'s constructor tails call this.
+/// (and a fault that records none, such as one in emitted code, would report it). Every run is built
+/// through [`CoopRun::start`], which calls this.
 fn clear_session_fault() {
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
 }
@@ -16207,7 +16241,7 @@ impl CoopRun {
         entry: FuncIdx,
         args: &[Value],
         fuel: u64,
-        mut host: Host,
+        host: Host,
         tierup: Option<TierUpConfig>,
         init_mem: &[u8],
         reserved_log2: u8,
@@ -16217,14 +16251,59 @@ impl CoopRun {
             return Err(Trap::Malformed);
         }
         host.wire_park_door();
-        clear_session_fault();
         let dom = Domain::over_primary(compiled, host.jit_table_log2());
-        let mut mem = Mem::root(m, reserved_log2, back, init_mem);
+        let mem = Mem::root(m, reserved_log2, back, init_mem);
+        Self::start(dom, mem, entry, args, fuel, host, tierup, Some(m))
+    }
+
+    fn assemble(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+        mem: Option<Mem>,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let c = compile_module_for(m, true)?;
+        if entry as usize >= c.progs.len() {
+            return Some(Err(Trap::Malformed));
+        }
+        let dom = Domain::new(c, host.jit_table_log2());
+        Some(Self::start(
+            dom,
+            mem,
+            entry,
+            args,
+            fuel,
+            host,
+            tierup,
+            Some(m),
+        ))
+    }
+
+    /// The one tail every run is built through: `dom` over the compiled program, the window `mem`,
+    /// the powerbox `host`, and `entry(args)` range-checked by the caller. Given a leaf emitter in
+    /// `tierup` and `image`, the module the program was compiled from, the run offers `entry` whole
+    /// as a root leaf ([`root_leaf`]). Then the powerbox's activation (#1944 slice 3: the root draws
+    /// from its own node) and the schedule. `Err` if the activation is refused or scheduling traps.
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        dom: Domain,
+        mut mem: Option<Mem>,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+        image: Option<&Module>,
+    ) -> Result<CoopRun, Trap> {
+        clear_session_fault();
         let root_leaf = tierup
             .as_ref()
             .and_then(|t| t.leaf.as_ref())
-            .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
-        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
+            .zip(image)
+            .and_then(|(emit, m)| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
         let node = host.begin_activation(fuel, RootWindow::of(mem.as_ref()));
         let mut fuel = Fuel::drawn(node.ok_or(Trap::ThreadFault)?);
         let mut sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
@@ -16236,45 +16315,6 @@ impl CoopRun {
             fuel,
             sched,
         })
-    }
-
-    fn assemble(
-        m: &Module,
-        entry: FuncIdx,
-        args: &[Value],
-        fuel: u64,
-        mut host: Host,
-        tierup: Option<TierUpConfig>,
-        mut mem: Option<Mem>,
-    ) -> Option<Result<CoopRun, Trap>> {
-        let c = compile_module_for(m, true)?;
-        if entry as usize >= c.progs.len() {
-            return Some(Err(Trap::Malformed));
-        }
-        clear_session_fault();
-        let dom = Domain::new(c, host.jit_table_log2());
-        let root_leaf = tierup
-            .as_ref()
-            .and_then(|t| t.leaf.as_ref())
-            .and_then(|emit| root_leaf(emit, m, &dom, entry, args, &host, mem.as_ref()));
-        // #1944 slice 3 — an activation of the powerbox: the root draws from its own node.
-        let Some(node) = host.begin_activation(fuel, RootWindow::of(mem.as_ref())) else {
-            return Some(Err(Trap::ThreadFault));
-        };
-        let mut fuel = Fuel::drawn(node);
-        let mut sched =
-            match CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup) {
-                Ok(s) => s,
-                Err(e) => return Some(Err(e)),
-            };
-        sched.emit.root_leaf = root_leaf;
-        Some(Ok(CoopRun {
-            dom,
-            mem,
-            host: host.into_cell(),
-            fuel,
-            sched,
-        }))
     }
 
     /// #816 env-routed tier-up: the task index of the outstanding tier-up / `Jit.invoke` round-trip

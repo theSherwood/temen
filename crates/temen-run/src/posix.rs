@@ -53,6 +53,7 @@ fn posix_cap_inner(
     // binds through the coverage walk).
     let p = posix.clone();
     let cap = HostCap::custom(temen_interp::cap_id::HOST_PROC, 0, move |h, _win| {
+        p.bind(&h.own_node()); // #2306 — the domain it is granted to pays for its state
         let (f, state) = make();
         let handle = h.grant_host_proc_forkable(f, std::sync::Arc::clone(&fork), state);
         let (door, armed) = temen_posix::cap_signal_source(&p);
@@ -79,5 +80,7 @@ fn posix_cap_inner(
 /// `read`/`write` ops. Loopback is served in-personality (the memnet); anything beyond routes to the
 /// embedder's [`temen_posix::NetDelegate`] ([`Posix::set_net`]) or fails closed.
 pub fn net_cap(posix: &Posix) -> HostCap {
-    HostCap::host_proc(0, temen_posix::net_cap_factory(posix))
+    // The memnet's queues are the personality's, paid for by the domain its posix cap is granted to.
+    let make = temen_posix::net_cap_factory(posix);
+    HostCap::host_proc(0, move |_| make())
 }

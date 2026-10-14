@@ -33,7 +33,8 @@ fn setup(src: &str) -> (Module, Host, [i32; 3]) {
     let mut h = Host::new();
     let ih = h.grant_instantiator(0, 128 << 10);
     let bh = h.grant_budget(-1, 1 << 20, -1);
-    let region = h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10));
+    let region =
+        h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10).expect("a region"));
     h.register_cap_name("region", region);
     let ch = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     (m, h, [ih, bh, ch])

@@ -17,8 +17,8 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_UNWINDING,
 };
 use temen_interp::{
-    run_capture_reserved_with_host_prots, CapturedProt, Host, MemLayout, RegionNotCaptured,
-    RegionRefusal, SharedBacking, Value,
+    run_capture_reserved_with_host_prots, CapturedProt, DurableBinding, Host, MemLayout,
+    RegionNotCaptured, RegionRefusal, SharedBacking, Value,
 };
 use temen_ir::Module;
 use temen_jit::JitOutcome;
@@ -95,7 +95,12 @@ const FLIP: &str = "  vsa = i64.const 16384\n  vsu = i32.const 1\n  i32.store vs
 
 /// The guests, instrumented; `flip` makes them request the freeze themselves.
 fn instrumented(flip: bool) -> Module {
-    let m = temen_text::parse_module(&SRC.replace("FLIP", if flip { FLIP } else { "" }))
+    instrument(SRC, flip)
+}
+
+/// `src`'s guests, instrumented as [`instrumented`] does [`SRC`]'s.
+fn instrument(src: &str, flip: bool) -> Module {
+    let m = temen_text::parse_module(&src.replace("FLIP", if flip { FLIP } else { "" }))
         .expect("parse");
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -222,6 +227,65 @@ fn a_created_region_rides_a_freeze_and_thaws_aliased() {
         Ok(vec![Value::I64(WANT)]),
         "the thaw reads the region's carried bytes through the re-aliased window"
     );
+}
+
+/// How the creating guest mints the region it keeps.
+const MINT: &str = "  vlen = i64.const 65536
+  vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+";
+
+/// [`MINT`], after a scratch region minted, mapped where the kept one goes, unmapped and closed.
+const MINT_AFTER_A_CLOSE: &str = "  vlen = i64.const 65536
+  vsh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vsr = i32.wrap_i64 vsh
+  vsat = i64.const 131072
+  vsz = i64.const 0
+  vsp = i64.const 3
+  vsm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vsr (vsat, vsz, vlen, vsp)
+  vsu = call.cap 4 1 (i64, i64) -> (i64) vsr (vsat, vlen)
+  vsc = call.cap 4 5 () -> (i64) vsr ()
+  vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)
+";
+
+/// **#2358 — a region closed before the freeze stays out of it.** The creating guest first mints a
+/// scratch region, maps, unmaps and closes it, so the region it keeps takes the scratch's slot and
+/// id. The freeze carries the kept region alone, and the thaw finishes as the uninterrupted run does.
+#[test]
+fn a_region_closed_before_the_freeze_stays_out_of_it() {
+    let src = SRC.replacen(MINT, MINT_AFTER_A_CLOSE, 1);
+    assert_ne!(src, SRC, "the guest mints a scratch region first");
+    let (mut control, args) = creating_host();
+    let window = init_durable_window(WINDOW, TEST_ARENA);
+    let (base, ..) = run(
+        &instrument(&src, false),
+        0,
+        &mut control,
+        &args,
+        &window,
+        None,
+    );
+    assert_eq!(base, Ok(vec![Value::I64(WANT)]), "uninterrupted run");
+
+    let m = instrument(&src, true);
+    let (mut fhost, args) = creating_host();
+    let (res, snap, prots) = run(&m, 0, &mut fhost, &args, &window, None);
+    assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    let held = fhost.capture_durable_handles().expect("a durable powerbox");
+    let regions = held
+        .iter()
+        .filter(|h| matches!(h.binding, DurableBinding::SharedRegion { .. }))
+        .count();
+    assert_eq!(regions, 1, "the closed region's handle is gone");
+
+    let artifact = freeze_with_prots(&m, &snap, &prots, SIZE_LOG2, &fhost).expect("rides");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let (rwin, rprots, _) = restore_with_prots(&artifact, &m, &mut thost).expect("restores");
+    let mut twin = rwin;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let (thawed, ..) = run(&m, 0, &mut thost, &args, &twin, Some(&rprots));
+    assert_eq!(thawed, Ok(vec![Value::I64(WANT)]), "the kept region thaws");
 }
 
 /// **Step 3 — a region the guest created rides a freeze of its native JIT run.** The JIT's page map
@@ -633,7 +697,7 @@ block 4 (vd: i64) {
 fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
     let child = confined(SHARING_CHILD);
     let parent = confined(SHARING_PARENT);
-    let shm = || temen_run::new_shared_region(LEN);
+    let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (mut host, args) = sharing_host(&child, shm());
     assert_eq!(
@@ -894,7 +958,7 @@ fn a_region_granted_into_a_running_child_rides_a_freeze() {
 #[test]
 fn a_region_granted_into_a_running_child_rides_a_jit_freeze() {
     let child = confined(GRANTED_CHILD);
-    let shm = || temen_run::new_shared_region(LEN);
+    let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (mut host, args) = granting_host(&child, shm(), shm());
     let image = || MemLayout::image(fresh.clone());

@@ -261,7 +261,11 @@ use temen_ir::Module;
 /// v41 (#2268): a budget vector in Section 10 has a sixth field, `maps`, the OS mappings its subtree
 /// causes the host. Its charge rides as 0, like `channel`'s: the thaw re-charges every window, vCPU
 /// and region it rebuilds.
-const FORMAT_VERSION: u16 = 41;
+/// v42 (#2365): a capability handle is `(generation << 10) | slot`, its generation 21 bits, where it
+/// was `<< 8` and 24 bits: a domain's table has 1,024 slots. The records are unchanged, but the
+/// window image holds the guest's handle values, which a v41 artifact wrote in the old layout and a
+/// thaw would decode to the wrong slots; so a v41 artifact is refused.
+const FORMAT_VERSION: u16 = 42;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -439,6 +443,10 @@ pub enum RestoreError {
     /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
     /// the thaw may narrow that, never widen it (INVARIANTS #3).
     BudgetRefused(BudgetThawRefused),
+    /// #2306 — the restoring host could not rebuild a carried §13 region: the OS or the process's
+    /// descriptor pool refused it, or its memory could not be had. Carries the errno. Nothing is
+    /// restored: a thaw never runs without a region its artifact names.
+    RegionRefused(i64),
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -1595,7 +1603,11 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
     if depth == 0 {
-        cut.regions = carried.iter().map(|b| host.rebuild_region(b)).collect();
+        cut.regions = carried
+            .iter()
+            .map(|b| host.rebuild_region(b))
+            .collect::<Result<_, _>>()
+            .map_err(RestoreError::RegionRefused)?;
         cut.regions_reached = vec![false; carried.len()];
     }
     let mut region_named = BTreeSet::new();

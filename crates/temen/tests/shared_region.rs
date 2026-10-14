@@ -227,7 +227,8 @@ fn ring_buffer_straddling_access_wraps_differential() {
     let mut hi = Host::new();
     let mut hj = Host::new();
     let ri = hi.grant_shared_region(region_len); // interp: pure-Rust VecBacking (per-byte model)
-    let rj = hj.grant_shared_region_backed(temen_run::new_shared_region(region_len)); // JIT: OS memory
+    let rj =
+        hj.grant_shared_region_backed(temen_run::new_shared_region(region_len).expect("a region")); // JIT: OS memory
     assert_eq!(ri, rj, "grants are deterministic");
 
     let init = vec![0u8; 1 << 17];

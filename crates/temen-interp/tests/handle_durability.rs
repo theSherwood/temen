@@ -4,8 +4,8 @@
 //! * `capture_durable_handles` — the live table classified into the re-grantable §12.5 set,
 //!   or a clean refusal if any live slot is non-durable (freeze is all-or-nothing);
 //! * `restore_durable_handles` / `grant_at` — reinstating that set into a fresh table while
-//!   pinning each `(slot, generation)`, so a guest-held handle value (`(generation << 8) |
-//!   slot`) still resolves after restore.
+//!   pinning each `(slot, generation)`, so a guest-held handle value (`DurableHandle::handle`)
+//!   still resolves after restore.
 //!
 //! The invariant tested is structural: a handle value is a pure function of `(generation,
 //! slot)` and resolve re-checks `type_id` + `generation`, so equality of the captured set
@@ -73,7 +73,7 @@ fn restore_pins_generation_not_destination_default() {
     let mut a = Host::new();
     let h0 = a.grant_clock(); // slot 0, generation 1
     a.close(h0);
-    a.grant_clock(); // slot 0 again, generation 2 (close kept the generation)
+    let h = a.grant_clock(); // slot 0 again, generation 2 (close kept the generation)
 
     let captured = a.capture_durable_handles().unwrap();
     assert_eq!(captured.len(), 1);
@@ -81,6 +81,11 @@ fn restore_pins_generation_not_destination_default() {
     assert_eq!(
         captured[0].generation, 2,
         "re-grant after close advanced the generation"
+    );
+    assert_eq!(
+        captured[0].handle(),
+        h,
+        "the entry names the handle the guest holds"
     );
 
     let mut b = Host::new(); // slot 0 is generation 0 here
@@ -90,6 +95,12 @@ fn restore_pins_generation_not_destination_default() {
         restored, captured,
         "generation 2 pinned, not reset to the fresh table's 0"
     );
+    assert_eq!(
+        b.type_id_of(h),
+        Some(cap_id::CLOCK),
+        "the guest's handle resolves"
+    );
+    assert_eq!(b.type_id_of(h0), None, "the closed one stays dead");
 }
 
 /// A live non-durable handle (here a `Blocking`, which carries out-of-line host state) makes
@@ -209,7 +220,7 @@ fn empty_table_captures_empty_and_capacity_is_table_size() {
         a.capture_durable_handles().unwrap(),
         Vec::<DurableHandle>::new()
     );
-    assert_eq!(Host::handle_capacity(), 256);
+    assert_eq!(Host::handle_capacity(), 1024);
 }
 
 // ---- #1455: named host capabilities ---------------------------------------------------------
@@ -319,7 +330,7 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
     let mut b = Host::new();
     let seen: CapLog = Default::default();
     let log = std::sync::Arc::clone(&seen);
-    b.set_named_cap_registrar(Box::new(move |name, state| {
+    b.set_named_cap_registrar(Box::new(move |name, state, _payer| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         // Re-seed the fresh handler from the captured state — this is the provider reading back
         // exactly the bytes it wrote at freeze.
@@ -369,7 +380,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
 
     for forkable in [true, false] {
         let mut b = Host::new();
-        b.set_named_cap_registrar(Box::new(move |_name, _state| {
+        b.set_named_cap_registrar(Box::new(move |_name, _state, _payer| {
             Some(temen_interp::NamedCapGrant {
                 handler: answer(),
                 fork: forkable.then(factory),
@@ -424,7 +435,7 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
 
     // A registrar that serves a *different* name refuses this one rather than substituting.
     let mut picky = Host::new();
-    picky.set_named_cap_registrar(Box::new(|name, _state| {
+    picky.set_named_cap_registrar(Box::new(|name, _state, _payer| {
         (name == "display").then(|| temen_interp::NamedCapGrant {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![0])),
             fork: None,

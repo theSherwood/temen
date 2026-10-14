@@ -394,7 +394,7 @@ pub extern "C" fn run_fork() -> i64 {
     };
     // The original resumed past the fork with reply_orig (100), and the shared sink carries BOTH
     // replies — proof the twin ran over its private window + duplicated powerbox.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     let mut vals: Vec<i64> = bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap_or([0; 8])))
@@ -3830,8 +3830,8 @@ impl OnrampCaps {
     /// counterpart (#1697).
     fn registrar(&self) -> temen_interp::NamedCapRegistrar {
         let caps = self.clone();
-        Box::new(move |name, state| {
-            if let Some(g) = temen_fs::regrant_vm_fs(name, state) {
+        Box::new(move |name, state, payer| {
+            if let Some(g) = temen_fs::regrant_vm_fs(name, state, payer) {
                 return Some(g);
             }
             let handler = caps.handler(name)?;
@@ -3951,22 +3951,8 @@ fn decode_events(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
-/// Image a reactor window that is a bare [`Region`](temen_interp::Region) rather than a live engine
-/// window — the wasm-JIT reactor, whose window lives in the host's linear memory and is handed to
-/// emitted code directly. There is no page map to carry: that reactor runs its cross-tier bounces over
-/// a fresh window each time (`run_over`), so page state never persists between frames and the bytes
-/// are the whole of it. `None` if the region has no flat address (a `Paged` fallback backing, which
-/// this tier never uses — it could not hand emitted code a base at all).
-fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout> {
-    back.raw_base()?; // the tier's own precondition, restated: a window emitted code can address
-    let mut bytes = vec![0u8; back.len() as usize];
-    back.read_into(0, &mut bytes);
-    let mapped = bytes.len() as u64; // a bare region is committed end to end
-    temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), mapped, &[])
-}
-
 // The moment / timeline types moved to `temen_interp::moment` (#1457 item 6): one ladder has to be
-// reachable by every reactor there is — these two, the wasm-JIT one below, and a native driver — or
+// reachable by every reactor there is — these two and a native driver — or
 // the ones that cannot reach it grow their own, which is how a behaviour ends up with two
 // implementations (INVARIANTS #15; the page had exactly that before this). Re-exported here so the
 // cdylib's consumers and the reactor tests keep one name for them.
@@ -3981,7 +3967,7 @@ pub use temen_interp::moment::{
 // they always describe the same one.
 
 /// Drive an [`OnrampReactor`]-shaped reactor through the shared [`MomentReactor`] surface. Both
-/// interpreter reactors present the identical frame/input/moment API over different window backings,
+/// reactors present the identical frame/input/moment API over different window backings,
 /// so the two impls are the same six forwarders and are written with one macro rather than twice.
 macro_rules! impl_moment_reactor {
     ($t:ty) => {
@@ -4011,25 +3997,6 @@ macro_rules! impl_moment_reactor {
 
 impl_moment_reactor!(OnrampReactor);
 impl_moment_reactor!(SharedOnrampReactor);
-
-/// The wasm-JIT reactor records and restores like the others but implements **only**
-/// [`MomentReactor`], never [`SteppableReactor`]: its `tick` is emitted wasm that a JS host compiles
-/// and calls, so there is no tick for Rust to run. A timeline over it is driven with `begin_tick` /
-/// the embedder's own tick / `end_tick`, and the type system says so rather than a runtime refusal.
-impl MomentReactor for JitOnrampReactor {
-    fn push_key(&self, keycode: i32, pressed: i32) {
-        JitOnrampReactor::push_key(self, keycode, pressed);
-    }
-    fn push_mouse(&self, kind: i32, payload: i32) {
-        JitOnrampReactor::push_mouse(self, kind, payload);
-    }
-    fn moment(&self) -> Result<Moment, Refusal> {
-        JitOnrampReactor::moment(self)
-    }
-    fn restore(&mut self, m: &Moment) -> bool {
-        JitOnrampReactor::restore(self, m)
-    }
-}
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
@@ -4970,6 +4937,7 @@ fn pg_setup(
     // later ([`temen_pg_snapshot`]); the one-shot `pg_exec` simply drops it.
     let (files, dirs) = temen_fs::decode_image(image).map_err(|_| STATUS_DECODE_ERR)?;
     let (fs_hostfn, fs_handle) = temen_fs::mem_fs_seeded_shared(files, dirs);
+    fs_handle.bind(&host.own_node()); // #2306 — the run pays for the data dir it is handed and grows
     let fsh = host.grant_host_proc(fs_hostfn, fs_handle.cap_state());
     host.register_cap_name("fs", fsh);
     // Seed the caller's `argv` at the powerbox args base (Postgres: a slashed `argv[0]` so
@@ -5688,17 +5656,28 @@ pub extern "C" fn temen_pg_close() {
 /// A live per-frame **reactor** over an on-ramp guest — the interactive/graphical run model (the path
 /// Doom rides), the browser twin of `temen-run`'s reactor `Session`. Instantiate once: run `_start`
 /// (func 0) to stash the granted handles and run the C initializer, then call the guest's exported
-/// `tick` once per host-driven frame. State (globals/BSS within the 256 KiB `SNAP_CAP` window)
-/// **persists** between frames via the snapshot round-trip. Each `tick` presents a frame through the
-/// `display` capability (captured into `frame`) and drains input through the `keyboard` capability
-/// (`keys`, fed by the host). Single-threaded; the guest keeps its per-frame state in globals/BSS (a
-/// grown `malloc` heap above the window is **not** persisted yet — the same slice-1 reactor scope as
-/// `temen-run`, and the reason Doom itself needs the heap-persistence follow-on).
+/// `tick` once per host-driven frame. The guest's window — globals, BSS and the `vm_map`-grown heap —
+/// stays live between frames, and so does the powerbox. Each `tick` presents a frame through the
+/// `display` capability (captured into `frame`) and drains input through the `keyboard` and `mouse`
+/// capabilities (fed by the host).
+///
+/// Every call into the guest is a resumable **pump run** (#1414 S4-4): the run the emitted tier's
+/// driver pumps, over the reactor's live window, which the run borrows and hands back when it ends.
+/// A frame is interpreted, or offered whole to the emitted tier ([`begin_frame`](Self::begin_frame)):
+/// the tier is a parameter of the frame, so both tiers run one guest and share its moments and
+/// save-states.
 pub struct OnrampReactor {
-    /// The persistent single-vCPU instance — its guest window (globals, BSS, **and** the grown heap)
-    /// stays live between frames, so heavy-heap guests (Life, eventually Doom) keep their state.
+    /// The module both tiers run: the guest with its inline capability calls hoisted into wrapper
+    /// functions (`outline_cap_calls`), so a hot `tick` that calls `display` once a frame still emits.
+    /// Outlining only appends functions, so `_start` and `tick` keep their indices.
+    module: temen_ir::Module,
+    /// The compiled program and its live window, over a flat backing that grows as the guest maps.
     inst: bytecode::Reactor,
-    host: Host,
+    /// That backing, which emitted code addresses.
+    back: std::sync::Arc<temen_interp::Region>,
+    /// The powerbox, kept across frames. A frame's run holds it while it runs. `None` after a call
+    /// that could not start, whose window and powerbox went with it: there is nothing left to call.
+    host: Option<Host>,
     /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
     entry_sp: u64,
     tick: temen_ir::FuncIdx,
@@ -5707,6 +5686,30 @@ pub struct OnrampReactor {
     caps: OnrampCaps,
     /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
     last_trap: Option<String>,
+}
+
+/// A reactor's compiled program and window over `m`, and the window's backing. The backing is flat
+/// and grows as the guest maps past it, which is what emitted code can address (#1414 S4-4). It
+/// opens at the declared size, or at `len` when that is longer: a save-state's image, which the
+/// restore then fills.
+fn reactor_instance(
+    m: &temen_ir::Module,
+    len: u64,
+) -> Option<(bytecode::Reactor, std::sync::Arc<temen_interp::Region>)> {
+    let declared = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let page = temen_interp::host_page_size();
+    let back = std::sync::Arc::new(temen_interp::Region::growable(
+        declared.max(len).max(page),
+        page,
+    )?);
+    Some((bytecode::Reactor::open_over(m, back.clone())?, back))
+}
+
+/// `m` with its inline capability calls outlined: the module a reactor runs on both tiers.
+fn reactor_module(m: &temen_ir::Module) -> temen_ir::Module {
+    let mut module = m.clone();
+    temen_wasm_jit::outline_cap_calls(&mut module);
+    module
 }
 
 impl OnrampReactor {
@@ -5737,28 +5740,28 @@ impl OnrampReactor {
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<OnrampReactor, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let module = reactor_module(m);
         // The per-frame entry: the guest's exported `tick` (reactor convention `(sp) -> …`).
-        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = temen_ir::powerbox_entry_sp(m);
+        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs, None);
-        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
-        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
-        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
-        // then persists for every `tick`.
-        let mut fuel = DEFAULT_FUEL;
-        match inst.call(0, &[], &mut fuel, &mut host) {
-            Ok(_) => {}
-            Err(_) => return Err(STATUS_TRAP),
-        }
-        Ok(OnrampReactor {
+        let caps = grant_onramp_caps(&mut host, &module, fs, None);
+        let (inst, back) = reactor_instance(&module, 0).ok_or(STATUS_UNSUPPORTED)?;
+        let mut r = OnrampReactor {
+            module,
             inst,
-            host,
+            back,
+            host: Some(host),
             entry_sp,
             tick,
             caps,
             last_trap: None,
-        })
+        };
+        // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
+        // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
+        // then persists for every `tick`.
+        r.call(0, &[]).map_err(|_| STATUS_TRAP)?;
+        Ok(r)
     }
 
     /// Freeze this reactor into a **§12 artifact** — a save-state (#1458). Everything the guest is,
@@ -5775,19 +5778,18 @@ impl OnrampReactor {
     ///   deliberately does not re-run the entry. For Doom that is seconds of WAD parsing and renderer
     ///   setup skipped — most of the point of a save-state.
     ///
-    /// `module` must be the module this reactor was opened over: the artifact binds its digest, so a
-    /// thaw against a different one refuses (`ModuleMismatch`) rather than restoring one guest's
-    /// memory under another's code.
+    /// `module` must be the module this reactor was opened over, as the caller decoded it: the
+    /// artifact binds its digest, so a thaw against a different one refuses (`ModuleMismatch`) rather
+    /// than restoring one guest's memory under another's code.
     pub fn freeze(
         &self,
         module: &temen_ir::Module,
     ) -> Result<Vec<u8>, temen_snapshot::FreezeError> {
-        let layout = self
-            .inst
-            .window_layout()
-            .ok_or(temen_snapshot::FreezeError::WindowGeometry(0))?;
+        let (Some(layout), Some(host)) = (self.inst.window_layout(), self.host.as_ref()) else {
+            return Err(temen_snapshot::FreezeError::WindowGeometry(0));
+        };
         let reserved_log2 = self.inst.window_reserved_log2().unwrap_or(0);
-        temen_snapshot::freeze_layout(module, &layout, reserved_log2, &self.host)
+        temen_snapshot::freeze_layout(module, &layout, reserved_log2, host)
     }
 
     /// Rebuild a reactor from a [`freeze`](Self::freeze) artifact: the guest resumes at the frame it
@@ -5805,8 +5807,9 @@ impl OnrampReactor {
         fs: Option<(String, Vec<u8>)>,
     ) -> Result<OnrampReactor, i32> {
         onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = temen_ir::powerbox_entry_sp(m);
+        let module = reactor_module(m);
+        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = temen_ir::powerbox_entry_sp(&module);
 
         // The one grant path, exactly as a fresh open takes it: the module's self-referential surface,
         // its import bindings, the §3e prefix, and the capabilities. The artifact then replaces that
@@ -5814,19 +5817,24 @@ impl OnrampReactor {
         // which is what keeps a guest-held handle value valid across the save; a capability the guest
         // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs, None);
+        let caps = grant_onramp_caps(&mut host, &module, fs, None);
         host.set_named_cap_registrar(caps.registrar());
 
+        // Bound to `m`, the module the guest was frozen over, and not to the outlined copy the
+        // reactor runs: an artifact binds the guest, not an emitter's rewrite of it.
         let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
-        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
+        let (mut inst, back) =
+            reactor_instance(&module, layout.byte_len() as u64).ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout, &host) {
             return Err(STATUS_UNSUPPORTED);
         }
         Ok(OnrampReactor {
+            module,
             inst,
-            host,
+            back,
+            host: Some(host),
             entry_sp,
             tick,
             caps,
@@ -5834,15 +5842,69 @@ impl OnrampReactor {
         })
     }
 
+    /// One call into the guest — `_start` at open, `tick` each frame — as a pump run over the live
+    /// window, driven here to its end. Nothing but its end surfaces: the run has no emitted tier and
+    /// no slices, so any other event fails the call closed.
+    fn call(&mut self, func: temen_ir::FuncIdx, args: &[Value]) -> Result<Vec<Value>, Trap> {
+        let host = self.host.take().ok_or(Trap::ThreadFault)?;
+        let mut run = self
+            .inst
+            .coop_call(func, args, DEFAULT_FUEL, host, None, None)?;
+        let ended = match run.run() {
+            bytecode::CoopEvent::Done(vals) => Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => Err(t),
+            // No capability of the reactor's completes on the host, so nothing could answer a park:
+            // it is declined, as a run to completion declines it.
+            bytecode::CoopEvent::CapPark { .. } => Err(Trap::CapFault),
+            _ => Err(Trap::ThreadFault),
+        };
+        self.host = Some(self.inst.end_coop_call(&mut run));
+        ended
+    }
+
+    /// Start a frame for an embedder to pump: `tick` as a pump run over the live window, which
+    /// [`end_frame`](Self::end_frame) takes back when the run has ended. With `emit` — the shared
+    /// flag of the memory emitted code imports — `tick` is offered whole to the emitted tier, as any
+    /// run's root is: it runs there as a leaf when the emitter takes it, page-checked when the
+    /// guest's page state can change (#2302), and interpreted when it does not. A frame's leaf never
+    /// parks: one that could is declined, so the embedder runs it without suspending. The programs
+    /// the run emitted land in the returned map.
+    fn begin_frame(&mut self, emit: Option<bool>) -> Result<(bytecode::CoopRun, Programs), Trap> {
+        let host = self.host.take().ok_or(Trap::ThreadFault)?;
+        let programs = Programs::default();
+        let tierup = emit.map(|shared| bytecode::TierUpConfig {
+            root: bytecode::ProgramEmit::default(),
+            leaf: Some(leaf_emitter(programs.clone(), false, shared)),
+            modules: None,
+        });
+        let args = [Value::I64(self.entry_sp as i64)];
+        let run = self.inst.coop_call(
+            self.tick,
+            &args,
+            DEFAULT_FUEL,
+            host,
+            tierup,
+            Some(&self.module),
+        )?;
+        Ok((run, programs))
+    }
+
+    /// End the frame [`begin_frame`](Self::begin_frame) started, once its run has ended, in `trap`
+    /// or not: the window and the powerbox come back.
+    fn end_frame(&mut self, run: &mut bytecode::CoopRun, trap: Option<&Trap>) {
+        self.host = Some(self.inst.end_coop_call(run));
+        if let Some(t) = trap {
+            self.last_trap = Some(format!("{t:?}"));
+        }
+    }
+
     /// Run one frame: call the guest's `tick` on the **live** window (all prior-frame state — globals,
-    /// BSS, heap — intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT`
-    /// = the guest called `Exit`; `STATUS_TRAP` = a trap. The presented frame (if any) is read via
+    /// BSS, heap — intact), returning `(status, stdout)`: what the guest wrote since the last frame
+    /// (the first frame's carries `_start`'s). `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
+    /// called `Exit`; `STATUS_TRAP` = a trap. The presented frame (if any) is read via
     /// [`take_frame`](Self::take_frame).
     pub fn frame(&mut self) -> (i32, Vec<u8>) {
-        let stdout_before = self.host.stdout.len();
-        let args = [Value::I64(self.entry_sp as i64)];
-        let mut fuel = DEFAULT_FUEL;
-        let status = match self.inst.call(self.tick, &args, &mut fuel, &mut self.host) {
+        let status = match self.call(self.tick, &[Value::I64(self.entry_sp as i64)]) {
             Ok(_) => STATUS_OK,
             Err(Trap::Exit(_)) => STATUS_EXIT,
             Err(t) => {
@@ -5850,8 +5912,8 @@ impl OnrampReactor {
                 STATUS_TRAP
             }
         };
-        let delta = self.host.stdout[stdout_before..].to_vec();
-        (status, delta)
+        let stdout = self.host.as_mut().map(|h| h.take_stdout());
+        (status, stdout.unwrap_or_default())
     }
 
     /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
@@ -5881,10 +5943,8 @@ impl OnrampReactor {
     /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
     /// fiction).
     pub fn moment(&self) -> Result<Moment, Refusal> {
-        Moment::capture(
-            self.inst.window_layout().ok_or(Refusal::NoWindow)?,
-            &self.host,
-        )
+        let host = self.host.as_ref().ok_or(Refusal::NoWindow)?;
+        Moment::capture(self.inst.window_layout().ok_or(Refusal::NoWindow)?, host)
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -5895,10 +5955,13 @@ impl OnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &Moment) -> bool {
-        if !self.inst.restore_window(&moment.layout(), &self.host) {
+        let Some(host) = self.host.as_mut() else {
+            return false;
+        };
+        if !self.inst.restore_window(&moment.layout(), host) {
             return false;
         }
-        moment.restore_host(&mut self.host);
+        moment.restore_host(host);
         true
     }
 }
@@ -6092,329 +6155,7 @@ impl SharedOnrampReactor {
     }
 }
 
-/// A **wasm-JIT reactor** over an on-ramp guest (BROWSER.md § "wasm-JIT tier", slice 5c): the guest's
-/// whole `tick` runs on **emitted wasm** each frame instead of the interpreter, over the same shared
-/// window as [`SharedOnrampReactor`]. The host (JS in the browser, `wasmi` in the native differential)
-/// compiles the emitted module ([`emitted_wasm`](Self::emitted_wasm)), instantiates it against *this*
-/// module's linear memory, and calls `f{tick}(win, env, entry_sp)` per frame; the emitted code bounces
-/// each call to a non-emitted (cross-tier) helper back through [`run_cross_tier`](Self::run_cross_tier),
-/// which runs that callee on the interpreter over the shared window **with the powerbox** (so
-/// `display`/`keyboard`/`fs`/`exit` all resolve) — its memory effects landing in the bytes the emitted
-/// code reads.
-///
-/// The mapped window is enlarged at open (`win_log2`) so the guest's heap growth stays **within**
-/// mapped — Doom `vm_map`s its zone heap to ~11 MiB, above its native 4 MiB mapped window; keeping it
-/// inside mapped lets the emitter's static-`mapped` confinement mask cover every emitted access, and
-/// lets a fresh-`Mem` cross-tier run reach the whole live window without committed-page tracking. The
-/// guest stays confined to the (larger, still power-of-two) window.
-pub struct JitOnrampReactor {
-    /// The import-resolved, window-enlarged module — cross-tier callees are interpreted from it.
-    module: temen_ir::Module,
-    /// The module compiled **once** for cross-tier runs. Recompiling per `env.call_interp` bounce
-    /// (a handful per frame) otherwise dominates the frame — for Doom, ~6 ms × 3 ≈ 19 ms of a 20 ms
-    /// frame; cached, a cross-tier call is just build-window + interpret.
-    program: bytecode::SharedProgram,
-    /// The powerbox (granted caps + `_start`'s stashed handles), shared across `_start` and every
-    /// per-frame cross-tier callee so caps + their state persist.
-    host: Host,
-    /// Keep-alive for an owned backing (native path); `None` when the window is caller-owned (FFI).
-    _backing: Option<Box<[u8]>>,
-    back: std::sync::Arc<temen_interp::Region>,
-    /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`
-    /// argument (the address the emitted code masks its accesses against).
-    win_base: usize,
-    entry_sp: u64,
-    tick: temen_ir::FuncIdx,
-    /// The emitted wasm for the whole `tick` (the host compiles + runs it) and the per-function emitted
-    /// bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest bounce through `run_cross_tier`).
-    emitted_wasm: Vec<u8>,
-    emitted: Vec<bool>,
-    /// The stateful host capabilities this reactor granted — the half of its state that is not the
-    /// window (see [`OnrampCaps`]).
-    caps: OnrampCaps,
-    last_trap: Option<String>,
-}
-
-/// Where a wasm-JIT reactor's first window comes from — the one axis an open varies along, so it is a
-/// parameter of the single open path rather than a second copy of it (INVARIANTS #15).
-pub enum JitStart<'a> {
-    /// Run the entry (func 0) once over the window: an ordinary open.
-    Entry,
-    /// Restore a §12 save-state artifact into the window instead, skipping the entry (#1458).
-    Thaw(&'a [u8]),
-}
-
-impl JitOnrampReactor {
-    /// Open a wasm-JIT reactor over `m` with an **owned** backing of `1 << win_log2` bytes (native
-    /// path). `shared_memory` selects the emitted `env.memory` import's shared flag (`true` for the
-    /// browser threads build; `false` for the `wasmi` differential — the codegen is otherwise
-    /// identical). `Err(status)` if imports don't resolve, there is no `tick`, `_start` traps, or the
-    /// `tick` isn't wasm-JIT-emittable (it falls back to [`SharedOnrampReactor`]).
-    pub fn open_owned_jit(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        fs: Option<(String, Vec<u8>)>,
-        start: JitStart<'_>,
-    ) -> Result<JitOnrampReactor, i32> {
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
-        let ptr = backing.as_mut_ptr();
-        // SAFETY: `backing` is owned by the returned struct and its heap allocation is pointer-stable
-        // across the struct's moves, so `[ptr, win_size)` stays valid + exclusive for the run.
-        let win_base = ptr as usize;
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
-        Self::open_over_jit(
-            m,
-            back,
-            Some(backing),
-            win_base,
-            win_log2,
-            shared_memory,
-            fs,
-            start,
-        )
-    }
-
-    /// Open a wasm-JIT reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
-    /// module's linear memory (the FFI path). `win_size` must equal `1 << win_log2`.
-    ///
-    /// # Safety
-    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
-    /// reactor's window and kept valid until the reactor is dropped.
-    pub unsafe fn open_shared_jit(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        win_log2: u8,
-        shared_memory: bool,
-        fs: Option<(String, Vec<u8>)>,
-        start: JitStart<'_>,
-    ) -> Result<JitOnrampReactor, i32> {
-        let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over_jit(m, back, None, win_base, win_log2, shared_memory, fs, start)
-    }
-
-    #[allow(clippy::too_many_arguments)] // the one JIT open path: window, tier flags, grants, start
-    fn open_over_jit(
-        m: &temen_ir::Module,
-        back: std::sync::Arc<temen_interp::Region>,
-        backing: Option<Box<[u8]>>,
-        win_base: usize,
-        win_log2: u8,
-        shared_memory: bool,
-        fs: Option<(String, Vec<u8>)>,
-        start: JitStart<'_>,
-    ) -> Result<JitOnrampReactor, i32> {
-        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let mut module = m.clone();
-        // Hoist inline `call.cap`s into cross-tier wrapper functions so a hot `tick` that interleaves
-        // compute with a once-per-frame present/poll cap call still emits (its hot path runs on wasm;
-        // only the cap wrapper bounces to the interpreter). Mutates the module BOTH tiers use: the
-        // emitter reads it below, and `run_cross_tier` runs the wrappers on the interpreter.
-        temen_wasm_jit::outline_cap_calls(&mut module);
-        // Enlarge the mapped window to cover the guest's grown heap (see the struct docs).
-        if let Some(mc) = module.memory.as_mut() {
-            if (mc.size_log2 as u32) < win_log2 as u32 {
-                mc.size_log2 = win_log2;
-            }
-        }
-        let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = temen_ir::powerbox_entry_sp(&module);
-        let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, &module, fs, None);
-        // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
-        let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
-        // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
-        // slot bindings deliver the capabilities), servicing `call.cap`s (Doom's WAD read) inline
-        // against the powerbox. The window then persists in `back` for every frame.
-        match start {
-            JitStart::Entry => {
-                let mut fuel = DEFAULT_FUEL;
-                match program.run_over(0, &[], &mut fuel, back.clone(), &mut host, true) {
-                    Ok(_) => {}
-                    Err(_) => return Err(STATUS_TRAP),
-                }
-            }
-            // A save-state instead of a boot (#1458): the artifact's image is already post-`_start`, so
-            // the entry is **not** run — which is most of the point, Doom's WAD parse being seconds.
-            JitStart::Thaw(artifact) => {
-                host.set_named_cap_registrar(caps.registrar());
-                // Bound to `m` — the module the guest was *frozen* over — not the outlined copy this
-                // tier runs. Outlining rewrites the module, so binding the digest to it would make an
-                // artifact un-thawable for a reason that has nothing to do with the guest.
-                let (bytes, _prots, _reserved) =
-                    temen_snapshot::restore_with_prots(artifact, m, &mut host)
-                        .map_err(|_| STATUS_UNSUPPORTED)?;
-                // A window image is only meaningful in a window its own size: this tier reserves more
-                // than the interpreter does, so an artifact frozen on the other tier lands here and is
-                // refused rather than splatted over a prefix (INVARIANTS #9c).
-                if bytes.len() as u64 != back.len() {
-                    return Err(STATUS_UNSUPPORTED);
-                }
-                back.write_from(0, &bytes);
-            }
-        }
-        // Emit the whole `tick`, wasm-driven (cross-tier helpers routed to `env.call_interp`). The
-        // front door derives the strategy: a `tick` whose reachable set can suspend is *not*
-        // wasm-drivable (a JITted frame can't unwind across a stack switch), so it reports
-        // `InterpDriven` instead of emitting a reactor this driver couldn't run — fall back to the
-        // pure interpreter then, exactly as when the `tick` is out of subset.
-        let artifact = temen_wasm_jit::compile_jit(
-            &module,
-            temen_wasm_jit::Shape::Reactor { entry: tick },
-            shared_memory,
-        )
-        .map_err(|_| STATUS_UNSUPPORTED)?;
-        let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
-            return Err(STATUS_UNSUPPORTED);
-        };
-        let (emitted_wasm, emitted) = (artifact.wasm, artifact.emitted);
-        Ok(JitOnrampReactor {
-            module,
-            program,
-            host,
-            _backing: backing,
-            back,
-            win_base,
-            entry_sp,
-            tick,
-            emitted_wasm,
-            emitted,
-            caps,
-            last_trap: None,
-        })
-    }
-
-    /// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`.
-    pub fn win_base(&self) -> usize {
-        self.win_base
-    }
-
-    /// The emitted wasm module for the whole `tick` — the host compiles + instantiates it against this
-    /// module's linear memory and calls the exported `f{tick}(win, env, entry_sp)`.
-    pub fn emitted_wasm(&self) -> &[u8] {
-        &self.emitted_wasm
-    }
-
-    /// The per-function emitted bitmap: `emitted[i]` ⇒ `f{i}` runs on wasm (the rest bounce through
-    /// [`run_cross_tier`](Self::run_cross_tier)).
-    pub fn emitted(&self) -> &[bool] {
-        &self.emitted
-    }
-
-    /// The reactor calling-convention data-stack base, passed as the emitted `f{tick}`'s `sp` argument.
-    pub fn entry_sp(&self) -> u64 {
-        self.entry_sp
-    }
-
-    /// The Temen index of the exported `tick` — the emitted export name is `f{tick}`.
-    pub fn tick(&self) -> temen_ir::FuncIdx {
-        self.tick
-    }
-
-    /// **Cross-tier bounce.** Run non-emitted `func(args)` on the interpreter over the shared window
-    /// with the powerbox — the callback the emitted `tick`'s `env.call_interp` drives. Memory effects
-    /// land in the shared window (the bytes the emitted code reads); `call.cap`s resolve against the
-    /// persistent host (so a `display.present` populates the frame cell, `keyboard.poll` drains input).
-    /// `Err(Trap::Exit)` is the guest's `Exit`; any other `Err` is a trap.
-    pub fn run_cross_tier(&mut self, func: u32, args: &[Value]) -> Result<Vec<Value>, Trap> {
-        let mut fuel = DEFAULT_FUEL;
-        // Use the once-compiled `program` (no per-call recompile — the frame's dominant cost otherwise).
-        self.program.run_over(
-            func,
-            args,
-            &mut fuel,
-            self.back.clone(),
-            &mut self.host,
-            false,
-        )
-    }
-
-    /// The signature of cross-tier `func` (the host marshals `env.call_interp`'s i64 arg/result slots
-    /// per these types).
-    pub fn func_sig(&self, func: u32) -> (&[temen_ir::ValType], &[temen_ir::ValType]) {
-        let f = &self.module.funcs[func as usize];
-        (&f.params, &f.results)
-    }
-
-    /// Record a trap's `Debug` string (diagnostic); returns `""` if none.
-    pub fn last_trap(&self) -> &str {
-        self.last_trap.as_deref().unwrap_or("")
-    }
-
-    /// Set the last-trap diagnostic (the host records the trap that unwound a frame's emitted `tick`).
-    pub fn set_last_trap(&mut self, s: String) {
-        self.last_trap = Some(s);
-    }
-
-    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
-    pub fn take_frame(&self) -> Option<Frame> {
-        self.caps.take_frame()
-    }
-
-    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
-    pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.caps.push_key(keycode, pressed);
-    }
-
-    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
-    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
-    pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.caps.push_mouse(kind, payload);
-    }
-
-    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
-    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
-    /// fiction).
-    pub fn moment(&self) -> Result<Moment, Refusal> {
-        Moment::capture(
-            region_layout(&self.back).ok_or(Refusal::NoWindow)?,
-            &self.host,
-        )
-    }
-
-    /// Freeze this reactor into a §12 save-state artifact — the emitted tier's twin of
-    /// [`OnrampReactor::freeze`], over the same window image a [`moment`](Self::moment) captures.
-    ///
-    /// `module` must be the module this reactor was opened over, **as the caller decoded it**: the
-    /// artifact binds its digest, and this tier's own `self.module` is the cap-outlined rewrite, which
-    /// would bind an artifact to an emitter detail instead of to the guest.
-    pub fn freeze(
-        &self,
-        module: &temen_ir::Module,
-    ) -> Result<Vec<u8>, temen_snapshot::FreezeError> {
-        let layout =
-            region_layout(&self.back).ok_or(temen_snapshot::FreezeError::WindowGeometry(0))?;
-        // The window is `1 << win_log2` bytes of bare region, committed end to end — so its reservation
-        // is its length, and both are what `open_over_jit` sized it to.
-        let reserved_log2 = self.back.len().trailing_zeros() as u8;
-        temen_snapshot::freeze_layout(module, &layout, reserved_log2, &self.host)
-    }
-
-    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
-    /// next frame runs as the frame that followed the one the moment was taken at. `false` — nothing
-    /// written — if the image is not this window's size, which means it was captured from a different
-    /// reactor: a partial overwrite would leave the tail of the window holding *this* run's bytes under
-    /// *that* run's guest, so it refuses instead (INVARIANTS #9c).
-    ///
-    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
-    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
-    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &Moment) -> bool {
-        if moment.byte_len() as u64 != self.back.len() {
-            return false;
-        }
-        self.back.write_from(0, moment.layout().bytes());
-        moment.restore_host(&mut self.host);
-        true
-    }
-}
-
-/// A **single-shot** wasm-JIT run of an on-ramp module — the run-to-completion twin of
-/// [`JitOnrampReactor`] (which drives an exported `tick` per frame). Here the whole program *is* func 0
+/// A **single-shot** wasm-JIT run of an on-ramp module. The whole program *is* func 0
 /// (`_start`), so we emit **that** and run it once: the paramless `_start` reads its capabilities
 /// through the manifest slot bindings / `self.resolve` (phase 4 — no handle params), seeds the
 /// heap, and calls `main(sp)` — all on emitted wasm, with the 47/103 cross-tier helpers (Lua/SQLite)
@@ -9547,11 +9288,27 @@ pub extern "C" fn temen_framebuffer_height() -> u32 {
 /// `None` until [`temen_onramp_open`]; single-threaded wasm, so a plain static is sound.
 static mut REACTOR: Option<OnrampReactor> = None;
 
+/// Make `r` the open reactor, or close it with `None`. A frame of the reactor it replaces that is
+/// still in flight goes first: its run holds that reactor's window and powerbox, and its end would
+/// hand them to whichever reactor is open then.
+fn set_reactor(r: Option<OnrampReactor>) {
+    // SAFETY: single-threaded wasm; exclusive access to the session and reactor statics.
+    unsafe {
+        if (*core::ptr::addr_of!(COOP_RUN))
+            .as_ref()
+            .is_some_and(|s| s.reactor)
+        {
+            temen_coop_close();
+        }
+        *core::ptr::addr_of_mut!(REACTOR) = r;
+    }
+}
+
 /// Open a per-frame **reactor** over the on-ramp module at `[mod_ptr, mod_len)` (an interactive guest
 /// exporting `tick`): decode, grant the powerbox, run `_start`. Returns `0` on success, else a
-/// negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor. Drive it with
-/// [`temen_onramp_frame`], feed input with [`temen_onramp_key`], and read each frame via the
-/// `temen_framebuffer_*` exports; close with [`temen_onramp_close`].
+/// negative `STATUS_*`; also sets [`LAST_STATUS`]. Replaces any prior reactor. Start each frame with
+/// [`temen_onramp_frame_begin`] and pump it (`web/reactor.js`), feed input with [`temen_onramp_key`],
+/// and read each frame via the `temen_framebuffer_*` exports; close with [`temen_onramp_close`].
 #[no_mangle]
 pub extern "C" fn temen_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -9566,8 +9323,7 @@ pub extern "C" fn temen_onramp_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
     };
     match OnrampReactor::open(&m) {
         Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(REACTOR) = Some(r) };
+            set_reactor(Some(r));
             set(STATUS_OK);
             0
         }
@@ -9607,8 +9363,7 @@ pub extern "C" fn temen_onramp_open_fs(
     let name = String::from_utf8_lossy(name).into_owned();
     match OnrampReactor::open_with_fs(&m, name, data.to_vec()) {
         Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(REACTOR) = Some(r) };
+            set_reactor(Some(r));
             set(STATUS_OK);
             0
         }
@@ -9619,33 +9374,46 @@ pub extern "C" fn temen_onramp_open_fs(
     }
 }
 
-/// Advance the open reactor by one frame: call the guest's `tick`, stash the presented frame (read
-/// via `temen_framebuffer_*`) and any stdout delta (read via `temen_stdout_*`), and return the frame
-/// status (`0` = keep going, [`STATUS_EXIT`] = the guest exited, else a trap). Returns
-/// [`STATUS_UNSUPPORTED`] if no reactor is open. Sets [`LAST_STATUS`].
+/// Start the open reactor's next frame (#1414 S4-4): a pump run of the guest's `tick` over its live
+/// window, which the caller pumps to its end with the `temen_coop_*` session — `driveCoopTierupRun`
+/// in the browser. With `jit`, `tick` is offered whole to the emitted tier over a `shared` memory or
+/// not; a `tick` the emitter declines runs interpreted, as every frame without `jit` does. When the
+/// run ends, the frame's status (`0` = keep going, [`STATUS_EXIT`] = the guest exited, else a trap)
+/// is [`temen_status`], the frame it presented is in the `temen_framebuffer_*` slots and what it
+/// wrote in `temen_stdout_*`, as after any run, and the reactor has its window and powerbox back.
+/// Returns `0` with the run armed, else a negative `STATUS_*`: no reactor is open, or a frame of it
+/// could not start.
 #[no_mangle]
-pub extern "C" fn temen_onramp_frame() -> i32 {
+pub extern "C" fn temen_onramp_frame_begin(jit: i32, shared: i32) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
+    temen_coop_close();
     // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
-    let reactor = unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() };
-    let Some(reactor) = reactor else {
+    let Some(reactor) = (unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() }) else {
         set(STATUS_UNSUPPORTED);
-        return STATUS_UNSUPPORTED;
+        return -STATUS_UNSUPPORTED;
     };
-    let (status, stdout_delta) = reactor.frame();
-    let (fb_rgba, fb_w, fb_h) = match reactor.take_frame() {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => (Vec::new(), 0, 0),
-    };
-    set(status);
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(FB), fb_rgba);
-        FB_W = fb_w;
-        FB_H = fb_h;
-        stash(&mut *core::ptr::addr_of_mut!(OUT), stdout_delta);
+    match reactor.begin_frame((jit != 0).then_some(shared != 0)) {
+        Ok((run, programs)) => {
+            // SAFETY: single-threaded wasm; the session is read back only via the coop exports, and
+            // its end hands the window and powerbox back to this reactor (`coop_pump`).
+            unsafe {
+                *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
+                    back: Some(reactor.back.clone()),
+                    programs,
+                    frame: reactor.caps.frame.clone(),
+                    reactor: true,
+                    ..CoopTierupRun::over(run)
+                })
+            };
+            set(STATUS_OK);
+            0
+        }
+        Err(t) => {
+            reactor.last_trap = Some(format!("{t:?}"));
+            set(STATUS_TRAP);
+            -STATUS_TRAP
+        }
     }
-    status
 }
 
 /// Enqueue a key event for the open reactor's guest to `poll` next frame (`pressed`: 1 = down,
@@ -9671,8 +9439,7 @@ pub extern "C" fn temen_onramp_mouse(kind: i32, payload: i32) {
 /// Close the open reactor, freeing its instance. Idempotent.
 #[no_mangle]
 pub extern "C" fn temen_onramp_close() {
-    // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
-    unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
+    set_reactor(None);
 }
 
 // ---- reactor moments: the keyframe store behind the page's scrub bar (#1457) ---------------------
@@ -9726,7 +9493,7 @@ fn moment_with(slot: i32, f: impl FnOnce(&Moment) -> bool) -> i32 {
     }
 }
 
-/// Capture a **moment** of the open interpreter reactor — the window image plus the host-side
+/// Capture a **moment** of the open reactor — the window image plus the host-side
 /// capability state at this frame boundary — and return the slot holding it, or `-1` if there is no
 /// open reactor (or its window cannot be imaged). Restore it with [`temen_onramp_moment_restore`];
 /// release it with [`temen_onramp_moment_free`].
@@ -9737,37 +9504,14 @@ pub extern "C" fn temen_onramp_moment_take() -> i32 {
     moment_store(m)
 }
 
-/// Put the open interpreter reactor back at the moment in `slot`, so the next
-/// [`temen_onramp_frame`] runs as the frame that followed it. `0` on success; `-1` if the slot is
-/// empty or no reactor is open. The moment stays in its slot — a ladder seeks back to the same
-/// keyframe repeatedly.
+/// Put the open reactor back at the moment in `slot`, so its next frame runs as the frame that
+/// followed it, on either tier. `0` on success; `-1` if the slot is empty or no reactor is open.
+/// The moment stays in its slot — a ladder seeks back to the same keyframe repeatedly.
 #[no_mangle]
 pub extern "C" fn temen_onramp_moment_restore(slot: i32) -> i32 {
     moment_with(slot, |m| {
         // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
         match unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() } {
-            Some(r) => r.restore(m),
-            None => false,
-        }
-    })
-}
-
-/// Capture a moment of the open **wasm-JIT** reactor — the same capability on the emitted tier
-/// (INVARIANTS #14), taken between frames exactly as on the interpreter.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_moment_take() -> i32 {
-    // SAFETY: single-threaded wasm; shared read of the reactor.
-    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment().ok());
-    moment_store(m)
-}
-
-/// Restore the open wasm-JIT reactor to the moment in `slot` (the twin of
-/// [`temen_onramp_moment_restore`]).
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_moment_restore(slot: i32) -> i32 {
-    moment_with(slot, |m| {
-        // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
-        match unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() } {
             Some(r) => r.restore(m),
             None => false,
         }
@@ -9820,32 +9564,24 @@ pub extern "C" fn temen_onramp_moment_clear() {
 // picture beside each rung (the presented frame is *output* — no guest reads it back, so it is no part
 // of a moment; but a scrub landing exactly on a rung runs no frames, so something has to repaint).
 //
-// Only the **split** form is exported. The page already has a per-tier "run one tick" — the
-// interpreter's `temen_onramp_frame`, the emitted tier's JS-compiled `f{tick}` — and those do more
-// than run the guest (they stash the framebuffer for the page to read). So the timeline brackets that
-// call rather than replacing it: `begin_tick`, the page's own tick, `end_tick`. One code path per
-// tier, and the wasm-JIT tick stays where it has to be, in JS.
+// Only the **split** form is exported. The page runs a tick as a pump run its JS driver drives
+// ([`temen_onramp_frame_begin`], then `driveCoopTierupRun`), on the emitted tier with `tick` in JS,
+// and the run's end stashes the framebuffer for the page to read. So the timeline brackets that frame
+// rather than replacing it: `begin_tick`, the page's frame, `end_tick`.
 
 /// The live timeline, or `None` when nothing is being recorded (single-threaded wasm ⇒ a plain
 /// static, like `REACTOR` beside it).
 static mut TIMELINE: Option<ReactorTimeline> = None;
 
-/// Whichever reactor tier is open, as the recording surface a timeline needs. The wasm-JIT reactor
-/// wins when both are set (the page closes one before opening the other). `None` when neither is.
-///
-/// This is `dyn MomentReactor` and not `dyn SteppableReactor` on purpose: the emitted tier cannot be
-/// stepped from here at all, so the only operations this hands out are the ones both tiers really
-/// have — capture, restore, feed.
+/// The open reactor, as the recording surface a timeline needs. This is `dyn MomentReactor` and not
+/// `dyn SteppableReactor` on purpose: a frame is a run the page pumps, maybe on the emitted tier, so
+/// the only operations this hands out are capture, restore and feed.
 fn live_reactor() -> Option<&'static mut dyn MomentReactor> {
-    // SAFETY: single-threaded wasm; exclusive access to the reactor statics for this call.
+    // SAFETY: single-threaded wasm; exclusive access to the reactor static for this call.
     unsafe {
-        if let Some(r) = (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() {
-            return Some(r);
-        }
-        match (*core::ptr::addr_of_mut!(REACTOR)).as_mut() {
-            Some(r) => Some(r),
-            None => None,
-        }
+        (*core::ptr::addr_of_mut!(REACTOR))
+            .as_mut()
+            .map(|r| r as &mut dyn MomentReactor)
     }
 }
 
@@ -10044,13 +9780,13 @@ pub extern "C" fn temen_onramp_timeline_keyframe_at(i: i32) -> i32 {
 // *and* to rebuild the program. That is what makes a save-state refuse to open one guest's memory
 // under another's code rather than restoring a fiction (INVARIANTS #9c).
 
-/// Freeze the open interpreter reactor into a §12 save-state artifact and return its length (`0` on
+/// Freeze the open reactor into a §12 save-state artifact and return its length (`0` on
 /// failure, with [`temen_status`] set). `[mod_ptr, mod_len)` must be the module the reactor was opened
 /// over. The bytes land in a cdylib-managed allocation exposed by `temen_onramp_artifact_ptr`/`_len`,
 /// valid until the next freeze (do **not** `temen_dealloc` it).
 ///
 /// Freezing is safe at a frame boundary and only there — which is where the page ever calls it, since
-/// `temen_onramp_frame` has returned. There is no guest stack to serialize at that point, so the
+/// the frame's run has ended. There is no guest stack to serialize at that point, so the
 /// artifact is the window image plus each capability's own state, and nothing else.
 #[no_mangle]
 pub extern "C" fn temen_onramp_freeze(mod_ptr: *const u8, mod_len: usize) -> usize {
@@ -10101,7 +9837,7 @@ pub extern "C" fn temen_onramp_artifact_len() -> usize {
 }
 
 /// Open a reactor from a [`temen_onramp_freeze`] artifact instead of from `_start`: the guest comes
-/// back at the frame it was frozen on, and the next [`temen_onramp_frame`] is the frame that would
+/// back at the frame it was frozen on, and its next frame, on either tier, is the frame that would
 /// have come next. Returns `0` on success, else a negative `STATUS_*`; also sets [`temen_status`].
 /// Replaces any prior reactor (and, like an open, leaves the caller to clear held moments).
 ///
@@ -10143,8 +9879,7 @@ pub extern "C" fn temen_onramp_thaw(
     };
     match OnrampReactor::thaw(artifact, &m, fs) {
         Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(REACTOR) = Some(r) };
+            set_reactor(Some(r));
             set(STATUS_OK);
             0
         }
@@ -10309,347 +10044,6 @@ mod xcall_slot_tests {
     }
 }
 
-// ---- the wasm-JIT reactor (Doom's whole `tick` on emitted wasm) — BROWSER.md §"wasm-JIT tier" 5d ---
-//
-// Unlike the interpreter reactor (`temen_onramp_*`), the per-frame `tick` runs as a **JS-compiled**
-// emitted wasm module (`temen_wasmjit`), instantiated by `play.js` against this cdylib's own linear
-// memory. Each frame the page calls the emitted `f{tick}(win, env, sp)` directly; its cross-tier
-// helpers relay `env.call_interp` back to [`temen_onramp_jit_call_interp`], which runs the callee on the
-// interpreter over the same window with the powerbox (so `display`/`keyboard`/`fs`/`exit` resolve).
-// The window lives in a Rust-owned `Box` inside linear memory; the page reads its base
-// ([`temen_onramp_jit_win_ptr`]) for the emitted `win` argument and reads the emitted bytes to compile.
-
-/// The live wasm-JIT reactor. `None` until [`temen_onramp_jit_open_fs`]; single-threaded wasm.
-static mut JIT_REACTOR: Option<JitOnrampReactor> = None;
-
-/// The JIT reactor's mapped-window log2 — 16 MiB, covering Doom's grown zone heap so the emitter's
-/// static-`mapped` confinement mask holds (see [`JitOnrampReactor`]).
-const JIT_WIN_LOG2: u8 = 24;
-
-/// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)` with **no `fs` file** —
-/// the reactor analogue of [`temen_onramp_open`], with the whole `tick` emitted to wasm (for interactive
-/// guests that need no served file: bounce/life/mandelzoom). Decodes, enlarges the window, runs
-/// `_start` on the interpreter, and emits the whole `tick`. Returns `0` on success, else a negative
-/// `STATUS_*` (also set in [`LAST_STATUS`]) — notably [`STATUS_UNSUPPORTED`] if the `tick` isn't
-/// wasm-JIT-emittable (the page falls back to the interp reactor). Otherwise identical to
-/// [`temen_onramp_jit_open_fs`]; drive/close with the same `temen_onramp_jit_*` exports.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_open(mod_ptr: *const u8, mod_len: usize) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
-        }
-    };
-    // The play threads build imports a **shared** memory, so the emitted module must too. No `fs` file.
-    match JitOnrampReactor::open_owned_jit(&m, JIT_WIN_LOG2, true, None, JitStart::Entry) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
-}
-
-/// Open a **wasm-JIT reactor** over the on-ramp module at `[mod_ptr, mod_len)`, granting an `fs`
-/// capability that serves the file `[data_ptr, data_len)` under the name `[name_ptr, name_len)` (Doom's
-/// WAD). Decodes, enlarges the window, runs `_start` on the interpreter, and emits the whole `tick`.
-/// Returns `0` on success, else a negative `STATUS_*` (also set in [`LAST_STATUS`]) — notably
-/// [`STATUS_UNSUPPORTED`] if the `tick` isn't wasm-JIT-emittable (the page falls back to the interp
-/// reactor). Replaces any prior JIT reactor. After success, read [`temen_onramp_jit_wasm_ptr`]/`_len`
-/// (emitted bytes), [`temen_onramp_jit_win_ptr`], [`temen_onramp_jit_entry_sp`], [`temen_onramp_jit_tick`],
-/// and [`temen_onramp_jit_env_bytes`] to set up the emitted module; drive it with
-/// [`temen_onramp_jit_call_interp`] + [`temen_onramp_jit_present`]; feed input with
-/// [`temen_onramp_jit_key`]; close with [`temen_onramp_jit_close`].
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_open_fs(
-    mod_ptr: *const u8,
-    mod_len: usize,
-    name_ptr: *const u8,
-    name_len: usize,
-    data_ptr: *const u8,
-    data_len: usize,
-) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each `[ptr, len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-    let name = unsafe { core::slice::from_raw_parts(name_ptr, name_len) };
-    let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
-        }
-    };
-    let name = String::from_utf8_lossy(name).into_owned();
-    // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampReactor::open_owned_jit(
-        &m,
-        JIT_WIN_LOG2,
-        true,
-        Some((name, data.to_vec())),
-        JitStart::Entry,
-    ) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
-}
-
-/// Freeze the open **wasm-JIT** reactor into a §12 save-state artifact — the emitted tier's twin of
-/// [`temen_onramp_freeze`], with the same contract: `[mod_ptr, mod_len)` is the module the reactor was
-/// opened over, the length comes back (`0` on failure, with [`temen_status`] set), and the bytes land
-/// in the cdylib-managed `temen_onramp_artifact_ptr`/`_len` buffer shared with the interpreter path.
-///
-/// The artifact is **tier-local in practice**: this tier reserves a 16 MiB window where the interpreter
-/// reserves the module's declared one, and a thaw refuses an image that is not its window's size. The
-/// page therefore remembers which tier a save was taken on and loads it back on that tier.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_freeze(mod_ptr: *const u8, mod_len: usize) -> usize {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-    let bytes = unsafe { host_slice(mod_ptr, mod_len) };
-    let Ok(m) = temen_encode::decode_module(bytes) else {
-        set(STATUS_DECODE_ERR);
-        return 0;
-    };
-    // SAFETY: single-threaded wasm; shared read of the reactor for this call.
-    let Some(reactor) = (unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }) else {
-        set(STATUS_UNSUPPORTED);
-        return 0;
-    };
-    let artifact = match reactor.freeze(&m) {
-        Ok(a) => a,
-        Err(e) => {
-            // As on the interpreter path: name the refusal rather than leaving the page with a code.
-            // SAFETY: single-threaded wasm; read back only via the `temen_stdout_*` accessors.
-            unsafe {
-                stash(
-                    &mut *core::ptr::addr_of_mut!(OUT),
-                    format!("{e:?}").into_bytes(),
-                )
-            };
-            set(STATUS_UNSUPPORTED);
-            return 0;
-        }
-    };
-    let len = artifact.len();
-    // SAFETY: single-threaded wasm; read back only via the `temen_onramp_artifact_*` accessors.
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(ARTIFACT), artifact) };
-    set(STATUS_OK);
-    len
-}
-
-/// Open a **wasm-JIT reactor** from a [`temen_onramp_jit_freeze`] artifact instead of from `_start` —
-/// the emitted tier's twin of [`temen_onramp_thaw`], and otherwise exactly
-/// [`temen_onramp_jit_open_fs`]: on success the page reads `temen_onramp_jit_wasm_ptr`/`_len` and the
-/// rest of the emitted ABI as it would after an open. `name_len == 0` for a guest that granted no `fs`.
-/// Returns `0` on success, else a negative `STATUS_*`; also sets [`temen_status`].
-#[allow(clippy::too_many_arguments)] // an FFI ABI: artifact + module + packed (ptr,len) pairs
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_thaw(
-    art_ptr: *const u8,
-    art_len: usize,
-    mod_ptr: *const u8,
-    mod_len: usize,
-    name_ptr: *const u8,
-    name_len: usize,
-    data_ptr: *const u8,
-    data_len: usize,
-) -> i32 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    // SAFETY: the host guarantees each `[ptr, len)` is a live `temen_alloc`ation it just filled.
-    let artifact = unsafe { host_slice(art_ptr, art_len) };
-    let bytes = unsafe { host_slice(mod_ptr, mod_len) };
-    let m = match temen_encode::decode_module(bytes) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_DECODE_ERR);
-            return -STATUS_DECODE_ERR;
-        }
-    };
-    let fs = if name_len == 0 {
-        None
-    } else {
-        // SAFETY: as above — the host filled both buffers before the call.
-        let name = unsafe { host_slice(name_ptr, name_len) };
-        let data = unsafe { host_slice(data_ptr, data_len) };
-        Some((String::from_utf8_lossy(name).into_owned(), data.to_vec()))
-    };
-    // The play threads build imports a **shared** memory, so the emitted module must too.
-    match JitOnrampReactor::open_owned_jit(&m, JIT_WIN_LOG2, true, fs, JitStart::Thaw(artifact)) {
-        Ok(r) => {
-            // SAFETY: single-threaded wasm; the reactor is touched only by these export accessors.
-            unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = Some(r) };
-            set(STATUS_OK);
-            0
-        }
-        Err(status) => {
-            set(status);
-            -status
-        }
-    }
-}
-
-/// Pointer / length of the emitted `tick` wasm bytes (valid until the reactor is replaced/closed; the
-/// page copies them out and `WebAssembly.compile`s them). `(null, 0)` if no reactor is open.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_wasm_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }
-        .map_or(core::ptr::null(), |r| r.emitted_wasm().as_ptr())
-}
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_wasm_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.emitted_wasm().len())
-}
-
-/// The window base as a byte offset in this module's linear memory — the emitted `f{tick}`'s `win`.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_win_ptr() -> usize {
-    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.win_base())
-}
-/// The reactor calling-convention data-stack base — the emitted `f{tick}`'s `sp` argument.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_entry_sp() -> i64 {
-    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.entry_sp() as i64)
-}
-/// The Temen index of the exported `tick` — the emitted export is `f{tick}`.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_tick() -> u32 {
-    unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or(0, |r| r.tick())
-}
-/// The `env` cell size (fuel counter + cross-tier scratch) the page must `temen_alloc` for the emitted
-/// module's `env` argument.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_env_bytes() -> usize {
-    temen_wasm_jit::ENV_CELL_BYTES
-}
-
-/// **Cross-tier bounce** — the emitted `tick`'s `env.call_interp(func, args_ptr)` relays here. Runs
-/// non-emitted `func` on the interpreter over the shared window with the powerbox, marshalling its i64
-/// arg/result slots at `args_ptr` (in linear memory). Returns `0` on success, [`STATUS_EXIT`] if the
-/// callee `Exit`ed, else [`STATUS_TRAP`] — the page throws on any nonzero to unwind the emitted `tick`.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
-    // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
-    let Some(reactor) = (unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() }) else {
-        return STATUS_UNSUPPORTED;
-    };
-    let (params, results) = {
-        let (p, r) = reactor.func_sig(func);
-        (p.to_vec(), r.to_vec())
-    };
-    // SAFETY: the host guarantees `args_ptr` addresses the signature's full slot span (the env scratch).
-    let args: Vec<Value> = params
-        .iter()
-        .zip(slot_offs(&params))
-        .map(|(t, o)| unsafe { read_slot_value(*t, args_ptr, o) })
-        .collect();
-    match reactor.run_cross_tier(func, &args) {
-        Ok(vals) => {
-            let offs = slot_offs(&results);
-            for (i, v) in vals.iter().enumerate() {
-                if i >= results.len() {
-                    break;
-                }
-                // SAFETY: `args_ptr + offs[i]` is within the env scratch (result slots overlay arg slots).
-                if !unsafe { write_slot_value(v, args_ptr, offs[i]) } {
-                    return STATUS_TRAP;
-                }
-            }
-            0
-        }
-        Err(Trap::Exit(_)) => STATUS_EXIT,
-        Err(t) => {
-            reactor.set_last_trap(format!("{t:?}"));
-            STATUS_TRAP
-        }
-    }
-}
-
-/// Stash the frame the last emitted `tick` presented through `display` into the `temen_framebuffer_*`
-/// slots (the page blits it after each frame). Returns `1` if a frame was presented, else `0`.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_present() -> i32 {
-    // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
-    let Some(r) = (unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() }) else {
-        return 0;
-    };
-    // The tick's stdout (cross-tier `write`s land in the reactor's host): drain it into the stdout
-    // slot (read via `temen_stdout_*`), exactly as `temen_onramp_frame` does for the interpreter, so a
-    // guest's console output reaches the page on this tier too.
-    let stdout = r.host.take_stdout();
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), stdout) };
-    let (rgba, w, h) = match r.take_frame() {
-        Some(f) => (f.rgba, f.width, f.height),
-        None => return 0,
-    };
-    // SAFETY: single-threaded wasm; the capture slots are read back only via the `temen_framebuffer_*`.
-    unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(FB), rgba);
-        FB_W = w;
-        FB_H = h;
-    }
-    1
-}
-
-/// Enqueue a key event for the JIT reactor's guest to `poll` next frame (`pressed`: 1 = down, 0 = up).
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_key(keycode: i32, pressed: i32) {
-    // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
-    if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
-        r.push_key(keycode, pressed);
-    }
-}
-
-/// Enqueue a mouse event for the JIT reactor's guest to `poll` next frame (`kind` 0 = pointer, 1 =
-/// wheel; `payload` per [`MouseQueue`]).
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_mouse(kind: i32, payload: i32) {
-    // SAFETY: single-threaded wasm; shared read of the reactor's mouse queue.
-    if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
-        r.push_mouse(kind, payload);
-    }
-}
-
-/// Diagnostic: stash the JIT reactor's last-trap string into [`OUT`] and return its length (`0` if
-/// none). Read via [`temen_stdout_ptr`].
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_trap_len() -> usize {
-    // SAFETY: single-threaded wasm; shared read of the reactor.
-    let s = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.map_or("", |r| r.last_trap());
-    let bytes = s.as_bytes().to_vec();
-    let len = bytes.len();
-    // SAFETY: single-threaded wasm; the stash is read back only via `temen_stdout_ptr`.
-    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
-    len
-}
-
-/// Close the open JIT reactor, freeing it (and its window `Box`). Idempotent.
-#[no_mangle]
-pub extern "C" fn temen_onramp_jit_close() {
-    // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
-    unsafe { *core::ptr::addr_of_mut!(JIT_REACTOR) = None };
-}
-
 // ---- single-shot module wasm-JIT run (an op-13 or detached child on emitted wasm) ---------------------
 //
 // The module-demo analogue of the reactor FFI above: the whole program is func 0 (`_start`), emitted and
@@ -10791,8 +10185,11 @@ pub extern "C" fn temen_onramp_jit_run_slot(i: usize) -> i64 {
     })
 }
 
-/// **Cross-tier bounce** — the emitted `f0`'s `env.call_interp(func, args_ptr)` relays here (identical
-/// contract to [`temen_onramp_jit_call_interp`], but over the single-shot run's window/powerbox).
+/// **Cross-tier bounce** — the emitted `f0`'s `env.call_interp(func, args_ptr)` relays here. Runs
+/// non-emitted `func` on the interpreter over the single-shot run's window with its powerbox,
+/// marshalling its i64 arg/result slots at `args_ptr` (in linear memory). Returns `0` on success,
+/// [`STATUS_EXIT`] if the callee `Exit`ed, else [`STATUS_TRAP`]: the page throws on any nonzero to
+/// unwind the emitted `f0`.
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_run_call_interp(func: u32, args_ptr: *mut u8) -> i32 {
     // SAFETY: single-threaded wasm; exclusive access to the run for this call.
@@ -12545,7 +11942,7 @@ pub extern "C" fn temen_durable_thaw_resume(
             return 0;
         }
     };
-    // Recover the restored cap handles (never re-grant): AddressSpace then Clock, `(gen << 8) | slot`.
+    // Recover the restored cap handles (never re-grant): AddressSpace then Clock.
     let caps = match host.capture_durable_handles() {
         Ok(c) => c,
         Err(_) => {
@@ -12557,8 +11954,7 @@ pub extern "C" fn temen_durable_thaw_resume(
         set(STATUS_UNSUPPORTED);
         return 0;
     }
-    let handle = |i: usize| ((caps[i].generation << 8) | caps[i].slot) as i32;
-    let (t_space, t_clk) = (handle(0), handle(1));
+    let (t_space, t_clk) = (caps[0].handle(), caps[1].handle());
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
         return 0;
@@ -13338,6 +12734,9 @@ struct CoopTierupRun {
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
     warm: bool,
+    /// #1414 S4-4: a reactor's frame ([`temen_onramp_frame_begin`]) — at DONE/TRAP the open reactor
+    /// takes its window and powerbox back.
+    reactor: bool,
     /// The emitted wasm — shared (`Arc`) so a warm session's cached emit is reused per Run without
     /// copying; a `temen_coop_open` run wraps its fresh emit once.
     emitted_wasm: std::sync::Arc<[u8]>,
@@ -13545,6 +12944,7 @@ impl CoopTierupRun {
             requests: temen_interp::CapRequests::default(),
             sliced: false,
             warm: false,
+            reactor: false,
             emitted_wasm: std::sync::Arc::from([]),
             func: 0,
             mapped: 0,
@@ -14253,6 +13653,15 @@ fn coop_pump(budget: Option<u64>) -> i32 {
     // A fault in emitted code left its address with the session (#2126).
     if matches!(out.trap, Some(Trap::MemoryFault)) {
         out.fault_addr = out.fault_addr.or(s.jit_fault);
+    }
+    // #1414 S4-4: a reactor's frame has ended — the reactor takes back its window and powerbox, the
+    // latter with this frame's output already taken above.
+    if s.reactor {
+        // SAFETY: single-threaded wasm; a reactor whose frame is live is the open one (`set_reactor`
+        // drops the frame with it).
+        if let Some(r) = unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() } {
+            r.end_frame(&mut s.run, out.trap.as_ref());
+        }
     }
     s.value = out.publish();
     // SAFETY: single-threaded wasm; the image is read back only via the export accessors.

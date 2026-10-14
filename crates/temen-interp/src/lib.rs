@@ -873,8 +873,8 @@ pub(crate) struct HostCursor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegionTable {
     /// Per region id, its backing's index among the captured bytes. Ids aliasing one backing share
-    /// it, so they restore as one region again.
-    backing: Vec<usize>,
+    /// it, so they restore as one region again; an id the host closed (#2358) restores closed.
+    backing: Vec<Option<usize>>,
     /// Each live `SharedRegion` handle: `(slot, generation, region id)`.
     handles: Vec<(u32, u32, u32)>,
 }
@@ -1167,6 +1167,9 @@ impl GuestMem for RecordingMem<'_> {
     ) -> i64 {
         self.inner
             .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        self.inner.maps_region(region)
     }
     fn page_size(&self) -> i64 {
         self.inner.page_size()
@@ -14866,27 +14869,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // 7–8): bytes of this domain's window copied to the child's
                             // `module_args_base()` before start — the detached twin of the op-13
                             // convention (a parent data segment landing inside the carve), which has
-                            // no analogue across windows. The 7-arg form seeds nothing; an over-long
-                            // payload refuses probeably.
-                            let payload: Option<Vec<u8>> = match (args.get(7), args.get(8)) {
-                                _ if rec.is_some() => match rec.as_ref().map(|r| r.args) {
-                                    Some((ptr, len)) if len > 0 => {
-                                        let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                        Some(m.read_window(ptr, len as usize)?)
-                                    }
-                                    _ => None,
-                                },
-                                (Some(&p), Some(&l)) => {
-                                    let ptr = get(&frames[top].vals, p)?.i64() as u64;
-                                    let len = get(&frames[top].vals, l)?.i64() as usize;
-                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                    Some(m.read_window(ptr, len)?)
+                            // no analogue across windows. The 7-arg form seeds nothing. An over-long
+                            // payload refuses probeably, before anything is read: its length is the
+                            // guest's (#2338).
+                            let payload_at: Option<(u64, u64)> = match (args.get(7), args.get(8)) {
+                                _ if rec.is_some() => {
+                                    rec.as_ref().map(|r| r.args).filter(|&(_, len)| len > 0)
                                 }
+                                (Some(&p), Some(&l)) => Some((
+                                    get(&frames[top].vals, p)?.i64() as u64,
+                                    get(&frames[top].vals, l)?.i64() as u64,
+                                )),
                                 _ => None,
                             };
-                            let payload_ok = payload.as_ref().is_none_or(|p| {
-                                p.len() as u64
-                                    <= temen_ir::module_args_end() - temen_ir::module_args_base()
+                            let payload_ok = payload_at.is_none_or(|(_, len)| {
+                                len <= temen_ir::module_args_end() - temen_ir::module_args_base()
                             });
                             // Optional **pre-mapped region** `(region, child_off)` (args 9–10): a
                             // `SharedRegion` of this domain aliased whole, read-write, into the
@@ -14914,6 +14911,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .lock_unpoisoned()
                                 .resolve_spawn_module(mh, unit)?
                                 .clone();
+                            // The payload is read after the module resolves, as every engine reads
+                            // it, so a forged module faults the same way beside a bad payload.
+                            let payload = match payload_at {
+                                Some((ptr, len)) if payload_ok => {
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    Some(m.read_window(ptr, len as usize)?)
+                                }
+                                _ => None,
+                            };
                             // Named grants (the op-11 record format), pre-validated fail-closed. A
                             // detached spawn may carry #744's live self-serve grant, from a v1
                             // record or op 15's positional form alike.
@@ -19095,7 +19101,8 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
 use temen_ir::errno::{
-    E2BIG, EACCES, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC, EPIPE,
+    E2BIG, EACCES, EAGAIN, EBUSY, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC,
+    EPIPE,
 };
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable
@@ -19306,7 +19313,8 @@ impl SharedBacking for VecBacking {
 
 /// #2111 — a region the run's domains made (a guest's `create_region` or a file mapping, or a thaw's
 /// rebuild): its backing, charged to `node` and every ancestor for as long as it lives — its `bytes`
-/// of `channel`, and (#2268) the mapping the host holds of it ([`region_cost`]). The charge rides the
+/// of `channel`, and (#2268, #2306) the mapping the host holds of it and that mapping's address space
+/// ([`region_cost`]). The charge rides the
 /// shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go of it last
 /// refunds the node that paid. A domain lets go of its regions when it ends
 /// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
@@ -19317,9 +19325,10 @@ struct ChargedRegion {
 }
 
 /// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
-/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it.
-fn region_cost(bytes: u64) -> [(usize, u64); 2] {
-    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1)]
+/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it, whose
+/// `size` (#2306) is address space the process's pool of it counts ([`RESERVED_POOL`]).
+fn region_cost(bytes: u64, size: u64) -> [(usize, u64); 3] {
+    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1), (RESERVED, size)]
 }
 
 impl SharedBacking for ChargedRegion {
@@ -19348,9 +19357,10 @@ impl SharedBacking for ChargedRegion {
 
 impl Drop for ChargedRegion {
     fn drop(&mut self) {
-        self.node
-            .tree
-            .refund_set(self.node.node, &region_cost(self.bytes));
+        self.node.tree.refund_set(
+            self.node.node,
+            &region_cost(self.bytes, self.backing.size()),
+        );
     }
 }
 
@@ -19658,6 +19668,13 @@ pub trait GuestMem {
         _backing: RegionBacking,
     ) -> i64 {
         EINVAL
+    }
+    /// #2358 — whether a page of the window aliases `region` (§13): `SharedRegion.close` refuses
+    /// while one does. A window is no holder of its own, and a mapping that outlived its backing
+    /// would read zero on the paged [`Mem`] and keep its bytes in the Cranelift JIT's `mmap`. The
+    /// default answers for a window that cannot map a region, which maps none.
+    fn maps_region(&self, _region: u32) -> bool {
+        false
     }
 
     /// `Memory` op 3 `page_size() -> i64`: the host MMU page granularity this window is managed in —
@@ -20007,10 +20024,10 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2305 — how much address space the windows of this process's guests may reserve between them:
-/// 64 TiB, half of what a 47-bit host gives a process, so the host's own mappings keep the other
-/// half. Every window reserves its whole mask domain up front, 128 GiB by default
-/// ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
+/// #2305 — how much address space the windows of this process's guests may reserve between them,
+/// and (#2306) the host's mappings of their regions: 64 TiB, half of what a 47-bit host gives a
+/// process, so the host's own mappings keep the other half. Every window reserves its whole mask
+/// domain up front, 128 GiB by default ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
 /// only be refused where it is built, which differs by engine (the interpreter falls back to a
 /// heap-backed window, the JIT cannot); so every domain's window is held against this at its
 /// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
@@ -20022,18 +20039,25 @@ pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
 };
 
 /// #2268, #2305 — what every run in this process holds between them of a resource the process has a
-/// fixed amount of: its OS mappings ([`maps_pool`]) or its address space ([`RESERVED_POOL`]).
-struct Pool(AtomicU64);
+/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`RESERVED_POOL`]), or
+/// (#2306, `temen-run`'s) its file descriptors.
+#[derive(Debug, Default)]
+pub struct Pool(AtomicU64);
 
 /// #2268 — what every run holds of [`maps_pool`].
-static MAPS_IN_USE: Pool = Pool(AtomicU64::new(0));
-/// #2305 — what every run's windows hold of [`RESERVED_POOL`].
-static RESERVED_IN_USE: Pool = Pool(AtomicU64::new(0));
+static MAPS_IN_USE: Pool = Pool::new();
+/// #2305 — what every run's windows and regions hold of [`RESERVED_POOL`].
+static RESERVED_IN_USE: Pool = Pool::new();
 
 impl Pool {
+    /// A pool nothing holds any of yet.
+    pub const fn new() -> Pool {
+        Pool(AtomicU64::new(0))
+    }
+
     /// Take `n` for a charge: `false`, taking nothing, when that would hold more than `size`
     /// (`check`). A [`Fits::Forced`] charge takes it regardless.
-    fn take(&self, n: u64, size: u64, check: bool) -> bool {
+    pub fn take(&self, n: u64, size: u64, check: bool) -> bool {
         n == 0
             || self.update(|used| {
                 let now = used.saturating_add(n);
@@ -20042,7 +20066,7 @@ impl Pool {
     }
 
     /// Hand `n` back.
-    fn give(&self, n: u64) {
+    pub fn give(&self, n: u64) {
         self.update(|used| Some(used.saturating_sub(n)));
     }
 
@@ -20727,6 +20751,239 @@ pub type LiveVcpu = Held<VcpuCost>;
 /// `cont.new` makes it ([`Host::fiber_charge`]) and handed back when it returns or its registry goes.
 pub type LiveFiber = Held<FiberCost>;
 
+/// #2306 — the size from which an allocation is an OS mapping of its own: glibc's default
+/// `M_MMAP_THRESHOLD`. A [`HostCharge`] this large holds one `maps` besides its bytes, so no
+/// allocator needs tuning to keep the guests' mappings inside [`maps_pool`].
+pub const MAPPED_BUFFER: u64 = 128 << 10;
+
+/// #2306 — what one entry of a table a guest fills through a capability costs the host besides its
+/// contents: its slot, and its allocations' headers. A capability charges it ([`HostCharge`]) for
+/// each name, descriptor, listing entry, mapping or job its guest holds, so their number is
+/// bounded with the bytes they hold.
+pub const TABLE_ENTRY: u64 = 128;
+
+/// #2306 — host memory a guest causes through a capability: a file's bytes, a pipe's or a socket's
+/// queue, a listing it holds open, the entries of a table it fills. Charged to its **payer**, the
+/// node of the domain the capability's state was granted to, and every ancestor: its bytes of
+/// `channel`, and one `maps` while those reach [`MAPPED_BUFFER`]. Growing is all or nothing, refused
+/// at any ceiling or at the process's pool of mappings; shrinking hands the difference back, and
+/// dropping it the rest. One with no payer charges nothing: state an embedder keeps for itself.
+#[derive(Default)]
+pub struct HostCharge {
+    payer: Option<NodeRef>,
+    bytes: u64,
+}
+
+impl HostCharge {
+    /// One that holds nothing yet, charging `payer` as it grows.
+    pub fn new(payer: Option<NodeRef>) -> HostCharge {
+        HostCharge { payer, bytes: 0 }
+    }
+
+    /// Who it charges.
+    pub fn payer(&self) -> Option<&NodeRef> {
+        self.payer.as_ref()
+    }
+
+    /// What it holds.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Hold `bytes` from now on: `false`, holding what it held, when growing to them would pass a
+    /// ceiling or the pool.
+    pub fn resize(&mut self, bytes: u64) -> bool {
+        self.set(bytes, Fits::All)
+    }
+
+    /// [`Self::resize`] past every limit: what a restore rebuilds, which existed before it.
+    pub fn force(&mut self, bytes: u64) {
+        self.set(bytes, Fits::Forced);
+    }
+
+    /// Room in `bytes` for `len` of them, charged as this holds it and then allocated, fallibly: what a
+    /// [`HostBuffer`] grows by, for a buffer its embedder also reads as a plain `Vec` (a host's
+    /// captured stdout). The room grows by doubling, or to exactly `len` when the doubling does not
+    /// fit: `false`, with nothing charged or allocated, when neither does.
+    pub fn reserve(&mut self, bytes: &mut Vec<u8>, len: u64) -> bool {
+        let had = self.bytes;
+        let room = if len <= had {
+            had
+        } else {
+            match [had.saturating_mul(2), len]
+                .into_iter()
+                .find(|&r| r >= len && usize::try_from(r).is_ok() && self.resize(r))
+            {
+                Some(room) => room,
+                None => return false,
+            }
+        };
+        if bytes.capacity() < len as usize
+            && bytes
+                .try_reserve_exact((room as usize).saturating_sub(bytes.len()))
+                .is_err()
+        {
+            self.resize(had);
+            return false;
+        }
+        true
+    }
+
+    /// Charge `payer` for what it holds, past every limit, if it charged no one yet: state made
+    /// before its capability was granted (a seeded store), which the grantee pays for from then on.
+    pub fn bind(&mut self, payer: &NodeRef) {
+        if self.payer.is_none() {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.payer = Some(payer.clone());
+            self.force(bytes);
+        }
+    }
+
+    fn set(&mut self, bytes: u64, fits: Fits) -> bool {
+        if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
+            let maps = |b: u64| u64::from(b >= MAPPED_BUFFER);
+            let (lo, hi) = (self.bytes.min(bytes), self.bytes.max(bytes));
+            let diff = [
+                (BUDGET_CHANNEL, hi - lo),
+                (BUDGET_MAPS, maps(hi) - maps(lo)),
+            ];
+            if bytes < self.bytes {
+                n.tree.refund_set(n.node, &diff);
+            } else if !n.tree.add(n.node, &diff, fits) {
+                return false;
+            }
+        }
+        self.bytes = bytes;
+        true
+    }
+}
+
+impl Drop for HostCharge {
+    fn drop(&mut self) {
+        self.set(0, Fits::All);
+    }
+}
+
+/// #2306 — bytes a guest grows through a capability, their allocation held as a [`HostCharge`]: a
+/// file's contents, a pipe's or a socket's queue, a captured stream. Room for them is charged before
+/// it is allocated, and allocated fallibly, so running out is the guest's errno and never the host's
+/// abort. It grows by doubling, or to exactly what it needs when the doubling does not fit, and gives
+/// the room back once it holds under a quarter of it. A reader can consume it from the front as a
+/// queue, each byte moved at most once on average.
+#[derive(Default)]
+pub struct HostBuffer {
+    bytes: Vec<u8>,
+    /// How many of `bytes` a reader consumed ([`Self::consume`]) that have yet to be dropped.
+    head: usize,
+    room: HostCharge,
+}
+
+impl HostBuffer {
+    /// An empty one, charging `payer` as it grows.
+    pub fn new(payer: Option<NodeRef>) -> HostBuffer {
+        HostBuffer::from_parts(Vec::new(), HostCharge::new(payer))
+    }
+
+    /// `bytes`, charged to `payer` past every limit: what a restore rebuilds, or a seed is made of.
+    pub fn forced(payer: Option<NodeRef>, bytes: Vec<u8>) -> HostBuffer {
+        let mut room = HostCharge::new(payer);
+        room.force(bytes.capacity() as u64);
+        HostBuffer::from_parts(bytes, room)
+    }
+
+    /// `bytes` and the room they were charged as: a buffer an embedder kept as a plain `Vec` until it
+    /// shared it ([`Host::shared_stdout`]).
+    pub fn from_parts(bytes: Vec<u8>, room: HostCharge) -> HostBuffer {
+        HostBuffer {
+            bytes,
+            head: 0,
+            room,
+        }
+    }
+
+    /// [`HostCharge::bind`].
+    pub fn bind(&mut self, payer: &NodeRef) {
+        self.room.bind(payer);
+    }
+
+    /// Hold `bytes` instead, charged past every limit: what a rewind puts back, which it held before.
+    pub fn restore(&mut self, bytes: Vec<u8>) {
+        self.room.force(bytes.capacity() as u64);
+        (self.bytes, self.head) = (bytes, 0);
+    }
+
+    /// Make it `len` long, zero-filled past its end: `false`, unchanged, when it cannot grow to it.
+    pub fn resize(&mut self, len: u64) -> bool {
+        let Some(end) = len.checked_add(self.head as u64) else {
+            return false;
+        };
+        if !self.room.reserve(&mut self.bytes, end) {
+            return false;
+        }
+        self.bytes.resize(end as usize, 0);
+        self.settle();
+        true
+    }
+
+    /// Write `data` at `at`, zero-filling from its end to `at`: `false`, unchanged, when it cannot
+    /// grow to hold them.
+    pub fn write_at(&mut self, at: u64, data: &[u8]) -> bool {
+        let Some(end) = at.checked_add(data.len() as u64) else {
+            return false;
+        };
+        if end > self.len() as u64 && !self.resize(end) {
+            return false;
+        }
+        self[at as usize..end as usize].copy_from_slice(data);
+        true
+    }
+
+    /// Append `data`: [`Self::write_at`] its end.
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        self.write_at(self.len() as u64, data)
+    }
+
+    /// Drop its first `n` bytes, as a queue's reader consumes them.
+    pub fn consume(&mut self, n: usize) {
+        self.head += n.min(self.len());
+        self.settle();
+    }
+
+    /// Its bytes, handed out; it is left empty, holding nothing.
+    pub fn take(&mut self) -> Vec<u8> {
+        let mut bytes = std::mem::take(&mut self.bytes);
+        bytes.drain(..std::mem::take(&mut self.head));
+        self.room.resize(0);
+        bytes
+    }
+
+    /// Drop what was consumed once it is as much as what is left, so each byte is moved at most once
+    /// on average, and give the room back once it holds under a quarter of it.
+    fn settle(&mut self) {
+        if self.head > 0 && self.head >= self.bytes.len() - self.head {
+            self.bytes.drain(..self.head);
+            self.head = 0;
+        }
+        if (self.bytes.len() as u64) < self.room.bytes() / 4 {
+            self.bytes.shrink_to_fit();
+            self.room.resize(self.bytes.capacity() as u64);
+        }
+    }
+}
+
+impl core::ops::Deref for HostBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[self.head..]
+    }
+}
+
+impl core::ops::DerefMut for HostBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.head..]
+    }
+}
+
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
 /// [`Trap::OutOfFuel`]. With no `src` it is a fixed allowance, never refilled: an unmetered vCPU's
@@ -21031,6 +21288,14 @@ pub struct DurableHandle {
     pub binding: DurableBinding,
 }
 
+impl DurableHandle {
+    /// The handle value the guest holds for this entry: what an embedder passes a thawed domain
+    /// that takes its capabilities as arguments.
+    pub fn handle(&self) -> i32 {
+        handle_of(self.slot, self.generation)
+    }
+}
+
 /// One §22 guest-JIT **unit** captured for snapshot (DURABILITY.md §12.5 Slice 2). The durable
 /// state is the unit's already-instrumented+verified IR (encoded as a module image, `unit_ir`)
 /// plus its B2 `install` type id; the native/wasm code pointers are process-local and re-derived
@@ -21152,10 +21417,7 @@ pub fn capture_cut_regions(
     for (host, ids) in cut {
         for &id in ids {
             let refuse = |why| RegionNotCaptured { region: id, why };
-            let b = host
-                .regions
-                .get(id as usize)
-                .ok_or(refuse(RegionRefusal::Unknown))?;
+            let b = host.region(id).ok_or(refuse(RegionRefusal::Unknown))?;
             let key = region_key(b);
             if out.iter().any(|r| r.key == key) {
                 continue; // an alias of a region already captured
@@ -21165,7 +21427,13 @@ pub fn capture_cut_regions(
             }
             let held: usize = cut
                 .iter()
-                .map(|(h, _)| h.regions.iter().filter(|r| Arc::ptr_eq(r, b)).count())
+                .map(|(h, _)| {
+                    h.regions
+                        .iter()
+                        .flatten()
+                        .filter(|r| Arc::ptr_eq(r, b))
+                        .count()
+                })
                 .sum();
             if Arc::strong_count(b) != held {
                 return Err(refuse(RegionRefusal::HolderOutsideCut));
@@ -21296,26 +21564,38 @@ struct Slot {
     type_id: u32,
 }
 
-/// `log2` of the handle-table capacity. A handle value packs `(generation, slot)`:
+/// `log2` of the handle-table capacity: 1,024 live capabilities a domain holds at once, the
+/// POSIX personality's `FD_MAX` (#2365). A handle value packs `(generation, slot)`:
 /// `slot = h & (cap-1)`, `generation = h >> CAP_LOG2`.
-const CAP_LOG2: u32 = 8;
+const CAP_LOG2: u32 = 10;
 const CAP: usize = 1 << CAP_LOG2;
 
-/// Bits the packed handle carries for the generation counter: the 32-bit `i32`/`u32` handle minus
-/// the `CAP_LOG2` slot bits. `Slot::generation` is a full `u32`, so it is compared **masked to
-/// these bits** (`GEN_MASK`) — otherwise, once the counter passed `2^GEN_BITS` regrants of one slot
-/// the full-width `generation` could no longer equal the truncated value carried in any handle, and
-/// the slot died permanently (a single-slot, fail-closed DoS — reachable via a `Jit.compile`→`release`
-/// loop). Masking lets the slot recycle cleanly on wrap. ABA resistance is `2^GEN_BITS` (~16M)
-/// regrants of one slot; a stale handle that aliased after a full wrap is still inert — it re-selects
-/// one of *this domain's own* current grants, re-checked by `type_id` at the call (D37) — so this is
-/// not an authority escape, only the documented "a forged index is inert" property.
-const GEN_BITS: u32 = 32 - CAP_LOG2;
+/// Bits the packed handle carries for the generation counter: the 31 bits of a **positive** `i32`
+/// minus the `CAP_LOG2` slot bits. Bit 31 stays clear, so a handle is never negative — a guest can
+/// tell it from a `-errno` — and never a grant-record tag ([`GRANT_SERVE_LIVE_TAG`],
+/// [`GRANT_EMPTY`]), both of which set it (#2365). `Slot::generation` is a full `u32`, so it is
+/// compared **masked to these bits** (`GEN_MASK`) — otherwise, once the counter passed
+/// `2^GEN_BITS` regrants of one slot the full-width `generation` could no longer equal the truncated
+/// value carried in any handle, and the slot died permanently (a single-slot, fail-closed DoS —
+/// reachable via a `Jit.compile`→`release` loop). Masking lets the slot recycle cleanly on wrap. ABA
+/// resistance is `2^GEN_BITS` (~2M) regrants of one slot; a stale handle that aliased after a full
+/// wrap is still inert — it re-selects one of *this domain's own* current grants, re-checked by
+/// `type_id` at the call (D37) — so this is not an authority escape, only the documented "a forged
+/// index is inert" property.
+const GEN_BITS: u32 = 31 - CAP_LOG2;
+const _: () = assert!(CAP_LOG2 + GEN_BITS == 31);
 /// DURABILITY.md §13.3 — the process-wide [`Host::domain_id`] mint (uniqueness is all the
 /// runtime needs; a snapshot records the ids it saw and a thaw re-links by record, so the
 /// counter's absolute values never matter).
 static NEXT_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
+
+/// The handle a grant of `slot` at `generation` returns: `(generation << CAP_LOG2) | slot`, the
+/// generation masked to the `GEN_BITS` a handle carries. Every handle is packed here, so the layout
+/// lives in one place (#2365).
+const fn handle_of(slot: u32, generation: u32) -> i32 {
+    (((generation & GEN_MASK) << CAP_LOG2) | slot) as i32
+}
 
 /// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
 /// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
@@ -21974,7 +22254,10 @@ pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 /// run" includes forkability. A capability granted forkable (so it can be re-granted into a §14
 /// child — `Host::can_regrant` — or carried into a `fork()` twin) must come back forkable, or a
 /// thawed domain could no longer hand a child what the same domain could before its freeze.
-pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<NamedCapGrant> + Send>;
+///
+/// #2306 — the node it is handed is the thawing domain's, which pays for the host memory the
+/// rebuilt state holds and the guest grows it by, as a fresh grant's state is paid for by its grantee.
+pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8], &NodeRef) -> Option<NamedCapGrant> + Send>;
 
 /// What a [`NamedCapRegistrar`] re-grants: the handler, its fork factory when the capability is
 /// forkable (#1718), and its [`CapState`] (#1699) — so a thawed stateful capability is captured by
@@ -22598,12 +22881,11 @@ fn translate_cap_slots(
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
     /// #2268 — the region a capability maps a file as (§4b) is the guest's: its mapping is charged
-    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives.
+    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives. #2306 — so
+    /// is the address space the host maps it over, the whole file.
     fn grant_region(&mut self, backing: RegionBacking) -> i32 {
-        if !self
-            .budgets
-            .add(self.own_budget, &region_cost(0), Fits::All)
-        {
+        let cost = region_cost(0, backing.size());
+        if !self.budgets.add(self.own_budget, &cost, Fits::All) {
             return ENOMEM as i32;
         }
         let backing: RegionBacking = Arc::new(ChargedRegion {
@@ -23052,14 +23334,19 @@ pub struct Host {
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// #2306 — the room `stdout` and `stderr` hold for the guest's writes, charged to this domain's
+    /// node ([`HostCharge::reserve`]) until [`Host::take_stdout`] drains them. A shared sink holds its
+    /// own ([`Host::shared_stdout`]).
+    out_room: HostCharge,
+    err_room: HostCharge,
     /// PROCESS.md S2: optional **shared** stdout/stderr sinks. `None` (default) ⇒ writes go to the
     /// local `stdout`/`stderr` Vec (the existing public API — untouched for hosts that never share).
     /// `Some` ⇒ writes go to the shared buffer instead — set on a **child** host whose stdout/stderr
     /// was re-granted from a parent (`instantiate_granted`), so the child's output reaches the same
     /// buffer the granting embedder observes (POSIX stdio inheritance). Promoted lazily by
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
-    out_sink: Option<Arc<Mutex<Vec<u8>>>>,
-    err_sink: Option<Arc<Mutex<Vec<u8>>>>,
+    out_sink: Option<Arc<Mutex<HostBuffer>>>,
+    err_sink: Option<Arc<Mutex<HostBuffer>>>,
     /// Optional **live tee** on stdout: when set, every `Stream(Out)` write is handed to this callback
     /// *in addition to* the normal buffering (the local `stdout` Vec / shared sink are untouched, so
     /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
@@ -23076,7 +23363,7 @@ pub struct Host {
     stdin_source: Option<StdinSource>,
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
-    sinks: Vec<Arc<Mutex<Vec<u8>>>>,
+    sinks: Vec<Arc<Mutex<HostBuffer>>>,
     /// §7c stdin inheritance (#1720): once promoted, this host's own stdin (see [`SharedStdin`]).
     in_shared: Option<Arc<Mutex<SharedStdin>>>,
     /// The shared stdins carried by re-granted `Stream(In)`s, indexed by the id their `sink` holds —
@@ -23085,9 +23372,11 @@ pub struct Host {
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
-    /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
-    /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
-    regions: Vec<RegionBacking>,
+    /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries: this
+    /// domain's holds. Each is a shared host buffer; aliasing a region into several window offsets
+    /// clones this `Arc`. #2358 — a hold its domain closed is `None`, an id the next hold reuses
+    /// ([`Host::hold_region`]), as the table reuses a closed slot.
+    regions: Vec<Option<RegionBacking>>,
     /// PROCESS.md S1b/S1c — the **canonical-key futex** region hook. On a §13 `map`/`unmap` the JIT needs
     /// to canonicalize a `Backed` address to `(backing, region offset)` for its futex, but its futex
     /// thunk has no region map. `temen-run` installs a recorder here (over the JIT window's `mem_base`);
@@ -23199,7 +23488,7 @@ pub struct Host {
     /// `None` (the default) mints the pure-Rust reference [`VecBacking`]; a flat-window embedder
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
-    region_factory: Option<fn(usize) -> RegionBacking>,
+    region_factory: Option<fn(usize) -> Result<RegionBacking, i64>>,
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
@@ -24107,6 +24396,8 @@ impl Host {
             sig_interrupt: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            out_room: HostCharge::default(),
+            err_room: HostCharge::default(),
             out_sink: None,
             err_sink: None,
             out_tee: None,
@@ -24656,7 +24947,7 @@ impl Host {
             (0..CAP).find_map(|slot| {
                 let st = &h.table[slot];
                 (st.entry.is_some() && st.type_id == tid)
-                    .then_some(((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32)
+                    .then_some(handle_of(slot as u32, st.generation))
             })
         };
         // Resolve an import's §3.5 requirement set — `(names, sigs)` — through the child's
@@ -25650,7 +25941,7 @@ impl Host {
     /// [`journal_invertible`](Host::journal_invertible) instead of being restored wrongly.
     pub(crate) fn journal_cursor(&self) -> HostCursor {
         // #2055: a stream promoted into a shared cell (a child re-granted it) writes there.
-        let len = |cell: &Option<Arc<Mutex<Vec<u8>>>>, own: &Vec<u8>| {
+        let len = |cell: &Option<Arc<Mutex<HostBuffer>>>, own: &Vec<u8>| {
             cell.as_ref()
                 .map_or(own.len(), |c| c.lock_unpoisoned().len())
         };
@@ -25682,11 +25973,15 @@ impl Host {
         self.stdin_pos = c.stdin_pos;
         // #2055: truncate where the bytes went — the shared cell, once promoted.
         match &self.out_sink {
-            Some(cell) => cell.lock_unpoisoned().truncate(c.stdout_len),
+            Some(cell) => {
+                cell.lock_unpoisoned().resize(c.stdout_len as u64);
+            }
             None => self.stdout.truncate(c.stdout_len),
         }
         match &self.err_sink {
-            Some(cell) => cell.lock_unpoisoned().truncate(c.stderr_len),
+            Some(cell) => {
+                cell.lock_unpoisoned().resize(c.stderr_len as u64);
+            }
             None => self.stderr.truncate(c.stderr_len),
         }
         self.clock_ns = c.clock_ns;
@@ -25789,11 +26084,11 @@ impl Host {
             None => self.stdin_pos = s.stdin_pos,
         }
         match &self.out_sink {
-            Some(cell) => *cell.lock_unpoisoned() = s.stdout.clone(),
+            Some(cell) => cell.lock_unpoisoned().restore(s.stdout.clone()),
             None => self.stdout = s.stdout.clone(),
         }
         match &self.err_sink {
-            Some(cell) => *cell.lock_unpoisoned() = s.stderr.clone(),
+            Some(cell) => cell.lock_unpoisoned().restore(s.stderr.clone()),
             None => self.stderr = s.stderr.clone(),
         }
         self.clock_ns = s.clock_ns;
@@ -26240,9 +26535,14 @@ impl Host {
         let slot = self.table.iter().position(|s| s.entry.is_none())?;
         let s = &mut self.table[slot];
         s.generation = s.generation.wrapping_add(1); // advance per (re)grant (ABA-safe)
+                                                     // A wrap skips generation 0, so no handle is `0`: a spawn record reads a `0` budget as
+                                                     // none (#2365).
+        if s.generation & GEN_MASK == 0 {
+            s.generation = s.generation.wrapping_add(1);
+        }
         s.entry = Some(binding);
         s.type_id = type_id;
-        Some((((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32)
+        Some(handle_of(slot as u32, s.generation))
     }
 
     /// §7 capability **reflection** (backs `self.count`/`self.get`): the live handle-table
@@ -26297,10 +26597,7 @@ impl Host {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.entry.is_some())
-            .map(|(slot, s)| {
-                let handle = (((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32;
-                (handle, s.type_id)
-            })
+            .map(|(slot, s)| (handle_of(slot as u32, s.generation), s.type_id))
             .collect()
     }
 
@@ -26549,9 +26846,7 @@ impl Host {
                     None => continue,
                 },
                 // #2025: re-pin onto the region the thaw adopted (the codec rewrote the id to it). An id naming no region leaves the slot closed, as for a pipe.
-                DurableBinding::SharedRegion { region }
-                    if (region as usize) < self.regions.len() =>
-                {
+                DurableBinding::SharedRegion { region } if self.region(region).is_some() => {
                     Binding::SharedRegion(region)
                 }
                 DurableBinding::SharedRegion { .. } => continue,
@@ -26572,7 +26867,7 @@ impl Host {
                 // registration wins, so a name the embedder granted before restoring keeps its handle.
                 DurableBinding::Named { idx } => {
                     if let Some(Some(name)) = self.thaw_names.get(idx as usize) {
-                        let handle = (((h.generation & GEN_MASK) << CAP_LOG2) | h.slot) as i32;
+                        let handle = h.handle();
                         if self.resolve_cap_name(name) != Some(handle) {
                             self.cap_names.push((name.clone(), handle));
                         }
@@ -26651,7 +26946,7 @@ impl Host {
 
     /// #2025 — the identity of region `id`'s backing ([`DurableRegion::key`]), `None` for no region.
     pub fn region_key(&self, id: u32) -> Option<usize> {
-        self.regions.get(id as usize).map(region_key)
+        self.region(id).map(region_key)
     }
 
     /// #2025 — alias back into `mem` every region `prots` names: the thaw half of a captured
@@ -26676,7 +26971,7 @@ impl Host {
     /// first that names no region of this host or does not map.
     fn map_aliases(&self, mem: &mut dyn GuestMem, aliases: &[RegionAlias]) -> bool {
         aliases.iter().all(|a| {
-            let Some(backing) = self.regions.get(a.region as usize).cloned() else {
+            let Some(backing) = self.region(a.region).cloned() else {
                 return false;
             };
             let prot = PROT_READ | if a.writable { PROT_WRITE } else { 0 };
@@ -26684,19 +26979,31 @@ impl Host {
         })
     }
 
-    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
-    /// embedder's factory, as a guest mint uses, else the heap. #2111 — charged to this domain's
-    /// node whatever its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a
-    /// freeze carries no node's `channel` use.
-    pub fn rebuild_region(&self, bytes: &[u8]) -> RegionBacking {
-        let backing = match self.region_factory {
-            Some(f) => f(bytes.len()),
-            None => Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))),
-        };
+    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: a backing
+    /// as a guest mint gets one ([`Self::new_region`]). #2111 — charged to this domain's node whatever
+    /// its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a freeze carries
+    /// no node's `channel` use. #2306 — `Err`, the errno, when no backing can be had: the thaw
+    /// refuses, rather than run without the region.
+    pub fn rebuild_region(&self, bytes: &[u8]) -> Result<RegionBacking, i64> {
+        Ok(self.refill_region(self.new_region(bytes.len())?, bytes))
+    }
+
+    /// #2306 — a debugger moment's region, as [`Self::rebuild_region`] makes it, else on the heap: a
+    /// moment is the interpreter's, which any backing serves, so a seek is never refused for want of
+    /// an OS object.
+    pub(crate) fn rebuild_moment_region(&self, bytes: &[u8]) -> RegionBacking {
+        let backing = self
+            .new_region(bytes.len())
+            .unwrap_or_else(|_| Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))));
+        self.refill_region(backing, bytes)
+    }
+
+    /// `backing` holding `bytes`, charged to this domain's node past any ceiling ([`ChargedRegion`]).
+    fn refill_region(&self, backing: RegionBacking, bytes: &[u8]) -> RegionBacking {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        let cost = region_cost(bytes.len() as u64);
+        let cost = region_cost(bytes.len() as u64, backing.size());
         self.budgets.add(self.own_budget, &cost, Fits::Forced);
         Arc::new(ChargedRegion {
             backing,
@@ -26705,16 +27012,49 @@ impl Host {
         })
     }
 
+    /// #2306 — a fresh, zeroed backing of `len` bytes for a §13 region: the embedder's factory (OS
+    /// shared memory under the JIT, [`Self::set_region_factory`]), else the heap. `Err`, the errno,
+    /// when the one it uses refuses: the OS, the process's descriptor pool, or an allocation the host
+    /// cannot make. Never a panic: a guest's mint reaches it.
+    fn new_region(&self, len: usize) -> Result<RegionBacking, i64> {
+        if let Some(f) = self.region_factory {
+            return f(len);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+        bytes.resize(len, 0);
+        Ok(Arc::new(VecBacking(Mutex::new(bytes))))
+    }
+
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
     /// pages that name it.
     pub fn adopt_region(&mut self, backing: RegionBacking) -> u32 {
-        self.regions.push(backing);
-        self.regions.len() as u32 - 1
+        self.hold_region(backing)
     }
 
     /// How many §13 regions this domain holds, mapped or not.
     pub(crate) fn region_count(&self) -> usize {
-        self.regions.len()
+        self.regions.iter().flatten().count()
+    }
+
+    /// The region this domain holds as `id`, `None` for an id it never held or closed (#2358).
+    fn region(&self, id: u32) -> Option<&RegionBacking> {
+        self.regions.get(id as usize)?.as_ref()
+    }
+
+    /// #2358 — hold `backing` under the lowest id no hold names, as a grant takes the lowest free slot
+    /// of the table: what a closed region left is reused, so neither grows with a domain's history.
+    fn hold_region(&mut self, backing: RegionBacking) -> u32 {
+        match self.regions.iter().position(Option::is_none) {
+            Some(id) => {
+                self.regions[id] = Some(backing);
+                id as u32
+            }
+            None => {
+                self.regions.push(Some(backing));
+                self.regions.len() as u32 - 1
+            }
+        }
     }
 
     /// #2026 — this host's regions for a debugger checkpoint: each backing's bytes once, and the
@@ -26722,16 +27062,20 @@ impl Host {
     /// alone ([`capture_cut_regions`]): a checkpoint carries no child domain's regions, so any other
     /// holder — a child, or the embedder — is outside it, and so is a host file the region aliases.
     pub(crate) fn capture_regions(&self) -> Option<(Vec<Vec<u8>>, RegionTable)> {
-        let ids = (0..self.regions.len() as u32).collect();
+        let ids = (0..self.regions.len() as u32)
+            .filter(|&id| self.region(id).is_some())
+            .collect();
         let captured = capture_cut_regions(&[(self, ids)]).ok()?;
         let backing = self
             .regions
             .iter()
             .map(|b| {
-                captured
-                    .iter()
-                    .position(|r| r.key == region_key(b))
-                    .expect("every region of this host was captured")
+                b.as_ref().map(|b| {
+                    captured
+                        .iter()
+                        .position(|r| r.key == region_key(b))
+                        .expect("every region of this host was captured")
+                })
             })
             .collect();
         let handles = self
@@ -26756,7 +27100,7 @@ impl Host {
         self.regions = table
             .backing
             .iter()
-            .map(|&i| Arc::clone(&backings[i]))
+            .map(|i| i.map(|i| Arc::clone(&backings[i])))
             .collect();
         for &(slot, generation, region) in &table.handles {
             let s = &mut self.table[slot as usize];
@@ -26926,7 +27270,10 @@ impl Host {
                 // An index no live handle named: keep the slot so later indices line up, but install
                 // a handler that traps rather than one that silently answers.
                 None => None,
-                Some(c) => match registrar.as_mut().and_then(|r| r(&c.name, &c.state)) {
+                Some(c) => match registrar
+                    .as_mut()
+                    .and_then(|r| r(&c.name, &c.state, &self.own_node()))
+                {
                     Some(g) => Some(g),
                     None => {
                         refused.get_or_insert_with(|| c.name.clone());
@@ -27311,10 +27658,9 @@ impl Host {
             .table
             .iter()
             .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
-        let handle = slot as u32 | ((self.table[slot].generation & GEN_MASK) << CAP_LOG2);
         let data = child.self_module.as_ref().map_or(&[][..], |m| &m.data[..]);
         let lease = Lease {
-            budget: handle as i32,
+            budget: handle_of(slot as u32, self.table[slot].generation),
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
@@ -27809,12 +28155,38 @@ impl Host {
     /// host can be pointed at the same buffer (stdio inheritance via `instantiate_granted`).
     /// Idempotent (a second call returns the same sink). After promotion, new writes go to the sink;
     /// read the effective bytes via [`Host::stdout_bytes`] (`stdout` itself no longer receives them).
-    pub fn shared_stdout(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    /// #2306: what every writer appends to it is charged to this domain's node, the domain its stdout
+    /// was granted to, until it is drained.
+    pub fn shared_stdout(&mut self) -> Arc<Mutex<HostBuffer>> {
         if self.out_sink.is_none() {
-            let taken = std::mem::take(&mut self.stdout);
-            self.out_sink = Some(Arc::new(Mutex::new(taken)));
+            let sink = self.capture_sink(StreamRole::Out);
+            self.out_sink = Some(Arc::new(Mutex::new(sink)));
         }
         Arc::clone(self.out_sink.as_ref().unwrap())
+    }
+
+    /// #2306 — this host's own `stdout` (or `stderr`) and the room it holds for the guest's writes,
+    /// charged to this domain's node from the first.
+    fn capture(&mut self, role: StreamRole) -> (&mut Vec<u8>, &mut HostCharge) {
+        let unbound = match role {
+            StreamRole::Out => self.out_room.payer().is_none(),
+            _ => self.err_room.payer().is_none(),
+        };
+        let payer = unbound.then(|| self.own_node());
+        let (bytes, room) = match role {
+            StreamRole::Out => (&mut self.stdout, &mut self.out_room),
+            _ => (&mut self.stderr, &mut self.err_room),
+        };
+        if let Some(payer) = payer {
+            room.bind(&payer);
+        }
+        (bytes, room)
+    }
+
+    /// #2306 — [`Self::capture`], moved into a buffer a shared sink keeps.
+    fn capture_sink(&mut self, role: StreamRole) -> HostBuffer {
+        let (bytes, room) = self.capture(role);
+        HostBuffer::from_parts(std::mem::take(bytes), std::mem::take(room))
     }
 
     /// Install a **live stdout tee** (see [`Host::out_tee`]): `tee` is called with each `Stream(Out)`
@@ -27861,10 +28233,10 @@ impl Host {
     }
 
     /// S2 — the stderr analogue of [`Host::shared_stdout`].
-    pub fn shared_stderr(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    pub fn shared_stderr(&mut self) -> Arc<Mutex<HostBuffer>> {
         if self.err_sink.is_none() {
-            let taken = std::mem::take(&mut self.stderr);
-            self.err_sink = Some(Arc::new(Mutex::new(taken)));
+            let sink = self.capture_sink(StreamRole::Err);
+            self.err_sink = Some(Arc::new(Mutex::new(sink)));
         }
         Arc::clone(self.err_sink.as_ref().unwrap())
     }
@@ -27874,7 +28246,7 @@ impl Host {
     /// have inherited this host's stdout.
     pub fn stdout_bytes(&self) -> Vec<u8> {
         match &self.out_sink {
-            Some(s) => s.lock_unpoisoned().clone(),
+            Some(s) => s.lock_unpoisoned().to_vec(),
             None => self.stdout.clone(),
         }
     }
@@ -27882,7 +28254,7 @@ impl Host {
     /// S2 — the stderr analogue of [`Host::stdout_bytes`].
     pub fn stderr_bytes(&self) -> Vec<u8> {
         match &self.err_sink {
-            Some(s) => s.lock_unpoisoned().clone(),
+            Some(s) => s.lock_unpoisoned().to_vec(),
             None => self.stderr.clone(),
         }
     }
@@ -27892,18 +28264,25 @@ impl Host {
     /// `stdout` directly: the first stdio-inheriting child spawn *moves* this host's buffer into a
     /// shared sink ([`Host::shared_stdout`]), so a guest that spawned one would otherwise appear to
     /// have written nothing at all — its own writes included (#1234).
+    /// #2306: drained, the bytes' room is handed back.
     pub fn take_stdout(&mut self) -> Vec<u8> {
         match &self.out_sink {
-            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
-            None => std::mem::take(&mut self.stdout),
+            Some(s) => s.lock_unpoisoned().take(),
+            None => {
+                self.out_room.resize(0);
+                std::mem::take(&mut self.stdout)
+            }
         }
     }
 
     /// S2 — the stderr analogue of [`Host::take_stdout`].
     pub fn take_stderr(&mut self) -> Vec<u8> {
         match &self.err_sink {
-            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
-            None => std::mem::take(&mut self.stderr),
+            Some(s) => s.lock_unpoisoned().take(),
+            None => {
+                self.err_room.resize(0);
+                std::mem::take(&mut self.stderr)
+            }
         }
     }
     pub fn grant_exit(&mut self) -> i32 {
@@ -29099,7 +29478,7 @@ impl Host {
 
     /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
     /// table is full. The spawn path uses this rather than the panicking form: a guest chooses how
-    /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
+    /// many children it spawns, so a per-spawn grant that could exhaust the handle table would hand
     /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
     /// a lot of legitimate work).
     pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
@@ -29432,8 +29811,7 @@ impl Host {
     /// backend installs a region whose `os_fd` it can `mmap` for real hardware aliasing (the JIT
     /// side of the §13 differential). The pure-Rust [`grant_shared_region`] is the common case.
     pub fn grant_shared_region_backed(&mut self, backing: RegionBacking) -> i32 {
-        let id = self.regions.len() as u32;
-        self.regions.push(backing);
+        let id = self.hold_region(backing);
         self.grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
 
@@ -29523,7 +29901,7 @@ impl Host {
     /// handle it was re-granted, exactly as after [`apply_premap`](Self::apply_premap).
     pub fn take_premap(&mut self) -> Option<(RegionBacking, u64)> {
         let (id, off) = self.premap.take()?;
-        let backing = self.regions.get(id as usize).cloned()?;
+        let backing = self.region(id).cloned()?;
         Some((backing, off))
     }
 
@@ -29541,7 +29919,7 @@ impl Host {
         let Some((id, off)) = self.premap.take() else {
             return 0;
         };
-        let Some(backing) = self.regions.get(id as usize).cloned() else {
+        let Some(backing) = self.region(id).cloned() else {
             return EINVAL;
         };
         let len = backing.size();
@@ -30289,7 +30667,7 @@ impl Host {
     /// `Binding::JitCode` entry the guest can still `invoke`/`install`/`release`). Compaction must
     /// carry these (their trampoline pointers move, so the handle would dangle otherwise); a unit
     /// that is neither here nor occupying a table slot is dead and is reclaimed. Scans the
-    /// host-owned handle table — small (`CAP` = 256) and done only at a quiescent compaction point.
+    /// host-owned handle table — small (`CAP` = 1,024) and done only at a quiescent compaction point.
     pub fn jit_live_units(&self, domain: u32) -> Vec<u32> {
         let mut units: Vec<u32> = self
             .table
@@ -30331,8 +30709,7 @@ impl Host {
         if self.table.iter().all(|s| s.entry.is_some()) {
             return None; // table full — don't register a backing we can't hand out
         }
-        let id = self.regions.len() as u32;
-        self.regions.push(backing);
+        let id = self.hold_region(backing);
         self.try_grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
     /// A fresh host for a domain this one spawns or forks (#1978): it keeps what the embedder set
@@ -30365,7 +30742,9 @@ impl Host {
     /// §13/§14). A flat-window embedder passes an OS-shared-memory factory (e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints; without one, mints use
     /// the pure-Rust reference [`VecBacking`] (fine for the interpreter, unmappable by the JIT).
-    pub fn set_region_factory(&mut self, f: fn(usize) -> RegionBacking) {
+    /// #2306 — a factory refuses with the errno the guest gets, e.g. `-EMFILE` past the process's
+    /// descriptors: a guest's mint reaches it, so it must never panic.
+    pub fn set_region_factory(&mut self, f: fn(usize) -> Result<RegionBacking, i64>) {
         self.region_factory = Some(f);
     }
 
@@ -30374,11 +30753,30 @@ impl Host {
     /// closed / wrong-type handle is a `CapFault`.
     fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
         match self.resolve(handle, cap_id::SHARED_REGION)? {
-            Binding::SharedRegion(id) => {
-                self.regions.get(id as usize).cloned().ok_or(Trap::CapFault)
-            }
+            Binding::SharedRegion(id) => self.region(id).cloned().ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
         }
+    }
+
+    /// §13 op 5 `close` (#2358): give up `handle`, and with it this domain's hold on `region`, which
+    /// goes when no domain holds it (its [`ChargedRegion`] drop refunds the node that minted it). The
+    /// slot closes as a `Stream`'s does ([`Host::close`]), so a later use answers `-EBADF`; a hold
+    /// another of this domain's handles still names stays. `-EBUSY`, changing nothing, while `mem`
+    /// maps the region ([`GuestMem::maps_region`]): a personality that wants POSIX's
+    /// close-before-`munmap` keeps the handle until its last unmap (INVARIANTS #4).
+    fn close_region(&mut self, handle: i32, region: u32, mem: &dyn GuestMem) -> i64 {
+        if mem.maps_region(region) {
+            return EBUSY;
+        }
+        self.close(handle);
+        let named = self
+            .table
+            .iter()
+            .any(|s| matches!(s.entry, Some(Binding::SharedRegion(r)) if r == region));
+        if !named {
+            self.regions[region as usize] = None;
+        }
+        0
     }
 
     /// Close a handle (§3c): free the slot but keep its generation, so the old handle value is
@@ -31296,9 +31694,7 @@ impl Host {
                 else {
                     continue;
                 };
-                let handle = |t: &[Slot], k: usize| {
-                    ((t[k].generation & GEN_MASK) << CAP_LOG2 | k as u32) as i32
-                };
+                let handle = |t: &[Slot], k: usize| handle_of(k as u32, t[k].generation);
                 let old = handle(&child.table, i);
                 child.table[j].entry = child.table[i].entry.take();
                 child.table[j].type_id = child.table[i].type_id;
@@ -31367,7 +31763,7 @@ impl Host {
             if st.entry.is_none() {
                 continue;
             }
-            let old_h = ((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32;
+            let old_h = handle_of(slot as u32, st.generation);
             if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
                 continue;
             }
@@ -32418,7 +32814,7 @@ impl Host {
             Binding::SharedRegion(region) => {
                 // §13: alias the host-backed region into the window. `map` (op 0) at several offsets
                 // aliases the same bytes; loads/stores then go through the ordinary masked path.
-                let Some(backing) = self.regions.get(region as usize).cloned() else {
+                let Some(backing) = self.region(region).cloned() else {
                     return Ok(vec![EINVAL]);
                 };
                 let Some(mem) = mem else {
@@ -32459,6 +32855,7 @@ impl Host {
                     }
                     2 => backing.size() as i64,
                     3 => mem.region_page_size(),
+                    5 => self.close_region(handle, region, mem),
                     _ => EINVAL,
                 }])
             }
@@ -32585,15 +32982,18 @@ impl Host {
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return Ok(vec![EINVAL]);
                     }
-                    if !self
-                        .budgets
-                        .add(self.own_budget, &region_cost(len as u64), Fits::All)
-                    {
+                    let cost = region_cost(len as u64, len as u64);
+                    if !self.budgets.add(self.own_budget, &cost, Fits::All) {
                         return Ok(vec![ENOMEM]);
                     }
-                    let backing = match self.region_factory {
-                        Some(f) => f(len as usize),
-                        None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
+                    // #2306 — a backing the host cannot make is the guest's errno, its charge
+                    // handed back.
+                    let backing = match self.new_region(len as usize) {
+                        Ok(backing) => backing,
+                        Err(errno) => {
+                            self.budgets.refund_set(self.own_budget, &cost);
+                            return Ok(vec![errno]);
+                        }
                     };
                     let backing: RegionBacking = Arc::new(ChargedRegion {
                         backing,
@@ -32930,24 +33330,32 @@ impl Host {
                         (tee.lock_unpoisoned())(&bytes);
                     }
                 }
+                // #2306 — the bytes are host memory until their reader drains them, charged to the
+                // domain the stream was granted to: a write it has no room for is `-ENOMEM`.
                 if let Some(i) = sink {
                     let Some(s) = self.sinks.get(i as usize) else {
                         return ret(EINVAL);
                     };
-                    s.lock_unpoisoned().extend_from_slice(&bytes);
-                    return ret(len as i64);
+                    let fits = s.lock_unpoisoned().push(&bytes);
+                    return ret(if fits { len as i64 } else { ENOMEM });
                 }
                 let own = if role == StreamRole::Out {
                     &self.out_sink
                 } else {
                     &self.err_sink
                 };
-                match own {
-                    Some(s) => s.lock_unpoisoned().extend_from_slice(&bytes),
-                    None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
-                    None => self.stderr.extend_from_slice(&bytes),
-                }
-                ret(len as i64)
+                let fits = match own {
+                    Some(s) => s.lock_unpoisoned().push(&bytes),
+                    None => {
+                        let (buf, room) = self.capture(role);
+                        let fits = room.reserve(buf, (buf.len() + bytes.len()) as u64);
+                        if fits {
+                            buf.extend_from_slice(&bytes);
+                        }
+                        fits
+                    }
+                };
+                ret(if fits { len as i64 } else { ENOMEM })
             }
             2 => ret(0), // close: no-op in the MVP (exit reclaims all)
             _ => ret(EINVAL),
@@ -34349,7 +34757,9 @@ impl Mem {
         if len == 0 {
             return Ok(Vec::new());
         }
-        let abs = self.confine_checked(addr, 0, len as u32)?;
+        // The whole span, at its full width: an access width is a `u32`, so confining `len` as one
+        // would check only `len mod 2^32` bytes before the read below allocates `len` (#2338).
+        let abs = self.confine_span(addr, len as u64)?;
         if self.has_regions.load(Ordering::Relaxed) {
             return Ok(self.read_abs(abs, len));
         }
@@ -35776,6 +36186,13 @@ impl GuestMem for Mem {
         0
     }
 
+    fn maps_region(&self, region: u32) -> bool {
+        self.space_read()
+            .prot
+            .values()
+            .any(|p| matches!(*p, PageProt::Backed { region: r, .. } if r == region))
+    }
+
     /// §3e op 3 `page_size`: the backing-store page granularity (`self.page`, the host page) — the
     /// unit `map`/`unmap`/`protect` round to. The JIT's `MprotectWindow` reports the same host page,
     /// so the two backends agree.
@@ -35837,6 +36254,9 @@ impl GuestMem for SoleMem<'_> {
     ) -> i64 {
         self.0
             .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        self.0.maps_region(region)
     }
     fn page_size(&self) -> i64 {
         self.0.page_size()
@@ -36359,7 +36779,11 @@ mod region_minter_tests {
         // backing is the 64-byte object the handler minted.
         match host.resolve(region_h as i32, cap_id::SHARED_REGION) {
             Ok(Binding::SharedRegion(id)) => {
-                assert_eq!(host.regions[id as usize].size(), 64, "minted region size");
+                assert_eq!(
+                    host.region(id).expect("held").size(),
+                    64,
+                    "minted region size"
+                );
             }
             other => panic!("minted handle should resolve as a SharedRegion, got {other:?}"),
         }
@@ -36767,6 +37191,167 @@ mod exec_maps_tests {
 }
 
 #[cfg(test)]
+mod host_buffer_tests {
+    //! #2306 — a host buffer charges its payer's `channel` for its room, and one `maps` while that
+    //! reaches [`MAPPED_BUFFER`], all or nothing, and hands both back as it shrinks and goes.
+    use super::*;
+
+    /// A host whose own node's `channel` and `maps` ceilings are these, with nothing charged yet.
+    fn host(channel: i64, maps: i64) -> Host {
+        let mut h = Host::new();
+        h.set_grant(-1, channel, -1, maps);
+        h
+    }
+
+    fn maps(h: &Host) -> i64 {
+        h.budgets.used(h.own_budget, BUDGET_MAPS)
+    }
+
+    #[test]
+    fn a_buffer_charges_its_room_and_hands_it_back() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.push(&[1; 100]));
+        assert_eq!(h.channel_used(), 100, "exactly what its first write needs");
+        assert!(b.push(&[2; 10]));
+        assert_eq!(h.channel_used(), 200, "then by doubling");
+        assert!(b.write_at(1000, &[3]));
+        assert_eq!((b.len(), h.channel_used()), (1001, 1001));
+        assert!(
+            b[110..1000].iter().all(|&x| x == 0),
+            "a write past the end zero-fills to it"
+        );
+        b.consume(1000);
+        assert_eq!(
+            (&b[..], h.channel_used()),
+            (&[3][..], 1),
+            "a quarter empty, it shrinks"
+        );
+        drop(b);
+        assert_eq!(h.channel_used(), 0, "and gone, it holds nothing");
+    }
+
+    #[test]
+    fn a_queue_reads_back_what_was_pushed_in_order() {
+        let h = host(-1, -1);
+        let mut q = HostBuffer::new(Some(h.own_node()));
+        let (mut sent, mut out) = (0, Vec::new());
+        for round in 1..200 {
+            let chunk: Vec<u8> = (sent..sent + round % 37).map(|i| i as u8).collect();
+            sent += chunk.len();
+            assert!(q.push(&chunk));
+            let n = ((round * 7) % 41).min(q.len());
+            out.extend_from_slice(&q[..n]);
+            q.consume(n);
+            assert!(
+                h.channel_used() as usize >= q.len(),
+                "its room covers what it holds"
+            );
+        }
+        out.extend_from_slice(&q.take());
+        assert!(
+            out.iter().copied().eq((0..sent).map(|i| i as u8)),
+            "in order, none lost"
+        );
+        assert_eq!(h.channel_used(), 0, "taken, it holds nothing");
+    }
+
+    #[test]
+    fn growth_past_a_ceiling_is_refused_and_charges_nothing() {
+        let h = host(1000, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.push(&[1; 600]));
+        assert!(
+            b.push(&[1; 300]),
+            "the doubling does not fit, but what it needs does"
+        );
+        assert_eq!(h.channel_used(), 900);
+        assert!(!b.push(&[1; 101]), "a byte past the ceiling is refused");
+        assert_eq!(
+            (b.len(), h.channel_used()),
+            (900, 900),
+            "and changes nothing"
+        );
+        assert!(
+            !b.write_at(u64::MAX, &[1]),
+            "as is a write no buffer can reach"
+        );
+        assert!(b.push(&[1; 100]));
+    }
+
+    #[test]
+    fn a_buffer_large_enough_to_be_mapped_holds_one_maps() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.resize(MAPPED_BUFFER - 1));
+        assert_eq!(maps(&h), 0);
+        assert!(b.resize(MAPPED_BUFFER));
+        assert_eq!(maps(&h), 1);
+        assert!(b.resize(0));
+        assert_eq!((maps(&h), h.channel_used()), (0, 0));
+
+        let h = host(-1, 0);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.resize(MAPPED_BUFFER - 1));
+        assert!(
+            !b.resize(MAPPED_BUFFER),
+            "with no `maps` left, it stays on the heap"
+        );
+        assert_eq!(h.channel_used(), (MAPPED_BUFFER - 1) as i64);
+    }
+
+    /// A host's captured stdout is charged to its own node as the guest writes it, a write past the
+    /// ceiling is `-ENOMEM`, and draining it hands the room back. So is a sink a child shares.
+    #[test]
+    fn captured_output_is_charged_until_it_is_drained() {
+        let mut h = host(4096, -1);
+        let out = h.grant_stream(StreamRole::Out);
+        let mut win = vec![7u8; 4096];
+        let mut write = |h: &mut Host, len: i64| {
+            let mut wm = WindowMem::new(&mut win, 4096);
+            h.cap_dispatch_slots(cap_id::STREAM, 1, out, &[0, len], Some(&mut wm))
+                .expect("dispatch")[0]
+        };
+        assert_eq!(write(&mut h, 3000), 3000);
+        assert_eq!(write(&mut h, 2000), ENOMEM, "past the ceiling");
+        assert_eq!(h.take_stdout().len(), 3000);
+        assert_eq!(h.channel_used(), 0, "drained, its room is handed back");
+        let sink = h.shared_stdout();
+        assert_eq!(write(&mut h, 4096), 4096);
+        assert_eq!(
+            write(&mut h, 1),
+            ENOMEM,
+            "the sink is charged as the buffer was"
+        );
+        assert_eq!(sink.lock_unpoisoned().take().len(), 4096);
+        assert_eq!(h.channel_used(), 0);
+    }
+
+    #[test]
+    fn an_unpaid_buffer_charges_nothing_until_its_grantee_binds_it() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::forced(None, vec![7; 300]);
+        assert!(b.push(&[1; 10]));
+        assert_eq!(h.channel_used(), 0, "state its embedder keeps");
+        b.bind(&h.own_node());
+        assert_eq!(
+            h.channel_used(),
+            600,
+            "bound, its grantee pays for all it holds"
+        );
+        let other = host(-1, -1);
+        b.bind(&other.own_node());
+        assert_eq!(
+            (h.channel_used(), other.channel_used()),
+            (600, 0),
+            "the first grantee"
+        );
+        drop(b);
+        assert_eq!(h.channel_used(), 0);
+    }
+}
+
+#[cfg(test)]
 mod region_charge_tests {
     //! #2111 — a guest-minted region spends `channel` of its minter's node and every ancestor until
     //! no domain holds it.
@@ -36843,10 +37428,96 @@ mod region_charge_tests {
     #[test]
     fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
         let (parent, node, mut child, _) = child(-1);
-        let id = child.adopt_region(child.rebuild_region(&[7; 64]));
-        assert_eq!(child.regions[id as usize].read_byte(63), 7);
+        let id = child.adopt_region(child.rebuild_region(&[7; 64]).expect("rebuilt"));
+        assert_eq!(child.region(id).expect("held").read_byte(63), 7);
         assert_eq!(used(&parent, node), 64);
         child.release_memory();
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// `SharedRegion` op `op` on `h` with `args`, over `mem`.
+    fn region_op(host: &mut Host, h: i64, op: u32, args: &[i64], mem: &mut Mem) -> i64 {
+        let r = host.cap_dispatch_slots(cap_id::SHARED_REGION, op, h as i32, args, Some(mem));
+        r.expect("a region op")[0]
+    }
+
+    /// #2358 — closing a region gives up the handle and this domain's hold: the charge comes back,
+    /// and the handle answers `-EBADF` from then on, a second close included.
+    #[test]
+    fn closing_a_region_hands_it_back() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        assert!(h >= 0, "the region fits");
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(used(&parent, node), 0, "the close hands the region back");
+        let ebadf = temen_ir::errno::EBADF;
+        assert_eq!(region_op(&mut child, h, 2, &[], &mut mem), ebadf);
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), ebadf);
+    }
+
+    /// #2358 — a region the window still maps refuses to close and changes nothing; unmapped, it
+    /// closes.
+    #[test]
+    fn a_mapped_region_refuses_to_close() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        let at = 1 << 17;
+        let rw = (PROT_READ | PROT_WRITE) as i64;
+        assert_eq!(
+            region_op(&mut child, h, 0, &[at, 0, REGION as i64, rw], &mut mem),
+            0
+        );
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), EBUSY);
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the refused close changes nothing"
+        );
+        assert_eq!(
+            region_op(&mut child, h, 1, &[at, REGION as i64], &mut mem),
+            0,
+            "and the handle still works"
+        );
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// #2358 — a region another domain holds stays charged when this one closes it, and goes at
+    /// that holder's end.
+    #[test]
+    fn a_closed_region_stays_while_another_domain_holds_it() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        let mut twin = child.fork_powerbox(7, 0).expect("a simple domain forks");
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the twin still holds it"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the last holder's end hands it back"
+        );
+    }
+
+    /// #2358 — a domain that closes what it mints reuses the slot and the id: it never fills its
+    /// table, and a ceiling of one region is enough.
+    #[test]
+    fn a_domain_that_closes_what_it_mints_never_fills_its_table() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        for i in 0..2 * CAP {
+            let h = mint(&mut child, space, REGION);
+            assert!(h >= 0, "mint {i}: {h}");
+            assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        }
+        assert_eq!(child.regions.len(), 1, "one id, reused");
         assert_eq!(used(&parent, node), 0);
     }
 }
@@ -37409,13 +38080,14 @@ mod fork_powerbox_tests {
             host.resolve(hr, cap_id::SHARED_REGION),
             twin.resolve(hr, cap_id::SHARED_REGION),
         ) {
-            (Ok(Binding::SharedRegion(a)), Ok(Binding::SharedRegion(b))) => {
-                (a as usize, b as usize)
-            }
+            (Ok(Binding::SharedRegion(a)), Ok(Binding::SharedRegion(b))) => (a, b),
             other => panic!("region handle should resolve in both, got {other:?}"),
         };
         assert!(
-            Arc::ptr_eq(&host.regions[hid], &twin.regions[tid]),
+            Arc::ptr_eq(
+                host.region(hid).expect("held"),
+                twin.region(tid).expect("held")
+            ),
             "the twin shares the very same region backing (fork shares shared memory)"
         );
         // But the tables are independent objects: a later grant into the parent is not in the twin.
@@ -37977,11 +38649,14 @@ mod gen_recycle_tests {
         let slot = (handle0 as u32 as usize) & (CAP - 1);
         assert!(h.resolve(handle0, cap_id::EXIT).is_ok());
 
-        // Force the counter to the last value before wrap, then close + regrant: the new handle is
-        // issued at generation `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case the old
-        // `s.generation == gen` compare got wrong (the slot would have died forever).
-        h.table[slot].generation = (1u32 << GEN_BITS) - 1;
+        // Force the counter to two before the wrap and regrant up to the last generation, then close
+        // + regrant: the counter passes `2^GEN_BITS`, whose low `GEN_BITS` are 0 — exactly the case
+        // the old `s.generation == gen` compare got wrong (the slot would have died forever). That
+        // masked 0 is skipped, so the handle is issued at masked generation 1 (#2365).
+        h.table[slot].generation = (1u32 << GEN_BITS) - 2;
         h.close(handle0);
+        let last = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        h.close(last);
         let handle_wrap = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
         assert_eq!(
             (handle_wrap as u32 as usize) & (CAP - 1),
@@ -37990,20 +38665,73 @@ mod gen_recycle_tests {
         );
         assert_eq!(
             h.table[slot].generation,
-            1u32 << GEN_BITS,
-            "counter wrapped past GEN_BITS"
+            (1u32 << GEN_BITS) + 1,
+            "counter wrapped past GEN_BITS, skipping the masked 0"
         );
         assert!(
             h.resolve(handle_wrap, cap_id::EXIT).is_ok(),
             "slot must recycle cleanly when the generation counter wraps"
         );
 
-        // The stale pre-wrap handle is still inert (a forged/stale index re-checks the generation and
-        // faults), so recycling did not reopen a use-after-close hole.
-        assert!(matches!(
-            h.resolve(handle0, cap_id::EXIT),
-            Err(Trap::CapFault)
-        ));
+        // The handle closed before the wrap is still inert (a forged/stale index re-checks the
+        // generation and faults), so recycling did not reopen a use-after-close hole.
+        assert!(matches!(h.resolve(last, cap_id::EXIT), Err(Trap::CapFault)));
+        // A handle a whole cycle stale is the wrap D37 documents: generation 1 again, so it
+        // re-selects the slot's current grant, re-checked by `type_id` at the call.
+        assert_eq!(handle0, handle_wrap, "a full cycle of regrants aliases");
+    }
+
+    /// #2365 — a handle at any generation is positive and nonzero: a guest can tell it from a
+    /// `-errno`, a grant record never reads it as a tag, and a spawn record never reads it as "no
+    /// budget". Checked at the top generation and across the wrap after it, on slot 0, where a wrap
+    /// to masked generation 0 would have made the handle `0`.
+    #[test]
+    fn a_handle_is_positive_nonzero_and_never_a_tag_at_any_generation() {
+        let mut h = Host::new();
+        let first = h.try_grant(cap_id::EXIT, Binding::Exit).expect("grant");
+        assert_eq!(
+            first,
+            1 << CAP_LOG2,
+            "a fresh table's first grant: slot 0, generation 1"
+        );
+        let ok = |handle: i32| {
+            handle > 0 && serve_live_export(handle).is_none() && handle as u32 != GRANT_EMPTY
+        };
+        h.table[0].generation = GEN_MASK - 1;
+        h.close(first);
+        let top = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        assert_eq!(
+            top as u32,
+            GEN_MASK << CAP_LOG2,
+            "the top generation, slot 0"
+        );
+        assert!(ok(top), "{top:#x} at the top generation");
+        h.close(top);
+        let wrapped = h.try_grant(cap_id::EXIT, Binding::Exit).expect("regrant");
+        assert_eq!(wrapped, 1 << CAP_LOG2, "the wrap skips generation 0");
+        assert!(ok(wrapped), "{wrapped:#x} across the wrap");
+        assert!(matches!(h.resolve(top, cap_id::EXIT), Err(Trap::CapFault)));
+    }
+
+    /// #2365 — a domain holds 1,024 live capabilities, and a grant past that is refused, not a
+    /// panic; a close frees a slot for the next grant.
+    #[test]
+    fn a_table_holds_1024_live_capabilities_and_reuses_a_closed_slot() {
+        let mut h = Host::new();
+        let live: Vec<i32> = (0..CAP)
+            .map(|i| {
+                h.try_grant(cap_id::EXIT, Binding::Exit)
+                    .unwrap_or_else(|| panic!("{i}"))
+            })
+            .collect();
+        assert_eq!(live.len(), 1024);
+        assert!(h.try_grant(cap_id::EXIT, Binding::Exit).is_none(), "full");
+        h.close(live[700]);
+        let again = h
+            .try_grant(cap_id::EXIT, Binding::Exit)
+            .expect("a closed slot is reused");
+        assert_eq!((again as u32 as usize) & (CAP - 1), 700);
+        assert_ne!(again, live[700], "with a new generation");
     }
 }
 
