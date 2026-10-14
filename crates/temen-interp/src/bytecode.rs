@@ -11871,7 +11871,7 @@ impl VTask {
         vm.room = RegsRoom::new(vm.room.charge.payer().cloned());
         vm.stack = Vec::new();
         vm.scratch = Vec::new();
-        vm.setjmp_points = std::collections::BTreeMap::new();
+        vm.rare = None;
         vm.sig_handler_stack = Vec::new();
         self.chain = Vec::new();
         self.active_invoke = None;
@@ -15391,7 +15391,7 @@ impl SchedCore {
                 let result: i64 = 'fork: {
                     // The running handler's dispatch ticket names the parked caller; outside a
                     // handler there is none → `-EINVAL`, exactly as the oracle.
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
                         break 'fork super::EINVAL;
                     };
                     // The server (this task) is the callee the caller parked on. In the fork
@@ -15514,7 +15514,7 @@ impl SchedCore {
                 // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
                 // mint (the handler's own reply carries it); `-EINVAL` outside a handler. Never a hang.
                 let result: i64 = 'reap: {
-                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket else {
+                    let Some((ticket, _)) = tasks[ti].vm.vt.active.serve_ticket() else {
                         break 'reap super::EINVAL;
                     };
                     let Some(server_env) = tasks[ti].env else {
@@ -15590,7 +15590,7 @@ impl SchedCore {
                 // (`env: None` — the shell / `bash -c` replacing itself) and a **fork-twin** exec
                 // (`env: Some` — bash forking then exec'ing an external command) are serviced; they
                 // differ only in where the rebuilt activation's window/host/table live.
-                let clean = tasks[ti].vm.vt.active.serve_ticket.is_none()
+                let clean = tasks[ti].vm.vt.active.serve_ticket().is_none()
                     && tasks[ti].vm.vt.active_id == ROOT_FIBER
                     && !root.lock_unpoisoned().is_durable();
                 if !clean {
@@ -15687,7 +15687,7 @@ impl SchedCore {
                     tasks[ti].deliver(dst, Reg::from_i64(temen_ir::errno::ENOSYS));
                     return None;
                 }
-                if tasks[ti].vm.vt.active.serve_ticket.is_some() {
+                if tasks[ti].vm.vt.active.serve_ticket().is_some() {
                     tasks[ti].deliver(dst, Reg::from_i64(super::EINVAL));
                     return None;
                 }
@@ -18621,15 +18621,6 @@ struct Vm {
     pc: usize,
     /// Edge-copy staging buffer (parallel-copy safety); kept here so it is reused across resumes.
     scratch: Vec<Reg>,
-    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
-    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
-    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
-    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
-    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
-    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
-    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
-    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
-    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
     /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
     /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
     /// per-context SP word. The root's is context 0 (`ShadowArena::region_base(0)`); a fiber's its `slot + 1`. Set when
@@ -18651,13 +18642,6 @@ struct Vm {
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
     /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
     jit_page_checked: bool,
-    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
-    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
-    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
-    /// re-execution that settles its result — and the count of dispatches completed by the current
-    /// `svc.poll` activation.
-    serve_ticket: Option<(u64, usize)>,
-    serve_count: i64,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
     /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
@@ -18679,7 +18663,35 @@ struct Vm {
     /// (bash's `throw_to_top_level`) pops every crossed entry the same way. Bounded to
     /// `MAX_SIG_HANDLER_NEST` nested deliveries. Empty on any run without a signal personality.
     sig_handler_stack: Vec<usize>,
+    /// [`VmRare`], made on first use.
+    rare: Option<Box<VmRare>>,
 }
+
+/// #2336 — the part of a [`Vm`] only `setjmp`/`longjmp` and the serve loop use, made on first use.
+/// A fiber's start and return move its `Vm` by value about a dozen times, and glibc's `memcpy` costs
+/// about twice as much past 256 bytes, so the `Vm` is held to that (below) and what most never touch
+/// stays off it.
+#[derive(Clone, Default)]
+struct VmRare {
+    /// `<setjmp.h>` checkpoints — `setjmp` records its activation's resume point here, keyed by a
+    /// per-`setjmp` **token** it writes into the guest `jmp_buf`'s opaque first 8 bytes (#1062);
+    /// `longjmp` reads the token back from the (possibly-copied) buffer and looks it up. No register
+    /// snapshot is needed (unlike the tree-walker): the flat per-function register layout gives each
+    /// block its own slots, so the `setjmp` block's values survive a deeper call in place.
+    /// Token-keying (vs the old address key) is what lets a guest *copy* a `jmp_buf` — bash's
+    /// `COPY_PROCENV` memcpy of `top_level` — carry the checkpoint identity with the bytes; bounded
+    /// by pruning checkpoints whose `setjmp` activation has returned (`SetJmp` op).
+    setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
+    /// §3.6 serve-loop core (I36 slice 1): the in-flight handler's completion ticket and the depth
+    /// of the serve frame that admitted it (`stack.len()` there) — `Some` between admitting a
+    /// handler activation (whose return linkage rewinds into the `SvcPoll` op) and the
+    /// re-execution that settles its result — and the count of dispatches completed by the current
+    /// `svc.poll` activation.
+    serve_ticket: Option<(u64, usize)>,
+    serve_count: i64,
+}
+
+const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
 
 /// #1958 — the deepest one `Vm`'s calls may nest (its return stack), past which a call traps
 /// `StackOverflow`: the engine's own ceiling, as wasm traps on stack exhaustion. Above the depth the
@@ -18723,6 +18735,32 @@ impl RegsRoom {
             held: 0,
         }
     }
+
+    /// [`Vm::grow_regs`] for `regs`, the file this charges for.
+    fn grow(&mut self, regs: &mut Vec<Reg>, need: usize) -> Result<(), Trap> {
+        if need > MAX_REG_SLOTS {
+            return Err(Trap::StackOverflow);
+        }
+        if regs.len() < need {
+            if need > regs.capacity() {
+                // #2336 — the guest's calls size the file, so its room is charged to the vCPU's
+                // domain before it is allocated, then allocated fallibly: doubled, or exactly what
+                // this call needs when that does not fit. Neither is `StackOverflow`, the trap an
+                // exhausted stack is on every engine.
+                let cap = grown_capacity(regs.capacity(), need, MAX_REG_SLOTS);
+                let room = [cap, need]
+                    .into_iter()
+                    .find(|&slots| self.charge.resize(reg_bytes(slots)))
+                    .ok_or(Trap::StackOverflow)?;
+                if regs.try_reserve_exact(room - regs.len()).is_err() {
+                    self.charge.resize(reg_bytes(regs.capacity()));
+                    return Err(Trap::StackOverflow);
+                }
+            }
+            regs.resize(need, Reg::default());
+        }
+        Ok(())
+    }
 }
 
 impl Clone for RegsRoom {
@@ -18765,28 +18803,17 @@ impl Vm {
     /// [`MAX_REG_SLOTS`] it traps `StackOverflow` before it allocates anything (#1958); below it, it
     /// grows no further than the bound (#2082).
     fn grow_regs(&mut self, need: usize) -> Result<(), Trap> {
-        if need > MAX_REG_SLOTS {
-            return Err(Trap::StackOverflow);
-        }
-        if self.regs.len() < need {
-            if need > self.regs.capacity() {
-                // #2336 — the guest's calls size the file, so its room is charged to the vCPU's
-                // domain before it is allocated, then allocated fallibly: doubled, or exactly what
-                // this call needs when that does not fit. Neither is `StackOverflow`, the trap an
-                // exhausted stack is on every engine.
-                let cap = grown_capacity(self.regs.capacity(), need, MAX_REG_SLOTS);
-                let room = [cap, need]
-                    .into_iter()
-                    .find(|&slots| self.room.charge.resize(reg_bytes(slots)))
-                    .ok_or(Trap::StackOverflow)?;
-                if self.regs.try_reserve_exact(room - self.regs.len()).is_err() {
-                    self.room.charge.resize(reg_bytes(self.regs.capacity()));
-                    return Err(Trap::StackOverflow);
-                }
-            }
-            self.regs.resize(need, Reg::default());
-        }
-        Ok(())
+        self.room.grow(&mut self.regs, need)
+    }
+
+    /// [`VmRare`], made on first use.
+    fn rare(&mut self) -> &mut VmRare {
+        self.rare.get_or_insert_default()
+    }
+
+    /// The serve loop's in-flight ticket and the depth of the frame that admitted it.
+    fn serve_ticket(&self) -> Option<(u64, usize)> {
+        self.rare.as_ref()?.serve_ticket
     }
 
     /// #2336 — hold again, past any ceiling, what the `Vm` this copies held ([`RegsRoom`]): a copy
@@ -18809,31 +18836,29 @@ impl Vm {
     /// trace or a test run no budget governs).
     fn new(c: &Compiled, entry: usize, args: &[Value], payer: Option<NodeRef>) -> Result<Vm, Trap> {
         let prog = c.progs.get(entry).ok_or(Trap::Malformed)?;
-        let mut vm = Vm {
-            regs: Vec::new(),
-            room: RegsRoom::new(payer),
+        let (mut regs, mut room) = (Vec::new(), RegsRoom::new(payer));
+        room.grow(&mut regs, prog.nslots as usize)?;
+        for (i, a) in args.iter().enumerate() {
+            *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
+        }
+        Ok(Vm {
+            regs,
+            room,
             stack: Vec::new(),
             module: 0,
             cur: entry,
             base: 0,
             pc: 0,
             scratch: Vec::new(),
-            setjmp_points: std::collections::BTreeMap::new(),
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             jit_module: 0,
             jit_page_checked: false,
-            serve_ticket: None,
-            serve_count: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
-        };
-        vm.grow_regs(prog.nslots as usize)?;
-        for (i, a) in args.iter().enumerate() {
-            *vm.regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
-        }
-        Ok(vm)
+            rare: None,
+        })
     }
 
     /// Write a value to a frame-relative slot of the *current* (persisted) activation window. Used
@@ -19336,11 +19361,12 @@ impl Vm {
                     // would trap regardless. A copied-but-live checkpoint sits at a still-live
                     // activation (`depth <= stack.len()`) and is retained.
                     let live = self.stack.len();
-                    self.setjmp_points.retain(|_, p| p.depth <= live);
-                    self.setjmp_points.insert(
+                    let points = &mut self.rare().setjmp_points;
+                    points.retain(|_, p| p.depth <= live);
+                    points.insert(
                         token,
                         ByteSetJmp {
-                            depth: self.stack.len(),
+                            depth: live,
                             module,
                             cur,
                             base,
@@ -19365,7 +19391,9 @@ impl Vm {
                         .ok_or(Trap::Malformed)?
                         .load_scalar(buf_addr, 0, LoadOp::I64)?
                         .i64() as u64;
-                    let point = *self.setjmp_points.get(&token).ok_or(Trap::Malformed)?;
+                    let point = *(self.rare.as_ref())
+                        .and_then(|r| r.setjmp_points.get(&token))
+                        .ok_or(Trap::Malformed)?;
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
@@ -19979,17 +20007,17 @@ impl Vm {
                     // than the serve frame) is a probeable refusal that serves nothing — the serve
                     // loop is the domain's outermost dispatcher.
                     if self
-                        .serve_ticket
+                        .serve_ticket()
                         .is_some_and(|(_, depth)| self.stack.len() > depth)
                     {
                         self.regs[base + *dst as usize] = Reg::from_i64(super::EINVAL);
                         pc += 1;
                         continue;
                     }
-                    if let Some((t, _)) = self.serve_ticket.take() {
+                    if let Some((t, _)) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
                         let v = self.regs[base + *dst as usize].i64();
                         host.with(|p| p.svc_results.insert(t, v));
-                        self.serve_count += 1;
+                        self.rare().serve_count += 1;
                     }
                     // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
                     // makes **no progress** — it delivers an inert sentinel so its trailing poll
@@ -19997,7 +20025,7 @@ impl Vm {
                     // re-executes the drain on thaw (#1904).
                     if is_unwinding(mem) && host.with(|p| p.is_durable()) {
                         self.regs[base + *dst as usize] = Reg::from_i64(0);
-                        self.serve_count = 0;
+                        self.rare().serve_count = 0;
                         pc += 1;
                         continue;
                     }
@@ -20031,7 +20059,8 @@ impl Vm {
                         for (i, (s, ty)) in d.args.iter().zip(params.iter()).enumerate() {
                             self.regs[nb + i] = Reg::from_value(slot_to_val(*ty, *s));
                         }
-                        self.serve_ticket = Some((d.ticket, self.stack.len()));
+                        let depth = self.stack.len();
+                        self.rare().serve_ticket = Some((d.ticket, depth));
                         self.stack
                             .push((module, cur, base, pc, base + *dst as usize));
                         cur = fidx;
@@ -20045,7 +20074,10 @@ impl Vm {
                         // form's no-progress answer) instead of parking on a queue no client can
                         // fill. Consulted only where it would park, so queued work is served first
                         // and the token outlives it.
-                        if *wait && self.serve_count == 0 && !host.with(Host::take_client_gone) {
+                        if *wait
+                            && self.rare().serve_count == 0
+                            && !host.with(Host::take_client_gone)
+                        {
                             // svc.wait with no progress: persist the cursor AT this op (a wake
                             // re-executes the whole drain) and park the task on its domain.
                             self.module = module;
@@ -20055,8 +20087,8 @@ impl Vm {
                             return Ok(Outcome::SvcWait);
                         }
                         // Queue drained: deliver the completed count and close the activation.
-                        self.regs[base + *dst as usize] = Reg::from_i64(self.serve_count);
-                        self.serve_count = 0;
+                        let served = std::mem::take(&mut self.rare().serve_count);
+                        self.regs[base + *dst as usize] = Reg::from_i64(served);
                         pc += 1;
                     }
                 }

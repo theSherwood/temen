@@ -20796,11 +20796,13 @@ impl HostCharge {
 
     /// Hold `bytes` from now on: `false`, holding what it held, when growing to them would pass a
     /// ceiling or the pool.
+    #[inline]
     pub fn resize(&mut self, bytes: u64) -> bool {
         self.set(bytes, Fits::All)
     }
 
     /// [`Self::resize`] past every limit: what a restore rebuilds, which existed before it.
+    #[inline]
     pub fn force(&mut self, bytes: u64) {
         self.set(bytes, Fits::Forced);
     }
@@ -20844,6 +20846,7 @@ impl HostCharge {
     }
 
     /// What holding `bytes` costs: its `channel` (or a stack's `mem`), and its `maps`.
+    #[inline]
     fn cost(&self, bytes: u64) -> [(usize, u64); 2] {
         let maps = (BUDGET_MAPS, u64::from(bytes >= MAPPED_BUFFER));
         match self.stack {
@@ -20855,10 +20858,12 @@ impl HostCharge {
         }
     }
 
+    #[inline]
     fn set(&mut self, bytes: u64, fits: Fits) -> bool {
-        if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
+        // A stack's first `FIBER_STACK` costs nothing, so most never reach the tree.
+        let (was, now) = (self.cost(self.bytes), self.cost(bytes));
+        if let Some(n) = self.payer.as_ref().filter(|_| was != now) {
             // Each dimension's cost only grows with the bytes, so the difference is one-signed.
-            let (was, now) = (self.cost(self.bytes), self.cost(bytes));
             let diff: [(usize, u64); 2] =
                 std::array::from_fn(|i| (was[i].0, was[i].1.abs_diff(now[i].1)));
             if bytes < self.bytes {
