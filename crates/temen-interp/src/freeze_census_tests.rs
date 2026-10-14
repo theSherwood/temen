@@ -33,9 +33,7 @@ impl Fixture {
     fn root_seat(&self) -> Seat<'_> {
         Seat {
             id: 0,
-            nested_child: false,
             threads: &self.threads,
-            nested_children: &[],
             child_hosts: &self.child_hosts,
             child_freeze: &self.child_freeze,
             host: &self.root,
@@ -230,24 +228,6 @@ fn a_freeze_re_admits_a_reply_wait_and_records_its_ticket() {
     assert!(matches!(v.pending, Some(Pending::Abandoned)));
     drop(s);
     assert_eq!(f.root.lock_unpoisoned().reply_waits(), vec![(3, 2)]);
-}
-
-/// #1901 — except in a nested carve, whose powerbox rides without the record: its thaw would issue
-/// the call twice.
-#[test]
-fn a_reply_wait_in_a_nested_carve_declines() {
-    let f = Fixture::new();
-    let SchedRef::Real(rs) = &f.sched else {
-        unreachable!()
-    };
-    let mut v = parked_vcpu(&f, 5);
-    v.reply_ticket = Some(2);
-    v.freeze_sink = Some(Arc::clone(&f.root));
-    rs.lock().ticket_waiters.insert((1, 2), Waiter::VCpu(v));
-    assert_eq!(
-        f.census(&f.root_seat()),
-        Some(DeclineCause::Parked(ParkSite::Reply))
-    );
 }
 
 /// A vCPU parked in an indefinite `atomic.wait`: the park that lets freeze-on-quiesce fire.

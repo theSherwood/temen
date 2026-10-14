@@ -196,6 +196,7 @@ dependencies = [
  "temen-verify",
  "temen-wasm-jit",
  "wasmi",
+ "wat",
 ]
 
 [[package]]

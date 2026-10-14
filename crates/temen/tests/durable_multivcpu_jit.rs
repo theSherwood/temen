@@ -586,7 +586,6 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
                 fibers: seed_fibers.to_vec(),
                 vcpus: seed_vcpus.to_vec(),
                 root_sp: jroot_sp,
-                ..Default::default()
             },
             ..Default::default()
         },
@@ -1174,7 +1173,6 @@ fn a_trigger_that_fires_in_a_joined_child_freezes_identically_on_both_engines() 
                 fibers: jfibers.to_vec(),
                 vcpus: jvcpus.to_vec(),
                 root_sp: Some(jroot_sp),
-                ..Default::default()
             },
             ..Default::default()
         },

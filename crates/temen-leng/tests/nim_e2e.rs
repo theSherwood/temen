@@ -93,8 +93,12 @@ fn compile_to_leng(nim_path: &str, source: &str) -> Vec<(String, String)> {
 /// evaluates at compile time (and `std/macros` routes `parsegen`/`regex` through plugins of its own).
 /// Each helper has its own `<stem>/<stem>.linkmanifest.nif`, and sweeping its modules in too fails
 /// the link with `DuplicateSymbol("main")`. Empty when no manifest names `output`.
+///
+/// A backend writes under its own directory, `<nimcache>/c/` for `nimony c` (nim-lang/nimony#2616):
+/// each program's build directory, and beside them the `.x.nif` of every module but a main one.
 fn program_modules(nimcache: &std::path::Path, output: &str, nif: &str) -> Vec<(String, String)> {
-    let manifest = std::fs::read_dir(nimcache)
+    let backend = nimcache.join("c");
+    let manifest = std::fs::read_dir(&backend)
         .into_iter()
         .flatten()
         .flatten()
@@ -114,8 +118,8 @@ fn program_modules(nimcache: &std::path::Path, output: &str, nif: &str) -> Vec<(
         .filter_map(|f| std::path::Path::new(f).file_name()?.to_str())
         .map(|stem| {
             // A program's `.c.nif` are all in its build directory. Of its `.x.nif`, only its own
-            // module's is; the rest are in `nimcache`.
-            let file = [build_dir.as_path(), nimcache]
+            // module's is; the rest are the backend's.
+            let file = [build_dir.as_path(), backend.as_path()]
                 .map(|d| d.join(format!("{stem}.{nif}.nif")))
                 .into_iter()
                 .find(|p| p.exists())
@@ -3205,7 +3209,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
 /// edge rather than the sizing.
 ///
 /// **Knobs**, for bisecting from the outside: `NIM_NIFLER2_SRC` picks a different in-tree program
-/// (a smaller probe against the same parser, or another phase — `src/hexer/hexer.nim`,
+/// (a smaller probe against the same parser, or another phase — `src/lengc/shoggoth/shoggoth.nim`,
 /// `src/nimony/nimsem.nim`), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SEED` the inputs to
 /// seed into both the guest memfs and the oracle's cwd (so a phase is driven over **real work**
 /// rather than an argv it rejects), `NIM_NIFLER2_OUT` the file to compare, `NIM_NIFLER2_SL` the

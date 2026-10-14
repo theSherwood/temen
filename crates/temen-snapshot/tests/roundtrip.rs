@@ -6,9 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{
-    run_capture_reserved_with_host, Attestation, FreezeScope, FrozenDetached, Host, Value,
-};
+use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -1458,7 +1456,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
         h.grant_budget(-1, 1 << 20, -1),
     ]
     .map(Value::I32);
-    h.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    h.grant_freeze_authority();
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 5_000_000u64;

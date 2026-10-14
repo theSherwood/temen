@@ -59,10 +59,6 @@ const RECHECK: Duration = Duration::from_millis(20);
 type LimitedEntry =
     extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64, u64);
 
-/// A **carve** child's copy-back: the parent is the superset, so the child's window image is
-/// written back into its carve at finish. `None` for a detached child (its window is its own).
-pub(crate) type CopyBack = Box<dyn FnOnce(&[u8]) + Send>;
-
 /// A task's one-shot teardown: release the child powerbox, return its lane and its window's bytes.
 /// Its argument says whether a freeze captured the child (#1971): a child that unwound for a freeze
 /// is carried by the artifact, not ended, so its window stays charged, as on the interpreter.
@@ -84,9 +80,7 @@ pub(crate) struct ChildTask {
     /// The child's own fiber execution context — published as `CURRENT_RT` for each resume so the
     /// futex thunk's "inside a fiber ⇒ park the fiber" arm sees this task.
     rt: Box<FiberRuntime>,
-    /// The child's window — its own for a detached child, a private image of the parent's carve
-    /// for a carve child (seeded by `init`, written back by `copy_back`). Moves with the task
-    /// (`GuestWindow: Send`).
+    /// The child's own window (seeded by `init`). Moves with the task (`GuestWindow: Send`).
     window: mem::GuestWindow,
     fault: (usize, usize),
     /// The task's own instance context — the child's powerbox, the parent's kill-path cell, its own
@@ -108,10 +102,6 @@ pub(crate) struct ChildTask {
     /// on whichever worker picks it up ([`vcpu_tls::serve_handlers`]).
     serve_handlers: u32,
     done: Arc<ChildDone>,
-    /// A **carve** child's copy-back: runs once at finish over the task's window image, before
-    /// `teardown` — the parent (superset) then sees the child's writes. `None` for a detached child
-    /// (its window is its own; nothing to copy anywhere).
-    copy_back: Option<CopyBack>,
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
     teardown: Option<Teardown>,
@@ -160,7 +150,6 @@ impl ChildTask {
         n_results: usize,
         chain: Vec<(usize, i64)>,
         done: Arc<ChildDone>,
-        copy_back: Option<CopyBack>,
         teardown: Teardown,
         node: Option<Arc<dyn crate::BudgetNode>>,
     ) -> Result<ChildTask, Teardown> {
@@ -250,7 +239,6 @@ impl ChildTask {
             tls: 0,
             serve_handlers: 0,
             done,
-            copy_back,
             teardown: Some(teardown),
             dom: None,
             node,
@@ -317,21 +305,20 @@ impl ChildTask {
 
     /// Open the window for the host's read of it: the guest may have closed pages through the Memory
     /// capability (`GuestWindow::restore_rw`). #2286 — when the OS refuses, the process cannot hold
-    /// the child's window, so the child ends with `ThreadFault` (unless it trapped already) and
-    /// nothing reads the window: its copy-back is dropped, a capture needs a child that did not
-    /// trap, and [`Self::root_unwound`] reads the trap first.
+    /// the child's window, so the child ends refused ([`Self::end_refused`]) and nothing reads the
+    /// window: a capture needs a child that did not trap, and [`Self::root_unwound`] reads the trap
+    /// first.
     fn open_for_host(&mut self) {
         if !self.window.restore_rw() {
             self.end_refused();
         }
     }
 
-    /// The child ends with `ThreadFault`, unless it trapped already, and its window is not copied
-    /// back: the host could not read it (#2286, #2318).
-    fn end_refused(&mut self) {
+    /// The child ends with `ThreadFault`, unless it trapped already: the host could not read its
+    /// window (#2286, #2318).
+    fn end_refused(&self) {
         let fault = TrapKind::ThreadFault as i64;
         let _ = (self.vm.trap).compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
-        self.copy_back = None;
     }
 
     /// #1361 step 4 — what a durable child whose root unwound for a freeze leaves for its parent's
@@ -374,7 +361,6 @@ impl ChildTask {
             residue: crate::DurableResidue {
                 fibers,
                 vcpus,
-                nested: Vec::new(),
                 root_sp: Some(root_sp),
             },
         })
@@ -1009,8 +995,8 @@ impl ChildExec {
         if let Some(d) = &task.dom {
             d.join_all(false);
         }
-        // The host reads the window for a durable child's state and capture, and for a copy-back.
-        if task.done.durable.is_some() || task.copy_back.is_some() {
+        // The host reads a durable child's window, for its state and its capture.
+        if task.done.durable.is_some() {
             task.open_for_host();
         }
         let unwound = task.root_unwound();
@@ -1054,9 +1040,6 @@ impl ChildExec {
         // #2112 — the child's domain has ended: its fibers' charges go back before its parent can
         // learn of the end, as its window's do in `teardown`.
         task.rt.table().release_charges();
-        if let Some(c) = task.copy_back.take() {
-            c(task.window.rw_mut());
-        }
         if let Some(t) = task.teardown.take() {
             t(captured);
         }
@@ -1079,15 +1062,11 @@ impl ChildExec {
     /// #1469 — the root of a task whose vCPUs still run has returned: publish its outcome now, as
     /// the oracle does at the root's completion (a `join` of the child returns), and drop it from
     /// the run's live count. Its window and powerbox stay until the vCPUs end ([`Self::finish`]).
-    /// A carve child's copy-back happens here, so the parent's join sees the child's writes; what
-    /// the vCPUs write after it stays in the child's image. A durable root that unwound for a freeze
+    /// A durable root that unwound for a freeze
     /// has no outcome yet (#2010): its vCPUs are unwinding too, and the capture `finish` takes once
     /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
-        if task.copy_back.is_some() {
-            task.open_for_host();
-        }
         let trap = task.vm.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
@@ -1095,9 +1074,6 @@ impl ChildExec {
             if let Some(d) = &task.dom {
                 d.wake_own_parked();
             }
-        }
-        if let Some(c) = task.copy_back.take() {
-            c(task.window.rw_mut());
         }
         if !task.root_unwound() {
             task.done.publish(result, trap, self.domain());

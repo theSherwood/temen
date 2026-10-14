@@ -1828,8 +1828,8 @@ with "debugger observes from outside." Nesting (§14) makes a parent a natural d
 child. (That rests on the carve child's parent-readable window, which is being retired —
 INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant, and the
 owner decided on 2026-10-01 (#1866) which grant: **inspecting a detached child is the freeze
-grant**, since a snapshot is a read. An ancestor may inspect a child it holds
-`FreezeScope::DetachedProgeny` over and that attests `freeze_exposed`; a child nobody may freeze is
+grant**, since a snapshot is a read. An ancestor may inspect a child it holds freeze authority
+over and that attests `freeze_exposed`; a child nobody may freeze is
 uninspectable. No domain-held inspection surface exists: D-DBG-5 keeps the `Inspector` host-only,
 and none is built until a consumer needs one (owner, 2026-10-02, #1866), so that grant is the gate
 for the first one. The platform's debugger holds authority over every domain and reads, writes and
