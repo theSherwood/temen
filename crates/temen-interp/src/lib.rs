@@ -20754,16 +20754,34 @@ pub const TABLE_ENTRY: u64 = 128;
 /// `channel`, and one `maps` while those reach [`MAPPED_BUFFER`]. Growing is all or nothing, refused
 /// at any ceiling or at the process's pool of mappings; shrinking hands the difference back, and
 /// dropping it the rest. One with no payer charges nothing: state an embedder keeps for itself.
+/// #2336 — the same holds for a bytecode vCPU's register file, as `mem` ([`HostCharge::stack`]).
 #[derive(Default)]
 pub struct HostCharge {
     payer: Option<NodeRef>,
     bytes: u64,
+    stack: bool,
 }
 
 impl HostCharge {
     /// One that holds nothing yet, charging `payer` as it grows.
     pub fn new(payer: Option<NodeRef>) -> HostCharge {
-        HostCharge { payer, bytes: 0 }
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: false,
+        }
+    }
+
+    /// #2336 — one for a vCPU's stack as an engine keeps it in host memory (the bytecode engine's
+    /// register file): its bytes past the [`temen_ir::FIBER_STACK`] a vCPU's own charge already
+    /// pays for are `mem`, which a stack is on every engine, and it holds one `maps` from
+    /// [`MAPPED_BUFFER`], as any buffer does.
+    pub fn stack(payer: Option<NodeRef>) -> HostCharge {
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: true,
+        }
     }
 
     /// Who it charges.
@@ -20825,14 +20843,24 @@ impl HostCharge {
         }
     }
 
+    /// What holding `bytes` costs: its `channel` (or a stack's `mem`), and its `maps`.
+    fn cost(&self, bytes: u64) -> [(usize, u64); 2] {
+        let maps = (BUDGET_MAPS, u64::from(bytes >= MAPPED_BUFFER));
+        match self.stack {
+            false => [(BUDGET_CHANNEL, bytes), maps],
+            true => [
+                (BUDGET_MEM, bytes.saturating_sub(temen_ir::FIBER_STACK)),
+                maps,
+            ],
+        }
+    }
+
     fn set(&mut self, bytes: u64, fits: Fits) -> bool {
         if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
-            let maps = |b: u64| u64::from(b >= MAPPED_BUFFER);
-            let (lo, hi) = (self.bytes.min(bytes), self.bytes.max(bytes));
-            let diff = [
-                (BUDGET_CHANNEL, hi - lo),
-                (BUDGET_MAPS, maps(hi) - maps(lo)),
-            ];
+            // Each dimension's cost only grows with the bytes, so the difference is one-signed.
+            let (was, now) = (self.cost(self.bytes), self.cost(bytes));
+            let diff: [(usize, u64); 2] =
+                std::array::from_fn(|i| (was[i].0, was[i].1.abs_diff(now[i].1)));
             if bytes < self.bytes {
                 n.tree.refund_set(n.node, &diff);
             } else if !n.tree.add(n.node, &diff, fits) {

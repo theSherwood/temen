@@ -1281,6 +1281,13 @@ impl World {
         names_cost(self.files.keys()) + names_cost(&self.explicit_dirs)
     }
 
+    /// The process-table entry the guest's `pid` names (#2353). A pid past `i32` names none: cut
+    /// down, it would name another process, the caller's own among them, whose `Proc` its op holds,
+    /// so locking that would deadlock the host.
+    fn proc_at(&self, pid: i64) -> Option<&ProcEntry> {
+        self.procs.get(&i32::try_from(pid).ok()?)
+    }
+
     /// `path`'s length, or 0 when it does not exist — the read half, which never stamps.
     fn file_len(&self, path: &str) -> usize {
         self.files.get(path).map_or(0, |f| f.bytes.len())
@@ -4091,7 +4098,7 @@ impl Ctx<'_> {
                         .then_some(*p)
                 })
                 .min()
-        } else if is_zombie(self.w.procs.get(&(pid as i32))) {
+        } else if is_zombie(self.w.proc_at(pid)) {
             Some(pid as i32)
         } else {
             None
@@ -4175,8 +4182,9 @@ impl Ctx<'_> {
             // STOP (the `Blocked::Stopped` insert drain), and the re-executed op reports.
             if (opts & WNOHANG) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
+                    // A process is never its own child, and its `Proc` is the one this op holds.
                     let target: Option<temen_interp::ParkEvent> = if pid > 0 {
-                        match self.w.procs.get(&(pid as i32)) {
+                        match self.w.proc_at(pid).filter(|_| pid != self.p.pid as i64) {
                             Some(ProcEntry::Live(t)) => t
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -4294,7 +4302,7 @@ impl Ctx<'_> {
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
-        let transitioned: Option<i32> = match self.w.procs.get(&(pid as i32)) {
+        let transitioned: Option<i32> = match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 // Not self (guarded above), so this is a different mutex — World → Proc, the
                 // canonical order, serialized against other multi-`Proc` paths by the world lock.
@@ -4392,7 +4400,7 @@ impl Ctx<'_> {
             self.p.pgid = if pgid == 0 { self.p.pid } else { pgid as i32 };
             return 0;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                 tp.pgid = if pgid == 0 { tp.pid } else { pgid as i32 };
@@ -4408,7 +4416,7 @@ impl Ctx<'_> {
         if pid == 0 || pid == self.p.pid as i64 {
             return self.p.pgid as i64;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => t.lock().unwrap_or_else(|e| e.into_inner()).pgid as i64,
             _ => ESRCH,
         }

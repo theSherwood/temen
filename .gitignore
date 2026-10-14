@@ -2,6 +2,7 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+/fuzz/fuzz-*.log
 /bench/target
 /crates/temen-llvm/target
 /crates/temen-webgpu/target

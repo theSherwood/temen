@@ -51,9 +51,9 @@ use temen_ir::{
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
-    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, Lease,
-    LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, Reg, RootWindow, Trap, Value,
-    VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
+    intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, HostCharge,
+    Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow,
+    Trap, Value, VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -1025,7 +1025,61 @@ mod frame_bound_tests {
         let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         let c = compile_module(&m.funcs, &m.types, None).expect("compile");
-        Vm::new(&c, 0, &[]).expect("vm")
+        Vm::new(&c, 0, &[], None).expect("vm")
+    }
+
+    /// A guest whose func 1 recurses `depth` deep through a frame of about `slots` registers.
+    fn fat_recursion(slots: usize) -> temen_ir::Module {
+        let chain: String = (1..slots)
+            .map(|i| format!("  c{i} = i64.add c{} vd1\n", i - 1))
+            .collect();
+        temen_text::parse_module(&format!(
+            "func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vr = call 1 (v0)\n  return vr\n  }}\n}}\n\
+             func (i64) -> (i64) {{\n\
+             block 0 (vd: i64) {{\n  vz = i64.const 0\n  vstop = i64.eq vd vz\n  br_if vstop 2(vd) 1(vd)\n  }}\n\
+             block 1 (vd1: i64) {{\n  c0 = i64.add vd1 vd1\n{chain}  vone = i64.const 1\n  vn = i64.sub vd1 vone\n\
+               vr = call 1 (vn)\n  vs = i64.add vr c{last}\n  return vs\n  }}\n\
+             block 2 (vd2: i64) {{\n  return vd2\n  }}\n}}\n",
+            last = slots - 1
+        ))
+        .expect("parse")
+    }
+
+    /// #2336 — a register file is charged to `mem` of its vCPU's domain past the stack a vCPU's own
+    /// charge pays for: a recursion that passes the domain's ceiling traps `StackOverflow`, the trap
+    /// an exhausted stack is, and what it held goes back when the run ends.
+    #[test]
+    fn a_register_file_is_charged_to_its_domains_mem() {
+        let m = fat_recursion(1000);
+        let run = |mem: i64, depth: i64| {
+            let mut h = Host::new();
+            h.set_grant(mem, -1, -1, -1);
+            let mut fuel = u64::MAX;
+            let r = compile_and_run_with_host(&m, 0, &[Value::I64(depth)], &mut fuel, &mut h)
+                .expect("the bytecode engine runs it");
+            (
+                r.map(|_| ()),
+                h.budgets.used(h.own_budget, super::super::BUDGET_MEM),
+            )
+        };
+        let (shallow, held) = run(256 << 20, 1);
+        assert_eq!(shallow, Ok(()));
+        // 2,000 frames of about 16 KiB: 32 MiB of registers.
+        assert_eq!(
+            run(256 << 20, 2000),
+            (Ok(()), held),
+            "fits, and is handed back"
+        );
+        assert_eq!(
+            run(8 << 20, 2000).0,
+            Err(Trap::StackOverflow),
+            "past the ceiling"
+        );
+        assert_eq!(
+            run(8 << 20, 2000).1,
+            held,
+            "and what it held is handed back"
+        );
     }
 
     /// #1958 — a call that would nest past [`MAX_FRAMES`], or grow the register file past
@@ -1897,7 +1951,8 @@ impl AdmittedChild {
             false => Err(Trap::ThreadFault), // instantiate bomb
             true => {
                 let (module, prog) = program.unit();
-                child_task(module, &prog, entry, &args, host.jit_table_log2())
+                let payer = Some(host.own_node());
+                child_task(module, &prog, entry, &args, host.jit_table_log2(), payer)
                     .map(|(vt, table)| (module, vt, table))
             }
         };
@@ -1933,17 +1988,24 @@ fn child_task(
     entry: i64,
     args: &[Value],
     jit_table_log2: u8,
+    payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, entry as usize, args)?;
+    let vt = entry_task(prog, module as usize, entry as usize, args, payer)?;
     Ok((vt, table))
 }
 
 /// A new vCPU's task, entered at `func` of `module` (`unit`, that module's program) with `args`, its
 /// frames homed there: a thread's, a §14/§5 child's, an exec'd image's or a host-built [`Vcpu`]'s
 /// first frame. `Malformed` for a function `unit` does not have.
-fn entry_task(unit: &Compiled, module: usize, func: usize, args: &[Value]) -> Result<VTask, Trap> {
-    let mut vt = VTask::new(unit, func, args)?;
+fn entry_task(
+    unit: &Compiled,
+    module: usize,
+    func: usize,
+    args: &[Value],
+    payer: Option<NodeRef>,
+) -> Result<VTask, Trap> {
+    let mut vt = VTask::new(unit, func, args, payer)?;
     vt.active.module = module;
     vt.active.home = module;
     Ok(vt)
@@ -1959,6 +2021,7 @@ fn thread_task(
     func: u32,
     sp: i64,
     arg: i64,
+    payer: Option<NodeRef>,
 ) -> Result<VTask, Trap> {
     let cm = source.get(module).ok_or(Trap::Malformed)?;
     entry_task(
@@ -1966,6 +2029,7 @@ fn thread_task(
         module,
         func as usize,
         &[Value::I64(sp), Value::I64(arg)],
+        payer,
     )
 }
 
@@ -2857,9 +2921,13 @@ fn compile_inst(
             args,
         } => {
             use super::cap_id;
+            // #2353 — the driver-served ops below deliver exactly one result, at `dst`. A call that
+            // declares another shape has no such slot (with none, `dst` lies past its frame), so it
+            // declines to the oracle rather than writing where its frame does not reach.
+            let one = view.sig(*sig).results.len() == 1;
             match (*type_id, *op) {
                 // op 18 = wait: join's park, delivering how the child ended (`join_delivery`).
-                (cap_id::INSTANTIATOR, op @ (1 | 18)) if !args.is_empty() => Op::InstJoin {
+                (cap_id::INSTANTIATOR, op @ (1 | 18)) if one && !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
@@ -2868,7 +2936,7 @@ fn compile_inst(
                 // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
                 // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
                 // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
-                (cap_id::INSTANTIATOR, 15) if args.len() >= 7 => Op::InstantiateDetached {
+                (cap_id::INSTANTIATOR, 15) if one && args.len() >= 7 => Op::InstantiateDetached {
                     handle: g(*handle),
                     budget: g(args[0]),
                     module: g(args[1]),
@@ -2882,45 +2950,50 @@ fn compile_inst(
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
                 // arg; every other spawn parameter is data in the record, read at exec time.
-                (cap_id::INSTANTIATOR, 17) if !args.is_empty() => Op::InstantiateRec {
+                (cap_id::INSTANTIATOR, 17) if one && !args.is_empty() => Op::InstantiateRec {
                     handle: g(*handle),
                     rec: g(args[0]),
                     dst,
                 },
-                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if !args.is_empty() => Op::ChildCtl {
-                    handle: g(*handle),
-                    child: g(args[0]),
-                    dst,
-                    ctl: match op {
-                        9 => ChildCtl::Poll,
-                        10 => ChildCtl::Detach,
-                        _ => ChildCtl::Kill,
-                    },
-                },
+                (cap_id::INSTANTIATOR, op @ (9 | 10 | 12)) if one && !args.is_empty() => {
+                    Op::ChildCtl {
+                        handle: g(*handle),
+                        child: g(args[0]),
+                        dst,
+                        ctl: match op {
+                            9 => ChildCtl::Poll,
+                            10 => ChildCtl::Detach,
+                            _ => ChildCtl::Kill,
+                        },
+                    }
+                }
                 // §3.6 (I36 slice 2) — child_offer (op 14): mint a live-callee offer over a running
                 // child's export; #2220 — grant (op 19): grant a capability into it. Both need the
                 // child's live env, so the op surfaces to the driver; the compile only marshals
                 // `(child, arg)`.
-                (cap_id::INSTANTIATOR, op @ (14 | 19)) if args.len() >= 2 => Op::ChildOffer {
-                    handle: g(*handle),
-                    child: g(args[0]),
-                    arg: g(args[1]),
-                    dst,
-                    grant: op == 19,
-                },
+                (cap_id::INSTANTIATOR, op @ (14 | 19)) if one && args.len() >= 2 => {
+                    Op::ChildOffer {
+                        handle: g(*handle),
+                        child: g(args[0]),
+                        arg: g(args[1]),
+                        dst,
+                        grant: op == 19,
+                    }
+                }
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (cap_id::JIT, 3) if !args.is_empty() => Op::JitInstall {
+                (cap_id::JIT, 3) if one && !args.is_empty() => Op::JitInstall {
                     handle: g(*handle),
                     code: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 4) if !args.is_empty() => Op::JitUninstall {
+                (cap_id::JIT, 4) if one && !args.is_empty() => Op::JitUninstall {
                     handle: g(*handle),
                     slot: g(args[0]),
                     dst,
                 },
+                (cap_id::JIT, 3 | 4) => return None,
                 (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
                     handle: g(*handle),
                     code: g(args[0]),
@@ -3294,7 +3367,12 @@ pub fn compile_and_run_with_host_traced(
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
     };
@@ -4680,7 +4758,13 @@ impl<'p> Vcpu<'p> {
             .source
             .get(module as usize)
             .ok_or(Trap::Malformed)?;
-        let vt = entry_task(&cm, module as usize, func as usize, args)?;
+        let vt = entry_task(
+            &cm,
+            module as usize,
+            func as usize,
+            args,
+            Some(host.own_node()),
+        )?;
         Ok(Vcpu {
             vt,
             fibers: Vec::new(),
@@ -4737,6 +4821,7 @@ impl<'p> Vcpu<'p> {
             i64::from(entry),
             &args,
             host.jit_table_log2(),
+            Some(host.own_node()),
         )?;
         let own_dom = Domain::child(std::sync::Arc::clone(&prog.dom.source), table);
         Ok(Vcpu {
@@ -5660,7 +5745,11 @@ impl<'p> Vcpu<'p> {
             .zip(io.iter())
             .map(|(ty, s)| slot_to_val(*ty, *s))
             .collect();
-        let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+        let payer = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().own_node(),
+            None => self.host.own_node(),
+        };
+        let mut vm = Vm::new(&tm, ts.func as usize, &args, Some(payer))?;
         vm.module = ts.module as usize;
         vm.tls = self.vt.active.tls; // the callback runs on this vCPU: its `vcpu.tls` word
         let mut cell = match self.shared_host {
@@ -5920,7 +6009,12 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
     let dom = Domain::new(c, 0);
     let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -5970,7 +6064,12 @@ pub fn ir_window_trace(
     let dom = Domain::new(c, 0);
     let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -6038,7 +6137,12 @@ pub fn ir_value_trace(
     let dom = Domain::new(c, 0);
     let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
     let mut host = Host::new();
-    let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
+    let mut vm = match Vm::new(
+        &dom.source.primary(),
+        func as usize,
+        args,
+        Some(host.own_node()),
+    ) {
         Ok(v) => v,
         Err(e) => return Some((Vec::new(), Err(e))),
     };
@@ -6844,7 +6948,8 @@ fn debug_advance_fiber(
                 match claim_fiber(&mut cell, &mut HostCell::Excl(host), k, arg, None, false) {
                     Ok(Claim::Continue(vm)) => vm,
                     Ok(Claim::Start { funcref, sp }) => {
-                        match start_fiber(source, table, mem, k, funcref, sp, arg) {
+                        let payer = Some(host.own_node());
+                        match start_fiber(source, table, mem, k, funcref, sp, arg, payer) {
                             Ok(vm) => vm,
                             Err(t) => return FiberStep::Trapped(t),
                         }
@@ -7927,7 +8032,7 @@ fn dbg_spawn(
     source: &ModuleSource,
     host: &mut Host,
 ) -> Result<(), Trap> {
-    let mut vt = thread_task(source, module, func, sp, arg)?;
+    let mut vt = thread_task(source, module, func, sp, arg, Some(host.own_node()))?;
     if live_tasks(tasks) >= super::MAX_VCPUS {
         return Err(Trap::ThreadFault); // thread bomb
     }
@@ -8353,7 +8458,7 @@ fn dbg_jit_step_into(
 ) -> Result<(), Trap> {
     let parent_depth = vt.active.stack.len() + 1;
     vt.active_invoke = Some(Box::new(InvokeStep {
-        vt: VTask::of(invoke_entry(source, umod, args)?, 0),
+        vt: VTask::of(invoke_entry(source, umod, args, None)?, 0),
         fibers: FiberTables::default(),
         dst,
         results,
@@ -8626,7 +8731,13 @@ impl ScheduledDebugRun {
         source.debug = true;
         let source = std::sync::Arc::new(source);
         let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
-        let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
+        let vt = VTask::new(
+            &source.primary(),
+            func as usize,
+            args,
+            Some(host.own_node()),
+        )
+        .ok()?;
         // #2113 — the run's window and main vCPU, charged to the powerbox's own node. The debugger
         // lends its fuel per resume. #2268 — a run the process has no room for is not debugged here.
         let mut host = host;
@@ -9824,9 +9935,23 @@ impl ScheduledDebugRun {
             .map(|ts| TaskSlot {
                 vm: Box::new(TaskVm {
                     vt: VTask {
-                        active: ts.active.clone(),
+                        // #2336 — and its register files, as its thread is below: its own and
+                        // those of the fibers on its resume chain.
+                        active: {
+                            let mut vm = ts.active.clone();
+                            vm.recharge();
+                            vm
+                        },
                         active_id: ts.active_id,
-                        chain: ts.chain.clone(),
+                        chain: ts
+                            .chain
+                            .iter()
+                            .map(|(k, vm, dst)| {
+                                let mut vm = vm.clone();
+                                vm.recharge();
+                                (*k, vm, *dst)
+                            })
+                            .collect(),
                         root_shadow_sp: ts.root_shadow_sp,
                         active_invoke: None, // never captured mid-invoke (`checkpointable`)
                     },
@@ -10518,12 +10643,19 @@ fn wire_kill(host: &Host) {
 }
 
 /// A fork twin's task: its parent's frame (`parent`, a bare root's, so no resume chain or invoke) at
-/// the post-fork resume point, answered `reply` at `dst` — the return-twice value.
-fn twin_task(parent: &Vm, dst: u32, reply: i64) -> VTask {
+/// the post-fork resume point, answered `reply` at `dst` — the return-twice value. #2336 — its copy
+/// of its parent's register file is its own, charged to `payer`, its node, as its window is: `None`,
+/// with nothing charged, when there is no room for it, which fails the fork as no room for the
+/// window does.
+fn twin_task(parent: &Vm, dst: u32, reply: i64, payer: NodeRef) -> Option<VTask> {
     let mut active = parent.clone();
+    active.room = RegsRoom::new(Some(payer));
+    if !active.room.charge.resize(reg_bytes(active.regs.capacity())) {
+        return None;
+    }
     active.set(dst, Reg::from_i64(reply));
     let root_shadow_sp = active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
-    VTask::of(active, root_shadow_sp)
+    Some(VTask::of(active, root_shadow_sp))
 }
 
 /// FORK.md §8.6 (#1080) — build the `execve` image-replace for the bytecode engine's exec pump arm,
@@ -10615,7 +10747,9 @@ fn exec_image_build(
     child_host.start_window(win.window_runs());
     let cunit = dom.source.get(cm).ok_or(super::EINVAL)?;
     let child_table = build_table_for(cunit.progs.len(), child_host.jit_table_log2(), cm as u32);
-    let new_vt = entry_task(&cunit, cm, entry as usize, &child_args).map_err(|_| super::EINVAL)?;
+    let payer = Some(child_host.own_node());
+    let new_vt =
+        entry_task(&cunit, cm, entry as usize, &child_args, payer).map_err(|_| super::EINVAL)?;
     let leaf = leaf.map(|(paged, parks)| LeafStart {
         module: cm as u32,
         entry: entry as u32,
@@ -11085,7 +11219,13 @@ impl FiberTables {
     /// fiber not yet done takes its charge on `host`'s node again, past any ceiling, as a thaw's
     /// re-created fiber does. The restore then puts back the budget tree as the checkpoint saw it,
     /// which held these charges.
-    fn restored(fibers: Vec<FiberState>, host: &Host) -> FiberTables {
+    fn restored(mut fibers: Vec<FiberState>, host: &Host) -> FiberTables {
+        // #2336 — and its register file, which the tree charged too.
+        for f in &mut fibers {
+            if let FiberState::Parked { vm, .. } | FiberState::HostParked { vm, .. } = f {
+                vm.recharge();
+            }
+        }
         let meta = fibers
             .iter()
             .map(|f| FiberMeta {
@@ -11444,6 +11584,7 @@ fn claim_fiber(
 /// JIT's `fn_table` resolve it), so a fiber may start on an **installed §22 unit** function, not only a
 /// module-0 one (#1226, DESIGN.md §22 "Concurrency"). A forged or mistyped funcref is a `FiberFault`.
 /// The fiber spills into its own durable shadow region (slot `k` = context `k + 1`, §12.8 4A.5).
+#[allow(clippy::too_many_arguments)]
 fn start_fiber(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -11452,10 +11593,11 @@ fn start_fiber(
     funcref: i32,
     sp: i64,
     arg: i64,
+    payer: Option<NodeRef>,
 ) -> Result<Vm, Trap> {
     let (module, func, unit) =
         resolve_fiber_entry(source, table, funcref).ok_or(Trap::FiberFault)?;
-    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)])?;
+    let mut vm = Vm::new(&unit, func, &[Value::I64(sp), Value::I64(arg)], payer)?;
     vm.module = module;
     vm.durable_region_base = mem
         .as_ref()
@@ -11690,10 +11832,15 @@ struct InvokeStep {
 }
 
 impl VTask {
-    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<VTask, Trap> {
+    fn new(
+        c: &Compiled,
+        entry: usize,
+        args: &[Value],
+        payer: Option<NodeRef>,
+    ) -> Result<VTask, Trap> {
         // §12.8 4A.5: an empty root shadow stack sits at its context's frame base.
         let root_shadow_sp = c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0);
-        Ok(VTask::of(Vm::new(c, entry, args)?, root_shadow_sp))
+        Ok(VTask::of(Vm::new(c, entry, args, payer)?, root_shadow_sp))
     }
 
     /// A task running `active` as its root activation, in no fiber, with `root_shadow_sp` as its root
@@ -11713,6 +11860,7 @@ impl VTask {
     fn release(&mut self) {
         let vm = &mut self.active;
         vm.regs = Vec::new();
+        vm.room = RegsRoom::new(vm.room.charge.payer().cloned());
         vm.stack = Vec::new();
         vm.scratch = Vec::new();
         vm.setjmp_points = std::collections::BTreeMap::new();
@@ -12148,7 +12296,7 @@ fn run_invoke(
     drive_nested(
         source,
         table,
-        VTask::of(invoke_entry(source, module, args)?, 0),
+        VTask::of(invoke_entry(source, module, args, payer(host))?, 0),
         fuel,
         mem,
         host,
@@ -12161,9 +12309,14 @@ fn run_invoke(
 }
 
 /// An invoked unit's entry frame: function 0 of the unit `module`, over `args`.
-fn invoke_entry(source: &ModuleSource, module: usize, args: &[Value]) -> Result<Vm, Trap> {
+fn invoke_entry(
+    source: &ModuleSource,
+    module: usize,
+    args: &[Value],
+    payer: Option<NodeRef>,
+) -> Result<Vm, Trap> {
     let unit = source.get(module).ok_or(Trap::Malformed)?;
-    let mut vm = Vm::new(&unit, 0, args)?;
+    let mut vm = Vm::new(&unit, 0, args, payer)?;
     vm.module = module;
     Ok(vm)
 }
@@ -12316,7 +12469,7 @@ fn drive_nested(
                 let target = match claim_fiber(fibers, host, k, arg, None, false)? {
                     Claim::Continue(vm) => vm,
                     Claim::Start { funcref, sp } => {
-                        start_fiber(source, table, mem, k, funcref, sp, arg)?
+                        start_fiber(source, table, mem, k, funcref, sp, arg, payer(host))?
                     }
                     Claim::Block | Claim::Poll => {
                         vt.active.set(dst, Reg::from_i32(super::FIBER_PARKED));
@@ -12627,6 +12780,11 @@ enum HostCell<'a> {
     Shared(&'a std::sync::Mutex<Host>),
 }
 
+/// #2336 — who pays for a register file a vCPU on `host` grows: its domain's node.
+fn payer(host: &mut HostCell) -> Option<NodeRef> {
+    Some(host.with(|h| h.own_node()))
+}
+
 impl HostCell<'_> {
     /// Run `f` with exclusive access to the powerbox: directly (`Excl`) or under a brief lock
     /// (`Shared`). `f`'s result is owned (no borrow escapes the lock), so the lock is held only across
@@ -12740,7 +12898,17 @@ fn step_vcpu(
                     match claim_fiber(fibers, &mut ctx.host, k, arg, blocking_ip, cooperative)? {
                         Claim::Continue(vm) => vm,
                         Claim::Start { funcref, sp } => {
-                            start_fiber(&dom.source, ctx.table, ctx.mem, k, funcref, sp, arg)?
+                            let payer = payer(&mut ctx.host);
+                            start_fiber(
+                                &dom.source,
+                                ctx.table,
+                                ctx.mem,
+                                k,
+                                funcref,
+                                sp,
+                                arg,
+                                payer,
+                            )?
                         }
                         // The oracle's rule: a durable run whose freeze is unwinding takes the
                         // advisory downgrade (the poll status), so the resumer reaches its trailing
@@ -14278,7 +14446,12 @@ impl SchedCore {
         if !thaws(host, mem) {
             fuel.burn()?;
         }
-        let root_vt = VTask::new(&dom.source.primary(), entry as usize, args)?;
+        let root_vt = VTask::new(
+            &dom.source.primary(),
+            entry as usize,
+            args,
+            Some(host.own_node()),
+        )?;
         let tasks = vec![TaskSlot::new(root_vt, None, LiveVcpu::none())];
         wire_kill(host);
         // #1122/#1146/#1262 — an armed external-wake doorbell: wire the root's personality doors to
@@ -15274,8 +15447,12 @@ impl SchedCore {
                     };
                     // The twin's continuation is the caller's, with `reply_twin` injected at the
                     // caller's reply slot.
-                    let mut twin_vt =
-                        twin_task(&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
+                    let active = &tasks[caller_ti].vm.vt.active;
+                    let Some(mut twin_vt) =
+                        twin_task(active, caller_dst, reply_twin, twin_host.own_node())
+                    else {
+                        break 'fork degrade(tasks, Some(caller_ti));
+                    };
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                     // keep an inherited bitmap only if its private `fork_private` window is
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
@@ -15554,17 +15731,20 @@ impl SchedCore {
                 } else {
                     None
                 };
+                // The return-twice `0`; the parent keeps the twin's pid, set below.
+                let forked = forked.and_then(|(twin_mem, twin_host, live)| {
+                    let twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0, twin_host.own_node())?;
+                    Some((twin_mem, twin_host, live, twin_vt))
+                });
                 match forked {
                     None => {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
                     }
-                    Some((twin_mem, twin_host, live)) => {
+                    Some((twin_mem, twin_host, live, mut twin_vt)) => {
                         // #1080 / #1262 — the twin's own park door, so its own `fork()`/`waitpid()`
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
                         wire_process(&twin_host, root);
-                        // The return-twice `0`; the parent keeps the twin's pid, set below.
-                        let mut twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0);
                         // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
                         // may keep it only if its OWN private window (`fork_private`, pushed into
                         // `extra_envs` below) is servable — the driver then answers each of the
@@ -15626,22 +15806,24 @@ impl SchedCore {
                 dst,
                 module,
             }) => {
-                let mut child = match thread_task(&dom.source, module as usize, func, sp, arg) {
-                    Ok(vt) => vt,
-                    Err(t) => {
-                        complete(tasks, ti, Err(t));
-                        return None;
-                    }
-                };
+                let node = task_host(root, extra_envs, tasks[ti].env)
+                    .lock_unpoisoned()
+                    .own_node();
+                let payer = Some(node.clone());
+                let mut child =
+                    match thread_task(&dom.source, module as usize, func, sp, arg, payer) {
+                        Ok(vt) => vt,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            return None;
+                        }
+                    };
                 if live_tasks(tasks) >= super::MAX_VCPUS {
                     complete(tasks, ti, Err(Trap::ThreadFault)); // thread bomb
                     return None;
                 }
                 // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                 // ceiling refuses it as the live cap does.
-                let node = task_host(root, extra_envs, tasks[ti].env)
-                    .lock_unpoisoned()
-                    .own_node();
                 let Some(live) = LiveVcpu::charge(node) else {
                     complete(tasks, ti, Err(Trap::ThreadFault));
                     return None;
@@ -16755,7 +16937,12 @@ fn coop_bounce(
         .zip(io.iter())
         .map(|(ty, s)| slot_to_val(*ty, *s))
         .collect();
-    let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
+    let mut vm = Vm::new(
+        &tm,
+        ts.func as usize,
+        &args,
+        Some(host.with(|h| h.own_node())),
+    )?;
     vm.module = ts.module as usize;
     // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
     let vals = drive_nested(
@@ -16788,7 +16975,7 @@ mod dbg_domain_end_tests {
         let m = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
             .expect("parse");
         let unit = compile_module(&m.funcs, &m.types, None).expect("compile");
-        let vt = VTask::new(&unit, 0, &[]).expect("task");
+        let vt = VTask::new(&unit, 0, &[], None).expect("task");
         TaskSlot {
             state,
             ..TaskSlot::new(vt, Some(0), LiveVcpu::none())
@@ -16905,7 +17092,7 @@ mod live_cap_tests {
     }
 
     fn vtask() -> VTask {
-        VTask::new(&unit(), 0, &[]).expect("task")
+        VTask::new(&unit(), 0, &[], None).expect("task")
     }
 
     #[test]
@@ -18412,6 +18599,8 @@ struct Vm {
     /// Function-wide register file, shared across activations by register windows (`[base, base +
     /// nslots)` per activation). Grows on demand as calls open deeper windows.
     regs: Vec<Reg>,
+    /// #2336 — what [`Self::regs`]' room holds of its vCPU's domain's node.
+    room: RegsRoom,
     /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot)`.
     /// `module` is carried so a cross-module `call.dyn` (into an installed §22 unit) returns to
     /// the caller's module.
@@ -18502,6 +18691,44 @@ const MAX_FRAMES: usize = 1 << 17;
 const MAX_REG_SLOTS: usize = 1 << 25;
 const _: () = assert!(MAX_REG_SLOTS > 21 << 20);
 
+/// #2336 — what a register file of `slots` slots holds of the host.
+fn reg_bytes(slots: usize) -> u64 {
+    (slots * std::mem::size_of::<Reg>()) as u64
+}
+
+/// #2336 — the charge a register file holds ([`HostCharge::stack`]). A copy of its `Vm` (a
+/// checkpoint, the undo journal, a continuation) holds none of it, so a history costs the guest
+/// nothing, and remembers what it held: put back to run, it holds that again ([`Vm::recharge`]), as
+/// the restore puts back the budget tree that charged it. A copy that grows first charges what it
+/// holds then.
+#[derive(Default)]
+struct RegsRoom {
+    charge: HostCharge,
+    /// What the `Vm` this copies held, while this holds nothing.
+    held: u64,
+}
+
+impl RegsRoom {
+    fn new(payer: Option<NodeRef>) -> RegsRoom {
+        RegsRoom {
+            charge: HostCharge::stack(payer),
+            held: 0,
+        }
+    }
+}
+
+impl Clone for RegsRoom {
+    fn clone(&self) -> RegsRoom {
+        RegsRoom {
+            charge: HostCharge::stack(self.charge.payer().cloned()),
+            held: match self.charge.bytes() {
+                0 => self.held,
+                bytes => bytes,
+            },
+        }
+    }
+}
+
 /// The capacity the register file grows to for a window ending at slot `need`: geometric, so a deep
 /// recursion grows it O(log n) times, but never past `max` (#2082).
 fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
@@ -18535,12 +18762,30 @@ impl Vm {
         }
         if self.regs.len() < need {
             if need > self.regs.capacity() {
+                // #2336 — the guest's calls size the file, so its room is charged to the vCPU's
+                // domain before it is allocated, then allocated fallibly: doubled, or exactly what
+                // this call needs when that does not fit. Neither is `StackOverflow`, the trap an
+                // exhausted stack is on every engine.
                 let cap = grown_capacity(self.regs.capacity(), need, MAX_REG_SLOTS);
-                self.regs.reserve_exact(cap - self.regs.len());
+                let room = [cap, need]
+                    .into_iter()
+                    .find(|&slots| self.room.charge.resize(reg_bytes(slots)))
+                    .ok_or(Trap::StackOverflow)?;
+                if self.regs.try_reserve_exact(room - self.regs.len()).is_err() {
+                    self.room.charge.resize(reg_bytes(self.regs.capacity()));
+                    return Err(Trap::StackOverflow);
+                }
             }
             self.regs.resize(need, Reg::default());
         }
         Ok(())
+    }
+
+    /// #2336 — hold again, past any ceiling, what the `Vm` this copies held ([`RegsRoom`]): a copy
+    /// put back to run, whose restore puts back the budget tree that charged it.
+    fn recharge(&mut self) {
+        let held = std::mem::take(&mut self.room.held);
+        self.room.charge.force(held);
     }
 
     /// The slots a clone of this `Vm` copies, its registers and return entries: what the journal
@@ -18551,15 +18796,14 @@ impl Vm {
 
     /// Open the entry activation: a zero-based window sized to the entry function, seeded with the
     /// call arguments. Total — an out-of-range entry or arg overflow is a clean `Malformed` trap.
-    /// Every entry (root, fiber, thread, coroutine) starts in module 0.
-    fn new(c: &Compiled, entry: usize, args: &[Value]) -> Result<Vm, Trap> {
+    /// Every entry (root, fiber, thread, coroutine) starts in module 0. #2336 — its register file is
+    /// charged to `payer`, the node of the vCPU's domain, as it grows; `None` charges nothing (a
+    /// trace or a test run no budget governs).
+    fn new(c: &Compiled, entry: usize, args: &[Value], payer: Option<NodeRef>) -> Result<Vm, Trap> {
         let prog = c.progs.get(entry).ok_or(Trap::Malformed)?;
-        let mut regs: Vec<Reg> = vec![Reg::default(); prog.nslots as usize];
-        for (i, a) in args.iter().enumerate() {
-            *regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
-        }
-        Ok(Vm {
-            regs,
+        let mut vm = Vm {
+            regs: Vec::new(),
+            room: RegsRoom::new(payer),
             stack: Vec::new(),
             module: 0,
             cur: entry,
@@ -18576,7 +18820,12 @@ impl Vm {
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
-        })
+        };
+        vm.grow_regs(prog.nslots as usize)?;
+        for (i, a) in args.iter().enumerate() {
+            *vm.regs.get_mut(i).ok_or(Trap::Malformed)? = Reg::from_value(*a);
+        }
+        Ok(vm)
     }
 
     /// Write a value to a frame-relative slot of the *current* (persisted) activation window. Used

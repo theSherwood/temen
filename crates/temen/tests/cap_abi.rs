@@ -65,3 +65,59 @@ fn random_capability_calls_never_crash_the_host() {
         );
     }
 }
+
+/// What the fuzzer found, kept found: each input runs through the harness again.
+#[test]
+fn the_fuzzers_finds_stay_fixed() {
+    for input in [
+        // `Jit.uninstall` declaring no result: the bytecode engine wrote its answer past the frame.
+        &[0x00, 0xc0, 0x70, 0x75, 0x32, 0x64, 0x6f, 0x2c][..],
+        // `waitpid` of the caller's own pid: it locked the caller's own process, deadlocking.
+        &[
+            0x00, 0x41, 0x6b, 0x64, 0x69, 0xdc, 0xdc, 0x3e, 0x01, 0x00, 0xdc, 0x3e, 0x01, 0x00,
+        ],
+        &[
+            0x00, 0x41, 0x6b, 0x64, 0x69, 0xdc, 0x05, 0xdc, 0xb8, 0x01, 0x00,
+        ],
+    ] {
+        cap_abi::fuzz_one(input);
+    }
+}
+
+/// The guest `src` (taking the POSIX personality's handle) on both interpreters.
+fn on_both(src: &str) -> [Option<Result<Vec<temen_interp::Value>, temen_interp::Trap>>; 2] {
+    use temen_interp::{bytecode, run_with_host, Host, Value};
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let host = || {
+        let mut h = Host::new();
+        let (posix, _) = temen_run::posix::posix_cap(1 << 15, 1 << 16, Vec::new());
+        let px = posix.install(&mut h, 0);
+        (h, [Value::I32(px)])
+    };
+    let (mut h, args) = host();
+    let tw = run_with_host(&m, 0, &args, &mut 1_000_000, &mut h);
+    let (mut h, args) = host();
+    let bc = bytecode::compile_and_run_with_host(&m, 0, &args, &mut 1_000_000, &mut h);
+    [Some(tw), bc]
+}
+
+/// #2353 — a process is never its own child: `waitpid` of its own pid is `-ECHILD`, and a pid past
+/// `i32` names no process (cut down, it named the caller's own, whose lock the op holds).
+#[test]
+fn a_process_waiting_on_itself_is_echild() {
+    let [tw, bc] = on_both(
+        "memory 16\nfunc (i32) -> (i64, i64) {\nblock 0 (vp: i32) {\n\
+           vpid = call.cap 13 44 () -> (i64) vp ()\n  vz = i64.const 0\n\
+           vw = call.cap 13 28 (i64, i64, i64) -> (i64) vp (vpid, vz, vz)\n\
+           vhi = i64.const 4294967296\n  vfar = i64.add vpid vhi\n\
+           vk = call.cap 13 31 (i64, i64) -> (i64) vp (vfar, vz)\n  return vw vk\n  }\n}\n",
+    );
+    use temen_interp::Value::I64;
+    let want = Ok(vec![
+        I64(temen_ir::errno::ECHILD),
+        I64(temen_ir::errno::ESRCH),
+    ]);
+    assert_eq!(tw, Some(want.clone()), "tree-walker");
+    assert_eq!(bc, Some(want), "bytecode");
+}
