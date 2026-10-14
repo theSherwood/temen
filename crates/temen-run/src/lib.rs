@@ -1651,6 +1651,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 reserved_log2,
                 funcs: r.funcs,
                 types: r.types,
+                impl_exports: r.module.impl_exports.clone(),
                 shadow: r
                     .shadow
                     .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
@@ -2464,8 +2465,8 @@ pub unsafe extern "C" fn module_resolver_locked(
     resolve_module_into(&host, handle, out)
 }
 
-/// The body of both resolvers: fill `out` with the views of the module a spawn's operand names
-/// ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
+/// The body of both resolvers: fill `out` with the module a spawn's operand names and what its grant
+/// records ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
 ///
 /// # Safety
 /// `out` is a writable [`temen_jit::ResolvedModule`].
@@ -2475,26 +2476,10 @@ unsafe fn resolve_module_into(
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     match host.resolve_module_parts(handle) {
-        Some((
-            funcs,
-            n_funcs,
-            memory_log2,
-            data,
-            n_data,
-            types,
-            n_types,
-            shadow,
-            durable,
-            digest,
-        )) => {
+        Some((m, memory_log2, shadow, durable, digest)) => {
             *out = temen_jit::ResolvedModule {
-                funcs,
-                n_funcs,
+                module: m,
                 memory_log2,
-                data,
-                n_data,
-                types,
-                n_types,
                 shadow,
                 durable,
                 digest,
@@ -3978,6 +3963,13 @@ impl MprotectWindow {
         runs
     }
 
+    /// #2370 — the runs of `pages` a page op leaving them `prot` can change
+    /// ([`temen_interp::changed_runs`]): every engine's page map visits the same pages.
+    fn changed_runs(&self, pages: std::ops::RangeInclusive<u64>, prot: i32) -> Vec<(u64, u64)> {
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        temen_interp::changed_runs(&map, pages, self.mapped.div_ceil(self.page), prot)
+    }
+
     /// `protect`'s page-map update for one page. A §13 alias stays an alias — only its writability
     /// changes — exactly the interpreter's `Mem::protect`; a `protect(none)` has dropped it already
     /// ([`MprotectWindow::drop_aliases`]).
@@ -4106,8 +4098,9 @@ impl MprotectWindow {
 
     /// Before a page op changes the hardware: give each page of `pages` that `apply` leaves with
     /// *less* access than it has now — `prot` grants less — its new state already (see the hardware
-    /// primitives). The op runs `apply` over every page once the hardware has changed; on the pages
-    /// narrowed here that repeats the same update.
+    /// primitives). The op runs `apply` over every page it changes once the hardware has; on the
+    /// pages narrowed here that repeats the same update. A page that loses access holds some now, so
+    /// only the pages that hold something are visited (#2370).
     fn narrow(
         &mut self,
         pages: std::ops::RangeInclusive<u64>,
@@ -4126,9 +4119,11 @@ impl MprotectWindow {
         } else {
             0
         };
-        for page in pages {
-            if new < rank(self.page_access(page)) {
-                apply(self, page);
+        for (first, last) in self.changed_runs(pages, 0) {
+            for page in first..=last {
+                if new < rank(self.page_access(page)) {
+                    apply(self, page);
+                }
             }
         }
     }
@@ -4233,8 +4228,8 @@ impl GuestMem for MprotectWindow {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let start = *pages.start() * self.page;
-        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // The runs it changes (#2370), named before an alias it drops leaves the page map.
+        let runs = self.changed_runs(pages.clone(), prot);
         // A §13 alias in the range is dropped first: the pages are the window's own from here on.
         // Then zero them (a fresh commit reads zero; dropped rather than written, so they stay
         // unbacked until touched) and apply the requested protection.
@@ -4242,11 +4237,14 @@ impl GuestMem for MprotectWindow {
         if e != 0 {
             return e;
         }
-        self.narrow(pages.clone(), prot, |w, page| w.set_prot(page, prot, false));
-        if !self.zero_private(start, plen, false) || !self.hw_protect(start, plen, prot) {
-            return ENOMEM;
+        self.narrow(pages, prot, |w, page| w.set_prot(page, prot, false));
+        for &(first, last) in &runs {
+            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
+            if !self.zero_private(start, plen, false) || !self.hw_protect(start, plen, prot) {
+                return ENOMEM;
+            }
         }
-        for page in pages {
+        for page in runs.into_iter().flat_map(|(first, last)| first..=last) {
             self.set_prot(page, prot, false);
         }
         0
@@ -4265,21 +4263,24 @@ impl GuestMem for MprotectWindow {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let start = *pages.start() * self.page;
-        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // The runs it changes (#2370), named before an alias it drops leaves the page map.
+        let runs = self.changed_runs(pages.clone(), 0);
         // A §13 alias is the region's memory, not the window's: it is dropped before the zeroing,
         // which then never reaches the region (the oracle's `Mem::unmap` re-points the page at the
         // domain's own backing). Every page loses its access in the page map before the hardware.
-        let e = self.drop_aliases(pages.clone());
+        let e = self.drop_aliases(pages);
         if e != 0 {
             return e;
         }
-        for page in pages {
+        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
             self.set_prot(page, 0, false);
         }
         // Zero it, then protect NONE so any later access faults (detect-and-kill).
-        if !self.zero_private(start, plen, true) || !self.hw_protect(start, plen, 0) {
-            return ENOMEM;
+        for (first, last) in runs {
+            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
+            if !self.zero_private(start, plen, true) || !self.hw_protect(start, plen, 0) {
+                return ENOMEM;
+            }
         }
         0
     }
@@ -4320,8 +4321,8 @@ impl GuestMem for MprotectWindow {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let start = *pages.start() * self.page;
-        let plen = (*pages.end() + 1 - *pages.start()) * self.page;
+        // The runs it changes (#2370), named before an alias it drops leaves the page map.
+        let runs = self.changed_runs(pages.clone(), prot);
         // Neither R nor W left ends a §13 alias, as in the interpreter: the shared view goes too.
         if prot & 3 == 0 {
             let e = self.drop_aliases(pages.clone());
@@ -4329,11 +4330,14 @@ impl GuestMem for MprotectWindow {
                 return e;
             }
         }
-        self.narrow(pages.clone(), prot, |w, page| w.protect_page(page, prot));
-        if !self.hw_protect(start, plen, prot) {
-            return ENOMEM;
+        self.narrow(pages, prot, |w, page| w.protect_page(page, prot));
+        for &(first, last) in &runs {
+            let (start, plen) = (first * self.page, (last + 1 - first) * self.page);
+            if !self.hw_protect(start, plen, prot) {
+                return ENOMEM;
+            }
         }
-        for page in pages {
+        for page in runs.into_iter().flat_map(|(first, last)| first..=last) {
             self.protect_page(page, prot);
         }
         0
@@ -5043,21 +5047,23 @@ pub use temen_ir::is_named_powerbox_entry;
 /// **Demote** non-entry-point exports to diagnostic names (#907, the `.dynsym`/`.symtab` split — the
 /// `temen-strip` packaging step). Translate exports *every* defined function by its symbol name, so a
 /// shipped `.temen` carries thousands of export entries nothing ever resolves; only the ones in `keep`
-/// (plus `_start`, always — it is the powerbox-entry *marker*, [`is_named_powerbox_entry`]) are
+/// (plus, always, `_start`, the powerbox-entry *marker* ([`is_named_powerbox_entry`]), and
+/// `_child`, where the host's child image of the program starts ([`temen_ir::CHILD_EXPORT`])) are
 /// semantic. Each export not kept is removed from [`Module::exports`] and its name recorded in
 /// [`temen_ir::DebugInfo::func_names`] instead — the strippable, verifier-ignored §6 name waist that
 /// backtraces and the wasm-JIT emitter's name section already read — so demotion changes **no**
 /// diagnostic output, only what [`Module::resolve_export`] can reach. An existing `func_names` entry
 /// (a `-g` source name) is never overwritten. Returns the number of exports demoted.
 ///
-/// Only sound as an explicit **per-artifact** choice for a known-single-module artifact: a parent
-/// guest can resolve any child export by name through the Module capability, so a linking or
-/// child-module artifact must keep everything it publishes.
+/// Only sound as an explicit **per-artifact** choice: an embedder that calls a function by its
+/// export name (a reactor's `tick`, say) names it in `keep`, and a linking artifact must keep
+/// everything it publishes.
 pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
-    // `_start` (the powerbox-entry marker) is a semantic the host resolves — always kept, never
-    // demotable to a diagnostic name. (#1094: the `__null_guard` marker is retired; the NULL guard is
-    // unconditional now, so no export needs preserving for it — a stale one in an old asset is inert.)
-    let semantic = |name: &str| name == "_start";
+    // `_start` (the powerbox-entry marker) and `_child` (#2219: the host builds the program's child
+    // image from it) are semantics the host resolves — always kept, never demotable to a diagnostic
+    // name. (#1094: the `__null_guard` marker is retired; the NULL guard is unconditional now, so
+    // no export needs preserving for it — a stale one in an old asset is inert.)
+    let semantic = |name: &str| name == "_start" || name == temen_ir::CHILD_EXPORT;
     let kept: Vec<temen_ir::Export> = module
         .exports
         .iter()

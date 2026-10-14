@@ -750,22 +750,18 @@ pub type FastCapResolver = unsafe extern "C" fn(
     n_res: u32,
 ) -> *const core::ffi::c_void;
 
-/// A resolved §14 **`Module` grant** — raw views into host-owned storage (the powerbox's module
-/// table), filled in by a [`ModuleResolver`]. The pointers must stay valid for the whole run (the
-/// host's table is append-only and the host outlives the run — the same lifetime contract as the
-/// `call.cap` ctx). `memory_log2 < 0` means the module declares no memory.
+/// A resolved §14 **`Module` grant**, filled in by a [`ModuleResolver`]: the module, in host-owned
+/// storage (the powerbox's module table), and what its grant records of it. The pointer must stay
+/// valid for the whole run (the host's table is append-only and the host outlives the run — the
+/// same lifetime contract as the `call.cap` ctx). `memory_log2 < 0` means the module declares no
+/// memory.
 #[repr(C)]
 pub struct ResolvedModule {
-    pub funcs: *const Func,
-    pub n_funcs: usize,
+    /// The granted module: what a spawn of it compiles and seeds — its functions, its type section
+    /// (#922: the child's interned `call.dyn` type indices resolve against it), its data segments
+    /// and its impl exports (#2247: the child serves their handlers).
+    pub module: *const temen_ir::Module,
     pub memory_log2: i32,
-    pub data: *const Data,
-    pub n_data: usize,
-    /// #922 — the module's **type section**, so the §14 nesting runtime can resolve a
-    /// separate-module child's interned `call.dyn` type indices when re-compiling it. Same
-    /// outlives-the-run contract as `funcs`/`data`.
-    pub types: *const temen_ir::TypeEntry,
-    pub n_types: usize,
     /// The module's declared durable shadow arena (INVARIANTS.md #16) — `ShadowArena::EMPTY` when
     /// it declared none (then a durable child of it is refused, never placed by default).
     pub shadow: temen_ir::durable_abi::ShadowArena,
@@ -1925,6 +1921,8 @@ pub struct CapturedSeed {
     /// Its own program, resolved by the embedder from the module digest the artifact names.
     pub funcs: Arc<[Func]>,
     pub types: Arc<[temen_ir::TypeEntry]>,
+    /// #2247 — its program's impl exports, whose handlers it serves.
+    pub impl_exports: Vec<temen_ir::ImplExport>,
     pub shadow: temen_ir::durable_abi::ShadowArena,
     /// Its restored window image.
     pub image: Vec<u8>,
@@ -3561,13 +3559,6 @@ impl CompiledModule {
                     .unwrap_or(0),
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
-                // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
-                // (same module) compiles with serve trampolines and can be a child_offer target.
-                m.impl_exports
-                    .iter()
-                    .flat_map(|e| e.ops.iter().copied())
-                    .collect::<Vec<u32>>()
-                    .into_boxed_slice(),
                 None, // the run's own child executor
             )))
         } else {
@@ -5809,8 +5800,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 0, // durable subtree: no shared futex domain (child futex ops stay rejected)
                 std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
                 std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
-                Box::new([]), // durable grandchildren are not offer targets (a later slice)
-                None,         // an executor of its own, with no domain: it files no task
+                None, // an executor of its own, with no domain: it files no task
             ));
             n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
             n.set_freeze(freeze.clone());
@@ -5839,7 +5829,7 @@ pub(crate) unsafe fn compile_child_and_run(
             }),
             ..InstanceAddrs::NONE
         },
-        serve_handlers: &[], // the durable/sync nested child is never an offer target
+        impl_exports: &[], // the durable/sync nested child is never an offer target
         table_reserve_log2: 0, // an empty powerbox holds no `Jit` — the natural table
         shadow: child_shadow,
         run: ChildRun::Inline, // on its parent's thread: no fiber runtime or thread domain of its own
@@ -6254,10 +6244,10 @@ pub(crate) struct ChildCompile<'a> {
     /// the durable path), and its own nursery (null: it cannot spawn). The code polls, charges, waits
     /// and nests exactly when its instance has the cell, so every instance of it has the same set.
     pub(crate) addrs: InstanceAddrs,
-    /// CALLS.md 5c.1a — the impl-export **handler** funcidxs, each given a buffer-ABI serve
-    /// trampoline so a cross-domain dispatch can invoke it over the child's live window. Empty ⇒ a
-    /// child that offers nothing.
-    pub(crate) serve_handlers: &'a [u32],
+    /// CALLS.md 5c.1a — the child module's impl exports: each **handler** is given a buffer-ABI
+    /// serve trampoline so a cross-domain dispatch can invoke it over the child's live window, as a
+    /// root's compile gives its own (#2247). Empty ⇒ a child that offers nothing.
+    pub(crate) impl_exports: &'a [temen_ir::ImplExport],
     /// #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
     pub(crate) table_reserve_log2: u8,
     /// The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
@@ -6294,7 +6284,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         reserved_log2,
         thunk: cap_thunk,
         addrs,
-        serve_handlers,
+        impl_exports,
         table_reserve_log2,
         shadow,
         run,
@@ -6494,7 +6484,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     let mut serve_ids: Vec<(u32, cranelift_module::FuncId)> = Vec::new();
     {
         let mut seen = std::collections::BTreeSet::new();
-        for &f in serve_handlers {
+        for &f in impl_exports.iter().flat_map(|e| &e.ops) {
             if (f as usize) < funcs.len() && seen.insert(f) {
                 build_trampoline(
                     &mut module,
@@ -6671,8 +6661,8 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
 #[derive(PartialEq, Eq, Hash)]
 struct ChildCodeKey {
     /// The module's content digest, from its grant: the same code however it was granted. Identity
-    /// is structural (INVARIANTS #10). It names the functions, types and shadow arena the compile
-    /// read.
+    /// is structural (INVARIANTS #10). It names the functions, types, impl exports and shadow arena
+    /// the compile read.
     digest: [u8; 32],
     entry: FuncIdx,
     mapped_log2: u8,
@@ -6681,7 +6671,6 @@ struct ChildCodeKey {
     /// Which cells the code's instances have, which decides the checks it emits
     /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain, and the nursery.
     cells: [bool; 4],
-    serve_handlers: Box<[u32]>,
     table_reserve_log2: u8,
     run: ChildRun,
 }
@@ -6701,7 +6690,6 @@ impl ChildCodeKey {
                 !a.sched.is_null(),
                 !a.nursery.is_null(),
             ],
-            serve_handlers: c.serve_handlers.into(),
             table_reserve_log2: c.table_reserve_log2,
             run: c.run,
         }
@@ -7847,40 +7835,55 @@ fn lower_block(
             args,
         } = inst
         {
-            let sig = sig_of(lower.type_section, *sig); // #922: resolve interned call type index
-                                                        // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
-                                                        // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
-                                                        // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
-                                                        // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
-                                                        // value the tree-walker does under the differential oracle (which arms counted fuel on
-                                                        // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
-                                                        // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
-                                                        // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
-            if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
-                if !sig.results.is_empty() {
-                    let v = if lower.fuel {
-                        // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
-                        // budget chain's room, asked of the cell (word 2).
-                        let addr = vmctx_load(b, lower, vmctx::FUEL);
-                        let rsig = {
-                            let mut s = Signature::new(lower.frontend_config.default_call_conv);
-                            s.params.push(AbiParam::new(I64)); // the cell
-                            s.returns.push(AbiParam::new(I64)); // the remaining fuel
-                            b.import_signature(s)
-                        };
-                        let remaining = b.ins().load(
-                            I64,
-                            MemFlags::trusted(),
-                            addr,
-                            crate::fuel::REMAINING_OFF,
-                        );
-                        let call = b.ins().call_indirect(rsig, remaining, &[addr]);
-                        b.inst_results(call)[0]
-                    } else {
-                        b.ins().iconst(I64, i64::MAX)
-                    };
-                    vals.push(v);
+            // #922: resolve interned call type index.
+            let sig = sig_of(lower.type_section, *sig);
+            // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a
+            // verifier-valid module can call an op an engine serves itself with any shape. Held to
+            // the op's contract (`temen_ir::served_contract`), as every engine holds it: a call
+            // that doesn't match, or an Instantiator op that isn't live, lowers to an
+            // unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
+            // rejection of a verified module (#2066, #2361). (Found by the libFuzzer `diff`
+            // target: Instantiator ops 5/6/7 with short args made the compile fail `Malformed`,
+            // crashing the differential — nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.)
+            if !temen_ir::served_shape_ok(*type_id, *op, sig) {
+                emit_trap_set(b, lower, TrapKind::CapFault);
+                emit_trap_propagate(b, lower);
+                // Dead at runtime (the cell is already set), but keep the verifier's value
+                // accounting for the rest of the block: push zeros of the *declared* result types.
+                for t in &sig.results {
+                    let z = zero_of(b, clif_ty(*t));
+                    vals.push(z);
                 }
+                continue;
+            }
+            // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): read the
+            // domain's remaining fuel **inline**, from the same host-owned cell `emit_fuel_check`
+            // charges, mirroring the interp arm that pushes `*fuel` (and charging none of its own).
+            // Fuel is safepoint-anchored and bit-exact across engines, so this returns the identical
+            // value the tree-walker does under the differential oracle (which arms counted fuel on
+            // the JIT). When no fuel is armed for this compile (`fuel_addr == 0` — the production CLI
+            // bounds runaways via the interrupt kill-path, not a counter) there is no cell to read,
+            // so report `i64::MAX` ("unmetered"): the honest answer for an unbudgeted run.
+            if *type_id == temen_ir::CAP_SELF_TYPE_ID && *op == 13 {
+                let v = if lower.fuel {
+                    // #1944 slice 3 — what the domain can still burn: the cell's `left` plus its
+                    // budget chain's room, asked of the cell (word 2).
+                    let addr = vmctx_load(b, lower, vmctx::FUEL);
+                    let rsig = {
+                        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+                        s.params.push(AbiParam::new(I64)); // the cell
+                        s.returns.push(AbiParam::new(I64)); // the remaining fuel
+                        b.import_signature(s)
+                    };
+                    let remaining =
+                        b.ins()
+                            .load(I64, MemFlags::trusted(), addr, crate::fuel::REMAINING_OFF);
+                    let call = b.ins().call_indirect(rsig, remaining, &[addr]);
+                    b.inst_results(call)[0]
+                } else {
+                    b.ins().iconst(I64, i64::MAX)
+                };
+                vals.push(v);
                 continue;
             }
             // FORK.md §8.6 — `exec_module` (`execve` image-replace, op 14) is eval-loop-only: the
@@ -10170,28 +10173,11 @@ fn lower_instantiator(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a verifier-valid
-    // module can call iface 6 with any `(op, sig)` shape. This lowering dispatches on `op`
-    // **statically** and can neither index missing args nor pass mistyped values through the fixed
-    // thunk ABIs, so it checks the declared shape against the one contract every engine checks
-    // (`temen_ir::instantiator_contract`, #2066). A call that doesn't match, or whose op isn't live,
-    // lowers to an unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
-    // rejection of a verified module. (Found by the libFuzzer `diff` target: ops 5/6/7 with short
-    // args made the compile fail `Malformed`, crashing the differential — nightlies Jun 19 / Jul 2 /
-    // Jul 4, ISSUES.md I16.) The contract is width-tolerant: the per-arg coercions below
+    // This lowering dispatches on `op` **statically** and can neither index missing args nor pass
+    // mistyped values through the fixed thunk ABIs. The `call.cap` lowering has held the call to
+    // its op's contract (`temen_ir::served_contract`) before routing it here, so every arg the
+    // contract names is present. The contract is width-tolerant: the per-arg coercions below
     // (`slot_i64`/`slot_i32`/`result_as`) reconcile the declared widths with each thunk's fixed ABI.
-    let shape_ok = temen_ir::instantiator_shape_ok(op, sig);
-    if !shape_ok {
-        emit_trap_set(b, lower, TrapKind::CapFault);
-        emit_trap_propagate(b, lower);
-        // Dead at runtime (the cell is already set), but keep the verifier's value accounting for
-        // the rest of the block: push zeros of the *declared* result types.
-        for t in &sig.results {
-            let z = zero_of(b, clif_ty(*t));
-            vals.push(z);
-        }
-        return Ok(());
-    }
     // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
     let nursery = vmctx_load(b, lower, vmctx::NURSERY);
     let mem_base = b.use_var(lower.mem_var);

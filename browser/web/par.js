@@ -106,7 +106,8 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               none). Of the emitted-tier options it takes `tierup` and the §22 ones (`jitCodegen`,
 //               `jitRuntimeCodegen`, `jitB2`): each thread runs its task's tier-ups and emitted
 //               invokes on its own Worker, over a window of `winSize` that cannot grow. It refuses
-//               `instCodegen` (#1414 B6-3c);
+//               `instCodegen` (#1414 B6-3c). A run it ends with a trap rejects with an Error whose
+//               `faultAddr` is where a memory fault faulted, window-relative (`-1n` for none, #2275);
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
 //   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
@@ -195,7 +196,8 @@ export function makeRunner({ module, memory, ex }) {
     // seconds later, wherever it is, and one stopped inside the engine's allocator holds its lock for
     // good. Only a stop tears these down too, as the note on `signal` above says.
     const x2threads = new Set();
-    let started = 0;
+    // `childMems`: how many parallel-driver threads ran over a detached child's own memory.
+    let started = 0, childMems = 0;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
         if (signal) {
@@ -209,8 +211,10 @@ export function makeRunner({ module, memory, ex }) {
           w.onmessage = (e) => {
             const m = e.data;
             if (m.kind === 'x2spawn') {
-              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own.
-              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase });
+              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own,
+              // with the detached child's memory its window lives in, if any (B6-3c).
+              if (m.x2Mem) childMems++;
+              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'spawn') {
               // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
               // child's message carries its own win/winSize — the carve; a detached child's carries its
@@ -222,7 +226,7 @@ export function makeRunner({ module, memory, ex }) {
             } else if (m.kind === 'exit') {
               resolve({ exit: m.code });
             } else if (m.kind === 'trap' || m.kind === 'fail') {
-              reject(new Error(m.why || 'guest trap'));
+              reject(Object.assign(new Error(m.why || 'guest trap'), { faultAddr: m.faultAddr }));
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
@@ -237,7 +241,7 @@ export function makeRunner({ module, memory, ex }) {
         startVcpu({ role: x2 ? 'x2root' : 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
-      return { value, exit, started, tierups };
+      return { value, exit, started, tierups, childMems };
     } finally {
       for (const w of workers) w.terminate();
       if (signal && signal.aborted) for (const w of x2threads) w.terminate();

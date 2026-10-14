@@ -14629,12 +14629,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     });
                     continue 'frames;
                 }
+                // The arms below serve their ops here, each delivering the results its op's contract
+                // names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, is a `CapFault` before any of them runs, as on
+                // every engine: no arm numbers a result it doesn't push (#2066, #2361).
+                Inst::CapCall {
+                    type_id, op, sig, ..
+                } if !temen_ir::served_shape_ok(*type_id, *op, call_sig(&cur_types, *sig)) => {
+                    return Err(Trap::CapFault);
+                }
                 Inst::CapCall {
                     type_id: cap_id::INSTANTIATOR,
                     op,
-                    sig,
                     handle,
                     args,
+                    ..
                 } => {
                     // #1578 — DESIGN §22: an **invoked** unit is a seam-free leaf, so the whole
                     // `Instantiator` is unavailable inside a `Jit.invoke` (a non-empty `below` — the
@@ -14643,12 +14652,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // never installed, and its handle names this transient vCPU's child, which no
                     // one can join. An *installed* unit spawns like the base module (#1726).
                     if !below.is_empty() {
-                        return Err(Trap::CapFault);
-                    }
-                    // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
-                    // every engine: an op that isn't live, or a call that would number a result this
-                    // arm doesn't push, is a `CapFault` (#2066).
-                    if !temen_ir::instantiator_shape_ok(*op, call_sig(&cur_types, *sig)) {
                         return Err(Trap::CapFault);
                     }
                     let h = get_i32(&frames[top].vals, *handle)?;
@@ -15175,7 +15178,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
-                    sig,
                     args,
                     ..
                 } => {
@@ -15185,9 +15187,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // frame is a parked ancestor): probeable refusal — the serve loop
                             // is the domain's outermost dispatcher (re-entry into a domain is
                             // a fresh dispatch, never a nested drain).
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
-                            }
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
                             continue;
                         }
                     }
@@ -15242,9 +15242,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && serve_run.is_none()
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
                     {
-                        if !call_sig(&cur_types, *sig).results.is_empty() {
-                            frames[top].vals.push(Reg::from_i64(0));
-                        }
+                        frames[top].vals.push(Reg::from_i64(0));
                         continue;
                     }
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
@@ -15402,9 +15400,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         return Ok(Inner::Park(Blocked::SvcWait { key, deadline_ns }));
                     }
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(*serve_count));
-                    }
+                    frames[top].vals.push(Reg::from_i64(*serve_count));
                     *serve_count = 0;
                 }
                 // FORK.md PR 1/PR 5 — `clone_caller` (self-namespace op 11): serviced here because it
@@ -15427,7 +15423,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15470,9 +15465,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `reap` (self-namespace op 12): serviced here (needs the eval-loop
                 // -local `serve_run`). From within a handler, reap the twin named by the `pid` arg on
@@ -15485,7 +15478,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_REAP,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15539,16 +15531,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
                 // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_PIPE,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15562,9 +15551,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
                 // domain's remaining fuel. No handler context, no host lock — just the live counter,
@@ -15576,12 +15563,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_FUEL_REMAINING,
-                    sig,
                     ..
                 } => {
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(fuel.remaining()));
-                    }
+                    frames[top].vals.push(Reg::from_i64(fuel.remaining()));
                 }
                 // FORK.md §8.6 — `exec_module(module, grants_ptr, grants_n, entry, size_log2)`
                 // (self-namespace op 14): **`execve` image-replace**. Resolve the command module + the
@@ -15594,7 +15578,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_EXEC,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15620,10 +15603,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         clean_root,
                     ) {
                         Ok(req) => return Ok(Inner::Exec(req)),
-                        Err(e) if !call_sig(&cur_types, *sig).results.is_empty() => {
-                            frames[top].vals.push(Reg::from_i64(e));
-                        }
-                        Err(_) => {}
+                        Err(e) => frames[top].vals.push(Reg::from_i64(e)),
                     }
                 }
                 Inst::CapCall {
@@ -15675,9 +15655,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -15718,9 +15700,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -15838,9 +15822,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // Degenerate blocking wait (slice 1): single-fiber guests, durable
                         // callers, non-i64 signatures, the deterministic explorer.
                         let r = comps.wait(id);
-                        if let Some(ty) = call_sig(&cur_types, *sig).results.first() {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
-                        }
+                        push_results(
+                            &mut frames[top].vals,
+                            &[r],
+                            &call_sig(&cur_types, *sig).results,
+                        );
                         continue;
                     }
                     // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
@@ -15908,22 +15894,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
                         Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
-                            frames[top].vals.push(Reg::from_i64(EINTR));
+                            push_results(
+                                &mut frames[top].vals,
+                                &[EINTR],
+                                &call_sig(&cur_types, *sig).results,
+                            );
                             eintr_done = true;
                         }
                         Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7 executable named import (IMPORTS.md phase 1): dispatch through the reserved
@@ -15952,6 +15942,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .lock_unpoisoned()
                         .import_binding(*import)
                         .ok_or(Trap::CapFault)?;
+                    // The bound op is served here too, so the import's declared shape is held to
+                    // its contract as a `call.cap`'s is (#2361).
+                    if !temen_ir::served_shape_ok(b.type_id, b.op, call_sig(&cur_types, *sig)) {
+                        return Err(Trap::CapFault);
+                    }
                     let h = b.handle;
                     match b.op {
                         3 => jit_install_body!(h, args),
@@ -16007,9 +16002,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16050,9 +16047,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16120,15 +16119,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
@@ -16173,9 +16172,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16212,9 +16213,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16283,15 +16286,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
@@ -16368,18 +16371,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results)
-                            {
-                                frames[top]
-                                    .vals
-                                    .push(Reg::from_value(slot_to_val(*tyv, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
@@ -19335,6 +19335,38 @@ pub fn window_tail_bytes<S>(
         held: count(&held) * page,
         aliased: count(&aliased) * page,
     }
+}
+
+/// #2370 — the runs of `pages`, as `(first, last)` page indices, that a page op leaving them `prot`
+/// can change, on every engine's page map. One that grants access commits every page, and
+/// [`Host::page_op`] charges each first, so the budget bounds that walk. One that grants none
+/// changes only the pages that hold something: each of the declared window's, `[0, mapped)`, mapped
+/// unless its entry says otherwise, and each of the reserved tail's that has an entry. A tail page
+/// without one is unmapped and reads zero already, so the op's host work is bounded by the declared
+/// window and by what the guest holds, however large the span it names.
+pub fn changed_runs<S>(
+    map: &BTreeMap<u64, S>,
+    pages: core::ops::RangeInclusive<u64>,
+    mapped: u64,
+    prot: i32,
+) -> Vec<(u64, u64)> {
+    let (first, last) = pages.into_inner();
+    if prot & (PROT_READ | PROT_WRITE) != 0 {
+        return vec![(first, last)];
+    }
+    let mut runs = Vec::new();
+    if first < mapped {
+        runs.push((first, last.min(mapped - 1)));
+    }
+    if first.max(mapped) <= last {
+        for &page in map.range(first.max(mapped)..=last).map(|(page, _)| page) {
+            match runs.last_mut() {
+                Some((_, end)) if *end + 1 == page => *end = page,
+                _ => runs.push((page, page)),
+            }
+        }
+    }
+    runs
 }
 
 /// #2268 — what decides whether two neighbouring window pages can share one OS mapping where the
@@ -29614,43 +29646,23 @@ impl Host {
         }
     }
 
-    /// Resolve a §14 `Module` handle to **raw views** of its grant — the bridge the JIT's nesting
-    /// runtime uses (via `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`).
-    /// `None` for a forged/closed/wrong-type handle. The returned pointers borrow [`Host::modules`]
-    /// (append-only), or a unit's own grant, which lives as long as the unit (`JitUnit::grant`), so
-    /// they stay valid for as long as this `Host` lives — which outlives the run,
-    /// the same lifetime contract as the `call.cap` ctx itself. `memory_log2` is `-1` when the
-    /// module declares no memory. Host-side callers only; never reachable from a guest `call.cap`
-    /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
-    /// leaks into a guest-readable value.
-    #[allow(clippy::type_complexity)]
+    /// Resolve a §14 `Module` handle to its grant — the bridge the JIT's nesting runtime uses (via
+    /// `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`): the module, its
+    /// declared window's `log2` (`-1` when it declares no memory), its shadow arena, whether it was
+    /// attested freezable, and its digest. `None` for a forged/closed/wrong-type handle. The module
+    /// borrows [`Host::modules`] (append-only), so views into it stay valid for as long as this
+    /// `Host` lives — which outlives the run, the same lifetime contract as the `call.cap` ctx
+    /// itself. Host-side callers only; never reachable from a guest `call.cap` (the generic
+    /// dispatch on a `Module` handle is an inert `CapFault`), so no host address ever leaks into a
+    /// guest-readable value.
     pub fn resolve_module_parts(
         &self,
         handle: i32,
-    ) -> Option<(
-        *const Func,
-        usize,
-        i32,
-        *const Data,
-        usize,
-        *const temen_ir::TypeEntry,
-        usize,
-        ShadowArena,
-        bool,
-        [u8; 32],
-    )> {
+    ) -> Option<(&Module, i32, ShadowArena, bool, [u8; 32])> {
         let g = self.resolve_module(handle).ok()?;
-        let m = &g.module;
         Some((
-            m.funcs.as_ptr(),
-            m.funcs.len(),
+            &g.module,
             g.memory_log2().map_or(-1, |l| l as i32),
-            m.data.as_ptr(),
-            m.data.len(),
-            // #922: the child module's type section, so the JIT nesting runtime can resolve the
-            // child's interned `call.dyn` type indices when it re-compiles the child.
-            m.types.as_ptr(),
-            m.types.len(),
             g.shadow().unwrap_or(ShadowArena::EMPTY),
             g.durable,
             // temen#2168: what names its code to the JIT's cache of compiled children.
@@ -32734,10 +32746,13 @@ impl Host {
                         let len = *args.get(1).unwrap_or(&0) as u64;
                         let gone = ClassChange::Every(PageClass::Own(0));
                         self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
-                            if let Some(hook) = &h.region_hook {
+                            let r = m.unmap(win_off, len);
+                            // As `region_map`'s: the hook hears of a span only once the op took
+                            // it, so a span outside the window never reaches it (#2400).
+                            if let (0, Some(hook)) = (r, &h.region_hook) {
                                 hook(win_off, len, None);
                             }
-                            m.unmap(win_off, len)
+                            r
                         })
                     }
                     2 => backing.size() as i64,
@@ -34609,10 +34624,16 @@ impl Mem {
     /// produced a rejected address is allowed to have overflowed — reporting the wrapped value is
     /// honest about what was asked for, where saturating would invent a different question.
     fn report_out_of_window(&self, addr: u64, offset: u64) -> Trap {
-        let rel = addr.wrapping_add(offset);
+        self.report_fault_rel(addr.wrapping_add(offset));
+        Trap::MemoryFault
+    }
+
+    /// Record `rel`, a window-relative address, as where this window's fatal memory fault faulted
+    /// ([`Self::peek_fault_rel`]): an out-of-window refusal's, or the address the emitted tier's
+    /// guard left for a fault in emitted code (#2126, #2275).
+    pub(crate) fn report_fault_rel(&self, rel: u64) {
         self.fault_report
             .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
-        Trap::MemoryFault
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -35116,6 +35137,23 @@ impl Mem {
         );
     }
 
+    /// #2370 — `set` on each page of `pages` that a change to `prot` can alter ([`changed_runs`]),
+    /// in order, under the address-space write lock; the runs it visited.
+    fn change_pages(
+        &self,
+        pages: core::ops::RangeInclusive<u64>,
+        prot: i32,
+        mut set: impl FnMut(&mut BTreeMap<u64, PageProt>, u64),
+    ) -> Vec<(u64, u64)> {
+        let mut space = self.space_write();
+        let mapped = self.window.mapped().div_ceil(self.page);
+        let runs = changed_runs(&space.prot, pages, mapped, prot);
+        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
+            set(&mut space.prot, page);
+        }
+        runs
+    }
+
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
     /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
     /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
@@ -35593,6 +35631,12 @@ impl Mem {
         !self.has_regions.load(Ordering::Relaxed)
     }
 
+    /// The embedder's id of the memory this window lives in when it is not the engine's own
+    /// ([`Region::Foreign`]): what a thread that steps over the window must be able to reach.
+    pub(crate) fn foreign_id(&self) -> Option<u32> {
+        self.back.foreign_id()
+    }
+
     /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
     /// base plus the window's absolute base offset — or `None` when the backing is non-flat (`Sparse`,
     /// `Paged` or `Foreign`: no contiguous address, so the emitted tier cannot serve this window and it stays
@@ -35911,13 +35955,12 @@ impl GuestMem for Mem {
         {
             return ENOMEM;
         }
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, prot, false);
-            }
+        let runs = self.change_pages(pages, prot, |map, page| {
+            self.set_prot(map, page, prot, false)
+        });
+        for (first, last) in runs {
+            self.zero_pages(first..=last); // commit ⇒ fresh zeroed pages
         }
-        self.zero_pages(pages); // commit ⇒ fresh zeroed pages
         0
     }
 
@@ -35927,13 +35970,10 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, 0, false);
-            }
+        let runs = self.change_pages(pages, 0, |map, page| self.set_prot(map, page, 0, false));
+        for (first, last) in runs {
+            self.zero_pages(first..=last);
         }
-        self.zero_pages(pages);
         0
     }
 
@@ -35981,16 +36021,15 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut space = self.space_write();
-        for page in pages {
+        self.change_pages(pages, prot, |map, page| {
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = space.prot.get(&page).copied()
+            }) = map.get(&page).copied()
             {
                 if prot & (PROT_READ | PROT_WRITE) == 0 {
-                    self.set_prot(&mut space.prot, page, 0, false); // the region's, not kept
+                    self.set_prot(map, page, 0, false); // the region's, not kept
                 } else {
-                    space.prot.insert(
+                    map.insert(
                         page,
                         PageProt::Backed {
                             region,
@@ -36000,9 +36039,9 @@ impl GuestMem for Mem {
                     );
                 }
             } else {
-                self.set_prot(&mut space.prot, page, prot, true);
+                self.set_prot(map, page, prot, true);
             }
-        }
+        });
         0
     }
 
@@ -36523,6 +36562,19 @@ fn val_to_slot(v: Value) -> i64 {
 }
 
 /// Decode a capability-ABI result slot back to a `Value` of the declared type.
+/// #2361 — the values a host-served `call.cap` defines: one per declared result, each the host's
+/// result at that place converted to its declared type, or zero past the results the host returned.
+/// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
+/// result slots start zeroed, and the bytecode engine zeroes its result registers.
+fn push_results(vals: &mut Vec<Reg>, results: &[i64], declared: &[ValType]) {
+    vals.extend(
+        declared
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0)))),
+    );
+}
+
 fn slot_to_val(ty: ValType, s: i64) -> Value {
     match ty {
         ValType::I32 => Value::I32(s as i32),
@@ -38765,6 +38817,74 @@ mod prot_tests {
         assert_eq!(m.map(0, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    /// #2370 — the runs an op can change: the whole span when it grants access, else the declared
+    /// window's part of it and the tail pages with an entry, adjacent ones joined.
+    #[test]
+    fn changed_runs_are_the_span_or_what_it_holds() {
+        let map: BTreeMap<u64, PageProt> = [
+            (2, PageProt::Unmapped),
+            (16, PageProt::Rw),
+            (17, PageProt::Ro),
+            (20, PageProt::Unmapped),
+            (99, PageProt::Rw),
+        ]
+        .into_iter()
+        .collect();
+        let runs = |pages, prot| changed_runs(&map, pages, 16, prot);
+        assert_eq!(runs(0..=1 << 40, PROT_READ), [(0, 1 << 40)]);
+        assert_eq!(runs(0..=1 << 40, 0), [(0, 17), (20, 20), (99, 99)]);
+        assert_eq!(runs(3..=98, 0), [(3, 17), (20, 20)]);
+        assert_eq!(runs(18..=19, 0), []);
+        assert_eq!(runs(21..=1 << 40, 0), [(99, 99)]);
+    }
+
+    /// #2370 — a page op that grants no access changes only what the window holds, so its host work
+    /// is bounded by that, not by the span it names. Over a 128 GiB reservation's 2^25 pages, a walk
+    /// of the span took seconds per op; this one costs microseconds. Measured in this thread's CPU
+    /// time, which a loaded machine does not stretch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
+        let cpu_ns = || -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+            stat.split(' ').next().unwrap().parse().unwrap()
+        };
+        let (p, mapped, reserved) = (page(), 1u64 << 16, 1u64 << 37);
+        let mut m = Mem::with_reservation(37, 16, None);
+        // Two adjacent tail pages and one far up, each holding a value.
+        let held = [mapped, mapped + p, reserved - p];
+        let fill = |m: &mut Mem| {
+            for at in held {
+                assert_eq!(m.map(at, p, PROT_READ | PROT_WRITE), 0);
+                assert!(m.store(at, 0, StoreOp::I64, Value::I64(7)).is_ok());
+            }
+        };
+        let read = |m: &mut Mem, at| {
+            assert_eq!(m.protect(at, p, PROT_READ), 0);
+            m.load(at, 0, LoadOp::I64)
+        };
+        let start = cpu_ns();
+        for _ in 0..4 {
+            fill(&mut m);
+            // To no access: the pages keep their contents, which a later `protect` shows.
+            assert_eq!(m.protect(0, reserved, 0), 0);
+            assert_eq!(m.load(0, 0, LoadOp::I64), Err(Trap::MemoryFault));
+            assert_eq!(read(&mut m, held[2]), Ok(Value::I64(7)));
+            // A `map` to no access and an `unmap` zero them, the declared window's included.
+            assert_eq!(m.map(0, reserved, 0), 0);
+            assert_eq!(read(&mut m, held[0]), Ok(Value::I64(0)));
+            fill(&mut m);
+            assert_eq!(m.unmap(0, reserved), 0);
+            for at in [0, held[1], held[2]] {
+                assert_eq!(read(&mut m, at), Ok(Value::I64(0)));
+            }
+            assert_eq!(m.unmap(0, reserved), 0);
+            assert_eq!(m.map(0, mapped, PROT_READ | PROT_WRITE), 0);
+        }
+        let spent = cpu_ns() - start;
+        assert!(spent < 500_000_000, "16 ops took {spent} ns of CPU");
     }
 
     /// §12 shared synchronized address space: a forked vCPU view (`thread.spawn`) sees `map`/`unmap`

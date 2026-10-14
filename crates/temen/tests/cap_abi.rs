@@ -23,7 +23,7 @@ fn seeds(n: usize) -> impl Iterator<Item = Vec<u8>> {
     })
 }
 
-/// Every seed's guest runs to an answer, a trap or a refusal on both engines, and the host survives
+/// Every seed's guest runs to an answer, a trap or a refusal on every engine, and the host survives
 /// it. A panic names the seed and prints its guest; an abort (a refused allocation) does not unwind,
 /// so `CAP_ABI_TRACE=1` prints each seed's number before it runs.
 #[test]
@@ -101,6 +101,18 @@ fn the_fuzzers_finds_stay_fixed() {
         &[
             0x00, 0x41, 0x6b, 0x64, 0x69, 0xdc, 0x05, 0xf0, 0x1c, 0xc1, 0x01, 0x00,
         ],
+        // `SharedRegion.unmap` of a span past the window on the Cranelift JIT: its region hook
+        // heard the span before the unmap refused it, and `base + win_off` overflowed (#2400).
+        &[
+            0x00, 0x01, 0x6d, 0x64, 0x95, 0xf3, 0x2a, 0x7c, 0x7c, 0x7c, 0x49, 0x49, 0x49, 0x49,
+            0x49, 0x48, 0x49, 0x49, 0x49, 0x49, 0x7f, 0x69, 0x72, 0x31,
+        ],
+        // An `unmap` of 88 GiB of the reservation: every engine walked each page of the span, 16 s
+        // of host CPU for a few fuel (#2370).
+        &[
+            0x00, 0x3f, 0xc1, 0xc1, 0xd1, 0xc1, 0xc1, 0x08, 0x2c, 0xfe, 0xff, 0xff, 0x3f, 0x03,
+            0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+        ],
     ] {
         cap_abi::fuzz_one(input);
     }
@@ -142,4 +154,96 @@ fn a_process_waiting_on_itself_is_echild() {
     ]);
     assert_eq!(tw, Some(want.clone()), "tree-walker");
     assert_eq!(bc, Some(want), "bytecode");
+}
+
+/// One call to make: its type, op, the place of its handle in the powerbox, and its args (type,
+/// value).
+type Call<'a> = (u32, u32, usize, &'a [(&'a str, i64)]);
+
+/// A guest making one `call.cap {type_id} {op}` on the powerbox handle at `cap`, with constant
+/// `args` (type, value), declaring `results` `i64` results. It returns the second result when it
+/// declares two, else `7777`, a value defined after the call. Its function 1 is the harness's child
+/// entry, as every generated guest's is.
+fn one_call(
+    type_id: u32,
+    op: u32,
+    cap: usize,
+    args: &[(&str, i64)],
+    results: usize,
+) -> temen_ir::Module {
+    let mut body = String::new();
+    for (i, (ty, v)) in args.iter().enumerate() {
+        body.push_str(&format!("  a{i} = {ty}.const {v}\n"));
+    }
+    let params: Vec<&str> = args.iter().map(|(ty, _)| *ty).collect();
+    let names: Vec<String> = (0..args.len()).map(|i| format!("a{i}")).collect();
+    let outs: Vec<String> = (0..results).map(|i| format!("r{i}")).collect();
+    let bind = match outs.is_empty() {
+        true => String::new(),
+        false => format!("{} = ", outs.join(", ")),
+    };
+    let src =
+        format!(
+        "memory 20\nfunc ({}) -> (i64) {{\nblock 0 ({}) {{\n{body}  {bind}call.cap {type_id} {op} \
+         ({}) -> ({}) p{cap} ({})\n  vr = i64.const 7777\n  return {}\n  }}\n}}\n",
+        ["i32"; 15].join(", "),
+        (0..15).map(|i| format!("p{i}: i32")).collect::<Vec<_>>().join(", "),
+        params.join(", "),
+        vec!["i64"; results].join(", "),
+        names.join(", "),
+        if results == 2 { "r1" } else { "vr" },
+    ) + cap_abi::CHILD_ENTRY;
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// #2361 — every engine defines the values a `call.cap` declares, and numbers the rest of its frame
+/// by them. A call to an op an engine serves itself (`temen_ir::served_contract`) declaring any
+/// other count of results traps `CapFault` before the op runs. One the host serves defines each
+/// result it declares: the host's, then zero. The tree-walker used to push one value whatever such
+/// a call declared, which shifted every later value of its frame.
+#[test]
+fn every_engine_defines_the_results_a_call_declares() {
+    use temen_ir::{cap_id, trap_code::CAP_FAULT, CAP_SELF_TYPE_ID as SELF};
+    // Each op with the args its contract reads.
+    let served: [Call; 11] = [
+        (cap_id::JIT, 3, 14, &[("i64", 5)]),
+        (cap_id::JIT, 4, 14, &[("i64", 999)]),
+        (cap_id::INSTANTIATOR, 1, 3, &[("i32", 7)]),
+        (cap_id::INSTANTIATOR, 9, 3, &[("i32", 7)]),
+        (cap_id::INSTANTIATOR, 14, 3, &[("i32", 7), ("i64", 0)]),
+        (cap_id::INSTANTIATOR, 17, 3, &[("i64", 0)]),
+        (SELF, 9, 0, &[]),
+        (SELF, 12, 0, &[("i64", 99)]),
+        (SELF, 13, 0, &[]),
+        (SELF, 14, 0, &[("i64", 0); 5]),
+        (SELF, 16, 0, &[("i64", 4096)]),
+    ];
+    for (type_id, op, cap, args) in served {
+        let (_, contract) = temen_ir::served_contract(type_id, op).expect("a served op");
+        for results in (0..=2).filter(|&n| n != contract.len()) {
+            let outcomes = cap_abi::on_every_engine(&one_call(type_id, op, cap, args, results));
+            assert!(
+                outcomes.iter().all(|o| *o == Some(Err(CAP_FAULT))),
+                "({type_id}, {op}) declaring {results} results: {outcomes:?}"
+            );
+        }
+    }
+    // A stream write, the clock, the address space's page size, a `Jit.release`: one result each.
+    let host_served: [Call; 4] = [
+        (cap_id::STREAM, 1, 0, &[("i64", 4096), ("i64", 0)]),
+        (cap_id::CLOCK, 0, 8, &[]),
+        (cap_id::ADDRESS_SPACE, 3, 4, &[]),
+        (cap_id::JIT, 2, 14, &[("i64", 5)]),
+    ];
+    for (type_id, op, cap, args) in host_served {
+        for (results, want) in [(0, 7777), (2, 0)] {
+            let outcomes = cap_abi::on_every_engine(&one_call(type_id, op, cap, args, results));
+            assert!(
+                outcomes.iter().all(|o| *o == Some(Ok(vec![want]))),
+                "({type_id}, {op}) declaring {results} results: {outcomes:?}"
+            );
+        }
+    }
 }

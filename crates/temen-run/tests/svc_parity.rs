@@ -5,8 +5,16 @@
 //! (`Instantiator.child_offer`), call through it (park), serve (`svc.wait`), reply-wake, join —
 //! producing the SAME observable on TreeWalk, Bytecode, and Jit.
 
+use temen_interp::{Host, MemLayout, Value};
+use temen_ir::Module;
+use temen_jit::JitOutcome;
 use temen_run::{instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig};
 use temen_text::parse_module;
+
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
+
+use drivers::{agree_on, Driver, Ran};
 
 /// `_start`: resolve the granted `"vm"` Instantiator, `"budget"` and `"child"` by name, spawn the
 /// serving child (the image of func 1) detached through a v1 record, mint
@@ -180,4 +188,154 @@ fn a_serving_root_with_a_thread_serves_on_all_three_backends() {
             "{backend:?}: an empty poll serves nothing and answers 0"
         );
     }
+}
+
+/// #2247 — a parent whose `"adder"` handler is its func 1 spawns a child of **another module**, the
+/// `"kid"` grant ([`SEPARATE_CHILD`]), mints `child_offer(child, export 0)`, calls `add(40, 2)`
+/// through it, joins, and returns the reply.
+const SEPARATE_PARENT: &str = "\
+memory 17
+data 16384 \"vm\"
+data 16400 \"budget\"
+data 16416 \"kid\"
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"adder\" 1 { add: 1 }
+
+func 0 () -> (i64) {
+block 0 () {
+  vp = i64.const 16384
+  vl = i64.const 2
+  vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vkp = i64.const 16416
+  vkl = i64.const 3
+  vkid = self.resolve vkp vkl
+  q0a0 = i64.const 17536
+  q0v0 = i64.const 1
+  i64.store q0a0 q0v0
+  q0v2 = i64.const -4294967296
+  i64.store q0a0 q0v2 offset=16
+  i32.store q0a0 vkid offset=24
+  i32.store q0a0 vbud offset=28
+  q0v9 = i64.const 4294967295
+  i64.store q0a0 q0v9 offset=72
+  v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
+  v6 = i64.const 0
+  v7 = call.cap 6 14 (i32, i64) -> (i32) vh (v5, v6)
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (v5)
+  return vr
+  }
+}
+
+func 1 (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  return vs
+  }
+}
+";
+
+/// The `"kid"` module: its func 0 serves one call; its `"adder"` handler is its func 2, which adds
+/// 1000. Its func 1, at the parent's handler index, adds 2000, so a child served through the
+/// parent's handler indices answers 2042 instead of 1042.
+const SEPARATE_CHILD: &str = "\
+memory 16
+type 0 func (i64, i64) -> (i64)
+type 1 interface { add: 0 }
+export 0 interface \"adder\" 1 { add: 2 }
+
+func 0 (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i32.const 0
+  vn = svc.wait vz
+  return vn
+  }
+}
+
+func 1 (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  vk = i64.const 2000
+  vt = i64.add vs vk
+  return vt
+  }
+}
+
+func 2 (i64, i64) -> (i64) {
+block 0 (va: i64, vb: i64) {
+  vs = i64.add va vb
+  vk = i64.const 1000
+  vt = i64.add vs vk
+  return vt
+  }
+}
+";
+
+fn verified(src: &str) -> Module {
+    let m = parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// [`SEPARATE_PARENT`]'s powerbox: the `"vm"` it spawns through, the `"budget"` that pays, and the
+/// `"kid"` module.
+fn separate_setup(kid: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
+    move || {
+        let mut h = Host::new();
+        let vm = h.grant_instantiator(0, 128 << 10);
+        h.register_cap_name("vm", vm);
+        let budget = h.grant_budget(-1, 1 << 20, -1);
+        h.register_cap_name("budget", budget);
+        let k = h.grant_module(kid);
+        h.register_cap_name("kid", k);
+        (h, Vec::new())
+    }
+}
+
+/// **#2247: a child serves its own module's offer, at its own handler index.** The Cranelift JIT
+/// compiled every child with its parent's handler indices, so this child had no serve trampoline
+/// for its func 2, and the call answered `-EBADF`. The tree-walker and the scheduling bytecode
+/// drivers serve it; the debug driver declines `child_offer` and the resumable `Vcpu` has no child
+/// to offer over (#1732), so neither is asked.
+#[test]
+fn a_child_of_another_module_serves_its_own_offer_on_every_engine() {
+    let parent = verified(SEPARATE_PARENT);
+    let kid = verified(SEPARATE_CHILD);
+    let want = Ran {
+        result: Ok(vec![Value::I64(1042)]),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    agree_on(
+        &[Driver::Oracle, Driver::Coop, Driver::Parallel],
+        "a child of another module serves",
+        &parent,
+        &separate_setup(&kid),
+        &want,
+    );
+
+    // The Cranelift JIT, on a thread of its own, so a call the child never serves fails the test
+    // instead of hanging it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut host, _) = separate_setup(&kid)();
+        let window = MemLayout::image(vec![0u8; 128 << 10]);
+        let (jo, _) = temen_run::jit_cap_run(&parent, 0, &[], &window, 0, 0, &mut host, None)
+            .expect("the JIT compiles it");
+        let _ = tx.send(jo);
+    });
+    let jo = rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the JIT run hung");
+    assert_eq!(
+        jo,
+        JitOutcome::Returned(vec![1042]),
+        "the Cranelift JIT: the kid's own handler answers add(40, 2)"
+    );
 }

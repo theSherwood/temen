@@ -398,9 +398,8 @@ enum Op {
     CloneCaller {
         /// The reply-value arg registers (0, 1, or 2), resolved to i64s in the driver.
         args: Box<[u32]>,
+        /// The twin handle (or an errno) lands here.
         dst: u32,
-        /// Whether the `call.cap` has a result slot (the twin handle / errno lands here).
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
     /// handler, reap a twin `pid` a prior `clone_caller` minted, on behalf of the caller parked on
@@ -411,7 +410,6 @@ enum Op {
         /// The `pid` arg register (`None` = no arg → an out-of-range pid → `-ECHILD`).
         pid: Option<u32>,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (self-op 14): **`execve` image-replace** (#1080). The running vCPU
     /// replaces its own image with a granted *separate command module*, in place, keeping its task id
@@ -613,7 +611,7 @@ enum Op {
     },
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
-    /// (`temen_ir::instantiator_contract`), which the oracle refuses after the handle resolves (a
+    /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
     /// forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5 and 13, #1867), `wait`
     /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
@@ -1630,14 +1628,16 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
             }
             for inst in &b.insts {
                 match inst {
-                    // Every live op (`temen_ir::instantiator_contract`) drives executor children,
+                    // Every live op (`temen_ir::served_contract`) drives executor children,
                     // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
                     // (`Op::CapFault`), so it is no seam.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         op,
                         ..
-                    } if temen_ir::instantiator_contract(*op).is_some() => s.has_instantiate = true,
+                    } if temen_ir::served_contract(super::cap_id::INSTANTIATOR, *op).is_some() => {
+                        s.has_instantiate = true
+                    }
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         ..
@@ -2172,23 +2172,41 @@ fn admit_detached_child(
 }
 
 /// [`admit_detached_child`] for the in-process drivers, which hold the child's window themselves:
-/// built at once, over a reservation of the engine's own. Returns the child, and the emit of the
+/// built at once, over a reservation of the engine's own, or over a backing `backing` makes
+/// ([`ThreadPlatform::child_window`]). A backing it cannot make refuses the spawn, and hands the
+/// window's bytes back to the budget that paid for them. Returns the child, and the emit of the
 /// program it runs, as `emit` answers for it: the cooperative pump's ([`ProgramEmits::for_child`]),
-/// `None` on a driver with no emitted tier. A child with an emit gets its window over a
-/// [`FreshWindow::flat_backing`] instead, so that it can tier up on every target (#2102). Only the
-/// cooperative pump has emits, and it is the single owner a backing that relocates needs.
+/// `None` on a driver with no emitted tier, and `None` for a window over its own backing. A child
+/// with an emit gets its window over a [`FreshWindow::flat_backing`] instead, so that it can tier
+/// up on every target (#2102). Only the cooperative pump has emits, and it is the single owner a
+/// backing that relocates needs.
+#[allow(clippy::too_many_arguments)] // the spawn's inputs, its emit, and where its window can live
 fn admit_detached_in_process(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
+    backing: Option<ChildBacking>,
 ) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
     let Some((mut child, window)) = admit_detached_child(host, pm, s, false, source)? else {
         return Ok(None);
     };
-    let tierup = emit(&child);
-    let back = tierup.as_ref().and_then(|_| window.flat_backing());
+    let (back, tierup) = match backing {
+        Some(make) => match make(window.size_log2) {
+            Some(back) => (Some(back), None),
+            None => {
+                if let Some(lease) = child.lease {
+                    host.release_detached(lease);
+                }
+                return Ok(None);
+            }
+        },
+        None => {
+            let tierup = emit(&child);
+            (tierup.as_ref().and_then(|_| window.flat_backing()), tierup)
+        }
+    };
     child.mem = Some(window.build(back, &mut child.host)?);
     Ok(Some((child, tierup)))
 }
@@ -2841,21 +2859,12 @@ fn compile_inst(
             args,
         } => {
             use super::cap_id;
-            // #2353 — the driver-served ops below deliver exactly one result, at `dst`. A call that
-            // declares another shape has no such slot (with none, `dst` lies past its frame), so it
-            // declines to the oracle rather than writing where its frame does not reach. The
-            // `Instantiator`'s are held to their contract instead (the first arm), which gives `join`
-            // its two result slots.
-            let one = view.sig(*sig).results.len() == 1;
             match (*type_id, *op) {
-                // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
-                // every engine: an op that isn't live, or a call shaped otherwise, traps `CapFault`
-                // (#2066). Past this arm every Instantiator call has its op's arg prefix.
-                (cap_id::INSTANTIATOR, op)
-                    if !temen_ir::instantiator_shape_ok(op, view.sig(*sig)) =>
-                {
-                    Op::CapFault
-                }
+                // The ops below are served here, each delivering at `dst` the results its op's
+                // contract names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, traps `CapFault`, as on every engine (#2066,
+                // #2361). Past this arm every served call has its op's arg prefix and results.
+                _ if !temen_ir::served_shape_ok(*type_id, *op, view.sig(*sig)) => Op::CapFault,
                 (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
@@ -2892,17 +2901,16 @@ fn compile_inst(
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (cap_id::JIT, 3) if one && !args.is_empty() => Op::JitInstall {
+                (cap_id::JIT, 3) => Op::JitInstall {
                     handle: g(*handle),
                     code: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 4) if one && !args.is_empty() => Op::JitUninstall {
+                (cap_id::JIT, 4) => Op::JitUninstall {
                     handle: g(*handle),
                     slot: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 3 | 4) => return None,
                 (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
                     handle: g(*handle),
                     code: g(args[0]),
@@ -2922,24 +2930,18 @@ fn compile_inst(
                 // A live op this lowering has no arm for declines to the oracle.
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
-                // shape compiles to the native serve-loop-core op — the module-level veto in
-                // [`compile_module`] guarantees its handlers cannot park mid-dispatch, so the
-                // rewind linkage runs each one to completion (or trap). `svc.wait`'s
-                // empty-queue park needs a waker topology (cross-domain callers, timers) the
-                // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
-                // leave the op without its result-slot scratch — both still decline, falling
-                // the whole module back to the tree-walk oracle, which serves.
+                // §3.6 service points (I36 slice 1): `svc.poll` compiles to the native
+                // serve-loop-core op — the module-level veto in [`compile_module`] guarantees its
+                // handlers cannot park mid-dispatch, so the rewind linkage runs each one to
+                // completion (or trap). `svc.wait`'s empty-queue park needs a waker topology
+                // (cross-domain callers, timers) the cooperative scheduler doesn't host yet, so it
+                // declines, falling the whole module back to the tree-walk oracle, which serves.
                 // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
                 // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
-                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
-                    if view.sig(*sig).results.len() == 1 && args.is_empty() =>
-                {
-                    Op::SvcPoll {
-                        dst,
-                        wait: op == 10,
-                    }
-                }
+                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if args.is_empty() => Op::SvcPoll {
+                    dst,
+                    wait: op == 10,
+                },
                 (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
                 // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
@@ -2947,12 +2949,10 @@ fn compile_inst(
                 (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
                     pid: args.first().map(|a| g(*a)),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
@@ -2966,7 +2966,7 @@ fn compile_inst(
                 // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
                 // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
                 // an exec-bearing module — bash — runs on the browser's bytecode engine.)
-                (temen_ir::CAP_SELF_TYPE_ID, 14) if args.len() >= 5 => Op::ExecModule {
+                (temen_ir::CAP_SELF_TYPE_ID, 14) => Op::ExecModule {
                     module: g(args[0]),
                     grants_ptr: g(args[1]),
                     grants_n: g(args[2]),
@@ -2974,9 +2974,6 @@ fn compile_inst(
                     size_log2: g(args[4]),
                     dst,
                 },
-                // A malformed `exec_module` (< 5 args) is outside the ABI — decline the module so it
-                // folds to the tree-walker rather than mis-lowering.
-                (temen_ir::CAP_SELF_TYPE_ID, 14) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
@@ -8084,7 +8081,8 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None)? else {
+    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None, None)?
+    else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
@@ -10605,19 +10603,17 @@ enum Outcome {
     /// twin. Driver-side (it owns the task/env set + the parked caller). `reply_orig` = `Some` in the
     /// explicit two-reply form, `None` in pid mode (the parent gets the twin's task id). The driver
     /// reads the handler's `serve_ticket` to name the caller; the twin handle (or an errno) lands at
-    /// `dst` when `has_result`.
+    /// `dst`.
     CloneCaller {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (`execve` image-replace, #1080): the running vCPU asks the driver
     /// to replace its image with command module `mh`, granting the by-name cap list at `(grants_ptr,
@@ -12321,14 +12317,12 @@ enum VcpuStop {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` image-replace (#1080): surfaced to the cooperative driver, which
     /// owns the task/env set + `dom.source`. Cooperative-driver-only (like [`VcpuStop::CloneCaller`]);
@@ -12691,26 +12685,14 @@ fn step_vcpu(
                 reply_orig,
                 reply_twin,
                 dst,
-                has_result,
             } => {
                 return Ok(VcpuStop::CloneCaller {
                     reply_orig,
                     reply_twin,
                     dst,
-                    has_result,
                 })
             }
-            Outcome::Reap {
-                pid,
-                dst,
-                has_result,
-            } => {
-                return Ok(VcpuStop::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                })
-            }
+            Outcome::Reap { pid, dst } => return Ok(VcpuStop::Reap { pid, dst }),
             Outcome::Exec {
                 cmd,
                 grants_ptr,
@@ -13715,6 +13697,9 @@ struct SchedCore {
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
+    /// Where a detached child's window lives ([`ThreadPlatform::child_window`]): executor 2's
+    /// platform may give it a backing of its own; the pump builds it in the engine's.
+    child_window: Option<ChildBacking>,
 }
 
 /// The cooperative pump's state for the host's emitted tier (#926): which programs' calls tier up,
@@ -14245,6 +14230,7 @@ impl SchedCore {
             hooked_twins,
             released: Released::default(),
             clock,
+            child_window: None,
         })
     }
 }
@@ -14370,6 +14356,7 @@ impl CoopSched {
                 hooked_twins,
                 released,
                 clock,
+                child_window: _, // the pump builds every child's window in the engine's memory
             } = &mut *core;
             let EmitTier {
                 leaf,
@@ -14872,6 +14859,7 @@ impl SchedCore {
             forked_twins,
             hooked_twins,
             clock,
+            child_window,
             ..
         } = self;
         let EmitTier {
@@ -15075,7 +15063,6 @@ impl SchedCore {
                 reply_orig,
                 reply_twin,
                 dst,
-                has_result,
             }) => {
                 // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
                 // parked on this handler's dispatch into a live **twin** (private window +
@@ -15196,15 +15183,9 @@ impl SchedCore {
                     tasks[caller_ti].state = TaskState::Runnable;
                     twin_ti as i64
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
-            Ok(VcpuStop::Reap {
-                pid,
-                dst,
-                has_result,
-            }) => {
+            Ok(VcpuStop::Reap { pid, dst }) => {
                 // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
                 // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
                 // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
@@ -15259,9 +15240,7 @@ impl SchedCore {
                         0
                     }
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
             Ok(VcpuStop::Exec {
                 cmd,
@@ -15588,6 +15567,7 @@ impl SchedCore {
                     spawn,
                     &dom.source,
                     |c| programs.for_child(&c.program, &c.host, &dom.source),
+                    *child_window,
                 );
                 let (child, tierup) = match admitted {
                     Ok(Some(c)) => c,
@@ -16907,21 +16887,35 @@ struct ThreadRun {
 /// of its own, and a browser's threads can run emitted wasm.
 #[derive(Clone)]
 pub struct ThreadPlatform {
-    /// Start `f` on a thread of its own, which nothing joins. An error refuses the thread.
-    pub spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    /// Start `f` on a thread of its own, which nothing joins. The second argument names the memory
+    /// the thread's window lives in when it is one of [`Self::child_window`]'s
+    /// ([`super::Region::foreign_id`]), which the thread must be able to reach. An error refuses the
+    /// thread.
+    pub spawn: fn(ThreadStart, Option<u32>) -> std::io::Result<()>,
     /// Nanoseconds of wall time on a monotonic clock that every thread of the run reads alike.
     pub now_ns: fn() -> u64,
     /// The emitted tier the run's tasks tier up to, if any ([`ThreadTier`]).
     pub tier: Option<ThreadTier>,
+    /// Where a detached child's window lives (#1414 B6-3c): a backing of the embedder's own, apart
+    /// from the engine's memory, `2^size_log2` bytes to start with; `None` builds it in the engine's,
+    /// as every other driver does. A backing the embedder cannot make refuses the spawn.
+    pub child_window: Option<ChildBacking>,
 }
+
+/// A thread a run starts ([`ThreadPlatform::spawn`]), for the platform to run on a thread of its own.
+pub type ThreadStart = Box<dyn FnOnce() + Send>;
+
+/// Make a detached child's window backing of `2^size_log2` bytes ([`ThreadPlatform::child_window`]).
+pub type ChildBacking = fn(u8) -> Option<std::sync::Arc<super::Region>>;
 
 impl ThreadPlatform {
     /// An OS thread per task (D56), the process-wide monotonic clock the pump's busy-poll deadlines
     /// use, and no emitted tier.
     pub const OS: ThreadPlatform = ThreadPlatform {
-        spawn: |f| std::thread::Builder::new().spawn(f).map(drop),
+        spawn: |f, _| std::thread::Builder::new().spawn(f).map(drop),
         now_ns: sched_wall_now,
         tier: None,
+        child_window: None,
     };
 }
 
@@ -16976,6 +16970,10 @@ pub struct EmittedCall<'a> {
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
+    /// Where a `MemoryFault` the emitted code ended with faulted, window-relative: the address its
+    /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
+    /// interpreted fault (#2275).
+    pub fault: Option<u64>,
     /// A call out of the emitted code back into the interpreter ([`Bounce`]).
     pub bounce: &'a mut Bounce<'a>,
     table: &'a SharedSlots,
@@ -17186,6 +17184,7 @@ fn drive_threads(
     if let Some(e) = &programs.root {
         core.arm_tierup(e);
     }
+    core.child_window = platform.child_window;
     let run = std::sync::Arc::new(ThreadRun {
         dom: std::sync::Arc::new(dom),
         root: std::mem::take(host).into_cell(),
@@ -17216,7 +17215,7 @@ fn drive_threads(
         let seen = *bell.0.lock().unwrap_or_else(|e| e.into_inner());
         run.state.lock_unpoisoned().live += 1;
         let r = std::sync::Arc::clone(&run);
-        run.start_thread(move || r.watch(&bell, seen));
+        run.start_thread(move || r.watch(&bell, seen), None);
     }
     run_task_thread(std::sync::Arc::clone(&run), 0, view, hand);
     // The run is over, and every thread leaves at its next look: wait for them all to go.
@@ -17331,7 +17330,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             release(g);
             for (j, mem, fuel) in made {
                 let r = std::sync::Arc::clone(&run);
-                run.start_thread(move || run_task_thread(r, j, mem, fuel));
+                let window = mem.as_ref().and_then(Mem::foreign_id);
+                run.start_thread(move || run_task_thread(r, j, mem, fuel), window);
             }
             g = run.state.lock_unpoisoned();
         }
@@ -17515,6 +17515,7 @@ impl ThreadRun {
             win,
             over: &self.over,
             results: Vec::new(),
+            fault: None,
             bounce: &mut bounce,
             table,
             host,
@@ -17522,7 +17523,12 @@ impl ThreadRun {
             pagestate: &pagestate,
             spill: spilled,
         };
-        (tier.run)(&mut call).map(|()| call.results)
+        let ran = (tier.run)(&mut call);
+        let (results, fault) = (call.results, call.fault);
+        if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
+            m.report_fault_rel(rel);
+        }
+        ran.map(|()| results)
     }
 
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
@@ -17556,8 +17562,10 @@ impl ThreadRun {
 
     /// Start `f` on a thread of its own, one the run has counted in ([`Threads::live`]). A thread
     /// that cannot start ends the run, which cannot go on without it (D56: a task is a thread).
-    fn start_thread(&self, f: impl FnOnce() + Send + 'static) {
-        if (self.platform.spawn)(Box::new(f)).is_err() {
+    /// Start `f` on a thread of its own, over a window in `window`, the memory
+    /// [`ThreadPlatform::spawn`] must let it reach, if any.
+    fn start_thread(&self, f: impl FnOnce() + Send + 'static, window: Option<u32>) {
+        if (self.platform.spawn)(Box::new(f), window).is_err() {
             let mut g = self.state.lock_unpoisoned();
             g.live -= 1;
             self.end(&mut g);
@@ -19435,6 +19443,12 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // #2361 — the call defines every result it declares: whatever lands below (the
+                    // host's results, an errno, a parked call's delivery) lands over zeros, as the
+                    // oracle and the Cranelift JIT define them.
+                    for i in 0..results.len() {
+                        self.regs[base + *dst as usize + i] = Reg::default();
+                    }
                     // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
                     // landing freeze only to reach its next freeze point, so nothing may leave it on the
                     // way — a host call is abandoned rather than performed, for the thaw to re-issue.
@@ -19442,9 +19456,6 @@ impl Vm {
                     if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
                         && self.abandon_for_freeze(mem, host)
                     {
-                        for i in 0..results.len() {
-                            self.regs[base + *dst as usize + i] = Reg::default();
-                        }
                         pc += 1;
                         continue;
                     }
@@ -19456,9 +19467,7 @@ impl Vm {
                         let mut sole = mem.as_mut().map(super::SoleMem);
                         let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
                         let r = host.with(|p| p.mint_pipe(fds, gm));
-                        if !results.is_empty() {
-                            self.regs[base + *dst as usize] = Reg::from_i64(r);
-                        }
+                        self.regs[base + *dst as usize] = Reg::from_i64(r);
                         pc += 1;
                         continue;
                     }
@@ -19476,8 +19485,16 @@ impl Vm {
                                 && b.type_id == super::cap_id::JIT
                                 && matches!(b.op, 1 | 3 | 4)
                             {
-                                if argv.is_empty() {
-                                    return Err(Trap::CapFault); // invoke/install/uninstall need arg0
+                                // invoke needs its code handle in arg0; install and uninstall are
+                                // held to their contract, as on the oracle (#2361).
+                                let sig = temen_ir::FuncType {
+                                    params: params.to_vec(),
+                                    results: results.to_vec(),
+                                };
+                                if argv.is_empty()
+                                    || !temen_ir::served_shape_ok(b.type_id, b.op, &sig)
+                                {
+                                    return Err(Trap::CapFault);
                                 }
                                 self.module = module;
                                 self.cur = cur;
@@ -20030,11 +20047,7 @@ impl Vm {
                         grant,
                     });
                 }
-                Op::CloneCaller {
-                    args,
-                    dst,
-                    has_result,
-                } => {
+                Op::CloneCaller { args, dst } => {
                     // Arity picks the mode (mirrors the oracle, `temen-interp` clone_caller arm):
                     // 2 args = explicit `(reply_orig, reply_twin)`; 0/1 args = pid mode
                     // (`reply_orig = None` → the parent gets the twin's task id).
@@ -20045,7 +20058,6 @@ impl Vm {
                         (None, twin)
                     };
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
@@ -20054,27 +20066,17 @@ impl Vm {
                         reply_orig,
                         reply_twin,
                         dst,
-                        has_result,
                     });
                 }
-                Op::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                } => {
+                Op::Reap { pid, dst } => {
                     // The pid to reap (an out-of-range default → the driver answers -ECHILD).
                     let pid = pid.map(|p| r!(p).i64()).unwrap_or(-1);
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::Reap {
-                        pid,
-                        dst,
-                        has_result,
-                    });
+                    return Ok(Outcome::Reap { pid, dst });
                 }
                 // FORK.md §8.6 — `exec_module` (#1080): resolve the five register operands and surface
                 // the image-replace to the driver. The cursor is saved (pc+1) so a *refused* exec

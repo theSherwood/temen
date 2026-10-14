@@ -3,8 +3,9 @@
 //! a random sequence of `call.cap`s — any type, op, handle, signature and arguments, the handles and
 //! arguments drawn from the powerbox, earlier results, pointers into fuzzer-chosen window bytes and
 //! raw values — against a powerbox holding each capability a default one grants a guest, under
-//! small budgets. It runs on the tree-walker and the bytecode engine, so it reaches both the host's
-//! dispatch and each engine's own arms (spawns, joins, page ops).
+//! small budgets. It runs on the tree-walker, the bytecode engine and the Cranelift JIT (#2400), so
+//! it reaches both the host's dispatch and each engine's own arms (spawns, joins, page ops, the JIT's
+//! window and thunks), each set up as production sets it up.
 //!
 //! A find is a host panic, an abort, or one host allocation past [`ALLOC_LIMIT`] ([`Bounded`]
 //! refuses it, and the allocation-failure handler aborts). A refusal, a trap or an errno is the
@@ -15,8 +16,9 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
-use temen_interp::{bytecode, cap_id, Host, Trap, Value};
+use temen_interp::{bytecode, cap_id, Host, MemLayout, Value};
 use temen_ir::ValType;
+use temen_jit::JitOutcome;
 
 /// The most one host allocation may take: well above what the budgets below let a guest hold, so
 /// a larger one is a size the guest chose that nothing charged.
@@ -53,6 +55,10 @@ unsafe impl GlobalAlloc for Bounded {
     }
 }
 
+/// Every guest's function 1: a child entry, which the powerbox grants as the module a spawn runs
+/// (#2219).
+pub const CHILD_ENTRY: &str = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n";
+
 /// The guest's window: 1 MiB.
 const WINDOW_LOG2: u8 = 20;
 const WINDOW: i64 = 1 << WINDOW_LOG2;
@@ -62,6 +68,8 @@ const SCRATCH: i64 = 1 << 16;
 const FUEL: u64 = 1_000_000;
 /// The root's ceilings: `mem`, `channel`, `spawn`, `maps`.
 const GRANT: (i64, i64, i64, i64) = (64 << 20, 16 << 20, 16, 4096);
+/// The `call.dyn` table a `Jit.install` may fill: 16 slots.
+const TABLE_LOG2: u8 = 4;
 
 /// The powerbox, in the order the entry function takes its handles, with each one's type.
 const CAPS: [u32; 15] = [
@@ -378,8 +386,7 @@ fn program(data: &[u8]) -> (String, Vec<u32>) {
         p.body,
         rets.join(" ")
     );
-    // A child entry, for a spawn to start.
-    src.push_str("func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n");
+    src.push_str(CHILD_ENTRY);
     (src, p.results.iter().map(|v| v.type_id).collect())
 }
 
@@ -388,19 +395,13 @@ pub fn guest(data: &[u8]) -> String {
     program(data).0
 }
 
-/// Decode and verify, as a validating loader would: the gate `ModuleLoader.from_bytes` runs.
-fn validate(bytes: &[u8]) -> Result<temen_ir::Module, i64> {
-    let m = temen_encode::decode_module(bytes).map_err(|_| temen_ir::errno::EINVAL)?;
-    temen_verify::verify_module(&m).map_err(|_| temen_ir::errno::EINVAL)?;
-    Ok(m)
-}
-
 /// A fresh host holding the powerbox [`CAPS`] lists, and the entry's arguments: its handles.
-fn powerbox(m: &temen_ir::Module) -> (Host, Vec<Value>) {
+fn powerbox(m: &temen_ir::Module) -> (Host, Vec<i32>) {
     let mut h = Host::new();
     let (mem, channel, spawn, maps) = GRANT;
     h.set_grant(mem, channel, spawn, maps);
-    h.set_module_validator(validate);
+    // OS-backed regions, which the JIT maps for real, as production's are.
+    h.set_region_factory(temen_run::new_shared_region);
     let handles = [
         h.grant_stream(temen_interp::StreamRole::Out),
         h.grant_stream(temen_interp::StreamRole::Err),
@@ -411,7 +412,7 @@ fn powerbox(m: &temen_ir::Module) -> (Host, Vec<Value>) {
         // #2219: a spawn starts at its module's function 0, so the program is granted as the child
         // image of its child entry, function 1.
         h.grant_module(&temen_ir::child_image_at(m, 1).expect("function 1 is a child entry")),
-        h.grant_module_loader(),
+        temen_run::grant_module_loader(&mut h),
         h.grant_clock(),
         h.grant_shared_region(1 << 16),
         temen_run::fs::mem_fs().install(&mut h, 0),
@@ -426,10 +427,9 @@ fn powerbox(m: &temen_ir::Module) -> (Host, Vec<Value>) {
             exit: 0,
         }])
         .install(&mut h, 0),
-        h.grant_jit(Some(WINDOW_LOG2)),
+        temen_run::grant_jit(&mut h, m, TABLE_LOG2),
     ];
-    let args = handles.iter().map(|&h| Value::I32(h)).collect();
-    (h, args)
+    (h, handles.to_vec())
 }
 
 /// What one input did, for the stable test to check the harness reaches the capabilities: how the
@@ -443,34 +443,65 @@ pub struct Runs {
     pub results: Vec<(u32, i64)>,
 }
 
-/// Run the guest `data` becomes on the tree-walker and on the bytecode engine, each over a fresh
-/// powerbox. A host panic or abort is the find; anything the guest sees is not.
+/// How a run ended: what it returned, each result as an `i64`, or the wire code it ended with
+/// (`temen_ir::trap_code`: a trap, an exit, a host unwind); `None` when the engine declined the
+/// module.
+pub type Outcome = Option<Result<Vec<i64>, i64>>;
+
+/// `m`'s entry on the tree-walker, the bytecode engine and the Cranelift JIT, each over a fresh
+/// powerbox, which it takes as its arguments.
+pub fn on_every_engine(m: &temen_ir::Module) -> [Outcome; 3] {
+    let interp = |r: Result<Vec<Value>, temen_interp::Trap>| {
+        let wide = |v: &Value| match v {
+            Value::I64(x) => *x,
+            _ => i64::MIN,
+        };
+        r.map(|vals| vals.iter().map(wide).collect())
+            .map_err(temen_interp::Trap::code)
+    };
+    let (mut h, handles) = powerbox(m);
+    let args: Vec<Value> = handles.into_iter().map(Value::I32).collect();
+    let mut fuel = FUEL;
+    let tree_walker = Some(interp(temen_interp::run_with_host(
+        m, 0, &args, &mut fuel, &mut h,
+    )));
+    let (mut h, handles) = powerbox(m);
+    let args: Vec<Value> = handles.into_iter().map(Value::I32).collect();
+    let mut fuel = FUEL;
+    let bytecode = bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut h).map(interp);
+    let (mut h, handles) = powerbox(m);
+    let args: Vec<i64> = handles.into_iter().map(i64::from).collect();
+    let window = MemLayout::image(vec![0; WINDOW as usize]);
+    // The reservation the interpreters' runs take, so a page op past the declared window reaches
+    // the same tail on every engine.
+    let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+    let jit = match temen_run::jit_cap_run(m, 0, &args, &window, reserved, TABLE_LOG2, &mut h, None)
+    {
+        Ok((JitOutcome::Returned(vals), _)) => Some(Ok(vals)),
+        Ok((JitOutcome::Trapped(kind), _)) => Some(Err(kind as i64)),
+        Ok((JitOutcome::Exited(code), _)) => Some(Err(temen_ir::trap_code::exit(code))),
+        Ok((JitOutcome::HostUnwound, _)) => Some(Err(temen_jit::HOST_UNWIND_CODE.into())),
+        Err(_) => None,
+    };
+    [tree_walker, bytecode, jit]
+}
+
+/// Run the guest `data` becomes on every engine ([`on_every_engine`]). A host panic or abort is the
+/// find; anything the guest sees is not.
 pub fn fuzz_one(data: &[u8]) -> Runs {
     let (src, types) = program(data);
     let m = temen_text::parse_module(&src).expect("the generated guest parses");
     temen_verify::verify_module(&m).expect("the generated guest verifies");
     let mut runs = Runs::default();
-    let mut tally = |r: Option<Result<Vec<Value>, Trap>>| match r {
-        Some(Ok(vals)) => {
-            runs.completed += 1;
-            let vals = vals.iter().map(|v| match v {
-                Value::I64(x) => *x,
-                _ => i64::MIN,
-            });
-            runs.results.extend(types.iter().copied().zip(vals));
+    for outcome in on_every_engine(&m) {
+        match outcome {
+            Some(Ok(vals)) => {
+                runs.completed += 1;
+                runs.results.extend(types.iter().copied().zip(vals));
+            }
+            Some(Err(_)) => runs.trapped += 1,
+            None => runs.declined += 1,
         }
-        Some(Err(_)) => runs.trapped += 1,
-        None => runs.declined += 1,
-    };
-    let (mut h, args) = powerbox(&m);
-    let mut fuel = FUEL;
-    tally(Some(temen_interp::run_with_host(
-        &m, 0, &args, &mut fuel, &mut h,
-    )));
-    let (mut h, args) = powerbox(&m);
-    let mut fuel = FUEL;
-    tally(bytecode::compile_and_run_with_host(
-        &m, 0, &args, &mut fuel, &mut h,
-    ));
+    }
     runs
 }

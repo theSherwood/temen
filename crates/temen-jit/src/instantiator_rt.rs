@@ -16,7 +16,7 @@
 use crate::{CapThunk, TrapKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Data, Func, SpawnRec, TypeEntry};
+use temen_ir::{Func, SpawnRec, TypeEntry};
 
 /// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
 use temen_ir::errno::EINVAL;
@@ -453,11 +453,6 @@ unsafe fn register_serve(
 /// **asynchronously** on their own OS threads; outcomes land in per-child completion cells `join`
 /// parks on. Only durable children still run synchronously at `instantiate`.
 pub(crate) struct Nursery {
-    /// CALLS.md 5c.1a — the parent module's impl-export **handler** funcidxs, threaded into every
-    /// granted-child compile so the child gets serve trampolines (same-module children, ops 8/11;
-    /// op-13 separate-module children pass their own — a later slice). Computed from
-    /// `m.impl_exports` at construction.
-    pub(crate) serve_handlers: Box<[u32]>,
     /// The module's own program, which a thaw re-runs a frozen §14 carve child in over its carve
     /// ([`Nursery::funcs`]): empty when the module names no `Instantiator`, as a nursery stood up for
     /// §22 units alone (#2312).
@@ -591,7 +586,6 @@ impl Nursery {
         futex_sched: usize,
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
-        serve_handlers: Box<[u32]>,
         // #1956 — the executor this nursery files its children on: a run's own (`None`, made here),
         // or the run's, shared by a detached child's nursery.
         child_exec: Option<std::sync::Arc<crate::child_exec::ChildExec>>,
@@ -599,7 +593,6 @@ impl Nursery {
         Nursery {
             funcs,
             types,
-            serve_handlers,
             cap_thunk,
             cap_ctx,
             resolve_module,
@@ -796,7 +789,6 @@ impl Nursery {
             self.futex_sched,
             self.task_counter(),
             self.nested_sink(),
-            self.serve_handlers.clone(),
             Some(std::sync::Arc::clone(&self.child_exec)),
         );
         n.ancestors = self.lane_chain_of(gc);
@@ -1175,6 +1167,7 @@ impl Nursery {
             reserved_log2,
             funcs,
             types,
+            impl_exports,
             shadow,
             image,
             prots,
@@ -1218,7 +1211,7 @@ impl Nursery {
             reserved_log2,
             thunk: child_thunk,
             addrs: self.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
-            serve_handlers: &self.serve_handlers,
+            impl_exports: &impl_exports,
             table_reserve_log2: gc.jit_table_log2,
             shadow,
             // A thawed child runs as a durable executor task, as at its spawn.
@@ -1307,18 +1300,15 @@ impl Nursery {
     }
 
     /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) to the granted
-    /// module's program, data segments and declared memory, which a detached child's fresh window
-    /// needs.
-    #[allow(clippy::type_complexity)]
+    /// module, its declared memory, shadow arena and digest: what a spawn of it compiles, and its
+    /// fresh window needs.
     unsafe fn resolve_granted(
         &self,
         module: i64,
         trap_out: *mut i64,
     ) -> Option<(
-        &[Func],
-        &[TypeEntry],
+        &temen_ir::Module,
         Option<i32>,
-        &[Data],
         temen_ir::durable_abi::ShadowArena,
         [u8; 32],
     )> {
@@ -1327,30 +1317,11 @@ impl Nursery {
             return None;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
-        if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || rm.n_funcs == 0 {
+        if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || (*rm.module).funcs.is_empty() {
             *trap_out = TrapKind::CapFault as i64;
             return None;
         }
-        let funcs = std::slice::from_raw_parts(rm.funcs, rm.n_funcs);
-        let data = if rm.n_data == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(rm.data, rm.n_data)
-        };
-        // #922: the child's type section (empty ⇒ a module with no interned call sites).
-        let types = if rm.n_types == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(rm.types, rm.n_types)
-        };
-        Some((
-            funcs,
-            types,
-            Some(rm.memory_log2),
-            data,
-            rm.shadow,
-            rm.digest,
-        ))
+        Some((&*rm.module, Some(rm.memory_log2), rm.shadow, rm.digest))
     }
 
     /// #1501 — whether the module a detached spawn names is attested **freezable** (instrumented): the
@@ -1676,11 +1647,10 @@ unsafe fn spawn_detached(
     if rt.resolve(mem_base, handle, trap_out).is_none() {
         return 0;
     }
-    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow, digest)) =
-        rt.resolve_granted(module, trap_out)
-    else {
+    let Some((child, mod_mem, child_shadow, digest)) = rt.resolve_granted(module, trap_out) else {
         return 0;
     };
+    let (child_funcs, child_types, child_data) = (&child.funcs[..], &child.types[..], &child.data);
     let size_log2 = temen_ir::detached_size_log2(size_log2, mod_mem.map(|m| m as u8));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -1836,7 +1806,7 @@ unsafe fn spawn_detached(
         reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
         thunk: child_thunk,
         addrs: rt.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
-        serve_handlers: &rt.serve_handlers,
+        impl_exports: &child.impl_exports,
         // #1296: slots for the units a `Jit`-holding child installs.
         table_reserve_log2: gc.jit_table_log2,
         shadow: child_shadow,

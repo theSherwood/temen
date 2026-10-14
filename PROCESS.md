@@ -413,7 +413,7 @@ recompiled its child's whole module every time, the spawner's own program includ
 The child's code now loads its nursery from its vmctx, as it loads its powerbox, cells and
 thread domain, so it bakes nothing of one spawn: a run compiles each child once per shape
 (`temen_jit::ChildCodeCache`, keyed by the module's digest and every other compile input:
-entry, window, `call.cap` thunk, which cells its instances have, serve handlers, table, run
+entry, window, `call.cap` thunk, which cells its instances have, table, run
 kind), and every spawn instantiates that compile over its own powerbox, window, budget cell
 and nursery. Durable and nesting children share it too. A child holding a `Jit` compiles its
 own, since the units it compiles extend its code. An embedder keeps the compiles past the run
