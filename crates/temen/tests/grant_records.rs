@@ -3,10 +3,11 @@
 //! engine parses it with one reader (`temen_interp::read_grant_records`, #1736), so a malformed list
 //! gets one answer everywhere — a trap in the guest, never a host failure.
 //!
-//! The case that motivated pinning it: a huge `grants_n`. The records run off the end of the window
-//! long before the count is reached, so the answer is the out-of-window read's `MemoryFault`. The
-//! native reader used to pre-size its list on the untrusted count, so on Cranelift the same guest
-//! aborted the host process on the allocation instead.
+//! The case that motivated pinning it: a huge `grants_n`. The native reader used to pre-size its
+//! list on the untrusted count, so on Cranelift the guest aborted the host process on the allocation.
+//! Since #2349 the count is bounded before anything is read (`MAX_SPAWN_GRANTS`): a longer list is
+//! malformed, `CapFault`, on every engine. Within the bound, a record outside the window is the read's
+//! `MemoryFault`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -105,10 +106,22 @@ fn cranelift(m: &temen_ir::Module) -> JitOutcome {
     .0
 }
 
-/// The list starts past any window, so it fails at record 0 however long it says it is.
+/// A count past the bound is refused before anything is read, wherever the list starts.
 #[test]
-fn a_huge_grant_count_is_a_memory_fault_on_every_engine() {
+fn a_huge_grant_count_is_refused_on_every_engine() {
     let m = guest(-16, 1 << 60);
+    assert_eq!(oracle(&m), Err(Trap::CapFault), "oracle");
+    assert_eq!(bytecode_engine(&m), Err(Trap::CapFault), "bytecode");
+    assert!(
+        matches!(cranelift(&m), JitOutcome::Trapped(TrapKind::CapFault)),
+        "cranelift"
+    );
+}
+
+/// Within the bound, a list starting past any window fails at record 0: the read's `MemoryFault`.
+#[test]
+fn a_record_outside_the_window_is_a_memory_fault_on_every_engine() {
+    let m = guest(-16, temen_interp::MAX_SPAWN_GRANTS as i64);
     assert_eq!(oracle(&m), Err(Trap::MemoryFault), "oracle");
     assert_eq!(bytecode_engine(&m), Err(Trap::MemoryFault), "bytecode");
     assert!(
