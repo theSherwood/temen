@@ -8402,10 +8402,7 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
             return -1;
         }
     };
-    if let Some(debug) = module.debug_info.as_mut() {
-        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
-        debug.lib_files = (0..debug.files.len() as u32).collect();
-    }
+    make_resident(&mut module);
     let exports = link_lib_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.
     let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
@@ -8422,6 +8419,15 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
     };
     set(STATUS_OK);
     h as i32
+}
+
+/// What a library unit becomes as it goes resident ([`temen_link_lib_open`]): its module-scoped
+/// globals' debug vars dropped (#1806), and every one of its files marked library code (#2341).
+pub fn make_resident(module: &mut temen_ir::Module) {
+    if let Some(debug) = module.debug_info.as_mut() {
+        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+        debug.lib_files = (0..debug.files.len() as u32).collect();
+    }
 }
 
 /// Drop the resident library `handle` ([`temen_link_lib_open`]). Unknown / already-closed handles are
