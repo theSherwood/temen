@@ -1033,12 +1033,19 @@ impl Nursery {
         }
     }
 
-    /// The unjoined child at `slot`: the powerbox this nursery retains for it (`0`: its builder
-    /// shared none) and whether its outcome is in, as [`poll`] reads it. `None` for a forged or
-    /// joined handle — the interp's dead thread slot. What `child_offer` and `grant` reach a child by.
-    fn unjoined(&self, slot: i32) -> Option<(usize, bool)> {
+    /// The live child slot `handle` names, by the oracle's rule ([`temen_ir::handle_slot`], #2378):
+    /// issued, and neither joined nor detached. `None` for a forged or spent handle — the interp's
+    /// dead thread slot.
+    fn live_slot(children: &[Child], handle: i32) -> Option<usize> {
+        temen_ir::handle_slot(children.len(), handle).filter(|&slot| !children[slot].joined)
+    }
+
+    /// The live child `handle` names ([`Nursery::live_slot`]): the powerbox this nursery retains
+    /// for it (`0`: its builder shared none) and whether its outcome is in, as [`poll`] reads it.
+    /// What `child_offer` and `grant` reach a child by.
+    fn unjoined(&self, handle: i32) -> Option<(usize, bool)> {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        let c = children.get(slot as usize).filter(|c| !c.joined)?;
+        let c = &children[Self::live_slot(&children, handle)?];
         let ended = c
             .done
             .state
@@ -1050,8 +1057,7 @@ impl Nursery {
 
     /// `Instantiator.kill` (#2074): end the child at `slot` and every child under it, running or
     /// parked ([`crate::child_exec::ChildExec::kill`]). A child that has finished is left as it is.
-    /// `false` if there is no such slot.
-    fn kill_slot(&self, slot: usize) -> bool {
+    fn kill_slot(&self, slot: usize) {
         let target = self
             .children
             .lock()
@@ -1059,13 +1065,12 @@ impl Nursery {
             .get(slot)
             .map(|c| (c.task, c.kid.clone()));
         let Some((task, kid)) = target else {
-            return false;
+            return;
         };
         self.child_exec.kill(task);
         if let Some(kid) = kid {
             kid.kill_all();
         }
-        true
     }
 
     /// [`Nursery::kill_slot`] for every child of this nursery: its spawner was killed.
@@ -2035,21 +2040,16 @@ pub(crate) unsafe extern "C" fn join(
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = handle as usize;
-    let done = match children.get_mut(slot) {
-        Some(c) if !c.joined => {
-            c.joined = true; // a join claims the child now
-            c.done.clone() // clone the cell + drop the `children` lock before parking
-        }
-        _ => {
-            // A forged or already-joined child handle: `ThreadFault`, as the oracle's `take_child`
-            // answers — a child rides the §12 executor as a vCPU, so this is a thread-handle
-            // forgery, not a capability one (#1573). The `Instantiator` operand itself was checked
-            // above and is the `CapFault` case.
-            *trap_out = TrapKind::ThreadFault as i64;
-            return 0;
-        }
+    // A forged or spent child handle: `ThreadFault`, as the oracle's `take_child` answers — a child
+    // rides the §12 executor as a vCPU, so this is a thread-handle forgery, not a capability one
+    // (#1573). The `Instantiator` operand itself was checked above and is the `CapFault` case.
+    let Some(slot) = Nursery::live_slot(&children, handle) else {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return 0;
     };
+    let c = &mut children[slot];
+    c.joined = true; // a join claims the child now
+    let done = c.done.clone(); // clone the cell + drop the `children` lock before parking
     drop(children);
     // #1956 — a detached child joins from a task, so the thread that would block is an executor
     // worker: the join parks the task instead, as `thread.join` does there, and the executor gives
@@ -2206,8 +2206,8 @@ pub(crate) unsafe extern "C" fn join(
 /// ops 0/5/8/11/13) runs on its own OS thread, so `poll` reports the live cell state: `0` while its
 /// thread is still executing, then `1` (clean) / `2` (trapped) once it publishes an outcome. A
 /// synchronous (durable) child is already done, so it never reads `0`. Non-destructive: the slot + its
-/// result stay for a later `join`. A forged / already-joined handle is a `CapFault` (matching this
-/// runtime's `join`).
+/// result stay for a later `join`. A forged or spent handle is a `ThreadFault`, as `join`'s and the
+/// oracle's (#2378).
 ///
 /// # Safety
 /// As [`join`]: `rt`/`trap_out` are the instance's nursery + run trap cell, valid for the call.
@@ -2223,26 +2223,27 @@ pub(crate) unsafe extern "C" fn poll(
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    match children.get(handle as usize) {
-        Some(c) if !c.joined => {
-            let st = c.done.state.lock().unwrap_or_else(|e| e.into_inner());
-            match *st {
-                None => 0,             // still running (the OS-thread child hasn't finished)
-                Some((_, 0)) => 1,     // returned cleanly
-                Some((_, _trap)) => 2, // trapped
-            }
-        }
-        _ => {
-            *trap_out = TrapKind::CapFault as i64;
-            0
-        }
+    let Some(slot) = Nursery::live_slot(&children, handle) else {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return 0;
+    };
+    let st = children[slot]
+        .done
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match *st {
+        None => 0,             // still running (the OS-thread child hasn't finished)
+        Some((_, 0)) => 1,     // returned cleanly
+        Some((_, _trap)) => 2, // trapped
     }
 }
 
 /// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; a later `join` is then inert.
 /// The child's OS thread (if still running) is joined at run teardown (`join_children`), so a detached
 /// async child never outlives the window; what the nursery keeps for it goes once it has ended
-/// (#2359, [`Nursery::claim_ended`]). A forged / already-joined handle is a `CapFault`.
+/// (#2359, [`Nursery::claim_ended`]). A forged or spent handle is a `ThreadFault`, as the oracle's
+/// (#2378).
 ///
 /// # Safety
 /// As [`join`].
@@ -2258,25 +2259,20 @@ pub(crate) unsafe extern "C" fn detach(
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let claimed = match children.get_mut(handle as usize) {
-        Some(c) if !c.joined => {
-            c.joined = true;
-            true
-        }
-        _ => false,
+    let Some(slot) = Nursery::live_slot(&children, handle) else {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return 0;
     };
+    children[slot].joined = true;
     drop(children);
-    if claimed {
-        rt.claim_ended(handle as usize);
-    } else {
-        *trap_out = TrapKind::CapFault as i64;
-    }
+    rt.claim_ended(slot);
     0
 }
 
 /// PROCESS.md S3 `kill(child) -> 0` (JIT, #2074): end the child and every child under it with
 /// `ThreadFault`, running or parked ([`Nursery::kill_slot`]), as the interpreter's op-12 arm does. A
-/// child that has finished is left as it is. A forged / already-joined handle is a `CapFault`.
+/// child that has finished is left as it is. A forged or spent handle is a `ThreadFault`, as the
+/// oracle's: a joined or detached child is no longer this parent's to kill (#2378).
 ///
 /// # Safety
 /// As [`join`].
@@ -2291,9 +2287,13 @@ pub(crate) unsafe extern "C" fn kill(
     if rt.resolve(mem_base, inst, trap_out).is_none() {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
-    if !rt.kill_slot(handle as usize) {
-        *trap_out = TrapKind::CapFault as i64;
-    }
+    let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(slot) = Nursery::live_slot(&children, handle) else {
+        *trap_out = TrapKind::ThreadFault as i64;
+        return 0;
+    };
+    drop(children);
+    rt.kill_slot(slot);
     0
 }
 
