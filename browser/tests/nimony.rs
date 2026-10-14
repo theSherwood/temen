@@ -386,6 +386,16 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
         at(&format!("{cache}t/{}/config.nif", module_suffix("prog.nim"))).is_some(),
         "the card program's backend memo, without which its build lowers every module again"
     );
+    // The plugins the library declares, built: `std/macros`' grammar declares parsegen and regex
+    // (#2049), `std/parfor`'s `||` is one (#2375). A program that reaches one would otherwise compile
+    // it first, minutes of build in the browser.
+    for plugin in ["parsegen", "regex", "parfor"] {
+        assert!(
+            at(&format!("{cache}{plugin}"))
+                .is_some_and(|i| temen_encode::wire::is_module_blob(files[i].1)),
+            "the {plugin} plugin, built"
+        );
+    }
     assert!(
         last_source < first_cached,
         "the pack is seeded after the sources it was built from"

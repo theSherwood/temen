@@ -168,8 +168,9 @@ main()
   {
     name: 'Parallel for',
     src: `# Count the primes below 100,000 with a parallel for: \`||\` splits the range
-# into chunks that a pool of threads runs at once, and the loop ends when all of
-# them have. Each iteration writes only its own slot, so nothing races.
+# into chunks for a pool of threads, and the loop ends when all of them are
+# done. Each iteration writes only its own slot, so nothing races. On this card
+# the pool's threads run on the one Worker, taking turns.
 import std/[parfor, syncio]
 
 proc isPrime(n: int): bool =
