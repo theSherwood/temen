@@ -21,8 +21,8 @@ use temen_durable::{
     transform_module_assume_confined, ARM_QUIESCE_OFF,
 };
 use temen_interp::{
-    run_capture_reserved_with_host, CapState, FreezeRule, FreezeScope, Host, ParkSite,
-    SignalSource, StreamRole, Value,
+    run_capture_reserved_with_host, CapState, FreezeRule, Host, ParkSite, SignalSource, StreamRole,
+    Value,
 };
 use temen_ir::{Memory, Module};
 use temen_jit::JitOutcome;
@@ -947,7 +947,7 @@ block 0 (vx: i64) {
         let i = h.grant_instantiator(0, WINDOW as u64);
         let m = h.grant_durable_module(&c);
         let b = h.grant_budget(-1, 1 << 20, -1);
-        h.grant_freeze_authority(FreezeScope::DetachedProgeny);
+        h.grant_freeze_authority();
         (h, vec![Value::I32(i), Value::I32(m), Value::I32(b)])
     };
 
