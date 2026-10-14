@@ -484,7 +484,8 @@ fn grant_rec_ir(at: u64, name_at: u64, name_len: usize, handle: &str) -> String 
 
 /// A nested-corpus guest (`memory {mem}`): func 0 spawns `"child"`, the image of func 1 (`child`,
 /// whole `func`s), through a v1 record asking for window `2^size_log2` (`0`: the declared one). With
-/// `join` it joins the child into `vj`; either way `tail` ends the block (the spawn's handle is `vh`).
+/// `join` it joins the child: `vj_st` how it ended (0 returned, else its trap's code, #2066), `vj` its
+/// result. Either way `tail` ends the block (the spawn's handle is `vh`).
 /// `data` adds segments. With `grandchild`, func 2 is exported as `"grandchild"` too, and the child is
 /// granted its image under that name.
 fn nested_guest(
@@ -504,7 +505,7 @@ fn nested_guest(
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vchild", "vbud");
     let join = if join {
-        "  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n"
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n"
     } else {
         ""
     };
@@ -562,7 +563,7 @@ fn child_depth2() -> String {
              vbp = i64.const 16384\n  vbl = i64.const 6\n  vb = self.resolve vbp vbl\n  \
              vgp = i64.const 16416\n  vgl = i64.const 10\n  vgc = self.resolve vgp vgl\n{stores}  \
              vrp = i64.const 17504\n  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)\n  \
-             vj = call.cap 6 1 (i32) -> (i64) vi (vh)\n  return vj\n  }}\n}}\n\
+             vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)\n  return vj\n  }}\n}}\n\
              func (i64) -> (i64) {{\nblock 0 (va: i64) {{\n  v = i64.const 77\n  return v\n  }}\n}}\n"
         ),
         true,
@@ -600,14 +601,15 @@ fn child_refused() -> String {
     )
 }
 
-// A child trap (`unreachable`) must propagate through `join` as the parent's trap (STATUS_TRAP).
+// A child trap (`unreachable`) stays the child's: the parent's `join` answers it with the trap's wire
+// code (#2066), which the parent returns.
 fn child_trap() -> String {
     nested_guest(
         17,
         0,
         true,
         "",
-        "  return vj\n",
+        "  return vj_st\n",
         "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  unreachable\n  }\n}\n",
         false,
     )
@@ -1370,8 +1372,10 @@ block 0 (va: i64, vb: i64) {
 // #1865 — a root `(instantiator, module, budget) -> sum`
 // that spawns the granted module `n` times through one op-17 v1 record (module and budget filled in
 // at run time), each child in a fresh window of its own on its own Worker and `Memory`, paid from the
-// budget, then joins them and sums. With [`THREADS_INST_UNIT`]: 8 × 75 = 600. With `grant_unit` each
-// child is granted the module itself as `"unit"`, to spawn copies of itself by (#2219).
+// budget, then joins them and sums. A join answers a child's trap rather than raising it (#2066), so
+// the root ends in `unreachable` when a child did not return: a faulting child still fails the run.
+// With [`THREADS_INST_UNIT`]: 8 × 75 = 600. With `grant_unit` each child is granted the module itself
+// as `"unit"`, to spawn copies of itself by (#2219).
 fn inst_detached_root(n: u64, grant_unit: bool) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 16464,
@@ -1426,14 +1430,19 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {{
   v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
-  br 4(vjn, vsn, vinst5)
+  vz = i64.const 0
+  vfault = i64.ne vr_st vz
+  br_if vfault 7() 4(vjn, vsn, vinst5)
 }}
 block 6 (vs3: i64) {{
   return vs3
+}}
+block 7 () {{
+  unreachable
   }}
 }}
 "#
@@ -1483,7 +1492,7 @@ block 1 (va1: i64) {{
   i64.store vpay vone
 {stores}  vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vr = i64.add vk vj
   return vr
 }}
@@ -2134,7 +2143,11 @@ fn main() {
             refused.as_str(),
             (STATUS_OK, temen_ir::errno::EINVAL),
         ),
-        ("child_trap", trap.as_str(), (STATUS_TRAP, 0)),
+        (
+            "child_trap",
+            trap.as_str(),
+            (STATUS_OK, temen_ir::trap_code::UNREACHABLE),
+        ),
         // The retired carve spawns trap (#1867).
         ("carve_op0", CARVE_OP0, (STATUS_TRAP, 0)),
         ("carve_op5", CARVE_OP5, (STATUS_TRAP, 0)),

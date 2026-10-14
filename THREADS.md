@@ -264,7 +264,8 @@ property, so in practice:
       children, each compiled+pushed, data materialized, run, joined → oracle's value) and a
       `instantiate_module` case in `parallel_instantiate_miri.rs` (data-materialization + cross-thread
       access over the pushed module, race/UB-clean).
-    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)**: resolve + compile + push the granted module,
+    - [x] **§14-C — `spawn_coroutine_module` (op 6/7)** *(retired with the coroutine ops, #2065)*:
+      resolve + compile + push the granted module,
       materialize its data segments (demand-page for op 7), and build the `Coro` in the vCPU's
       coroutine set — driven **inline** by `resume` (no thread), so it then runs exactly as a
       same-module coroutine already does in this driver. With this, **every** multi-vCPU `VcpuStop` is
@@ -278,7 +279,8 @@ property, so in practice:
       during `resume`, so the resumable vCPU must carry a **real powerbox** (not the deny-all default)
       — [`Vcpu::new_root_with_powerbox`]. With the grant in its own host, a §14 op is then serviced
       *internally* (no host-serviced event, unlike JIT C1).
-      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`**: serviced inside `Vcpu::run`
+      - [x] **§14-D1 — `spawn_coroutine_module` via the resumable `Vcpu`** *(retired with the
+        coroutine ops, #2065)*: serviced inside `Vcpu::run`
         (resolve the granted module from the vCPU's own powerbox, build the inline `Coro`), so the host
         sees no §14 event; the coroutine then runs inline via `resume`. Proven by
         `bytecode_vcpu_coroutine_module.rs` (a powerbox-carrying root vCPU builds + resumes 8

@@ -93,9 +93,9 @@ reproduced (not argued):
    production `temen-encode` decode path `temen_run` depends on), the host powerbox
    (`run_powerbox() == 17` — `Stream.write` + capture and `Exit.exit(42)`), the seed→transform→snapshot
    capture (`run_capture() == 1007`), **and** cooperative continuations
-   (`run_fiber() == 107`, `run_coroutine() == 1001329`). So the full stack — compute, concurrency,
-   codec, capabilities, memory capture, sub-guest isolation, *and* fibers/coroutines — runs on the
-   real production target.
+   (`run_fiber() == 107`; a `run_coroutine` probe went with the coroutine ops, #2065). So the full
+   stack — compute, concurrency, codec, capabilities, memory capture, sub-guest isolation, *and*
+   fibers — runs on the real production target.
    *Node/V8 22.x cannot yet load it:* Rust's `wasm64` target emits **64-bit tables** (`table64` —
    table limits flag `0x05`, i64 element-segment offsets), and V8 implements memory64 *memory* but
    not 64-bit *tables* (`--v8-options` shows `--experimental-wasm-memory64` on by default, no table64
@@ -124,7 +124,6 @@ wasmtime run --invoke run_roundtrip -W memory64=y "$W"   # 1442695040888963407 (
 wasmtime run --invoke run_powerbox  -W memory64=y "$W"   # 17 (stream write + capture + exit(42))
 wasmtime run --invoke run_capture   -W memory64=y "$W"   # 1007 (seed window → transform → snapshot)
 wasmtime run --invoke run_fiber     -W memory64=y "$W"   # 107 (cont.new/resume cooperative fiber)
-wasmtime run --invoke run_coroutine -W memory64=y "$W"   # 1001329 (spawn_coroutine/resume/yield)
 wasmtime run --invoke run_tailcall  -W memory64=y "$W"   # 120 (return_call tail recursion, O(1) state)
 wasmtime run --invoke run_simd      -W memory64=y "$W"   # 42 (i64x2 splat/add/extract_lane)
 wasmtime run --invoke run_gcroots  -W memory64=y "$W"   # 2 (gc.roots conservative root scan)
@@ -318,8 +317,8 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
   the grandchild from its own budget, #1944), a two-arg child managing its own pages via an
   attenuated `AddressSpace` (`0`), a window that disagrees with the module's refused at admission
-  (`-22`), and a child trap propagating through `join` (`STATUS_TRAP`). So a guest can spin up isolated
-  sub-guests inside the wasm sandbox.
+  (`-22`), and a child trap its `join` answers rather than raises (the `unreachable` code, #2066). So
+  a guest can spin up isolated sub-guests inside the wasm sandbox.
 - [x] **§12 fibers.** Cooperative continuation switching — the engine's signature.
   *Fibers* (`cont.new`/`cont.resume`/`suspend`, no powerbox → the plain `temen_run0` path): run-to-
   completion (`107`), suspend round-trip (`36`), multi-suspend loop (`19`), and forged-handle / root-

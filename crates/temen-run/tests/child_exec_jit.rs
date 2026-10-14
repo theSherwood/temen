@@ -57,15 +57,15 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
 }
 
 /// Join both, then return the region's **violation** word (region byte 8).
-const TAIL_VIOLATIONS: &str = "vja = call.cap 6 1 (i32) -> (i64) v0 (vca)
-  vjb = call.cap 6 1 (i32) -> (i64) v0 (vcb)
+const TAIL_VIOLATIONS: &str = "vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (vca)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vcb)
   vviol = i64.const 65544
   vv = i64.load vviol
   return vv";
 
 /// Join both; return `1000·A + B`.
-const TAIL_SUM: &str = "vja = call.cap 6 1 (i32) -> (i64) v0 (vca)
-  vjb = call.cap 6 1 (i32) -> (i64) v0 (vcb)
+const TAIL_SUM: &str = "vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (vca)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vcb)
   vk = i64.const 1000
   vm = i64.mul vja vk
   vr = i64.add vm vjb
@@ -305,27 +305,37 @@ block 3 (vr: i64) {{
 /// a 4-core Linux box: ~0.1 s with the fix, 2.02 s without (100 waits × the 20 ms cadence). The
 /// bound, 1.5 × the host's own figure + 0.2 s, sits well under the broken figure wherever the host
 /// can wait 1 ms, and on Windows asks only that a child's wait cost about what the host's does.
+///
+/// The host's figure is sampled for as long as the child runs, not before it (#2392): on a shared
+/// runner a "1 ms" wait stretches with whatever else is running, so a figure taken first can be
+/// stale by the time the child waits — 3.6 ms per wait sampled, then 8.4 ms in the child, on macOS.
 #[test]
 fn a_tasks_short_timed_waits_end_at_their_deadlines() {
     let p = module(&parent(TAIL_SUM));
     let a = module(&sleeper(100, 1_000_000));
     let b = module(TRIVIAL);
     assert_eq!(run_interp(&p, &a, &b, -1), 100_000, "the oracle");
+    let run = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        assert_eq!(run_jit(&p, &a, &b, -1), 100_000);
+        t.elapsed()
+    });
+    // At least 100 waits, and on until the run ends; scaled to 100.
     let host = {
         let (m, cv) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
         let t = std::time::Instant::now();
         let mut g = m.lock().unwrap();
-        for _ in 0..100 {
+        let mut waits = 0;
+        while waits < 100 || !run.is_finished() {
             g = cv
                 .wait_timeout(g, std::time::Duration::from_millis(1))
                 .unwrap()
                 .0;
+            waits += 1;
         }
-        t.elapsed()
+        t.elapsed() * 100 / waits
     };
-    let t = std::time::Instant::now();
-    assert_eq!(run_jit(&p, &a, &b, -1), 100_000);
-    let took = t.elapsed();
+    let took = run.join().expect("the JIT run");
     let bound = host.mul_f64(1.5) + std::time::Duration::from_millis(200);
     assert!(
         took < bound,
@@ -448,8 +458,8 @@ const TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD: &str = "vx2 = i64.const 65556
   ve2 = i32.const 0
   vinf = i64.const -1
   vs2 = i32.atomic.wait vx2 ve2 vinf
-  vja = call.cap 6 1 (i32) -> (i64) v0 (vca)
-  vjb = call.cap 6 1 (i32) -> (i64) v0 (vcb)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) v0 (vca)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) v0 (vcb)
   vs64 = i64.extend_i32_u vs2
   return vs64";
 
@@ -511,8 +521,8 @@ block 4 (h4: i32, a4: i32, b4: i32, vi4: i64) {{
   br 1(h4, a4, b4, vi5)
 }}
 block 5 (h5: i32, a5: i32, b5: i32) {{
-  vja = call.cap 6 1 (i32) -> (i64) h5 (a5)
-  vjb = call.cap 6 1 (i32) -> (i64) h5 (b5)
+  vja_st, vja = call.cap 6 1 (i32) -> (i64, i64) h5 (a5)
+  vjb_st, vjb = call.cap 6 1 (i32) -> (i64, i64) h5 (b5)
   vk = i64.const 1000
   vm = i64.mul vja vk
   vr = i64.add vm vjb
@@ -578,7 +588,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   vtwo = i64.const 2
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vrec, vtwo, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vrun = i64.const 65536
   vold = i64.atomic.rmw.add vrun vone
   vge = i64.ge_s vold vone

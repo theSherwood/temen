@@ -1361,6 +1361,115 @@ fn thread_top(s: &mut DapServer, seq: i64, tid: i64) -> Option<(i64, String)> {
     ))
 }
 
+/// **A system header's code is library code, end to end (#2401).** The playground's `<pthread.h>`
+/// compiles its thread trampoline `__pthread_entry` into the program's own unit. chibicc marks the
+/// header library code because it found it on the include path; the program's `in.c` stays its own.
+/// So a new thread's first frame, the trampoline, is `subtle`, and under `justMyCode` one step on
+/// that thread goes straight to the thread function's first line, where without it the step stays
+/// in the trampoline.
+#[test]
+fn a_system_headers_code_is_library_code() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode");
+    let ir = compile_g(&chibicc, TWO_THREADS_SRC);
+    let m = temen_text::parse_module(&ir).expect("the linked text parses");
+    let di = m.debug_info.as_ref().expect("the link keeps the -g info");
+    let lib: Vec<&str> = di
+        .lib_files
+        .iter()
+        .map(|&f| di.files[f as usize].as_str())
+        .collect();
+    assert!(
+        lib.iter().any(|f| f.ends_with("include/pthread.h")),
+        "pthread.h is library code: {lib:?}"
+    );
+    assert!(
+        !lib.iter().any(|f| f.ends_with("in.c")),
+        "the program's own file is not: {lib:?}"
+    );
+
+    for just_my_code in [false, true] {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(ir.as_str())),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("powerbox", Json::s("onramp")),
+                ("justMyCode", Json::Bool(just_my_code)),
+            ]),
+        ));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(13))])]),
+                ),
+            ]),
+        ));
+        let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+
+        // Thread 2 is spawned and waits at the trampoline's first op, which has no line; one step on
+        // it alone.
+        s.handle(&req(
+            5,
+            "stepIn",
+            Json::obj(vec![
+                ("threadId", Json::i(2)),
+                ("singleThread", Json::Bool(true)),
+            ]),
+        ));
+        let out = s.handle(&req(
+            6,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(2))]),
+        ));
+        let top = response(&out)
+            .get("body")
+            .and_then(|b| b.get("stackFrames"))
+            .and_then(|f| f.as_array())
+            .and_then(|f| f.first())
+            .cloned()
+            .expect("thread 2 is live");
+        let at = |key: &str| top.get(key).cloned();
+        let path = top
+            .get("source")
+            .and_then(|src| src.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if just_my_code {
+            assert_eq!(
+                (at("name"), at("line")),
+                (Some(Json::s("#0 count_a")), Some(Json::i(5))),
+                "straight to the thread function's first line: {top:?}"
+            );
+            assert_eq!(at("presentationHint"), None, "the program's own frame");
+        } else {
+            assert!(
+                path.ends_with("include/pthread.h"),
+                "the step stays in the trampoline: {top:?}"
+            );
+            assert_eq!(
+                at("presentationHint"),
+                Some(Json::s("subtle")),
+                "and the trampoline's frame is library code"
+            );
+        }
+    }
+}
+
 /// **Split-view stepping on a chosen thread, and a Step Back that undoes the last step.** A step
 /// names its thread (`threadId`) and, with `singleThread`, moves only that thread; a `stepBack` then undoes the most recent
 /// step, whichever thread took it, and leaves the other thread where it was. Stepping again after a

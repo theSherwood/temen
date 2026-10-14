@@ -612,7 +612,7 @@ block 0 (v0: i64) {{
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
   vh = i32.const 0
-  vw = {call}
+  {call}
   return v0
   }}
 }}
@@ -627,21 +627,29 @@ block 0 (v0: i64) {{
 #[test]
 fn a_callee_that_needs_its_task_is_not_a_widened_cross_tier_leaf() {
     for (what, call, f1_emits) in [
-        ("a join", "call.cap 6 1 (i32) -> (i64) vh (vh)", false),
         (
-            "svc.wait",
-            "call.cap 4294967295 10 () -> (i64) vh ()",
+            "a join",
+            "vs, vw = call.cap 6 1 (i32) -> (i64, i64) vh (vh)",
             false,
         ),
-        ("svc.poll", "call.cap 4294967295 9 () -> (i64) vh ()", false),
+        (
+            "svc.wait",
+            "vw = call.cap 4294967295 10 () -> (i64) vh ()",
+            false,
+        ),
+        (
+            "svc.poll",
+            "vw = call.cap 4294967295 9 () -> (i64) vh ()",
+            false,
+        ),
         (
             "a guest-interface call",
-            "call.cap 268435456 0 (i64) -> (i64) vh (v0)",
+            "vw = call.cap 268435456 0 (i64) -> (i64) vh (v0)",
             false,
         ),
         (
             "a stream write",
-            "call.cap 0 1 (i64, i64) -> (i64) vh (v0, v0)",
+            "vw = call.cap 0 1 (i64, i64) -> (i64) vh (v0, v0)",
             true,
         ),
     ] {

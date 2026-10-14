@@ -44,7 +44,7 @@
 //! countable; a cell scored on what the test happened to reach is a wish.
 
 mod support;
-use support::capability_probe::{probe_module, rows, RealArgs, Row, MAX_ARGC, PROBE_BEYOND};
+use support::capability_probe::{probe_module_with, rows, RealArgs, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
 use temen_interp::{Host, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
@@ -62,20 +62,33 @@ enum Verdict {
     Serviced,
 }
 
-/// Run `call.cap iface op` on `handle` with `argc` zero arguments, under the multi-vCPU debug
-/// engine. `None` where the call faults for a reason that is not one of the two gates — a wrong
-/// signature, or an op that needs a handle this harness cannot mint.
-fn drive(host: Host, handle: i32, iface: u32, op: u32, argc: usize) -> Option<Verdict> {
-    let m = probe_module(iface, op, argc);
+/// Run `call.cap iface op` on `handle` with `argc` arguments, zero but for the row's `real` ones
+/// (see `Row::mint`), under the multi-vCPU debug engine. `None` where the call faults for a reason
+/// that is not one of the two gates — a wrong signature, or an op that needs a handle this harness
+/// cannot mint.
+fn drive(
+    host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    real: &[(usize, i64)],
+) -> Option<Verdict> {
+    let m = probe_module_with(iface, op, argc, "i64", real);
     let Some(mut run) = ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(handle)], host) else {
         return Some(Verdict::NotInSubset);
     };
     let mut fuel = 1_000_000u64;
+    // For the Instantiator the shared contract says which calls match their op's arm (#2066); the
+    // probe declares the contract's results, so its arity decides.
+    let matched = iface == temen_ir::cap_id::INSTANTIATOR
+        && temen_ir::instantiator_contract(op).is_some_and(|(args, _)| argc >= args.len());
     match run.run_until_stop(&mut fuel) {
         SchedStop::Declined => Some(Verdict::Declined),
         // A cap fault is the harness miscalling, not an answer: the signature did not match any
-        // dispatch arm. The sweep tries other arities.
-        SchedStop::Finished(Err(Trap::CapFault)) => None,
+        // dispatch arm. The sweep tries other arities. On a call that did match, the fault is the
+        // op's own answer — a forged module, a malformed record — so the op was driven.
+        SchedStop::Finished(Err(Trap::CapFault)) if !matched => None,
         _ => Some(Verdict::Serviced),
     }
 }
@@ -84,8 +97,13 @@ fn drive(host: Host, handle: i32, iface: u32, op: u32, argc: usize) -> Option<Ve
 fn best(mint: &dyn Fn() -> (Host, i32, RealArgs), iface: u32, op: u32) -> Option<Verdict> {
     (0..MAX_ARGC)
         .filter_map(|argc| {
-            let (host, h, _real) = mint();
-            drive(host, h, iface, op, argc)
+            let (host, h, real) = mint();
+            let real: Vec<(usize, i64)> = real
+                .iter()
+                .filter(|(o, _, _)| *o == op)
+                .map(|(_, idx, v)| (*idx, *v))
+                .collect();
+            drive(host, h, iface, op, argc, &real)
         })
         .max()
 }

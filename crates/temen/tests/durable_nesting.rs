@@ -116,7 +116,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   v5 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   v7 = ref.func 1
   v8 = i64.const 4096
   v9 = cont.new v7 v8

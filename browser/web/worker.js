@@ -9,9 +9,11 @@
 // (not the page) is the only place a browser permits a blocking `Atomics.wait`.
 
 import { foreignImports, registerForeign } from './foreign-mem.js';
-import { emittedTier, tierupJitArg, tierupJitRes } from './coop-driver.js';
+import { emittedTier, nativeTrap, tierupJitArg, tierupJitRes } from './coop-driver.js';
 const STACK = 1 << 20; // per-Worker stack
-const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
+const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]; a trapped child (done 2) leaves its
+// trap's wire code at @8 for its joiner (#2066), or THREAD_FAULT where its host knows no better.
+const THREAD_FAULT = 10n; // temen_ir::trap_code::THREAD_FAULT
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes — must match browser/src/lib.rs PAR_*.
 const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, TIERUP = 7, JIT_INVOKE = 8,
@@ -424,6 +426,7 @@ self.onmessage = async (e) => {
     const cv = ex.temen_par_child_detached(prog, BigInt(ticket), registerForeign(childMem, fbase), slog);
     if (cv === 0) {
       self.postMessage({ kind: 'fail', why: 'detached child vcpu build failed (codegen path)' });
+      i64()[(slot + 8) >> 3] = THREAD_FAULT;
       Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2); // after the report (#2259)
       return;
     }
@@ -453,12 +456,19 @@ self.onmessage = async (e) => {
       return rc;
     };
     const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
+    // The wire code of the trap the child ended in, once known: an emitted trap names it to `env.trap`,
+    // and a bounce that trapped stages it in `ev_e`; a native wasm trap is named where it is caught.
+    // Its joiner reads it from the slot (#2066).
+    let childTrap = 0n;
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory: childMem,
-        trap: () => {},
+        trap: (code) => { childTrap = BigInt(code); },
         call_interp: (f, a) => {
-          if (bounce(f, a) !== 0) throw new Error('cross-tier trap');
+          if (bounce(f, a) !== 0) {
+            childTrap = ex.temen_par_ev_e(cv);
+            throw new Error('cross-tier trap');
+          }
           syncMapped();
         },
         // A carve spawn (op 0/5/13): a detached window has no carve to give a grandchild.
@@ -470,21 +480,28 @@ self.onmessage = async (e) => {
         // trapped, as the interpreter traps the parent.
         instantiate_rec: (_cwin, inst, rec) => {
           const t = ex.temen_par_inst_instantiate_rec(cv, inst, rec);
-          if (t === 0n) throw new Error('instantiate_rec trapped');
+          if (t === 0n) {
+            childTrap = ex.temen_par_ev_e(cv);
+            throw new Error('instantiate_rec trapped');
+          }
           if (t < 0n) return Number(t);
           const gslot = postDetached(t, Number(ex.temen_par_ev_b(cv)), ex.temen_par_ev_d(cv));
           return ex.temen_par_inst_file_child(cv, BigInt(gslot));
         },
         // A join from emitted code resolves in the vCPU's child table, by the rule the interpreted
         // join uses; then wait on the child's slot, as the interpreter's JOIN arm does, and return
-        // its window's bytes to the budget that paid.
+        // its window's bytes to the budget that paid. It answers how the child ended (#2066):
+        // `[0, its result]`, or `[its trap's wire code, 0]`.
         join: (_inst, child) => {
           const gslot = Number(ex.temen_par_inst_join(cv, child));
-          if (gslot === 0) throw new Error('join of a spent or unissued child');
+          if (gslot === 0) {
+            childTrap = ex.temen_par_ev_e(cv);
+            throw new Error('join of a spent or unissued child');
+          }
           Atomics.wait(i32(), gslot >> 2, 0);
           ex.temen_par_inst_end_join(cv);
-          if (Atomics.load(i32(), gslot >> 2) === 2) throw new Error('nested child trapped');
-          return i64()[(gslot + 8) >> 3];
+          const r = i64()[(gslot + 8) >> 3];
+          return Atomics.load(i32(), gslot >> 2) === 2 ? [r, 0n] : [0n, r];
         },
         // §11 slice 3 — thread/futex ops from an EMITTED unit, serviced through the same spawn
         // relay + completion-slot protocol as the interpreter's SPAWN/JOIN arms. The spawned vCPU
@@ -540,8 +557,10 @@ self.onmessage = async (e) => {
       i64()[(slot + 8) >> 3] = BigInt(ret); // publish result...
       Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
       Atomics.notify(i32(), slot >> 2); // ...and wake the joiner
-    } catch {
-      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped (the joiner traps on deliver_join)
+    } catch (e) {
+      // What the joiner reads: the `env.trap` code, else the native trap's, else no better than THREAD_FAULT.
+      i64()[(slot + 8) >> 3] = childTrap !== 0n ? childTrap : BigInt(nativeTrap(e)) || THREAD_FAULT;
+      Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
     }
     ex.temen_par_free(cv);
@@ -583,6 +602,7 @@ self.onmessage = async (e) => {
       self.postMessage({ kind: 'fail', why });
       if (role !== 'root') {
         const iv = new Int32Array(memory.buffer);
+        new BigInt64Array(memory.buffer)[(slot + 8) >> 3] = THREAD_FAULT;
         Atomics.store(iv, slot >> 2, 2); // 2 = trapped
         Atomics.notify(iv, slot >> 2);
       }
@@ -612,7 +632,8 @@ self.onmessage = async (e) => {
         self.postMessage({ kind: 'trap', why: `guest trap: ${name}${role === 'root' ? '' : ` (in a spawned thread)`}` });
       }
       // Only now wake the joiner (#2259): a root-domain joiner traps `ThreadFault`, and its report
-      // must not reach the page before this one.
+      // must not reach the page before this one. The trap's wire code is what a §14 joiner reads.
+      i64()[(slot + 8) >> 3] = ex.temen_par_ev_e(v);
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
       ex.temen_par_free(v);
@@ -773,7 +794,8 @@ self.onmessage = async (e) => {
     try {
       if (role !== 'root' && slot !== undefined) {
         const iv = new Int32Array(memory.buffer);
-        Atomics.store(iv, slot >> 2, 2); // 2 = trapped → the parent's deliver_join sees a trap
+        new BigInt64Array(memory.buffer)[(slot + 8) >> 3] = THREAD_FAULT;
+        Atomics.store(iv, slot >> 2, 2); // 2 = trapped → the parent's deliver_join reads its code
         Atomics.notify(iv, slot >> 2);
       }
     } catch { /* memory unusable — nothing more we can do */ }

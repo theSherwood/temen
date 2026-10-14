@@ -663,7 +663,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 3 (v3)
   vr = i64.add vj vlocal
@@ -872,9 +872,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
+  vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
   vh2 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vr = i64.add vj1 vj2
   return vr
   }
@@ -970,7 +970,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32) {
   va5 = i64.const 16664
   i32.store va5 vout
 @GUEST@  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }

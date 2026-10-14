@@ -56,7 +56,7 @@ pub extern "C" fn rust_eh_personality() {}
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }
 
 #[no_mangle]
@@ -70,7 +70,12 @@ pub extern "C" fn run() -> i64 {
             return -1;
         }
         let child = vm_spawn(inst, budget, child_mod, &[(b"fs", fs)], &[]);
-        __vm_join(inst, child)
+        let mut st = 0i64;
+        let r = __vm_join(inst, child, &mut st);
+        if st != 0 {
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }
+        r
     }
 }
 "##;
@@ -108,7 +113,7 @@ pub extern "C" fn rust_eh_personality() {}
 
 extern "C" {
     fn __vm_cap_resolve(name: *const u8, len: i64) -> i32;
-    fn __vm_join(inst: i32, child: i64) -> i64;
+    fn __vm_join(inst: i32, child: i64, status: *mut i64) -> i64;
 }
 
 #[no_mangle]
@@ -124,12 +129,19 @@ pub extern "C" fn run() -> i64 {
         if first < 0 {
             return first;
         }
-        let r1 = __vm_join(inst, first);
+        let mut st = 0i64;
+        let r1 = __vm_join(inst, first, &mut st);
+        if st != 0 {
+            return -st; // the child ended in a trap: its wire code, negated (#2066)
+        }
         let second = vm_spawn(inst, budget, child_mod, &[], &[b"zz", b"y"]);
         if second < 0 {
             return second;
         }
-        let r2 = __vm_join(inst, second);
+        let r2 = __vm_join(inst, second, &mut st);
+        if st != 0 {
+            return -st;
+        }
         r1 * 10000 + r2
     }
 }

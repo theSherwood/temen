@@ -33,7 +33,7 @@ pub fn driver(grants: &[&str], tail: &str) -> Vec<u8> {
     let src = format!(
         "memory 16\n{data}{seg}func (i32, i32, i32) -> (i64) {{\nblock 0 (v0: i32, v1: i32, v2: i32) {{\n\
          {body}{stores}  vrp = i64.const 17408\n  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)\n  \
-         vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n{tail}\n  return {ret}\n  }}\n}}\n"
+         vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n{tail}\n  return {ret}\n  }}\n}}\n"
     );
     let m = temen_text::parse_module(&src).expect("parse driver");
     temen_verify::verify_module(&m).expect("verify driver");

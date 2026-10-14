@@ -80,7 +80,7 @@ block 0 () {{
   i32.store vgb vb
   vgp = i64.const 17504
   vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
-  vjs = call.cap 6 1 (i32) -> (i64) v0 (vs)
+  vjs_st, vjs = call.cap 6 1 (i32) -> (i64, i64) v0 (vs)
   vc = i32.wrap_i64 vjs
   return vc
   }}
@@ -298,7 +298,7 @@ block 0 (vinst: i32, vbud: i32, vmod: i32) {{
   br_if visneg 2() 1(vinst, vch)
 }}
 block 1 (vinst1: i32, vch1: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vinst1 (vch1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst1 (vch1)
   k = i64.const 1000
   t0 = i64.mul vj k
   return t0
@@ -457,7 +457,7 @@ block 1 (vh1: i32, vch1: i32) {{
   ; serve the child's one `exec.run` call: OUR handler (func 2) answers over OUR live world
   vz1 = i32.const 0
   vn = svc.wait vz1
-  vj = call.cap 6 1 (i32) -> (i64) vh1 (vch1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh1 (vch1)
   vk = i64.const 100
   vt = i64.mul vj vk
   vs = i64.add vt vn
@@ -667,7 +667,7 @@ fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
         .replace(
             "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)\n",
             "  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   vgo = i64.const 65544
   vgone = i32.const 1
   i32.store vgo vgone
@@ -772,7 +772,7 @@ block 0 () {{
 {stores}
   vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vc = i32.wrap_i64 vj
   return vc
   }}
@@ -898,7 +898,7 @@ fn a_v1_record_with_size_zero_gets_the_declared_window() {
             "  vr16 = i64.const -4294967280\n",
         )
         .replace(
-            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+            "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
             "  vz0 = i32.const 0\n  vneg = i32.lt_s vch vz0\n  vseven = i32.const 7\n  vc = select vneg vseven vz0\n",
         );
     assert!(wrong.contains("vneg"), "the rewrite must apply");
@@ -940,7 +940,8 @@ fn a_malformed_v1_record_fails_closed() {
 
 /// A root that serves its own detached demand child: the v1 record names impl export 0 as the
 /// pager, and the root waits in `svc.wait` before it joins the child, then returns `byte + serves *
-/// 1000`. The child (func 1) returns the byte at `fault`, its first touch of that page. The pager
+/// 1000 + status * 1_000_000`, the join's status the wire code of a trap the child ended in
+/// (#2066). The child (func 1) returns the byte at `fault`, its first touch of that page. The pager
 /// (func 2) gets the fault address in the child's coordinates, stores 77 at `addr + 40000` in its
 /// own window, and replies with that address (#1862).
 fn detached_pager_program_at(fault: u64) -> String {
@@ -953,8 +954,8 @@ fn detached_pager_program_at(fault: u64) -> String {
         // pager = impl export 0
         .replace("  vr16 = i64.const -4294967279\n", "  vr16 = i64.const 17\n")
         .replace(
-            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
-            "  vz = i32.const 0\n  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vk1 = i64.const 1000\n  vsk = i64.mul vs vk1\n  vt = i64.add vj vsk\n  vc = i32.wrap_i64 vt\n",
+            "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+            "  vz = i32.const 0\n  vs = svc.wait vz\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vk1 = i64.const 1000\n  vsk = i64.mul vs vk1\n  vt = i64.add vj vsk\n  vk2 = i64.const 1000000\n  vstk = i64.mul vj_st vk2\n  vt2 = i64.add vt vstk\n  vc = i32.wrap_i64 vt2\n",
         )
         .replace(
             &format!("  va = i64.const {}\n  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  vk = i64.const 100\n  vr = i64.add vbw vk\n  return vr\n", temen_ir::module_args_base()),
@@ -1048,14 +1049,17 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
 /// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
 /// recoverable kind the pager services (the reserved region cannot be mapped). The parent is parked
 /// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
-/// no-progress answer) so its `join` surfaces the trap — the run traps instead of hanging.
+/// no-progress answer) so its `join` answers the child's `MEMORY_FAULT` — the run ends instead of
+/// hanging.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
     let src = detached_pager_program_at(0);
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
     for b in BACKENDS {
-        assert!(
-            run_detached(b, &src).is_err(),
-            "{b:?}: a NULL fault in a paged child is fatal"
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            faulted,
+            "{b:?}: a NULL fault in a paged child is fatal to it"
         );
     }
 }
@@ -1080,8 +1084,8 @@ fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
     let src = detached_pager_program_at(0)
         .replace("  vb = i32.load8_u va\n", "  vb = i32.const 5\n")
         .replace(
-            "  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n",
-            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vs = svc.wait vz\n",
+            "  vs = svc.wait vz\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n",
+            "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vs = svc.wait vz\n",
         );
     assert!(
         src.contains("vb = i32.const 5\n") && src.contains("(vch)\n  vs = svc.wait"),
@@ -1094,8 +1098,8 @@ fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
 
 /// #1862: a pager reply names a source the pager's window can't supply — here 1 MiB past a buffer
 /// it did fill, beyond its 128 KiB window. The fault is unserviceable, so the child dies as a
-/// pagerless fault would (detect-and-kill), and the parent's `join` raises it: the run traps instead
-/// of the child reading unsupplied bytes.
+/// pagerless fault would (detect-and-kill), after the one serve, and the parent's `join` answers its
+/// `MEMORY_FAULT`: the child never reads unsupplied bytes.
 #[test]
 fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
     let src = detached_pager_program_at(20000).replace(
@@ -1103,9 +1107,13 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
         "  vpast = i64.const 1048576\n  vbad = i64.add vsrc vpast\n  return vbad\n",
     );
     assert!(src.contains("return vbad"), "the rewrite must apply");
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000 + 1000;
     for b in BACKENDS {
-        let e = run_detached(b, &src).expect_err("an unsuppliable page is fatal");
-        assert!(e.contains("MemoryFault"), "{b:?}: {e}");
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            faulted,
+            "{b:?}: an unsuppliable page is fatal to the child"
+        );
     }
 }
 
@@ -1117,8 +1125,8 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
 #[test]
 fn a_joined_detached_childs_window_returns_to_its_budget() {
     let src = detached_record_program().replace(
-        "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
-        "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vch2 = call.cap 6 17 (i64) -> (i32) vh (vrp)\n  vj2 = call.cap 6 1 (i32) -> (i64) vh (vch2)\n  vjs = i64.add vj vj2\n  vc = i32.wrap_i64 vjs\n",
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vch2 = call.cap 6 17 (i64) -> (i32) vh (vrp)\n  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) vh (vch2)\n  vjs = i64.add vj vj2\n  vc = i32.wrap_i64 vjs\n",
     );
     assert!(src.contains("vch2"), "the rewrite must apply");
     for b in BACKENDS {
@@ -1173,7 +1181,7 @@ block 0 () {{
   vc2 = self.resolve gp gl
 {grandchild_grant}  rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (rp)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   k = i64.const 100
   vr = i64.add vj k
   vc = i32.wrap_i64 vr
@@ -1204,7 +1212,7 @@ block 1 (ve: i32) {{
   return vr
   }}
 block 2 (vi: i32, vc: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vi (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   k = i64.const 20
   vr = i64.add vj k
   return vr
@@ -1267,7 +1275,7 @@ block 0 () {{
   i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   one = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) vsub (one)
   vfull = i64.eq vroom m
@@ -1358,7 +1366,7 @@ block 0 () {{
   i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   three = i64.const 3
   vroom = call.cap 14 1 (i64) -> (i64) vsub (three)
   vfull = i64.eq vroom c

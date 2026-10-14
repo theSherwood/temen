@@ -526,8 +526,9 @@ block 0 (v0: i64) {
   // table into the child's header after — then reads "K"=75 on the Ro page and stores+loads a marker on
   // an Rw page → 7509;
   // 8 × 7509 = 60072 on both tiers, codegen actually emitting. The trap twin stores on the UNMAPPED
-  // page: the child faults on both tiers (the root's join propagates it → the run rejects), so the
-  // emitted access provably honors the page state, not just the window bound.
+  // page: the child faults on both tiers (the root's join answers the fault and the root traps on it,
+  // #2066 → the run rejects), so the emitted access provably honors the page state, not just the
+  // window bound.
   try {
     const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_paged_unit.temenc');

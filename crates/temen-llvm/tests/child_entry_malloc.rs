@@ -101,7 +101,7 @@ fn child_entry_malloc_grows_heap_in_its_window() {
             .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
         assert_eq!(
             ran.result,
-            Ok(vec![Value::I64(4950)]),
+            Ok(vec![Value::I64(0), Value::I64(4950)]),
             "{driver:?}: the allocating child grew its heap (sum 0..100) and joined its result"
         );
     }

@@ -162,7 +162,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -282,7 +282,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -778,7 +778,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64, vbud: i32, v
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -1962,7 +1962,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32) {
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -2110,7 +2110,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32) {
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -2310,7 +2310,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32, vsrv: i32) {
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }
@@ -2504,7 +2504,7 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32, vsr
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
-  vjg = call.cap 6 1 (i32) -> (i64) v0 (vg)
+  vjg_st, vjg = call.cap 6 1 (i32) -> (i64, i64) v0 (vg)
   return vjg
   }
 }

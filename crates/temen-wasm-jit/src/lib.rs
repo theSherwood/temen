@@ -842,11 +842,21 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// out-of-subset): INSTANTIATOR (iface 6) `join` (op 1) and the config-record `instantiate_rec`
 /// (op 17) — the VM-in-VM primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child
 /// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::InstantiateDetached`), so
-/// the emitted code just marshals the args to an `env.instantiate_rec`/`env.join` import. Other
-/// Instantiator ops stay out-of-subset (fail-closed), interpreted: the retired carve spawns (ops 0
-/// and 13, #1867) trap `CapFault` there, and the fixed `env.instantiate` import slot is unused.
-fn is_nested_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::INSTANTIATOR && (op == 1 || op == 17)
+/// the emitted code just marshals the args to an `env.instantiate_rec`/`env.join` import. The
+/// bounce passes operands and results through unconverted, so a call is lowered only when it is
+/// declared with its import's exact widths: `join: (i32 child) -> (i64 status, i64 value)`,
+/// `instantiate_rec: (i64 record) -> i32`. Every other Instantiator call stays out-of-subset
+/// (fail-closed), interpreted, where the shared contract (`temen_ir::instantiator_contract`)
+/// answers it: the retired carve spawns (ops 0 and 13, #1867) trap `CapFault` there, and the fixed
+/// `env.instantiate` import slot is unused.
+fn is_nested_cap(type_id: u32, op: u32, sig: &FuncType) -> bool {
+    use ValType::{I32, I64};
+    type_id == cap_id::INSTANTIATOR
+        && match op {
+            1 => sig.params == [I32] && sig.results == [I64, I64],
+            17 => sig.params == [I64] && sig.results == [I32],
+            _ => false,
+        }
 }
 
 /// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
@@ -1003,7 +1013,9 @@ fn block_value_types_with(
             // §14 instantiator bounce (opt-in): typed by the cap-call's declared results so the entry
             // that spawns a nested VM is in-subset. Gated to the lowerable ops; any other cap-call
             // still hits the catch-all below (out-of-subset).
-            Inst::CapCall { type_id, op, sig, .. } if nested_caps && is_nested_cap(*type_id, *op) => {
+            Inst::CapCall { type_id, op, sig, .. }
+                if nested_caps && is_nested_cap(*type_id, *op, sig_of(&m.types, *sig)) =>
+            {
                 for r in &sig_of(&m.types, *sig).results {
                     tys.push(*r);
                 }
@@ -3624,7 +3636,7 @@ fn emit_module(
     let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
     // §14 host-bounce import types (added up front so the import section can reference them):
     //   env.instantiate: (i32 win, i32 inst, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32
-    //   env.join:        (i32 inst, i32 child) -> i64
+    //   env.join:        (i32 inst, i32 child) -> (i64 status, i64 value)
     let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
     let uses_rec = nested_caps && module_uses_rec(m);
     let mut instantiate_rec_ty = 0u32;
@@ -3634,7 +3646,7 @@ fn emit_module(
         instantiate_ty = types.len() as u32;
         types.push((vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e], vec![0x7f]));
         join_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7f], vec![0x7e]));
+        types.push((vec![0x7f, 0x7f], vec![0x7e, 0x7e]));
         if uses_rec {
             // §3c.3 env.instantiate_rec: (i32 win, i32 inst, i64 record_ptr) -> i32 child handle
             instantiate_rec_ty = types.len() as u32;
@@ -7050,7 +7062,7 @@ fn emit_block_body(
                 sig,
                 handle,
                 args,
-            } if nested_caps && is_nested_cap(*type_id, *op) => {
+            } if nested_caps && is_nested_cap(*type_id, *op, sig_of(&m.types, *sig)) => {
                 let n_results = sig_of(&m.types, *sig).results.len(); // #922: interned index
                 if *op == 17 {
                     // §3c.3 env.instantiate_rec(win, inst, record_ptr) -> i32 child handle — the
@@ -7065,7 +7077,7 @@ fn emit_block_body(
                     code.push(OP_CALL);
                     uleb(code, INSTANTIATE_REC_IMPORT_IDX as u64);
                 } else {
-                    // env.join(inst, child) -> i64 result
+                    // env.join(inst, child) -> (i64 status, i64 value) (#2066)
                     get(code, cx, *handle); // the Instantiator handle
                     for a in args {
                         get(code, cx, *a); // the child handle

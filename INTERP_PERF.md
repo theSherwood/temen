@@ -701,7 +701,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               8×500 atomic counter=4000, futex handoff=987654 exercising wait/notify, forged-join
               fault) — bit-identical to `run`. **Fiber migration** (run-shared registry) is deferred:
               modules using *both* threads and fibers are compile-rejected (→ fallback) for now.
-        - [x] **1c-5d** — §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume` + `Yielder.yield`),
+        - [x] **1c-5d** — §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume` + `Yielder.yield`;
+              retired with the coroutine ops, #2065),
               the cooperative nesting round-trip. `spawn_coroutine` carves a confined child window via
               `Mem::nested_view(abs_base, size_log2)` (shared backing, fresh page-protection) and gives
               the child a Yielder-only powerbox; `resume` drives that child **inline** (`resume_coro`,
@@ -787,7 +788,7 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               −EINVAL, forged module handle → CapFault) bit-identical to `run_with_host`. Still
               deferred: the module **coroutine** variants (ops 6/7) and demand/fault-yield (op 4).
         - [x] **1c-5i** — §14 separate-**module** *coroutine* (`Instantiator.spawn_coroutine_module`,
-              op 6): the inline-coroutine analogue of op 5. The spawn escapes to the driver (it must
+              op 6; retired with the coroutine ops, #2065): the inline-coroutine analogue of op 5. The spawn escapes to the driver (it must
               compile + push the granted module into `dom.mods`), which builds a `Coro` over it and
               registers it in the spawner's coroutine set; thereafter it is `resume`d **inline** like
               any coroutine. `Coro` gained a `table` field (its natural dispatch table — module 0 for
@@ -798,7 +799,8 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
               returning 1019 → 1_001_329) bit-identical to `run_with_host`. Still deferred: demand
               variants (ops 4/7, fault-yield paging).
         - [x] **1c-5j** — §14 **demand (fault-driven-yield) coroutines** (`spawn_demand_coroutine`
-              op 4, `spawn_demand_coroutine_module` op 7): completes §14 (ops 0–7). A demand child
+              op 4, `spawn_demand_coroutine_module` op 7; retired with the coroutine ops, #2065, the
+              pager now op 17's demand record): completes §14 (ops 0–7). A demand child
               starts with its whole window **unmapped** (`Mem::demand_page`), so an in-window access to
               an unsupplied page is a *recoverable* fault that suspends to the parent (status `FAULTED`
               = 2, value = the fault address) instead of trapping; the parent supplies the page

@@ -156,7 +156,7 @@ block 0 (v0: i32, v1: i32) {
   i32.store rba vb
   rp = i64.const 17408
   v9 = call.cap 6 17 (i64) -> (i32) v0 (rp)
-  v10 = call.cap 6 1 (i32) -> (i64) v0 (v9)
+  v10_st, v10 = call.cap 6 1 (i32) -> (i64, i64) v0 (v9)
   return v10
   }
 }

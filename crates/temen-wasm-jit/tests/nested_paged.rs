@@ -245,7 +245,7 @@ fn run_paged_nested(src: &str) -> (Outcome, u32) {
         .func_wrap(
             "env",
             "join",
-            |_: Caller<'_, DriverData>, _i: i32, _c: i32| -> i64 { unreachable!("no join") },
+            |_: Caller<'_, DriverData>, _i: i32, _c: i32| -> (i64, i64) { unreachable!("no join") },
         )
         .unwrap();
     linker

@@ -223,7 +223,7 @@ use temen_ir::Module;
 /// assuming it re-derives the freeze's ids.
 /// v31 (#1674): a completed-but-unjoined child's join outcome is `0` none | `1` + value | `2` + the
 /// trap's code ([`Trap::code`]), so a child that finished with a trap rides the artifact and the
-/// thawed `join` re-raises it. A nested record's `0 | 1 + value` is unchanged; a detached record's
+/// thawed `join` answers it as a live one does. A nested record's `0 | 1 + value` is unchanged; a detached record's
 /// bare value gains the tag.
 /// v32 (#1680, #1672): pipes inside the cut ride. `B_PIPE_END` names a pipe by its artifact number
 /// (first appearance: the root's table by slot, then each nested child's in record order), and
