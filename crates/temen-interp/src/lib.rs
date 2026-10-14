@@ -1003,15 +1003,21 @@ pub fn func_name_in(di: &DebugInfo, func: FuncIdx) -> Option<&str> {
         .map(|f| f.name.as_str())
 }
 
-/// The source position of `pc`, an op of the module `di` describes (DEBUGGING.md §6/W4 S2): the
-/// latest `loc` in `pc`'s block at or before `pc.inst`. Shared by [`source_loc`],
-/// [`Inspector::source_loc`] and a debugger reading a frame of any module the run admitted (#2239).
-pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
-    let l = di
-        .locs
+/// The §6 `loc` that op `pc` of the module `di` describes falls under: the latest in `pc`'s block at
+/// or before `pc.inst`. What [`source_loc_in`] renders, and what a debugger reads a frame's file off
+/// to tell a library's code from the program's (`DebugInfo::is_lib_file`, #2341).
+pub fn loc_in(di: &DebugInfo, pc: IrPc) -> Option<&temen_ir::Loc> {
+    di.locs
         .iter()
         .filter(|l| l.func == pc.func && l.block as usize == pc.block && l.inst as usize <= pc.inst)
-        .max_by_key(|l| l.inst)?;
+        .max_by_key(|l| l.inst)
+}
+
+/// The source position of `pc`, an op of the module `di` describes (DEBUGGING.md §6/W4 S2): its
+/// [`loc_in`]. Shared by [`source_loc`], [`Inspector::source_loc`] and a debugger reading a frame of
+/// any module the run admitted (#2239).
+pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
+    let l = loc_in(di, pc)?;
     let file = di.files.get(l.file as usize)?.clone();
     Some(SourceLoc {
         file,

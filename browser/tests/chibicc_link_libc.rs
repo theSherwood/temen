@@ -781,3 +781,143 @@ int main(void) {
         "private AA\nafter private: AAAA\nafter close: WXYZ\nafter munmap: !XYZ\n"
     );
 }
+
+/// A user TU with `-g` lines to step: the `printf` call is line 4, the line after it line 5.
+const STEP_USER_C: &str = r#"int printf(char *fmt, ...);
+int main(void) {
+  int a = 1;
+  printf("a=%d\n", a);
+  a = a + 1;
+  return a;
+}
+"#;
+
+/// #2341: a resident library's code is the library's under the debugger. Opening a unit resident
+/// (`temen_link_lib_open`) marks its files library code, the link carries the mark into the program,
+/// and the DAP shows the library's frames as `subtle` — and under `justMyCode` a step into `printf`
+/// goes through it to the program's next line instead of stopping on the libc's first.
+#[test]
+fn a_resident_librarys_code_is_library_code_under_the_debugger() {
+    use temen_browser::{
+        temen_link_lib_close, temen_link_lib_open, temen_link_text_libs, temen_stdout_len,
+        temen_stdout_ptr,
+    };
+    use temen_dap::{DapServer, Json};
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    let _exports = ffi::lock();
+    let lib_ir = emit_object(&chibicc, "pglibc.c", &[("pglibc.c", LIBC_C)], true);
+    let prog_ir = emit_object(&chibicc, "in.c", &[("in.c", STEP_USER_C)], true);
+    let h = temen_link_lib_open(lib_ir.as_ptr(), lib_ir.len());
+    assert!(h >= 0, "the libc opens resident");
+    let entry = b"main";
+    let rc = temen_link_text_libs(
+        [h].as_ptr(),
+        1,
+        prog_ir.as_ptr(),
+        prog_ir.len(),
+        entry.as_ptr(),
+        entry.len(),
+    );
+    assert_eq!(rc, 0, "the program links");
+    // SAFETY: the slot holds the linked text until the next entry replaces it; the lock is held.
+    let linked = String::from_utf8(
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec(),
+    )
+    .expect("linked text is utf8");
+    temen_link_lib_close(h);
+
+    // The libc's file is library code in the linked program; the program's own is not.
+    let m = temen_text::parse_module(&linked).expect("the linked text parses");
+    let di = m.debug_info.as_ref().expect("the link keeps the -g info");
+    let lib_files: Vec<&str> = di
+        .lib_files
+        .iter()
+        .map(|&f| di.files[f as usize].as_str())
+        .collect();
+    assert!(
+        lib_files.iter().any(|f| f.ends_with("pglibc.c")),
+        "the libc's source is library code: {lib_files:?}"
+    );
+    assert!(
+        !lib_files.iter().any(|f| f.ends_with("in.c")),
+        "the program's own source is not: {lib_files:?}"
+    );
+
+    let req = |seq: i64, command: &str, args: Json| {
+        Json::obj(vec![
+            ("seq", Json::i(seq)),
+            ("type", Json::s("request")),
+            ("command", Json::s(command)),
+            ("arguments", args),
+        ])
+    };
+    // Stop on the `printf` line, `stepIn`, and report the top frame's `(path, line, hint)`.
+    let step_in_from_printf = |just_my_code: bool| -> (String, i64, Option<String>) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(linked.as_str())),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("powerbox", Json::s("onramp")),
+                ("justMyCode", Json::Bool(just_my_code)),
+            ]),
+        ));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(4))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        s.handle(&req(5, "stepIn", Json::obj(vec![("threadId", Json::i(1))])));
+        let out = s.handle(&req(
+            6,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let resp = out
+            .iter()
+            .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
+            .expect("a response");
+        let top = &resp
+            .get("body")
+            .and_then(|b| b.get("stackFrames"))
+            .and_then(|f| f.as_array())
+            .expect("frames")[0];
+        (
+            top.get("source")
+                .and_then(|src| src.get("path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string(),
+            top.get("line").and_then(|l| l.as_i64()).unwrap_or(0),
+            top.get("presentationHint")
+                .and_then(|h| h.as_str())
+                .map(str::to_string),
+        )
+    };
+    let (path, _, hint) = step_in_from_printf(false);
+    assert!(
+        path.ends_with("pglibc.c") && hint.as_deref() == Some("subtle"),
+        "without justMyCode the step stops in the libc, marked subtle: {path} {hint:?}"
+    );
+    let (path, line, hint) = step_in_from_printf(true);
+    assert_eq!(
+        (path.as_str(), line, hint),
+        ("/in.c", 5, None),
+        "with it the step goes through printf to the program's next line"
+    );
+}

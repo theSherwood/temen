@@ -8675,7 +8675,9 @@ const LINK_SETS_MAX: usize = 4;
 /// module-scoped globals are implementation internals: their debug vars are dropped here (#1806).
 /// Otherwise every frame's Locals and the shared-state `globals` list would carry them beside the
 /// program's own (a playground libc's `__pg_std`, `__pg_rng`, …). The library's line table and its
-/// functions' locals stay, so a step into it still shows where it is.
+/// functions' locals stay, so a step into it still shows where it is — and every one of its files is
+/// marked library code (`lib_files`, #2341), so a debugger shows its frames as library frames and
+/// steps past them under just-my-code. `link` carries the mark into every program linked against it.
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -8688,6 +8690,7 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
     };
     if let Some(debug) = module.debug_info.as_mut() {
         debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+        debug.lib_files = (0..debug.files.len() as u32).collect();
     }
     let exports = link_lib_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.

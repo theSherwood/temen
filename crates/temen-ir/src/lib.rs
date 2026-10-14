@@ -4685,11 +4685,19 @@ pub struct DebugInfo {
     /// (the [`TLS_ROOT_SYM`] address it placed) or by a whole-program frontend that laid the block out
     /// itself; `None` for a module with no thread-locals. See [`DebugInfo::tls_addr`].
     pub tls_root: Option<u64>,
+    /// The [`files`](Self::files) (indices, ascending) that hold a **library's** code rather than the
+    /// program's own: a unit linked *into* a program, never debugged as one (#2341). A debugger marks
+    /// their frames as library frames, and steps past them under just-my-code. Set where a unit
+    /// becomes a library (the cdylib's resident libraries) and relocated by [`link`] like every file
+    /// reference, so it holds per module — a child's own libraries included. A header compiled into
+    /// the program's own unit is the program's code, not a library's.
+    pub lib_files: Vec<u32>,
 }
 
 impl DebugInfo {
     /// True when every table is empty. Such a `DebugInfo` says nothing: [`tls_root`](Self::tls_root)
-    /// only locates [`VarLoc::Tls`] variables, so on its own nothing reads it. The decoder, the text
+    /// only locates [`VarLoc::Tls`] variables and [`lib_files`](Self::lib_files) only classifies
+    /// files, so on their own nothing reads them. The decoder, the text
     /// printer and parser, and the linker all treat a vacuous `DebugInfo` as none, so "no debug info"
     /// has one form (`None`) and every round trip keeps it.
     pub fn is_vacuous(&self) -> bool {
@@ -4704,6 +4712,7 @@ impl DebugInfo {
             blobs,
             func_names,
             tls_root: _,
+            lib_files: _,
         } = self;
         files.is_empty()
             && locs.is_empty()
@@ -4724,6 +4733,11 @@ impl DebugInfo {
             self.tls_root?
         };
         Some(block.wrapping_add(off))
+    }
+
+    /// Whether file `file` holds a library's code ([`lib_files`](Self::lib_files)).
+    pub fn is_lib_file(&self, file: u32) -> bool {
+        self.lib_files.contains(&file)
     }
 }
 
@@ -6002,6 +6016,8 @@ fn merge_debug_info(
                 func: n.func + fbase,
                 name: n.name.clone(),
             }));
+        out.lib_files
+            .extend(di.lib_files.iter().map(|f| f + file_base));
         out.blobs.extend(di.blobs.iter().cloned());
     }
     // Vacuous in ⇒ nothing out.
