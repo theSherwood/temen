@@ -4412,6 +4412,7 @@ fn import_sig(import: &str) -> temen_ir::FuncType {
         "vm_region_map" => ft(vec![I64, I64, I64, I32], vec![I64]),
         "vm_region_unmap" => ft(vec![I64, I64], vec![I64]),
         "vm_region_page_size" => ft(vec![], vec![I64]),
+        "vm_region_close" => ft(vec![], vec![I64]),
         _ => ft(vec![I64, I64], vec![I64]), // write / read (Stream)
     }
 }
@@ -4612,8 +4613,8 @@ fn register_vm_jit_imports(
 }
 
 /// The §7 import a §13/§14 SharedRegion builtin needs (`__vm_region_create` → `vm_region_create`, …),
-/// or `None`. `create` reaches the `AddressSpace` (slot 4) handle; `map`/`unmap`/`page_size` reach the
-/// region handle `create` returned (passed as the call's first arg, not a stash slot).
+/// or `None`. `create` reaches the `AddressSpace` (slot 4) handle; `map`/`unmap`/`page_size`/`close`
+/// reach the region handle `create` returned (passed as the call's first arg, not a stash slot).
 fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
     Some(match name {
         "__vm_region_create" => "vm_region_create",
@@ -4622,6 +4623,7 @@ fn vm_region_builtin_import(name: &str) -> Option<&'static str> {
         "__vm_region_map" => "vm_region_map",
         "__vm_region_unmap" => "vm_region_unmap",
         "__vm_region_page_size" => "vm_region_page_size",
+        "__vm_region_close" => "vm_region_close",
         _ => return None,
     })
 }
@@ -12843,7 +12845,7 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
-        "__vm_region_map" | "__vm_region_unmap" | "__vm_region_page_size" => {
+        "__vm_region_map" | "__vm_region_unmap" | "__vm_region_page_size" | "__vm_region_close" => {
             let import = vm_region_builtin_import(name).expect("region builtin");
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the region handle (arg 0)
             let args = match name {
@@ -12857,7 +12859,7 @@ fn lower_vm_builtin(
                     ctx.operand_i64(vm_arg(c, 1)?)?, // win_off
                     ctx.operand_i64(vm_arg(c, 2)?)?, // len
                 ],
-                _ => vec![], // page_size
+                _ => vec![], // page_size, close
             };
             // The region handle is a runtime-minted *object*, so this is the dynamic addressing
             // mode (IMPORTS.md §2.2 — `call.cap` on the live handle, §3c-checked at use); the
@@ -12865,7 +12867,8 @@ fn lower_vm_builtin(
             let op = match import {
                 "vm_region_map" => 0,
                 "vm_region_unmap" => 1,
-                _ => 3, // vm_region_page_size
+                "vm_region_close" => 5, // #2358
+                _ => 3,                 // vm_region_page_size
             };
             let sig = ctx.intern_sig(import_sig(import)); // #922
             let r = ctx.push(Inst::CapCall {
