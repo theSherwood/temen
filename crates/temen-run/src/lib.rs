@@ -179,8 +179,10 @@ impl Drop for WindowRegionPurge {
 /// # Safety
 /// Honours the `CapThunk` contract: `ctx` is a live `*mut Host`; `args`/`results` are valid for
 /// `n_args`/`n_results`; `mem_base` (when non-null) is the guest window with `mem_size` backed
-/// bytes inside a `mem_reserved` reservation; `trap_out` is writable. The trap cell is encoded as
-/// the JIT expects: `0` = ok, else the host trap's wire code ([`Trap::code`], [`temen_ir::trap_code`]).
+/// bytes inside a `mem_reserved` reservation; `trap_out` is the trap cell of the calling instance's
+/// live [`temen_jit::VmCtx`], as compiled code passes it — a park and a punted call's wait read the
+/// instance through it. The trap cell is encoded as the JIT expects: `0` = ok, else the host trap's
+/// wire code ([`Trap::code`], [`temen_ir::trap_code`]).
 pub unsafe extern "C" fn cap_thunk(
     ctx: *mut c_void,
     mem_base: *mut u8,

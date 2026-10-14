@@ -428,8 +428,10 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
     let comps = host.completions();
     let m = Mutex::new(host);
     let ctx = &m as *const Mutex<Host> as *mut core::ffi::c_void;
-    // SAFETY: `ctx` is a live `*const Mutex<Host>` for the scope; args/results/trap_out are valid
-    // per-thread locals; no window (`mem_base` null) — the `CapThunk` contract.
+    // SAFETY: `ctx` is a live `*const Mutex<Host>` for the scope; args/results are valid
+    // per-thread locals, and `trap_out` is each worker's own `VmCtx` trap cell, as compiled code
+    // passes it (the thunk's wait reads the instance through it: here no domain, no kill cell); no
+    // window (`mem_base` null) — the `CapThunk` contract.
     let addr = ctx as usize;
     let results: Vec<i64> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..2i64)
@@ -437,7 +439,7 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                 s.spawn(move || {
                     let arg = [i];
                     let mut result = 0i64;
-                    let mut trap = 0i64;
+                    let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
                     unsafe {
                         temen_run::cap_thunk_locked(
                             addr as *mut core::ffi::c_void,
@@ -451,9 +453,10 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                             1,
                             &mut result,
                             1,
-                            &mut trap,
+                            vm.trap_ptr(),
                         );
                     }
+                    let trap = vm.trap.load(std::sync::atomic::Ordering::Relaxed);
                     assert_eq!(trap, 0, "worker {i}: clean dispatch");
                     result
                 })
