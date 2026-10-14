@@ -40,6 +40,13 @@ test = false
 doc = false
 
 [[bin]]
+name = "cap_abi"
+path = "fuzz_targets/cap_abi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "opt_ssa_roundtrip"
 path = "fuzz_targets/opt_ssa_roundtrip.rs"
 test = false

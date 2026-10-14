@@ -611,6 +611,11 @@ struct MemFile {
 /// descriptor numbers never size the host's table.
 const FD_MAX: usize = 1024;
 
+/// #2345 — the most processes the personality's table holds, live and unreaped together: Linux's
+/// default `pid_max`. A zombie stays until its parent reaps it, so a `fork` or `posix_spawn` past it
+/// is `-EAGAIN`, as one past a user's process limit is.
+const PID_MAX: usize = 32768;
+
 /// #2306 — the most connections a listener holds unaccepted: Linux's `SOMAXCONN`. A loopback
 /// `connect` past them is refused (`-ECONNREFUSED`).
 const SOMAXCONN: usize = 4096;
@@ -943,6 +948,85 @@ impl FdEntry {
             // Fork does NOT use this arm for CorePipe — see [`Proc::fork`]'s re-split.
             FdEntry::CorePipe(t) => FdEntry::CorePipe(Arc::clone(t)),
         }
+    }
+}
+
+/// #2345 — a process's environment. POSIX `fork` copies it, so a twin shares its parent's until
+/// either writes, and the writer's own copy is made then: a fork copies nothing. Each copy is
+/// charged to the personality's payer as `channel`, a [`TABLE_ENTRY`] and its bytes per variable, so
+/// a `setenv` past the ceiling, or a write needing a copy there is no room for, is `-ENOMEM`.
+#[derive(Default)]
+struct Env {
+    vars: HashMap<String, String>,
+    room: HostCharge,
+}
+
+impl Env {
+    /// What `name=value` costs.
+    fn cost(name: &str, value: &str) -> u64 {
+        TABLE_ENTRY + (name.len() + value.len()) as u64
+    }
+
+    /// `env` to write, its own copy charged to `payer` when a fork still shares it: `None`, with
+    /// nothing changed, when the payer has no room for the copy. `force` charges past any ceiling:
+    /// what the embedder sets.
+    fn own(env: &mut Arc<Env>, payer: Option<NodeRef>, force: bool) -> Option<&mut Env> {
+        if Arc::get_mut(env).is_none() {
+            let mut room = HostCharge::new(payer);
+            match force {
+                true => room.force(env.room.bytes()),
+                false if !room.resize(env.room.bytes()) => return None,
+                false => {}
+            }
+            *env = Arc::new(Env {
+                vars: env.vars.clone(),
+                room,
+            });
+        }
+        Arc::get_mut(env)
+    }
+
+    /// Set `name` to `value` in `env`: `false`, its variables unchanged, when `payer` has no room.
+    fn set(
+        env: &mut Arc<Env>,
+        payer: Option<NodeRef>,
+        force: bool,
+        name: String,
+        value: String,
+    ) -> bool {
+        let Some(e) = Env::own(env, payer, force) else {
+            return false;
+        };
+        let old = e.vars.get(&name).map_or(0, |v| Env::cost(&name, v));
+        let held = e.room.bytes() - old + Env::cost(&name, &value);
+        match force {
+            true => e.room.force(held),
+            false if !e.room.resize(held) => return false,
+            false => {}
+        }
+        e.vars.insert(name, value);
+        true
+    }
+
+    /// Unset `name` in `env`: `false` when it must be copied first and `payer` has no room.
+    fn remove(env: &mut Arc<Env>, payer: Option<NodeRef>, name: &str) -> bool {
+        if !env.vars.contains_key(name) {
+            return true;
+        }
+        let Some(e) = Env::own(env, payer, false) else {
+            return false;
+        };
+        if let Some(value) = e.vars.remove(name) {
+            e.room.resize(e.room.bytes() - Env::cost(name, &value));
+        }
+        true
+    }
+
+    /// An environment of `vars`, charged to `payer` past any ceiling: what a restore rebuilt.
+    fn forced(vars: HashMap<String, String>, payer: Option<NodeRef>) -> Env {
+        let mut room = HostCharge::new(payer);
+        room.force(vars.iter().map(|(n, v)| Env::cost(n, v)).sum());
+        Env { vars, room }
     }
 }
 
@@ -1281,10 +1365,23 @@ impl World {
         names_cost(self.files.keys()) + names_cost(&self.explicit_dirs)
     }
 
+    /// The process-table entry the guest's `pid` names (#2353). A pid past `i32` names none: cut
+    /// down, it would name another process, the caller's own among them, whose `Proc` its op holds,
+    /// so locking that would deadlock the host.
+    fn proc_at(&self, pid: i64) -> Option<&ProcEntry> {
+        self.procs.get(&i32::try_from(pid).ok()?)
+    }
+
     /// `path`'s length, or 0 when it does not exist — the read half, which never stamps.
     fn file_len(&self, path: &str) -> usize {
         self.files.get(path).map_or(0, |f| f.bytes.len())
     }
+}
+
+/// The process group a negative pid names: `-pid` in `kill(-pgid)` and `waitpid(-pgid)` (#2353).
+/// A group is named by a pid, an `i32`, so a pid whose negation is past that names none.
+fn named_group(pid: i64) -> Option<i32> {
+    i32::try_from(pid.checked_neg()?).ok()
 }
 
 /// #863 slice 2 — a [`World::procs`] process-table entry.
@@ -1370,8 +1467,9 @@ struct Proc {
     cwd: String,
     /// The environment: `name → value` — per-process (POSIX fork copies it; a child's `setenv` is
     /// invisible to the parent). `getenv`/`setenv` read and update it; host-side, out of the guest's
-    /// reach, like the rest of the bookkeeping (POSIX.md §3).
-    env: HashMap<String, String>,
+    /// reach, like the rest of the bookkeeping (POSIX.md §3). #2345: shared with a fork twin until
+    /// either writes, and charged ([`Env`]).
+    env: Arc<Env>,
     /// Cache of `getenv` results already materialized into the window: `name → ptr`. C's `getenv`
     /// returns a stable `char*` into libc-owned storage, so a repeated `getenv("X")` must return the
     /// **same** pointer; we allocate a NUL-terminated copy in the arena once and reuse it. `setenv`
@@ -1624,6 +1722,9 @@ impl Posix {
         for d in p.dirs.iter_mut().flatten() {
             d.held.bind(payer);
         }
+        if let Some(env) = Arc::get_mut(&mut p.env) {
+            env.room.bind(payer);
+        }
     }
 
     /// The signal whose default action terminated this personality's root process, if one did
@@ -1769,9 +1870,17 @@ impl Posix {
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
     /// guest `getenv`s. Invalidates any cached `getenv` pointer for the name.
     pub fn set_env(&self, name: &str, value: &str) {
+        let payer = self.world.lock().unwrap_or_else(|e| e.into_inner()).payer();
         let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
         st.env_ptrs.remove(name);
-        st.env.insert(name.to_string(), value.to_string());
+        // The embedder's, charged past any ceiling (#2345).
+        Env::set(
+            &mut st.env,
+            payer,
+            true,
+            name.to_string(),
+            value.to_string(),
+        );
     }
 
     /// Pin the clock to a fixed `nanos` value (all `clock(_)` calls return it) — how a test makes
@@ -2749,6 +2858,10 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             // The copies `getenv` handed out lived in that heap.
             p.env_ptrs.clear();
         }
+        // #2345 — the old image's handler frames are gone with it, so none can return to restore
+        // the mask it saved: an exec from inside a handler left its entry behind for good. The mask
+        // itself survives the exec, as POSIX keeps it.
+        p.handler_mask_stack.clear();
         // Every adopted pipe end re-points to its new handle — and so does the terminal input end
         // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
         // exec'd child's `read(0)` still taps the terminal. Each token moves **once, from the
@@ -3049,7 +3162,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         dirs: Vec::new(),
         args: Vec::new(),
         cwd: "/".to_string(),
-        env: HashMap::new(),
+        env: Arc::default(),
         env_ptrs: HashMap::new(),
         sig_pending: 0,
         sig_handler: HashMap::new(),
@@ -3470,7 +3583,7 @@ impl Proc {
             dirs: self.dirs.clone(),
             args: self.args.clone(),
             cwd: self.cwd.clone(),
-            env: self.env.clone(),
+            env: Arc::clone(&self.env), // shared until either writes (#2345)
             env_ptrs: self.env_ptrs.clone(),
             sig_pending: 0,
             sig_handler: self.sig_handler.clone(),
@@ -4070,6 +4183,7 @@ impl Ctx<'_> {
         // The zombie carries the `ppid` it exited with; a wildcard/`-pgid` reap that ignored it would let
         // a bash pipeline stage steal the reap the shell is blocked waiting for (the `echo | cat` wedge).
         let self_pid = self.p.pid;
+        let group = named_group(pid);
         let reaped = if pid == -1 {
             self.w
                 .procs
@@ -4082,16 +4196,15 @@ impl Ctx<'_> {
             // #799 — `waitpid(-pgid)`: group-reap the lowest OWN zombie whose pgid (retained on the
             // zombie entry) matches. Non-blocking like `-1` — the park door benches only
             // specific-pid waits this rung.
-            let g = (-pid) as i32;
             self.w
                 .procs
                 .iter()
                 .filter_map(|(p, e)| {
-                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if *pgid == g && *ppid == self_pid)
+                    matches!(e, ProcEntry::Zombie { pgid, ppid, .. } if group == Some(*pgid) && *ppid == self_pid)
                         .then_some(*p)
                 })
                 .min()
-        } else if is_zombie(self.w.procs.get(&(pid as i32))) {
+        } else if is_zombie(self.w.proc_at(pid)) {
             Some(pid as i32)
         } else {
             None
@@ -4114,11 +4227,8 @@ impl Ctx<'_> {
                 if pid > 0 && pid != tpid as i64 {
                     continue;
                 }
-                if pid < -1 {
-                    let g = (-pid) as i32;
-                    if t.lock().unwrap_or_else(|e| e.into_inner()).pgid != g {
-                        continue;
-                    }
+                if pid < -1 && group != Some(t.lock().unwrap_or_else(|e| e.into_inner()).pgid) {
+                    continue;
                 }
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                 if (opts & WUNTRACED) != 0 && tp.stop_fresh {
@@ -4154,7 +4264,7 @@ impl Ctx<'_> {
                     tp.ppid == self_pid
                         && (pid == -1
                             || (pid > 0 && tpid as i64 == pid)
-                            || (pid < -1 && tp.pgid == (-pid) as i32))
+                            || (pid < -1 && group == Some(tp.pgid)))
                 });
                 if running {
                     return Ok(vec![0]);
@@ -4175,8 +4285,9 @@ impl Ctx<'_> {
             // STOP (the `Blocked::Stopped` insert drain), and the re-executed op reports.
             if (opts & WNOHANG) == 0 {
                 if let Some(req) = self.p.park_req.clone() {
+                    // A process is never its own child, and its `Proc` is the one this op holds.
                     let target: Option<temen_interp::ParkEvent> = if pid > 0 {
-                        match self.w.procs.get(&(pid as i32)) {
+                        match self.w.proc_at(pid).filter(|_| pid != self.p.pid as i64) {
                             Some(ProcEntry::Live(t)) => t
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -4272,7 +4383,8 @@ impl Ctx<'_> {
             return EINVAL;
         }
         if pid < 0 {
-            return self.kill_pgroup((-pid) as i32, sig); // kill(-pgid): the group sweep (#798)
+            // kill(-pgid): the group sweep (#798).
+            return named_group(pid).map_or(ESRCH, |g| self.kill_pgroup(g, sig));
         }
         // Self — pid 0 (the pre-table calling convention) or the caller's own pid. Never a table
         // lock: the caller's own `Proc` is already held by this dispatch.
@@ -4294,7 +4406,7 @@ impl Ctx<'_> {
             return 0;
         }
         // #863 slice 2 — any other pid is a process-table lookup.
-        let transitioned: Option<i32> = match self.w.procs.get(&(pid as i32)) {
+        let transitioned: Option<i32> = match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 // Not self (guarded above), so this is a different mutex — World → Proc, the
                 // canonical order, serialized against other multi-`Proc` paths by the world lock.
@@ -4384,18 +4496,19 @@ impl Ctx<'_> {
     /// a live table process. `-EINVAL` on a negative `pgid`, `-ESRCH` on an unknown/zombie pid.
     fn setpgid(&mut self, args: &[i64]) -> i64 {
         let pid = *args.first().unwrap_or(&0);
-        let pgid = *args.get(1).unwrap_or(&0);
+        // A group is named by a pid, an `i32`: one past that is as invalid as a negative one.
+        let pgid = i32::try_from(*args.get(1).unwrap_or(&0)).unwrap_or(-1);
         if pgid < 0 || pid < 0 {
             return EINVAL;
         }
         if pid == 0 || pid == self.p.pid as i64 {
-            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid as i32 };
+            self.p.pgid = if pgid == 0 { self.p.pid } else { pgid };
             return 0;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => {
                 let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
-                tp.pgid = if pgid == 0 { tp.pid } else { pgid as i32 };
+                tp.pgid = if pgid == 0 { tp.pid } else { pgid };
                 0
             }
             _ => ESRCH,
@@ -4408,7 +4521,7 @@ impl Ctx<'_> {
         if pid == 0 || pid == self.p.pid as i64 {
             return self.p.pgid as i64;
         }
-        match self.w.procs.get(&(pid as i32)) {
+        match self.w.proc_at(pid) {
             Some(ProcEntry::Live(t)) => t.lock().unwrap_or_else(|e| e.into_inner()).pgid as i64,
             _ => ESRCH,
         }
@@ -4465,6 +4578,10 @@ impl Ctx<'_> {
     /// return the no-door placeholder; see [`OP_FORK`] for the full contract. Policy lives in the
     /// fork factory (table registration, inherited signal state/pgid/`ppid`) — this op only asks.
     fn fork_request(&mut self) -> i64 {
+        // #2345 — the twin's entry would pass the table's bound, which zombies hold until reaped.
+        if self.w.procs.len() >= PID_MAX {
+            return EAGAIN;
+        }
         if let Some(req) = self.p.park_req.clone() {
             req(temen_interp::ParkEvent::ForkSelf);
         }
@@ -5574,6 +5691,10 @@ impl Ctx<'_> {
         let Some(req) = self.p.park_req.clone() else {
             return Ok(vec![ENOSYS]);
         };
+        // #2345 — as `fork`: no room in the table for the new process's entry.
+        if self.w.procs.len() >= PID_MAX {
+            return Ok(vec![EAGAIN]);
+        }
         let at = *args.first().ok_or(Trap::Malformed)? as u64;
         let Some(&[path_ptr, argv_ptr, envp_ptr, acts_ptr, nacts]) =
             read_guest_words(mem, at, 5).as_deref()
@@ -5849,7 +5970,7 @@ impl Ctx<'_> {
         if let Some(&cached) = self.p.env_ptrs.get(&name) {
             return Ok(vec![cached as i64]);
         }
-        let Some(value) = self.p.env.get(&name).cloned() else {
+        let Some(value) = self.p.env.vars.get(&name).cloned() else {
             return Ok(vec![0]); // unset → NULL
         };
         let mut vb = value.into_bytes();
@@ -5879,11 +6000,13 @@ impl Ctx<'_> {
         let (Ok(name), Ok(value)) = (String::from_utf8(nb), String::from_utf8(vb)) else {
             return Ok(vec![EINVAL]);
         };
-        if overwrite == 0 && self.p.env.contains_key(&name) {
+        if overwrite == 0 && self.p.env.vars.contains_key(&name) {
             return Ok(vec![0]); // keep the existing value
         }
+        if !Env::set(&mut self.p.env, self.w.payer(), false, name.clone(), value) {
+            return Ok(vec![ENOMEM]); // #2345: no room for it
+        }
         self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
-        self.p.env.insert(name, value);
         Ok(vec![0])
     }
 
@@ -5901,7 +6024,7 @@ impl Ctx<'_> {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![-1]);
         };
-        let Some(value) = self.p.env.get(&name) else {
+        let Some(value) = self.p.env.vars.get(&name) else {
             return Ok(vec![-1]); // unset
         };
         let vb = value.as_bytes();
@@ -5920,8 +6043,10 @@ impl Ctx<'_> {
         let Ok(name) = String::from_utf8(nb) else {
             return Ok(vec![EINVAL]);
         };
+        if !Env::remove(&mut self.p.env, self.w.payer(), &name) {
+            return Ok(vec![ENOMEM]); // #2345: a shared environment's copy has no room
+        }
         self.p.env_ptrs.remove(&name);
-        self.p.env.remove(&name);
         Ok(vec![0])
     }
 
@@ -5936,12 +6061,12 @@ impl Ctx<'_> {
         if index < 0 {
             return Ok(vec![-1]);
         }
-        let mut keys: Vec<&String> = self.p.env.keys().collect();
+        let mut keys: Vec<&String> = self.p.env.vars.keys().collect();
         keys.sort();
         let Some(key) = keys.get(index as usize) else {
             return Ok(vec![-1]); // past the end
         };
-        let entry = format!("{key}={}", self.p.env[*key]).into_bytes();
+        let entry = format!("{key}={}", self.p.env.vars[*key]).into_bytes();
         if buf != 0 && (entry.len() as u64) <= cap {
             mem.write_bytes(buf, &entry).ok_or(Trap::Malformed)?;
         }
@@ -6136,7 +6261,7 @@ mod tests {
             fd
         };
         p.cwd = "/parent".to_string();
-        p.env.insert("K".to_string(), "v".to_string());
+        Env::set(&mut p.env, None, true, "K".into(), "v".into());
         p.sig_handler.insert(2, 0x1234);
         p.sig_pending = 1 << 2;
         p.sig_mask = 1 << 10;
@@ -6159,13 +6284,13 @@ mod tests {
 
         // cwd/env are copies: the twin's mutations never reach the parent.
         twin.cwd = "/child".to_string();
-        twin.env.insert("K".to_string(), "child".to_string());
+        Env::set(&mut twin.env, None, true, "K".into(), "child".into());
         assert_eq!(
             p.cwd, "/parent",
             "a subshell's chdir must not move its parent"
         );
         assert_eq!(
-            p.env["K"], "v",
+            p.env.vars["K"], "v",
             "a child's setenv is invisible to the parent"
         );
 
@@ -8183,7 +8308,7 @@ block 0 (vph: i32) {\n\
         win[9] = b'2';
         let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
         // setenv("K", "v1", overwrite=1): name@0 len 1, value staged separately — reuse offset 8 with "v1".
-        st.p.env.insert("K".to_string(), "v1".to_string());
+        Env::set(&mut st.p.env, None, true, "K".into(), "v1".into());
         // getenv("K") materializes "v1\0" and caches the pointer.
         let p1 = st.getenv(&[0, 1], Some(&mut mem)).unwrap()[0];
         assert!(p1 > 0, "getenv returns a non-null arena pointer");
@@ -8199,7 +8324,7 @@ block 0 (vph: i32) {\n\
         let r0 = st.setenv(&[0, 1, 8, 2, 0], Some(&mut mem)).unwrap()[0];
         assert_eq!(r0, 0, "setenv(overwrite=0) on existing name returns 0");
         assert_eq!(
-            st.p.env.get("K").map(String::as_str),
+            st.p.env.vars.get("K").map(String::as_str),
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
@@ -9001,6 +9126,86 @@ block 0 () {\n\
     /// #2306 — a process's descriptors stay below [`FD_MAX`]: a `dup2` or `F_DUPFD` past it is
     /// refused, so a guest's fd number never sizes the host's table, and an op that needs a
     /// descriptor when none is left is `-EMFILE`, having made nothing (a pipe both ends or none).
+    /// #2345 — what a process keeps for its guest is bounded. Its environment is charged to the
+    /// personality's payer (`-ENOMEM` past the ceiling), shared with a fork twin until either writes
+    /// (a fork copies nothing; the writer's copy is charged then). The process table holds `PID_MAX`,
+    /// live and unreaped together (`-EAGAIN` for a `fork` past it), and an exec drops the mask entries
+    /// of handlers that will never return.
+    #[test]
+    fn a_processes_tables_are_bounded() {
+        let (posix, host) = bound(64 << 10);
+        let mut win = vec![b'v'; 64 << 10];
+        win[..4].copy_from_slice(b"NAME");
+        win[8..12].copy_from_slice(b"NAM2");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 64 << 10);
+        {
+            ctx!(posix, w_g, p_g, st);
+            let mut set = |st: &mut Ctx, name: i64, len: i64| {
+                st.setenv(&[name, 4, 64, len, 1], Some(&mut mem)).unwrap()[0]
+            };
+            assert_eq!(set(&mut st, 0, 20 << 10), 0, "a variable that fits");
+            let held = host.channel_used();
+            assert!(
+                held >= (20 << 10) + TABLE_ENTRY as i64,
+                "is charged: {held}"
+            );
+            assert_eq!(set(&mut st, 8, 50 << 10), ENOMEM, "one past the ceiling");
+            assert_eq!(host.channel_used(), held, "charges nothing");
+            // A fork shares the environment; the twin's write copies it, and the copy is charged.
+            let mut twin = st.p.fork();
+            assert_eq!(host.channel_used(), held, "a fork copies nothing");
+            let mut cx = Ctx {
+                w: &mut *st.w,
+                p: &mut twin,
+                wake_after: Vec::new(),
+            };
+            assert_eq!(set(&mut cx, 0, 4), 0, "the twin's write");
+            assert!(host.channel_used() > held, "charges its copy");
+            assert_eq!(
+                st.p.env.vars["NAME"].len(),
+                20 << 10,
+                "the parent's is its own"
+            );
+            for pid in 0..PID_MAX as i32 {
+                let zombie = ProcEntry::Zombie {
+                    status: 0,
+                    pgid: 1,
+                    ppid: 1,
+                };
+                st.w.procs.insert(pid + 10_000, zombie);
+            }
+            assert_eq!(st.fork_request(), EAGAIN, "the table holds PID_MAX");
+            st.p.handler_mask_stack = vec![1, 2, 3];
+        }
+        exec_remap_hook(Arc::clone(&posix.root))(&[]);
+        assert!(
+            posix.root.lock().unwrap().handler_mask_stack.is_empty(),
+            "an exec drops what no handler will return to restore"
+        );
+    }
+
+    /// #2353 — a group past `i32` names none. Negating `i64::MIN` panicked the host, and a group
+    /// cut down to `i32` named another one, the caller's own among them.
+    #[test]
+    fn a_group_past_i32_names_none() {
+        let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![0u8; 64];
+        let mut mem = temen_interp::WindowMem::new(&mut win, 64);
+        ctx!(posix, w_g, p_g, st);
+        assert_eq!(st.kill(&[i64::MIN, 0]), ESRCH);
+        assert_eq!(
+            st.waitpid(&[i64::MIN, 0, 0], Some(&mut mem)).unwrap()[0],
+            ECHILD
+        );
+        let own = i64::from(st.p.pgid);
+        assert_eq!(
+            st.kill(&[-own - (1 << 32), 0]),
+            ESRCH,
+            "not the caller's own"
+        );
+        assert_eq!(st.setpgid(&[0, own + (1 << 32)]), EINVAL);
+    }
+
     #[test]
     fn descriptor_numbers_are_bounded() {
         let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());

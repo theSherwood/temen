@@ -974,6 +974,8 @@ pub struct SourceLoc {
     pub line: u32,
     /// 0 means "no column".
     pub col: u32,
+    /// `file` holds a library's code, not the program's (`DebugInfo::lib_files`, #2341).
+    pub library: bool,
 }
 
 /// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
@@ -1017,6 +1019,7 @@ pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
         file,
         line: l.line,
         col: l.col,
+        library: di.is_lib_file(l.file),
     })
 }
 
@@ -20707,16 +20710,34 @@ pub const TABLE_ENTRY: u64 = 128;
 /// `channel`, and one `maps` while those reach [`MAPPED_BUFFER`]. Growing is all or nothing, refused
 /// at any ceiling or at the process's pool of mappings; shrinking hands the difference back, and
 /// dropping it the rest. One with no payer charges nothing: state an embedder keeps for itself.
+/// #2336 — the same holds for a bytecode vCPU's register file, as `mem` ([`HostCharge::stack`]).
 #[derive(Default)]
 pub struct HostCharge {
     payer: Option<NodeRef>,
     bytes: u64,
+    stack: bool,
 }
 
 impl HostCharge {
     /// One that holds nothing yet, charging `payer` as it grows.
     pub fn new(payer: Option<NodeRef>) -> HostCharge {
-        HostCharge { payer, bytes: 0 }
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: false,
+        }
+    }
+
+    /// #2336 — one for a vCPU's stack as an engine keeps it in host memory (the bytecode engine's
+    /// register file): its bytes past the [`temen_ir::FIBER_STACK`] a vCPU's own charge already
+    /// pays for are `mem`, which a stack is on every engine, and it holds one `maps` from
+    /// [`MAPPED_BUFFER`], as any buffer does.
+    pub fn stack(payer: Option<NodeRef>) -> HostCharge {
+        HostCharge {
+            payer,
+            bytes: 0,
+            stack: true,
+        }
     }
 
     /// Who it charges.
@@ -20731,11 +20752,13 @@ impl HostCharge {
 
     /// Hold `bytes` from now on: `false`, holding what it held, when growing to them would pass a
     /// ceiling or the pool.
+    #[inline]
     pub fn resize(&mut self, bytes: u64) -> bool {
         self.set(bytes, Fits::All)
     }
 
     /// [`Self::resize`] past every limit: what a restore rebuilds, which existed before it.
+    #[inline]
     pub fn force(&mut self, bytes: u64) {
         self.set(bytes, Fits::Forced);
     }
@@ -20778,14 +20801,27 @@ impl HostCharge {
         }
     }
 
+    /// What holding `bytes` costs: its `channel` (or a stack's `mem`), and its `maps`.
+    #[inline]
+    fn cost(&self, bytes: u64) -> [(usize, u64); 2] {
+        let maps = (BUDGET_MAPS, u64::from(bytes >= MAPPED_BUFFER));
+        match self.stack {
+            false => [(BUDGET_CHANNEL, bytes), maps],
+            true => [
+                (BUDGET_MEM, bytes.saturating_sub(temen_ir::FIBER_STACK)),
+                maps,
+            ],
+        }
+    }
+
+    #[inline]
     fn set(&mut self, bytes: u64, fits: Fits) -> bool {
-        if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
-            let maps = |b: u64| u64::from(b >= MAPPED_BUFFER);
-            let (lo, hi) = (self.bytes.min(bytes), self.bytes.max(bytes));
-            let diff = [
-                (BUDGET_CHANNEL, hi - lo),
-                (BUDGET_MAPS, maps(hi) - maps(lo)),
-            ];
+        // A stack's first `FIBER_STACK` costs nothing, so most never reach the tree.
+        let (was, now) = (self.cost(self.bytes), self.cost(bytes));
+        if let Some(n) = self.payer.as_ref().filter(|_| was != now) {
+            // Each dimension's cost only grows with the bytes, so the difference is one-signed.
+            let diff: [(usize, u64); 2] =
+                std::array::from_fn(|i| (was[i].0, was[i].1.abs_diff(now[i].1)));
             if bytes < self.bytes {
                 n.tree.refund_set(n.node, &diff);
             } else if !n.tree.add(n.node, &diff, fits) {
@@ -22469,6 +22505,13 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 /// (DEBUGGING.md W1).
 pub const CAP_SELF_PARALLELISM: u32 = 19;
 
+/// #2349 — the most records a spawn's or an exec's grant list may hold: a child's whole handle table.
+/// A powerbox's list is a handful of names, and a longer one could not fit the child anyway.
+pub const MAX_SPAWN_GRANTS: u64 = CAP as u64;
+
+/// #2349 — the longest name a grant record may carry. A powerbox's names are short words.
+pub const MAX_GRANT_NAME: usize = 255;
+
 /// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
 /// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
 /// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
@@ -22476,14 +22519,19 @@ pub const CAP_SELF_PARALLELISM: u32 = 19;
 /// why), and `handle` is returned as written — tag decoding and the authority check are the caller's
 /// policy, applied to the whole list after it parses.
 ///
-/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` is
-/// untrusted, so nothing is sized from it: the list grows one record at a time and the first
-/// out-of-window record ends it.
+/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` and
+/// each `name_len` are the guest's, so both are bounded before anything is read (#2349): a list of
+/// more than [`MAX_SPAWN_GRANTS`] records, or a name longer than [`MAX_GRANT_NAME`], is malformed,
+/// `CapFault`, as a non-UTF-8 name is. Every engine's spawn and exec reads its list here, so they
+/// refuse it alike.
 pub fn read_grant_records(
     grants_ptr: u64,
     grants_n: u64,
     read: impl Fn(u64, usize) -> Result<Vec<u8>, Trap>,
 ) -> Result<Vec<(String, i32)>, Trap> {
+    if grants_n > MAX_SPAWN_GRANTS {
+        return Err(Trap::CapFault);
+    }
     let mut list = Vec::new();
     for i in 0..grants_n {
         let off = i
@@ -22494,6 +22542,9 @@ pub fn read_grant_records(
         let word = |at: usize| [rec[at], rec[at + 1], rec[at + 2], rec[at + 3]];
         let name_off = u32::from_le_bytes(word(0)) as u64;
         let name_len = u32::from_le_bytes(word(4)) as usize;
+        if name_len > MAX_GRANT_NAME {
+            return Err(Trap::CapFault);
+        }
         let handle = i32::from_le_bytes(word(8));
         let name = String::from_utf8(read(name_off, name_len)?).map_err(|_| Trap::CapFault)?;
         list.push((name, handle));
@@ -26489,10 +26540,17 @@ impl Host {
             .collect()
     }
 
+    /// How many more entries this host's handle table holds. A guest-reachable path that installs
+    /// entries with the infallible [`Host::grant`] checks it first, so a table the guest filled
+    /// refuses the operation instead of panicking the host (#2222).
+    fn room(&self) -> usize {
+        self.table.iter().filter(|s| s.entry.is_none()).count()
+    }
+
     /// Infallible grant for **host-controlled** powerbox setup (`grant_stream`/`grant_memory`/… and
     /// the `grant_*` embedder APIs): the host grants a bounded handful into a fresh `CAP`-slot table,
     /// so the table cannot be full. Never call this on a **guest-reachable** path — use
-    /// [`Host::try_grant`] there (a guest can exhaust the table; see its docs).
+    /// [`Host::try_grant`] there, or check [`Host::room`] first (a guest can exhaust the table).
     fn grant(&mut self, type_id: u32, binding: Binding) -> i32 {
         self.try_grant(type_id, binding)
             .expect("handle table full during host powerbox setup (bounded by construction)")
@@ -27909,7 +27967,7 @@ impl Host {
     pub fn try_grant_pipe(&mut self) -> Option<(i32, i32)> {
         // Both ends must land or neither: check two free slots before minting the FIFO, so a
         // half-granted pipe (a write end with no reader) can never escape.
-        if self.table.iter().filter(|s| s.entry.is_none()).count() < 2 {
+        if self.room() < 2 {
             return None;
         }
         // #989 — the guest-reachable mint: refuse before allocating when it would push the domain's
@@ -29190,6 +29248,11 @@ impl Host {
             return Err(Trap::CapFault);
         }
         let named = m.interface_named_ops(e.interface).ok_or(Trap::CapFault)?;
+        // #2222 — guest-minting: a module may export more offers than the table holds, so a full
+        // table is `-EMFILE`, never the infallible grant's panic.
+        if self.room() == 0 {
+            return Ok(EMFILE as i32);
+        }
         let sigs: Arc<[FuncType]> = named.iter().map(|&(_, ft)| ft.clone()).collect();
         let names: Arc<[String]> = named.iter().map(|(n, _)| n.to_string()).collect();
         let state = self
@@ -29957,6 +30020,10 @@ impl Host {
         let Some(validate) = self.module_validator else {
             return EINVAL;
         };
+        // #2222 — guest-minting, so a full table is `-EMFILE`, checked before the gate's work.
+        if self.room() == 0 {
+            return EMFILE;
+        }
         match validate(bytes) {
             Ok(m) => self.grant_module_shared(Arc::new(m), false) as i64,
             Err(e) => e,
@@ -30339,7 +30406,9 @@ impl Host {
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
-        if unit_spawns_detached && !self.durable {
+        // #2222 — at most three grants, mid-run, into a table the guest may have filled: with no room
+        // for them the unit installs without the set, and its spawns refuse as before #1529.
+        if unit_spawns_detached && !self.durable && self.room() >= 3 {
             if let Some(win) = self
                 .resolve_cap_name("instantiator")
                 .and_then(|h| self.resolve_instantiator(h).ok())
@@ -30532,7 +30601,7 @@ impl Host {
     /// `-EMFILE` instead of panicking). Checks for a free slot **before** registering the backing, so
     /// a full table leaves `regions` untouched (no leaked backing).
     pub fn try_grant_shared_region_backed(&mut self, backing: RegionBacking) -> Option<i32> {
-        if self.table.iter().all(|s| s.entry.is_some()) {
+        if self.room() == 0 {
             return None; // table full — don't register a backing we can't hand out
         }
         let id = self.hold_region(backing);
@@ -30778,6 +30847,8 @@ impl Host {
         match serve_live_export(handle) {
             Some(k) => {
                 let (names, sigs) = self.offer_shape(k)?;
+                // #2222 — as [`Self::regrant_into_child`] refuses a full table.
+                (child.room() > 0).then_some(())?;
                 Some(child.install_live_impl(Arc::clone(cell?), k, names.into(), sigs.into(), None))
             }
             None => self.regrant_into_child(handle, child),
@@ -30818,7 +30889,7 @@ impl Host {
         if self.jit_table(handle) || self.forkable_host_proc(handle) {
             return Ok(EINVAL);
         }
-        if child.table.iter().all(|s| s.entry.is_some()) {
+        if child.room() == 0 {
             return Ok(EMFILE);
         }
         Ok(self
@@ -30886,6 +30957,12 @@ impl Host {
     /// or `None` for a forged / non-grantable cap. (A pipe end is checked first: it is index-carrying,
     /// so `resolve_copyable` would refuse it.)
     pub(crate) fn regrant_into_child(&mut self, handle: i32, child: &mut Host) -> Option<i32> {
+        // #2222 — every arm below installs exactly one entry, most with the infallible grant, and a
+        // guest reaches this with a table it filled (an offer call's `cap` argument, a spawn's grant
+        // list): a full table refuses it before any arm changes either host.
+        if child.room() == 0 {
+            return None;
+        }
         if let Some((write, backing)) = self.resolve_pipe_end(handle) {
             return Some(child.install_pipe_end(write, backing));
         }
@@ -31567,6 +31644,38 @@ impl Host {
         child.stop_depth = Arc::clone(&self.stop_depth);
         child.term_flag = Arc::clone(&self.term_flag);
         child.park_request = Arc::clone(&self.park_request);
+        // The process's pipe ends re-install into the new powerbox (POSIX keeps fds), gated on a
+        // provider having DECLARED fd-preservation (an exec-remap hook registered) — a capability-path
+        // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
+        // (`install_pipe_end`, below) happen BEFORE the driver's old-image release, so the shared
+        // counts never dip through the image-replace.
+        //
+        // Of those, only the ends the process can still reach ([`SignalSource::exec_keeps`]: its
+        // descriptors name them): an end nothing names would ride into the new image only to hold
+        // its pipe open — a spawned child's own stdin writer, closed by a file action, would keep
+        // the child from ever reading EOF. The ends left behind go with the old powerbox.
+        let keep_fds = !self.exec_remap_hooks.is_empty();
+        let keeps = self
+            .signal_poll()
+            .and_then(|(_, source)| source.exec_keeps());
+        let ends: Vec<(i32, bool, PipeBacking)> = (0..if keep_fds { self.table.len() } else { 0 })
+            .filter_map(|slot| {
+                let st = &self.table[slot];
+                st.entry?;
+                let old_h = handle_of(slot as u32, st.generation);
+                if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
+                    return None;
+                }
+                let (is_w, backing) = self.resolve_pipe_end(old_h)?;
+                Some((old_h, is_w, backing))
+            })
+            .collect();
+        // #2222 — each carried personality and each kept end installs one entry with the infallible
+        // grant, over the new image's own: a process whose table was full refuses the exec here,
+        // before either host changes, instead of panicking the host.
+        if child.room() < self.host_procs.len() + ends.len() {
+            return Err(());
+        }
         // The host-served personality moves VERBATIM (same handler over the same Proc — fds, pid, env
         // survive exec), never through a fresh fork-clone. Each carried entry re-grants a handle in the
         // new powerbox, and its published vtable registers its op names in the new image's directory so
@@ -31584,34 +31693,10 @@ impl Host {
                 }
             }
         }
-        // The process's pipe ends re-install into the new powerbox (POSIX keeps fds), gated on a
-        // provider having DECLARED fd-preservation (an exec-remap hook registered) — a capability-path
-        // guest manages its ends explicitly and its exec contract is drop-by-default. The count bumps
-        // (`install_pipe_end`) happen BEFORE the driver's old-image release, so the shared counts never
-        // dip through the image-replace.
-        //
-        // Of those, only the ends the process can still reach ([`SignalSource::exec_keeps`]: its
-        // descriptors name them): an end nothing names would ride into the new image only to hold
-        // its pipe open — a spawned child's own stdin writer, closed by a file action, would keep
-        // the child from ever reading EOF. The ends left behind go with the old powerbox.
         let mut remap: Vec<(i32, i32)> = Vec::new();
-        let keep_fds = !self.exec_remap_hooks.is_empty();
-        let keeps = self
-            .signal_poll()
-            .and_then(|(_, source)| source.exec_keeps());
-        for slot in 0..(if keep_fds { self.table.len() } else { 0 }) {
-            let st = &self.table[slot];
-            if st.entry.is_none() {
-                continue;
-            }
-            let old_h = handle_of(slot as u32, st.generation);
-            if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
-                continue;
-            }
-            if let Some((is_w, backing)) = self.resolve_pipe_end(old_h) {
-                let nh = child.install_pipe_end(is_w, backing);
-                remap.push((old_h, nh));
-            }
+        for (old_h, is_w, backing) in ends {
+            let nh = child.install_pipe_end(is_w, backing);
+            remap.push((old_h, nh));
         }
         // The new image's manifest binds **strictly** — the same walk as a §14 child, so an import
         // nothing can satisfy refuses the exec and the caller gets `-EINVAL` back while it still
@@ -36998,6 +37083,151 @@ mod exec_maps_tests {
         );
         image.host.release_memory();
         assert_eq!(maps(&parent, node), 0, "and its end hands them back");
+    }
+}
+
+#[cfg(test)]
+mod full_table_tests {
+    //! #2222 — a guest can fill its own handle table (`pipe()` takes two slots a call), then reach a
+    //! path that installs entries with the infallible grant. Each refuses instead of panicking the
+    //! host.
+    use super::*;
+
+    /// Fill `host`'s table as a guest's `pipe()` loop does.
+    fn fill(host: &mut Host) {
+        while host.try_grant_pipe().is_some() {}
+        while host.room() > 0 {
+            host.grant_stream(StreamRole::Out);
+        }
+    }
+
+    #[test]
+    fn a_re_grant_into_a_full_table_is_refused() {
+        let mut parent = Host::new();
+        let out = parent.grant_stream(StreamRole::Out);
+        let mut child = Host::new();
+        fill(&mut child);
+        assert_eq!(parent.regrant_into_child(out, &mut child), None);
+        let mut slots = [out as i64];
+        assert_eq!(
+            translate_cap_slots(&mut parent, &mut child, &[ValType::Cap], &mut slots),
+            Err(Trap::CapFault),
+            "an offer call passing a capability to a provider with a full table fails closed"
+        );
+    }
+
+    #[test]
+    fn a_spawn_whose_grants_do_not_fit_is_refused() {
+        let mut parent = Host::new();
+        let out = parent.grant_stream(StreamRole::Out);
+        let grants: Vec<(String, i32)> = (0..CAP).map(|i| (format!("out{i}"), out)).collect();
+        assert!(
+            parent
+                .spawn_child_powerbox(&grants, 1 << 20, parent.attestation, None, None)
+                .is_none(),
+            "more grants than a child's table holds"
+        );
+    }
+
+    #[test]
+    fn minting_into_a_full_table_is_emfile() {
+        let pm = temen_text::parse_module(
+            "type 0 func (i64) -> (i64)\n\
+             type 1 interface { dbl: 0 }\n\
+             export 0 interface \"svc\" 1 { dbl: 0 }\n\n\
+             func (i64) -> (i64) {\n\
+             block 0 (va: i64) {\n\
+               vs = i64.add va va\n\
+               return vs\n\
+               }\n\
+             }\n",
+        )
+        .expect("parse");
+        let mut host = Host::new();
+        host.set_self_module(&Arc::new(pm));
+        host.set_module_validator(|_| panic!("a full table refuses before the gate runs"));
+        fill(&mut host);
+        assert_eq!(host.reify_export(0), Ok(EMFILE as i32), "export.handle");
+        assert_eq!(host.module_from_bytes(b"\0asm"), EMFILE, "from_bytes");
+    }
+
+    #[test]
+    fn an_exec_whose_kept_ends_do_not_fit_is_refused() {
+        let mut host = Host::new();
+        let cmd = temen_text::parse_module(
+            "memory 16\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let mh = host.grant_module(&cmd);
+        let command = host.exec_module(ExecCmd::Granted(mh)).expect("resolves");
+        let personality =
+            host.grant_host_proc(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        // A personality that keeps descriptors across exec, as temen-posix's does.
+        host.exec_remap_hooks.push(Arc::new(|_: &[(i32, i32)]| {}));
+        fill(&mut host);
+        assert_eq!(
+            host.exec_image(&command, &[], 0, 0, 1 << 20).err(),
+            Some(EINVAL),
+            "the new image's own grants leave no room for every end"
+        );
+        assert_eq!(
+            host.cap_dispatch_slots(cap_id::HOST_PROC, 0, personality, &[], None),
+            Ok(vec![0]),
+            "the caller keeps its personality"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_list_tests {
+    //! #2349 — a spawn's or an exec's grant list is the guest's to size: its length and each name's
+    //! are bounded before anything is read, so a list of 2^33 records or a 4 GiB name refuses at once
+    //! instead of making the host loop or allocate.
+    use super::*;
+
+    /// A window holding `n` records, each naming the string just past them, `name_len` bytes long.
+    fn window(n: usize, name_len: u32) -> Vec<u8> {
+        let name = n * 16;
+        let mut w = vec![b'x'; name + MAX_GRANT_NAME];
+        for i in 0..n {
+            let rec = &mut w[i * 16..i * 16 + 16];
+            rec[..4].copy_from_slice(&(name as u32).to_le_bytes());
+            rec[4..8].copy_from_slice(&name_len.to_le_bytes());
+            rec[8..12].copy_from_slice(&7i32.to_le_bytes());
+        }
+        w
+    }
+
+    #[test]
+    fn a_list_past_its_bounds_refuses_before_it_is_read() {
+        let w = window(1, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(read_grant_records(0, 1, read), Ok(vec![("xxxx".into(), 7)]));
+        let reads = std::cell::Cell::new(0);
+        let counted = |o, l| {
+            reads.set(reads.get() + 1);
+            read_slice(&w, o, l)
+        };
+        assert_eq!(
+            read_grant_records(0, 1 << 33, counted),
+            Err(Trap::CapFault),
+            "2^33 records"
+        );
+        assert_eq!(reads.get(), 0, "and nothing was read");
+        let w = window(1, u32::MAX);
+        assert_eq!(
+            read_grant_records(0, 1, |o, l| read_slice(&w, o, l)),
+            Err(Trap::CapFault),
+            "a 4 GiB name"
+        );
+        let w = window(1, MAX_GRANT_NAME as u32);
+        assert!(read_grant_records(0, 1, |o, l| read_slice(&w, o, l)).is_ok());
+        let w = window(MAX_SPAWN_GRANTS as usize, 4);
+        let read = |o, l| read_slice(&w, o, l);
+        assert_eq!(
+            read_grant_records(0, MAX_SPAWN_GRANTS, read).map(|l| l.len()),
+            Ok(MAX_SPAWN_GRANTS as usize)
+        );
     }
 }
 
