@@ -26007,7 +26007,7 @@ impl Host {
     }
 
     /// Whether this domain holds a `Jit` table at all, unit or none.
-    pub(crate) fn has_jit_table(&self) -> bool {
+    pub fn has_jit_table(&self) -> bool {
         !self.jit_tables.is_empty()
     }
 
@@ -29613,6 +29613,7 @@ impl Host {
         usize,
         ShadowArena,
         bool,
+        [u8; 32],
     )> {
         let g = self.resolve_module(handle).ok()?;
         let m = &g.module;
@@ -29628,6 +29629,8 @@ impl Host {
             m.types.len(),
             g.shadow().unwrap_or(ShadowArena::EMPTY),
             g.durable,
+            // temen#2168: what names its code to the JIT's cache of compiled children.
+            g.digest,
         ))
     }
 

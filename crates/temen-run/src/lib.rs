@@ -2475,7 +2475,18 @@ unsafe fn resolve_module_into(
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
+        Some((
+            funcs,
+            n_funcs,
+            memory_log2,
+            data,
+            n_data,
+            types,
+            n_types,
+            shadow,
+            durable,
+            digest,
+        )) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -2486,6 +2497,7 @@ unsafe fn resolve_module_into(
                 n_types,
                 shadow,
                 durable,
+                digest,
             };
             1
         }
@@ -3644,8 +3656,10 @@ unsafe fn finish_child_build(
             // CALLS.md 5c.1b, #2173 — inherit the run's park hub, so the parked transport's waits on
             // this cell (its bell is armed with the cell, `Host::into_cell`) are parks of the run.
             child.set_park_hub(parent.park_hub());
-            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
+            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none),
+            // and whether it holds one at all.
             let jit_table_log2 = child.jit_table_log2();
+            let holds_jit = child.has_jit_table();
             // D66 — the lane chain the executor gates this child's dispatch on: the child's own
             // `(domain, cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child`
             // stamped) under the parent's.
@@ -3659,6 +3673,7 @@ unsafe fn finish_child_build(
                 inst_handle,
                 as_handle,
                 jit_table_log2,
+                holds_jit,
                 grant_handle: 0,
                 domain,
                 lane_cap,
