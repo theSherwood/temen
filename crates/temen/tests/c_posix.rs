@@ -3753,6 +3753,61 @@ fn c_execve_runs_a_shell_pipeline_as_a_command() {
     );
 }
 
+/// #2371 — **a shell builtin's output reaches a core pipe.** The caller pipes (`pipe()` mints a core
+/// pipe, as nim's `osproc.startProcess` does), forks, and its twin points fd 1 at the write end and
+/// execs `/bin/sh -c "echo one; exit 3"`. `echo` is a builtin, so the shell itself writes the pipe,
+/// and the caller reads it to EOF. The shell's shim used to hand the personality's redirect tag back
+/// to `echo` as a failed write, so the caller read nothing.
+#[test]
+fn c_a_shell_builtin_writes_into_a_core_pipe() {
+    let sh = posix_sh();
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_fork(int cap, long a);\n\
+long __px_dup2(int cap, long oldfd, long newfd);\n\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"/bin/sh\", \"-c\", \"echo one; exit 3\", 0 }};\n\
+static int fds[2];\n\
+static int status;\n\
+static char b[64];\n\
+static long pid; static long n; static long r;\n\
+int main(void) {{\n\
+  if (pipe(fds) != 0) return 1;\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, fds[1], 1);\n\
+    close(fds[0]);\n\
+    close(fds[1]);\n\
+    __px_execve(0, (long)\"/bin/sh\", (long)av, 0);\n\
+    return 9;\n\
+  }}\n\
+  close(fds[1]);\n\
+  while ((r = read(fds[0], b + n, 64 - n)) > 0) n = n + r;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 3;\n\
+  write(1, b, n);\n\
+  return 40 + ((status >> 8) & 0xff);\n\
+}}\n"
+    );
+    let stage = |host: &mut Host, posix: &Posix| stage_executable(host, posix, "/bin/sh", &sh);
+    for (driver, e) in [
+        ("tree-walker", run_interp_setup(&src, stage)),
+        ("cooperative", run_bytecode_setup(&src, stage)),
+        ("parallel", run_bytecode_parallel_setup(&src, stage)),
+    ] {
+        assert_eq!(
+            e.result,
+            vec![Value::I32(43)],
+            "{driver}: the shell ran and exited 3"
+        );
+        assert_eq!(
+            e.stdout, b"one\n",
+            "{driver}: the caller read what the shell's `echo` wrote into the pipe"
+        );
+    }
+}
+
 /// A command the POSIX shell runs: prints its one argument, then `P` if its parent is the root
 /// caller (pid 1) or `C` if it is the shell, and exits with the argument's digit. The parent is
 /// what tells exec-in-place (the shell *became* the command) from fork (the shell ran it).

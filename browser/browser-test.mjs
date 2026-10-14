@@ -234,20 +234,6 @@ try {
   checks.push(jitStreamed);
   console.log(`  play/jit-streamed: status=${JSON.stringify(helloC.status)} ${jitStreamed ? 'PASS' : 'FAIL'}`);
 
-  // A real **Nim** program (`web/assets/nim_hello.temen`, gated headlessly by `nim_hello_asset.rs`) —
-  // the full nimony toolchain → temen-leng → nim→powerbox bridge, run in-browser via `temen_run_onramp`.
-  // This is the first real-browser assertion of any nim card: the guest's `write(stdout, "hello, temen\n")`
-  // must land in the stdout pane, returning 0. (Without this, a browser-only break in the run/capture
-  // path is invisible — the headless gate can't see the JS boundary.)
-  const nim = await runPlay('nim (Nim → Temen, runs)');
-  check('nim (Nim → Temen, runs)', nim, '0', 'hello, temen\n');
-  // …and it ran through the **streamed** off-main-thread path (temen_run_onramp_stream on a worker,
-  // stdout teed to the page live) — not the synchronous main-thread fallback. The status chip names the
-  // tier; a fallback would read plain "interpreter".
-  const nimStreamed = nim.status.includes('streamed');
-  checks.push(nimStreamed);
-  console.log(`  play/nim-streamed: status=${JSON.stringify(nim.status)} ${nimStreamed ? 'PASS' : 'FAIL'}`);
-
   // A **warm-snapshot** card (Lua): the eval runs on its snapshot worker over the restored warm image,
   // and now streams stdout live to the pane as it writes (#1142). Type a `print`, Run, and require the
   // output lands. Exercises the warm-eval stdout tee + the worker chunk relay end-to-end.
@@ -276,6 +262,12 @@ try {
     checks.push(gradOk);
     console.log(`  play/gradient-canvas: state=${grad.state} canvas=${JSON.stringify(canvas)} ` +
       `${gradOk ? 'PASS' : 'FAIL'}`);
+    // …and it ran through the **streamed** interpreter path (`runStream` on a worker, the frame and
+    // stdout relayed to the page), not the synchronous main-thread fallback. The status chip names the
+    // tier; a fallback would read plain "interpreter".
+    const gradStreamed = grad.status.includes('streamed');
+    checks.push(gradStreamed);
+    console.log(`  play/interp-streamed: status=${JSON.stringify(grad.status)} ${gradStreamed ? 'PASS' : 'FAIL'}`);
   }
 
   // The reactor run model + `keyboard` capability (Doom slice 2): the bounce guest's exported tick()

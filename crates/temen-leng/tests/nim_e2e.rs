@@ -2997,7 +2997,8 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
 /// evaluation runs the program it built for a `const` and reads its answer, and how it builds that
 /// program in the first place. Unlike `execShellCmd`, the child's stdin, stdout and stderr are
 /// pipes (`startProcess` without `poParentStreams`): the parent reads the child's stdout until EOF
-/// and reaps its exit code.
+/// and reaps its exit code. The second command is the shell's own builtins: the shell itself writes
+/// the pipe, a core pipe, whose redirect tag its shim used to drop as a failed write (#2371).
 #[test]
 fn nim_reads_a_commands_output_through_execcmdex() {
     let Some(path) = toolchain_path() else {
@@ -3014,8 +3015,9 @@ fn nim_reads_a_commands_output_through_execcmdex() {
         &path,
         "import std/syncio\nimport std/osproc\n\
          try:\n\
-         \x20 let (outp, rc) = execCmdEx(\"bin/child hi\")\n\
-         \x20 write(stdout, \"parent:\" & $rc & \"|\" & outp)\n\
+         \x20 for cmd in [\"bin/child hi\", \"echo builtin; exit 4\"]:\n\
+         \x20   let (outp, rc) = execCmdEx(cmd)\n\
+         \x20   write(stdout, \"parent:\" & $rc & \"|\" & outp)\n\
          except ErrorCode as e:\n\
          \x20 write(stdout, \"parent raised:\" & $e)\n",
     );
@@ -3047,8 +3049,8 @@ fn nim_reads_a_commands_output_through_execcmdex() {
         );
         assert_eq!(
             String::from_utf8_lossy(&posix.stdout()),
-            "parent:3|child:hi\n",
-            "{engine:?}: the parent read the child's output and its exit code (stderr: {:?})",
+            "parent:3|child:hi\nparent:4|builtin\n",
+            "{engine:?}: the parent read each command's output and its exit code (stderr: {:?})",
             String::from_utf8_lossy(&posix.stderr())
         );
     }

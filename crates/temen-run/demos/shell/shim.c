@@ -70,10 +70,32 @@ static int __as(void) { if (__h_as < 0) __h_as = __capof(5); return __h_as; }   
 
 static long slen(char *s) { long n = 0; while (s[n]) n = n + 1; return n; }
 
-long write(long fd, void *buf, long n) { return __px_write(__px(), fd, (long)buf, n); }
-long read(long fd, void *buf, long n) { return __px_read(__px(), fd, (long)buf, n); }
+/* #972 tag protocol (the shape of `posix_utils/util.c`): an op that lands on a core pipe end returns
+   PX_TAG_BASE - handle (<= -(1<<20)), and the transfer belongs on that handle, where an empty pipe
+   with writers parks and one with none is EOF. Real errnos stay > -4096 and pass through. A shell
+   whose stdout is the pipe a program's `startProcess` made writes there (#2371). */
+long __vm_read(int h, void *buf, long len);
+long __vm_write(int h, void *buf, long len);
+long __vm_close(int h);
+static long __tag_handle(long r) { return r <= -1048576 ? -(r + 1048576) : -1; }
+long write(long fd, void *buf, long n) {
+  long r = __px_write(__px(), fd, (long)buf, n);
+  long h = __tag_handle(r);
+  return h < 0 ? r : __vm_write((int)h, buf, n);
+}
+long read(long fd, void *buf, long n) {
+  long r = __px_read(__px(), fd, (long)buf, n);
+  long h = __tag_handle(r);
+  return h < 0 ? r : __vm_read((int)h, buf, n);
+}
 long open(char *path, long flags) { return __px_open(__px(), (long)path, slen(path), flags); }
-long close(long fd) { return __px_close(__px(), fd); }
+long close(long fd) {
+  long r = __px_close(__px(), fd);
+  long h = __tag_handle(r);
+  if (h < 0) return r;
+  __vm_close((int)h);
+  return 0;
+}
 long unlink(char *path) { return __px_unlink(__px(), (long)path, slen(path)); }
 char *getcwd(char *buf, long size) { return __px_getcwd(__px(), (long)buf, size) > 0 ? buf : 0; }
 long chdir(char *path) { return __px_chdir(__px(), (long)path, slen(path)); }

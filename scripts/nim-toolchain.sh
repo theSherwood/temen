@@ -39,7 +39,7 @@ N="$W/nimony"
 mkdir -p "$N"
 cp -r "$ROOT/nimony/bin" "$ROOT/nimony/lib" "$ROOT/nimony/src" "$ROOT/nimony/doc" "$N/"
 for p in "$ROOT"/patches/nimony/*.patch; do (cd "$N" && git apply "$p"); done
-cargo build --release -q -p temen-run --example build_nim_hello_temen
+cargo build --release -q -p temen-run --example build_nim_temen
 B=target/release/examples
 
 echo "[toolchain 1/3] the phases, native: nimony builds nifler2, nimsem and hexer"
@@ -59,7 +59,7 @@ for pid in "${pids[@]}"; do wait "$pid"; done
 echo "[toolchain 2/3] the tools, through the POSIX edge, built by those phases"
 # nimsem builds in the tree's own nimcache, which the lane's self-build compares against; the others
 # each get their own, because the builds run at once and would otherwise all write it.
-build() { NIMONY_BIN="$N/bin" "$B/build_nim_hello_temen" --posix --root "$N" "$@"; }
+build() { NIMONY_BIN="$N/bin" "$B/build_nim_temen" --posix --root "$N" "$@"; }
 pids=()
 build src/nimony/nimsem.nim "$W/nimsem.temen" &
 pids+=($!)
