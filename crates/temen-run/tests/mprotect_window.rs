@@ -220,6 +220,77 @@ fn ending_an_alias_leaves_the_region_alone() {
     }
 }
 
+/// Whether the hardware lets this process read the byte at `p`: a `write` from it fails `EFAULT`
+/// where it may not, instead of faulting.
+fn readable(p: *const u8) -> bool {
+    let mut fds = [0; 2];
+    // SAFETY: plain fd calls on a fresh pipe, each checked; the kernel validates `p` itself.
+    unsafe {
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        let n = libc::write(fds[1], p as *const libc::c_void, 1);
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+        n == 1
+    }
+}
+
+/// #2370 — a page op that grants no access changes only what the window holds, in the page map and
+/// in the hardware, so its host work is bounded by that, not by the span it names. Over a 128 GiB
+/// reservation's 2^25 pages, a walk of the span took seconds per op; this one costs microseconds.
+/// Measured in this thread's CPU time, which a loaded machine does not stretch.
+#[test]
+fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
+    let cpu_us = || {
+        // SAFETY: as in `minor_faults`.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) },
+            0
+        );
+        let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+        us(usage.ru_utime) + us(usage.ru_stime)
+    };
+    let page = temen_interp::host_page_size();
+    let (mapped, reserved) = (64u64 << 10, 1u64 << 37);
+    let r = Reservation::new(reserved as usize, mapped as usize);
+    let mut w = MprotectWindow::new(r.base, mapped, reserved);
+    // Two adjacent tail pages and one far up, each holding a value.
+    let held = [mapped, mapped + page, reserved - page];
+    // SAFETY: each offset lies inside the reservation; `readable` only probes it.
+    let hw_readable = |at: u64| readable(unsafe { r.base.add(at as usize) });
+    let fill = |w: &mut MprotectWindow| {
+        for at in held {
+            assert_eq!(w.map(at, page, PROT_RW), 0);
+            assert_eq!(w.write_bytes(at, &[7]), Some(()));
+        }
+    };
+    let read = |w: &mut MprotectWindow, at| {
+        assert_eq!(w.protect(at, page, PROT_R), 0);
+        w.read_bytes(at, 1).map(|b| b[0])
+    };
+    let start = cpu_us();
+    for _ in 0..4 {
+        fill(&mut w);
+        // To no access: the pages keep their contents, which a later `protect` shows.
+        assert_eq!(w.protect(0, reserved, 0), 0);
+        assert!(held.iter().chain(&[0]).all(|&at| !hw_readable(at)));
+        assert_eq!(read(&mut w, held[2]), Some(7));
+        // A `map` to no access and an `unmap` zero them, the declared window's included.
+        assert_eq!(w.map(0, reserved, 0), 0);
+        assert_eq!(read(&mut w, held[0]), Some(0));
+        fill(&mut w);
+        assert_eq!(w.unmap(0, reserved), 0);
+        assert!(held.iter().chain(&[0]).all(|&at| !hw_readable(at)));
+        for at in [0, held[1], held[2]] {
+            assert_eq!(read(&mut w, at), Some(0));
+        }
+        assert_eq!(w.unmap(0, reserved), 0);
+        assert_eq!(w.map(0, mapped, PROT_RW), 0);
+    }
+    let spent = cpu_us() - start;
+    assert!(spent < 500_000, "16 ops took {spent} µs of CPU");
+}
+
 /// What the child below found wrong, one bit per check.
 const WRONG_PROTECT: i32 = 1;
 const WRONG_PROTECT_HOST: i32 = 2;

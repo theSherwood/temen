@@ -19423,6 +19423,38 @@ pub fn window_tail_bytes<S>(
     }
 }
 
+/// #2370 — the runs of `pages`, as `(first, last)` page indices, that a page op leaving them `prot`
+/// can change, on every engine's page map. One that grants access commits every page, and
+/// [`Host::page_op`] charges each first, so the budget bounds that walk. One that grants none
+/// changes only the pages that hold something: each of the declared window's, `[0, mapped)`, mapped
+/// unless its entry says otherwise, and each of the reserved tail's that has an entry. A tail page
+/// without one is unmapped and reads zero already, so the op's host work is bounded by the declared
+/// window and by what the guest holds, however large the span it names.
+pub fn changed_runs<S>(
+    map: &BTreeMap<u64, S>,
+    pages: core::ops::RangeInclusive<u64>,
+    mapped: u64,
+    prot: i32,
+) -> Vec<(u64, u64)> {
+    let (first, last) = pages.into_inner();
+    if prot & (PROT_READ | PROT_WRITE) != 0 {
+        return vec![(first, last)];
+    }
+    let mut runs = Vec::new();
+    if first < mapped {
+        runs.push((first, last.min(mapped - 1)));
+    }
+    if first.max(mapped) <= last {
+        for &page in map.range(first.max(mapped)..=last).map(|(page, _)| page) {
+            match runs.last_mut() {
+                Some((_, end)) if *end + 1 == page => *end = page,
+                _ => runs.push((page, page)),
+            }
+        }
+    }
+    runs
+}
+
 /// #2268 — what decides whether two neighbouring window pages can share one OS mapping where the
 /// window is real hardware (the JIT's): the window's own pages share one when their access matches;
 /// a §13 alias shares one only with the next page of the same region, at the next region offset,
@@ -35341,6 +35373,23 @@ impl Mem {
         );
     }
 
+    /// #2370 — `set` on each page of `pages` that a change to `prot` can alter ([`changed_runs`]),
+    /// in order, under the address-space write lock; the runs it visited.
+    fn change_pages(
+        &self,
+        pages: core::ops::RangeInclusive<u64>,
+        prot: i32,
+        mut set: impl FnMut(&mut BTreeMap<u64, PageProt>, u64),
+    ) -> Vec<(u64, u64)> {
+        let mut space = self.space_write();
+        let mapped = self.window.mapped().div_ceil(self.page);
+        let runs = changed_runs(&space.prot, pages, mapped, prot);
+        for page in runs.iter().flat_map(|&(first, last)| first..=last) {
+            set(&mut space.prot, page);
+        }
+        runs
+    }
+
     /// Set one page's protection from cap `prot` bits: `WRITE` ⇒ read+write, `READ` only ⇒
     /// read-only, neither ⇒ unmapped. A read-write page in the initial prefix is left *absent*
     /// (its default); in the reserved tail it needs an explicit [`PageProt::Rw`] entry, since
@@ -36136,13 +36185,12 @@ impl GuestMem for Mem {
         {
             return ENOMEM;
         }
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, prot, false);
-            }
+        let runs = self.change_pages(pages, prot, |map, page| {
+            self.set_prot(map, page, prot, false)
+        });
+        for (first, last) in runs {
+            self.zero_pages(first..=last); // commit ⇒ fresh zeroed pages
         }
-        self.zero_pages(pages); // commit ⇒ fresh zeroed pages
         0
     }
 
@@ -36152,13 +36200,10 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        {
-            let mut space = self.space_write();
-            for page in pages.clone() {
-                self.set_prot(&mut space.prot, page, 0, false);
-            }
+        let runs = self.change_pages(pages, 0, |map, page| self.set_prot(map, page, 0, false));
+        for (first, last) in runs {
+            self.zero_pages(first..=last);
         }
-        self.zero_pages(pages);
         0
     }
 
@@ -36206,16 +36251,15 @@ impl GuestMem for Mem {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let mut space = self.space_write();
-        for page in pages {
+        self.change_pages(pages, prot, |map, page| {
             if let Some(PageProt::Backed {
                 region, region_off, ..
-            }) = space.prot.get(&page).copied()
+            }) = map.get(&page).copied()
             {
                 if prot & (PROT_READ | PROT_WRITE) == 0 {
-                    self.set_prot(&mut space.prot, page, 0, false); // the region's, not kept
+                    self.set_prot(map, page, 0, false); // the region's, not kept
                 } else {
-                    space.prot.insert(
+                    map.insert(
                         page,
                         PageProt::Backed {
                             region,
@@ -36225,9 +36269,9 @@ impl GuestMem for Mem {
                     );
                 }
             } else {
-                self.set_prot(&mut space.prot, page, prot, true);
+                self.set_prot(map, page, prot, true);
             }
-        }
+        });
         0
     }
 
@@ -39031,6 +39075,74 @@ mod prot_tests {
         assert_eq!(m.map(0, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    /// #2370 — the runs an op can change: the whole span when it grants access, else the declared
+    /// window's part of it and the tail pages with an entry, adjacent ones joined.
+    #[test]
+    fn changed_runs_are_the_span_or_what_it_holds() {
+        let map: BTreeMap<u64, PageProt> = [
+            (2, PageProt::Unmapped),
+            (16, PageProt::Rw),
+            (17, PageProt::Ro),
+            (20, PageProt::Unmapped),
+            (99, PageProt::Rw),
+        ]
+        .into_iter()
+        .collect();
+        let runs = |pages, prot| changed_runs(&map, pages, 16, prot);
+        assert_eq!(runs(0..=1 << 40, PROT_READ), [(0, 1 << 40)]);
+        assert_eq!(runs(0..=1 << 40, 0), [(0, 17), (20, 20), (99, 99)]);
+        assert_eq!(runs(3..=98, 0), [(3, 17), (20, 20)]);
+        assert_eq!(runs(18..=19, 0), []);
+        assert_eq!(runs(21..=1 << 40, 0), [(99, 99)]);
+    }
+
+    /// #2370 — a page op that grants no access changes only what the window holds, so its host work
+    /// is bounded by that, not by the span it names. Over a 128 GiB reservation's 2^25 pages, a walk
+    /// of the span took seconds per op; this one costs microseconds. Measured in this thread's CPU
+    /// time, which a loaded machine does not stretch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
+        let cpu_ns = || -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+            stat.split(' ').next().unwrap().parse().unwrap()
+        };
+        let (p, mapped, reserved) = (page(), 1u64 << 16, 1u64 << 37);
+        let mut m = Mem::with_reservation(37, 16, None);
+        // Two adjacent tail pages and one far up, each holding a value.
+        let held = [mapped, mapped + p, reserved - p];
+        let fill = |m: &mut Mem| {
+            for at in held {
+                assert_eq!(m.map(at, p, PROT_READ | PROT_WRITE), 0);
+                assert!(m.store(at, 0, StoreOp::I64, Value::I64(7)).is_ok());
+            }
+        };
+        let read = |m: &mut Mem, at| {
+            assert_eq!(m.protect(at, p, PROT_READ), 0);
+            m.load(at, 0, LoadOp::I64)
+        };
+        let start = cpu_ns();
+        for _ in 0..4 {
+            fill(&mut m);
+            // To no access: the pages keep their contents, which a later `protect` shows.
+            assert_eq!(m.protect(0, reserved, 0), 0);
+            assert_eq!(m.load(0, 0, LoadOp::I64), Err(Trap::MemoryFault));
+            assert_eq!(read(&mut m, held[2]), Ok(Value::I64(7)));
+            // A `map` to no access and an `unmap` zero them, the declared window's included.
+            assert_eq!(m.map(0, reserved, 0), 0);
+            assert_eq!(read(&mut m, held[0]), Ok(Value::I64(0)));
+            fill(&mut m);
+            assert_eq!(m.unmap(0, reserved), 0);
+            for at in [0, held[1], held[2]] {
+                assert_eq!(read(&mut m, at), Ok(Value::I64(0)));
+            }
+            assert_eq!(m.unmap(0, reserved), 0);
+            assert_eq!(m.map(0, mapped, PROT_READ | PROT_WRITE), 0);
+        }
+        let spent = cpu_ns() - start;
+        assert!(spent < 500_000_000, "16 ops took {spent} ns of CPU");
     }
 
     /// §12 shared synchronized address space: a forked vCPU view (`thread.spawn`) sees `map`/`unmap`
