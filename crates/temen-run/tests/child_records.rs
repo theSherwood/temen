@@ -174,7 +174,7 @@ block 2 (vended: i32) {{
 {rec}",
         module_at = 17408 + rec::MODULE_AT,
         budget_at = 17408 + rec::BUDGET_AT,
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 

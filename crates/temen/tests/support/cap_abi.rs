@@ -71,7 +71,7 @@ const CAPS: [u32; 15] = [
     cap_id::INSTANTIATOR,  // 3
     cap_id::ADDRESS_SPACE, // 4
     cap_id::BUDGET,        // 5
-    cap_id::MODULE,        // 6 the program itself
+    cap_id::MODULE,        // 6 the program's child image
     cap_id::MODULE_LOADER, // 7
     cap_id::CLOCK,         // 8
     cap_id::SHARED_REGION, // 9
@@ -408,7 +408,9 @@ fn powerbox(m: &temen_ir::Module) -> (Host, Vec<Value>) {
         h.grant_instantiator(0, WINDOW as u64),
         h.grant_address_space(0, WINDOW as u64),
         h.grant_budget(FUEL as i64, 4 << 20, 4),
-        h.grant_module(m),
+        // #2219: a spawn starts at its module's function 0, so the program is granted as the child
+        // image of its child entry, function 1.
+        h.grant_module(&temen_ir::child_image_at(m, 1).expect("function 1 is a child entry")),
         h.grant_module_loader(),
         h.grant_clock(),
         h.grant_shared_region(1 << 16),

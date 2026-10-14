@@ -265,7 +265,7 @@ static long spawn_child(long mod, int *rec, long gn, int argc, char **argv) {
   int *w = (int *)spawn_rec_buf;
   long *q = (long *)spawn_rec_buf;
   w[0] = 1;                                  /* @0  version 1: detached */
-  w[1] = 0;                                  /* @4  entry 0 */
+  w[1] = 0;                                  /* @4  reserved, 0 */
   q[1] = 0;                                  /* @8  offset: reserved, 0 */
   w[4] = 0;                                  /* @16 size_log2 0 = the command's declared window */
   w[5] = -1;                                 /* @20 no pager */

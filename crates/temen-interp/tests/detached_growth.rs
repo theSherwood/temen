@@ -96,7 +96,7 @@ block 0 (vinst: i64, vas64: i64) {{
         c2 = op("r2", commit, 2),
         r3 = op("r3", release, 1),
         c4 = op("r4", commit, 2),
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 

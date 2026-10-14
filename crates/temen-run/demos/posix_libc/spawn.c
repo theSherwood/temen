@@ -14,7 +14,7 @@
  *
  * Record contract (little-endian, window-relative pointers; fails closed on any other layout) — the
  * v1 **detached** record (#1863): the child gets a window of its own, funded by a `Budget`:
- *   { version: u32 = 1, entry: u32 = 0, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
+ *   { version: u32 = 1, reserved: u32 = 0, off: u64 = 0 (reserved), size_log2: u32, pager: u32 = MAX,
  *     module: i32 (a granted Module), budget: i32 (Budget handle), quota: i64,
  *     grants_ptr: u64, grants_n: u64, args_ptr: u64, args_len: u64,
  *     region: i32 = -1 (none), reserved: u32 = 0, child_off: u64 = 0 }
@@ -92,7 +92,7 @@ static inline long vm_spawn(long module, long size_log2, vm_grant *grants, long 
   int *w = (int *)scratch;
   long *q = (long *)scratch;
   w[0] = 1;                /* version: the detached record */
-  w[1] = 0;                /* @4 entry: the child's function 0 */
+  w[1] = 0;                /* @4 reserved: a child starts at its function 0 */
   q[1] = 0;                /* @8 off: reserved */
   w[4] = (int)size_log2;   /* @16 */
   w[5] = -1;               /* @20 pager: u32::MAX = none */

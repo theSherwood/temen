@@ -335,11 +335,11 @@ block 0 (v0: i32, vbud: i32) {
   vcn = i64.const 16384
   vcl = i64.const 5
   vchild = self.resolve vcn vcl         ; this program's child image, by name
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
   ; Everything else — offset, quota, grants, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
@@ -456,11 +456,11 @@ block 0 () {
   i32.store vg1 vln
   vg2 = i64.const 17544
   i32.store vg2 vout
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
   ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
@@ -4708,7 +4708,7 @@ async function startDebug(c) {
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
   // output streams back as `output` events instead of trapping; so does an `onramp`-recipe Temen card,
-  // which resolves its powerbox by name (`instantiator`/`module`/`budget`, #1528) exactly as its Run
+  // which resolves its powerbox by name (`instantiator`/`budget`/`child`, #1528) exactly as its Run
   // does. Every other hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
   if (c.ex.kind === 'chibicc' || c.ex.mode === 'onramp') launchArgs.powerbox = 'onramp';
@@ -4859,7 +4859,7 @@ async function runText(c) {
 
   // The `onramp` recipe: the same single-threaded host the pre-built C/C++ cards run on
   // (`temen_run_onramp`) — a `_start` that resolves its powerbox **by name** (`self.resolve`), the
-  // named `instantiator`/`module`/`budget` grants a detached spawn needs, and a stdout pane. No
+  // named `instantiator`/`budget`/`child` grants a detached spawn needs, and a stdout pane. No
   // Workers: a pre-mapped SharedRegion aliases the parent's pages into the child's window, which
   // has no analogue across separate `WebAssembly.Memory`s (the par driver refuses it, by design).
   if (mode === 'onramp') {

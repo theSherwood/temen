@@ -37,7 +37,7 @@ fn granted_client_program(guest: &str) -> String {
     let guest_rec = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "\
@@ -104,7 +104,7 @@ block 0 (v0: i64) {{
   }}
 }}
 ",
-        server_rec = rec::segment(17408, &SpawnRec::v1(0)),
+        server_rec = rec::segment(17408, &SpawnRec::v1()),
         guest_rec = rec::segment(17504, &guest_rec),
         fork_grant = rec::grant("gf", 16640, 16684, 4, "voff"),
     )
@@ -333,7 +333,7 @@ block 3 (vnok: i64) {{
 {record}"#,
         module_at = rec::MODULE_AT,
         budget_at = rec::BUDGET_AT,
-        record = rec::segment(17408, &SpawnRec::v1(0)),
+        record = rec::segment(17408, &SpawnRec::v1()),
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
@@ -407,7 +407,7 @@ fn serve_live_program(handle: i32, positional: bool) -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let spawn = if positional {
         "vb64 = i64.extend_i32_s vb
@@ -1147,7 +1147,7 @@ fn three_generations(child_ceiling: i64) -> String {
     let r1 = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "memory 17
@@ -1226,7 +1226,7 @@ block 0 (va: i64) {{
 }}
 ",
         r1 = rec::segment(17408, &r1),
-        r2 = rec::segment(17504, &SpawnRec::v1(0)),
+        r2 = rec::segment(17504, &SpawnRec::v1()),
         grandchild_grant = rec::grant("g", 16640, 16456, 10, "vc2"),
     )
 }
@@ -1321,7 +1321,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 
@@ -1397,7 +1397,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 

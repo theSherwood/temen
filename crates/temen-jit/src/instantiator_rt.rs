@@ -16,19 +16,7 @@
 use crate::{CapThunk, TrapKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry};
-
-/// #1726 — the program an **installed §22 unit** runs, kept alive by the `CompiledModule` that
-/// defined it, so the unit's `Instantiator` call sites can bake its address as `self_prog`. A
-/// same-module (**self**) child spawned from unit code runs the *unit's* functions — the spawning
-/// frame's module, as on both interpreters — not module 0's. `self_prog == 0` names the nursery's own
-/// program (module 0), which is every call site outside a unit.
-pub(crate) struct UnitProg {
-    /// The unit's `(table, unit)` on its host ([`crate::unit_ref`]), which the host callbacks resolve
-    /// a detached self-spawn from the unit against (#2143); [`crate::NO_UNIT`] for a unit no host
-    /// names.
-    pub(crate) unit: i64,
-}
+use temen_ir::{Data, Func, SpawnRec, TypeEntry};
 
 /// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
 use temen_ir::errno::EINVAL;
@@ -96,8 +84,7 @@ pub(crate) struct DurableCell {
     pub(crate) capture: Mutex<Option<crate::DetachedCapture>>,
     /// The child module's shadow arena: its context-0 region is where the child spills.
     pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
-    /// What the spawn knew that a thaw needs: the entry and the window geometry.
-    pub(crate) entry: u32,
+    /// What the spawn knew that a thaw needs: the window geometry.
     pub(crate) mapped_log2: u8,
     pub(crate) reserved_log2: u8,
     /// #1854 — how far the child grew its window, asked of its own powerbox (`(hook, child ctx)`),
@@ -108,7 +95,6 @@ pub(crate) struct DurableCell {
 impl DurableCell {
     pub(crate) fn new(
         shadow: temen_ir::durable_abi::ShadowArena,
-        entry: u32,
         mapped_log2: u8,
         reserved_log2: u8,
         high_water: Option<(crate::HighWater, usize)>,
@@ -117,7 +103,6 @@ impl DurableCell {
             base: Mutex::new(0),
             capture: Mutex::new(None),
             shadow,
-            entry,
             mapped_log2,
             reserved_log2,
             high_water,
@@ -473,9 +458,9 @@ pub(crate) struct Nursery {
     /// op-13 separate-module children pass their own — a later slice). Computed from
     /// `m.impl_exports` at construction.
     pub(crate) serve_handlers: Box<[u32]>,
-    /// The module's own program, which a self child of its own code runs: empty when the module
-    /// names no `Instantiator`, as a nursery stood up for §22 units alone (#2312), whose self
-    /// children run their unit's program ([`UnitProg`]).
+    /// The module's own program, which a thaw re-runs a frozen §14 carve child in over its carve
+    /// ([`Nursery::funcs`]): empty when the module names no `Instantiator`, as a nursery stood up for
+    /// §22 units alone (#2312).
     funcs: std::sync::Arc<[Func]>,
     /// #922 — the parent module's type section, threaded into every same-module child compile so
     /// the child's interned `call.dyn` type indices resolve (a separate-module child resolves
@@ -1120,7 +1105,6 @@ impl Nursery {
             if c.delivered {
                 out.push(crate::DetachedHarvest {
                     slot,
-                    entry: 0,
                     mapped_log2: 0,
                     reserved_log2: 0,
                     powerbox: core::ptr::null_mut(),
@@ -1135,7 +1119,6 @@ impl Nursery {
             };
             out.push(crate::DetachedHarvest {
                 slot,
-                entry: d.entry,
                 mapped_log2: d.mapped_log2,
                 reserved_log2: d.reserved_log2,
                 powerbox: std::mem::take(&mut c.retained) as *mut core::ffi::c_void,
@@ -1183,7 +1166,6 @@ impl Nursery {
         };
         let crate::CapturedSeed {
             slot,
-            entry,
             mapped_log2,
             reserved_log2,
             funcs,
@@ -1226,7 +1208,7 @@ impl Nursery {
         let Ok(code) = crate::compile_child_windowed(&crate::ChildCompile {
             funcs: &funcs,
             types: &types,
-            entry: entry as FuncIdx,
+            entry: 0,
             mapped_log2,
             reserved_log2,
             thunk: child_thunk,
@@ -1241,8 +1223,8 @@ impl Nursery {
             release(gc.retained_ctx);
             return false;
         };
-        let n_args = funcs.get(entry as usize).map_or(1, |f| f.params.len());
-        let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
+        let n_args = funcs.first().map_or(1, |f| f.params.len());
+        let n_results = funcs.first().map_or(1, |f| f.results.len());
         let code = std::sync::Arc::new(code);
         register_serve(self, gc.ctx, &code);
         let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap, window, child_fuel);
@@ -1288,7 +1270,6 @@ impl Nursery {
             Some(slot),
             Some(DurableCell::new(
                 shadow,
-                entry,
                 mapped_log2,
                 reserved_log2,
                 self.child_high_water(gc.retained_ctx),
@@ -1320,17 +1301,13 @@ impl Nursery {
             .clone()
     }
 
-    /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) — including
-    /// `SELF_MODULE` (`-1`), which the host resolves to the spawning code's program *with* its data
-    /// segments and declared memory: the running module's, or from an installed unit's code (`unit`,
-    /// [`crate::unit_ref`]) the unit's (#2143). A detached child needs those (its window is fresh),
-    /// where a carve child of `-1` runs over the parent's bytes and takes only
-    /// [`Self::self_program`] (#1863).
+    /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) to the granted
+    /// module's program, data segments and declared memory, which a detached child's fresh window
+    /// needs.
     #[allow(clippy::type_complexity)]
     unsafe fn resolve_granted(
         &self,
         module: i64,
-        unit: i64,
         trap_out: *mut i64,
     ) -> Option<(
         &[Func],
@@ -1345,7 +1322,7 @@ impl Nursery {
             return None;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
-        if resolver(self.cap_ctx, module as i32, unit, &mut rm) == 0 || rm.n_funcs == 0 {
+        if resolver(self.cap_ctx, module as i32, &mut rm) == 0 || rm.n_funcs == 0 {
             *trap_out = TrapKind::CapFault as i64;
             return None;
         }
@@ -1372,14 +1349,13 @@ impl Nursery {
     }
 
     /// #1501 — whether the module a detached spawn names is attested **freezable** (instrumented): the
-    /// other half of what a durable domain may spawn. `-1` asks the host too, which attests neither the
-    /// running module's grant nor a unit's, so a durable domain refuses it, as on the oracle.
-    unsafe fn child_module_durable(&self, module: i64, unit: i64) -> bool {
+    /// other half of what a durable domain may spawn.
+    unsafe fn child_module_durable(&self, module: i64) -> bool {
         let Some(resolver) = self.resolve_module else {
             return false;
         };
         let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
-        resolver(self.cap_ctx, module as i32, unit, &mut rm) != 0 && rm.durable
+        resolver(self.cap_ctx, module as i32, &mut rm) != 0 && rm.durable
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
@@ -1423,7 +1399,8 @@ fn temen_ir_iface_instantiator() -> u32 {
 /// is op 15 as data (#1863), so there is exactly one spawn implementation on this tier too. Field
 /// handling mirrors the tree-walker's op-17 arm:
 ///
-/// - a version other than 1, or a nonzero reserved field → `CapFault` (fail closed).
+/// - a version other than 1, or a nonzero reserved field (the word at 4 was the entry, #2219) →
+///   `CapFault` (fail closed).
 /// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
 ///   **with** impl exports to the oracle, so a natively-running module has none — and the
 ///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
@@ -1433,7 +1410,6 @@ fn temen_ir_iface_instantiator() -> u32 {
 /// vCPU's thread with the run's live nursery, window base/size, and a writable `trap_out`.
 pub(crate) unsafe extern "C" fn instantiate_rec(
     rt: *const Nursery,
-    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -1470,7 +1446,6 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
     }
     instantiate_detached(
         rt,
-        self_prog,
         mem_base,
         mem_size,
         handle,
@@ -1478,7 +1453,7 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         sr.modh as i64,
         sr.grants_ptr as i64,
         sr.grants_n as i64,
-        sr.entry as i64,
+        0, // the record's reserved word at 4 (#2219)
         sr.size_log2,
         sr.quota,
         sr.args.0 as i64,
@@ -1527,9 +1502,8 @@ unsafe fn spawn_detached_child(
     // #2001 — that node, which the child's threads are charged to.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #1361 step 4 — `Some(arena)` for a durable parent's child: its window starts as a durable one
-    // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
+    // (context 0's shadow-SP word at its frame base) and carries a freeze cell.
     durable: Option<temen_ir::durable_abi::ShadowArena>,
-    entry: u32,
     // #1760, #2010 — the spawner's window, whose freeze word a durable child's follows: one spawned
     // by a parent already unwinding for a freeze starts `UNWINDING` (see [`init_durable_words`]),
     // and one a freeze's ring missed while it was being filed is rung once it is.
@@ -1600,7 +1574,6 @@ unsafe fn spawn_detached_child(
         durable.map(|a| {
             DurableCell::new(
                 a,
-                entry,
                 mapped_log2,
                 reserved_log2,
                 rt.child_high_water(gc.retained_ctx),
@@ -1678,12 +1651,10 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 ///
 /// # Safety
 /// `rt`/`mem_base`/`mem_size`/`trap_out` are the instance's nursery, live parent window base,
-/// **reserved** span, and run trap cell, valid for the call; a nonzero `self_prog` is a live
-/// [`UnitProg`] ([`Nursery::self_program`]).
+/// **reserved** span, and run trap cell, valid for the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(
     rt: *const Nursery,
-    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -1702,8 +1673,9 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
 ) -> i32 {
     let rt = &*rt;
     // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
-    // other value fails closed, checked first as the tree-walker's op-15 arm does.
-    if fuel != 0 {
+    // other value fails closed, checked first as the tree-walker's op-15 arm does. #2219 — so is
+    // `entry`: a child starts at its module's function 0, the module's child bootstrap.
+    if fuel != 0 || entry != 0 {
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
@@ -1733,36 +1705,22 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     if rt.resolve(mem_base, handle, trap_out).is_none() {
         return 0;
     }
-    // The installed unit the spawning code is, if any: from it, `module = -1` names the unit's own
-    // program (#2143). One no host names cannot spawn that program.
-    let unit = if self_prog == 0 {
-        crate::NO_UNIT
-    } else {
-        (*(self_prog as *const UnitProg)).unit
-    };
-    if module < 0 && self_prog != 0 && unit == crate::NO_UNIT {
-        *trap_out = TrapKind::CapFault as i64;
-        return 0;
-    }
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow, digest)) =
-        rt.resolve_granted(module, unit, trap_out)
+        rt.resolve_granted(module, trap_out)
     else {
         return 0;
     };
-    let entry = entry as u64;
     let size_log2 = temen_ir::detached_size_log2(size_log2, mod_mem.map(|m| m as u8));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
     } else {
         0
     };
-    let arity = child_funcs
-        .get(entry as usize)
-        .map_or(0, |f| f.params.len());
+    let arity = child_funcs.first().map_or(0, |f| f.params.len());
     // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
     // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
     let ok_entry = child_funcs
-        .get(entry as usize)
+        .first()
         .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // §14 transparency: the detached window equals the module's declared memory (the interpreter's
     // op-15 `mod_ok`); it grows into its own reservation, so no superset room is needed.
@@ -1788,7 +1746,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         Vec::new()
     };
     let durable_ok = !durable
-        || (rt.child_module_durable(module, unit)
+        || (rt.child_module_durable(module)
             && child_shadow != temen_ir::durable_abi::ShadowArena::EMPTY);
     if !ok_entry
         || child_size == 0
@@ -1871,7 +1829,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.grant_ctx(), gc.ctx, module, unit) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             undo_admission(rt, lease, lane);
@@ -1902,7 +1860,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     let cc = crate::ChildCompile {
         funcs: child_funcs,
         types: child_types,
-        entry: entry as FuncIdx,
+        entry: 0,
         mapped_log2: size_log2 as u8,
         reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
         thunk: child_thunk,
@@ -1937,7 +1895,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     };
     let args: Vec<i64> =
         temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
-    let n_results = child_funcs[entry as usize].results.len();
+    let n_results = child_funcs[0].results.len();
     // The window image: the module's data segments, then the payload at the args base.
     let mut seeds: Vec<Seed> = child_data
         .iter()
@@ -1970,7 +1928,6 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         child_fuel,
         node,
         durable.then_some(child_shadow),
-        entry as u32,
         mem_base,
         kid,
     )

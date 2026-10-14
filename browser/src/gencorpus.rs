@@ -501,7 +501,7 @@ fn nested_guest(
         size_log2,
         grants_ptr: 16448,
         grants_n: u64::from(grandchild),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vchild", "vbud");
     let join = if join {
@@ -551,7 +551,7 @@ fn child_isolated() -> String {
 // granted it as `"grandchild"`, returns 77, propagated up through two joins.
 fn child_depth2() -> String {
     let (seg, stores) =
-        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(0), "vgc", "vb");
+        temen_browser::plan::spawn_rec_ir(17504, &temen_ir::SpawnRec::v1(), "vgc", "vb");
     nested_guest(
         17,
         0,
@@ -1326,7 +1326,7 @@ fn inst_detached_root(n: u64, grant_unit: bool) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 16464,
         grants_n: u64::from(grant_unit),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vmod0", "vbud0");
     // The grant record at 16464 names the module `"unit"`.
@@ -1406,7 +1406,7 @@ block 7 () {{
 fn inst_nested_detached_unit() -> String {
     let rec = temen_ir::SpawnRec {
         args: (24576, 8),
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "vu", "vb");
     format!(

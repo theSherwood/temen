@@ -221,7 +221,7 @@ block 0 (va: i64, vb: i64) {
 
 /// [`CALLER_PARKING`] with its spawn record.
 fn caller_parking() -> String {
-    format!("{CALLER_PARKING}{}", rec::segment(17536, &SpawnRec::v1(0)))
+    format!("{CALLER_PARKING}{}", rec::segment(17536, &SpawnRec::v1()))
 }
 
 /// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
@@ -276,7 +276,7 @@ block 0 (va: i64, vb: i64) {
 
 /// [`SLOT_CALLER`] with its spawn record.
 fn slot_caller() -> String {
-    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1(0)))
+    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1()))
 }
 
 #[test]
@@ -381,7 +381,7 @@ block 0 (va: i64, vb: i64) {
 fn separate_module_bad_export() -> String {
     format!(
         "{SEPARATE_MODULE_BAD_EXPORT}{}",
-        rec::segment(17408, &SpawnRec::v1(0))
+        rec::segment(17408, &SpawnRec::v1())
     )
 }
 
@@ -494,11 +494,11 @@ fn sibling_as_service() -> String {
     let b = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{SIBLING_AS_SERVICE}{}{}",
-        rec::segment(17664, &SpawnRec::v1(0)),
+        rec::segment(17664, &SpawnRec::v1()),
         rec::segment(17760, &b)
     )
 }

@@ -784,32 +784,11 @@ pub struct ResolvedModule {
 /// be reachable from a guest-issued `call.cap` (the generic dispatch on a Module handle is an inert
 /// `CapFault`) — only the host-side nesting runtime calls this.
 ///
-/// `unit` is the installed §22 unit the spawning code runs ([`unit_ref`]), or [`NO_UNIT`]: from a
-/// unit, `handle = -1` names the unit's own program, not the domain's (#2143).
-///
 /// # Safety
 /// `ctx` is the same host pointer as the run's `cap_ctx`; `out` points at a writable
 /// [`ResolvedModule`]. The filled views must outlive the run (see [`ResolvedModule`]).
-pub type ModuleResolver = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    handle: i32,
-    unit: i64,
-    out: *mut ResolvedModule,
-) -> i32;
-
-/// No installed unit: the spawning code is the domain's own program (or a unit no host names).
-pub const NO_UNIT: i64 = -1;
-
-/// An installed §22 unit as the host callbacks carry it: its `(table, unit)` on the host
-/// ([`CompiledModule::define_extra`]) packed into one word, or [`NO_UNIT`].
-pub fn unit_ref(unit: Option<(u32, u32)>) -> i64 {
-    unit.map_or(NO_UNIT, |(t, u)| ((t as i64) << 32) | u as i64)
-}
-
-/// The `(table, unit)` a [`unit_ref`] word names, `None` for [`NO_UNIT`].
-pub fn unit_of(r: i64) -> Option<(u32, u32)> {
-    (r >= 0).then_some(((r >> 32) as u32, r as u32))
-}
+pub type ModuleResolver =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, handle: i32, out: *mut ResolvedModule) -> i32;
 
 /// A §14 **granted child** powerbox built host-side (PROCESS.md S2 JIT parity): an opaque child
 /// `Host` (`ctx`) holding an `Instantiator` + `AddressSpace` over the child's own window and the
@@ -1101,13 +1080,12 @@ pub type ChildGrant = unsafe extern "C" fn(
 /// Bind a child module's import manifest against its built powerbox host — see
 /// [`GrantChildHooks::bind_imports`]. Returns `0` on success, nonzero when a `required` import
 /// had nothing to bind (IMPORTS.md §3.3 withhold) — the spawn then fails closed with `-EINVAL`
-/// before any child code runs, matching the interpreter's inline spawn. `module` and `unit` name the
-/// child's program as for a [`ModuleResolver`].
+/// before any child code runs, matching the interpreter's inline spawn. `module` names the child's
+/// program, as for a [`ModuleResolver`].
 pub type ChildManifestBinder = unsafe extern "C" fn(
     parent_ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,
     module: i64,
-    unit: i64,
 ) -> i32;
 
 /// The default thunk for [`compile_and_run`] (no host): an empty powerbox, so every
@@ -1903,15 +1881,12 @@ pub struct DurableResidue {
 pub struct DetachedHarvest {
     /// The parent's join slot for it.
     pub slot: usize,
-    /// Its entry function in its own module.
-    pub entry: u32,
     /// Its window geometry.
     pub mapped_log2: u8,
     pub reserved_log2: u8,
     /// Its powerbox: the nursery's retained ref ([`GrantChild::retained_ctx`]) — one counted ref to
     /// the child `Host`, which the embedder now owns and must release. Null for a child a thaw
-    /// delivered as completed (#2044): its `outcome` is all there is, and `entry` and the geometry
-    /// are unused.
+    /// delivered as completed (#2044): its `outcome` is all there is, and the geometry is unused.
     pub powerbox: *mut core::ffi::c_void,
     /// What it left, **iff** it unwound for the freeze.
     pub capture: Option<DetachedCapture>,
@@ -1945,7 +1920,6 @@ pub enum DetachedSeed {
 /// #1361 step 4 — what a captured detached child's re-launch needs.
 pub struct CapturedSeed {
     pub slot: usize,
-    pub entry: u32,
     pub mapped_log2: u8,
     pub reserved_log2: u8,
     /// Its own program, resolved by the embedder from the module digest the artifact names.
@@ -2971,14 +2945,6 @@ pub struct CompiledModule {
     /// Kept alive because the instance names it ([`VmCtx::nursery`]) for its `Instantiator` sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
-    /// #1726 — the programs of installed §22 units that spawn same-module children: each one's
-    /// address is baked into that unit's `Instantiator` sites as `self_prog`, so it lives as long as
-    /// the code does. Declared after `_nursery`, so it outlives the nursery that resolves it.
-    // The `Box` is the point: each program's address is baked into code, so it must not move when
-    // this `Vec` reallocates.
-    #[cfg(fiber_rt)]
-    #[allow(clippy::vec_box)]
-    _unit_progs: Vec<Box<instantiator_rt::UnitProg>>,
     /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
     /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
     #[cfg(setjmp_rt)]
@@ -4071,8 +4037,6 @@ impl CompiledModule {
             domain,
             #[cfg(fiber_rt)]
             _nursery: nursery,
-            #[cfg(fiber_rt)]
-            _unit_progs: Vec::new(),
             #[cfg(setjmp_rt)]
             _setjmp_rt: setjmp_runtime,
             #[cfg(fiber_rt)]
@@ -4299,8 +4263,6 @@ impl CompiledModule {
             domain,
             #[cfg(fiber_rt)]
             _nursery: None,
-            #[cfg(fiber_rt)]
-            _unit_progs: Vec::new(),
             #[cfg(setjmp_rt)]
             _setjmp_rt: None,
             #[cfg(fiber_rt)]
@@ -5259,15 +5221,10 @@ impl CompiledModule {
     /// Functions using §12 fibers/threads are rejected (`Unsupported`) — the MVP restricts
     /// incremental definition to single-threaded code (DESIGN.md §22 "Concurrency"), and lowering
     /// `cont.*`/`thread.*` here would need per-unit runtime wiring this slice doesn't do.
-    ///
-    /// `unit` is the unit's `(table, unit)` on its host, which the host callbacks resolve a detached
-    /// self-spawn from the unit's code against (#2143); `None` for a unit no host names, which then
-    /// cannot spawn its own program detached.
     pub fn define_extra(
         &mut self,
         funcs: &[Func],
         types: &[temen_ir::TypeEntry],
-        unit: Option<(u32, u32)>,
     ) -> Result<Vec<DefinedFn>, JitError> {
         if funcs.is_empty() {
             return Ok(Vec::new());
@@ -5345,26 +5302,7 @@ impl CompiledModule {
             None
         };
 
-        // #1726: a unit's same-module (self) child runs the unit's OWN program — the spawning frame's
-        // module, as on both interpreters — so its `Instantiator` sites carry the address of a copy
-        // of that program, kept alive by `_unit_progs`, as `self_prog`. Without this a self child
-        // spawned from unit code ran module 0's function of the same index.
-        #[cfg(fiber_rt)]
-        let inst = if self.inst.is_active() && funcs_use_instantiator(funcs) {
-            let prog = Box::new(instantiator_rt::UnitProg {
-                unit: unit_ref(unit),
-            });
-            let self_prog = &*prog as *const instantiator_rt::UnitProg as i64;
-            self._unit_progs.push(prog);
-            InstEnv {
-                self_prog,
-                ..self.inst
-            }
-        } else {
-            self.inst
-        };
-        #[cfg(not(fiber_rt))]
-        let (inst, _) = (self.inst, unit);
+        let inst = self.inst;
         let mut ctx = module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
             build_clif(
@@ -6713,7 +6651,6 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         fiber_rt: None,
         domain: None,
         _nursery: None,
-        _unit_progs: Vec::new(),
         #[cfg(setjmp_rt)]
         _setjmp_rt: None,
         call_tramp,
@@ -7254,10 +7191,6 @@ struct InstEnv {
     // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
     // `Budget`; argv rides as the optional spawn-time payload.
     instantiate_detached_thunk: i64,
-    /// #1726 — the program a **self** child of this code runs: `0` for the module's own program
-    /// (module 0), or the address of an installed §22 unit's `instantiator_rt::UnitProg` when this
-    /// env lowers that unit (`define_extra`). Passed to every spawn thunk as `self_prog`.
-    self_prog: i64,
 }
 
 impl InstEnv {
@@ -7272,7 +7205,6 @@ impl InstEnv {
             child_offer_thunk: 0,
             child_grant_thunk: 0,
             instantiate_detached_thunk: 0,
-            self_prog: 0,
         }
     }
     /// The env that lowers a compile's `Instantiator` calls to its instance's nursery, for code of
@@ -7292,7 +7224,6 @@ impl InstEnv {
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
             child_grant_thunk: instantiator_rt::child_grant as *const () as i64,
             instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
-            self_prog: 0, // the module's own program (#1726)
         }
     }
 
@@ -10269,8 +10200,6 @@ fn lower_instantiator(
     }
     // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
     let nursery = vmctx_load(b, lower, vmctx::NURSERY);
-    // #1726: which program a self child of this code runs (0 = module 0; else this unit's).
-    let self_prog = b.ins().iconst(I64, lower.inst.self_prog);
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.vmctx_var);
     match op {
@@ -10344,7 +10273,7 @@ fn lower_instantiator(
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I64, I32, I64, I64] {
+            for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -10353,9 +10282,7 @@ fn lower_instantiator(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[
-                    nursery, self_prog, mem_base, mem_size, h, record_ptr, trap_out,
-                ],
+                &[nursery, mem_base, mem_size, h, record_ptr, trap_out],
             );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
@@ -10427,7 +10354,7 @@ fn lower_instantiator(
             };
             let mut tsig = module.make_signature();
             for t in [
-                I64, I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
+                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
             ] {
                 tsig.params.push(AbiParam::new(t));
             }
@@ -10439,7 +10366,6 @@ fn lower_instantiator(
                 thunk,
                 &[
                     nursery,
-                    self_prog,
                     mem_base,
                     mem_size,
                     h,

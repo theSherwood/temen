@@ -91,7 +91,7 @@ fn src() -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!("{SRC}{}", rec::segment(17856, &child))
 }

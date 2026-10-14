@@ -61,7 +61,7 @@ block 3 (dr: i64) {{
 /// trap's wire code. `canary` is the root's window digest before the spawn xor after the child's
 /// life: 0 when the child never touched the root's window.
 pub fn root() -> Module {
-    let rec = temen_ir::SpawnRec::v1(0).encode();
+    let rec = temen_ir::SpawnRec::v1().encode();
     let rec: String = rec.iter().map(|b| format!("\\x{b:02x}")).collect();
     let src = format!(
         "memory {ROOT_LOG2}

@@ -1,22 +1,18 @@
-//! A §22 unit's `Instantiator`, by route (#1726, #1578, #2143) — on the tree-walk oracle, every
-//! bytecode driver and Cranelift alike.
+//! A §22 unit's `Instantiator`, by route (#1578, #2219) — on the tree-walk oracle, every bytecode
+//! driver and Cranelift alike.
 //!
 //! DESIGN §22 gives a unit two ways in. **Install** + `call.dyn` runs it in the caller's own frames,
-//! where a spawn is an ordinary *module-aware* spawn: a same-module child (`module = -1`) runs the
-//! spawning frame's module — the unit's program, not module 0's — exactly as `thread.spawn` does
-//! (`bytecode_parallel_jit.rs::installed_unit_spawns_its_own_module`). **Invoke** runs it as a
-//! seam-free leaf, where the whole `Instantiator` is unavailable: a child would outlive the synchronous
-//! call over code nothing keeps (an invoked unit is never installed), and no one could join it.
+//! where a spawn is an ordinary spawn: its record names a `Module` the domain holds, and the child
+//! starts at that module's function 0. `-1` names no module, from a unit's frame as from the
+//! program's (#2219); it used to name the spawning frame's program, the unit's own (#1726, #2143).
+//! **Invoke** runs a unit as a seam-free leaf, where the whole `Instantiator` is unavailable: a child
+//! would outlive the synchronous call over code nothing keeps (an invoked unit is never installed),
+//! and no one could join it.
 //!
 //! The unit spawns detached, through a v1 record the guest carries at 17408, paid from the guest's
-//! `"budget"`. The base program *also* has a func 1, returning 7, while the unit's returns 42 — so a
-//! child built from the wrong module still runs and answers 7, instead of hiding behind the same trap
-//! as "no such function".
+//! `"budget"`, running the module the host granted as `"kid"`, whose function 0 returns 42.
 //!
-//! Before #1726 the install route's carve spawn failed on all three engines, each differently (oracle
-//! `Malformed`, bytecode `ThreadFault`, Cranelift `CapFault`); before #2143 its detached spawn ran the
-//! decoy on all three. Before #1578 the invoke route spawned on the oracle and Cranelift and
-//! `CapFault`ed on bytecode.
+//! Before #1578 the invoke route spawned on the oracle and Cranelift and `CapFault`ed on bytecode.
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -29,16 +25,6 @@ use temen_jit::{JitOutcome, TrapKind};
 use temen_run::{grant_jit, jit_cap_run};
 use temen_text::parse_module;
 use temen_verify::verify_module;
-
-/// The decoy every guest carries as func 1 — what a child built from module 0 would run.
-const DECOY: &str = r#"
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v = i64.const 7
-  return v
-  }
-}
-"#;
 
 /// Install the unit and `call.dyn` it with the `Instantiator` handle.
 const INSTALL: &str = r#"memory 17
@@ -66,74 +52,8 @@ block 0 (vjit: i32, vcode: i32, vinst: i32) {
 }
 "#;
 
-/// The unit's entry: spawn the guest's record at 17408 — a same-module child at func 1, paid from the
-/// `"budget"` it names into the record — join it, and return the child's result.
-const UNIT_ENTRY: &str = r#"memory 17
-func (i64) -> (i64) {
-block 0 (vi64: i64) {
-  vi = i32.wrap_i64 vi64
-  vnp = i64.const 16400
-  vnl = i64.const 6
-  vb = self.resolve vnp vnl
-  vbp = i64.const 17436
-  i32.store vbp vb
-  vrp = i64.const 17408
-  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
-  return vj
-  }
-}
-"#;
-
-/// The unit: its entry spawns its own func 1, which returns 42 plus the byte at 17408 of its window.
-/// The unit's module has no data segments, so its child's window is zeros there; a window seeded
-/// with the base program's image instead holds the record's version byte, `1`.
-const UNIT: &str = r#"func (i64) -> (i64) {
-block 0 (v0: i64) {
-  va = i64.const 17408
-  vb = i32.load8_u va
-  vb64 = i64.extend_i32_u vb
-  v = i64.const 42
-  vr = i64.add v vb64
-  return vr
-  }
-}
-"#;
-
-/// A unit whose child spawns in turn: func 1, in the child's fresh window, names its own `"budget"`,
-/// writes a v1 record for func 2 with `module = -1`, spawns and joins it, and returns `100 +` its
-/// result. Func 2 returns 42, so 142 means both generations ran the unit's program: the child's
-/// `-1` names the module the child runs, which is the unit's.
-const NESTED_UNIT: &str = r#"func (i64) -> (i64) {
-block 0 (vi64: i64) {
-  vi = i32.wrap_i64 vi64
-  vnp = i64.const 16400
-  vname = i64.const 127978875155810
-  i64.store vnp vname
-  vnl = i64.const 6
-  vb = self.resolve vnp vnl
-  vrp = i64.const 17408
-  vone = i32.const 1
-  i32.store vrp vone
-  vep = i64.const 17412
-  vtwo = i32.const 2
-  i32.store vep vtwo
-  vnone = i32.const -1
-  vpp = i64.const 17428
-  i32.store vpp vnone
-  vmp = i64.const 17432
-  i32.store vmp vnone
-  vbp = i64.const 17436
-  i32.store vbp vb
-  vgp = i64.const 17480
-  i32.store vgp vnone
-  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
-  vhundred = i64.const 100
-  vr = i64.add vj vhundred
-  return vr
-  }
-}
+/// The module the host grants as `"kid"`: its function 0 returns 42.
+const KID: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v = i64.const 42
@@ -141,6 +61,38 @@ block 0 (v0: i64) {
   }
 }
 "#;
+
+/// The unit's module operand: the `"kid"` grant, resolved by name.
+const NAMES_KID: &str =
+    "  vkp = i64.const 16416\n  vkl = i64.const 3\n  vm = self.resolve vkp vkl\n";
+
+/// The unit's module operand: `-1`, which names no module.
+const MINUS_ONE: &str = "  vm = i32.const -1\n";
+
+/// The unit: put the `"budget"` and `module` (IR that defines `vm`) into the guest's record at
+/// 17408, spawn it, join it, and return the child's result.
+fn unit(module: &str) -> String {
+    format!(
+        "memory 17
+func (i64) -> (i64) {{
+block 0 (vi64: i64) {{
+  vi = i32.wrap_i64 vi64
+  vnp = i64.const 16400
+  vnl = i64.const 6
+  vb = self.resolve vnp vnl
+  vbp = i64.const 17436
+  i32.store vbp vb
+{module}  vmp = i64.const 17432
+  i32.store vmp vm
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
+  return vj
+  }}
+}}
+"
+    )
+}
 
 /// What a run came to, in one vocabulary across the three engines.
 #[derive(Debug, PartialEq)]
@@ -150,26 +102,31 @@ enum Outcome {
     Other(String),
 }
 
-/// The guest: `route`, the decoy, the `"budget"` name and the unit entry's spawn record.
+/// The guest: `route`, the `"budget"` and `"kid"` names and the unit's spawn record.
 fn guest(route: &str) -> temen_ir::Module {
-    let rec = rec::segment(17408, &SpawnRec::v1(1));
-    let m =
-        parse_module(&format!("{route}{DECOY}data 16400 \"budget\"\n{rec}")).expect("parse guest");
+    let rec = rec::segment(17408, &SpawnRec::v1());
+    let m = parse_module(&format!(
+        "{route}data 16400 \"budget\"\ndata 16416 \"kid\"\n{rec}"
+    ))
+    .expect("parse guest");
     verify_module(&m).expect("verify guest");
     m
 }
 
-/// A fresh host with the `Jit`, an `Instantiator` over the whole window and a `"budget"` for the
-/// unit's children, the guest registered as the running module, and `unit` compiled into it —
-/// deterministic, so every engine sees the same handles `[jit, code, instantiator]`.
-fn setup(guest: &temen_ir::Module, unit: &str) -> (Host, [i32; 3]) {
+/// A fresh host with the `Jit`, an `Instantiator` over the whole window, a `"budget"` for the unit's
+/// children and the `"kid"` module, the guest registered as the running module, and the unit naming
+/// `module` compiled into it — deterministic, so every engine sees the same handles
+/// `[jit, code, instantiator]`.
+fn setup(guest: &temen_ir::Module, module: &str) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     host.set_self_module(&std::sync::Arc::new(guest.clone()));
     let jit = grant_jit(&mut host, guest, 4);
     let inst = host.grant_instantiator(0, 128 << 10);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
-    let unit = parse_module(&format!("{UNIT_ENTRY}{unit}")).expect("parse unit");
+    let kid = host.grant_module(&parse_module(KID).expect("parse kid"));
+    host.register_cap_name("kid", kid);
+    let unit = parse_module(&unit(module)).expect("parse unit");
     verify_module(&unit).expect("verify unit");
     let code = host
         .jit_compile(jit, &temen_encode::encode_module(&unit))
@@ -187,8 +144,8 @@ fn interp(r: Result<Vec<Value>, Trap>) -> Outcome {
     }
 }
 
-fn cranelift(m: &temen_ir::Module, unit: &str) -> Outcome {
-    let (mut host, h) = setup(m, unit);
+fn cranelift(m: &temen_ir::Module, module: &str) -> Outcome {
+    let (mut host, h) = setup(m, module);
     let slots: Vec<i64> = h.iter().map(|&x| x as i64).collect();
     let (out, _) = jit_cap_run(
         m,
@@ -208,12 +165,13 @@ fn cranelift(m: &temen_ir::Module, unit: &str) -> Outcome {
     }
 }
 
-/// Assert that `route` reaching `unit` comes to `want` on every engine: the tree-walk oracle, the four
-/// bytecode drivers ([`drivers::ALL`]) and Cranelift. A failure names every engine that disagreed.
-fn on_every_engine(route: &str, unit: &str, want: Outcome) {
+/// Assert that `route` reaching the unit that spawns `module` comes to `want` on every engine: the
+/// tree-walk oracle, the four bytecode drivers ([`drivers::ALL`]) and Cranelift. A failure names
+/// every engine that disagreed.
+fn on_every_engine(route: &str, module: &str, want: Outcome) {
     let m = guest(route);
     let powerbox = || {
-        let (host, h) = setup(&m, unit);
+        let (host, h) = setup(&m, module);
         (host, h.map(Value::I32).to_vec())
     };
     let mut got: Vec<(String, Outcome)> = drivers::ALL
@@ -224,7 +182,7 @@ fn on_every_engine(route: &str, unit: &str, want: Outcome) {
             (format!("{d:?}"), o)
         })
         .collect();
-    got.push(("Cranelift".into(), cranelift(&m, unit)));
+    got.push(("Cranelift".into(), cranelift(&m, module)));
     let wrong: Vec<_> = got.iter().filter(|(_, o)| *o != want).collect();
     assert!(
         wrong.is_empty(),
@@ -232,20 +190,21 @@ fn on_every_engine(route: &str, unit: &str, want: Outcome) {
     );
 }
 
-/// #1726, #2143 — an installed unit's same-module child runs the unit's function, and joins.
+/// An installed unit spawns a module the domain holds, and joins it.
 #[test]
-fn an_installed_unit_spawns_its_own_function() {
-    on_every_engine(INSTALL, UNIT, Outcome::Returned(42));
+fn an_installed_unit_spawns_a_granted_module() {
+    on_every_engine(INSTALL, NAMES_KID, Outcome::Returned(42));
 }
 
-/// #2143 — the child runs the unit's program as its own, so its `-1` names the unit's program too.
+/// #2219 — from an installed unit's frame, `-1` names no module: the spawn faults, as from the
+/// program's.
 #[test]
-fn an_installed_units_child_spawns_the_units_program() {
-    on_every_engine(INSTALL, NESTED_UNIT, Outcome::Returned(142));
+fn an_installed_units_minus_one_names_no_module() {
+    on_every_engine(INSTALL, MINUS_ONE, Outcome::CapFault);
 }
 
 /// #1578 — the same unit, invoked, reaches no `Instantiator` at all: a `CapFault` at the spawn.
 #[test]
 fn an_invoked_unit_has_no_instantiator() {
-    on_every_engine(INVOKE, UNIT, Outcome::CapFault);
+    on_every_engine(INVOKE, NAMES_KID, Outcome::CapFault);
 }

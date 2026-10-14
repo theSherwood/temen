@@ -604,16 +604,18 @@ pub mod durable_abi {
 ///
 /// A record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
 /// The version word is a fixed tag (#1867 decision 2): it must be 1, so a record written for the
-/// retired carve placement (version 0) fails closed; #2091 retires the tag.
+/// retired carve placement (version 0) fails closed; #2091 retires the tag. A child runs a module
+/// the spawner holds, from its function 0, the module's child bootstrap (#2219): the word at 4,
+/// once the entry function, must be 0 until the record is next revised.
 ///
 /// | off | field | |
 /// |---|---|---|
 /// | 0 | `u32` version | 1 |
-/// | 4 | `u32` entry | the child's entry function |
+/// | 4 | `u32` | reserved, must be 0 (was the entry function) |
 /// | 8 | `u64` | reserved, must be 0 |
 /// | 16 | `u32` size_log2 | the child's own window |
 /// | 20 | `u32` pager | impl export / `u32::MAX` |
-/// | 24 | `i32` module | handle / `-1` self |
+/// | 24 | `i32` module | the `Module` handle the child runs |
 /// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
 /// | 32 | `i64` quota | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
 /// | 40, 48 | `u64` grants ptr, count | named-grant list |
@@ -623,13 +625,11 @@ pub mod durable_abi {
 /// | 80 | `u64` child_off | where the region maps in the child |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
-    /// Child entry function index (record offset 4).
-    pub entry: u32,
     /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
     pub size_log2: i64,
     /// Pager impl-export index, or `u32::MAX` for none (offset 20).
     pub pager: u32,
-    /// `Module` handle, or `-1` for self (offset 24).
+    /// The `Module` handle the child runs (offset 24).
     pub modh: i32,
     /// `Budget` handle, or `0` for none (offset 28).
     pub budget: i32,
@@ -653,7 +653,7 @@ pub const SPAWN_REC_LEN: usize = 88;
 
 impl SpawnRec {
     /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
-    /// word other than 1, or a nonzero reserved field (offsets 8, 76) — every driver fails that
+    /// word other than 1, or a nonzero reserved field (offsets 4, 8, 76) — every driver fails that
     /// closed. Pure layout decode: no handle/window/geometry validation, all of which stays
     /// tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
@@ -662,11 +662,10 @@ impl SpawnRec {
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 1 || u64_at(8) != 0 || u32_at(76) != 0 {
+        if u32_at(0) != 1 || u32_at(4) != 0 || u64_at(8) != 0 || u32_at(76) != 0 {
             return None;
         }
         Some(SpawnRec {
-            entry: u32_at(4),
             size_log2: u32_at(16) as i64,
             pager: u32_at(20),
             modh: u32_at(24) as i32,
@@ -680,15 +679,14 @@ impl SpawnRec {
         })
     }
 
-    /// A record for `entry` with every other field at its "none" value: the module's declared
-    /// window (`size_log2` 0), no pager, the spawner's own module, no budget, the retired `quota`
-    /// 0, no grants, no args, no region. Producers set the fields they use.
-    pub fn v1(entry: u32) -> SpawnRec {
+    /// A record with every field at its "none" value: the module's declared window (`size_log2`
+    /// 0), no pager, no module (`0` names none, so a spawner sets `modh`), no budget, the retired
+    /// `quota` 0, no grants, no args, no region. Producers set the fields they use.
+    pub fn v1() -> SpawnRec {
         SpawnRec {
-            entry,
             size_log2: 0,
             pager: u32::MAX,
-            modh: -1,
+            modh: 0,
             budget: 0,
             quota: 0,
             grants_ptr: 0,
@@ -703,7 +701,7 @@ impl SpawnRec {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(SPAWN_REC_LEN);
         b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&self.entry.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
         b.extend_from_slice(&0u64.to_le_bytes());
         b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
         b.extend_from_slice(&self.pager.to_le_bytes());
@@ -3736,12 +3734,6 @@ impl Func {
         self.issues_instantiator(&[15, 17])
     }
 
-    /// Whether this function issues op 15, whose module operand must be a `Module` handle. See
-    /// [`spawns_by_module_handle`].
-    pub fn spawns_by_module_handle(&self) -> bool {
-        self.issues_instantiator(&[15])
-    }
-
     /// Whether this function issues a static `Instantiator` op among `ops`.
     fn issues_instantiator(&self, ops: &[u32]) -> bool {
         self.blocks.iter().any(|b| {
@@ -3926,9 +3918,8 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 15` in any function
 /// (the only spelling — an executor op reaches its seam through a static `call.cap`, never a
 /// manifest-bound `call.sym`; chibicc's `__vm_instantiate_detached` emits exactly that). The two
-/// reference powerboxes grant the by-name spawn set (`"module"`, `"budget"`) **only** to such a
-/// guest — least authority, and the `"module"` grant is non-durable, so a guest that never spawns
-/// keeps a powerbox a warm snapshot can freeze.
+/// reference powerboxes grant the by-name spawn set (`"budget"`, and `"child"` for a program that
+/// exports `_child`) **only** to such a guest: least authority.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
@@ -3942,14 +3933,6 @@ pub fn detached_size_log2(requested: i64, declared: Option<u8>) -> i64 {
         (0, Some(d)) => d as i64,
         _ => requested,
     }
-}
-
-/// Whether `module` issues op 15 (`instantiate_detached`), whose module operand must be a `Module`
-/// handle — the one spawn a by-name `"module"` grant serves. The op-17 record names the spawner's own
-/// program as `-1`, so an op-17-only guest is granted its `"budget"` alone, and keeps a powerbox a
-/// warm snapshot can freeze (the `"module"` grant is non-durable).
-pub fn spawns_by_module_handle(module: &Module) -> bool {
-    module.funcs.iter().any(Func::spawns_by_module_handle)
 }
 
 /// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle),
@@ -8088,7 +8071,7 @@ mod spawn_rec_tests {
 
     #[test]
     fn encode_is_the_inverse_of_parse() {
-        let mut v1 = SpawnRec::v1(3);
+        let mut v1 = SpawnRec::v1();
         v1.modh = 5;
         v1.budget = 9;
         v1.quota = 1 << 40;
@@ -8103,11 +8086,11 @@ mod spawn_rec_tests {
     }
 
     /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
-    /// placement — and any other version fail closed, as do the reserved words, a short record
-    /// (a v0 record was 56 bytes) and a long one.
+    /// placement — and any other version fail closed, as do the reserved words (the word at 4 is
+    /// the retired entry, #2219), a short record (a v0 record was 56 bytes) and a long one.
     #[test]
     fn only_a_version_1_record_parses() {
-        let b = SpawnRec::v1(1).encode();
+        let b = SpawnRec::v1().encode();
         let with = |o: usize, v: u32| {
             let mut r = b.clone();
             r[o..o + 4].copy_from_slice(&v.to_le_bytes());
@@ -8116,6 +8099,7 @@ mod spawn_rec_tests {
         for v in [0, 2, u32::MAX] {
             assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
         }
+        assert_eq!(SpawnRec::parse(&with(4, 1)), None, "the word at 4");
         assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
         assert_eq!(
             SpawnRec::parse(&with(12, 1)),

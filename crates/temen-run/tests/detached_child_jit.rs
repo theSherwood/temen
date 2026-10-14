@@ -1367,7 +1367,7 @@ fn parent_granting(grants: &[(&str, u32)]) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let mut segments = seg(REC, &rec.encode());
     for (i, (name, handle)) in grants.iter().enumerate() {

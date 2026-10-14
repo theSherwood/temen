@@ -58,7 +58,7 @@ block 0 (v0: i64) {
 "#;
 
 fn module() -> Module {
-    let src = format!("{TRAP_UNJOINED}{}", rec::segment(17408, &SpawnRec::v1(0)));
+    let src = format!("{TRAP_UNJOINED}{}", rec::segment(17408, &SpawnRec::v1()));
     parse_module(&src).expect("parse")
 }
 

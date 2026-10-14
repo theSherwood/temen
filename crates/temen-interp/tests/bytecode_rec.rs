@@ -47,11 +47,12 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// [`REC_WITH_IMPL_EXPORT`] with its record: func 1 in its declared window.
+/// [`REC_WITH_IMPL_EXPORT`] with its record. The module declines by its shape, before the record
+/// is read.
 fn rec_with_impl_export() -> String {
     format!(
         "{REC_WITH_IMPL_EXPORT}{}",
-        rec::segment(17536, &SpawnRec::v1(1))
+        rec::segment(17536, &SpawnRec::v1())
     )
 }
 
@@ -91,7 +92,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17536, &SpawnRec::v1(0))
+        rec = rec::segment(17536, &SpawnRec::v1())
     )
 }
 

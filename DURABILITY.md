@@ -603,8 +603,10 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-entry and module digest, its lane and its import names. Its fuel, `spawn` and `channel` bounds are its
-budget node's (Section 10, #1944 slice 3; the launch record carried them itself until v38). A thaw
+module digest, its lane and its import names (a child starts at its module's function 0 and binds its
+manifest strictly, so the record carried an entry and a same-module flag only until v43, #2219). Its
+fuel, `spawn` and `channel` bounds are its budget node's (Section 10, #1944 slice 3; the launch record
+carried them itself until v38). A thaw
 may narrow those bounds, never widen them. Restore rebuilds each child
 into a fresh powerbox holding the restoring host's thaw seams (`Host::detached_thaw_host`: its durable
 module grants and JIT admission copied, its registrar and budget hook lent), so one restoring host
@@ -1406,7 +1408,7 @@ pure function of the program, which the artifact already binds, so the restoring
 the same image again when it grants the same program. A handle to it rides as `Module { digest }`
 and re-pins to that image (`Host::module_rides_freeze`); no other grant of the same bytes satisfies
 it, and a thaw whose powerbox derived no such image fails `ModuleUnresolved`. Before this, a domain
-holding the grant could not be frozen at all, so once #2219 retires self-spawn a reactor that spawns
+holding the grant could not be frozen at all, so with self-spawn retired (#2219) a reactor that spawns
 copies of itself could take no save-state. A durable domain still cannot *spawn* the image: an
 instrumented image is #2245's other half. Pinned by
 `handle_durability.rs::{the_programs_child_image_rides_a_freeze,

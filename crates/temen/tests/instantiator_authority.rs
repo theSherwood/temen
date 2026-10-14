@@ -50,7 +50,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}"#,
-        rec = rec::segment(17408, &SpawnRec::v1(0))
+        rec = rec::segment(17408, &SpawnRec::v1())
     );
     let m = parse_module(&src).expect("parse guest");
     verify_module(&m).expect("verify guest");

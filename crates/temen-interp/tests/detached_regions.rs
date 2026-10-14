@@ -69,7 +69,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1(0)),
+        rec = rec::segment(17408, &SpawnRec::v1()),
     )
 }
 
@@ -99,7 +99,7 @@ fn a_minted_region_spends_the_childs_channel_until_it_ends_on_every_driver() {
 fn shared_futex_src() -> String {
     let child = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "memory 17

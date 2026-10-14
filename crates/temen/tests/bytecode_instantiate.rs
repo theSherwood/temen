@@ -85,7 +85,7 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1(0)));
+    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1()));
     check(&src, vec![Value::I64(0)]);
 }
 
@@ -122,6 +122,6 @@ block 0 (v0: i64) {
 
 #[test]
 fn a_child_trap_is_its_joins_status() {
-    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1(0)));
+    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1()));
     check(&src, vec![Value::I64(temen_ir::trap_code::UNREACHABLE)]);
 }
