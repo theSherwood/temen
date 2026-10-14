@@ -1446,8 +1446,9 @@ static int gen_builtin_jit_uninstall(Node *node) {
 //   long __vm_region_map(int r, long win_off, long region_off, long len, int prot); // op 0
 //   long __vm_region_unmap(int r, long win_off, long len);                          // op 1
 //   long __vm_region_page_size(int r);             // the map granularity (op 3)
+//   long __vm_region_close(int r);                 // give the handle up (op 5, #2358)
 //
-// `create` dispatches on the fixed AddressSpace interface — a manifest import. The other three
+// `create` dispatches on the fixed AddressSpace interface — a manifest import. The others
 // dispatch on the runtime-minted *region handle*, which is the dynamic addressing mode
 // (IMPORTS.md §2.2): an inline `call.cap 4 <op>` on the live handle, no manifest entry.
 //
@@ -1506,6 +1507,16 @@ static int gen_builtin_region_page_size(Node *node) {
   int rh = gen_expr(a);
   int r = nv++;
   cg("  v%d = call.cap 4 3 () -> (i64) v%d ()\n", r, rh);
+  return r;
+}
+
+static int gen_builtin_region_close(Node *node) {
+  Node *a = node->args;
+  if (!a || a->next)
+    error_tok(node->tok, "codegen_ir: __vm_region_close(r) expects 1 argument");
+  int rh = gen_expr(a);
+  int r = nv++;
+  cg("  v%d = call.cap 4 5 () -> (i64) v%d ()\n", r, rh);
   return r;
 }
 
@@ -2179,6 +2190,8 @@ static int gen_expr(Node *node) {
           return gen_builtin_region_unmap(node);
         if (!strcmp(fname, "__vm_region_page_size"))
           return gen_builtin_region_page_size(node);
+        if (!strcmp(fname, "__vm_region_close"))
+          return gen_builtin_region_close(node);
         if (!strcmp(fname, "__vm_page_size"))
           return gen_builtin_page_size(node);
         if (!strcmp(fname, "__vm_stream_write"))

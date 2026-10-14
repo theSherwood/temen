@@ -873,8 +873,8 @@ pub(crate) struct HostCursor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegionTable {
     /// Per region id, its backing's index among the captured bytes. Ids aliasing one backing share
-    /// it, so they restore as one region again.
-    backing: Vec<usize>,
+    /// it, so they restore as one region again; an id the host closed (#2358) restores closed.
+    backing: Vec<Option<usize>>,
     /// Each live `SharedRegion` handle: `(slot, generation, region id)`.
     handles: Vec<(u32, u32, u32)>,
 }
@@ -1167,6 +1167,9 @@ impl GuestMem for RecordingMem<'_> {
     ) -> i64 {
         self.inner
             .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        self.inner.maps_region(region)
     }
     fn page_size(&self) -> i64 {
         self.inner.page_size()
@@ -19098,7 +19101,8 @@ fn builtin_iface_ops(id: u32) -> Option<&'static [(&'static str, FuncType)]> {
 /// `>= 0` is success. Errors do **not** trap — traps stay reserved for escape/fatal. The standard
 /// errnos come from the one shared table ([`temen_ir::errno`]); the aliases below are temen-interp's own.
 use temen_ir::errno::{
-    E2BIG, EACCES, EAGAIN, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC, EPIPE,
+    E2BIG, EACCES, EAGAIN, EBUSY, ECHILD, EFAULT, EINTR, EINVAL, EMFILE, ENOEXEC, ENOMEM, ENOSPC,
+    EPIPE,
 };
 /// §3.6 revocation-unparks completion status (`-EBADF`): the errno a fiber's parked capability
 /// call returns when the handle it was parked through is revoked out from under it. Probeable
@@ -19664,6 +19668,13 @@ pub trait GuestMem {
         _backing: RegionBacking,
     ) -> i64 {
         EINVAL
+    }
+    /// #2358 — whether a page of the window aliases `region` (§13): `SharedRegion.close` refuses
+    /// while one does. A window is no holder of its own, and a mapping that outlived its backing
+    /// would read zero on the paged [`Mem`] and keep its bytes in the Cranelift JIT's `mmap`. The
+    /// default answers for a window that cannot map a region, which maps none.
+    fn maps_region(&self, _region: u32) -> bool {
+        false
     }
 
     /// `Memory` op 3 `page_size() -> i64`: the host MMU page granularity this window is managed in —
@@ -21406,10 +21417,7 @@ pub fn capture_cut_regions(
     for (host, ids) in cut {
         for &id in ids {
             let refuse = |why| RegionNotCaptured { region: id, why };
-            let b = host
-                .regions
-                .get(id as usize)
-                .ok_or(refuse(RegionRefusal::Unknown))?;
+            let b = host.region(id).ok_or(refuse(RegionRefusal::Unknown))?;
             let key = region_key(b);
             if out.iter().any(|r| r.key == key) {
                 continue; // an alias of a region already captured
@@ -21419,7 +21427,13 @@ pub fn capture_cut_regions(
             }
             let held: usize = cut
                 .iter()
-                .map(|(h, _)| h.regions.iter().filter(|r| Arc::ptr_eq(r, b)).count())
+                .map(|(h, _)| {
+                    h.regions
+                        .iter()
+                        .flatten()
+                        .filter(|r| Arc::ptr_eq(r, b))
+                        .count()
+                })
                 .sum();
             if Arc::strong_count(b) != held {
                 return Err(refuse(RegionRefusal::HolderOutsideCut));
@@ -23358,9 +23372,11 @@ pub struct Host {
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
-    /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries. Each is a
-    /// shared host buffer; aliasing a region into several window offsets clones this `Rc`.
-    regions: Vec<RegionBacking>,
+    /// §13 `SharedRegion` backings, indexed by the id a [`Binding::SharedRegion`] carries: this
+    /// domain's holds. Each is a shared host buffer; aliasing a region into several window offsets
+    /// clones this `Arc`. #2358 — a hold its domain closed is `None`, an id the next hold reuses
+    /// ([`Host::hold_region`]), as the table reuses a closed slot.
+    regions: Vec<Option<RegionBacking>>,
     /// PROCESS.md S1b/S1c — the **canonical-key futex** region hook. On a §13 `map`/`unmap` the JIT needs
     /// to canonicalize a `Backed` address to `(backing, region offset)` for its futex, but its futex
     /// thunk has no region map. `temen-run` installs a recorder here (over the JIT window's `mem_base`);
@@ -26830,9 +26846,7 @@ impl Host {
                     None => continue,
                 },
                 // #2025: re-pin onto the region the thaw adopted (the codec rewrote the id to it). An id naming no region leaves the slot closed, as for a pipe.
-                DurableBinding::SharedRegion { region }
-                    if (region as usize) < self.regions.len() =>
-                {
+                DurableBinding::SharedRegion { region } if self.region(region).is_some() => {
                     Binding::SharedRegion(region)
                 }
                 DurableBinding::SharedRegion { .. } => continue,
@@ -26932,7 +26946,7 @@ impl Host {
 
     /// #2025 — the identity of region `id`'s backing ([`DurableRegion::key`]), `None` for no region.
     pub fn region_key(&self, id: u32) -> Option<usize> {
-        self.regions.get(id as usize).map(region_key)
+        self.region(id).map(region_key)
     }
 
     /// #2025 — alias back into `mem` every region `prots` names: the thaw half of a captured
@@ -26957,7 +26971,7 @@ impl Host {
     /// first that names no region of this host or does not map.
     fn map_aliases(&self, mem: &mut dyn GuestMem, aliases: &[RegionAlias]) -> bool {
         aliases.iter().all(|a| {
-            let Some(backing) = self.regions.get(a.region as usize).cloned() else {
+            let Some(backing) = self.region(a.region).cloned() else {
                 return false;
             };
             let prot = PROT_READ | if a.writable { PROT_WRITE } else { 0 };
@@ -27015,13 +27029,32 @@ impl Host {
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
     /// pages that name it.
     pub fn adopt_region(&mut self, backing: RegionBacking) -> u32 {
-        self.regions.push(backing);
-        self.regions.len() as u32 - 1
+        self.hold_region(backing)
     }
 
     /// How many §13 regions this domain holds, mapped or not.
     pub(crate) fn region_count(&self) -> usize {
-        self.regions.len()
+        self.regions.iter().flatten().count()
+    }
+
+    /// The region this domain holds as `id`, `None` for an id it never held or closed (#2358).
+    fn region(&self, id: u32) -> Option<&RegionBacking> {
+        self.regions.get(id as usize)?.as_ref()
+    }
+
+    /// #2358 — hold `backing` under the lowest id no hold names, as a grant takes the lowest free slot
+    /// of the table: what a closed region left is reused, so neither grows with a domain's history.
+    fn hold_region(&mut self, backing: RegionBacking) -> u32 {
+        match self.regions.iter().position(Option::is_none) {
+            Some(id) => {
+                self.regions[id] = Some(backing);
+                id as u32
+            }
+            None => {
+                self.regions.push(Some(backing));
+                self.regions.len() as u32 - 1
+            }
+        }
     }
 
     /// #2026 — this host's regions for a debugger checkpoint: each backing's bytes once, and the
@@ -27029,16 +27062,20 @@ impl Host {
     /// alone ([`capture_cut_regions`]): a checkpoint carries no child domain's regions, so any other
     /// holder — a child, or the embedder — is outside it, and so is a host file the region aliases.
     pub(crate) fn capture_regions(&self) -> Option<(Vec<Vec<u8>>, RegionTable)> {
-        let ids = (0..self.regions.len() as u32).collect();
+        let ids = (0..self.regions.len() as u32)
+            .filter(|&id| self.region(id).is_some())
+            .collect();
         let captured = capture_cut_regions(&[(self, ids)]).ok()?;
         let backing = self
             .regions
             .iter()
             .map(|b| {
-                captured
-                    .iter()
-                    .position(|r| r.key == region_key(b))
-                    .expect("every region of this host was captured")
+                b.as_ref().map(|b| {
+                    captured
+                        .iter()
+                        .position(|r| r.key == region_key(b))
+                        .expect("every region of this host was captured")
+                })
             })
             .collect();
         let handles = self
@@ -27063,7 +27100,7 @@ impl Host {
         self.regions = table
             .backing
             .iter()
-            .map(|&i| Arc::clone(&backings[i]))
+            .map(|i| i.map(|i| Arc::clone(&backings[i])))
             .collect();
         for &(slot, generation, region) in &table.handles {
             let s = &mut self.table[slot as usize];
@@ -29774,8 +29811,7 @@ impl Host {
     /// backend installs a region whose `os_fd` it can `mmap` for real hardware aliasing (the JIT
     /// side of the §13 differential). The pure-Rust [`grant_shared_region`] is the common case.
     pub fn grant_shared_region_backed(&mut self, backing: RegionBacking) -> i32 {
-        let id = self.regions.len() as u32;
-        self.regions.push(backing);
+        let id = self.hold_region(backing);
         self.grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
 
@@ -29865,7 +29901,7 @@ impl Host {
     /// handle it was re-granted, exactly as after [`apply_premap`](Self::apply_premap).
     pub fn take_premap(&mut self) -> Option<(RegionBacking, u64)> {
         let (id, off) = self.premap.take()?;
-        let backing = self.regions.get(id as usize).cloned()?;
+        let backing = self.region(id).cloned()?;
         Some((backing, off))
     }
 
@@ -29883,7 +29919,7 @@ impl Host {
         let Some((id, off)) = self.premap.take() else {
             return 0;
         };
-        let Some(backing) = self.regions.get(id as usize).cloned() else {
+        let Some(backing) = self.region(id).cloned() else {
             return EINVAL;
         };
         let len = backing.size();
@@ -30673,8 +30709,7 @@ impl Host {
         if self.table.iter().all(|s| s.entry.is_some()) {
             return None; // table full — don't register a backing we can't hand out
         }
-        let id = self.regions.len() as u32;
-        self.regions.push(backing);
+        let id = self.hold_region(backing);
         self.try_grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
     }
     /// A fresh host for a domain this one spawns or forks (#1978): it keeps what the embedder set
@@ -30718,11 +30753,30 @@ impl Host {
     /// closed / wrong-type handle is a `CapFault`.
     fn resolve_region(&self, handle: i32) -> Result<RegionBacking, Trap> {
         match self.resolve(handle, cap_id::SHARED_REGION)? {
-            Binding::SharedRegion(id) => {
-                self.regions.get(id as usize).cloned().ok_or(Trap::CapFault)
-            }
+            Binding::SharedRegion(id) => self.region(id).cloned().ok_or(Trap::CapFault),
             _ => Err(Trap::CapFault),
         }
+    }
+
+    /// §13 op 5 `close` (#2358): give up `handle`, and with it this domain's hold on `region`, which
+    /// goes when no domain holds it (its [`ChargedRegion`] drop refunds the node that minted it). The
+    /// slot closes as a `Stream`'s does ([`Host::close`]), so a later use answers `-EBADF`; a hold
+    /// another of this domain's handles still names stays. `-EBUSY`, changing nothing, while `mem`
+    /// maps the region ([`GuestMem::maps_region`]): a personality that wants POSIX's
+    /// close-before-`munmap` keeps the handle until its last unmap (INVARIANTS #4).
+    fn close_region(&mut self, handle: i32, region: u32, mem: &dyn GuestMem) -> i64 {
+        if mem.maps_region(region) {
+            return EBUSY;
+        }
+        self.close(handle);
+        let named = self
+            .table
+            .iter()
+            .any(|s| matches!(s.entry, Some(Binding::SharedRegion(r)) if r == region));
+        if !named {
+            self.regions[region as usize] = None;
+        }
+        0
     }
 
     /// Close a handle (§3c): free the slot but keep its generation, so the old handle value is
@@ -32760,7 +32814,7 @@ impl Host {
             Binding::SharedRegion(region) => {
                 // §13: alias the host-backed region into the window. `map` (op 0) at several offsets
                 // aliases the same bytes; loads/stores then go through the ordinary masked path.
-                let Some(backing) = self.regions.get(region as usize).cloned() else {
+                let Some(backing) = self.region(region).cloned() else {
                     return Ok(vec![EINVAL]);
                 };
                 let Some(mem) = mem else {
@@ -32801,6 +32855,7 @@ impl Host {
                     }
                     2 => backing.size() as i64,
                     3 => mem.region_page_size(),
+                    5 => self.close_region(handle, region, mem),
                     _ => EINVAL,
                 }])
             }
@@ -36131,6 +36186,13 @@ impl GuestMem for Mem {
         0
     }
 
+    fn maps_region(&self, region: u32) -> bool {
+        self.space_read()
+            .prot
+            .values()
+            .any(|p| matches!(*p, PageProt::Backed { region: r, .. } if r == region))
+    }
+
     /// §3e op 3 `page_size`: the backing-store page granularity (`self.page`, the host page) — the
     /// unit `map`/`unmap`/`protect` round to. The JIT's `MprotectWindow` reports the same host page,
     /// so the two backends agree.
@@ -36192,6 +36254,9 @@ impl GuestMem for SoleMem<'_> {
     ) -> i64 {
         self.0
             .map_region(win_off, region_off, len, prot, region, backing)
+    }
+    fn maps_region(&self, region: u32) -> bool {
+        self.0.maps_region(region)
     }
     fn page_size(&self) -> i64 {
         self.0.page_size()
@@ -36714,7 +36779,11 @@ mod region_minter_tests {
         // backing is the 64-byte object the handler minted.
         match host.resolve(region_h as i32, cap_id::SHARED_REGION) {
             Ok(Binding::SharedRegion(id)) => {
-                assert_eq!(host.regions[id as usize].size(), 64, "minted region size");
+                assert_eq!(
+                    host.region(id).expect("held").size(),
+                    64,
+                    "minted region size"
+                );
             }
             other => panic!("minted handle should resolve as a SharedRegion, got {other:?}"),
         }
@@ -37360,9 +37429,95 @@ mod region_charge_tests {
     fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
         let (parent, node, mut child, _) = child(-1);
         let id = child.adopt_region(child.rebuild_region(&[7; 64]).expect("rebuilt"));
-        assert_eq!(child.regions[id as usize].read_byte(63), 7);
+        assert_eq!(child.region(id).expect("held").read_byte(63), 7);
         assert_eq!(used(&parent, node), 64);
         child.release_memory();
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// `SharedRegion` op `op` on `h` with `args`, over `mem`.
+    fn region_op(host: &mut Host, h: i64, op: u32, args: &[i64], mem: &mut Mem) -> i64 {
+        let r = host.cap_dispatch_slots(cap_id::SHARED_REGION, op, h as i32, args, Some(mem));
+        r.expect("a region op")[0]
+    }
+
+    /// #2358 — closing a region gives up the handle and this domain's hold: the charge comes back,
+    /// and the handle answers `-EBADF` from then on, a second close included.
+    #[test]
+    fn closing_a_region_hands_it_back() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        assert!(h >= 0, "the region fits");
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(used(&parent, node), 0, "the close hands the region back");
+        let ebadf = temen_ir::errno::EBADF;
+        assert_eq!(region_op(&mut child, h, 2, &[], &mut mem), ebadf);
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), ebadf);
+    }
+
+    /// #2358 — a region the window still maps refuses to close and changes nothing; unmapped, it
+    /// closes.
+    #[test]
+    fn a_mapped_region_refuses_to_close() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        let at = 1 << 17;
+        let rw = (PROT_READ | PROT_WRITE) as i64;
+        assert_eq!(
+            region_op(&mut child, h, 0, &[at, 0, REGION as i64, rw], &mut mem),
+            0
+        );
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), EBUSY);
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the refused close changes nothing"
+        );
+        assert_eq!(
+            region_op(&mut child, h, 1, &[at, REGION as i64], &mut mem),
+            0,
+            "and the handle still works"
+        );
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(used(&parent, node), 0);
+    }
+
+    /// #2358 — a region another domain holds stays charged when this one closes it, and goes at
+    /// that holder's end.
+    #[test]
+    fn a_closed_region_stays_while_another_domain_holds_it() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        let h = mint(&mut child, space, REGION);
+        let mut twin = child.fork_powerbox(7, 0).expect("a simple domain forks");
+        assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        assert_eq!(
+            used(&parent, node),
+            REGION as i64,
+            "the twin still holds it"
+        );
+        twin.release_memory();
+        assert_eq!(
+            used(&parent, node),
+            0,
+            "the last holder's end hands it back"
+        );
+    }
+
+    /// #2358 — a domain that closes what it mints reuses the slot and the id: it never fills its
+    /// table, and a ceiling of one region is enough.
+    #[test]
+    fn a_domain_that_closes_what_it_mints_never_fills_its_table() {
+        let (parent, node, mut child, space) = child(REGION as i64);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        for i in 0..2 * CAP {
+            let h = mint(&mut child, space, REGION);
+            assert!(h >= 0, "mint {i}: {h}");
+            assert_eq!(region_op(&mut child, h, 5, &[], &mut mem), 0);
+        }
+        assert_eq!(child.regions.len(), 1, "one id, reused");
         assert_eq!(used(&parent, node), 0);
     }
 }
@@ -37925,13 +38080,14 @@ mod fork_powerbox_tests {
             host.resolve(hr, cap_id::SHARED_REGION),
             twin.resolve(hr, cap_id::SHARED_REGION),
         ) {
-            (Ok(Binding::SharedRegion(a)), Ok(Binding::SharedRegion(b))) => {
-                (a as usize, b as usize)
-            }
+            (Ok(Binding::SharedRegion(a)), Ok(Binding::SharedRegion(b))) => (a, b),
             other => panic!("region handle should resolve in both, got {other:?}"),
         };
         assert!(
-            Arc::ptr_eq(&host.regions[hid], &twin.regions[tid]),
+            Arc::ptr_eq(
+                host.region(hid).expect("held"),
+                twin.region(tid).expect("held")
+            ),
             "the twin shares the very same region backing (fork shares shared memory)"
         );
         // But the tables are independent objects: a later grant into the parent is not in the twin.

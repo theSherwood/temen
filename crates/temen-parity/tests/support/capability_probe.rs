@@ -141,12 +141,12 @@ pub fn rows() -> Vec<Row> {
                 (h, x)
             }),
         ),
-        // op 4 is the guest-minted-region `create`/`grant` follow-up: wired in the oracle, vetoed by
-        // name in the bytecode lowering.
+        // op 4 is #1511's runtime `grant`, unbuilt: every engine answers `-EINVAL`, and the bytecode
+        // lowering vetoes it by name. op 5 is `close` (#2358).
         row(
             Capability::SharedRegion,
             c::SHARED_REGION,
-            &[0, 1, 2, 3, 4],
+            &[0, 1, 2, 3, 4, 5],
             Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_shared_region(4096);

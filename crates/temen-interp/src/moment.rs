@@ -1132,7 +1132,9 @@ mod ladder_tests {
             4 * SHARED_PAGE,
             "the region's bytes are held"
         );
-        host.regions[0].write_byte(SHARED_PAGE as u64, 7);
+        host.region(0)
+            .expect("held")
+            .write_byte(SHARED_PAGE as u64, 7);
         ladder.take(2, take(&host));
         assert_eq!(
             ladder.held_bytes(),
@@ -1151,10 +1153,13 @@ mod ladder_tests {
             7,
             "with the bytes it had"
         );
-        assert!(Arc::ptr_eq(&region, &fresh.regions[0]), "under the same id");
+        assert!(
+            Arc::ptr_eq(&region, fresh.region(0).expect("held")),
+            "under the same id"
+        );
 
         let mut shared = Host::new();
-        shared.grant_shared_region_backed(Arc::clone(&host.regions[0]));
+        shared.grant_shared_region_backed(Arc::clone(host.region(0).expect("held")));
         assert_eq!(
             Moment::checkpoint(None, &shared, Continuation::None).err(),
             Some(Refusal::Region),

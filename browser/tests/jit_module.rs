@@ -1,5 +1,4 @@
-//! **Single-shot module wasm-JIT differential** (the run-to-completion twin of `jit_reactor.rs`). An
-//! on-ramp module's whole program is func 0 (`_start`); [`JitOnrampRun`] emits it and runs
+//! **Single-shot module wasm-JIT differential**. An on-ramp module's whole program is func 0 (`_start`); [`JitOnrampRun`] emits it and runs
 //! `f0(win, env, ...slots)` once on `wasmi` (playing the browser's JS host), with the cross-tier
 //! helpers relaying to the interpreter over the shared window through `env.call_interp`. The captured
 //! stdout + exit must match [`onramp_exec_root`] (the interpreter oracle, at the root like this tier)
