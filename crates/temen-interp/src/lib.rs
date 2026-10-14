@@ -21277,6 +21277,14 @@ pub struct DurableHandle {
     pub binding: DurableBinding,
 }
 
+impl DurableHandle {
+    /// The handle value the guest holds for this entry: what an embedder passes a thawed domain
+    /// that takes its capabilities as arguments.
+    pub fn handle(&self) -> i32 {
+        handle_of(self.slot, self.generation)
+    }
+}
+
 /// One §22 guest-JIT **unit** captured for snapshot (DURABILITY.md §12.5 Slice 2). The durable
 /// state is the unit's already-instrumented+verified IR (encoded as a module image, `unit_ir`)
 /// plus its B2 `install` type id; the native/wasm code pointers are process-local and re-derived
@@ -21567,6 +21575,13 @@ const _: () = assert!(CAP_LOG2 + GEN_BITS == 31);
 /// counter's absolute values never matter).
 static NEXT_DOMAIN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const GEN_MASK: u32 = (1u32 << GEN_BITS) - 1;
+
+/// The handle a grant of `slot` at `generation` returns: `(generation << CAP_LOG2) | slot`, the
+/// generation masked to the `GEN_BITS` a handle carries. Every handle is packed here, so the layout
+/// lives in one place (#2365).
+const fn handle_of(slot: u32, generation: u32) -> i32 {
+    (((generation & GEN_MASK) << CAP_LOG2) | slot) as i32
+}
 
 /// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
 /// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
@@ -24916,7 +24931,7 @@ impl Host {
             (0..CAP).find_map(|slot| {
                 let st = &h.table[slot];
                 (st.entry.is_some() && st.type_id == tid)
-                    .then_some(((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32)
+                    .then_some(handle_of(slot as u32, st.generation))
             })
         };
         // Resolve an import's §3.5 requirement set — `(names, sigs)` — through the child's
@@ -26511,7 +26526,7 @@ impl Host {
         }
         s.entry = Some(binding);
         s.type_id = type_id;
-        Some((((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32)
+        Some(handle_of(slot as u32, s.generation))
     }
 
     /// §7 capability **reflection** (backs `self.count`/`self.get`): the live handle-table
@@ -26566,10 +26581,7 @@ impl Host {
             .iter()
             .enumerate()
             .filter(|(_, s)| s.entry.is_some())
-            .map(|(slot, s)| {
-                let handle = (((s.generation & GEN_MASK) << CAP_LOG2) | slot as u32) as i32;
-                (handle, s.type_id)
-            })
+            .map(|(slot, s)| (handle_of(slot as u32, s.generation), s.type_id))
             .collect()
     }
 
@@ -26841,7 +26853,7 @@ impl Host {
                 // registration wins, so a name the embedder granted before restoring keeps its handle.
                 DurableBinding::Named { idx } => {
                     if let Some(Some(name)) = self.thaw_names.get(idx as usize) {
-                        let handle = (((h.generation & GEN_MASK) << CAP_LOG2) | h.slot) as i32;
+                        let handle = h.handle();
                         if self.resolve_cap_name(name) != Some(handle) {
                             self.cap_names.push((name.clone(), handle));
                         }
@@ -27609,10 +27621,9 @@ impl Host {
             .table
             .iter()
             .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
-        let handle = slot as u32 | ((self.table[slot].generation & GEN_MASK) << CAP_LOG2);
         let data = child.self_module.as_ref().map_or(&[][..], |m| &m.data[..]);
         let lease = Lease {
-            budget: handle as i32,
+            budget: handle_of(slot as u32, self.table[slot].generation),
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
@@ -29430,7 +29441,7 @@ impl Host {
 
     /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
     /// table is full. The spawn path uses this rather than the panicking form: a guest chooses how
-    /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
+    /// many children it spawns, so a per-spawn grant that could exhaust the handle table would hand
     /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
     /// a lot of legitimate work).
     pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
@@ -30620,7 +30631,7 @@ impl Host {
     /// `Binding::JitCode` entry the guest can still `invoke`/`install`/`release`). Compaction must
     /// carry these (their trampoline pointers move, so the handle would dangle otherwise); a unit
     /// that is neither here nor occupying a table slot is dead and is reclaimed. Scans the
-    /// host-owned handle table — small (`CAP` = 256) and done only at a quiescent compaction point.
+    /// host-owned handle table — small (`CAP` = 1,024) and done only at a quiescent compaction point.
     pub fn jit_live_units(&self, domain: u32) -> Vec<u32> {
         let mut units: Vec<u32> = self
             .table
@@ -31629,9 +31640,7 @@ impl Host {
                 else {
                     continue;
                 };
-                let handle = |t: &[Slot], k: usize| {
-                    ((t[k].generation & GEN_MASK) << CAP_LOG2 | k as u32) as i32
-                };
+                let handle = |t: &[Slot], k: usize| handle_of(k as u32, t[k].generation);
                 let old = handle(&child.table, i);
                 child.table[j].entry = child.table[i].entry.take();
                 child.table[j].type_id = child.table[i].type_id;
@@ -31700,7 +31709,7 @@ impl Host {
             if st.entry.is_none() {
                 continue;
             }
-            let old_h = ((st.generation & GEN_MASK) << CAP_LOG2 | slot as u32) as i32;
+            let old_h = handle_of(slot as u32, st.generation);
             if keeps.as_ref().is_some_and(|k| !k.contains(&old_h)) {
                 continue;
             }

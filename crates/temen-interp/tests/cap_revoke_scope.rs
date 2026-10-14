@@ -18,7 +18,7 @@ const CAP_REVOKED: i64 = -9;
 /// `"o"`, detached by the record [`src`] appends at 17856 and paid from `budget`; then block reading stdin. The child resolves `"o"` — landing, in its own table, on the number the root's stdin has
 /// — sleeps 100 ms (so the root is parked), closes it, and returns the number. Only the root's own
 /// close may end the read, so the marker is up when it returns. Result:
-/// `marker * 1_000_000 + child_number * 1_000 - read_status`.
+/// `marker * 1_000_000_000 + child_number * 1_000 - read_status`.
 const SRC: &str = r#"
 memory 18
 data 16684 "o"
@@ -47,7 +47,7 @@ block 0 (v0: i32, vin: i32, vout: i32, vbud: i32, vmod: i32) {
   vm = i64.load vma
   vtj = thread.join vt
   vk = call.cap 6 1 (i32) -> (i64) v0 (vc)
-  vmil = i64.const 1000000
+  vmil = i64.const 1000000000
   vmm = i64.mul vm vmil
   vthou = i64.const 1000
   vkk = i64.mul vk vthou
@@ -128,7 +128,7 @@ fn a_close_in_one_domain_does_not_revoke_another_domains_parked_read() {
     let [Value::I64(r)] = r[..] else {
         panic!("one i64: {r:?}")
     };
-    let (marker, child_h, status) = (r / 1_000_000, r / 1_000 % 1_000, -(r % 1_000));
+    let (marker, child_h, status) = (r / 1_000_000_000, r / 1_000 % 1_000_000, -(r % 1_000));
     assert_eq!(
         child_h, hin as i64,
         "fixture: the child's \"o\" must share the root stdin's number (root in={hin} out={hout}, r={r})"

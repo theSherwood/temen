@@ -12572,7 +12572,7 @@ pub extern "C" fn temen_durable_thaw_resume(
             return 0;
         }
     };
-    // Recover the restored cap handles (never re-grant): AddressSpace then Clock, `(gen << 8) | slot`.
+    // Recover the restored cap handles (never re-grant): AddressSpace then Clock.
     let caps = match host.capture_durable_handles() {
         Ok(c) => c,
         Err(_) => {
@@ -12584,8 +12584,7 @@ pub extern "C" fn temen_durable_thaw_resume(
         set(STATUS_UNSUPPORTED);
         return 0;
     }
-    let handle = |i: usize| ((caps[i].generation << 8) | caps[i].slot) as i32;
-    let (t_space, t_clk) = (handle(0), handle(1));
+    let (t_space, t_clk) = (caps[0].handle(), caps[1].handle());
     let Some(prog) = bytecode::SharedProgram::compile(&m) else {
         set(STATUS_UNSUPPORTED);
         return 0;
