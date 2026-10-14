@@ -2,7 +2,7 @@
 // `Vcpu` FFI (`temen_par_run` → `PAR_TIERUP` → run the emitted `f{func}` → `temen_par_deliver_tierup`)
 // exactly as `worker.js` does, but on one thread so it runs fast under Node. Asserts the tier-up run
 // is byte-identical to the pure bytecode interpreter (`temen_run`) for the same guest — the same oracle
-// the native `vcpu_tierup.rs` test uses, now over the REAL emitted wasm through the real FFI.
+// the native `coop_tierup.rs` test uses, now over the REAL emitted wasm through the real FFI.
 //
 // Run: node browser/tierup.mjs
 import { readFileSync } from 'node:fs';
@@ -53,7 +53,7 @@ block 0 (v0: i64) {
 
 // func 0 calls the eligible leaf f1 once; f1 divides 100/(x-3) with x=3 → traps. The emitted `f1`
 // calls `env.trap` then `unreachable` → a catchable RuntimeError at the JS boundary, which worker.js
-// surfaces as a vCPU trap. Mirrors vcpu_tierup.rs SRC_TRAP.
+// surfaces as a vCPU trap.
 const SRC_TRAP = `
 func (i64) -> (i64) {
 block 0 (v0: i64) {

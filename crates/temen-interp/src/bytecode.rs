@@ -4070,10 +4070,21 @@ impl Reactor {
     }
 
     /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point). See [`VcpuReactor::window_layout`] for
-    /// why a reactor moment needs no continuation; the two reactors delegate to the one capture.
+    /// keyframe: time travel, a save-state, a branch point).
+    ///
+    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
+    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
+    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
+    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
+    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
+    ///
+    /// A page that aliases a §13 `SharedRegion` is captured as the region it names (#2051): a §12
+    /// save-state carries the region and re-aliases it, and a moment, which cannot, refuses such a
+    /// layout ([`Moment::capture`]). `None` for a memory-less module.
+    ///
+    /// [`Moment::capture`]: crate::moment::Moment::capture
     pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
+        Some(self.mem.as_ref()?.layout_snapshot())
     }
 
     /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window, its §13 pages
@@ -4083,30 +4094,16 @@ impl Reactor {
         restore_window_of(self.mem.as_mut(), layout, host)
     }
 
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
+    /// This window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
+    /// artifact records alongside the committed image so a thaw restores a window that can grow as far
+    /// again. `None` for a memory-less module.
     pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
+        let (_, _, reserved, _) = self.mem.as_ref()?.map_info();
+        Some(reserved.trailing_zeros() as u8)
     }
 }
 
-/// Capture a reactor's window, or `None` for a memory-less module. A page that aliases a §13
-/// `SharedRegion` is captured as the region it names (#2051): a §12 save-state carries the region and
-/// re-aliases it, and a moment, which cannot, refuses such a layout ([`Moment::capture`]).
-///
-/// [`Moment::capture`]: crate::moment::Moment::capture
-fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
-    Some(mem?.layout_snapshot())
-}
-
-/// A reactor window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
-/// artifact records alongside the committed image so a thaw restores a window that can grow as far
-/// again. `None` for a memory-less module.
-fn window_reserved_log2_of(mem: Option<&Mem>) -> Option<u8> {
-    let (_, _, reserved, _) = mem?.map_info();
-    Some(reserved.trailing_zeros() as u8)
-}
-
-/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]), each §13
+/// Reinstate `layout` into a live window (the write half of [`Reactor::window_layout`]), each §13
 /// page aliased back onto the region of `host` it names — the thaw of a save-state, whose restore
 /// rebuilt the regions on `host` (#2051). `false` with no window, or for a page naming no region of
 /// `host`.
@@ -4117,193 +4114,6 @@ fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout, host: &Host) -> 
             host.realias_regions(m, &layout.dense_prots())
         }
         None => false,
-    }
-}
-
-/// A persistent single-vCPU reactor driven through the **resumable [`Vcpu`]** — the vehicle the
-/// browser wasm-JIT **tier-up** rides (BROWSER.md § "wasm-JIT tier"). Like [`Reactor`], it keeps the
-/// guest window live across frames (globals, BSS, and the `vm_map`-grown heap, with its address-space
-/// commit state), but each frame runs on a `Vcpu` instead of the one-shot [`run`]: a direct `Call` to
-/// a [`with_jit_eligible`](Vcpu::with_jit_eligible) function surfaces as a [`VcpuEvent::TierUp`] the
-/// caller services (the browser runs the emitted `f{func}` on the raw window; a native driver runs the
-/// callee on the interpreter) instead of interpreting it. With no eligibility set it is a faithful,
-/// interpreter-only substitute for [`Reactor`] — the differential the reactor tests assert.
-///
-/// The window lives in the caller-provided `back` [`Region`] (a `Region::shared` over the host's
-/// linear memory in the browser; a leaked buffer natively), sized to hold the guest's grown heap. The
-/// `Host` is shared (a `Mutex<Host>`) so its capabilities — `display`/`keyboard`/`fs`, stdout —
-/// persist across frames and are serviced inline during each frame's `call.cap`s.
-pub struct VcpuReactor {
-    prog: VcpuProgram,
-    /// The live window, carried across per-frame vCPUs via [`Vcpu::take_mem`]. `None` only for a
-    /// memory-less module.
-    mem: Option<Mem>,
-    /// The tier-up eligibility bitmap (`None` ⇒ everything interprets — the pure-substitute mode).
-    eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 **paged tier-up**: the eligible set was emitted with the software page-check
-    /// (`compile_module_tierup_paged`). Frames then surface tier-up regardless of the window's
-    /// scalar representability, and each `TierUp` hands `service` the live [`MemMapInfo`] to build
-    /// its page-state table from ([`build_pagestate_table`]).
-    page_checked: bool,
-}
-
-impl VcpuReactor {
-    /// Open over the persistent window `back`: compile `m`, then run `_start` (func 0) once over a
-    /// freshly seeded + data-initialised window to bootstrap the guest, keeping the window live for
-    /// the per-frame [`frame`](VcpuReactor::frame) calls. `call.cap`s in `_start` (e.g. Doom's WAD
-    /// read through `fs`) are serviced inline against `host`. `Err` if `m` is outside the engine's
-    /// subset (`Malformed`) or `_start` traps.
-    pub fn open(
-        m: &Module,
-        back: std::sync::Arc<super::Region>,
-        host: &std::sync::Mutex<Host>,
-        start_args: &[Value],
-    ) -> Result<VcpuReactor, Trap> {
-        let prog = VcpuProgram::compile(m).ok_or(Trap::Malformed)?;
-        let mem;
-        {
-            let mut vcpu = Vcpu::new_root(&prog, 0, start_args, back, &[])?.with_shared_host(host);
-            // `_start` runs to completion in one `run`: `call.cap`s are serviced inline (shared host),
-            // and a reactor is single-vCPU with no tier-up during open — so no spawn/join/wait/JIT/
-            // tier-up event can occur (a `thread.spawn`ing guest is out of scope).
-            match vcpu.run() {
-                VcpuEvent::Done(_) => {}
-                VcpuEvent::Trapped(t) => return Err(t),
-                // Out of a reactor's scope, named rather than `_` (see `VcpuEvent`): a `_start` that
-                // spawns, joins, waits, JITs, tiers up, parks on a cap or on stdin is not a reactor.
-                VcpuEvent::TierUp { .. }
-                | VcpuEvent::Spawn { .. }
-                | VcpuEvent::Join { .. }
-                | VcpuEvent::Wait { .. }
-                | VcpuEvent::Notify { .. }
-                | VcpuEvent::JitInstall { .. }
-                | VcpuEvent::JitUninstall { .. }
-                | VcpuEvent::JitInvoke { .. }
-                | VcpuEvent::InstantiateDetached { .. }
-                | VcpuEvent::CapPending { .. }
-                | VcpuEvent::StdinPark => return Err(Trap::Malformed),
-            }
-            mem = vcpu.take_mem();
-        }
-        Ok(VcpuReactor {
-            prog,
-            mem,
-            eligible: None,
-            page_checked: false,
-        })
-    }
-
-    /// Enable wasm-JIT tier-up: a direct `Call` to a function `f` with `eligible[f] == true` surfaces
-    /// as [`VcpuEvent::TierUp`] for the `frame` caller to service. `None` (the default) interprets
-    /// everything — the faithful [`Reactor`] substitute.
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> VcpuReactor {
-        self.eligible = Some(eligible);
-        self
-    }
-
-    /// #750 paged tier-up: mark the eligible set as page-checked (see [`Vcpu::with_jit_page_checked`]).
-    /// Each frame's `TierUp` then carries the live [`MemMapInfo`] to `service` so the driver can
-    /// refresh its page-state table ([`build_pagestate_table`]) before running emitted code.
-    pub fn with_jit_page_checked(mut self) -> VcpuReactor {
-        self.page_checked = true;
-        self
-    }
-
-    /// Run `func(args)` on the live window for one frame, servicing host caps inline against `host`.
-    /// A [`VcpuEvent::TierUp`] is handed to `service(func, argv, mapped, map_info)` — return the
-    /// callee's i64 result slots (or an `Err(Trap)` to propagate the emitted region's trap).
-    /// `mapped` is the window's scalar committed extent at call entry: `service` MUST write it to
-    /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-    /// `map_info` is `Some` only on a [`with_jit_page_checked`](Self::with_jit_page_checked)
-    /// reactor: the live page map, from which `service` builds its page-state table
-    /// ([`build_pagestate_table`]) and writes the returned coverage to `"mapped"` **instead** of
-    /// the event's value (#750). With no eligibility set, `service` is never called. The window
-    /// persists after the call (reclaimed for the next frame).
-    pub fn frame<F>(
-        &mut self,
-        func: FuncIdx,
-        args: &[Value],
-        host: &std::sync::Mutex<Host>,
-        mut service: F,
-    ) -> Result<Vec<Value>, Trap>
-    where
-        F: FnMut(u32, &[i64], u64, Option<MemMapInfo>) -> Result<Vec<i64>, Trap>,
-    {
-        let mem = self.mem.take();
-        let result;
-        let reclaimed;
-        {
-            let mut vcpu =
-                Vcpu::with_mem(&self.prog, func, args, mem, Host::new())?.with_shared_host(host);
-            if let Some(e) = &self.eligible {
-                vcpu = vcpu.with_jit_eligible(e.clone());
-            }
-            if self.page_checked {
-                vcpu = vcpu.with_jit_page_checked();
-            }
-            result = loop {
-                match vcpu.run() {
-                    VcpuEvent::Done(v) => break Ok(v),
-                    VcpuEvent::Trapped(t) => break Err(t),
-                    VcpuEvent::TierUp { func, argv, mapped } => {
-                        // Paged reactors snapshot the live page map for the driver's table build;
-                        // computed only here (page state is frozen while emitted code runs).
-                        let info = if self.page_checked {
-                            vcpu.mem_map_info()
-                        } else {
-                            None
-                        };
-                        match service(func, &argv, mapped, info) {
-                            Ok(vals) => vcpu.deliver_tierup(&vals),
-                            Err(t) => vcpu.deliver_tierup_trap(t),
-                        }
-                    }
-                    // A reactor frame is one vCPU over one window, serviced only for tier-up: it
-                    // runs no threads or futex waits, spawns no §14 children, hosts no §22 guest
-                    // JIT, and has no embedder to complete a host call or feed a blocking stdin.
-                    VcpuEvent::Spawn { .. }
-                    | VcpuEvent::Join { .. }
-                    | VcpuEvent::Wait { .. }
-                    | VcpuEvent::Notify { .. }
-                    | VcpuEvent::InstantiateDetached { .. }
-                    | VcpuEvent::JitInstall { .. }
-                    | VcpuEvent::JitUninstall { .. }
-                    | VcpuEvent::JitInvoke { .. }
-                    | VcpuEvent::CapPending { .. }
-                    | VcpuEvent::StdinPark => break Err(Trap::Malformed),
-                }
-            };
-            reclaimed = vcpu.take_mem();
-        }
-        self.mem = reclaimed;
-        result
-    }
-
-    /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
-    /// keyframe: time travel, a save-state, a branch point).
-    ///
-    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
-    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
-    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
-    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
-    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
-    ///
-    /// `None` when there is nothing faithfully capturable — see [`window_layout_of`].
-    pub fn window_layout(&self) -> Option<MemLayout> {
-        window_layout_of(self.mem.as_ref())
-    }
-
-    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window — the window
-    /// this reactor keeps across frames, so the next `frame` runs over the restored state — its §13
-    /// pages aliased back onto the regions `host` holds. `false` for a memory-less module (nothing to
-    /// restore into), or a page naming no region of `host`.
-    pub fn restore_window(&mut self, layout: &MemLayout, host: &Host) -> bool {
-        restore_window_of(self.mem.as_mut(), layout, host)
-    }
-
-    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
-    pub fn window_reserved_log2(&self) -> Option<u8> {
-        window_reserved_log2_of(self.mem.as_ref())
     }
 }
 
@@ -4986,15 +4796,6 @@ impl<'p> Vcpu<'p> {
     /// identical between two tier-ups with no intervening page-op). `0` for a memory-less module.
     pub fn mem_map_version(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.map_version())
-    }
-
-    /// Reclaim this vCPU's live guest window after it finishes — the seam a **reactor** uses to keep
-    /// the window (globals, BSS, and the `vm_map`-grown heap, with its address-space commit state)
-    /// alive across per-frame vCPUs: build a vCPU over the persistent [`Mem`] with
-    /// [`with_mem`](Vcpu::with_mem), run one frame to `Done`, then `take_mem` it back for the next
-    /// frame. `None` for a memory-less module (or if already taken).
-    pub(crate) fn take_mem(&mut self) -> Option<Mem> {
-        self.mem.take()
     }
 
     /// Enable **blocking stdin** on this vCPU's owned powerbox (a persistent interactive session). A
