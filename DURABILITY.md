@@ -922,7 +922,7 @@ module digest for a host-supplied re-grant at thaw) are the remaining §14 gap.
 *(The §14 surface itself has since grown — PROCESS.md's S-slices. The grant-carrying instantiate
 forms (S2 `instantiate_granted` / `instantiate_named`, Stage-1 `instantiate_module_named`) **failed
 closed (`-EINVAL`) under a durable JIT run** — a granted child's separate powerbox host had no freeze
-story, the same exclusion as the separate-module child. All three are retired (#1867); they trap
+story, the same exclusion as the separate-module child. All three are retired (#1867, #2065); they trap
 `CapFault` on every run. And
 `self.attest` (S6) stamps a nested child `freeze_exposed = durable`, adding one follow-up here: a
 durable freeze/thaw must capture + restore the child's `Attestation` — the thaw re-attach currently

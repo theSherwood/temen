@@ -31,10 +31,11 @@ glue, not new substrate**:
   grants a `Module` capability (`Host::grant_module`); on the JIT the child is
   resolved through `temen_run::module_resolver` (never guest-reachable) and
   compiled **at instantiate** — §14's "nesting cost paid at setup".
-- **Grants into children** — `instantiate_granted` (op 8) / `instantiate_named`
-  (op 11) re-grant the parent's own capabilities (stdout/stderr/stdin) into the
-  child, discovered by name via `self.resolve` (`instantiate_granted.rs`,
-  `instantiate_named.rs`). This is stdio inheritance.
+- **Grants into children** — an op-17 spawn record's grant list re-grants the
+  parent's own capabilities (stdout/stderr/stdin) into the child, discovered by
+  name via `self.resolve` (`instantiate_granted.rs`); `grant` (op 19) adds one to
+  a running child. This is stdio inheritance. (Ops 8 and 11 did this before
+  op 17 folded them in, #2065.)
 - **argv delivery** — a child runs over the **parent's shared window backing**;
   the carve is not zeroed, so the parent seeds `argv` bytes into the child's
   carve before `instantiate` and the child reads them at low offsets. (The
@@ -112,6 +113,8 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
      argument at runtime* (`codegen_ir.c` §7) and cannot emit `self.resolve`,
      so `applet(inst, addrspace, stdout_h)` writing through `stdout_h` is the
      natural form. Proven with a seeded-argv echo, differential interp==JIT.
+     *(Retired with op 8, #2065: chibicc has since gained `__vm_resolve`, so a
+     C child finds its `stdout` by name.)*
 4. **exec a compiled-C command (pure status)** *(done —
    `stage1_exec_command.rs`)* — a "shell" parent spawns a *separate*, unmodified
    `int main(int argc, char **argv)` C program via `instantiate_module` (op 5),

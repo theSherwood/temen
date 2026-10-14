@@ -1532,7 +1532,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         cap_thunk,
         cap_ctx,
         None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
+        None, // no child-powerbox hooks: a spawn is an inert CapFault
     )
 }
 
@@ -1544,8 +1544,9 @@ pub fn compile_and_run_capture_reserved_with_host(
 /// # Safety
 /// As [`compile_and_run_capture_reserved_with_host`]; `resolve_module` (with `cap_ctx`) must honour
 /// the [`ModuleResolver`] contract — in particular the resolved views must outlive the run.
-/// `grant_child` (PROCESS.md S2 JIT parity) supplies the `instantiate_granted` (op 8) child-powerbox
-/// builder/releaser; `None` ⇒ op 8 is an inert `CapFault`. Both hooks share `cap_ctx` as their host.
+/// `grant_child` (PROCESS.md S2 JIT parity) supplies the hooks that build and release a detached
+/// child's powerbox ([`GrantChildHooks`]); `None` ⇒ a spawn is an inert `CapFault`. Both hooks share
+/// `cap_ctx` as their host.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_and_run_capture_reserved_with_host_ex(
     m: &IrModule,
@@ -2212,7 +2213,7 @@ struct RunOpts<'a> {
     sub: Option<SubWindow>,
     /// §14 module resolver for a guest `instantiate` of a separate-module child.
     resolve_module: Option<ModuleResolver>,
-    /// op-8 `instantiate_granted` child-powerbox builder/releaser (PROCESS.md S2).
+    /// The detached-child powerbox builder/releaser ([`GrantChildHooks`], PROCESS.md S2).
     grant_child: Option<GrantChildHooks>,
     /// §5 async kill-path cell, host-written and polled at safepoints.
     interrupt: Option<*const AtomicU64>,
@@ -2288,9 +2289,9 @@ fn run_inner(
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
     )?;
-    // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
-    // §14 nursery before the guest runs (the nursery only exists when the module holds an
-    // `Instantiator`). `None` leaves op 8 an inert `CapFault`.
+    // PROCESS.md S2 (JIT parity): install the child-powerbox host callbacks into the §14 nursery
+    // before the guest runs (the nursery only exists when the module holds an `Instantiator`). `None`
+    // leaves a spawn an inert `CapFault`.
     // Through the one setter, so the nursery hooks and the domain's lane are installed together
     // (they come from the same host and must agree).
     cm.set_grant_child_hooks(grant_child);

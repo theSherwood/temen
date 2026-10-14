@@ -12,16 +12,13 @@
 //! capability seam (generic `call.cap` + `self.*`, via `host.cap_dispatch_slots`); §12 **fibers**
 //! (`cont.*`/`suspend`, cooperative single-vCPU switching in [`step_vcpu`]); and §12 **threads**
 //! (`thread.spawn`/`join` + `memory.wait`/`notify`) on a cooperative single-threaded scheduler
-//! ([`drive`]) over one shared `Mem`; and §14 **coroutines** (`Instantiator.spawn_coroutine`/`resume`
-//! + `Yielder.yield`, inline-driven over a confined `nested_view` child window — including the
-//! separate-**module** and **demand** (fault-driven-yield, lazy-paged) variants) and §14 **executor
-//! children** (`Instantiator.instantiate`/`join` + the separate-module variant, scheduler-driven over
-//! a confined child env with an attenuated `Instantiator`+`AddressSpace` powerbox and a `quota`
-//! sub-budget) — §14 is fully covered (ops 0–7). Faithful for the
-//! interleaving-invariant programs the oracle uses; and §22 **guest-driven JIT units**
-//! (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an installed unit) over a
-//! multi-module [`Domain`] (a runtime dispatch table spanning `mods`; `invoke` runs a unit nested
-//! over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
+//! ([`drive`]) over one shared `Mem`; and §14 **executor children** (the `Instantiator`'s op-17
+//! spawn and its `join`/`poll`/`detach`/`kill`/`child_offer`/`grant`, scheduler-driven over a child
+//! env with a window of its own and an attenuated `Instantiator`+`AddressSpace` powerbox, paid from a
+//! `Budget`). Faithful for the interleaving-invariant programs the oracle uses; and §22
+//! **guest-driven JIT units** (`Jit.install`/`uninstall`/`invoke` + cross-module `call.dyn` into an
+//! installed unit) over a multi-module [`Domain`] (a runtime dispatch table spanning `mods`;
+//! `invoke` runs a unit nested over the shared window/table). Hot scalar/memory ops dispatch inline; the SIMD/`v128`/fence long
 //! tail is delegated to the reference [`super::eval_inst`]. Threads and fibers compose (the fiber
 //! registry is run-shared, so fibers migrate across vCPUs); and **tail calls** (`return_call`/
 //! `return_call.dyn`, reusing the current window — O(1) deep tail recursion); §GC **`gc.roots`**
@@ -37,8 +34,8 @@
 //! via `run_fast`/`run_with_host_fast` (and, with a trap-time backtrace, `run_with_host_fast_traced`).
 //! Correctness is gated by exact-equality harnesses against the tree-walker (`bytecode_diff.rs` — which
 //! also checks trap-backtrace parity on every trapping generated module, `bytecode_{caps,fibers,threads,
-//! coroutines,instantiate,separate_module,demand_coroutine,tailcall,debug,traced,gc_roots,durable,
-//! dynlink}.rs`; `gc_roots` checks soundness rather than equality; `durable` checks freeze/thaw artifact
+//! instantiate,separate_module,tailcall,debug,traced,gc_roots,durable,dynlink}.rs`; `gc_roots` checks
+//! soundness rather than equality; `durable` checks freeze/thaw artifact
 //! + round-trip equality; `traced` checks trap-time backtrace `IrPc`-equality with `run_with_host_traced`).
 //!
 //! Like the reference interpreter, it is total and panic-free: every slot/pc index is in range by
@@ -633,9 +630,10 @@ enum Op {
         want_results: Box<[ValType]>,
     },
     Unreachable,
-    /// A `CapFault` trap: an `Instantiator` op the oracle has no arm for, which it refuses after the
-    /// handle resolves (a forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5
-    /// and 13, #1867) and the deleted coroutine ops (#2069).
+    /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
+    /// (`temen_ir::instantiator_contract`), which the oracle refuses after the handle resolves (a
+    /// forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5 and 13, #1867), `wait`
+    /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
     /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
@@ -2350,20 +2348,14 @@ fn compile_module_with(
     escape: bool,
     mut memo: Option<&mut FuncMemo>,
 ) -> Option<Compiled> {
-    // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
-    // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
-    // would need the child to participate in those seams (a coroutine child can use `cont.*`/`thread.*`
-    // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
-    // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
-    // are different: they run on the scheduler like threads, not inline — so they classify as
-    // scheduler-driven, not as coroutines — and they combine with `cont.*` fibers too: every driver
-    // gives each confined child domain its own fiber registry (the cooperative `ChildEnv::fibers`,
-    // which the parallel driver shares, and the debugger's `DbgEnv::fibers`), as the oracle does. Plain coroutine /
-    // fiber / thread / instantiate modules are each fine, as are instantiate+thread,
-    // instantiate+coroutine and instantiate+fiber.
+    // §14 **executor children** (the `Instantiator`'s spawn and `join`) run on the scheduler like
+    // threads, and they combine with `cont.*` fibers: every driver gives each child domain its own
+    // fiber registry (the cooperative `ChildEnv::fibers`, which the parallel driver shares, and the
+    // debugger's `DbgEnv::fibers`), as the oracle does. Fiber / thread / instantiate modules are each
+    // fine, as are instantiate+thread and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
-    // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
+    // calling vCPU's continuation (`vt.active` + `vt.chain`) **plus the run-shared
     // fiber registry** (`fibers`, scanned in [`step_vcpu`]'s `Outcome::GcRoots` arm) — the exact
     // scope the tree-walker's op documents ("the caller's own live frames, the parked root, and every
     // registry fiber's frames", `crates/temen/tests/gc_roots.rs`). Neither engine scans a *sibling
@@ -2372,12 +2364,11 @@ fn compile_module_with(
     // `crates/temen/tests/gc_quiesce.rs`); JACL's roots live in the migratable fibers the shared
     // registry covers. So `gc.roots` + `thread.*` is **not** vetoed — the criterion for this op is
     // soundness (`tw ⊆ bc`, GC.md §3.2), which holds because the bytecode scope is a superset of the
-    // tree-walker's. (`gc.roots` + fibers / coroutines was always fine — those continuations are
-    // scanned.)
+    // tree-walker's. (`gc.roots` + fibers was always fine — those continuations are scanned.)
     //
     // §3.6 (I36 slice 1): a **serving** module is admitted natively only when no handler could
     // park or unwind mid-dispatch ([`serve_qualifies`]) — any park-capable seam anywhere in the
-    // module (futex waits / threads, fibers, coroutines, nested instantiate, setjmp/longjmp — a
+    // module (futex waits / threads, fibers, nested instantiate, setjmp/longjmp — a
     // `longjmp` out of a handler would unwind past the serve linkage — blocking stream reads,
     // spawn-bound imports, gc.roots) falls the whole module back to the tree-walk oracle, whose
     // serve arm has the fiber-park machinery (slice 5b).
@@ -4648,8 +4639,9 @@ impl<'p> Vcpu<'p> {
     /// Like [`new_root`](Vcpu::new_root), but the vCPU carries a **powerbox** (its own `Host`) instead
     /// of the deny-all default — the seam §14 needs (THREADS.md 4c-domain §14-D). Unlike §22 JIT
     /// (whose ops hand the raw cap handle to the host to resolve), §14 resolves its `Instantiator`
-    /// authority **in-Vm** during `resume`, so the grant must live in this vCPU's own host; with it,
-    /// `spawn_coroutine_module` is then serviced entirely inside [`run`](Vcpu::run) (no host event).
+    /// authority **in-Vm**, so the grant must live in this vCPU's own host: the engine admits a spawn
+    /// against it and hands the host only the admitted child to run
+    /// ([`VcpuEvent::InstantiateDetached`]).
     /// Grant only the non-I/O caps (`Instantiator`/`Module`) — the resumable path still has no host
     /// I/O, so an I/O `call.cap` remains an inert `CapFault`.
     pub fn new_root_with_powerbox(
@@ -5120,9 +5112,10 @@ impl<'p> Vcpu<'p> {
             self.pending.is_none(),
             "deliver the last event before resuming"
         );
-        // Loop so §14 `spawn_coroutine_module` (serviced in-Rust against this vCPU's own powerbox)
+        // Loop so a stop serviced in-Rust against this vCPU's own powerbox (a §14 `child_offer`)
         // never surfaces to the orchestrating host — it only ever sees the multi-vCPU events
-        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `Instantiate` (+ `done`/`trap`).
+        // `spawn`/`join`/`wait`/`notify`, the §22 JIT events, and §14 `InstantiateDetached` (+
+        // `done`/`trap`).
         loop {
             // A §14 confined child dispatches through its OWN domain (own natural table, no parent
             // install slots); everything else through the program's shared one. Host access goes

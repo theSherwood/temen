@@ -123,11 +123,10 @@ pub mod cap_id {
     /// Host-granted (non-ambient), like `exec`/`fs`.
     pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
-    /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
-    /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
-    /// spawn a child domain running *that* module's code confined to a carve of the holder's window
-    /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
-    /// authority). It has no directly callable ops (`call.cap` on it is an inert `CapFault`).
+    /// confers only the authority to name it in an `Instantiator` spawn (op 17's record), which runs
+    /// *that* module's code as a child domain in a window of its own — the "plugin-in-plugin" story:
+    /// a guest can only instantiate modules it was given (no ambient authority). It has no directly
+    /// callable ops (`call.cap` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
     // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
     // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by

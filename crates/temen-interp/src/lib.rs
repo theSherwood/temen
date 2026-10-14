@@ -23447,7 +23447,7 @@ pub struct Host {
     /// PROCESS.md S2: optional **shared** stdout/stderr sinks. `None` (default) ⇒ writes go to the
     /// local `stdout`/`stderr` Vec (the existing public API — untouched for hosts that never share).
     /// `Some` ⇒ writes go to the shared buffer instead — set on a **child** host whose stdout/stderr
-    /// was re-granted from a parent (`instantiate_granted`), so the child's output reaches the same
+    /// was re-granted from a parent (a spawn record's grant list), so the child's output reaches the same
     /// buffer the granting embedder observes (POSIX stdio inheritance). Promoted lazily by
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
     out_sink: Option<Arc<Mutex<HostBuffer>>>,
@@ -28264,7 +28264,7 @@ impl Host {
     }
 
     /// PROCESS.md S2 — promote `stdout` to a **shared** sink and return a handle to it, so a child
-    /// host can be pointed at the same buffer (stdio inheritance via `instantiate_granted`).
+    /// host can be pointed at the same buffer (stdio inheritance through a spawn record's grant list).
     /// Idempotent (a second call returns the same sink). After promotion, new writes go to the sink;
     /// read the effective bytes via [`Host::stdout_bytes`] (`stdout` itself no longer receives them).
     /// #2306: what every writer appends to it is charged to this domain's node, the domain its stdout
@@ -30964,7 +30964,7 @@ impl Host {
     }
 
     /// PROCESS.md S2 — resolve `handle` to its `(type_id, binding)` for **re-granting into a child**
-    /// (`Instantiator.instantiate_granted`), so a §14 child is not born destitute. Only a
+    /// (a spawn record's grant list), so a §14 child is not born destitute. Only a
     /// **coordinate-free, self-contained** capability qualifies — one a fresh child `Host` can hold
     /// as-is: `Stream` (stdio), `Exit`, `Clock`. Refused (`CapFault`), deliberately:
     /// - **index-carrying** caps (`SharedRegion`/`Module`/`Blocking`/`HostProc*`) whose index
@@ -30995,8 +30995,8 @@ impl Host {
     /// points the child's sink at the parent's shared buffer (stdio inheritance), so the child's output
     /// reaches the granting embedder rather than the child's discarded host buffer.
     ///
-    /// This is the child-host construction the interpreter's own `instantiate_granted` (op 8) inlines,
-    /// factored out so the **JIT** backend can build the *same* child powerbox host-side (via
+    /// This is the child-host construction the retired `instantiate_granted` (op 8) inlined, factored
+    /// out so the **JIT** backend could build the *same* child powerbox host-side (via
     /// `temen_run::grant_child_build`) and keep both backends in differential lockstep — the child sees an
     /// identical set of handles and the same shared sink.
     ///

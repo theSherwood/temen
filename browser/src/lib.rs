@@ -12518,61 +12518,6 @@ block 0 (vsp: i64, varg: i64) {
     }
 }
 
-/// Self-contained coroutine probe (`wasmtime --invoke run_coroutine`): a §14 coroutine confined to a
-/// sub-window is resumed three times, yielding 100, 210, then returning 1019. Returns
-/// `100 + 210 + 1019 + RETURNED*1_000_000 = 1001329` iff `spawn_coroutine`/`resume`/`yield` work on
-/// this target, else `-1`.
-#[no_mangle]
-pub extern "C" fn run_coroutine() -> i64 {
-    const CORO: &str = r#"memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 1
-  v2 = i64.const 65536
-  v3 = i64.const 16
-  v4 = i64.const 0
-  v5 = call.cap 6 2 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
-  v6 = i64.const 0
-  v7, v8 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v6)
-  v9 = i64.const 10
-  v10, v11 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v9)
-  v12 = i64.const 20
-  v13, v14 = call.cap 6 3 (i32, i64) -> (i32, i64) v0 (v5, v12)
-  v15 = i64.add v8 v11
-  v16 = i64.add v15 v14
-  v17 = i64.extend_i32_s v13
-  v18 = i64.const 1000000
-  v19 = i64.mul v17 v18
-  v20 = i64.add v16 v19
-  return v20
-  }
-}
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
-  v3 = i32.const 7
-  i32.store8 v2 v3
-  v4 = i64.const 100
-  v5 = call.cap 7 0 (i64) -> (i64) v1 (v4)
-  v6 = i64.const 200
-  v7 = i64.add v6 v5
-  v8 = call.cap 7 0 (i64) -> (i64) v1 (v7)
-  v9 = i64.const 999
-  v10 = i64.add v9 v8
-  return v10
-  }
-}
-"#;
-    let Ok(m) = temen_text::parse_module(CORO) else {
-        return -1;
-    };
-    match instantiate_exec(&m) {
-        (STATUS_OK, v) => v,
-        _ => -1,
-    }
-}
-
 /// Self-contained scalar-float probe (`wasmtime --invoke run_float`): reinterpret the f64 bits of
 /// `4.0`, take `sqrt(|·|)`, and return the result's i64 bits — `4611686018427387904` (the bits of
 /// `2.0`) iff f64 reinterpret/abs/sqrt round-trip bit-exactly on this target, else `-1`.
