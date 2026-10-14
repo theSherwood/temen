@@ -32935,10 +32935,13 @@ impl Host {
                         let len = *args.get(1).unwrap_or(&0) as u64;
                         let gone = ClassChange::Every(PageClass::Own(0));
                         self.page_op(mem, win_off, len, Commits::Nothing, gone, |h, m| {
-                            if let Some(hook) = &h.region_hook {
+                            let r = m.unmap(win_off, len);
+                            // As `region_map`'s: the hook hears of a span only once the op took
+                            // it, so a span outside the window never reaches it (#2400).
+                            if let (0, Some(hook)) = (r, &h.region_hook) {
                                 hook(win_off, len, None);
                             }
-                            m.unmap(win_off, len)
+                            r
                         })
                     }
                     2 => backing.size() as i64,
