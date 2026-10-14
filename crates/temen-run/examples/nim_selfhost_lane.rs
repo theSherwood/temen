@@ -1,7 +1,7 @@
 //! **The self-hosted nimony lane** (#1609, #763): nimony's own toolchain, compiled to Temen with
 //! **no C compiler anywhere**, builds a nim program on Temen, and the program runs.
 //!
-//! Every tool is a `.temen` module built by `build_nim_hello_temen --posix` (nimony → Leng →
+//! Every tool is a `.temen` module built by `build_nim_temen --posix` (nimony → Leng →
 //! `temen-leng`), bound to one shared `temen_posix` personality, so they all see one memfs.
 //!
 //! ```text
@@ -282,7 +282,7 @@ fn run_program(
 /// directory, `lib/` in it — so both record the same paths, relative and absolute alike (nimony
 /// writes a compile-time evaluation program's imports and output file absolute). And native's
 /// phases are the ones **nimony** built natively from the same sources as these Temen builds
-/// (`build_nim_hello_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
+/// (`build_nim_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
 /// own phases are built by classic Nim, a different compiler whose hash tables iterate in a
 /// different order, and hexer's output shows it (#1753).
 fn expect_native(posix: &temen_posix::Posix, cache: &str) {
@@ -371,7 +371,7 @@ fn main() {
     let hexer_p = need(flag("--hexer"), "--hexer");
     let link_p = need(flag("--temen-link"), "--temen-link");
     // The prebuilt guest libc (`snprintf`, `strtod`, libm): what `temen-link` links a program
-    // against, found where `build_nim_hello_temen` finds it.
+    // against, found where `build_nim_temen` finds it.
     let libc_p = flag("--libc")
         .or_else(|| std::env::var("TEMEN_PG_LIBC").ok())
         .unwrap_or_else(|| "browser/web/assets/pg_libc.temeno".to_string());

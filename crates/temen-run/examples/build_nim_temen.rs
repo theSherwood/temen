@@ -1,24 +1,20 @@
-//! **Build the `nim_hello.temen` playground asset** — a real Nim program compiled to a runnable
-//! powerbox `.temen` through the whole nimony → temen-leng pipeline, the analog of the chibicc /
-//! `temen-leng` asset lanes but for a *compiled Nim program that runs* (not a compiler).
+//! **Build a Nim program into a runnable `.temen`** through the whole nimony → temen-leng pipeline.
+//! `scripts/nim-toolchain.sh` builds nimony's own tools with it, for the self-hosted lane and the
+//! playground's nim card.
 //!
 //! Pipeline: `nimony c` (→ nifler → nimony → hexer, then hexer's dead-code elimination) emits the
 //! program's modules as DCE'd Leng — the `.c.nif`s `nimony t` hands `temen-link` — then
-//! `temen_leng::link_nim` links them on the **capability edge** (`Edge::Caps`: compute leaves → shim,
-//! fd 0/1/2 → the host's `stream_read`/`stream_write`/`stderr` caps, the exit status → `exit`), and
-//! the merged powerbox module is verified and re-serialized with `temen_encode::encode_module` — the
-//! browser-loadable form the playground's `temen_run_onramp` runs (the host grants its streams, so
-//! the program prints for real).
+//! `temen_leng::link_nim` links them on one of Nim's two bottom edges: the **capability edge** by
+//! default (`Edge::Caps`: compute leaves → shim, fd 0/1/2 → the host's `stream_read`/`stream_write`/
+//! `stderr` caps, the exit status → `exit`), or the **POSIX edge** with `--posix`. The merged module is
+//! verified and re-serialized with `temen_encode::encode_module`.
 //!
 //! ```text
 //! NIMONY_BIN=<abs>/nimony/bin NIM_BIN=<dir of nim> \
-//!   cargo run --release -p temen-run --example build_nim_hello_temen -- \
-//!     crates/temen-run/demos/nim_hello/hello.nim browser/web/assets/nim_hello.temen
+//!   cargo run --release -p temen-run --example build_nim_temen -- [--posix] <prog.nim> <out.temen>
 //! ```
 //!
 //! Needs the nimony toolchain (the vendored submodules, built by `scripts/ci/provision-nimony.sh`).
-//! Re-run + commit the asset whenever the IR/ABI/encoder or the bridge changes — the same
-//! code-coupled asset discipline as `chibicc.temen` / `temen-leng.temen`.
 
 use std::path::Path;
 use std::process::Command;
@@ -67,7 +63,7 @@ fn main() {
     };
     let [nim, out] = positional.as_slice() else {
         panic!(
-            "usage: build_nim_hello_temen [--posix] [--root <tree>] [--nimcache <dir>] <prog.nim> \
+            "usage: build_nim_temen [--posix] [--root <tree>] [--nimcache <dir>] <prog.nim> \
              <out.temen>"
         );
     };
