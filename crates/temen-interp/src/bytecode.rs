@@ -2534,6 +2534,11 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             nslots += view.results(inst) as u32;
         }
     }
+    // #2353 — one slot past every value's: the `dst` of an instruction that defines none. A driver
+    // answering such a call later (a `fork`'s return-twice value, a parked call's result) writes it
+    // here, where no value lives, not over the slot of the value defined next, nor past the frame.
+    let discard = nslots;
+    nslots += 1;
     let mut block_pc = vec![0u32; f.blocks.len()];
     let mut ops: Vec<Op> = Vec::new();
     // Debug reverse map (Slice 1c-3), built **incrementally** alongside `ops` (was a positional
@@ -2549,7 +2554,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
         let g = |local: u32| base[bi] + local; // operand: block-local index -> frame slot
         let mut local = b.params.len() as u32;
         for (i, inst) in b.insts.iter().enumerate() {
-            let dst = base[bi] + local;
+            let dst = match view.results(inst) {
+                0 => discard,
+                _ => base[bi] + local,
+            };
             local += view.results(inst) as u32;
             ops.push(compile_inst(inst, dst, base[bi], view, &g)?);
             src.push(Some((bi as u32, i as u32)));
@@ -20584,7 +20592,11 @@ mod func_memo_tests {
             2,
             "the same module again reuses both functions"
         );
-        assert_eq!(again.progs[0].nslots, 1);
+        assert_eq!(
+            again.progs[0].nslots,
+            1 + 1,
+            "its value's slot and the discard slot"
+        );
         let changed = compile_module_memo(&two, &[], None, &mut memo).unwrap();
         assert_eq!(
             memo.reused(),
@@ -20593,7 +20605,7 @@ mod func_memo_tests {
         );
         let fresh = compile_module(&two, &[], None).unwrap();
         assert_eq!(changed.progs[0].nslots, fresh.progs[0].nslots);
-        assert_eq!(changed.progs[0].nslots, 2);
+        assert_eq!(changed.progs[0].nslots, 2 + 1);
     }
 
     /// A `call.dyn` whose signature's parameters change keeps its result count, so only the logged

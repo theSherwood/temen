@@ -2508,7 +2508,11 @@ child's grants is exactly the party positioned to observe their use.
   back as it shrinks or goes. File descriptors are the process's to share, as its
   mappings and address space are: each one a guest causes holds a slot of a pool
   over the soft `RLIMIT_NOFILE`, less a host reserve, while it is open, and one
-  past it is `-EMFILE`.
+  past it is `-EMFILE`. A stack an engine keeps in host memory (the bytecode
+  engine's register file) is `mem` past the `FIBER_STACK` its vCPU's charge pays
+  for (#2336). The `cap_abi` fuzz target holds the whole surface to this: random
+  capability calls against a default powerbox under small budgets, where a host
+  panic, an abort or an outsized allocation is a find (#2353).
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +

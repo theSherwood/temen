@@ -123,7 +123,12 @@ the node of the domain the capability's state was granted to, and every ancestor
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling
 (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed back as it shrinks or
 goes (#2306). A descriptor a guest causes holds one of the process's pool over its soft
-`RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A
+`RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A stack an engine keeps in
+host memory (the bytecode engine's register file) is `mem` of its vCPU's domain past the
+`FIBER_STACK` the vCPU's own charge pays for, plus its one `maps` from 128 KiB, and growing past a
+ceiling is `StackOverflow` (#2336). What a capability keeps per guest with no budget dimension of
+its own has a fixed bound and an errno past it: a POSIX process's descriptors, environment and the
+personality's process table (#2306, #2345), a spawn's grant list (#2349). A
 fiber `cont.new` makes is `FIBER_STACK` (256 KiB) of its domain's `mem` while it lives: charged to
 the domain's node and every ancestor, `FiberFault` past a ceiling, and handed back when the fiber
 returns or its domain ends. A freeze hands it back as it flattens the fiber, and the thaw re-charges

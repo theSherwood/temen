@@ -611,6 +611,16 @@ struct MemFile {
 /// descriptor numbers never size the host's table.
 const FD_MAX: usize = 1024;
 
+/// #2345 — the most a process's environment holds: Linux's default `ARG_MAX`, which bounds the
+/// environment an `execve` may pass. Each variable costs a [`TABLE_ENTRY`] besides its name and
+/// value, so their number is bounded too; a `setenv` past it is `-ENOMEM`.
+const ARG_MAX: u64 = 2 << 20;
+
+/// #2345 — the most processes the personality's table holds, live and unreaped together: Linux's
+/// default `pid_max`. A zombie stays until its parent reaps it, so a `fork` or `posix_spawn` past it
+/// is `-EAGAIN`, as one past a user's process limit is.
+const PID_MAX: usize = 32768;
+
 /// #2306 — the most connections a listener holds unaccepted: Linux's `SOMAXCONN`. A loopback
 /// `connect` past them is refused (`-ECONNREFUSED`).
 const SOMAXCONN: usize = 4096;
@@ -2756,6 +2766,10 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             // The copies `getenv` handed out lived in that heap.
             p.env_ptrs.clear();
         }
+        // #2345 — the old image's handler frames are gone with it, so none can return to restore
+        // the mask it saved: an exec from inside a handler left its entry behind for good. The mask
+        // itself survives the exec, as POSIX keeps it.
+        p.handler_mask_stack.clear();
         // Every adopted pipe end re-points to its new handle — and so does the terminal input end
         // (#797 interactive rung 2), which rides the same exec carry as a PipeEnd binding, so an
         // exec'd child's `read(0)` still taps the terminal. Each token moves **once, from the
@@ -4473,6 +4487,10 @@ impl Ctx<'_> {
     /// return the no-door placeholder; see [`OP_FORK`] for the full contract. Policy lives in the
     /// fork factory (table registration, inherited signal state/pgid/`ppid`) — this op only asks.
     fn fork_request(&mut self) -> i64 {
+        // #2345 — the twin's entry would pass the table's bound, which zombies hold until reaped.
+        if self.w.procs.len() >= PID_MAX {
+            return EAGAIN;
+        }
         if let Some(req) = self.p.park_req.clone() {
             req(temen_interp::ParkEvent::ForkSelf);
         }
@@ -5582,6 +5600,10 @@ impl Ctx<'_> {
         let Some(req) = self.p.park_req.clone() else {
             return Ok(vec![ENOSYS]);
         };
+        // #2345 — as `fork`: no room in the table for the new process's entry.
+        if self.w.procs.len() >= PID_MAX {
+            return Ok(vec![EAGAIN]);
+        }
         let at = *args.first().ok_or(Trap::Malformed)? as u64;
         let Some(&[path_ptr, argv_ptr, envp_ptr, acts_ptr, nacts]) =
             read_guest_words(mem, at, 5).as_deref()
@@ -5889,6 +5911,13 @@ impl Ctx<'_> {
         };
         if overwrite == 0 && self.p.env.contains_key(&name) {
             return Ok(vec![0]); // keep the existing value
+        }
+        // #2345 — what the environment would hold with this variable set, its old value gone.
+        let entry = |n: &String, v: &String| TABLE_ENTRY + (n.len() + v.len()) as u64;
+        let old = self.p.env.get(&name).map_or(0, |v| entry(&name, v));
+        let held: u64 = self.p.env.iter().map(|(n, v)| entry(n, v)).sum();
+        if held - old + entry(&name, &value) > ARG_MAX {
+            return Ok(vec![ENOMEM]);
         }
         self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
         self.p.env.insert(name, value);
@@ -9009,6 +9038,45 @@ block 0 () {\n\
     /// #2306 — a process's descriptors stay below [`FD_MAX`]: a `dup2` or `F_DUPFD` past it is
     /// refused, so a guest's fd number never sizes the host's table, and an op that needs a
     /// descriptor when none is left is `-EMFILE`, having made nothing (a pipe both ends or none).
+    /// #2345 — what a process keeps for its guest is bounded: its environment at `ARG_MAX`
+    /// (`-ENOMEM` past it), the process table at `PID_MAX`, live and unreaped together (`-EAGAIN`
+    /// for a `fork` past it), and an exec drops the mask entries of handlers that will never return.
+    #[test]
+    fn a_processes_tables_are_bounded() {
+        let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![b'v'; 256];
+        win[..4].copy_from_slice(b"NAME");
+        win[8..12].copy_from_slice(b"NAM2");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        {
+            ctx!(posix, w_g, p_g, st);
+            // A variable holding all but 200 bytes of the environment's room.
+            let big = (ARG_MAX - TABLE_ENTRY - 3 - 200) as usize;
+            st.p.env.insert("BIG".into(), "v".repeat(big));
+            let mut set = |st: &mut Ctx, name: i64| {
+                st.setenv(&[name, 4, 64, 4, 1], Some(&mut mem)).unwrap()[0]
+            };
+            assert_eq!(set(&mut st, 0), 0, "a variable that fits");
+            assert_eq!(set(&mut st, 8), ENOMEM, "one past ARG_MAX");
+            assert_eq!(set(&mut st, 0), 0, "a value replacing its own fits");
+            for pid in 0..PID_MAX as i32 {
+                let zombie = ProcEntry::Zombie {
+                    status: 0,
+                    pgid: 1,
+                    ppid: 1,
+                };
+                st.w.procs.insert(pid + 10_000, zombie);
+            }
+            assert_eq!(st.fork_request(), EAGAIN, "the table holds PID_MAX");
+            st.p.handler_mask_stack = vec![1, 2, 3];
+        }
+        exec_remap_hook(Arc::clone(&posix.root))(&[]);
+        assert!(
+            posix.root.lock().unwrap().handler_mask_stack.is_empty(),
+            "an exec drops what no handler will return to restore"
+        );
+    }
+
     #[test]
     fn descriptor_numbers_are_bounded() {
         let posix = new_posix(HEAP_BASE, HEAP_END, Vec::new());
