@@ -23,8 +23,8 @@ mod rec;
 
 use drivers::{agree_on_every_driver, Ran};
 
-/// Splits and closes past the table's 256 slots.
-const SPLITS: u64 = 300;
+/// Splits and closes past the table's 1,024 slots (#2365).
+const SPLITS: u64 = 1100;
 
 /// The fuel ceiling of the node the child is spawned from: far less than its loop burns.
 const CHILD_FUEL: i64 = 10_000;

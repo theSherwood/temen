@@ -2,12 +2,17 @@
 //! its result. A supervisor or server that spawns a child per request or per connection otherwise
 //! grows with every child it has ever had.
 //!
-//! A root spawns a small child (func 1's child image, from a spawn record) and joins it, or detaches
-//! it, `n` times. The test binary counts every byte the process holds, and a run's peak, less what was
-//! held before it, is what the run grew to. Two runs, of [`FEW`] and [`MANY`] children, show what each
-//! child left behind: the difference over the children between them. Before #2359 the tree-walker and
-//! the Cranelift JIT kept each child's whole powerbox, and the bytecode drivers a fresh one in its
-//! place: about 11 KiB a child on each.
+//! A root spawns a small child (func 1's child image, from a spawn record) and joins it, or waits for
+//! it to end and detaches it, `n` times. The test binary counts every byte the process holds, and a
+//! run's peak, less what was held before it, is what the run grew to. Two runs, of [`FEW`] and
+//! [`MANY`] children, show what each child left behind: the difference over the children between
+//! them. Before #2359 the tree-walker and the Cranelift JIT kept each child's whole powerbox, and the
+//! bytecode drivers a fresh one in its place: about 11 KiB a child on each.
+//!
+//! The root waits for each child before it detaches it, so the peak holds what ended children left,
+//! never children still running. A root that detaches each child at once outruns them by as many as
+//! the host's scheduling lets it, and those still running hold their whole powerbox: on CI's macOS
+//! runners, enough to read as 1.3 KiB a child.
 //!
 //! The debug driver is left out: it keeps every child domain for time travel, by design.
 
@@ -96,7 +101,8 @@ fn held_at_most(run: impl FnOnce()) -> usize {
     PEAK.load(Ordering::Relaxed).saturating_sub(before)
 }
 
-/// The child's last act on each turn: `join` (op 1), or `detach` (op 10).
+/// The root's last act on each child: `join` (op 1), or `wait` (op 18) for it to end, then `detach`
+/// (op 10).
 #[derive(Clone, Copy, Debug)]
 enum End {
     Join,
@@ -105,11 +111,16 @@ enum End {
 
 /// A root that spawns func 1's child image `n` times from the record at 17408, paid from its
 /// `Budget`, and joins or detaches each. It returns the sum of what the joined children returned (7
-/// apiece), or `n` when it detaches them.
+/// apiece), or, when it detaches them, how many `wait`s answered that the child returned (`n`).
 fn src(n: u64, end: End) -> String {
     let take = match end {
         End::Join => "vr = call.cap 6 1 (i32) -> (i64) vi (vch)",
-        End::Detach => "vd = call.cap 6 10 (i32) -> (i32) vi (vch)\n  vr = i64.const 1",
+        End::Detach => {
+            "vw = call.cap 6 18 (i32) -> (i64) vi (vch)
+  vd = call.cap 6 10 (i32) -> (i32) vi (vch)
+  vret = i64.eqz vw
+  vr = i64.extend_i32_u vret"
+        }
     };
     format!(
         "memory 16
