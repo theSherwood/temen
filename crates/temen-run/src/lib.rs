@@ -4354,6 +4354,13 @@ impl GuestMem for MprotectWindow {
     /// §3e op 3 `page_size`: the hardware protection granularity (`self.page` = the host page) —
     /// the unit `map`/`unmap`/`protect` round to, matching the interpreter's `Mem::page_size` on the
     /// same host so the two backends agree.
+    /// #2358 — from the page map [`MprotectWindow::map_region`] marks, as the paged `Mem` answers
+    /// from its own.
+    fn maps_region(&self, region: u32) -> bool {
+        let map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .any(|s| matches!(*s, PageState::Backed { region: r, .. } if r == region))
+    }
     fn page_size(&self) -> i64 {
         self.page as i64
     }
