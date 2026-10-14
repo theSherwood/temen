@@ -307,6 +307,45 @@ pub unsafe fn park_host_call(
     }
 }
 
+/// #2047 — wait outside the run for a host call's answer (a job punted to the offload pool, which
+/// may wait on the world), as a park waits: the calling vCPU gives its lane back for the wait (D66)
+/// and takes it again after, and a kill or its domain's end stops the wait. It is not counted
+/// parked: the answer comes from outside, so it may yet end a peer's wait. `wait(d)` waits at most
+/// `d` for the answer, and is asked again every [`KILL_RECHECK`] until it has it. `None`: the run
+/// was killed (the trap cell now says `OutOfFuel`, as a join's does) or its domain ended, and the
+/// answer is left unclaimed.
+///
+/// # Safety
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`); a call in a fiber waits with its vCPU.
+/// The caller holds no lock the run's other vCPUs need.
+#[cfg(not(loom))]
+pub unsafe fn wait_outside<R>(
+    trap_out: *mut i64,
+    mut wait: impl FnMut(Duration) -> Option<R>,
+) -> Option<R> {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    let dom = (!vm.sched.is_null()).then(|| current_domain(vm.sched as *const Domain));
+    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
+    if let Some(d) = dom {
+        d.lane_give_back(&lane);
+    }
+    let killed = || epoch_fired(vm.epoch as usize);
+    let ended = || killed() || load_trap(trap_out) != 0;
+    let answer = loop {
+        if let Some(r) = wait(KILL_RECHECK) {
+            break Some(r);
+        }
+        if ended() {
+            break None;
+        }
+    };
+    let back = dom.is_none_or(|d| d.lane_acquire(&lane, ended));
+    if killed() {
+        store_trap(trap_out, TrapKind::OutOfFuel as i64);
+    }
+    answer.filter(|_| back && !ended())
+}
+
 /// #1826 — wake every host call parked on `key` ([`park_host_call`]): each re-checks its predicate.
 ///
 /// # Safety

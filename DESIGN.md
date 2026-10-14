@@ -1907,7 +1907,7 @@ numbers:
    (invariant 8). The test-only `Blocking` cap is the exerciser.
 2. *Dispatch gains a third outcome* behind an out-param face (`cap_dispatch_slots_pending` →
    `Pending(completion_id)`, job handed to the offload pool, result posted to `Completions`);
-   every other call site keeps the sync face and runs punts inline — decline-never-diverge
+   a call site that cannot park keeps the sync face and runs punts inline — decline-never-diverge
    (invariant 9). Under a W1 tape punts are forced inline so the tape records real results.
 3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
@@ -1916,6 +1916,18 @@ numbers:
    (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
+
+**A parked caller holds nothing its run needs (#2047, 2026-10-14).** A blocking call may wait on
+the world, or on what another vCPU, thread or child of the run does, so its caller parks as the
+oracle's vCPU does, on every engine: the cooperative pump and the parallel driver park the *task*
+(`BlockedHostCap`, the state a host-completed call already used) and run the others, and each
+round's drain wakes it (`drain_task_completions`); the debug scheduler parks the thread and takes
+the pool's answer only once nothing else can run, so its schedule stays deterministic; the JIT's
+vCPU, under either thunk, waits outside the run with its D66 lane given back and the §5 kill
+re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
+context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
+on an outstanding call, so a call waiting on the world never holds back a timed waiter (the clock
+stays logical, #1979). Pinned on every engine in `temen-run/tests/root_cap_park.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -1954,23 +1966,25 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
   ONE ordered drain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the first
   not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on the
-  store** (pending pool work is never a deadlock and never jumps the logical clock). GC root
-  scans cover cap-parked frames.
+  store** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
+  first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
   the store, drain at registration + every pool-side `complete` — no notify hook; resumption is
   poll-driven), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
   the pending face and park via the `fiber_rt` event-park seam the futex thunk already used.
-  Root context keeps the sync/blocking faces — "sync ops never pay" holds.
+  Root context takes the pending face too since #2047 — "sync ops never pay" holds, as nothing is
+  minted until a handler punts.
 
 *Measured (F4, `fiber_overlap_bench.rs`, n=8 × block=2 ms, K=4):* fiber lane ~4.8–5.3 ms/batch
 on all three engines (JIT net of its per-run compile floor) vs ~19 ms serialized root — the
 ring's own overlap range, restored on one vCPU. **Inline-by-design postures (enumerated, not
 debt):** the browser-`Vcpu` driver (I45 — fiber delivery through the real cross-thread futex is
 its own slice; the native parallel driver takes the cooperative driver's postures since #1414 3e),
-the debug drivers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers like
-futex-parked ones), the §22 invoke leaves
+the debug drivers' fibers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers
+and pool-parked threads like futex-parked ones), the §22 invoke leaves
 (seam-free atomic), confined `instantiate` children on the cooperative driver (their
-completions live on their own host), durable runs everywhere (a punted completion has no freeze
+completions live on their own host; no offloadable procedure reaches a child yet, #2424), durable
+runs everywhere (a punted completion has no freeze
 rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the
 animated-offer punt is exercised only by construction (`wire_offer_proc` seals the provider
 `Host`; pin it when a public wiring can grant a provider an offloadable cap). I48 (a blocking

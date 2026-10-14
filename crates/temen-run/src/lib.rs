@@ -203,18 +203,15 @@ pub unsafe extern "C" fn cap_thunk(
         *trap_out = TrapKind::ThreadFault as i64;
         return;
     }
-    // F3 (FIBER_PARK.md) — a punt INSIDE A FIBER parks the fiber, not this OS thread: route
-    // through the pending face so the dispatch can punt to the pool, then park-poll on the
-    // completion cell (`fiber_cap_wait`) — the §3.6 slice-5a contract, completion form, the
-    // futex thunk's exact shape. Gated on the oracle's predicate: a live fiber, exactly one
-    // result slot (the wake delivers one scalar — invariant 8), and a non-durable run (the
-    // freeze driver has no cap-park re-derivation). Root context keeps the sync face
-    // (`pending = None`): a single-threaded guest's punts run inline — semantically identical and
-    // cheaper than a pool round-trip nobody could overlap with (DESIGN.md §12), and the "sync ops
-    // never pay" pin stays intact (nothing here is touched unless a fiber is live). Either face, a
-    // would-block op parks the calling fiber and runs again (#1826, #1952).
-    let pending_face =
-        n_results == 1 && temen_jit::fiber_active() && !(*(ctx as *mut Host)).is_durable();
+    // F3 (FIBER_PARK.md), #2047 — a punt parks its caller, never the run: route through the
+    // pending face so the dispatch can punt to the pool, then wait for the completion as a park
+    // ([`cap_wait`]). A fiber parks alone (the §3.6 slice-5a contract, completion form). A vCPU
+    // waits outside the run with its lane given back, while the run's children run — the call may
+    // wait on the world, or on what a child does. Gated on the oracle's predicate: exactly one
+    // result slot (the wake delivers one scalar — invariant 8) and a non-durable run (the freeze
+    // driver has no cap-park re-derivation). Sync ops never pay: nothing is minted unless a handler
+    // punts. Either face, a would-block op parks the calling fiber and runs again (#1826, #1952).
+    let pending_face = n_results == 1 && !(*(ctx as *mut Host)).is_durable();
     loop {
         let (mut pending_id, mut park) = (None, None);
         cap_thunk_impl(
@@ -235,7 +232,7 @@ pub unsafe extern "C" fn cap_thunk(
         );
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
-            let r = fiber_cap_wait(&comps, id, trap_out);
+            let r = cap_wait(&comps, id, temen_jit::fiber_active(), trap_out);
             if *trap_out == 0 {
                 *results = r;
             }
@@ -294,6 +291,26 @@ impl HostParkReq {
             }
         }
     }
+}
+
+/// F3, #2047 — wait for punted call `id`'s completion as a park. A fiber parks alone
+/// ([`fiber_cap_wait`]); a vCPU waits outside the run with its lane given back
+/// ([`temen_jit::wait_outside`]). A run that ends meanwhile leaves the answer unclaimed and the
+/// trap cell set, so the caller writes no result.
+///
+/// # Safety
+/// `trap_out` is the live call's trap cell; with `fiber`, the call runs in a live fiber
+/// ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
+unsafe fn cap_wait(
+    comps: &std::sync::Arc<temen_interp::Completions>,
+    id: u64,
+    fiber: bool,
+    trap_out: *mut i64,
+) -> i64 {
+    if fiber {
+        return fiber_cap_wait(comps, id, trap_out);
+    }
+    temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
 /// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
@@ -793,15 +810,11 @@ pub unsafe extern "C" fn cap_thunk_locked(
                 *trap_out = TrapKind::CapFault as i64;
                 return;
             }
-            // F3 (FIBER_PARK.md) — a punt inside a FIBER on the threaded tier parks the fiber
-            // (lock already released above), so the spawned vCPU keeps polling its other fibers;
-            // the root keeps the blocking wait (a JIT vCPU is a real thread — blocking it at root
-            // is the landed P3 contract).
-            let r = if n_results == 1 && temen_jit::fiber_active() && !durable {
-                fiber_cap_wait(&comps, id, trap_out)
-            } else {
-                comps.wait(id)
-            };
+            // F3, #2047 — the lock is already released: wait as a park ([`cap_wait`]). A punt
+            // inside a FIBER parks the fiber, so its vCPU keeps polling its other fibers; any other
+            // waits as its vCPU, with the vCPU's lane given back.
+            let fiber = n_results == 1 && temen_jit::fiber_active() && !durable;
+            let r = cap_wait(&comps, id, fiber, trap_out);
             if *trap_out != 0 {
                 return;
             }

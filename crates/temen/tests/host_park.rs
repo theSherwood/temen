@@ -5,7 +5,7 @@
 //! eval loop waits **without the host lock** (the single-fiber degenerate wait). Pins:
 //!
 //! - punt and inline produce identical results on every tier (tree-walk, bytecode, Cranelift JIT —
-//!   the JIT stays on the sync face and runs punts inline: decline-never-diverge, INVARIANTS.md 9);
+//!   each punts to the pool and parks its caller, the JIT's root included since #2047);
 //! - the fast case (`Done`) never touches the parking machinery;
 //! - **sync ops never pay**: a plain host proc / a `block_for = 0` `Blocking` call mints nothing;
 //! - the shared-host parallel tier genuinely overlaps punted blocking ops (the §5b
@@ -131,8 +131,8 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
         "bytecode: all completions delivered"
     );
 
-    // Cranelift JIT — sync face only (generic `cap_thunk`): punts run inline, same results
-    // (decline-never-diverge). Must mint nothing.
+    // Cranelift JIT — parking-aware too (#2047): the generic `cap_thunk` punts to the pool and
+    // waits outside the run, as the locked thunk always did.
     let mut hj = Host::new();
     let hjh = hj.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
     let comps_j = hj.completions();
@@ -164,13 +164,10 @@ fn offloadable_punt_matches_on_all_tiers() {
     assert_eq!(iv, want, "tree-walk sum");
     assert_eq!(bv, want, "bytecode sum");
     assert_eq!(jv, want, "jit sum");
-    // The two parking-aware tiers punted every call; the JIT's sync face ran them inline.
+    // Every tier punted every call (#2047: the JIT's root too).
     assert_eq!(im, n, "tree-walk minted one completion per punt");
     assert_eq!(bm, n, "bytecode minted one completion per punt");
-    assert_eq!(
-        jm, 0,
-        "jit sync face must never touch the parking machinery"
-    );
+    assert_eq!(jm, n, "jit minted one completion per punt");
 }
 
 #[test]
@@ -184,10 +181,7 @@ fn offloadable_fast_case_stays_inline() {
     // Only the odd args (half of n) punted — `Done` never touches the parking machinery.
     assert_eq!(im, n / 2, "tree-walk: only the punts minted");
     assert_eq!(bm, n / 2, "bytecode: only the punts minted");
-    assert_eq!(
-        jm, 0,
-        "jit sync face must never touch the parking machinery"
-    );
+    assert_eq!(jm, n / 2, "jit: only the punts minted");
 }
 
 #[test]
