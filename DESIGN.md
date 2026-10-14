@@ -1864,7 +1864,10 @@ hang, and the mirror: a server parked in `svc.wait` whose **client** child domai
 no-progress `0` — the timed form's answer — so it can return and be joined instead of
 waiting forever for a request that can never come (#1217); a nested child's exit/trap ends
 the *child* domain only, surfacing to its owner as
-an outcome (supervision: `poll` → trapped → detach + respawn, per I37). Before this rule
+an outcome (supervision: `join` or `poll` reads how it ended, then respawn, per I37; #2066).
+What an owner keeps for a child goes when its claim ends — a `join` or a `detach` — once the
+child has ended (#2359), so an owner that respawns children for its whole life does not grow
+with them. Before this rule
 the engines had divergent incidental residues (interpreter: join-all + a 10 s wait clamp;
 JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regression report
 (2026-07-24) is the consumer that forced the decision.
@@ -2280,7 +2283,9 @@ default above still stands for every handle-gated capability.
   sub-range: `map` / `unmap` / `protect` within scope; can mint a sub-range
   capability for a child.
 - **`Instantiator`**: spawn child domain (sub-window + attenuated caps + quota) — its own detached
-  window once the carve placement is retired (2026-09-29).
+  window once the carve placement is retired (2026-09-29). `join` answers how the child ended —
+  `(0, value)` if it returned, else `(trap code, 0)` — and never traps the parent (#2066): a child's
+  trap ends its own domain only.
 
 ### Honest bounds on "zero overhead"
 - Power-of-two, aligned sub-windows → a buddy-style carve of the parent window. *(The carve and the
@@ -2344,7 +2349,7 @@ accesses confine against the live `mapped` read from the module's exported `mapp
 (self-initialized to the emit-time `1 << size_log2`) rather than a baked constant, and every tier-up
 event carries the window's **scalar committed extent** (`Mem::scalar_extent` — `Some(H)` iff the
 admitted set is exactly `[0, H)`) which the driver writes to that global before each emitted call
-(native `VcpuReactor::frame` service and the browser Worker's TIERUP handler alike — and the §22
+(every pump host, native or in the browser, and the browser Worker's TIERUP handler alike — and the §22
 `Jit.invoke` codegen seam identically: `VcpuEvent::JitInvoke` carries the same snapshot, the Worker
 writes the unit instance's global before `f0`). A window state the scalar cannot represent — a
 sparse grow, a non-RW mapping, pages committed past a fixed backing — **declines** emitted execution
@@ -2501,7 +2506,8 @@ child's grants is exactly the party positioned to observe their use.
   makes. No code can use more than the grant above it (INVARIANTS #3).
 - **What a capability holds for its guest is metered too (#2306).** Host memory a
   guest grows through a capability (a file's bytes; a pipe's, socket's or captured
-  stream's queue; a job's output; a table of names, descriptors, listings or
+  stream's queue; a job's output; a process's environment, which a fork twin
+  shares until either writes (#2345); a table of names, descriptors, listings or
   mappings) is `channel` of the node of the domain the capability's state was
   granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
   the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
@@ -2511,7 +2517,11 @@ child's grants is exactly the party positioned to observe their use.
   back as it shrinks or goes. File descriptors are the process's to share, as its
   mappings and address space are: each one a guest causes holds a slot of a pool
   over the soft `RLIMIT_NOFILE`, less a host reserve, while it is open, and one
-  past it is `-EMFILE`.
+  past it is `-EMFILE`. A stack an engine keeps in host memory (the bytecode
+  engine's register file) is `mem` past the `FIBER_STACK` its vCPU's charge pays
+  for (#2336). The `cap_abi` fuzz target holds the whole surface to this: random
+  capability calls against a default powerbox under small budgets, where a host
+  panic, an abort or an outsized allocation is a find (#2353).
 
 ### Per-resource readouts (all read off structures the parent already owns)
 vCPU/core-time + scheduling stats vs quota; resident/mapped memory vs window +
@@ -3763,7 +3773,7 @@ The child's powerbox is the host its `Instantiator` resolves against and the par
 through the family the embedder's `GrantChildHooks::as_parent` builds over it (a child powerbox is
 always the shared form). The executor, the futex domain and the kill cell stay the run's. A
 grandchild's task is gated on every lane up to the root's, as the oracle gates a vCPU on its whole
-chain. The child joins from a task, so its `join` (and `wait`) parks the task, as `thread.join` does
+chain. The child joins from a task, so its `join` parks the task, as `thread.join` does
 there; a vCPU blocked in `join` gives back its own domain's lanes, not the run's. A join from a guest
 fiber parks the task too (#2322). A join blocks its whole vCPU on every engine — the oracle parks the
 vCPU, the bytecode drivers the task — and counts it blocked for the deadlock verdict, so the fiber's

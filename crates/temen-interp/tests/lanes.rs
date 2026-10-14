@@ -166,7 +166,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vc1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb1w, vmh, vz, vz, ve, vlog, vq)
   vb2w = i64.extend_i32_u vb2
   vc2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb2w, vmh, vz, vz, ve, vlog, vq)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc1)
   vb3w = i64.extend_i32_u vb3
   vc3 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb3w, vmh, vz, vz, ve, vlog, vq)
   vzero = i32.const 0

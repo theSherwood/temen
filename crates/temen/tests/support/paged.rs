@@ -10,13 +10,25 @@
 //! run is the oracle (INVARIANTS #9); a mismatch is a walk miscompile (a wrong page table is a trap-parity
 //! divergence, never an escape — the `& MASK` confine is unconditional, #2). `fuzz_one` drives it from
 //! coverage-guided bytes; the stable `paged_walk` test drives the same function from deterministic seeds.
+//!
+//! Every run is a pump run ([`CoopRun`]), the run every emitted tier-up goes through. The page-state
+//! sweep (`fuzz_one_pagestate`) also runs each guest as a [`Mode::Leaf`]: emitted whole from its entry
+//! as the run's root leaf, the way module cards, reactor ticks and warm evals run, its page ops bounced
+//! out of the emitted code ([`CoopRun::bounce`]) and the table rebuilt after each bounce.
 
 #![allow(dead_code)] // included via `#[path]` by both the fuzz target and the stable test.
 
-use std::sync::{Arc, OnceLock};
-use temen_interp::{bytecode, Host, Region, Trap, Value};
-use temen_wasm_jit::{compile_module_tierup_paged, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
-use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
+use std::sync::Arc;
+use temen_interp::bytecode::{CoopEvent, CoopRun, LeafOffer, ProgramEmit, TierUpConfig};
+use temen_interp::{bytecode, host_page_size, Host, Region, Trap, Value};
+use temen_wasm_jit::{
+    compile_jit_page_checked, compile_module_tierup_paged, outline_cap_calls, DriveMode, Shape,
+    TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
+};
+use wasmi::core::ValType;
+use wasmi::{
+    AsContextMut, Caller, Engine, Global, Linker, Memory, MemoryType, Module as WModule, Store, Val,
+};
 
 const WIN_BASE: u32 = 0x4_0000;
 const ENV_PTR: u32 = 1024;
@@ -36,11 +48,16 @@ pub enum TrapKind {
     Other,
 }
 
-/// How the leaf runs: pure interpreter (the oracle) vs. paged tier-up with the live-map table refresh.
+/// How the guest runs.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Mode {
+    /// Pure interpreter: the oracle.
     Interp,
+    /// The leaf tiers up, paged, with the table refreshed from the live map at each tier-up.
     PagedSynced,
+    /// The whole guest runs emitted, paged, as the run's root leaf; its page ops bounce to the
+    /// interpreter, and the table is refreshed after each bounce.
+    Leaf,
 }
 
 /// What the differential exercised — tallied by the stable test to prove non-vacuity (the sweep must
@@ -75,7 +92,7 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// with the page-state `table` placed after the window and both driver globals written. Copies emitted
 /// writes back into the live buffer.
 ///
-/// SAFETY: `base` is the live window buffer, touched only while the vCPU is paused (single-threaded).
+/// SAFETY: `base` is the live window buffer, touched only while the run is paused (single-threaded).
 fn run_emitted(
     wasm: &[u8],
     func: u32,
@@ -169,36 +186,63 @@ fn run_emitted(
 /// contract (the table refreshed from the live map). `tail` is the guest's i64 arguments after the
 /// implicit memory-cap handle. Returns the outcome.
 fn run_guest_argv_bytes(guest_src: &str, tail: &[i64], mode: Mode) -> (Outcome, Vec<u8>) {
-    let m = build(guest_src);
+    let mut m = build(guest_src);
     let win_size = 1usize << WIN_LOG2;
     let (back, base, layout) = shared_window(win_size);
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let mut host = Host::new();
     let asl = host.grant_memory();
     let mut args = vec![Value::I32(asl)];
     args.extend(tail.iter().map(|&a| Value::I64(a)));
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, back, &[], host)
-        .expect("root vcpu");
 
-    let page = vcpu.mem_map_info().expect("window").0;
-    let wasm = if mode != Mode::Interp {
-        let (wasm, eligible) =
-            compile_module_tierup_paged(&m, false, page.trailing_zeros() as u8).expect("emit");
-        assert_eq!(
-            eligible,
-            vec![false, true],
-            "paged mode: the page-op entry stays interpreted, the pure leaf emits"
-        );
-        let e: Arc<[bool]> = Arc::from(eligible.into_boxed_slice());
-        vcpu = vcpu.with_jit_eligible(e).with_jit_page_checked();
-        wasm
-    } else {
-        Vec::new()
+    let page_log2 = host_page_size().trailing_zeros() as u8;
+    let (wasm, tierup) = match mode {
+        Mode::Interp => (Vec::new(), None),
+        Mode::PagedSynced => {
+            let (wasm, eligible) = compile_module_tierup_paged(&m, false, page_log2).expect("emit");
+            assert_eq!(
+                eligible,
+                vec![false, true],
+                "paged mode: the page-op entry stays interpreted, the pure leaf emits"
+            );
+            let tierup = TierUpConfig {
+                root: ProgramEmit {
+                    eligible: Arc::from(eligible),
+                    page_checked: true,
+                },
+                leaf: None,
+                modules: None,
+            };
+            (wasm, Some(tierup))
+        }
+        Mode::Leaf => {
+            // The page ops move into wrappers the emitted entry bounces to; the run is over the same
+            // outlined module, so a bounce names a function the interpreter holds.
+            outline_cap_calls(&mut m);
+            let a = compile_jit_page_checked(&m, Shape::Batch { entry: 0 }, false, page_log2)
+                .expect("emit");
+            assert!(
+                matches!(a.drive, DriveMode::WasmDriven { entry: 0 }),
+                "leaf mode: the guest emits whole from its entry"
+            );
+            let tierup = TierUpConfig {
+                root: ProgramEmit::default(),
+                leaf: Some(Arc::new(|o: &LeafOffer| {
+                    assert!(o.paged && !o.parks, "offered paged, and unable to park");
+                    true
+                })),
+                modules: None,
+            };
+            (a.wasm, Some(tierup))
+        }
     };
+    let mut run = CoopRun::new_over(&m, 0, &args, FUEL, host, tierup, &[], WIN_LOG2, back)
+        .expect("supported")
+        .expect("entry in range");
 
+    let mut tierups = 0;
     let out = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
+        match run.run() {
+            CoopEvent::Done(vals) => {
                 break Outcome::Vals(
                     vals.iter()
                         .map(|v| match v {
@@ -209,31 +253,225 @@ fn run_guest_argv_bytes(guest_src: &str, tail: &[i64], mode: Mode) -> (Outcome, 
                         .collect(),
                 )
             }
-            bytecode::VcpuEvent::Trapped(Trap::MemoryFault) => {
-                break Outcome::Trap(TrapKind::MemoryFault)
-            }
-            bytecode::VcpuEvent::Trapped(Trap::OutOfFuel) => {
-                break Outcome::Trap(TrapKind::OutOfFuel)
-            }
-            bytecode::VcpuEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
-                let info = vcpu.mem_map_info().expect("window");
+            CoopEvent::Trapped(Trap::MemoryFault) => break Outcome::Trap(TrapKind::MemoryFault),
+            CoopEvent::Trapped(Trap::OutOfFuel) => break Outcome::Trap(TrapKind::OutOfFuel),
+            CoopEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
+            CoopEvent::TierUp {
+                func, argv, mapped, ..
+            } => {
+                tierups += 1;
+                let info = run.mem_map_info().expect("window");
                 assert_eq!(mapped, info.2, "paged runs surface reserved");
-                let (table, cover) = bytecode::build_pagestate_table(&info, vcpu.win_flat_len());
-                match run_emitted(&wasm, func, &argv, base, win_size, &table, cover) {
-                    Outcome::Vals(v) => vcpu.deliver_tierup(&v),
-                    Outcome::Trap(TrapKind::OutOfFuel) => vcpu.deliver_tierup_trap(Trap::OutOfFuel),
-                    Outcome::Trap(_) => vcpu.deliver_tierup_trap(Trap::MemoryFault),
+                let (_, backed) = run.pending_win().expect("a flat window");
+                let ended = match mode {
+                    Mode::Leaf => {
+                        assert_eq!(func, 0, "the root leaf tiers up at its entry");
+                        run_leaf(&mut run, &m, &wasm, &argv, base, win_size)
+                    }
+                    _ => {
+                        let (table, cover) = bytecode::build_pagestate_table(&info, backed);
+                        run_emitted(&wasm, func, &argv, base, win_size, &table, cover)
+                    }
+                };
+                match ended {
+                    Outcome::Vals(v) => run.deliver_tierup(&v),
+                    Outcome::Trap(TrapKind::OutOfFuel) => run.deliver_tierup_trap(Trap::OutOfFuel),
+                    Outcome::Trap(_) => run.deliver_tierup_trap(Trap::MemoryFault),
                 }
             }
-            _ => panic!("unexpected event on this single-vCPU run"),
+            // One task over one window, serviced only for tier-up.
+            CoopEvent::Paused
+            | CoopEvent::Idle
+            | CoopEvent::CapPark { .. }
+            | CoopEvent::Resume { .. }
+            | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),
         }
     };
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; copy, then free the buffer.
+    drop(run);
+    if mode == Mode::Leaf {
+        assert_eq!(tierups, 1, "the guest ran as the root leaf");
+    }
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped; copy, then free the buffer.
     let bytes = unsafe { std::slice::from_raw_parts(base, win_size) }.to_vec();
     unsafe { std::alloc::dealloc(base, layout) };
     (out, bytes)
+}
+
+/// Per-`Store` state of a [`run_leaf`] call.
+struct LeafCx {
+    /// The run the emitted code bounces into, as an address (the store's data is `Send`). SAFETY:
+    /// it is the `CoopRun` [`run_leaf`] borrows mutably for the whole call; the store lives inside
+    /// that borrow, on one thread, and the run is reached only from one bounce at a time.
+    run: usize,
+    /// The live window's base address (the same discipline: the run is paused on this leaf).
+    base: usize,
+    /// Each function's `(params, results)` count, to marshal a bounce.
+    sigs: Vec<(usize, usize)>,
+    /// The emitted module's `"pagestate"` and `"mapped"` globals, refreshed after every bounce.
+    pagestate: Option<Global>,
+    mapped: Option<Global>,
+    /// The code the emitted guard passed `env.trap` (or a bounce's trap), for the classification.
+    trap: i32,
+    bounces: u32,
+}
+
+/// The #750 refresh: rebuild the page-state table from the run's live map at `table_base` and
+/// re-point both driver globals. Run before entry and after every bounce (a remap).
+fn refresh_leaf(mut ctx: impl AsContextMut<Data = LeafCx>, memory: Memory, table_base: usize) {
+    let cx = ctx.as_context_mut();
+    // SAFETY: see `LeafCx::run`.
+    let run = unsafe { &*(cx.data().run as *const CoopRun) };
+    let info = run.mem_map_info().expect("window");
+    let (_, backed) = run.pending_win().expect("a flat window");
+    let (pg, mg) = (cx.data().pagestate.unwrap(), cx.data().mapped.unwrap());
+    let (table, cover) = bytecode::build_pagestate_table(&info, backed);
+    memory.write(&mut ctx, table_base, &table).unwrap();
+    pg.set(&mut ctx, Val::I32(table_base as i32)).unwrap();
+    mg.set(&mut ctx, Val::I64(cover as i64)).unwrap();
+}
+
+/// Run the emitted root leaf `f0(win, env, ...argv)` under wasmi over a memory mirrored from the live
+/// window at `base`, serving each `env.call_interp` on `run` ([`CoopRun::bounce`]) as the browser host
+/// does: the emitted writes reach the window before the bounce, the bounce's reach the mirror after
+/// it, and the page-state table is rebuilt. Returns how the leaf ended, for the run's delivery.
+fn run_leaf(
+    run: &mut CoopRun,
+    m: &temen_ir::Module,
+    wasm: &[u8],
+    argv: &[i64],
+    base: *mut u8,
+    win_size: usize,
+) -> Outcome {
+    let engine = Engine::default();
+    let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
+    let sigs = m
+        .funcs
+        .iter()
+        .map(|f| (f.params.len(), f.results.len()))
+        .collect();
+    let cx = LeafCx {
+        run: run as *mut CoopRun as usize,
+        base: base as usize,
+        sigs,
+        pagestate: None,
+        mapped: None,
+        trap: 0,
+        bounces: 0,
+    };
+    let mut store: Store<LeafCx> = Store::new(&engine, cx);
+    // The table holds one byte per page, so a window's length bounds it.
+    let table_base = WIN_BASE as usize + win_size;
+    let pages = ((table_base + win_size) as u32).div_ceil(1 << 16) + 1;
+    let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
+    // SAFETY: `base` is the live window, touched here only while the run is paused on this leaf.
+    let live = unsafe { std::slice::from_raw_parts(base, win_size) };
+    memory.write(&mut store, WIN_BASE as usize, live).unwrap();
+
+    let mut linker: Linker<LeafCx> = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .func_wrap("env", "trap", |mut c: Caller<'_, LeafCx>, code: i32| {
+            c.data_mut().trap = code;
+        })
+        .unwrap();
+    linker
+        .func_wrap(
+            "env",
+            "call_interp",
+            move |mut c: Caller<'_, LeafCx>,
+                  func: i32,
+                  args_ptr: i32|
+                  -> Result<(), wasmi::Error> {
+                c.data_mut().bounces += 1;
+                let (np, nr) = c.data().sigs[func as usize];
+                let mut io = vec![0i64; np.max(nr)];
+                let data = memory.data(&c);
+                for (i, slot) in io.iter_mut().enumerate().take(np) {
+                    let o = args_ptr as usize + i * 8;
+                    *slot = i64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+                }
+                // SAFETY: see `LeafCx::base`.
+                let window =
+                    unsafe { std::slice::from_raw_parts_mut(c.data().base as *mut u8, win_size) };
+                window.copy_from_slice(&data[WIN_BASE as usize..WIN_BASE as usize + win_size]);
+                // SAFETY: see `LeafCx::run`.
+                let run = unsafe { &mut *(c.data().run as *mut CoopRun) };
+                let bounced = run.bounce(func as u32, &mut io, None);
+                memory.write(&mut c, WIN_BASE as usize, window).unwrap();
+                let n = match bounced {
+                    Ok(Some(n)) => n,
+                    Ok(None) => unreachable!("the guest cannot park"),
+                    Err(t) => {
+                        c.data_mut().trap = match t {
+                            Trap::MemoryFault => TRAP_MEMORY_FAULT,
+                            Trap::OutOfFuel => TRAP_OUT_OF_FUEL,
+                            _ => -1,
+                        };
+                        return Err(wasmi::Error::from(
+                            wasmi::core::TrapCode::UnreachableCodeReached,
+                        ));
+                    }
+                };
+                assert_eq!(n, nr, "bounce result arity");
+                let out = memory.data_mut(&mut c);
+                for (i, slot) in io.iter().enumerate().take(n) {
+                    let o = args_ptr as usize + i * 8;
+                    out[o..o + 8].copy_from_slice(&slot.to_le_bytes());
+                }
+                refresh_leaf(&mut c, memory, table_base);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .unwrap()
+        .start(&mut store)
+        .unwrap();
+    let global = |name: &str| {
+        instance
+            .get_global(&store, name)
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let [fuel, win, pagestate, mapped] = ["fuel", "win", "pagestate", "mapped"].map(global);
+    store.data_mut().pagestate = Some(pagestate);
+    store.data_mut().mapped = Some(mapped);
+    fuel.set(&mut store, Val::I64(FUEL as i64)).unwrap();
+    win.set(&mut store, Val::I32(WIN_BASE as i32)).unwrap();
+    refresh_leaf(&mut store, memory, table_base);
+
+    let f = instance.get_func(&store, "f0").expect("f0 exported");
+    let ty = f.ty(&store);
+    let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
+    for (t, &a) in ty.params()[2..].iter().zip(argv) {
+        params.push(match t {
+            ValType::I32 => Val::I32(a as i32),
+            _ => Val::I64(a),
+        });
+    }
+    let mut results: Vec<Val> = ty.results().iter().map(|_| Val::I64(0)).collect();
+    let outcome = match f.call(&mut store, &params, &mut results) {
+        Ok(()) => Outcome::Vals(
+            results
+                .iter()
+                .map(|v| match v {
+                    Val::I64(x) => *x,
+                    Val::I32(x) => *x as i64,
+                    _ => panic!("non-integer result"),
+                })
+                .collect(),
+        ),
+        Err(_) => Outcome::Trap(match store.data().trap {
+            TRAP_OUT_OF_FUEL => TrapKind::OutOfFuel,
+            TRAP_MEMORY_FAULT => TrapKind::MemoryFault,
+            _ => TrapKind::Other,
+        }),
+    };
+    // SAFETY: as above; the emitted code is done with the window.
+    let window = unsafe { std::slice::from_raw_parts_mut(base, win_size) };
+    memory.read(&store, WIN_BASE as usize, window).unwrap();
+    assert!(store.data().bounces > 0, "the guest's page ops bounced");
+    outcome
 }
 
 fn run_guest_argv(guest_src: &str, tail: &[i64], mode: Mode) -> Outcome {
@@ -321,37 +559,6 @@ block 0 (v0: i64, vn: i64) {
 
 const GUESTS: [&str; 4] = [FILL_UNMAP, FILL_PROTECT, COPY_UNMAP, COPY_PROTECT];
 
-/// The host software page size, probed once (a throwaway paged guest run) and cached — the offsets the
-/// fuzzer chooses are page-relative, so the search adapts to 4-KiB and 16-KiB hosts alike.
-fn page_size() -> u64 {
-    static PAGE: OnceLock<u64> = OnceLock::new();
-    *PAGE.get_or_init(|| {
-        let m = build(FILL_UNMAP);
-        let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
-        let (back, base, layout) = shared_window(1usize << WIN_LOG2);
-        let vcpu = bytecode::Vcpu::new_root_with_powerbox(
-            &prog,
-            0,
-            &[
-                Value::I32(0),
-                Value::I64(0),
-                Value::I64(0),
-                Value::I64(0),
-                Value::I64(0),
-            ],
-            back,
-            &[],
-            Host::new(),
-        )
-        .expect("probe vcpu");
-        let page = vcpu.mem_map_info().expect("window").0;
-        drop(vcpu);
-        // SAFETY: the vCPU (and its Mem aliasing the region) is dropped; free the buffer.
-        unsafe { std::alloc::dealloc(base, layout) };
-        page
-    })
-}
-
 /// Map a byte to a window offset near a page boundary: pick a page index (incl. one past the window) and
 /// an intra-page delta from a set that lands on and either side of every edge — the walk's boundaries.
 fn edge_offset(page_byte: u8, delta_byte: u8, page: u64, npages: u64) -> u64 {
@@ -399,7 +606,7 @@ pub fn fuzz_one(data: &[u8]) -> Cat {
     let n = data.len().min(b.len());
     b[..n].copy_from_slice(&data[..n]);
 
-    let page = page_size();
+    let page = host_page_size();
     let win: u64 = 1u64 << WIN_LOG2;
     let npages = win / page;
 
@@ -516,7 +723,7 @@ pub fn fuzz_one_pagestate(data: &[u8]) -> Cat {
     let n = data.len().min(b.len());
     b[..n].copy_from_slice(&data[..n]);
 
-    let page = page_size();
+    let page = host_page_size();
     let win: u64 = 1u64 << WIN_LOG2;
     let npages = win / page;
 
@@ -539,24 +746,29 @@ pub fn fuzz_one_pagestate(data: &[u8]) -> Cat {
 
     let src = ps_guest_src(kinds, leaf);
     let (interp, ibytes) = run_guest_argv_bytes(&src, &tail, Mode::Interp);
-    let (paged, pbytes) = run_guest_argv_bytes(&src, &tail, Mode::PagedSynced);
-
-    if matches!(interp, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other))
-        || matches!(paged, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other))
-    {
+    if matches!(interp, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other)) {
         return Cat::Skipped;
     }
-
-    assert_eq!(
-        interp, paged,
-        "paged access over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
-        &tail[..6]
-    );
-    assert!(
-        ibytes == pbytes,
-        "paged window bytes over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
-        &tail[..6]
-    );
+    for mode in [Mode::PagedSynced, Mode::Leaf] {
+        let (paged, pbytes) = run_guest_argv_bytes(&src, &tail, mode);
+        if matches!(paged, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other)) {
+            return Cat::Skipped;
+        }
+        let tier = match mode {
+            Mode::Leaf => "root leaf",
+            _ => "leaf tier-up",
+        };
+        assert_eq!(
+            interp, paged,
+            "paged access ({tier}) over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
+            &tail[..6]
+        );
+        assert!(
+            ibytes == pbytes,
+            "paged window bytes ({tier}) over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
+            &tail[..6]
+        );
+    }
 
     match interp {
         Outcome::Trap(TrapKind::MemoryFault) => Cat::Trapped,

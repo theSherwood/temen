@@ -772,6 +772,9 @@ pub struct ResolvedModule {
     /// The granting host attested the module **freezable** (DURABILITY.md §4: it was instrumented). A
     /// durable domain admits only such a child (#1501).
     pub durable: bool,
+    /// temen#2168 — the module's content digest, as its grant records it: what names its code to the
+    /// run's [`ChildCodeCache`], however it was granted.
+    pub digest: [u8; 32],
 }
 
 /// The host callback the §14 nesting runtime uses to resolve a guest's **`Module` handle** to the
@@ -835,6 +838,10 @@ pub struct GrantChild {
     /// capability installs units into padding slots of its **own** table, so the builder reports
     /// the reservation its grant carried and the child compiles with that many slots.
     pub jit_table_log2: u8,
+    /// temen#2168 — the child holds a re-granted `Jit` capability, with install room or none, so it
+    /// may extend its own code (`define_extra`, #1296): it compiles its own rather than run the
+    /// run's one compile of the child ([`ChildCodeCache`]), which no instance may extend.
+    pub holds_jit: bool,
     /// D66 — the child's **lane chain** coordinates, read off the two powerboxes by the builder:
     /// the child domain's id and lane cap (`-1` = unbounded), and its parent's. The child-domain
     /// executor gates each task's dispatch on every bounded cap along this chain
@@ -1525,7 +1532,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         cap_thunk,
         cap_ctx,
         None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
+        None, // no child-powerbox hooks: a spawn is an inert CapFault
     )
 }
 
@@ -1537,8 +1544,9 @@ pub fn compile_and_run_capture_reserved_with_host(
 /// # Safety
 /// As [`compile_and_run_capture_reserved_with_host`]; `resolve_module` (with `cap_ctx`) must honour
 /// the [`ModuleResolver`] contract — in particular the resolved views must outlive the run.
-/// `grant_child` (PROCESS.md S2 JIT parity) supplies the `instantiate_granted` (op 8) child-powerbox
-/// builder/releaser; `None` ⇒ op 8 is an inert `CapFault`. Both hooks share `cap_ctx` as their host.
+/// `grant_child` (PROCESS.md S2 JIT parity) supplies the hooks that build and release a detached
+/// child's powerbox ([`GrantChildHooks`]); `None` ⇒ a spawn is an inert `CapFault`. Both hooks share
+/// `cap_ctx` as their host.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_and_run_capture_reserved_with_host_ex(
     m: &IrModule,
@@ -2205,7 +2213,7 @@ struct RunOpts<'a> {
     sub: Option<SubWindow>,
     /// §14 module resolver for a guest `instantiate` of a separate-module child.
     resolve_module: Option<ModuleResolver>,
-    /// op-8 `instantiate_granted` child-powerbox builder/releaser (PROCESS.md S2).
+    /// The detached-child powerbox builder/releaser ([`GrantChildHooks`], PROCESS.md S2).
     grant_child: Option<GrantChildHooks>,
     /// §5 async kill-path cell, host-written and polled at safepoints.
     interrupt: Option<*const AtomicU64>,
@@ -2281,9 +2289,9 @@ fn run_inner(
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
     )?;
-    // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
-    // §14 nursery before the guest runs (the nursery only exists when the module holds an
-    // `Instantiator`). `None` leaves op 8 an inert `CapFault`.
+    // PROCESS.md S2 (JIT parity): install the child-powerbox host callbacks into the §14 nursery
+    // before the guest runs (the nursery only exists when the module holds an `Instantiator`). `None`
+    // leaves a spawn an inert `CapFault`.
     // Through the one setter, so the nursery hooks and the domain's lane are installed together
     // (they come from the same host and must agree).
     cm.set_grant_child_hooks(grant_child);
@@ -2538,7 +2546,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 17408
   v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
-  v3 = call.cap 6 1 (i32) -> (i64) v0 (v2)
+  v3_st, v3 = call.cap 6 1 (i32) -> (i64, i64) v0 (v2)
   return v3
   }
 }
@@ -2960,7 +2968,7 @@ pub struct CompiledModule {
     fiber_rt: Option<Box<fiber_rt::FiberRuntime>>,
     #[cfg(fiber_rt)]
     domain: Option<Box<os_thread_rt::Domain>>,
-    /// Kept alive because its address is baked into the module's `Instantiator` call.cap sites.
+    /// Kept alive because the instance names it ([`VmCtx::nursery`]) for its `Instantiator` sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
     /// #1726 — the programs of installed §22 units that spawn same-module children: each one's
@@ -3005,12 +3013,17 @@ pub struct CompiledModule {
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<temen_ir::TypeDef>,
     /// #1825 — whether an instance of the code needs a runtime [`Self::instance`] does not make, so
-    /// the code cannot be shared: the §14 nursery its `Instantiator` sites bake, the `setjmp` table
-    /// its `SetJmp`/`LongJmp` sites bake, the fiber table and runtimes its `cont.*` and `thread.*`
-    /// sites run on, or one a §22 hosting entry stood up after the compile. (A nursery stood up only
-    /// for units this module may install, #1726, is not named by the module's own code.) Code that
-    /// only waits and notifies needs nothing but a thread domain, and each instance gets its own.
+    /// the code cannot be shared: the §14 nursery a root's `Instantiator` sites spawn through, the
+    /// `setjmp` table its `SetJmp`/`LongJmp` sites bake, the fiber table and runtimes its `cont.*`
+    /// and `thread.*` sites run on, or one a §22 hosting entry stood up after the compile. (A nursery
+    /// stood up only for units this module may install, #1726, is not named by the module's own
+    /// code.) Code that only waits and notifies needs nothing but a thread domain, and each instance
+    /// gets its own. A §14 child's runtimes are its task's and its nursery its spawn's, so its code
+    /// needs none of these (temen#2168).
     needs_runtime: bool,
+    /// temen#2168 — whether the code's own `Instantiator` sites spawn through its instance's nursery
+    /// ([`VmCtx::nursery`]): every instance of it has one exactly then.
+    nests: bool,
     /// Owns the executable memory — the whole point of the long-lived split. Dropped last
     /// (declaration order), after everything that points into it — and the drop **releases** the
     /// code arena back to the OS (see [`OwnedJit`]; a bare `JITModule` would leak it). Shared by every
@@ -3328,7 +3341,7 @@ impl CompiledModule {
             take_thunk: s.take as usize as i64,
             return_thunk: s.ret as usize as i64,
         });
-        // The thread domain, if any, is stood up below.
+        // The thread domain and the nursery, if any, are stood up below.
         #[cfg_attr(not(fiber_rt), allow(unused_mut))]
         let mut instance = InstanceAddrs {
             cap_ctx,
@@ -3550,10 +3563,7 @@ impl CompiledModule {
         let thread = ThreadEnv::null();
 
         // §14 nesting: if the module holds an `Instantiator` (a `call.cap` to iface 6), stand up the
-        // per-run `Nursery` whose stable address is baked into those sites. `instantiate` re-compiles a
-        // child confined to a sub-window and runs it over this window (its detect-and-kill fault range is
-        // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
-        // today, so the nursery is touched only on the calling thread.
+        // per-run `Nursery` those sites spawn through, which they load from the instance's vmctx.
         #[cfg(fiber_rt)]
         let spawns = module_uses_instantiator(m);
         #[cfg(fiber_rt)]
@@ -3597,8 +3607,13 @@ impl CompiledModule {
         } else {
             None
         };
+        // temen#2168: the code loads the nursery from its instance's vmctx, as it loads the domain.
         #[cfg(fiber_rt)]
-        let inst = nursery.as_deref().map_or(InstEnv::null(), InstEnv::over);
+        if let Some(n) = &nursery {
+            instance.nursery = &**n as *const instantiator_rt::Nursery as *const core::ffi::c_void;
+        }
+        #[cfg(fiber_rt)]
+        let inst = InstEnv::nesting(nursery.is_some());
         #[cfg(not(fiber_rt))]
         let inst = InstEnv::null();
 
@@ -3995,6 +4010,7 @@ impl CompiledModule {
         MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         Ok(CompiledModule {
             needs_runtime,
+            nests: cfg!(fiber_rt) && module_uses_instantiator(m),
             fn_table,
             tramp_code,
             tramp_code_limited: core::ptr::null(), // a root is never a child-domain task
@@ -4188,9 +4204,12 @@ impl CompiledModule {
     /// module included, which goes on running as the first instance.
     pub fn share(&self) -> Option<SharedCode> {
         self.is_only_code().then(|| {
+            // The kept instance is never run: it names none of this one's state.
             SharedCode(self.instance(InstanceAddrs {
                 cap_ctx: core::ptr::null_mut(),
                 embedder: core::ptr::null_mut(),
+                sched: core::ptr::null(),
+                nursery: core::ptr::null(),
                 ..self.instance
             }))
         })
@@ -4205,19 +4224,20 @@ impl CompiledModule {
     /// products, the function table copied (a run is handed its address; nothing bakes it), and fresh
     /// run state. Only for code [`Self::is_only_code`] admits, so it carries no runtime but a thread
     /// domain of its own, when the code waits or notifies — not even the §14 nursery a module with
-    /// install room gets for its units (#1726): no unit can be defined into shared code.
+    /// install room gets for its units (#1726): no unit can be defined into shared code. A §14
+    /// child's runtimes are its task's, and its domain and nursery are the ones `addrs` names: its
+    /// parent's domain, and the nursery its spawn made for it (temen#2168).
     #[cfg_attr(not(fiber_rt), allow(unused_mut))]
     fn instance(&self, mut addrs: InstanceAddrs) -> CompiledModule {
         #[cfg(fiber_rt)]
         let domain = self.domain.as_ref().map(|d| Box::new(d.fresh()));
         #[cfg(fiber_rt)]
-        {
-            addrs.sched = domain.as_ref().map_or(core::ptr::null(), |d| {
-                &**d as *const os_thread_rt::Domain as *const core::ffi::c_void
-            });
+        if let Some(d) = &domain {
+            addrs.sched = &**d as *const os_thread_rt::Domain as *const core::ffi::c_void;
         }
         CompiledModule {
             needs_runtime: self.needs_runtime,
+            nests: self.nests,
             fn_table: self
                 .fn_table
                 .iter()
@@ -4420,6 +4440,19 @@ impl CompiledModule {
         }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
+    }
+
+    /// temen#2168 — compile this run's §14 children into `cache` ([`ChildCodeCache`]), which an
+    /// embedder that keeps it hands its later runs too, so each child compiles once for all of them.
+    /// Call before the run. Without it the run's children share a cache of the run's own; a module
+    /// with no nursery spawns nothing, and ignores it.
+    pub fn set_child_code(&self, cache: ChildCodeCache) {
+        #[cfg(fiber_rt)]
+        if let Some(n) = &self._nursery {
+            n.set_child_code(cache);
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = cache;
     }
 
     /// Install the run's async freeze trigger (see [`FreezeController`]); `None` for none. What
@@ -5787,7 +5820,8 @@ impl CompiledModule {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn compile_child_and_run(
     funcs: &[Func],
-    // #922 — the child module's type section, threaded to `compile_child` (and on to a grandchild).
+    // #922 — the child module's type section, threaded to `compile_child_windowed` (and on to a
+    // grandchild).
     types: &[temen_ir::TypeEntry],
     child_entry: FuncIdx,
     sub_base: u64,
@@ -5811,12 +5845,13 @@ pub(crate) unsafe fn compile_child_and_run(
     // runs, and hands it to its own nursery for its grandchildren.
     freeze: Option<std::sync::Arc<FreezeController>>,
 ) -> Result<(i64, i64, bool), JitError> {
-    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
+    // Bounded ≤ MAX by `compile_child_windowed`'s reject (audit #3).
+    let child_size = 1u64 << child_size_log2;
 
     // §4 (DURABILITY.md, "JIT parity"): a **durable** child gets an attenuated `Instantiator` powerbox
     // so it can nest a grandchild of its own — the freeze slice's prerequisite (an instrumented child
     // that can be *live* mid-computation is one that reached a `call.cap`). Build a child `Nursery`
-    // over the child's own funcs, boxed here so its stable address (baked into the child code below)
+    // over the child's own funcs, boxed here so its stable address (the child's instance's nursery)
     // outlives the run; its `instantiate` re-enters `compile_child_and_run` for the grandchild
     // (recursion), re-checking the same durable + same-module guard. The child's powerbox holds one
     // capability — an `Instantiator` over its **own** window (`child_instantiator_thunk`, ctx = the
@@ -5845,29 +5880,32 @@ pub(crate) unsafe fn compile_child_and_run(
         } else {
             None
         };
-    // A durable nested child never installs grant hooks, and the thunks fail its granted spawns
-    // closed anyway, so of this env only `instantiate` and the lifecycle ops do anything.
-    let child_inst = child_nursery
-        .as_deref()
-        .map_or(InstEnv::null(), InstEnv::over);
     // The synchronous child's non-nesting powerbox is empty (an inert `call.cap` → `CapFault`); its
-    // `Instantiator` (if any) is routed by `child_inst` above.
-    let child = compile_child(
+    // `Instantiator` (if any) spawns through `child_nursery` above. A durable nested child never
+    // installs grant hooks, and the thunks fail its granted spawns closed anyway, so of that nursery
+    // only `instantiate` and the lifecycle ops do anything.
+    let child = compile_child_windowed(&ChildCompile {
         funcs,
         types,
-        child_entry,
-        child_size_log2,
-        empty_cap_thunk,
-        core::ptr::null_mut(),
-        epoch_addr, // §5 kill-path: the child polls the parent's interrupt cell
-        fuel_addr,  // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
-        0,          // durable path: no shared futex domain — child futex ops stay rejected
-        child_inst,
-        &[], // the durable/sync nested child is never an offer target — no serve trampolines
-        0,   // an empty powerbox holds no `Jit` — the natural table,,
-        child_shadow,
-        ChildRun::Inline, // on its parent's thread: no fiber runtime or thread domain of its own
-    )?;
+        entry: child_entry,
+        mapped_log2: child_size_log2,
+        reserved_log2: child_size_log2,
+        thunk: empty_cap_thunk,
+        addrs: InstanceAddrs {
+            epoch: epoch_addr as *const AtomicU64, // §5 kill-path: it polls the parent's cell
+            // Counted fuel: its own budget cell (null ⇒ un-metered).
+            fuel: fuel_addr as *mut FuelCell,
+            // The durable path has no shared futex domain, so child futex ops stay rejected.
+            nursery: child_nursery.as_deref().map_or(core::ptr::null(), |n| {
+                n as *const instantiator_rt::Nursery as *const core::ffi::c_void
+            }),
+            ..InstanceAddrs::NONE
+        },
+        serve_handlers: &[], // the durable/sync nested child is never an offer target
+        table_reserve_log2: 0, // an empty powerbox holds no `Jit` — the natural table
+        shadow: child_shadow,
+        run: ChildRun::Inline, // on its parent's thread: no fiber runtime or thread domain of its own
+    })?;
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.tramp_code;
     let fn_table_ptr = child.fn_table.as_ptr();
@@ -6141,9 +6179,10 @@ pub unsafe fn handler_tramp_of(
 // and running the same **plain** child concurrently on N threads is sound: every thread only reads the same finalized bytes, and the single `OwnedJit` frees the arena
 // once when the last `Arc` drops (after `join_children`, so no thread still runs the code). The one
 // mutable path — `define_extra`/`install` behind a re-granted `Jit` capability (#1296) — is reached
-// only through a **granted** child, which is compiled per spawn (never cached) and owned by exactly
-// one thread: its module is mutated by that thread alone, inside the child's own suspended `call.cap`
-// (the `run_raw` re-entry discipline), never shared. A root module is never sent anywhere.
+// only through a child holding that `Jit`, whose code is compiled for it alone (never cached,
+// temen#2168) and owned by exactly one thread: its module is mutated by that thread alone, inside the
+// child's own suspended `call.cap` (the `run_raw` re-entry discipline), never shared. A root module is
+// never sent anywhere.
 #[cfg(fiber_rt)]
 unsafe impl Send for CompiledModule {}
 #[cfg(fiber_rt)]
@@ -6167,7 +6206,8 @@ impl SharedCode {
     /// A new instance of the code at `addrs`: `cap_ctx` is its own powerbox, and `epoch`, `fuel` and
     /// `sig_armed` the cells its checks poll — its run's, which need not be the cells of the run that
     /// compiled it (#2145). A cell is set exactly when the code was compiled with its check: code
-    /// without the check never reads it, and a check of a null cell would fault in the host.
+    /// without the check never reads it, and a check of a null cell would fault in the host. The
+    /// same holds for `nursery`, set exactly when the code spawns.
     pub fn instance(&self, addrs: InstanceAddrs) -> CompiledModule {
         assert_eq!(addrs.epoch.is_null(), !self.0.epoch, "kill-path cell");
         assert_eq!(addrs.fuel.is_null(), !self.0.fuel, "fuel cell");
@@ -6176,6 +6216,8 @@ impl SharedCode {
             self.0.instance.sig_armed.is_null(),
             "signal cell"
         );
+        // Code that spawns hands its `Instantiator` thunks the nursery it loads (temen#2168).
+        assert_eq!(addrs.nursery.is_null(), !self.0.nests, "nursery");
         self.0.instance(addrs)
     }
 }
@@ -6190,8 +6232,8 @@ const _: fn() = || {
 };
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
-/// (top-level [`CompiledModule::compile`] and nested [`compile_child`]) — one audited copy, so the
-/// soundness-critical flags cannot drift between them. Most load-bearing is
+/// (top-level [`CompiledModule::compile`] and nested [`compile_child_windowed`]) — one audited copy,
+/// so the soundness-critical flags cannot drift between them. Most load-bearing is
 /// `enable_probestack=false`: the software stack-overflow guard (`emit_stack_check` / STACK_GUARD.md)
 /// is sound *only because* a large frame's `sub rsp` is a pure pointer move touching no pages before
 /// the entry-block check — a probestack that page-walked the frame downward would touch below the
@@ -6239,67 +6281,8 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
         .collect()
 }
 
-/// Compile a §14 child module: every function confined (top-level masking) to a fresh
-/// `2^child_size_log2`-byte window, `call.cap`s baked to `cap_thunk`/`cap_ctx`, and the entry
-/// wrapped in a buffer-ABI trampoline. "Nesting cost is paid at setup" (§14): this is the setup.
-/// A child using §12 fibers/threads is rejected (`Unsupported`) — those need per-child runtimes,
-/// and compiling them against null thunks would be unsound.
-#[cfg(fiber_rt)]
-#[allow(clippy::too_many_arguments)] // a child compile threads its full cap/kill/futex/nesting context
-fn compile_child(
-    funcs: &[Func],
-    // #922 — the child module's type section, so `call.dyn`/`call.cap` interned type indices
-    // in `funcs` resolve to their `FuncType` during lowering.
-    types: &[temen_ir::TypeEntry],
-    child_entry: FuncIdx,
-    child_size_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-    epoch_addr: usize,
-    // Address of this child's **own** counted-fuel cell (`0` ⇒ un-metered — byte-identical to before
-    // fuel threading). Unlike `epoch_addr` (one stable host cell shared by the whole run), each child
-    // gets its own budget (`min(quota, parent_remaining)`, INTERP_PERF.md "Fuel unification" step 5),
-    // so this address is **per-spawn** and is baked here — the caller (a fuel-armed run) must therefore
-    // not reuse cached child code across spawns (see the async cache guard in `instantiator_rt`).
-    fuel_addr: usize,
-    // The parent domain's futex (`os_thread_rt::Domain` address), or `0`. Nonzero lets the child's
-    // `atomic.wait`/`notify` compile against the **parent's shared futex table** — how concurrent
-    // §14 children (and the parent) rendezvous, e.g. a pipeline over a granted `SharedRegion` ring.
-    // Zero (the coroutine / durable paths) keeps futex ops rejected as before.
-    futex_sched: usize,
-    inst_env: InstEnv,
-    // CALLS.md 5c.1a — the child module's impl-export **handler** funcidxs (deduped by the
-    // caller or not — deduped again here), each of which gets a buffer-ABI serve trampoline so
-    // a cross-domain dispatch can invoke it over the child's live window (the `serve_tramps`
-    // block of `CompiledModule::compile`, child twin). Empty ⇒ a child that offers nothing.
-    serve_handlers: &[u32],
-    // #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
-    table_reserve_log2: u8,
-    shadow: temen_ir::durable_abi::ShadowArena,
-    // How the child runs, which decides the runtimes it may use (#1469); see [`ChildRun`].
-    run: ChildRun,
-) -> Result<CompiledModule, JitError> {
-    compile_child_windowed(
-        funcs,
-        types,
-        child_entry,
-        child_size_log2,
-        child_size_log2,
-        cap_thunk,
-        cap_ctx,
-        epoch_addr,
-        fuel_addr,
-        futex_sched,
-        inst_env,
-        serve_handlers,
-        table_reserve_log2,
-        shadow,
-        run,
-    )
-}
-
 /// How a §14 child runs, which decides the fiber and thread runtimes its code may call (#1469).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ChildRun {
     /// Synchronously on its parent's thread (the durable nested path): the running fiber runtime
     /// is the parent's, so `cont.*` and `thread.*` stay refused.
@@ -6313,44 +6296,79 @@ pub(crate) enum ChildRun {
     DurableTask,
 }
 
-/// [`compile_child`] over a **decoupled** window: `mapped_log2` committed bytes inside a
-/// `reserved_log2` reservation (#1287, the detached child — a root's shape). The confinement mask is
-/// the reservation, the thunks see `(mapped, reserved)` so the child's `vm_map` commits tail pages
-/// through the same path a root run's does, and an access past the committed extent faults on the
-/// inaccessible tail. `mapped_log2 == reserved_log2` is the fully-mapped carve child.
+/// What a §14 child's compile is given ([`compile_child_windowed`]). All of it but the module itself
+/// (its functions, types and shadow arena, which the module's digest names) is what else its code
+/// depends on, so a [`ChildCodeKey`] is made of exactly these fields.
+#[derive(Clone, Copy)]
+pub(crate) struct ChildCompile<'a> {
+    pub(crate) funcs: &'a [Func],
+    /// #922 — the child module's type section, so `call.dyn`/`call.cap` interned type indices in
+    /// `funcs` resolve to their `FuncType` during lowering.
+    pub(crate) types: &'a [temen_ir::TypeEntry],
+    pub(crate) entry: FuncIdx,
+    /// Its committed window, inside a reservation of `reserved_log2` (equal for a carve child).
+    pub(crate) mapped_log2: u8,
+    pub(crate) reserved_log2: u8,
+    /// The `call.cap` thunk its sites call.
+    pub(crate) thunk: CapThunk,
+    /// The first instance's addresses: its powerbox, the run's kill-path cell, its own budget cell
+    /// (null: un-metered), the domain its futex sites rendezvous in (null keeps futex ops rejected:
+    /// the durable path), and its own nursery (null: it cannot spawn). The code polls, charges, waits
+    /// and nests exactly when its instance has the cell, so every instance of it has the same set.
+    pub(crate) addrs: InstanceAddrs,
+    /// CALLS.md 5c.1a — the impl-export **handler** funcidxs, each given a buffer-ABI serve
+    /// trampoline so a cross-domain dispatch can invoke it over the child's live window. Empty ⇒ a
+    /// child that offers nothing.
+    pub(crate) serve_handlers: &'a [u32],
+    /// #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
+    pub(crate) table_reserve_log2: u8,
+    /// The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
+    pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
+    /// How it runs (see [`ChildRun`]): only a task has a fiber runtime and a thread domain of its own.
+    pub(crate) run: ChildRun,
+}
+
+/// Compile a §14 child: every function confined to its own window — `mapped_log2` committed bytes
+/// inside a `reserved_log2` reservation (#1287, the detached child — a root's shape) — its
+/// `call.cap`s calling its thunk, and the entry wrapped in a buffer-ABI trampoline. "Nesting cost
+/// is paid at setup" (§14): this is the setup. The confinement mask is the reservation, the thunks
+/// see `(mapped, reserved)` so the child's `vm_map` commits tail pages through the same path a root
+/// run's does, and an access past the committed extent faults on the inaccessible tail.
+/// `mapped_log2 == reserved_log2` is the fully-mapped carve child.
 ///
 /// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
 /// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
-/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no
-/// setjmp / nursery runtime of its own (those ops are rejected below). A child that runs as an
-/// executor task may use `cont.*` fibers, `gc.roots` and `thread.spawn`/`join` (#1469; a durable one
-/// since #2010): the thunks are static and find the running fiber runtime and thread domain through
-/// thread-locals, and each task brings its own (`child_exec`), so the code stays shareable across
-/// spawns. Being the root's shape is what
-/// lets a child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
-/// submitted unit against exactly these baked constants, into the child's own table.
-#[allow(clippy::too_many_arguments)]
-fn compile_child_windowed(
-    funcs: &[Func],
-    types: &[temen_ir::TypeEntry],
-    child_entry: FuncIdx,
-    mapped_log2: u8,
-    reserved_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-    epoch_addr: usize,
-    fuel_addr: usize,
-    futex_sched: usize,
-    inst_env: InstEnv,
-    serve_handlers: &[u32],
-    table_reserve_log2: u8,
-    // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
-    shadow: temen_ir::durable_abi::ShadowArena,
-    // How the child runs (see [`ChildRun`]): only a task has a fiber runtime and a thread domain of
-    // its own.
-    run: ChildRun,
-) -> Result<CompiledModule, JitError> {
+/// thunk, its window geometry, and no setjmp runtime of its own (those ops are rejected below). Its
+/// powerbox, the cells it polls and charges, the domain it waits in and the nursery it spawns
+/// through are its instance's, in its vmctx. A child that runs as an executor task may use `cont.*`
+/// fibers, `gc.roots` and `thread.spawn`/`join` (#1469; a durable one since #2010): the thunks are
+/// static and find the running fiber runtime and thread domain through thread-locals, and each task
+/// brings its own (`child_exec`). So the code is shared by every spawn of it ([`ChildCodeCache`],
+/// temen#2168). Being the root's shape is what lets a child hold a re-granted `Jit` capability:
+/// `define_extra` / `invoke_extra` / `install` lower a submitted unit against exactly these baked
+/// constants, into the child's own table — so such a child's code is its own.
+fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitError> {
+    let ChildCompile {
+        funcs,
+        types,
+        entry: child_entry,
+        mapped_log2,
+        reserved_log2,
+        thunk: cap_thunk,
+        addrs,
+        serve_handlers,
+        table_reserve_log2,
+        shadow,
+        run,
+    } = *c;
     let in_task = run != ChildRun::Inline;
+    let epoch_addr = addrs.epoch as usize;
+    let fuel_addr = addrs.fuel as usize;
+    let futex_sched = addrs.sched as usize;
+    #[cfg(fiber_rt)]
+    let inst_env = InstEnv::nesting(!addrs.nursery.is_null());
+    #[cfg(not(fiber_rt))]
+    let inst_env = InstEnv::null();
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
@@ -6473,7 +6491,7 @@ fn compile_child_windowed(
             cap,
             fiber,
             thread_env,
-            inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
+            inst_env, // a child that spawns loads its own nursery from its vmctx (temen#2168)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
             SigEnv::null(), // #932 — a §14 child is not signal-delivery armed (slice 1b)
             &mut ctx.func,
@@ -6633,8 +6651,11 @@ fn compile_child_windowed(
     // lets a test prove a child ran compiled.
     CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
     Ok(CompiledModule {
-        // A §14 child's code is never shared through `share`: each spawn compiles its own.
-        needs_runtime: true,
+        // A §14 child's runtimes are its task's (`child_exec`) and its nursery is its instance's
+        // (temen#2168), so its code is only code: every spawn of it can run one compile
+        // ([`ChildCodeCache`]).
+        needs_runtime: false,
+        nests: inst_env.is_active() && funcs_use_instantiator(funcs),
         fn_table,
         tramp_code: code,
         tramp_code_limited: code_limited,
@@ -6653,16 +6674,10 @@ fn compile_child_windowed(
         sub_base: 0,
         epoch: epoch_addr != 0,
         fuel: fuel_addr != 0,
-        // The child's own instance: its powerbox (the ctx its compile was handed), the parent's
-        // kill-path cell, its own budget cell. §14 children are not signal-delivery armed.
-        instance: InstanceAddrs {
-            cap_ctx,
-            epoch: epoch_addr as *const AtomicU64,
-            fuel: fuel_addr as *mut FuelCell,
-            // Its `thread.*` and futex sites run on the parent's domain (null when it has none).
-            sched: futex_sched as *const core::ffi::c_void,
-            ..InstanceAddrs::NONE
-        },
+        // The child's own instance: its powerbox, the parent's kill-path cell, its own budget cell,
+        // the parent's domain its `thread.*` and futex sites run on, and its own nursery. §14
+        // children are not signal-delivery armed.
+        instance: addrs,
         fn_table_mask,
         next_extra: 0,
         extra_bytes: 0,
@@ -6714,9 +6729,111 @@ fn compile_child_windowed(
     })
 }
 
-/// PROCESS.md S1: process-wide count of §14 child modules JIT-compiled — one per spawn, since the
-/// per-carve compile cache went with the carve spawn (#1867). Monotone; the public
-/// [`child_compiles`] reads it (a real metric, and the tests' proof that a child ran compiled).
+/// temen#2168 — what a §14 child's code depends on: its module, by digest, and every other input of
+/// its compile ([`ChildCompile`]). A spawn whose key is equal instantiates the cache's compile.
+#[derive(PartialEq, Eq, Hash)]
+struct ChildCodeKey {
+    /// The module's content digest, from its grant: the same code however it was granted. Identity
+    /// is structural (INVARIANTS #10). It names the functions, types and shadow arena the compile
+    /// read.
+    digest: [u8; 32],
+    entry: FuncIdx,
+    mapped_log2: u8,
+    reserved_log2: u8,
+    thunk: usize,
+    /// Which cells the code's instances have, which decides the checks it emits
+    /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain, and the nursery.
+    cells: [bool; 4],
+    serve_handlers: Box<[u32]>,
+    table_reserve_log2: u8,
+    run: ChildRun,
+}
+
+impl ChildCodeKey {
+    fn of(digest: [u8; 32], c: &ChildCompile<'_>) -> ChildCodeKey {
+        let a = &c.addrs;
+        ChildCodeKey {
+            digest,
+            entry: c.entry,
+            mapped_log2: c.mapped_log2,
+            reserved_log2: c.reserved_log2,
+            thunk: c.thunk as usize,
+            cells: [
+                !a.epoch.is_null(),
+                !a.fuel.is_null(),
+                !a.sched.is_null(),
+                !a.nursery.is_null(),
+            ],
+            serve_handlers: c.serve_handlers.into(),
+            table_reserve_log2: c.table_reserve_log2,
+            run: c.run,
+        }
+    }
+}
+
+/// One child's compile, made by its first spawn while later ones wait on the lock; `None` until then.
+type ChildCodeSlot = Arc<std::sync::Mutex<Option<SharedCode>>>;
+
+/// temen#2168 — compiled §14 children, by what their code depends on ([`ChildCodeKey`]): every
+/// spawn of the same child runs one compile of it, each over its own powerbox, window, cells and
+/// nursery ([`SharedCode::instance`]). A run's nurseries share one, made for the run unless the
+/// embedder hands its own ([`CompiledModule::set_child_code`]), which then serves its later runs too.
+/// The code lives as long as the cache: a run keeps a compile of each child it spawned, as the
+/// bytecode engine keeps one of each module a run grants.
+#[derive(Clone, Default)]
+pub struct ChildCodeCache(
+    Arc<std::sync::Mutex<std::collections::HashMap<ChildCodeKey, ChildCodeSlot>>>,
+);
+
+impl ChildCodeCache {
+    /// How many children it holds a compile of. One being compiled right now is not counted (its
+    /// slot is held for the compile, and this does not wait for it).
+    pub fn compiled(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|slot| slot.try_lock().is_ok_and(|code| code.is_some()))
+            .count()
+    }
+
+    /// The code for a spawn of the child `c` describes, whose module `digest` names: an instance of
+    /// the cache's compile of it. The first spawn makes the compile and runs it itself. Only for a
+    /// child that cannot extend its code: one holding a `Jit` ([`GrantChild::holds_jit`]) compiles
+    /// its own.
+    pub(crate) fn instance(
+        &self,
+        digest: [u8; 32],
+        c: &ChildCompile<'_>,
+    ) -> Result<CompiledModule, JitError> {
+        let slot = Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(ChildCodeKey::of(digest, c))
+                .or_default(),
+        );
+        let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(code) = &*kept {
+            return Ok(code.instance(c.addrs));
+        }
+        let first = compile_child_windowed(c)?;
+        *kept = first.share();
+        Ok(first)
+    }
+}
+
+impl std::fmt::Debug for ChildCodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildCodeCache")
+            .field("compiled", &self.compiled())
+            .finish()
+    }
+}
+
+/// PROCESS.md S1: process-wide count of §14 child modules JIT-compiled — one per child and window
+/// shape a run spawns ([`ChildCodeCache`]). Monotone; the public [`child_compiles`] reads it (a real
+/// metric, and the tests' proof that a child ran compiled).
 #[cfg(fiber_rt)]
 pub(crate) static CHILD_COMPILES: AtomicU64 = AtomicU64::new(0);
 
@@ -6732,7 +6849,8 @@ pub fn module_compiles() -> u64 {
 }
 
 /// PROCESS.md S1: how many §14 child modules this process has JIT-compiled (0 where nesting is
-/// unsupported — no child ever compiles): one per spawn.
+/// unsupported — no child ever compiles): one per child a run spawns, not per spawn
+/// ([`ChildCodeCache`]).
 pub fn child_compiles() -> u64 {
     #[cfg(fiber_rt)]
     {
@@ -7109,18 +7227,18 @@ impl ThreadEnv {
     }
 }
 
-/// The §14 nesting runtime address + the `instantiate`/`join` thunk addresses, baked into the
-/// module's `Instantiator` `call.cap` sites. All `0` when the compile has no nursery: a module that
-/// holds no `Instantiator`, or a §14 child that cannot spawn — a non-durable carve child, or a
-/// durable detached one. Its `Instantiator` `call.cap` then takes the ordinary `call.cap` path, an
-/// inert `CapFault`. A durable carve child and a non-durable detached child (#1956) that use the
+/// The `instantiate`/`join` thunk addresses baked into the module's `Instantiator` `call.cap` sites,
+/// which pass each thunk the instance's §14 nursery, loaded from its vmctx ([`VmCtx::nursery`],
+/// temen#2168). All `0` when the compile has no nursery: a module that holds no `Instantiator`, or a
+/// §14 child that cannot spawn. Its `Instantiator` `call.cap` then takes the ordinary `call.cap`
+/// path, an inert `CapFault`. A durable carve child and a detached child (#1956) that use the
 /// `Instantiator` each get a nursery of their own.
 #[derive(Clone, Copy)]
 struct InstEnv {
-    nursery_addr: i64,
+    /// Whether the compile lowers `Instantiator` calls to the nesting runtime: every instance of
+    /// the code has a nursery.
+    active: bool,
     join_thunk: i64,
-    // op 18 (`wait`): join's park, answering how the child ended.
-    wait_thunk: i64,
     // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
     poll_thunk: i64,
     detach_thunk: i64,
@@ -7145,9 +7263,8 @@ struct InstEnv {
 impl InstEnv {
     fn null() -> InstEnv {
         InstEnv {
-            nursery_addr: 0,
+            active: false,
             join_thunk: 0,
-            wait_thunk: 0,
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
@@ -7158,13 +7275,16 @@ impl InstEnv {
             self_prog: 0,
         }
     }
-    /// The env that lowers a compile's `Instantiator` calls to `n`, for code of module 0's program.
+    /// The env that lowers a compile's `Instantiator` calls to its instance's nursery, for code of
+    /// module 0's program; [`Self::null`] for a compile with none.
     #[cfg(fiber_rt)]
-    fn over(n: &instantiator_rt::Nursery) -> InstEnv {
+    fn nesting(nests: bool) -> InstEnv {
+        if !nests {
+            return InstEnv::null();
+        }
         InstEnv {
-            nursery_addr: (n as *const instantiator_rt::Nursery) as i64,
+            active: true,
             join_thunk: instantiator_rt::join as *const () as i64,
-            wait_thunk: instantiator_rt::wait as *const () as i64,
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
@@ -7179,7 +7299,7 @@ impl InstEnv {
     /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
     /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `call.cap` path.
     fn is_active(&self) -> bool {
-        self.nursery_addr != 0
+        self.active
     }
 }
 
@@ -10125,55 +10245,17 @@ fn lower_instantiator(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    // §3c: the verifier checks a `call.cap`'s args against its *declared* `sig` only — it knows
-    // nothing about host interfaces, so a verifier-valid module can call iface 6 with any
-    // `(op, sig)` shape. The interpreter discovers a mismatch at **runtime** (handle resolution
-    // first → `CapFault` on a forged handle; then per-op arg indexing → `Malformed`), but this
-    // lowering dispatches on `op` **statically** and can neither index missing args nor pass
-    // mistyped values through the fixed thunk ABIs. So: a call whose declared shape doesn't match
-    // the op's contract (arg prefix / result types below), or whose op is unknown (the
-    // interpreter's default arm is `CapFault`), lowers to an unconditional runtime `CapFault` —
-    // never a compile-time rejection of a verified module. (Found by the libFuzzer `diff` target:
-    // ops 5/6/7 with short args made the compile fail `Malformed`, crashing the differential —
-    // nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.) Extra trailing args beyond the contract
-    // prefix are tolerated exactly like the interpreter (it never indexes past the op's arity).
-    use ValType::{I32 as VI32, I64 as VI64};
-    let contract: Option<(&[ValType], &[ValType])> = match op {
-        // join(child) -> result; wait(child) -> 0 | trap code
-        1 | 18 => Some((&[VI32], &[VI64])),
-        // S3 lifecycle: poll / detach / kill (child) -> i32 status
-        9 | 10 | 12 => Some((&[VI32], &[VI32])),
-        // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn (§3d: the
-        // scalar granted/named spawns, ops 8/11, died into it — grants are record data now)
-        17 => Some((&[VI64], &[VI32])),
-        // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL); #2220
-        // grant: (child, handle) -> the child's handle (probeable -EINVAL / -EMFILE).
-        14 | 19 => Some((&[VI32, VI64], &[VI32])),
-        // PROCESS.md §5 / #1287 instantiate_detached: (budget, module, grants_ptr, grants_n, entry,
-        // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
-        // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
-        15 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // Every other op — the retired carve spawns (ops 0, 5 and 13, #1867) and the deleted ones —
-        // is the oracle's `CapFault`.
-        _ => None,
-    };
-    // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
-    // coerces each result to the *declared* sig type): a call is admitted when its arg count covers
-    // the op's contract prefix and every prefix arg + every result is a scalar int — i32 **or** i64.
-    // The exact-width `== *need` / `== res` was too strict: a chibicc guest widens all scalars to i64
-    // (`int __spawn(...)` → `… -> (i64)`), so a spawn's i32-result contract (and op 1/9/10/12's i32
-    // child arg) never matched, and every compiled-C driver of the Instantiator fell to a CapFault
-    // that the interpreter never raised. The per-arg coercions below (`slot_i64`/`slot_i32`/
-    // `result_as`) reconcile the declared widths with each thunk's fixed ABI, so relaxing the gate
-    // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
-    // unconditional runtime CapFault — never a compile-time rejection of a verified module.
-    let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
-    let shape_ok = contract.is_some_and(|(need, res)| {
-        sig.params.len() >= need.len()
-            && sig.params[..need.len()].iter().all(is_scalar_int)
-            && sig.results.len() == res.len()
-            && sig.results.iter().all(is_scalar_int)
-    });
+    // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a verifier-valid
+    // module can call iface 6 with any `(op, sig)` shape. This lowering dispatches on `op`
+    // **statically** and can neither index missing args nor pass mistyped values through the fixed
+    // thunk ABIs, so it checks the declared shape against the one contract every engine checks
+    // (`temen_ir::instantiator_contract`, #2066). A call that doesn't match, or whose op isn't live,
+    // lowers to an unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
+    // rejection of a verified module. (Found by the libFuzzer `diff` target: ops 5/6/7 with short
+    // args made the compile fail `Malformed`, crashing the differential — nightlies Jun 19 / Jul 2 /
+    // Jul 4, ISSUES.md I16.) The contract is width-tolerant: the per-arg coercions below
+    // (`slot_i64`/`slot_i32`/`result_as`) reconcile the declared widths with each thunk's fixed ABI.
+    let shape_ok = temen_ir::instantiator_shape_ok(op, sig);
     if !shape_ok {
         emit_trap_set(b, lower, TrapKind::CapFault);
         emit_trap_propagate(b, lower);
@@ -10185,36 +10267,40 @@ fn lower_instantiator(
         }
         return Ok(());
     }
-    let nursery = b.ins().iconst(I64, lower.inst.nursery_addr);
+    // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
+    let nursery = vmctx_load(b, lower, vmctx::NURSERY);
     // #1726: which program a self child of this code runs (0 = module 0; else this unit's).
     let self_prog = b.ins().iconst(I64, lower.inst.self_prog);
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.vmctx_var);
     match op {
-        1 | 18 => {
-            // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
-            // The nursery owns the child table for this run; the thunk still resolves the call.cap's
-            // `Instantiator` first, as the oracle does for every op (#1729). `wait` (op 18) has
-            // join's shape and answers how the child ended.
+        1 => {
+            // join(nursery, mem_base, instantiator:i32, child_handle:i32, status_out:i64,
+            // trap_out:i64) -> value:i64, the status through `status_out` as `cont.resume`'s is
+            // (#2066). The nursery owns the child table for this run; the thunk still resolves the
+            // call.cap's `Instantiator` first, as the oracle does for every op (#1729).
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64] {
+            for t in [I64, I64, I32, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
-            let thunk_addr = match op {
-                1 => lower.inst.join_thunk,
-                _ => lower.inst.wait_thunk,
-            };
-            let thunk = b.ins().iconst(I64, thunk_addr);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
+            let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, child, status_ptr, trap_out],
+            );
             emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
+            let value = b.inst_results(call)[0];
+            let status = b.ins().stack_load(I64, ss, 0);
+            vals.push(result_as(b, status, sig.results[0]));
+            vals.push(result_as(b, value, sig.results[1]));
         }
         9 | 10 | 12 => {
             // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,

@@ -1127,7 +1127,6 @@ fn process(ops: &mut Vec<Op>) {
         // §14 executor children — the process-spawn nouns.
         ("instantiate_rec", inst, 17u32),
         ("join", inst, 1),
-        ("wait", inst, 18),
         ("poll", inst, 9),
         ("detach", inst, 10),
         ("kill", inst, 12),

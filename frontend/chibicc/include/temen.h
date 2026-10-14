@@ -50,7 +50,11 @@ long __vm_resolve(const char *name, long len);
 long __vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
                                long entry, long size_log2, long args_ptr, long args_len, long region,
                                long child_off);
-long __vm_instantiate_join(int inst, long child);
+// `__vm_instantiate_join` waits for the child to end and returns its result, with `*status` 0; a
+// child that ended in a trap (out of fuel, a fault, `kill`, `exit(n)`) returns 0 with `*status` its
+// trap's wire code (`temen_ir::trap_code`: the kind in the low 32 bits, an exit's status in the
+// high). The child's end is never yours, and either way it is reaped.
+long __vm_instantiate_join(int inst, long child, long *status);
 // A grant record is `{u32 name_off, u32 name_len, i32 handle, u32 flags}`, the name a string in your
 // window. A child binds its imports strictly: one that no record satisfies refuses the spawn
 // (-EINVAL), and the run's notes name it. `VM_EMPTY` as a record's handle grants nothing under the
@@ -63,6 +67,10 @@ long __vm_instantiate_join(int inst, long child);
 // (a run of pages of one protection in a window, a thread, a region). The powerbox's `"budget"` holds
 // one window's worth.
 long __vm_budget_read(int budget, long field);
+// `__vm_budget_close(budget)` — give a `Budget` handle up (0; the handle answers -EBADF after). The
+// node stays, so a child you spawned from it is still capped by it: close a node you split for a
+// child once the child is spawned, or a parent that spawns many fills its handle table (#2384).
+long __vm_budget_close(int budget);
 //
 // **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
 // authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many

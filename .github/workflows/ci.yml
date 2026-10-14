@@ -341,6 +341,7 @@ jobs:
             durable_loop_jit,
             durable_recycle,
             durable_recycle_jit,
+            cap_abi,
           ]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

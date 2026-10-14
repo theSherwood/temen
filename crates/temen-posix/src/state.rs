@@ -142,7 +142,7 @@ pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     }
     b.strs(p.args.iter());
     b.str(&p.cwd);
-    let mut env: Vec<(&String, &String)> = p.env.iter().collect();
+    let mut env: Vec<(&String, &String)> = p.env.vars.iter().collect();
     env.sort();
     b.uleb(env.len() as u64);
     for (k, v) in env {
@@ -345,7 +345,7 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     p.dirs = dirs;
     p.args = args;
     p.cwd = cwd;
-    p.env = env;
+    p.env = Arc::new(super::Env::forced(env, w.payer()));
     p.env_ptrs = env_ptrs;
     p.sig_pending = sig_pending;
     p.sig_handler = sig_handler;
@@ -536,7 +536,7 @@ mod tests {
         p.fds.push(Some(FdEntry::PipeWrite(pipe)));
         let (sock, _) = mem_pair(NetAddr::loopback(1), NetAddr::loopback(2), None);
         p.fds.push(Some(FdEntry::NetSock(sock)));
-        p.env.insert("K".into(), "v".into());
+        super::Env::set(&mut p.env, None, true, "K".into(), "v".into());
         p.cwd = "/d".into();
         p.allocated.insert(4096, 16);
         p.heap_next = 4112;

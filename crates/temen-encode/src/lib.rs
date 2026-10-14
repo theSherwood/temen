@@ -871,6 +871,14 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
             write_uleb(out, root);
         }
     }
+    // The library files (#2341): a trailing section written only when there are any, so a module with
+    // none encodes exactly as before and an artifact from before it decodes as having none.
+    if !di.lib_files.is_empty() {
+        write_uleb(out, di.lib_files.len() as u64);
+        for &f in &di.lib_files {
+            write_uleb(out, f as u64);
+        }
+    }
 }
 
 fn encode_func(out: &mut Vec<u8>, f: &Func, object: bool) {
@@ -2484,6 +2492,14 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
             b => return Err(DecodeError::BadOptionFlag(b)),
         };
     }
+    // The library files (#2341), present only when there are any (see `encode_debug_info`).
+    let mut lib_files = Vec::new();
+    if !c.at_end() {
+        let n = c.count()?;
+        for _ in 0..n {
+            lib_files.push(c.idx()?);
+        }
+    }
     Ok(DebugInfo {
         files,
         locs,
@@ -2492,6 +2508,7 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
         blobs,
         func_names,
         tls_root,
+        lib_files,
     })
 }
 
@@ -3542,6 +3559,7 @@ mod debug_tests {
                 },
             ],
             tls_root: Some(0x2_0000),
+            lib_files: vec![1],
         }
     }
 
@@ -3586,6 +3604,29 @@ mod debug_tests {
         assert!(
             bytes_dbg.starts_with(&bytes_none),
             "debug section is appended after a byte-identical prefix"
+        );
+    }
+
+    /// #2341 — the library files are a trailing section, present only when there are any: a module
+    /// without them encodes byte for byte as before (so no artifact or digest moves), and that
+    /// encoding — an artifact from before the section — decodes as having none.
+    #[test]
+    fn library_files_are_an_optional_trailing_section() {
+        let without = DebugInfo {
+            lib_files: Vec::new(),
+            ..sample_debug()
+        };
+        let bytes_without = encode_module(&module(Some(without.clone())));
+        let bytes_with = encode_module(&module(Some(sample_debug())));
+        assert!(
+            bytes_with.len() > bytes_without.len() && bytes_with.starts_with(&bytes_without),
+            "the section follows a byte-identical prefix"
+        );
+        let back = decode_module(&bytes_without).expect("decode");
+        assert_eq!(
+            back.debug_info,
+            Some(without),
+            "no section ⇒ no library files"
         );
     }
 
@@ -3793,8 +3834,14 @@ mod debug_tests {
     #[test]
     fn rejects_a_truncated_debug_section() {
         // A truncated section must fail to decode, never panic (untrusted-input discipline): a
-        // declared count/length runs past the bytes (a blob's length, a var/type count, …).
-        let bytes = encode_module(&module(Some(sample_debug())));
+        // declared count/length runs past the bytes (a blob's length, a var/type count, …). Cut
+        // without the optional library-files section: cutting exactly that section off leaves the
+        // older, valid form (`library_files_are_an_optional_trailing_section`).
+        let without = DebugInfo {
+            lib_files: Vec::new(),
+            ..sample_debug()
+        };
+        let bytes = encode_module(&module(Some(without)));
         for cut in 1..=8 {
             let truncated = &bytes[..bytes.len() - cut];
             assert!(
@@ -3802,6 +3849,12 @@ mod debug_tests {
                 "truncating {cut} byte(s) must error, not panic"
             );
         }
+        // A cut inside the library-files section: its count runs past the bytes.
+        let bytes = encode_module(&module(Some(sample_debug())));
+        assert!(
+            decode_module(&bytes[..bytes.len() - 1]).is_err(),
+            "a truncated library-files section must error"
+        );
     }
 }
 

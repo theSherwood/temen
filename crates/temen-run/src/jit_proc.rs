@@ -333,7 +333,7 @@ impl Tree {
                 };
                 let slot = Arc::clone(
                     self.code
-                        .0
+                        .programs
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .entry(key)
@@ -613,19 +613,28 @@ struct CodeSlot {
     image: Mutex<Option<Option<Arc<Image>>>>,
 }
 
-/// Compiled programs, by what their code depends on ([`CodeKey`]). Every process tree has one for
-/// its run. An embedder that hands the same one to several runs ([`crate::RunConfig::jit_code`]) has
-/// each program compiled once for all of them, the root's included: a toolchain across builds
-/// (#2145). The code lives as long as the cache; how long that is, and so how much code it holds, is
-/// the embedder's call.
+/// Compiled programs, by what their code depends on ([`CodeKey`]), and the §14 children their
+/// processes spawn ([`temen_jit::ChildCodeCache`], temen#2168). Every process tree has one for its
+/// run. An embedder that hands the same one to several runs ([`crate::RunConfig::jit_code`]) has
+/// each program and child compiled once for all of them, the root's included: a toolchain across
+/// builds (#2145), or a shell's jobs across sessions. The code lives as long as the cache; how long
+/// that is, and so how much code it holds, is the embedder's call.
 #[derive(Clone, Default)]
-pub struct JitCodeCache(Arc<Mutex<HashMap<CodeKey, Arc<CodeSlot>>>>);
+pub struct JitCodeCache {
+    programs: Arc<Mutex<HashMap<CodeKey, Arc<CodeSlot>>>>,
+    children: temen_jit::ChildCodeCache,
+}
 
 impl JitCodeCache {
+    /// How many §14 children it holds a compile of ([`temen_jit::ChildCodeCache::compiled`]).
+    pub fn children_compiled(&self) -> usize {
+        self.children.compiled()
+    }
+
     /// How many programs it holds a compile of. A program being compiled right now is not counted
     /// (its slot is held for the compile, and this does not wait for it).
     pub fn compiled(&self) -> usize {
-        self.0
+        self.programs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
@@ -642,6 +651,7 @@ impl std::fmt::Debug for JitCodeCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitCodeCache")
             .field("compiled", &self.compiled())
+            .field("children_compiled", &self.children_compiled())
             .finish()
     }
 }
@@ -1033,6 +1043,11 @@ pub(crate) unsafe fn run_image(
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
     cm.set_window_ready(Some(cc.window_ready()));
+    // temen#2168 — a process's §14 children compile into its tree's code, kept with it by an
+    // embedder that keeps that (#2145).
+    if let Some(p) = process {
+        cm.set_child_code(p.tree.code.children.clone());
+    }
     let r = match start {
         Entry::Fresh {
             args,

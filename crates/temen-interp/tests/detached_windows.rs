@@ -59,7 +59,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vB)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vB)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -117,7 +117,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 12
   vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, vz, vlog, vz)
-  vjD = call.cap 6 1 (i32) -> (i64) v0 (vD)
+  vjD_st, vjD = call.cap 6 1 (i32) -> (i64, i64) v0 (vD)
   return vjD
   }
 }
@@ -167,7 +167,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vfst)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vfst)
   vzero = i32.const 0
   vf1 = i32.lt_s vfst vzero
   vf2 = i32.lt_s vsnd vzero
@@ -290,7 +290,7 @@ block 1 (vh: i32, vd: i32, vi: i64, vw: i32) {
   br_if vdone 2(vh, vd, vw2) 1(vh, vd, vi2, vw2)
   }
 block 2 (vh2: i32, vd2: i32, vwf: i32) {
-  vj = call.cap 6 1 (i32) -> (i64) vh2 (vd2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vd2)
   vwe = i64.extend_i32_u vwf
   vk = i64.const 10
   vm = i64.mul vwe vk
@@ -372,7 +372,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vap = i64.const 18432
   val = i64.const 24
   vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vD)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vD)
   return vj
   }
 }
@@ -547,7 +547,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vsum = call.cap 268435456 0 (i64, i64) -> (i64) vcap (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vs)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vs)
   return vr, vleft
   }
 }

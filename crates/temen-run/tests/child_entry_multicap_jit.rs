@@ -157,10 +157,10 @@ fn multi_record_grant_list_marshals_on_the_jit() {
         Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
+    // The conductor answers `(status, value)`, as the join did (#2066).
     let joined = match jo {
-        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-        JitOutcome::Exited(c) => c as i64,
-        ref o => panic!("jit ended abnormally: {o:?}"),
+        JitOutcome::Returned(ref v) if v.len() == 2 && v[0] == 0 => v[1],
+        ref o => panic!("the child did not return on the jit: {o:?}"),
     };
     check(joined, &fs, &stdout, "jit");
 }
@@ -179,9 +179,8 @@ fn multi_record_grant_list_marshals_on_the_tree_walker() {
     let mut fuel = 200_000_000u64;
     let r = run_with_host(&parent, 0, &args, &mut fuel, &mut host).expect("tree-walker run");
     let joined = match r.as_slice() {
-        [Value::I64(x)] => *x,
-        [Value::I32(x)] => *x as i64,
-        other => panic!("tree-walker result: {other:?}"),
+        [Value::I64(0), Value::I64(x)] => *x,
+        other => panic!("tree-walker: the child did not return: {other:?}"),
     };
     check(joined, &fs, &stdout, "tree-walker");
 }

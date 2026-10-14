@@ -51,7 +51,7 @@ block 0 () {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) vh (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (v5)
   return vr
   }
 }
@@ -158,7 +158,7 @@ block 0 (vsp: i64, va: i64) {
 
 func 4 (i32, i32) -> (i64) {
 block 0 (vh: i32, vc: i32) {
-  vj = call.cap 6 1 (i32) -> (i64) vh (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vc)
   return vj
   }
 }

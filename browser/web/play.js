@@ -388,7 +388,7 @@ block 5 (vj2: i64, vs2: i64, vinst5: i32) {
   v16b = i64.const 16400
   vjoff = i64.add v16b vjlo
   vhh = i32.load vjoff
-  vr = call.cap 6 1 (i32) -> (i64) vinst5 (vhh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst5 (vhh)
   vsn = i64.add vs2 vr
   v1b = i64.const 1
   vjn = i64.add vj2 v1b
@@ -480,12 +480,12 @@ block 0 () {
   vn1 = i64.const 1
   i64.store vr6 vn1
   vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vra = call.cap 6 1 (i32) -> (i64) vinst (vha)
+  vra_st, vra = call.cap 6 1 (i32) -> (i64, i64) vinst (vha)
   ; child B: no grants — A's window went back to the budget when A ended, so B fits
   vn0 = i64.const 0
   i64.store vr6 vn0
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
-  vrb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vrb_st, vrb = call.cap 6 1 (i32) -> (i64, i64) vinst (vhb)
   vten = i64.const 10
   vm = i64.mul vra vten
   vsum = i64.add vm vrb
@@ -570,7 +570,7 @@ block 0 () {
   vlog = i64.const 17
   vreg = i64.extend_i32_u vrh
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
   vm = i64.mul vj vk
   vob = i64.const 65544
@@ -1246,10 +1246,11 @@ int main(void) {
   vm_grant g[1];
   g[0].name = "stdout";
   g[0].handle = out;
+  long st;                                              /* how a child ended: 0 = it returned */
   long a = vm_spawn(worker, 0, g, 1, 0, 0, scratch);    /* A: stdout re-granted */
-  long ra = vm_join(a);
+  long ra = vm_join(a, &st);
   long b = vm_spawn(worker, 0, g, 0, 0, 0, scratch);    /* B: empty grant list */
-  long rb = vm_join(b);
+  long rb = vm_join(b, &st);
   printf("child A (granted stdout) returned %ld\\n", ra);
   printf("child B (no grants)      returned %ld\\n", rb);
   return (int)(ra * 10 + rb);
@@ -1319,7 +1320,12 @@ int main(void) {
     printf("spawn refused: %ld\\n", h);
     return 1;
   }
-  long r = __vm_instantiate_join(inst, h);
+  long st; // how the child ended: 0 if it returned, else its trap's code
+  long r = __vm_instantiate_join(inst, h, &st);
+  if (st != 0) {
+    printf("child trapped: %ld\\n", st);
+    return 1;
+  }
   printf("child returned %ld; the region now holds:", r);
   for (int i = 0; i < N; i++) printf(" %ld", p[i]);
   printf("\\n");

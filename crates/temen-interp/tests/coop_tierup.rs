@@ -9,9 +9,9 @@
 //! whole-run result is **identical** to a pure-interpreter cooperative run of the same guest — so the
 //! tier-up marshalling (args in, results out, resume) is exact across a genuinely threaded schedule.
 //!
-//! The distinguishing coverage over the single-vCPU `vcpu_tierup` test: tier-up fires on **two tasks**
-//! — the root and the spawned worker — proving the paused-task delivery routes to the right vCPU across
-//! the scheduler's multiplexing, and that a spawned same-module child inherits the eligibility bitmap.
+//! Tier-up fires on **two tasks** — the root and the spawned worker — proving the paused-task delivery
+//! routes to the right vCPU across the scheduler's multiplexing, and that a spawned same-module child
+//! inherits the eligibility bitmap.
 //! Plus the #926 "Differentials" concurrency shapes: tier-up co-runs with a **self-hosted fiber
 //! scheduler** (`cont.new`/`cont.resume` worker fibers) and with a **single-threaded live futex** wake
 //! cell (`atomic.wait`/`atomic.notify` park-and-wake) — the scheduler services the concurrency while the
@@ -228,6 +228,62 @@ fn coop_tierup_trap_parity() {
         want, got,
         "cooperative tier-up value/trap diverged from the oracle"
     );
+}
+
+// A task tiers up **once per call**, however many calls it makes: func 0 sums `f1(i)` over
+// `0..N_ITERS`, and each `call 1` pauses to the host. No memory and an all-i64 leaf: the smallest shape
+// that tiers up.
+const SRC_LOOP: &str = r#"
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const N_ITERS
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v0, v1, v2)
+}
+block 1 (v3: i64, v4: i64, v5: i64) {
+  v6 = i64.lt_s v5 v3
+  br_if v6 2(v3, v4, v5) 3(v4)
+}
+block 2 (v7: i64, v8: i64, v9: i64) {
+  v10 = call 1 (v9)
+  v11 = i64.add v8 v10
+  v12 = i64.const 1
+  v13 = i64.add v9 v12
+  br 1(v7, v11, v13)
+}
+block 3 (v14: i64) {
+  return v14
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 3
+  v2 = i64.mul v0 v1
+  v3 = i64.const 7
+  v4 = i64.add v2 v3
+  return v4
+  }
+}
+"#;
+
+#[test]
+fn a_task_tiers_up_once_per_call() {
+    for n in [0i64, 1, 2, 5, 10, 40] {
+        let m = parse_module(&SRC_LOOP.replace("N_ITERS", &n.to_string())).unwrap();
+        temen_verify::verify_module(&m).expect("verify");
+        let want = oracle(&m);
+        let (got, tierups) = coop_tierup_run(&m, std::sync::Arc::from(vec![false, true]));
+        assert_eq!(
+            want, got,
+            "the tier-up run diverged from the oracle at n={n}"
+        );
+        assert_eq!(tierups as i64, n, "one tier-up per call at n={n}");
+        if n == 5 {
+            // sum over i < 5 of (3i + 7) = 30 + 35.
+            assert_eq!(want, Ok(vec![Value::I64(65)]));
+        }
+    }
 }
 
 // A tier-up leaf whose emitted region **bounces** back to an interp-resident callee: func 1 (`L`, the
@@ -607,7 +663,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 3 (v3)
   vr = i64.add vj vlocal
@@ -816,9 +872,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
+  vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
   vh2 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vr = i64.add vj1 vj2
   return vr
   }
@@ -914,7 +970,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32) {
   va5 = i64.const 16664
   i32.store va5 vout
 @GUEST@  vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }

@@ -54,7 +54,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `temen-text`, `temen-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `temen-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `temen-ir` `DebugInfo`/`TypeDef`, `temen-text`, `temen-encode`, `temen-interp`, `codegen_ir.c`, `temen-wasm`, `temen-llvm` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay; #1528: it grants the same §14 by-name set the two Run paths do — `instantiator`, plus `module`/`budget` for a guest that spawns detached — so a §5/§14 guest is debuggable at all) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay; #1528: it grants the same §14 by-name set the two Run paths do — `instantiator`, plus `module`/`budget` for a guest that spawns detached — so a §5/§14 guest is debuggable at all; **library frames + `justMyCode`** — #2341: §6 `lib_files` (text `debug.lib <file>`) marks a linked library's code, set where a unit becomes a resident library (`temen_link_lib_open`) and relocated by `link`, so it holds per module; its frames are `presentationHint: "subtle"`, and under the launch arg `justMyCode` a step does not end in them and `stopOnEntry` stops on the program's own first line; **structured value shapes** — #2341: a variable or `evaluate` result whose type is in §6's table carries `typeInfo` (`kind` scalar/pointer/array/aggregate/opaque, `size`, a scalar's `encoding`, an array's `count`, and the pointee's or element's summary as `target`), so a client renders it from data, not a C spelling) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `temen-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -434,7 +434,8 @@ different things depending on which pair you compare:
   `bytecode_fiber_plus_thread_tick_replays_deterministically`) and `dap_over_bytecode_fiber_on_a_spawned_
   thread` (over DAP). `debug_advance_fiber` is now the single shared per-op driver for both engines.
 
-  **§14 same-module coroutines on the single-vCPU engine (slice 14a).** `debug_advance_fiber` now also
+  **§14 same-module coroutines on the single-vCPU engine (slice 14a; retired with the coroutine ops,
+  #2065).** `debug_advance_fiber` now also
   drives §14 **coroutines** inline — exactly as production `run_inner` does, never via the thread
   scheduler: `spawn_coroutine` builds the confined child in `vt.coroutines`, `resume` drives it via
   `resume_coro` (delivering yields / supplying demand-fault pages / collecting the return), and a leaked
@@ -460,7 +461,8 @@ different things depending on which pair you compare:
   (breakpoint-inside-the-body, step-descends, step-over-runs-the-coroutine, confined-window inspection,
   and body-position tick-replay), with the slice-14a oracle-parity suites unchanged (result-identical).
 
-  **§14 separate-module coroutines on the single-vCPU engine (slice 14c).** `spawn_coroutine_module`
+  **§14 separate-module coroutines on the single-vCPU engine (slice 14c; retired with the coroutine
+  ops, #2065).** `spawn_coroutine_module`
   (op 6 / demand op 7) is no longer declined: a new `spawn_coroutine_module` helper (the debug-engine
   counterpart of `Vcpu::service_coroutine_module`) resolves the host-granted `Module` from the powerbox,
   compiles it, **pushes it to the shared source** (the mutable-`Domain` step that was the blocker),
@@ -584,8 +586,8 @@ different things depending on which pair you compare:
   deterministic tick-replay). This closes the op-coverage gap — the scheduled engine now debugs everything
   the single-vCPU engine does.
 
-  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled).** Stepping into
-  a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
+  **§14 separate-module source-variable inspection (slice 17 — single-vCPU *and* scheduled; its
+  coroutine half retired with the coroutine ops, #2065).** Stepping into a separate-module coroutine child, `read_var`/`var_addr` now resolve the child's *own* named source
   variables — the `FrameReader`'s module-0 gate + per-module debug metadata that were the 14c/15b/15c
   follow-up. The granted child module already retained its whole `Module` (`ModuleGrant.module`, for §3.6),
   so `spawn_coroutine_module` builds a `ModuleDebug` from it (its `-g` info + per-`(func, block)` slot base

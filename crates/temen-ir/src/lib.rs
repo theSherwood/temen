@@ -100,17 +100,14 @@ pub mod cap_id {
     /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
     /// memory half of the `Instantiator`: a guest carves a child's window from its own.
     pub const ADDRESS_SPACE: u32 = 5;
-    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain** confined to a
-    /// power-of-two sub-window `[base, base+size)` of the holder's window (VM-in-VM). op 0
-    /// `instantiate(entry, off, size_log2, fuel) -> child_handle` enqueues a child vCPU running the
-    /// same module's `entry` (which returns one `i64` and takes one or two — its starter caps)
-    /// confined to `[base+off, base+off+2^size_log2)` with an **attenuated** powerbox over the child's
-    /// own window: an `Instantiator` (so it can recurse — confinement composes to any depth) and an
-    /// `AddressSpace` (so it can manage its own pages), passed as the entry's arguments. A fuel quota
-    /// caps it; returns immediately (non-blocking). op 1 `join(child_handle) -> result` parks **only
-    /// the calling fiber** until that child finishes, then yields its result (siblings keep running —
-    /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
-    /// child can only get what the parent sub-allocates).
+    /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
+    /// window of its own (VM-in-VM), and manage it. The live ops ([`super::instantiator_contract`]
+    /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`]
+    /// (15 is its retiring positional form, #2067); 1 `join(child) -> (status, value)` parks only
+    /// the calling fiber until the child ends, then answers how it ended, never as a trap of the
+    /// joiner's (#2066); 9 `poll`, 10 `detach` and 12 `kill` supervise it (PROCESS.md S3); 14
+    /// `child_offer` and 19 `grant` reach into it while it runs. Every other op is retired and traps
+    /// `CapFault`. Holding the handle is the authority to nest.
     pub const INSTANTIATOR: u32 = 6;
     /// `ModuleLoader` — the authority to **promote guest bytes to a spawnable `Module`** (§14 slice:
     /// run-in-guest). op 0 `from_bytes(ptr, len) -> module_handle | -errno` reads a wire-encoded module
@@ -126,11 +123,10 @@ pub mod cap_id {
     /// Host-granted (non-ambient), like `exec`/`fs`.
     pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
-    /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
-    /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
-    /// spawn a child domain running *that* module's code confined to a carve of the holder's window
-    /// — the "plugin-in-plugin" story: a guest can only instantiate modules it was given (no ambient
-    /// authority). It has no directly callable ops (`call.cap` on it is an inert `CapFault`).
+    /// confers only the authority to name it in an `Instantiator` spawn (op 17's record), which runs
+    /// *that* module's code as a child domain in a window of its own — the "plugin-in-plugin" story:
+    /// a guest can only instantiate modules it was given (no ambient authority). It has no directly
+    /// callable ops (`call.cap` on it is an inert `CapFault`).
     pub const MODULE: u32 = 8;
     // id 9 was `IoRing` (the submit/complete ring), retired 2026-08-07 by the §12
     // parking-on-blocking re-measure: batching measured 13× negative, overlap subsumed by
@@ -180,7 +176,9 @@ pub mod cap_id {
     /// sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
     /// unbounded on its own), deducting nothing. op 1 `read(field) -> room | -EINVAL`: the room left
     /// along the chain — the §15 monitoring readout. op 2 `transfer(dst, fuel, mem, spawn) -> 0 |
-    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's.
+    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's. op 3
+    /// `close() -> 0` (#2384): give the handle up; the node stays in the tree, so a child spawned
+    /// from it is still capped and charged.
     pub const BUDGET: u32 = 14;
     /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
     /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
@@ -211,6 +209,46 @@ pub mod cap_id {
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
     /// the fixed built-ins and far below the reserved `u32::MAX`-family dispatch sentinels.
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
+}
+
+/// The shape of each live [`cap_id::INSTANTIATOR`] op: the scalar-int argument prefix it reads and
+/// the results it answers. The verifier checks a `call.cap` against its *declared* signature only,
+/// so a verified module can call the Instantiator with any shape. Every engine checks the declared
+/// one against this table before running the op ([`instantiator_shape_ok`]), and a call that
+/// doesn't match, or names an op that isn't live, traps `CapFault`. One table, so no engine numbers
+/// a result that another doesn't deliver (#2066).
+///
+/// | op | | args | results |
+/// |---|---|---|---|
+/// | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
+/// | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
+/// | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
+/// | 15 | `instantiate_detached` | budget, module, grants ptr and count, entry, size_log2, quota | child or `-errno` |
+/// | 17 | `instantiate_rec` | record pointer | child or `-errno` |
+pub fn instantiator_contract(op: u32) -> Option<(&'static [ValType], &'static [ValType])> {
+    use ValType::{I32, I64};
+    match op {
+        1 => Some((&[I32], &[I64, I64])),
+        9 | 10 | 12 => Some((&[I32], &[I32])),
+        14 | 19 => Some((&[I32, I64], &[I32])),
+        15 => Some((&[I64; 7], &[I32])),
+        17 => Some((&[I64], &[I32])),
+        _ => None,
+    }
+}
+
+/// Whether an Instantiator `call.cap` of `op` declared as `sig` matches [`instantiator_contract`].
+/// Width-tolerant: an `i32` or an `i64` matches either, since every engine reads an arg as an
+/// `i64` and coerces a result to its declared type (a chibicc guest widens every scalar to `i64`).
+/// Args past the contract's prefix are tolerated (op 15's optional args payload and region).
+pub fn instantiator_shape_ok(op: u32, sig: &FuncType) -> bool {
+    let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
+    instantiator_contract(op).is_some_and(|(args, results)| {
+        sig.params.len() >= args.len()
+            && sig.params[..args.len()].iter().all(int)
+            && sig.results.len() == results.len()
+            && sig.results.iter().all(int)
+    })
 }
 
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
@@ -4690,11 +4728,19 @@ pub struct DebugInfo {
     /// (the [`TLS_ROOT_SYM`] address it placed) or by a whole-program frontend that laid the block out
     /// itself; `None` for a module with no thread-locals. See [`DebugInfo::tls_addr`].
     pub tls_root: Option<u64>,
+    /// The [`files`](Self::files) (indices, ascending) that hold a **library's** code rather than the
+    /// program's own: a unit linked *into* a program, never debugged as one (#2341). A debugger marks
+    /// their frames as library frames, and steps past them under just-my-code. Set where a unit
+    /// becomes a library (the cdylib's resident libraries) and relocated by [`link`] like every file
+    /// reference, so it holds per module — a child's own libraries included. A header compiled into
+    /// the program's own unit is the program's code, not a library's.
+    pub lib_files: Vec<u32>,
 }
 
 impl DebugInfo {
     /// True when every table is empty. Such a `DebugInfo` says nothing: [`tls_root`](Self::tls_root)
-    /// only locates [`VarLoc::Tls`] variables, so on its own nothing reads it. The decoder, the text
+    /// only locates [`VarLoc::Tls`] variables and [`lib_files`](Self::lib_files) only classifies
+    /// files, so on their own nothing reads them. The decoder, the text
     /// printer and parser, and the linker all treat a vacuous `DebugInfo` as none, so "no debug info"
     /// has one form (`None`) and every round trip keeps it.
     pub fn is_vacuous(&self) -> bool {
@@ -4709,6 +4755,7 @@ impl DebugInfo {
             blobs,
             func_names,
             tls_root: _,
+            lib_files: _,
         } = self;
         files.is_empty()
             && locs.is_empty()
@@ -4729,6 +4776,11 @@ impl DebugInfo {
             self.tls_root?
         };
         Some(block.wrapping_add(off))
+    }
+
+    /// Whether file `file` holds a library's code ([`lib_files`](Self::lib_files)).
+    pub fn is_lib_file(&self, file: u32) -> bool {
+        self.lib_files.contains(&file)
     }
 }
 
@@ -6008,6 +6060,8 @@ fn merge_debug_info(
                 func: n.func + fbase,
                 name: n.name.clone(),
             }));
+        out.lib_files
+            .extend(di.lib_files.iter().map(|f| f + file_base));
         out.blobs.extend(di.blobs.iter().cloned());
     }
     // Vacuous in ⇒ nothing out.

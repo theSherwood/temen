@@ -11,13 +11,12 @@
 
 #[path = "support/detached.rs"]
 mod detached;
-#[path = "../../temen-interp/tests/support/rec.rs"]
-mod rec;
 
 use core::ffi::c_void;
 use core::ptr::null_mut;
 use detached::{
-    grant_hooks, host, interp_on_reserved, jit_on_reserved, module, parent_room_after_refusal,
+    grant_hooks, host, interp_on_reserved, jit_on_reserved, module, nester,
+    parent_room_after_refusal, rec, within_a_minute,
 };
 use std::sync::Mutex;
 use temen_interp::{cap_id, run_with_host, Host, MemLayout, Trap, Value};
@@ -55,11 +54,19 @@ block 0 (v0: i64) {
 /// returns the spawn's own result.
 fn parent(join: bool) -> String {
     parent_then(if join {
-        "vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  return vr"
+        "vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  return vr"
     } else {
         "vr = i64.extend_i32_s vh\n  return vr"
     })
 }
+
+/// A [`parent_then`] tail that joins the child and returns `status * 1000 + value`: what the child
+/// returned, or its trap's wire code times 1000 (#2066).
+const JOIN_BOTH: &str = "vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+                         vk = i64.const 1000\n  \
+                         vsk = i64.mul vs vk\n  \
+                         vr = i64.add vsk vv\n  \
+                         return vr";
 
 /// [`parent`], ending in `tail` (which sees `v0` and the child handle `vh`).
 fn parent_then(tail: &str) -> String {
@@ -208,73 +215,44 @@ fn fuel_host(child: &temen_ir::Module, fuel: i64) -> (Host, [i32; 3]) {
     (host, h)
 }
 
-/// #1944 slice 3, #1705 — a detached child burns the fuel of the budget that paid for it, on the JIT
-/// as on the interpreter, though the JIT's root runs with no fuel armed at all: a ceiling the child
-/// loops past ends it (the join hands its trap to the parent), and one with room lets it finish.
+/// #1944 slice 3, #1705, #2066 — a detached child burns the fuel of the budget that paid for it, on
+/// the JIT as on the interpreter, though the JIT's root runs with no fuel armed at all: a ceiling the
+/// child loops past ends it, and the parent's join answers `OUT_OF_FUEL` while the parent runs on,
+/// unmetered as its root is; a ceiling with room lets the child finish.
 #[test]
 fn a_detached_childs_budget_bounds_its_fuel_under_an_unmetered_jit_root() {
-    let p = module(&parent(true));
+    let p = module(&parent_then(JOIN_BOTH));
     let c = module(CHILD_LOOPS);
-    for (fuel, want_interp, want_jit) in [
-        (2000, Ok(vec![Value::I64(7)]), JitOutcome::Returned(vec![7])),
-        (
-            500,
-            Err(Trap::OutOfFuel),
-            JitOutcome::Trapped(TrapKind::OutOfFuel),
-        ),
-    ] {
+    for (fuel, want) in [(2000, 7), (500, temen_ir::trap_code::OUT_OF_FUEL * 1000)] {
         assert_eq!(
             interp_result(&p, fuel_host(&c, fuel)),
-            want_interp,
+            Ok(vec![Value::I64(want)]),
             "interpreter, ceiling {fuel}"
         );
         assert_eq!(
             jit_outcome(&p, fuel_host(&c, fuel)),
-            want_jit,
+            JitOutcome::Returned(vec![want]),
             "the JIT, ceiling {fuel}"
         );
     }
 }
 
-/// #2053 — `wait` (op 18) on the JIT answers as the interpreter does: a child that loops past its
-/// node's fuel ceiling answers `OUT_OF_FUEL` and the parent runs on, unmetered as its root is, the
-/// child reaped; one with room answers 0 and stays for its `join`.
+/// #2066 — the join that answers a child's `OUT_OF_FUEL` reaps it, on the JIT as on the
+/// interpreter: joining it again is a spent handle.
 #[test]
-fn wait_reports_a_detached_childs_fuel_running_out_on_the_jit() {
-    let wait = module(&parent_then(
-        "vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  return vr",
-    ));
-    let wait_join = module(&parent_then(
-        "vw = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         vj = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  \
-         vk = i64.const 1000\n  \
-         vs = i64.mul vw vk\n  \
-         vr = i64.add vs vj\n  \
-         return vr",
+fn a_join_reaps_a_child_that_ran_out_of_fuel_on_the_jit() {
+    let join_join = module(&parent_then(
+        "vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         vs2, vv2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vv2",
     ));
     let c = module(CHILD_LOOPS);
-    for (p, fuel, want) in [
-        (&wait_join, 2000, 7),
-        (&wait, 500, temen_ir::trap_code::OUT_OF_FUEL),
-    ] {
-        assert_eq!(
-            interp_result(p, fuel_host(&c, fuel)),
-            Ok(vec![Value::I64(want)]),
-            "interpreter, ceiling {fuel}"
-        );
-        assert_eq!(
-            jit_outcome(p, fuel_host(&c, fuel)),
-            JitOutcome::Returned(vec![want]),
-            "the JIT, ceiling {fuel}"
-        );
-    }
-    // The wait reaped the trapped child: joining it after is a spent handle.
     assert_eq!(
-        interp_result(&wait_join, fuel_host(&c, 500)),
+        interp_result(&join_join, fuel_host(&c, 500)),
         Err(Trap::ThreadFault)
     );
     assert_eq!(
-        jit_outcome(&wait_join, fuel_host(&c, 500)),
+        jit_outcome(&join_join, fuel_host(&c, 500)),
         JitOutcome::Trapped(TrapKind::ThreadFault)
     );
 }
@@ -290,9 +268,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 16
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vh2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vr = i64.add vj vj2
   return vr
   }
@@ -337,7 +315,7 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
 }
 
 /// `v0` Instantiator, `v1` the child `Module`, `v2` the `Budget`: spawn the child detached (window
-/// 2^16, no payload) and join it.
+/// 2^16, no payload), join it, and return `status * 1000 + value` (#2066).
 const SPAWN_JOIN: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -346,8 +324,11 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 16
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  vk = i64.const 1000
+  vsk = i64.mul vj_st vk
+  vr = i64.add vsk vj
+  return vr
   }
 }
 "#;
@@ -370,7 +351,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vz = i64.const 0
   vlog = i64.const 16
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
   }}
 }}
@@ -407,17 +388,19 @@ block 0 (vsp: i64, varg: i64) {
 
 /// #2001 — a detached child's threads are `spawn`s of the budget that pays for it while they live, on
 /// the JIT as on the interpreter: a child whose ceiling is one vCPU fills it itself, so its first
-/// `thread.spawn` traps, and one whose ceiling is two runs a thread, joins it and runs another in its
-/// place (`Done::publish` hands the first one's charge back).
+/// `thread.spawn` traps (its parent's join answers `THREAD_FAULT`), and one whose ceiling is two runs
+/// a thread, joins it and runs another in its place (`Done::publish` hands the first one's charge
+/// back).
 #[test]
 fn a_detached_childs_threads_are_capped_by_its_budget_on_the_jit() {
     let p = module(SPAWN_JOIN);
     let c = module(CHILD_SPAWNS_THREADS_IN_TURN);
+    let fault = temen_ir::trap_code::THREAD_FAULT * 1000;
     for (spawn, want_interp, want_jit) in [
         (
             1,
-            Err(Trap::ThreadFault),
-            JitOutcome::Trapped(TrapKind::ThreadFault),
+            Ok(vec![Value::I64(fault)]),
+            JitOutcome::Returned(vec![fault]),
         ),
         (2, Ok(vec![Value::I64(32)]), JitOutcome::Returned(vec![32])),
     ] {
@@ -515,6 +498,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
             as_handle: 0,
             grant_handle: 0,
             jit_table_log2: 0,
+            holds_jit: false,
             domain: 0,
             lane_cap: -1,
             parent_domain: 0,
@@ -687,7 +671,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vlog = i64.const 18
   vq = i64.const 0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }}
 }}
@@ -832,9 +816,9 @@ fn premap_parent(off: u64, join: bool, hand_off: bool) -> String {
         ""
     };
     let tail = if hand_off {
-        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  return vj"
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  return vj"
     } else if join {
-        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
     } else {
         "vr = i64.extend_i32_s vc\n  return vr"
     };
@@ -961,77 +945,6 @@ fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
     );
 }
 
-/// #1956 — a detached child (`memory 16`) that reads a depth `d` from its payload. While `d > 0` it
-/// spawns the module it was granted as `"nester"` (itself) detached from its own `"budget"`, with
-/// `d - 1` as the payload and `"nester"` granted on, joins it and returns `10 * result + d`; at `d = 0`
-/// it returns 7. `orphan` makes the `d = 1` level return 5 without joining, and the `d = 0` level
-/// count down 200 000 first, so it outlives its parent.
-fn nester(orphan: bool) -> String {
-    let (join, leaf) = if orphan {
-        (
-            "vfive = i64.const 5\n  return vfive",
-            "vn = i64.const 200000\n  br 3(vn)",
-        )
-    } else {
-        (
-            "vj = call.cap 6 1 (i32) -> (i64) vinst (vh)\n  vten = i64.const 10\n  vm = i64.mul vj vten\n  vr = i64.add vm vd1\n  return vr",
-            "v7 = i64.const 7\n  return v7",
-        )
-    };
-    format!(
-        r#"memory 16
-data 20000 "budget"
-data 20016 "nester"
-func (i64) -> (i64) {{
-block 0 (v0: i64) {{
-  vab = i64.const {args}
-  vd = i64.load vab
-  vz = i64.const 0
-  vleaf = i64.eq vd vz
-  br_if vleaf 2() 1(v0, vd)
-}}
-block 1 (vi: i64, vd1: i64) {{
-  vone = i64.const 1
-  vnext = i64.sub vd1 vone
-  vpp = i64.const 24576
-  i64.store vpp vnext
-  vnp = i64.const 20000
-  vnl = i64.const 6
-  vb = self.resolve vnp vnl
-  vbw = i64.extend_i32_u vb
-  vmp = i64.const 20016
-  vml = i64.const 6
-  vnest = self.resolve vmp vml
-{grant}  vmw = i64.extend_i32_u vnest
-  vgp = i64.const 20032
-  vgn = i64.const 1
-  vzero = i64.const 0
-  vlog = i64.const 16
-  vpl = i64.const 8
-  vinst = i32.wrap_i64 vi
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vgp, vgn, vzero, vlog, vzero, vpp, vpl)
-  {join}
-}}
-block 2 () {{
-  {leaf}
-}}
-block 3 (vc: i64) {{
-  vdec = i64.const 1
-  vc1 = i64.sub vc vdec
-  vdone = i64.eqz vc1
-  br_if vdone 4() 3(vc1)
-}}
-block 4 () {{
-  v7l = i64.const 7
-  return v7l
-  }}
-}}
-"#,
-        args = temen_ir::module_args_base(),
-        grant = rec::grant("g", 20032, 20016, 6, "vnest"),
-    )
-}
-
 /// `v0` Instantiator, `v1` the [`nester`] module, `v2` the `Budget`: spawn it detached with depth `d`
 /// as its payload and itself granted as `"nester"`, join it, and return its result.
 fn nest_root(d: i64) -> String {
@@ -1051,23 +964,13 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vlog = i64.const 16
   vpl = i64.const 8
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz, vpp, vpl)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
   }}
 }}
 "#,
         grant = rec::grant("g", 20032, 20016, 6, "v1"),
     )
-}
-
-/// Run `f` on a thread of its own: a run that deadlocks fails here instead of hanging the suite.
-fn within_a_minute<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("{what}: no result within a minute (deadlocked?)"))
 }
 
 /// The `mem` room left along `budget`'s chain (Budget op 1, field 1).
@@ -1166,7 +1069,7 @@ block 0 (vsp: i64, vi: i64) {
   vlog = i64.const 16
   vinst = i32.wrap_i64 vi
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vgw, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vk = i64.const 100
   vr = i64.add vj vk
   return vr
@@ -1260,9 +1163,10 @@ block 1 () {
 
 /// #2074 — `kill` (op 12) ends a detached child however it is occupied, on the JIT as on the
 /// interpreter: spinning, parked on a word of its own window, or with its thread parked while its main
-/// joins it. The parent sleeps 50 ms so the child is spinning or parked first, kills it, and `wait`s:
-/// each answers `THREAD_FAULT`. A kill that only flags a parked child leaves the `wait` hanging (or, on
-/// the interpreter with nothing else alive, ends the run as a deadlock), so neither stands in for it.
+/// joins it. The parent sleeps 50 ms so the child is spinning or parked first, kills it, and joins it:
+/// each join answers `THREAD_FAULT` (#2066). A kill that only flags a parked child leaves the join
+/// hanging (or, on the interpreter with nothing else alive, ends the run as a deadlock), so neither
+/// stands in for it.
 #[test]
 fn kill_ends_a_detached_child_spinning_or_parked() {
     let p = module(&parent_then(
@@ -1271,8 +1175,8 @@ fn kill_ends_a_detached_child_spinning_or_parked() {
          vst = i64.const 50000000\n  \
          vsl = i32.atomic.wait vsa vse vst\n  \
          vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
-         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         return vr",
+         vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vs",
     ));
     let fault = temen_ir::trap_code::THREAD_FAULT;
     let children = [
@@ -1334,14 +1238,14 @@ block 1 () {
 
 /// #2088 — a kill on the JIT survives the child's host calls: each successful `call.cap` resets the
 /// trap cell, which used to erase a kill that landed during (or before) one, so the child ran on and
-/// its parent's `wait` hung. The parent kills each child as soon as it is spawned; both answer
+/// its parent's join hung. The parent kills each child as soon as it is spawned; both joins answer
 /// `THREAD_FAULT`, as on the interpreter.
 #[test]
 fn a_kill_survives_the_childs_host_calls_on_the_jit() {
     let p = module(&parent_then(
         "vk = call.cap 6 12 (i32) -> (i32) v0 (vh)\n  \
-         vr = call.cap 6 18 (i32) -> (i64) v0 (vh)\n  \
-         return vr",
+         vs, vv = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  \
+         return vs",
     ));
     let fault = temen_ir::trap_code::THREAD_FAULT;
     for (name, child) in [
@@ -1416,7 +1320,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vj
   }
 }
@@ -1497,7 +1401,7 @@ block 1 (ve: i32) {{
   return vr
 }}
 block 2 (vi: i32, vc: i32) {{
-  vr = call.cap 6 1 (i32) -> (i64) vi (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   return vr
   }}
 }}
