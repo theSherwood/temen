@@ -1651,6 +1651,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 reserved_log2,
                 funcs: r.funcs,
                 types: r.types,
+                impl_exports: r.module.impl_exports.clone(),
                 shadow: r
                     .shadow
                     .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
@@ -2464,8 +2465,8 @@ pub unsafe extern "C" fn module_resolver_locked(
     resolve_module_into(&host, handle, out)
 }
 
-/// The body of both resolvers: fill `out` with the views of the module a spawn's operand names
-/// ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
+/// The body of both resolvers: fill `out` with the module a spawn's operand names and what its grant
+/// records ([`Host::resolve_module_parts`]), `1`; `0` for a forged/closed/wrong handle.
 ///
 /// # Safety
 /// `out` is a writable [`temen_jit::ResolvedModule`].
@@ -2475,26 +2476,10 @@ unsafe fn resolve_module_into(
     out: *mut temen_jit::ResolvedModule,
 ) -> i32 {
     match host.resolve_module_parts(handle) {
-        Some((
-            funcs,
-            n_funcs,
-            memory_log2,
-            data,
-            n_data,
-            types,
-            n_types,
-            shadow,
-            durable,
-            digest,
-        )) => {
+        Some((m, memory_log2, shadow, durable, digest)) => {
             *out = temen_jit::ResolvedModule {
-                funcs,
-                n_funcs,
+                module: m,
                 memory_log2,
-                data,
-                n_data,
-                types,
-                n_types,
                 shadow,
                 durable,
                 digest,

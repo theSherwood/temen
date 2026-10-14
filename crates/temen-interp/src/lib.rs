@@ -29693,43 +29693,23 @@ impl Host {
         }
     }
 
-    /// Resolve a §14 `Module` handle to **raw views** of its grant — the bridge the JIT's nesting
-    /// runtime uses (via `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`).
-    /// `None` for a forged/closed/wrong-type handle. The returned pointers borrow [`Host::modules`]
-    /// (append-only), or a unit's own grant, which lives as long as the unit (`JitUnit::grant`), so
-    /// they stay valid for as long as this `Host` lives — which outlives the run,
-    /// the same lifetime contract as the `call.cap` ctx itself. `memory_log2` is `-1` when the
-    /// module declares no memory. Host-side callers only; never reachable from a guest `call.cap`
-    /// (the generic dispatch on a `Module` handle is an inert `CapFault`), so no host address ever
-    /// leaks into a guest-readable value.
-    #[allow(clippy::type_complexity)]
+    /// Resolve a §14 `Module` handle to its grant — the bridge the JIT's nesting runtime uses (via
+    /// `temen-run`'s `module_resolver` callback; `temen-jit` cannot name `Host`): the module, its
+    /// declared window's `log2` (`-1` when it declares no memory), its shadow arena, whether it was
+    /// attested freezable, and its digest. `None` for a forged/closed/wrong-type handle. The module
+    /// borrows [`Host::modules`] (append-only), so views into it stay valid for as long as this
+    /// `Host` lives — which outlives the run, the same lifetime contract as the `call.cap` ctx
+    /// itself. Host-side callers only; never reachable from a guest `call.cap` (the generic
+    /// dispatch on a `Module` handle is an inert `CapFault`), so no host address ever leaks into a
+    /// guest-readable value.
     pub fn resolve_module_parts(
         &self,
         handle: i32,
-    ) -> Option<(
-        *const Func,
-        usize,
-        i32,
-        *const Data,
-        usize,
-        *const temen_ir::TypeEntry,
-        usize,
-        ShadowArena,
-        bool,
-        [u8; 32],
-    )> {
+    ) -> Option<(&Module, i32, ShadowArena, bool, [u8; 32])> {
         let g = self.resolve_module(handle).ok()?;
-        let m = &g.module;
         Some((
-            m.funcs.as_ptr(),
-            m.funcs.len(),
+            &g.module,
             g.memory_log2().map_or(-1, |l| l as i32),
-            m.data.as_ptr(),
-            m.data.len(),
-            // #922: the child module's type section, so the JIT nesting runtime can resolve the
-            // child's interned `call.dyn` type indices when it re-compiles the child.
-            m.types.as_ptr(),
-            m.types.len(),
             g.shadow().unwrap_or(ShadowArena::EMPTY),
             g.durable,
             // temen#2168: what names its code to the JIT's cache of compiled children.
