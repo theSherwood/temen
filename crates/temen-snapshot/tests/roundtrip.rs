@@ -1900,7 +1900,7 @@ fn a_completed_detached_child_rides_the_control_section() {
 // ---------------------------------------------------------------------------------------------
 // #1361 — a **freezable** module handle rides the artifact. Before this, a durable domain holding
 // any `Module` grant could not be frozen at all: `capture_durable_handles` refused every one, so a
-// parent that had spawned a §14 child (op 15 takes a module handle) hit `NonDurableHandle` before
+// parent that had spawned a §14 child (a spawn names a module handle) hit `NonDurableHandle` before
 // any capture logic ran. Now an attested-freezable grant is carried by its §4 **content digest** —
 // a name, never the bytes — and the restoring host re-grants the module it chooses to.
 // ---------------------------------------------------------------------------------------------

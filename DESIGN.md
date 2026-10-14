@@ -2253,7 +2253,7 @@ default above still stands for every handle-gated capability.
 ### VM-in-VM (nesting), transparent & zero-overhead
 
 > **Retiring (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289):** the sub-window placement
-> described here is being deleted. Every child gets a **detached** window (its own reservation, op 15;
+> described here is being deleted. Every child gets a **detached** window (its own reservation, op 17;
 > PROCESS.md §5): the child still sees a zero-based `[0, size)` and cannot learn it is nested, but the
 > parent no longer sees child memory as a superset. Lending memory is a pre-mapped `SharedRegion` (§13);
 > lazy page supply becomes a pager that *supplies* bytes rather than writing through the parent's
@@ -3648,7 +3648,7 @@ domain, set once; a child uses its *parent's* futex table), the `child_code` cac
 impossible by construction — a park never holds a worker — so the only deadlocks left are the guest's
 own, which `run_deadlocked` turns into a `ThreadFault` rather than a hang. #1361's freeze harvest
 ("run the driver until every vCPU finished, then claim `Outcome.mem`") becomes **one** implementation
-across all three engines instead of two-plus-a-different-shape, and the op-15 gate lift becomes a
+across all three engines instead of two-plus-a-different-shape, and the detached-spawn gate lift becomes a
 single change. #1584 closes by construction: every park is scheduler-owned, so the 4c-bis `dstate`
 poke reaches all of them and no child can veto its parent's freeze by parking. And child-domain
 scheduling becomes **deterministic under the interpreter's seeded policy** — the win D56 recorded
@@ -3685,7 +3685,7 @@ as a value with the budget un-spent (#1587).
 *The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
 non-durable §14 child — the **carve** children of ops 0/5/8/11/13 (retiring with the carve
 placement, 2026-09-29; the copy-in/`copy_back` below goes with them) and the **detached** children of
-op 15 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+op 17 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),

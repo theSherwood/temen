@@ -10,16 +10,19 @@
 //!
 //! The freeze of a live child subtree and the admission of an unmarked grant are pinned on detached
 //! children, the only kind left (#1867): `durable_detached_jit.rs` and temen-interp's
-//! `durable_detached_parity.rs`. These parents spawn through op 15's scalar form: an R9-instrumented
-//! guest is pure SSA + `call.cap` (`transform_module` refuses any guest memory op —
-//! `GuestUsesMemory`), so a durable parent cannot build the op-17 record in its window.
+//! `durable_detached_parity.rs`. These parents spawn through a v1 record above their shadow arena,
+//! storing the module and budget in it, so they take the confined transform
+//! ([`instrument_parent`]): the strict one refuses any guest memory op (R9, `GuestUsesMemory`).
+
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use temen_durable::{
-    arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
-    STATE_NORMAL, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module,
+    transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
-use temen_ir::Module;
+use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -34,6 +37,20 @@ const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
 fn instrument(src: &str) -> Module {
     let m = parse_module(src).expect("parse");
     let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("instrumented module verifies");
+    inst
+}
+
+/// A durable parent from its source, with the v1 spawn record it spawns through at 65536, above its
+/// shadow arena: the child's 128 KiB window. The parent stores the module and budget in the record,
+/// a guest memory op, so it takes the confined transform.
+fn instrument_parent(src: &str) -> Module {
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::v1()
+    };
+    let m = parse_module(&format!("{src}{}", rec::segment(65536, &spawn))).expect("parse");
+    let inst = transform_module_assume_confined(&m).expect("transform");
     verify_module(&inst).expect("instrumented module verifies");
     inst
 }
@@ -103,19 +120,20 @@ block 0 () {
 
 // ---- Freeze × §14 children ----
 
-/// Durable parent that spawns its granted child **detached** (op 15's scalar form: budget, module,
-/// no grants, entry 0, `size_log2` 17, no quota) and joins it, then drives a fiber that suspends
-/// once (the armed freeze trigger ticks on `cont.resume`, so `arm = 2` lands the freeze at the second
-/// resume — after the join, with the fiber parked: the covered residue shape). Returns child result
-/// + fiber result = 4321 + 55 = 4376.
+/// Durable parent that spawns its granted child **detached** (through the v1 record at 65536 that
+/// [`instrument_parent`] lays: no grants, `size_log2` 17; the module and budget stored there) and
+/// joins it, then drives a fiber that suspends once (the armed freeze trigger ticks on
+/// `cont.resume`, so `arm = 2` lands the freeze at the second resume — after the join, with the
+/// fiber parked: the covered residue shape). Returns child result + fiber result = 4321 + 55 = 4376.
 const PARENT_DETACHED_JOIN_THEN_FIBER: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  v5 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6_st, v6 = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   v7 = ref.func 1
   v8 = i64.const 4096
@@ -159,7 +177,7 @@ fn detached_powerbox() -> (Host, [Value; 3]) {
 /// child is never re-run) and reproduces the uninterrupted total.
 #[test]
 fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
-    let parent = instrument(PARENT_DETACHED_JOIN_THEN_FIBER);
+    let parent = instrument_parent(PARENT_DETACHED_JOIN_THEN_FIBER);
 
     // Control: uninterrupted total.
     let (mut host, args) = detached_powerbox();
@@ -222,7 +240,7 @@ fn freeze_after_detached_child_joined_thaws_and_reloads_the_join_result() {
 /// `None`, so an embedder always lands on the enforced path.)
 #[test]
 fn bytecode_durable_capture_declines_a_nesting_module() {
-    let parent = instrument(PARENT_DETACHED_JOIN_THEN_FIBER);
+    let parent = instrument_parent(PARENT_DETACHED_JOIN_THEN_FIBER);
     let (mut host, args) = detached_powerbox();
     let mut fuel = 5_000_000u64;
     let r = temen_interp::bytecode::compile_and_run_capture_reserved_with_host(
@@ -248,8 +266,8 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
 /// domain-killing surprise", so that was the wrong failure shape even though the fail-closed instinct
 /// was right.
 ///
-/// With the interim spawn gate restored (#1412), a durable domain's op-15 refuses probeably, the
-/// detached child never comes into existence, and `detached_live_refused` is unreachable by
+/// With the interim spawn gate restored (#1412), a durable domain's detached spawn refuses probeably,
+/// the detached child never comes into existence, and `detached_live_refused` is unreachable by
 /// construction — so the freeze simply completes. This test pins that: **not** `ThreadFault`.
 ///
 /// The parent is frozen from the start, so the run's value is the unwind's rather than the guest's
@@ -261,12 +279,12 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
 const PARENT_DETACHED: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vb = i64.extend_i32_u v2
-  vm = i64.extend_i32_u v1
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 17
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vm, vz, vz, ve, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vs
   return vr
   }
@@ -275,8 +293,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 #[test]
 fn a_durable_freeze_is_never_killed_by_a_detached_child() {
-    let parent = instrument(PARENT_DETACHED);
-    let child_mod = child(); // memory 17 = the op-15 size_log2
+    let parent = instrument_parent(PARENT_DETACHED);
+    let child_mod = child(); // memory 17 = the record's size_log2
 
     let mut host = Host::new();
     host.set_durable(true);

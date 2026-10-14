@@ -210,36 +210,36 @@ fn the_concurrency_column_matches_what_the_two_drivers_actually_do() {
 ///
 /// The other was the admission of a spawn: the retired `instantiate_module_named` (op 13) gave a
 /// forged handle `Trap::Malformed` on the parallel driver where the cooperative one gave `CapFault`,
-/// and bound no imports there (#1570). The spawns left — op 15, and op 17 once it has read its
-/// record — run one admission on both drivers, pinned here the same way.
+/// and bound no imports there (#1570). The spawn left, op 17, runs one admission on both drivers once
+/// it has read its record, pinned here the same way.
 ///
-/// Reaching admission at all needs a real `Module` handle — see `Row::mint`. With the sweep's zeros
-/// the call dies at the handle resolve, which is why the original probe saw the two drivers "agree"
-/// on op 13 while they disagreed one step further in.
+/// Reaching admission at all needs a record naming a real `Module` handle — see `Row::mint` and
+/// `RECORD_AT`. With the sweep's zeros the call dies before it, which is why the original probe saw
+/// the two drivers "agree" on op 13 while they disagreed one step further in.
 #[test]
 fn the_instantiator_divergences_stay_closed() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
-    for op in [14, 15, 17] {
+    for op in [14, 17] {
         let found = divergences(&row, op);
         assert!(
             found.is_empty(),
             "op {op} diverges again — the drivers must give one answer per call shape: {found:?}"
         );
     }
-    // Non-vacuity: op 15 really does reach admission, rather than agreeing by faulting early on
+    // Non-vacuity: op 17 really does reach admission, rather than agreeing by faulting early on
     // both sides. `-EINVAL` is the answer for a spawn no `Budget` pays for.
     let (h, x, real) = (row.mint)();
     let real: Vec<(usize, i64)> = real
         .iter()
-        .filter(|(o, _, _)| *o == 15)
+        .filter(|(o, _, _)| *o == 17)
         .map(|(_, i, v)| (*i, *v))
         .collect();
     assert_eq!(
-        coop(h, x, row.iface, 15, 7, "i32", &real),
+        coop(h, x, row.iface, 17, 1, "i32", &real),
         Verdict::Answered(-22),
-        "the op-15 sweep must get past the handle resolve into admission"
+        "the op-17 sweep must get past reading its record into admission"
     );
 }

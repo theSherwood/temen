@@ -1,6 +1,5 @@
 
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
+#include <temen.h> /* the `__vm_*` builtins and `struct vm_spawn_rec` */
 
 /* Discover the handle of interface `want` from the domain's own capability table
    (cap.self reflection — the discovery tier IMPORTS.md keeps). */

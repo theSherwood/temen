@@ -60,7 +60,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
 - *code origin* ⛔ — an installed unit answers as the base module does (#1726); an invoked unit is a seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)
-- *debugger* 🔶 — join/instantiate_rec/instantiate_detached run on the debug scheduler through the executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op 14) reaches the debug scheduler and is declined
+- *debugger* 🔶 — join/instantiate_rec run on the debug scheduler through the executor's admission (#1855), and so does grant (op 19, #2220); child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
 - *nesting* ⛔ — not re-grantable by name: a child's own budget is the node its spawn charged (#1944)

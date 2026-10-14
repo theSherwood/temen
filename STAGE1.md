@@ -14,7 +14,7 @@ no fork-returns-twice yet.
 ## The substrate already exists
 
 > **Retiring:** this section describes the carve path, which is being deleted (INVARIANTS #13,
-> 2026-09-29; #1289). The detached equivalent is op 15 (`instantiate_detached`: its own window,
+> 2026-09-29; #1289). The detached equivalent is the op-17 spawn record (its own window,
 > by-name grants), with argv in its spawn-time args payload and the status through `join`
 > (DETACHED_JIT.md §1).
 
@@ -56,8 +56,9 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 > **Retiring:** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's carve,
 > parent-as-pager output read back from it), and the carve path is being deleted (INVARIANTS #13,
-> 2026-09-29; #1289). The detached equivalent is op 15: argv in its spawn-time args payload, output
-> through inherited stdio or a `SharedRegion` pre-mapped by op 15's `(region, child_off)`, status
+> 2026-09-29; #1289). The detached equivalent is the op-17 spawn record: argv in its spawn-time args
+> payload, output through inherited stdio or a `SharedRegion` pre-mapped by its `region` and
+> `child_off`, status
 > through `join`. Slice 6's ring already runs between detached stages.
 
 0. **Unmodified `main(argc, argv)` on chibicc** *(done —
@@ -192,7 +193,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
 - **`cmd > file`, `cmd | cmd2`** (shell-side interception): needs `Endpoint`
   (Power 2). The stopgap is the parent-as-pager model (`stage1_foreign_command.rs`
   — the command writes to its carve, the parent forwards; with the carve retired, INVARIANTS #13
-  2026-09-29, that memory becomes a `SharedRegion` pre-mapped by op 15), which requires a
+  2026-09-29, that memory becomes a `SharedRegion` pre-mapped by the spawn record), which requires a
   command written to output to memory rather than an ambient fd, so it is **not**
   a drop-in for unmodified compiled commands. Real redirection/pipelines of
   external commands wait on the endpoint work.
@@ -254,7 +255,7 @@ keystone of self-similarity. It is **not built**. Until it lands:
    and waking each other — the shape sequential spawn/wait deadlocks on
    outright. Regressions surface loudly (30 s wait timeouts fold into the
    result ×1000), and the run completes in well under a second — real wakes.
-   Also pinned: the same ring between two **detached** stages (op-15 spawns —
+   Also pinned: the same ring between two **detached** stages (op-17 record spawns —
    private windows + the explicit shared channel compose, the §5 model
    sentence as a test) and bytecode-entry equality via the standing oracle
    fallback.
@@ -453,7 +454,7 @@ already running); the ~20% that gates everything is **`fork` + R8**.
 
 > **Retired:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns.
 > Every engine now traps them `CapFault` (INVARIANTS #13; #1867), so the text below is history, and
-> the tests and ops it names are deleted. The detached spawn, op 15 and its op-17 record, runs on the
+> the tests and ops it names are deleted. The detached spawn, the op-17 record, runs on the
 > bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
 
 Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
@@ -463,7 +464,7 @@ cooperative, single-thread driver (`compile_and_run_with_host`, the exact entry 
 on) **already lowers and drives the core §14 ops, wasm-safely:**
 
 - **The spawn and `join` (op 1) already work on bytecode, single-thread.** The detached spawn
-  (op 15, and its op-17 record) — the "exec a command" primitive, a *separate-module* child — is
+  (the op-17 record) — the "exec a command" primitive, a *separate-module* child — is
   pinned matching the tree-walk oracle by `spawn_every_driver.rs`. (This plan started from the carve
   spawns, ops 0 and 5, which every engine now refuses.) No OS threads, no clock. So **sequential spawn/wait is already a
   browser capability**, not a missing one.

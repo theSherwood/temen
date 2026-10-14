@@ -6,10 +6,12 @@
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
 
 use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{pool_workers, run_with_host, Host, MemLayout, Value};
-use temen_ir::{Module, DEFAULT_RESERVED_LOG2};
+use temen_ir::{Module, SpawnRec, DEFAULT_RESERVED_LOG2};
 use temen_jit::{JitError, JitOutcome};
 
 /// The root's window: `memory 16`.
@@ -38,7 +40,8 @@ block 0 (v0: i64) {
 ";
 
 /// The root (args `(instantiator, CHILD, budget)`): split a budget with a lane of 2 from `budget`,
-/// spawn `CHILD` detached on it, and return what the child answers.
+/// spawn `CHILD` detached on it through the v1 record at 17408 ([`spawn`] lays it), and return what
+/// the child answers.
 const SPAWN: &str = "memory 16
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32) {
@@ -48,16 +51,27 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   vc = i64.const -1
   vl = i64.const 2
   vb = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) vbud (vf, vm, vs, vc, vl)
-  vbw = i64.extend_i32_u vb
-  vmh = i64.extend_i32_u vmod
-  vz = i64.const 0
-  vlog = i64.const 12
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 17432
+  i32.store vrm vmod
+  vrb = i64.const 17436
+  i32.store vrb vb
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   return vr
   }
 }
 ";
+
+/// [`SPAWN`] with its spawn record at 17408: `CHILD`'s 4 KiB window, the module and the split budget
+/// stored there.
+fn spawn() -> String {
+    let spawn = SpawnRec {
+        size_log2: 12,
+        ..SpawnRec::v1()
+    };
+    format!("{SPAWN}{}", rec::segment(17408, &spawn))
+}
 
 fn module(src: &str) -> Module {
     let m = temen_text::parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
@@ -139,7 +153,7 @@ fn a_child_has_its_parents_workers_within_its_own_lane() {
             (host, [inst, child, budget].map(Value::I32).to_vec())
         };
         let what = format!("a child's lane of 2, {workers} workers");
-        every_engine(&what, SPAWN, &setup, want);
+        every_engine(&what, &spawn(), &setup, want);
     }
 }
 

@@ -3335,7 +3335,7 @@ pub unsafe extern "C" fn grant_detached_child_build(
 /// at `mem_base`, once (idempotent; a no-op for a null base or a host that already has one). The JIT
 /// futex thunk has no region map, so a §13 `map` must record which absolute pages alias which region
 /// bytes into the JIT registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The
-/// `Host` dispatch owns the backing (hence its `os_fd`), but only the cap trampoline — and the op-15
+/// `Host` dispatch owns the backing (hence its `os_fd`), but only the cap trampoline — and the op-17
 /// pre-map apply, which runs before the child's first `call.cap` — know the window's base. The interp
 /// needs none: it canonicalizes via its own `PageProt::Backed`.
 fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
@@ -3368,7 +3368,7 @@ fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
     )));
 }
 
-/// Op-15 **pre-map admission** on the JIT ([`temen_jit::PremapAdmit`]): the interpreter's
+/// Spawn **pre-map admission** on the JIT ([`temen_jit::PremapAdmit`]): the interpreter's
 /// `Host::premap_admit` — `1` admitted, `0` refused (bad geometry; the spawn answers `-EINVAL`,
 /// charging nothing), `-1` with `*trap_out = CapFault` for a forged / wrong-kind handle.
 ///
@@ -3392,7 +3392,7 @@ pub unsafe extern "C" fn premap_admit(
     }
 }
 
-/// Op-15 **pre-map staging** on the JIT ([`temen_jit::PremapStage`]): `Host::stage_premap` — re-grant
+/// Spawn **pre-map staging** on the JIT ([`temen_jit::PremapStage`]): `Host::stage_premap` — re-grant
 /// the region into the built child powerbox and record the pending alias. Nonzero on success.
 ///
 /// # Safety
@@ -3413,7 +3413,7 @@ pub unsafe extern "C" fn premap_stage(
 /// A fresh window's ready hook on the JIT ([`temen_jit::WindowReady`]) over a shared powerbox cell:
 /// every detached child's, on its thread once its window exists, and a locked run's root's. Then
 /// [`window_aliases`] — the same `MprotectWindow` (shared page map, NULL guard) and the same futex
-/// region recorder its first `call.cap` would set up, so an op-15 pre-mapped page is a real
+/// region recorder its first `call.cap` would set up, so an op-17 pre-mapped page is a real
 /// `MAP_SHARED` alias, canonicalized exactly like a self-mapped one. `0` ⇒ the backing cannot be
 /// aliased here (a software-only region); the window's guest never runs.
 ///
@@ -3436,7 +3436,7 @@ pub unsafe extern "C" fn premap_apply(
 
 /// `host`'s fresh window `[base, base+mapped)` starts, before its guest runs: its page map starts
 /// ([`Host::start_window_pages`]) with the read-only pages `ro` its data segments made (#2268), as the
-/// interpreter's own starts with them, then `Host::apply_premap` aliases the op-15 pre-map and a
+/// interpreter's own starts with them, then `Host::apply_premap` aliases the op-17 pre-map and a
 /// durable thaw's §13 pages (#2025) — all through the window view its first `call.cap` would set up —
 /// and the domain holds the window's runs of page state ([`Host::start_window`]).
 ///
@@ -5695,7 +5695,7 @@ fn module_demand_spawns(m: &temen_ir::Module) -> bool {
         })
 }
 
-/// Whether `m` spawns a **detached** child (`Instantiator` op 15, or the op-17 record): a spawn
+/// Whether `m` spawns a **detached** child (`Instantiator` op 17, the record): a spawn
 /// that may grant the child a live offer back into its spawner (#744, [`jit_proc::locked`]).
 fn spawns_detached(m: &Module) -> bool {
     m.funcs.iter().any(|f| {
@@ -5705,7 +5705,7 @@ fn spawns_detached(m: &Module) -> bool {
                     i,
                     temen_ir::Inst::CapCall {
                         type_id: 6,
-                        op: 15 | 17,
+                        op: 17,
                         ..
                     }
                 )
@@ -7057,7 +7057,7 @@ impl HostCap {
     /// PROCESS.md §5 — a **detached-spawn `Budget`** with a `mem` byte quota (#1289 R2: minting a
     /// detached window is not a separate authority — it spends `Budget.mem`; the standalone
     /// `WindowMinter` retired). The authority to spawn **detached** children
-    /// (`Instantiator.instantiate_detached`, op 15) whose fresh platform windows no ancestor below
+    /// (a detached spawn, `Instantiator` op 17) whose fresh platform windows no ancestor below
     /// the platform can read (the child attests `window_exposed = false` — the distrust-spawner trust
     /// anchor). Embedder-granted like `exec`/`fs`; each mint charges the child's window size to
     /// `mem`, and what the child grows past it (#1909). Its fuel and spawn are unbounded on its own

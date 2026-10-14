@@ -560,7 +560,7 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   *Status (Stage 1, landed; the carve spawns and the tests named here are retired since, #1867 —
   `stage1_posix_spawn.rs` and `stage1_applet_dispatch.rs` pin the detached spawn):* the
   `posix_spawn`+`wait` core was proven differentially
-  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve — op 15's args payload once carves
+  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve — the spawn record's args payload once carves
   retire — spawns a separate host-verified
   `Module` via `Instantiator.instantiate_module` (op 5), and `join`s (op 1) for the child's exit
   status — need (1)'s spawn-with-argv + wait). Stdio inheritance landed as capability forwarding:

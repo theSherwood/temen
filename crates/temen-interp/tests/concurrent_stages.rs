@@ -26,7 +26,7 @@ type Entry = fn(
     &mut Host,
 ) -> Result<Vec<Value>, temen_interp::Trap>;
 
-/// Run the detached pipeline ([`pipeline::PARENT`] over [`pipeline::STAGES`]) through `entry`.
+/// Run the detached pipeline ([`pipeline::parent`] over [`pipeline::STAGES`]) through `entry`.
 fn detached_pipeline(entry: Entry) -> Vec<Value> {
     let (parent, stages) = pipeline::modules();
     let (mut host, args) = pipeline::host(&stages);

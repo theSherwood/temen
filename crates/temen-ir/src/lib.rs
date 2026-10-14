@@ -102,8 +102,8 @@ pub mod cap_id {
     pub const ADDRESS_SPACE: u32 = 5;
     /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
     /// window of its own (VM-in-VM), and manage it. The live ops ([`super::served_contract`]
-    /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`]
-    /// (15 is its retiring positional form, #2067); 1 `join(child) -> (status, value)` parks only
+    /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`];
+    /// 1 `join(child) -> (status, value)` parks only
     /// the calling fiber until the child ends, then answers how it ended, never as a trap of the
     /// joiner's (#2066); 9 `poll`, 10 `detach` and 12 `kill` supervise it (PROCESS.md S3); 14
     /// `child_offer` and 19 `grant` reach into it while it runs. Every other op is retired and traps
@@ -181,7 +181,7 @@ pub mod cap_id {
     /// from it is still capped and charged.
     pub const BUDGET: u32 = 14;
     /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
-    /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
+    /// spawned through it (a detached spawn) gets a fresh platform
     /// window *outside* the parent's — no ancestor below the minter holds read authority, and
     /// the child attests `window_exposed = false` (the jacl distrust-spawner trust anchor).
     /// The capability carries a **byte quota**, deducted at each mint (host-enforced); an
@@ -196,7 +196,7 @@ pub mod cap_id {
     /// not: authority was implicit in nesting, so the bit reported a *placement* and the report was
     /// conservative rather than true. Holding it as a `(base, size)` sub-range grant makes it
     /// attenuate down the grant graph like every other authority (#3), survive freeze/thaw through the
-    /// value-typed re-grant path, and be *askable* — which is what the op-15 gate needs before it can
+    /// value-typed re-grant path, and be *askable* — which is what the detached-spawn gate needs before it can
     /// become "refuse unless a freeze-authority holder is registered" instead of refusing outright.
     ///
     /// Confers no operations: like `Module`, it is pure authority that other paths consult, so a
@@ -224,8 +224,7 @@ pub mod cap_id {
 /// | Instantiator | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
 /// | Instantiator | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
 /// | Instantiator | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
-/// | Instantiator | 15 | `instantiate_detached` | budget, module, grants ptr and count, entry, size_log2, quota | child or `-errno` |
-/// | Instantiator | 17 | `instantiate_rec` | record pointer | child or `-errno` |
+/// | Instantiator | 17 | `instantiate_rec` | record pointer ([`SpawnRec`]) | child or `-errno` |
 /// | Jit | 3, 4 | `install`, `uninstall` | code handle, or slot | slot or `-errno`, or `0` or `-EINVAL` |
 /// | self | 9, 10 | `svc.poll`, `svc.wait` | | dispatches served |
 /// | self | 11, 12 | `clone_caller`, `reap` | | the served caller or `-errno`, or the twin's exit status |
@@ -241,7 +240,6 @@ pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'s
         (cap_id::INSTANTIATOR, 1) => Some((&[I32], &[I64, I64])),
         (cap_id::INSTANTIATOR, 9 | 10 | 12) => Some((&[I32], &[I32])),
         (cap_id::INSTANTIATOR, 14 | 19) => Some((&[I32, I64], &[I32])),
-        (cap_id::INSTANTIATOR, 15) => Some((&[I64; 7], &[I32])),
         (cap_id::INSTANTIATOR, 17) => Some((&[I64], &[I32])),
         (cap_id::JIT, 3 | 4) => Some((&[I64], &[I64])),
         (CAP_SELF_TYPE_ID, 9..=13 | 16) => Some((&[], &[I64])),
@@ -255,7 +253,7 @@ pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'s
 /// takes any shape, save an Instantiator op: none but the named ones is live. Width-tolerant: an
 /// `i32` or an `i64` matches either, since every engine reads an arg as an `i64` and coerces a
 /// result to its declared type (a chibicc guest widens every scalar to `i64`). Args past the
-/// contract's prefix are tolerated (op 15's optional args payload and region).
+/// contract's prefix are tolerated: an op reads some only when present.
 pub fn served_shape_ok(type_id: u32, op: u32, sig: &FuncType) -> bool {
     let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
     match served_contract(type_id, op) {
@@ -634,11 +632,13 @@ pub mod durable_abi {
 /// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
 /// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
 ///
-/// A record is op 15 (`instantiate_detached`) as data: every tier routes it to its op-15 path.
-/// The version word is a fixed tag (#1867 decision 2): it must be 1, so a record written for the
-/// retired carve placement (version 0) fails closed; #2091 retires the tag. A child runs a module
-/// the spawner holds, from its function 0, the module's child bootstrap (#2219): the word at 4,
-/// once the entry function, must be 0 until the record is next revised.
+/// The record is the one spawn form (INVARIANTS #13): op 15, which took the same fields as
+/// positional operands, is retired (#2067). The version word is a fixed tag (#1867 decision 2): it
+/// must be 1, so a record written for the retired carve placement (version 0) fails closed; #2091
+/// retires the tag. A child runs a module the spawner holds, from its function 0, the module's child
+/// bootstrap (#2219): the word at 4, once the entry function, must be 0 until the record is next
+/// revised, as must the word at 32, once a fuel quota (#1944 slice 3: the budget caps the child's
+/// fuel).
 ///
 /// | off | field | |
 /// |---|---|---|
@@ -648,8 +648,8 @@ pub mod durable_abi {
 /// | 16 | `u32` size_log2 | the child's own window |
 /// | 20 | `u32` pager | impl export / `u32::MAX` |
 /// | 24 | `i32` module | the `Module` handle the child runs |
-/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends (op 15's arg 0) |
-/// | 32 | `i64` quota | retired, must be 0 (#1944 slice 3: the budget caps the child's fuel) |
+/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends |
+/// | 32 | `u64` | reserved, must be 0 (was the fuel quota) |
 /// | 40, 48 | `u64` grants ptr, count | named-grant list |
 /// | 56, 64 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
 /// | 72 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
@@ -665,9 +665,6 @@ pub struct SpawnRec {
     pub modh: i32,
     /// `Budget` handle, or `0` for none (offset 28).
     pub budget: i32,
-    /// Raw fuel quota (offset 32) — retired: it must be 0, and a spawn naming any other value traps
-    /// `CapFault` (#1944 slice 3: the budget caps the child's fuel).
-    pub quota: i64,
     /// Named-grant list pointer (offset 40).
     pub grants_ptr: u64,
     /// Named-grant list count (offset 48).
@@ -685,8 +682,8 @@ pub const SPAWN_REC_LEN: usize = 88;
 
 impl SpawnRec {
     /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
-    /// word other than 1, or a nonzero reserved field (offsets 4, 8, 76) — every driver fails that
-    /// closed. Pure layout decode: no handle/window/geometry validation, all of which stays
+    /// word other than 1, or a nonzero reserved field (offsets 4, 8, 32, 76) — every driver fails
+    /// that closed. Pure layout decode: no handle/window/geometry validation, all of which stays
     /// tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
         if rec.len() != SPAWN_REC_LEN {
@@ -694,7 +691,8 @@ impl SpawnRec {
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 1 || u32_at(4) != 0 || u64_at(8) != 0 || u32_at(76) != 0 {
+        if u32_at(0) != 1 || u32_at(4) != 0 || u64_at(8) != 0 || u64_at(32) != 0 || u32_at(76) != 0
+        {
             return None;
         }
         Some(SpawnRec {
@@ -702,7 +700,6 @@ impl SpawnRec {
             pager: u32_at(20),
             modh: u32_at(24) as i32,
             budget: u32_at(28) as i32,
-            quota: u64_at(32) as i64,
             grants_ptr: u64_at(40),
             grants_n: u64_at(48),
             args: (u64_at(56), u64_at(64)),
@@ -712,15 +709,14 @@ impl SpawnRec {
     }
 
     /// A record with every field at its "none" value: the module's declared window (`size_log2`
-    /// 0), no pager, no module (`0` names none, so a spawner sets `modh`), no budget, the retired
-    /// `quota` 0, no grants, no args, no region. Producers set the fields they use.
+    /// 0), no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no
+    /// args, no region. Producers set the fields they use.
     pub fn v1() -> SpawnRec {
         SpawnRec {
             size_log2: 0,
             pager: u32::MAX,
             modh: 0,
             budget: 0,
-            quota: 0,
             grants_ptr: 0,
             grants_n: 0,
             args: (0, 0),
@@ -739,7 +735,7 @@ impl SpawnRec {
         b.extend_from_slice(&self.pager.to_le_bytes());
         b.extend_from_slice(&self.modh.to_le_bytes());
         b.extend_from_slice(&self.budget.to_le_bytes());
-        b.extend_from_slice(&self.quota.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
         b.extend_from_slice(&self.grants_ptr.to_le_bytes());
         b.extend_from_slice(&self.grants_n.to_le_bytes());
         b.extend_from_slice(&self.args.0.to_le_bytes());
@@ -3759,11 +3755,10 @@ impl Func {
         })
     }
 
-    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`)
-    /// or `instantiate_rec` (`call.cap 6 17` — the one spawn form, placed detached, #1863).
-    /// See [`Module::spawns_detached`].
+    /// Whether this function issues a static `Instantiator.instantiate_rec` (`call.cap 6 17` — the
+    /// one spawn form, placed detached, #1863). See [`Module::spawns_detached`].
     pub fn spawns_detached(&self) -> bool {
-        self.issues_instantiator(&[15, 17])
+        self.issues_instantiator(&[17])
     }
 
     /// Whether this function issues a static `Instantiator` op among `ops`.
@@ -3947,9 +3942,9 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// definition every host shares — `temen-run`'s front door, the browser on-ramp, and the DAP backend
 /// all key off the identical predicate so a module accepted as an entry by one host is by all
 /// (guest-ABI shape must not drift per host — #912).
-/// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 15` in any function
+/// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 17` in any function
 /// (the only spelling — an executor op reaches its seam through a static `call.cap`, never a
-/// manifest-bound `call.sym`; chibicc's `__vm_instantiate_detached` emits exactly that). The two
+/// manifest-bound `call.sym`; chibicc's and temen-llvm's `__vm_instantiate_rec` emit exactly that). The two
 /// reference powerboxes grant the by-name spawn set (`"budget"`, and `"child"` for a program that
 /// exports `_child`) **only** to such a guest: least authority.
 pub fn spawns_detached(module: &Module) -> bool {
@@ -4096,7 +4091,7 @@ const MIN_HOST_PAGE: u64 = 1 << 12;
 
 /// #2268 — the most runs of page state a fresh window of a module whose data is `data` starts with:
 /// [`WINDOW_RUNS`], and two more for each run of read-only pages, which splits the declared prefix
-/// around it, and for an op-15 pre-map (`premap`), which aliases a region into it. A `readonly`
+/// around it, and for a spawn record's pre-map (`premap`), which aliases a region into it. A `readonly`
 /// segment is protected over every host page it touches, so segments that share or adjoin pages make
 /// one run (#2355): a unit translated from LLVM, a segment per constant, makes one or a few, not two
 /// per segment. A detached child's admission reserves its window's mappings by it before the window
@@ -8106,7 +8101,6 @@ mod spawn_rec_tests {
         let mut v1 = SpawnRec::v1();
         v1.modh = 5;
         v1.budget = 9;
-        v1.quota = 1 << 40;
         v1.grants_ptr = 17536;
         v1.grants_n = 2;
         v1.args = (18432, 24);
@@ -8119,7 +8113,8 @@ mod spawn_rec_tests {
 
     /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
     /// placement — and any other version fail closed, as do the reserved words (the word at 4 is
-    /// the retired entry, #2219), a short record (a v0 record was 56 bytes) and a long one.
+    /// the retired entry, #2219, and the word at 32 the retired fuel quota), a short record (a v0
+    /// record was 56 bytes) and a long one.
     #[test]
     fn only_a_version_1_record_parses() {
         let b = SpawnRec::v1().encode();
@@ -8132,6 +8127,12 @@ mod spawn_rec_tests {
             assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
         }
         assert_eq!(SpawnRec::parse(&with(4, 1)), None, "the word at 4");
+        assert_eq!(SpawnRec::parse(&with(32, 1)), None, "the word at 32");
+        assert_eq!(
+            SpawnRec::parse(&with(36, 1)),
+            None,
+            "the word at 32, high half"
+        );
         assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
         assert_eq!(
             SpawnRec::parse(&with(12, 1)),
