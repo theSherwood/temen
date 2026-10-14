@@ -4032,16 +4032,35 @@ pub const FIBER_STACK: u64 = 1 << 18;
 /// (the JIT's), and every engine counts them alike (`Budget.maps`).
 pub const WINDOW_RUNS: u64 = 3;
 
+/// #2355 — the smallest host page temen runs on, in which [`window_runs_bound`] counts runs: a larger
+/// page only merges them, so the bound holds on every host and reads the same on each.
+const MIN_HOST_PAGE: u64 = 1 << 12;
+
 /// #2268 — the most runs of page state a fresh window of a module whose data is `data` starts with:
-/// [`WINDOW_RUNS`], and two more for each `readonly` segment, which splits the declared prefix around
-/// its pages, and for an op-15 pre-map (`premap`), which aliases a region into it. A detached child's
-/// admission reserves its window's mappings by it before the window is built, on every engine alike.
+/// [`WINDOW_RUNS`], and two more for each run of read-only pages, which splits the declared prefix
+/// around it, and for an op-15 pre-map (`premap`), which aliases a region into it. A `readonly`
+/// segment is protected over every host page it touches, so segments that share or adjoin pages make
+/// one run (#2355): a unit translated from LLVM, a segment per constant, makes one or a few, not two
+/// per segment. A detached child's admission reserves its window's mappings by it before the window
+/// is built, on every engine alike.
 pub fn window_runs_bound(data: &[Data], premap: bool) -> u64 {
-    let ro = data
+    let mut pages: Vec<(u64, u64)> = data
         .iter()
         .filter(|d| d.readonly && !d.bytes.is_empty())
-        .count() as u64;
-    WINDOW_RUNS + 2 * (ro + u64::from(premap))
+        .map(|d| {
+            let end = d.offset.saturating_add(d.bytes.len() as u64);
+            (d.offset / MIN_HOST_PAGE, end.div_ceil(MIN_HOST_PAGE))
+        })
+        .collect();
+    pages.sort_unstable();
+    let (mut runs, mut end) = (0u64, 0u64);
+    for (lo, hi) in pages {
+        if runs == 0 || lo > end {
+            runs += 1;
+        }
+        end = end.max(hi);
+    }
+    WINDOW_RUNS + 2 * (runs + u64::from(premap))
 }
 
 /// Hard anti-bomb ceiling on the vCPUs (`thread.spawn`) a single run may create (§12/§15) — a clean
@@ -7246,6 +7265,41 @@ pub mod bounds {
             };
             assert_eq!(ub_of(&cmp, &ubs), UB_TOP);
         }
+    }
+}
+
+#[cfg(test)]
+mod window_runs_tests {
+    use super::*;
+
+    fn seg(offset: u64, len: usize, readonly: bool) -> Data {
+        Data {
+            offset,
+            readonly,
+            bytes: vec![1; len],
+        }
+    }
+
+    /// #2355: read-only segments are protected over whole host pages, so the bound counts the runs
+    /// of pages they make, not the segments.
+    #[test]
+    fn readonly_segments_count_by_the_runs_of_pages_they_make() {
+        let p = MIN_HOST_PAGE;
+        // None: the window's own runs; a pre-map two more.
+        assert_eq!(window_runs_bound(&[], false), WINDOW_RUNS);
+        assert_eq!(window_runs_bound(&[], true), WINDOW_RUNS + 2);
+        // A thousand small constants packed together, as LLVM lays them out: one run.
+        let packed: Vec<Data> = (0..1000).map(|i| seg(p + i * 56, 50, true)).collect();
+        assert_eq!(window_runs_bound(&packed, false), WINDOW_RUNS + 2);
+        // Segments that share a page, or adjoin across a page boundary, in any order: one run.
+        let adjoin = [seg(3 * p, 10, true), seg(p, (2 * p) as usize, true)];
+        assert_eq!(window_runs_bound(&adjoin, false), WINDOW_RUNS + 2);
+        // A page between them that neither touches: two runs.
+        let apart = [seg(p, 10, true), seg(3 * p, 10, true)];
+        assert_eq!(window_runs_bound(&apart, true), WINDOW_RUNS + 2 * 3);
+        // Writable and empty segments protect nothing.
+        let none = [seg(p, 10, false), seg(2 * p, 0, true)];
+        assert_eq!(window_runs_bound(&none, false), WINDOW_RUNS);
     }
 }
 
