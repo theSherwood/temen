@@ -1,6 +1,6 @@
 //! **Grow-then-tier-up host sync** (#717) — the differential proof that a `vm_map`-growing guest
 //! and the wasm-JIT tier agree once the driver syncs the live `"mapped"` global from the
-//! [`VcpuEvent::TierUp`] entry snapshot.
+//! [`CoopEvent::TierUp`] entry snapshot.
 //!
 //! `live_mapped.rs` proves the emitted *check* reads the global (set by hand); `page_ops.rs` proves
 //! a pure-grow module now keeps its leaves eligible. This test closes the loop end-to-end: the
@@ -20,6 +20,7 @@
 //! every `f{func}` call.
 
 use std::sync::Arc;
+use temen_interp::bytecode::{CoopEvent, ProgramEmit, TierUpConfig};
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_wasm_jit::{compile_module_tierup, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -111,8 +112,8 @@ fn shared_window(size: usize) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 /// window, with the `"mapped"` global set to `sync` when given (the #717 driver contract) or left
 /// at its emit-time default when `None` (modelling a pre-fix driver). Copies emitted writes back.
 ///
-/// SAFETY: `base` is the live window buffer, read/written only while the vCPU is paused inside the
-/// tier-up service (single-threaded), so no aliasing with the interpreter's own access.
+/// SAFETY: `base` is the live window buffer, read/written only while the run is paused on the
+/// tier-up (single-threaded), so no aliasing with the interpreter's own access.
 #[allow(clippy::too_many_arguments)]
 fn run_emitted(
     m: &temen_ir::Module,
@@ -217,34 +218,41 @@ fn run_emitted(
 type Emitted<'a> = (&'a [u8], &'a Arc<[bool]>, bool);
 
 /// Drive `entry(handle, probe)` over a reserved live window. With `emitted`, the leaf's `Call`
-/// surfaces as [`bytecode::VcpuEvent::TierUp`] and is serviced on emitted wasm. Without, this is
-/// the pure-interpreter oracle. Returns the frame outcome and how many tier-ups fired.
+/// surfaces as [`CoopEvent::TierUp`] and is serviced on emitted wasm. Without, this is the
+/// pure-interpreter oracle. Returns the frame outcome and how many tier-ups fired.
 fn reserved_frame(m: &temen_ir::Module, emitted: Option<Emitted>, probe: i64) -> (Outcome, u32) {
     let win_size = 1usize << RESERVED_LOG2;
     let (back, base, layout) = shared_window(win_size);
-    let prog = bytecode::VcpuProgram::compile(m).expect("compile");
     let mut host = Host::new();
     let handle = host.grant_memory();
     let emit_m = bumped_for_emit(m);
+    let tierup = emitted.map(|(_, eligible, _)| TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::clone(eligible),
+            page_checked: false,
+        },
+        leaf: None,
+        modules: None,
+    });
 
-    let mut vcpu = bytecode::Vcpu::new_root_reserved_over_with_powerbox(
-        &prog,
+    let mut run = bytecode::CoopRun::new_over(
+        m,
         0,
         &[Value::I64(handle as i64), Value::I64(probe)],
-        &[],
+        FUEL,
         host,
+        tierup,
+        &[],
         RESERVED_LOG2,
         back,
     )
-    .expect("root vcpu");
-    if let Some((_, eligible, _)) = emitted {
-        vcpu = vcpu.with_jit_eligible(Arc::clone(eligible));
-    }
+    .expect("supported")
+    .expect("entry in range");
 
     let mut tierups = 0u32;
     let out = loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(vals) => {
+        match run.run() {
+            CoopEvent::Done(vals) => {
                 break Outcome::Vals(
                     vals.iter()
                         .map(|v| match v {
@@ -255,28 +263,31 @@ fn reserved_frame(m: &temen_ir::Module, emitted: Option<Emitted>, probe: i64) ->
                         .collect(),
                 )
             }
-            bytecode::VcpuEvent::Trapped(Trap::MemoryFault) => {
-                break Outcome::Trap(TrapKind::MemoryFault)
-            }
-            bytecode::VcpuEvent::Trapped(Trap::OutOfFuel) => {
-                break Outcome::Trap(TrapKind::OutOfFuel)
-            }
-            bytecode::VcpuEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
-            bytecode::VcpuEvent::TierUp { func, argv, mapped } => {
+            CoopEvent::Trapped(Trap::MemoryFault) => break Outcome::Trap(TrapKind::MemoryFault),
+            CoopEvent::Trapped(Trap::OutOfFuel) => break Outcome::Trap(TrapKind::OutOfFuel),
+            CoopEvent::Trapped(_) => break Outcome::Trap(TrapKind::Other),
+            CoopEvent::TierUp {
+                func, argv, mapped, ..
+            } => {
                 tierups += 1;
                 let (wasm, _, sync) = emitted.expect("tier-up only fires with eligibility set");
                 let sync = sync.then_some(mapped);
                 match run_emitted(&emit_m, wasm, func, &argv, base, win_size, sync) {
-                    Outcome::Vals(v) => vcpu.deliver_tierup(&v),
-                    Outcome::Trap(TrapKind::OutOfFuel) => vcpu.deliver_tierup_trap(Trap::OutOfFuel),
-                    Outcome::Trap(_) => vcpu.deliver_tierup_trap(Trap::MemoryFault),
+                    Outcome::Vals(v) => run.deliver_tierup(&v),
+                    Outcome::Trap(TrapKind::OutOfFuel) => run.deliver_tierup_trap(Trap::OutOfFuel),
+                    Outcome::Trap(_) => run.deliver_tierup_trap(Trap::MemoryFault),
                 }
             }
-            _ => panic!("unexpected event on the single-vCPU driver"),
+            // One task over one window, serviced only for tier-up.
+            CoopEvent::Paused
+            | CoopEvent::Idle
+            | CoopEvent::CapPark { .. }
+            | CoopEvent::Resume { .. }
+            | CoopEvent::JitInvoke { .. } => panic!("unexpected event on a one-task run"),
         }
     };
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the window buffer.
+    drop(run);
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped; free the window buffer.
     unsafe { std::alloc::dealloc(base, layout) };
     (out, tierups)
 }

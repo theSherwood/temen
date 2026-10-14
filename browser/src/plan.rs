@@ -91,7 +91,9 @@ impl Plan {
     }
 
     /// The root guest's Temen IR text. Its params are `(inst, module_0 … module_{n-1}, budget, cap_0 …)`
-    /// — the order [`root_args`](Self::root_args) builds. `Err` names what does not fit or resolve.
+    /// — the order [`root_args`](Self::root_args) builds. It joins every node and returns how the last
+    /// one ended, `(status, value)` as its join answers it (#2066), which [`outcome`] reads back. `Err`
+    /// names what does not fit or resolve.
     pub fn root_src(&self) -> Result<String, String> {
         let n = self.nodes.len();
         if n == 0 {
@@ -253,7 +255,7 @@ impl Plan {
         for k in 0..n {
             let s = sfx(k);
             body.push_str(&format!(
-                "  vr{s} = call.cap 6 1 (i32) -> (i64) v0 (vh{s})\n"
+                "  vs{s}, vr{s} = call.cap 6 1 (i32) -> (i64, i64) v0 (vh{s})\n"
             ));
         }
         let params = 2 + n + self.caps.len();
@@ -263,8 +265,8 @@ impl Plan {
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
-            "memory {ROOT_WINDOW_LOG2}\n{data}func ({sig}) -> (i64) {{\nblock 0 ({bparams}) {{\n{records}{body}  \
-             return vr{last}\n  }}\n}}\n",
+            "memory {ROOT_WINDOW_LOG2}\n{data}func ({sig}) -> (i64, i64) {{\nblock 0 ({bparams}) {{\n{records}{body}  \
+             return vs{last}, vr{last}\n  }}\n}}\n",
             last = sfx(n - 1),
         ))
     }
@@ -311,9 +313,20 @@ pub fn spawn_rec_ir(
     (format!("data {at} \"{esc}\"\n"), stores)
 }
 
+/// How the last node ended, from what the root returns ([`Plan::root_src`]): its result if it returned,
+/// else the trap it ended in — the run's outcome is the node's, as a node's join answers it (#2066).
+/// A root that itself trapped ends the run with its trap.
+pub fn outcome(root: Result<Vec<Value>, Trap>) -> Result<Vec<Value>, Trap> {
+    match root?.as_slice() {
+        [Value::I64(0), value] => Ok(vec![*value]),
+        [Value::I64(status), _] => Err(Trap::from_code(*status).unwrap_or(Trap::Malformed)),
+        _ => Err(Trap::Malformed),
+    }
+}
+
 /// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
 /// [`drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which already holds
-/// `caps`), and return what the root returns — the last node's result.
+/// `caps`), and return the last node's outcome ([`outcome`]).
 pub fn run(
     plan: &Plan,
     modules: &[&Module],
@@ -350,7 +363,7 @@ pub fn run(
     drop(back);
     // SAFETY: same layout; the root vCPU and its region views are dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
-    out
+    outcome(out)
 }
 
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`), for a root (see

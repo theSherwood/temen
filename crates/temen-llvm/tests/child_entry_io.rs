@@ -85,10 +85,10 @@ fn child_entry_writes_through_a_regranted_stdout() {
     for driver in drivers::ALL {
         let ran = drivers::run_on(driver, &parent, &powerbox)
             .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
-        // The child's `main` returned 0, joined back.
+        // The child's `main` returned 0, joined back as `(status 0, value 0)`.
         assert_eq!(
             ran.result,
-            Ok(vec![Value::I64(0)]),
+            Ok(vec![Value::I64(0), Value::I64(0)]),
             "{driver:?}: child status 0 joined back"
         );
         assert_eq!(

@@ -47,7 +47,7 @@ fn parent(payload: bool, join: bool) -> String {
         "vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)"
     };
     let tail = if join {
-        "vr = call.cap 6 1 (i32) -> (i64) v0 (vh)\n  return vr"
+        "vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  return vr"
     } else {
         "vr = i64.extend_i32_s vh\n  return vr"
     };

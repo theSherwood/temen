@@ -41,7 +41,7 @@ block 0 (vinst: i32, vbud: i32, vmod: i32) {{
   i32.store rb vnode
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   three = i64.const 3
   vroom = call.cap 14 1 (i64) -> (i64) vnode (three)
   k = i64.const 1000000
@@ -150,7 +150,7 @@ block 2 (vi: i64, vi2a: i32, vc2a: i32) {{
   br_if vend 3(vk64, vi2a, vc2a) 2(vi2, vi2a, vc2a)
 }}
 block 3 (vcount: i64, vi3: i32, vc3: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vi3 (vc3)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi3 (vc3)
   v10 = i64.const 10
   vm = i64.mul vcount v10
   vr = i64.add vm vj

@@ -34,7 +34,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   vb = i64.extend_i32_s vbud
   sl = i64.const 16
   hc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vm, z, z, z, sl, z)
-  rc = call.cap 6 1 (i32) -> (i64) vinst (hc)
+  rc_st, rc = call.cap 6 1 (i32) -> (i64, i64) vinst (hc)
   hb = thread.spawn 1 z z
   tb = thread.join hb
   return ta, rc, tb

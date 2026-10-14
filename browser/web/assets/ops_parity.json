@@ -444,7 +444,6 @@
     { "op": "durable.shadow_base", "family": "capabilities & reflection", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
     { "op": "instantiate_rec", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
     { "op": "join", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
-    { "op": "wait", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
     { "op": "poll", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
     { "op": "detach", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },
     { "op": "kill", "family": "process, serve & fork", "cells": ["full", "full", "full", "declines"], "notes": ["leaf accelerator: folds to the bytecode interp underneath (DESIGN §3)"] },

@@ -52,7 +52,7 @@ const CHILD_OFF: u64 = 65536;
 /// it returns the spawn's own result (the refusal probes).
 fn parent(off: u64, reg: &str, join: bool) -> String {
     let tail = if join {
-        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
     } else {
         "vr = i64.extend_i32_s vc\n  return vr"
     };

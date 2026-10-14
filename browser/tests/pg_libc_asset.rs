@@ -832,7 +832,8 @@ int main(void) {
   g[2].name = "*";
   g[2].handle = VM_EMPTY;
   long a = vm_spawn(talker, 0, g, 3, 0, 0, scratch);
-  long ra = a < 0 ? a : vm_join(a);
+  long st;
+  long ra = a < 0 ? a : vm_join(a, &st);
   long b = vm_spawn(talker, 0, g, 0, 0, 0, scratch);
   printf("granted: %ld, refused: %ld\n", ra, b);
   return 0;

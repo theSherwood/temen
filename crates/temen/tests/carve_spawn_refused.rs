@@ -186,7 +186,7 @@ fn the_same_harness_runs_a_version_1_spawn() {
   vba = i64.const {}
   i32.store vba vb
   vh = call.cap 6 17 (i64) -> (i32) vi (vp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vh)",
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)",
             REC + rec::MODULE_AT,
             REC + rec::BUDGET_AT,
         ),

@@ -425,10 +425,13 @@ granted, exactly as it reaches `fork`). Confinement is capability-shaped **plus*
 allow-set: `reap` acts only on ids `fork` actually minted, so a bogus/foreign pid is `-ECHILD`, never a
 park that hangs.
 
-**Reap ≠ join — a crashing command must not crash the shell.** `join` propagates a child trap as the
-joiner's own trap (`out.result?`). `wait` must not: a trapped twin reaps as a nonzero *crash status*
-(`reap_status`; the exact POSIX `128 + signal` encoding is a shell/guest concern, ISSUES.md I43). This
-is the one real semantic difference, and it is why `reap` is its own op rather than a rebind of `join`.
+**Reap ≠ join — a crashing command must not crash the shell.** `join` propagated a child trap as the
+joiner's own trap (`out.result?`) when this landed. `wait` must not: a trapped twin reaps as a nonzero
+*crash status* (`reap_status`; the exact POSIX `128 + signal` encoding is a shell/guest concern,
+ISSUES.md I43). That was the one real semantic difference, and why `reap` became its own op rather than
+a rebind of `join`. `join` has since taken the same rule (#2066): it answers a child's trap as
+`(trap code, 0)` and never traps the joiner. `reap` stays its own op because it reaps a twin by pid,
+which no handle table holds.
 
 **Two paths.** `reap_parked_caller` claims the parked caller (the shape `fork_parked_caller` removes),
 then: twin already finished → deliver its status now (`CapResult`); twin still running → move the caller

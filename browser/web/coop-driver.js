@@ -94,6 +94,22 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 //   with, or nothing to let the code trap `OutOfFuel`; without it, it traps.
 // Everything here is synchronous but `syncTable` and `unitFor`, which the coop driver awaits at its
 // event boundaries; a host that cannot await uses `syncTableSync` and `unitForSync`.
+// #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
+// wording is the engine's, not the spec's, so only messages that say exactly one of the interpreter's
+// traps are named (their `temen_ir::trap_code`); any other stays unnamed (`0`). ("integer overflow" is
+// not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
+// interpreter calls `BadConversion`.)
+const NATIVE_TRAPS = [
+  [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
+  [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
+  [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
+];
+export const nativeTrap = (e) => {
+  if (!(e instanceof WebAssembly.RuntimeError)) return 0;
+  const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
+  return hit ? hit[1] : 0;
+};
+
 export function emittedTier(ex, memory, x) {
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
@@ -200,21 +216,6 @@ export function emittedTier(ex, memory, x) {
     trap: onTrap,
     call_interp,
   } });
-  // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
-  // wording is the engine's, not the spec's, so only messages that say exactly one of the
-  // interpreter's traps are named; any other stays unnamed (`0`), as before. ("integer overflow" is
-  // not one: SpiderMonkey and JSC say it for an out-of-range float→int conversion too, which the
-  // interpreter calls `BadConversion`.)
-  const NATIVE_TRAPS = [
-    [/^(divide by zero|remainder by zero|integer divide by zero|division by zero)$/i, 1], // DIV_BY_ZERO
-    [/^divide result unrepresentable$/i, 2], // INT_OVERFLOW
-    [/^(float unrepresentable in integer range|invalid conversion to integer|out of bounds trunc operation)$/i, 3], // BAD_CONVERSION
-  ];
-  const nativeTrap = (e) => {
-    if (!(e instanceof WebAssembly.RuntimeError)) return 0;
-    const hit = NATIVE_TRAPS.find(([re]) => re.test(e.message));
-    return hit ? hit[1] : 0;
-  };
   // The trap emitted frames ended with (`e`, what they threw): their `env.trap` code, else the native
   // trap's. A memory fault's guard left its faulting address in the env cell (#2126), which the run
   // reports as the interpreter would.

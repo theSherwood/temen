@@ -94,10 +94,11 @@ Ordered by leverage ÷ risk; each lands with tests per AGENTS.md.
 ### Slice 0 — mainline tier-up over a live window (DIAGNOSED; gate fix landed)
 
 **Diagnosis (empirical, native).** A new native harness (`temen-wasm-jit/tests/tierup_live_window.rs`)
-drives the real loop — `bytecode::VcpuReactor` opens over a caller-owned window, runs `_start`
-(materializing `m.data`), and tiers up a mainline `Call` onto emitted wasm mirrored over that live
-window. It is the native twin of the browser `temen_par_run`/`PAR_TIERUP` lane, which had **no native
-coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation over a hand-seeded window).
+drives the real loop — a run over a caller-owned window (a `bytecode::VcpuReactor` then, the pump's
+`CoopRun` since #1414) materializes `m.data` and tiers up a mainline `Call` onto emitted wasm
+mirrored over that live window. It is the native twin of the browser `temen_par_run`/`PAR_TIERUP`
+lane, which had **no native coverage** (every prior `tierup.rs` test ran each `f{func}` in isolation
+over a hand-seeded window).
 
 Against the JACL doc's ranked hypotheses:
 - **Hypothesis 1 (data/window-materialization) — ruled out for the native path.** With a
