@@ -327,7 +327,7 @@ mod tests {
     // setup below.
     const SPEC: MemHookSpec = MemHookSpec {
         type_id: 13,
-        handle: 256,
+        handle: 1 << 10,
     };
 
     /// `func() -> i64 { store i64 7 at 16400+8; load i64 at 16400+8 }` — one store, one load, both

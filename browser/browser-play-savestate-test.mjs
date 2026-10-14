@@ -3,9 +3,9 @@
 // page: run the `bounce` reactor, save it at an exact frame, stop, load it back, and assert the guest
 // resumes at the instant it was frozen on — then reload the page and assert the save is still there.
 //
-// Run on **both tiers**, because a save-state is one frontier across them (INVARIANTS #14): the
-// interpreter freezes its own window, the wasm-JIT reactor freezes the emitted tier's, and the page
-// remembers which one took a save so it comes back on that tier rather than on whatever the toggle says.
+// Run on **both tiers**, because a save-state is one frontier across them (INVARIANTS #14): both run
+// the one reactor over the one window (#1414 S4-4), and the page remembers which tier took a save so
+// it comes back on that tier rather than on whatever the toggle says.
 //
 // **Scope.** This gates the page *wiring*: that the row reaches the engine's freeze/thaw exports on
 // either tier, that the artifact round-trips through IndexedDB, that a thaw resumes the frozen instant
@@ -35,11 +35,13 @@ const sel = `[data-demo="${DEMO}"]`;
 const SAVE_AT = 60; // a keyframe tick (stride 30), so the seek that parks us there re-runs zero frames
 const AFTER = 10;   // frames run past the save, on both the original and the thawed run
 
-// Park the scrub bar on `target` and hand back what is on the canvas there.
-const seek = (page, target) => page.evaluate((t) => {
+// Park the scrub bar on `target` and hand back what is on the canvas there, once the seek's frames
+// (runs the page pumps) have run.
+const seek = (page, target) => page.evaluate(async (t) => {
   const row = document.querySelector('.scrub:not([hidden]) .scrub-range');
   row.value = String(t);
   row.dispatchEvent(new Event('input', { bubbles: true }));
+  await globalThis.__reactorIdle();
   const canvas = document.querySelector('.demo .canvas:not([hidden])');
   return { at: globalThis.__scrubState().viewing, png: canvas.toDataURL() };
 }, target);

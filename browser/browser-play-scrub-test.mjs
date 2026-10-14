@@ -8,7 +8,7 @@
 // tears down a paused reactor. What it deliberately does not re-prove is replay *fidelity* — that the
 // frames a re-run produces are the frames the live run produced. That needs the original live frames
 // sampled at an exact tick, which you cannot do from outside a 60 fps rAF loop; it is gated instead,
-// rigorously and on both tiers, by `browser/tests/reactor_moment.rs` and `jit_reactor_moment.rs`.
+// rigorously, by `browser/tests/reactor_moment.rs` and, on the emitted tier, `coop_tierup_driver.rs`.
 //
 // Reuses the wasm32 module built by the CI real-browser job (and `serve.mjs` for COOP/COEP). Run:
 //   cargo build --release --lib --target wasm32-unknown-unknown
@@ -67,11 +67,13 @@ try {
     : fail('the steer was not taped — a re-run would replay an unsteered guest');
 
   // Seek to a frame, twice, from different starting points: the pixels must be identical. This is the
-  // whole property — a moment plus the tape reproduces the frame, whatever path you took to it.
-  const seek = (t) => page.evaluate((target) => {
+  // whole property — a moment plus the tape reproduces the frame, whatever path you took to it. A seek
+  // re-runs frames, each a run the page pumps, so it has landed once the page's reactor work settles.
+  const seek = (t) => page.evaluate(async (target) => {
     const row = document.querySelector('.scrub:not([hidden]) .scrub-range');
     row.value = String(target);
     row.dispatchEvent(new Event('input', { bubbles: true }));
+    await globalThis.__reactorIdle();
     const canvas = document.querySelector('.demo .canvas:not([hidden])');
     return { at: globalThis.__scrubState().viewing, png: canvas.toDataURL() };
   }, t);
@@ -85,8 +87,9 @@ try {
 
   // Stepping one frame forward from 60 must equal seeking straight to 61 — the re-run and the live path
   // agree on what frame 61 is.
-  const stepped = await page.evaluate((s) => {
+  const stepped = await page.evaluate(async (s) => {
     document.querySelector(`${s} .scrub .scrub-fwd`).click();
+    await globalThis.__reactorIdle();
     const canvas = document.querySelector('.demo .canvas:not([hidden])');
     return { at: globalThis.__scrubState().viewing, png: canvas.toDataURL() };
   }, sel);

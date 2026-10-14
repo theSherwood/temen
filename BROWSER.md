@@ -1238,7 +1238,10 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
 7. **[landed] Reactor (whole-`tick`-on-wasm) — DOOM in the playground.** The Doom demo runs its entire
    per-frame `tick()` on the emitted wasm tier (`temen_onramp_jit_*` FFI + `web/wasmjit-reactor.js`),
    over the cdylib's shared window, with the ~24 genuine I/O helpers (`call.cap` display/timer,
-   `self.resolve`) relaying through `env.call_interp` to the interpreter. Two increments closed the
+   `self.resolve`) relaying through `env.call_interp` to the interpreter. *(Retired by #1414 S4-4: one
+   reactor serves both tiers. Each frame is a pump run of `tick` over the reactor's live window, offered
+   whole to the emitted tier as a root leaf and page-checked over read-only data, #2302. FFI:
+   `temen_onramp_frame_begin`; JS: `web/reactor.js`.)* Two increments closed the
    last gaps: **(a)** `call.dyn` routes to *all* cross-tier functions, not just `ref.func`-taken
    ones (DOOM's `states[]`/`mobjinfo[]` action pointers live in data segments — PR #314 / I-note),
    fixing a `~frame-174` trap; **(b)** the **bulk-memory lowering** (`memcpy`/`memset`/`memmove` →

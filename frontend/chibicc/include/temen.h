@@ -118,6 +118,11 @@ long __vm_region_unmap(int region, long win_off, long len);
 // allocation granularity: 4 KiB or 16 KiB on unix, 64 KiB on Windows). Query it; never assume.
 long __vm_region_page_size(int region);
 
+// Give the region handle up, and with it this domain's hold on the region, which is freed (and its
+// charge returned) once no domain holds it. Returns 0, -EBUSY while any of the window still maps it
+// (unmap first), or -EBADF for a handle already closed.
+long __vm_region_close(int region);
+
 // --- Guest-driven JIT (iface 11, JIT.md Model A) --------------------------------------------
 //
 // Submit serialized Temen IR (the binary `temen-encode` format) built at runtime in this window;

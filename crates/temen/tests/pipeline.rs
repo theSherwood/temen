@@ -1954,13 +1954,13 @@ block 0 (vs: i32, vc: i32) {
 "#;
 
 /// A **forged** handle — slot 200 with generation 5, never granted by any test host (a fresh
-/// powerbox grants two handles into slots 0/1) — must still trap: `(5 << 8) | 200 = 1480`.
+/// powerbox grants two handles into slots 0/1) — must still trap: `(5 << 10) | 200 = 5320`.
 const FORGER: &str = r#"
 memory 12
 
 func () -> (i64) {
 block 0 () {
-  vh = i32.const 1480
+  vh = i32.const 5320
   vp = i64.const 0
   vl = i64.const 0
   vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)

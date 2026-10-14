@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**366 exports** in 39 families — 317 referenced from JS, 49 referenced by nothing, 23 behind a `cfg`.
+**348 exports** in 39 families — 301 referenced from JS, 47 referenced by nothing, 23 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -27,7 +27,7 @@
 | `module` | 3 | 0 | 0 |
 | `nim` | 5 | 5 | 0 |
 | `notes` | 2 | 2 | 0 |
-| `onramp` | 64 | 53 | 0 |
+| `onramp` | 46 | 37 | 0 |
 | `op13jit` | 9 | 9 | 0 |
 | `par` | 74 | 74 | 2 |
 | `parse` | 3 | 3 | 0 |
@@ -268,20 +268,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_artifact_len` — *unreferenced*
 - `temen_onramp_artifact_ptr`
 - `temen_onramp_close`
-- `temen_onramp_frame`
+- `temen_onramp_frame_begin`
 - `temen_onramp_freeze`
-- `temen_onramp_jit_call_interp`
-- `temen_onramp_jit_close`
-- `temen_onramp_jit_entry_sp`
-- `temen_onramp_jit_env_bytes`
-- `temen_onramp_jit_freeze`
-- `temen_onramp_jit_key`
-- `temen_onramp_jit_moment_restore` — *unreferenced*
-- `temen_onramp_jit_moment_take` — *unreferenced*
-- `temen_onramp_jit_mouse`
-- `temen_onramp_jit_open`
-- `temen_onramp_jit_open_fs`
-- `temen_onramp_jit_present`
 - `temen_onramp_jit_run_call_interp`
 - `temen_onramp_jit_run_close`
 - `temen_onramp_jit_run_env_bytes`
@@ -296,12 +284,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_onramp_jit_run_wasm_len`
 - `temen_onramp_jit_run_wasm_ptr`
 - `temen_onramp_jit_run_win_ptr`
-- `temen_onramp_jit_thaw`
-- `temen_onramp_jit_tick`
-- `temen_onramp_jit_trap_len`
-- `temen_onramp_jit_wasm_len`
-- `temen_onramp_jit_wasm_ptr`
-- `temen_onramp_jit_win_ptr`
 - `temen_onramp_key`
 - `temen_onramp_moment_bytes` — *unreferenced*
 - `temen_onramp_moment_clear` — *unreferenced*

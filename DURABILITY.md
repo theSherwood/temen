@@ -115,8 +115,10 @@ post-`_start`, so a thaw deliberately does not re-run the entry — for Doom tha
 parsing skipped, which is most of what a save-state is for. Both tiers freeze, because a save-state the
 playable (emitted) tier cannot take is not the feature (INVARIANTS #14); the artifact is tier-local in
 practice only because the two reserve different window sizes, and a mismatched image is refused rather
-than splatted over a prefix. Gated by `browser/tests/reactor_moment.rs`,
-`browser/tests/jit_reactor_moment.rs`, and the page-level `browser-play-savestate-test.mjs`.
+than splatted over a prefix. *(#1414 S4-4: one reactor now serves both tiers, so there is one
+`freeze`, and an artifact thaws onto either tier.)* Gated by `browser/tests/reactor_moment.rs`,
+`browser/tests/coop_tierup_driver.rs` (the emitted tier), and the page-level
+`browser-play-savestate-test.mjs`.
 
 **Follow-on — from rewind to scrub (2026-09-16, #1457 items 3–4).** A moment on its own only goes
 *back* to a point someone thought to save. `ReactorTimeline` adds the two things that make that a

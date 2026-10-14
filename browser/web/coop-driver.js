@@ -376,6 +376,14 @@ export function emittedTier(ex, memory, x) {
   };
 }
 
+// Free what a driver `session` kept (see `driveCoopTierupRun`): its emitted-tier host's env cell, and
+// with it the leaves instantiated over that host.
+export function endSession(session) {
+  session.host?.free();
+  session.host = undefined;
+  session.leaves = undefined;
+}
+
 //
 // `opts` (all optional):
 // - `cacheKey`: a stable identity for the run's region emit, to reuse its compiled Module across runs.
@@ -404,13 +412,18 @@ export function emittedTier(ex, memory, x) {
 //   but a native wasm trap (division by zero, an `unreachable`) reads as `Unreachable`, and no emitted
 //   trap has a fault address. A host that shows those re-runs such a run interpreted, as c_interpret
 //   does (replaying the cap answers the first run got).
+// - `session` (#1414 S4-4): an object the caller keeps across runs of one program — a reactor's frames.
+//   The driver keeps the emitted-tier host and each leaf it instantiates in it, so a run after the
+//   first instantiates nothing. A session's leaves never park (the engine offers a reactor's leaf only
+//   when it cannot), so they run without JSPI, over imports the session keeps. Free it with
+//   `endSession`.
 //
 // The driver closes the session before it returns; the run's value is `temen_run_value`, its files
 // `temen_coop_fs_image`.
 export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const {
     cacheKey, counts = {}, budget, leafBudget = budget, onOutput, onSlice, onCapPark,
-    trapDeclines = true,
+    trapDeclines = true, session,
   } = opts;
   // #1896: how many processes ran whole on the emitted tier, and how many parked calls in them
   // resumed. A caller that wants to know passes the object to fill.
@@ -423,7 +436,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   // via temen_coop_tierup_win_ptr(); never cache it across events.
   const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 
-  const host = emittedTier(ex, memory, {
+  const host = session?.host ?? emittedTier(ex, memory, {
     tableLog2: () => ex.temen_coop_table_log2(),
     nfuncs: () => ex.temen_coop_nfuncs(),
     tableGen: () => ex.temen_coop_table_gen(),
@@ -452,6 +465,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     spillBytes: () => ex.temen_coop_spill_bytes(),
     spillPtr: () => ex.temen_coop_spill_ptr(),
   });
+  if (session) session.host = host;
   const {
     mappedGlobals, fuelGlobals, pagestateGlobals, envCell, armEnv, bounce, afterBounce, callInterp,
     recordTrap, trapOf, unitFor, syncTable,
@@ -546,10 +560,14 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         jitCacheStats.hits++;
       }
       const leaf = isLeaf(m);
-      const imports = leaf ? host.imports(leafCallInterp, leafTrap) : host.imports();
-      p = (await WebAssembly.instantiate(module, imports)).exports;
-      if (leaf && sliceLeaves && p.fuel) leafFuelGlobals.push(p.fuel);
-      host.register(p);
+      p = session && leaf ? session.leaves?.get(key) : undefined;
+      if (p === undefined) {
+        const imports = leaf && !session ? host.imports(leafCallInterp, leafTrap) : host.imports();
+        p = (await WebAssembly.instantiate(module, imports)).exports;
+        if (leaf && sliceLeaves && p.fuel) leafFuelGlobals.push(p.fuel);
+        host.register(p);
+        if (session && leaf) (session.leaves ??= new Map()).set(key, p);
+      }
       programs.set(m, p);
     }
     return p;
@@ -718,8 +736,9 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         for (const g of pagestateGlobals) g.value = ps;
       }
       armEnv();
-      // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park.
-      if (suspendsLeaves && leaf) {
+      // #1896: a leaf program runs under JSPI where there is one, so that a call in it can park — but
+      // not a session's, which cannot.
+      if (suspendsLeaves && leaf && !session) {
         const entry = WebAssembly.promising(program['f' + func]);
         if (await settle(ex.temen_coop_task(), () => entry(eventWin(), envCell, ...args))) {
           stopped = true;
@@ -734,7 +753,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
       }
     }
   } finally {
-    host.free();
+    if (!session) host.free();
     ex.temen_coop_close();
   }
   if (stopped) return null;

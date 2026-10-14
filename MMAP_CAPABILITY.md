@@ -253,10 +253,9 @@ Resolved in slice 2 (§4b, §5.2):
   emulation got its buffer). No new §14 mechanism needed for the single-mapping case.
 - **`FileBacking` lifetime** — the backing owns its **own** `dup`'d fd over the file, independent of
   the guest's fd, so it outlives the mapping and both share one OS file / page cache; it is dropped
-  with the `Host` at run end (regions aren't reclaimed mid-run — matching `SharedRegion` today).
+  with the region when its last holder closes it or ends (#2358).
 
-Still open (deferred, not blocking): reclaiming a region mid-run (today it lives until run end, a
-minor leak on repeated map/unmap); a non-zero file offset in `FS_MAP_REGION` (v1 requires offset 0,
+Still open (deferred, not blocking): a non-zero file offset in `FS_MAP_REGION` (v1 requires offset 0,
 which is all LMDB needs); and the macOS/Windows `map_region` backends (Linux-only, following
 `SharedRegion`'s existing per-OS story).
 
@@ -277,13 +276,12 @@ be coherent — but it's untested. *Cost:* low (flip `MDB_WRITEMAP` off in the d
 through `FS_WRITE`; a differential like the existing LMDB ones). *Value:* proof only — real
 `MAP_SHARED` gives this for free; the doc rates it low priority.
 
-**G2 — mid-run region reclaim (a real, if minor, leak).** `FS_MAP_REGION` pushes each `FileBacking`
-into `Host::regions`, which is never freed until the run ends; `SharedRegion` has no release op, and
-`FS_MUNMAP`/`munmap` drop the *mapping* but not the *backing*. A guest that maps/unmaps repeatedly
-(reopen loops, many short-lived rings) grows `Host::regions` unboundedly. *Cost:* small but touches
-the capability surface — either a `SharedRegion` release op the shim calls on `munmap`, or fs-cap
-tracking that releases the backing when its last mapping goes. *Value:* fixes an actual defect in
-landed code (the most defensible remaining item).
+**G2 — mid-run region reclaim. Closed (#2358).** `FS_MAP_REGION` pushed each `FileBacking` into
+`Host::regions`, which was never freed until the run ended: `SharedRegion` had no release op, and
+`FS_MUNMAP`/`munmap` dropped the *mapping* but not the *backing*. `SharedRegion.close` (op 5) is that
+release op: the LMDB shim's `munmap` unmaps and then closes, and the backing (with its dup'd fd)
+goes with its last holder. A closed region's slot and id are reused, so a map/unmap loop holds
+neither.
 
 **G3 — non-zero `FS_MAP_REGION` file offset.** v1 requires `file_offset == 0` (all LMDB needs). A
 guest that wants to map a *window* of a large file at a non-zero offset can't. *Cost:* small — thread
@@ -302,5 +300,5 @@ just not zero-copy). *Cost:* per-OS FFI, following `SharedRegion`'s existing per
 the ring test, so this is a small completeness gap, not a hole. *Cost:* low (add `Backend::Jit` to the
 LMDB zero-copy run). *Value:* symmetry.
 
-Priority if resumed: **G2** (real defect) > **G1** (closes §4e) > **G3/G5** (cheap generality/symmetry)
+Priority if resumed: **G1** (closes §4e) > **G3/G5** (cheap generality/symmetry)
 > **G4** (portability, larger). None is urgent.
