@@ -18,7 +18,8 @@ export function engineImports(memory) {
   // to satisfy the import — a call would mean a bug, hence they throw. Kept in step with foreign-mem.js.
   const noForeign = () => { throw new Error('foreign memory access in a harness without foreign-mem.js'); };
   const foreign = Object.fromEntries(
-    ['foreign_read', 'foreign_write', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow', 'foreign_mint'].map((n) => [n, noForeign]));
+    ['foreign_read', 'foreign_write', 'foreign_load', 'foreign_store', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow',
+      'foreign_mint'].map((n) => [n, noForeign]));
   // `js_cap_call` is the JS-defined powerbox's seam (`web/powerbox.js`): one guest capability call,
   // dispatched to the function the page bound to that slot. Delegated to the same `globalThis` hook
   // the playground uses (`web/par.js`), so a harness that imports `powerbox.js` drives the real seam;

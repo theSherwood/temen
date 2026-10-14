@@ -244,6 +244,16 @@ mapping on native. So:
   (`read_bytes`) and unaffected. Acceptable for a fallback; slice 2's differential measures the
   end-to-end number on a real declined phase, and if that proves too slow for a real consumer
   the fourth answer is the escalation.
+  **Measured end to end, and cut (#2416).** On executor 2 a child's interpreted loop, one load
+  and one store per ~14 ops, ran 38% slower over its own memory than over a window in the
+  engine's (#2413). A byte or word access no longer calls JavaScript. The engine's
+  `foreign_load`/`foreign_store` imports are bound to a dispatcher instance per agent, which
+  calls a tiny accessor instance over the child's memory through its function table: a
+  wasm-to-wasm call, about 3 ns against the JS import's 28 (Chromium). In the cost gate
+  (`browser-foreign-mem-test.mjs`), a word write plus read went from ×5–7 the direct backing to
+  ×2, and a byte from ×3–4 to ×1.7. Spans, fill, copy, atomics and grow stay JS imports. Without
+  multi-memory, which the engine's Rust can't emit and Safari doesn't ship, the call between
+  instances is the floor.
   `Region::Foreign` is not flat-addressable (`raw_base_at = None`), so `tierup_servable`'s
   flat-window arm declines it — correct, since tier-up *into* the child's memory is the
   emitted run itself.

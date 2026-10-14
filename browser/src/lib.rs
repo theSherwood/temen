@@ -14576,10 +14576,13 @@ block 0 () {
 // A detached child's window on the wasm-JIT tier is its own `WebAssembly.Memory`, which this cdylib
 // cannot address (its pointers are offsets into ITS one linear memory). `temen_mem::Region::Foreign`
 // reaches such a memory through a `ForeignOps` table; here the table is the page's
-// `temen_host.foreign_*` imports (`web/foreign-mem.js`), all-`u32` (offsets are bounded by `Region`
-// first, and a child memory is < 4 GiB by wasm32 construction; atomics pass operands through a 16-byte
-// cell in this memory so no `i64`/BigInt crosses the import). Threads build only (the plain build has
-// no Workers and no detached children, and stays import-free for its Node harnesses).
+// `temen_host.foreign_*` imports (`web/foreign-mem.js`), with `u32` offsets (they are bounded by
+// `Region` first, and a child memory is < 4 GiB by wasm32 construction). A byte or word access
+// (`foreign_load`/`foreign_store`) is bound to wasm, an accessor instance over the child's memory
+// (#2416), so it calls no JavaScript and its value comes back in a register. The span copies, fill,
+// copy, atomics and grow are JS functions; atomics pass their operands through a 16-byte cell in this
+// memory, so no `i64` (a BigInt) crosses into JavaScript. Threads build only (the plain build has no
+// Workers and no detached children, and stays import-free for its Node harnesses).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 mod foreign_mem {
     use temen_mem::ForeignOps;
@@ -14588,6 +14591,8 @@ mod foreign_mem {
     extern "C" {
         fn foreign_read(id: u32, off: u32, dst: *mut u8, len: u32);
         fn foreign_write(id: u32, off: u32, src: *const u8, len: u32);
+        fn foreign_load(id: u32, off: u32, width: u32) -> i64;
+        fn foreign_store(id: u32, off: u32, width: u32, val: i64);
         fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
         fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
         fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
@@ -14614,6 +14619,14 @@ mod foreign_mem {
     fn write(id: u32, off: u64, data: &[u8]) {
         // SAFETY: `data` is a live cdylib buffer; JS reads exactly `data.len()` bytes from it.
         unsafe { foreign_write(id, off as u32, data.as_ptr(), data.len() as u32) }
+    }
+    fn load(id: u32, off: u64, width: u32) -> u64 {
+        // SAFETY: no cdylib memory is touched; the word comes back in a register.
+        unsafe { foreign_load(id, off as u32, width) as u64 }
+    }
+    fn store(id: u32, off: u64, width: u32, val: u64) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_store(id, off as u32, width, val as i64) }
     }
     fn fill(id: u32, off: u64, len: u64, b: u8) {
         // SAFETY: no cdylib memory is touched.
@@ -14642,6 +14655,8 @@ mod foreign_mem {
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
+        load,
+        store,
         fill,
         copy_within,
         atomic,
