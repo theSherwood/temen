@@ -29537,20 +29537,6 @@ impl Host {
         self.grant_module_inner(m, false)
     }
 
-    /// The two **by-name grants a detached spawn needs** beyond `"instantiator"` itself, so a guest
-    /// can reach `Instantiator` op 15 from a plain powerbox: `"module"` — a `Module` handle for the
-    /// **running module**, letting a program spawn one of its own functions as the child (a child
-    /// that is a *different* module is a host grant, as the shell's PATH registry); and `"budget"`
-    /// — the detached-window allowance, `win` bytes of `Budget.mem` (a detached window is minted
-    /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
-    /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
-    /// them beside `"instantiator"` — one frontier (INVARIANTS #14) — to a guest that can spawn
-    /// detached ([`temen_ir::spawns_detached`]): least authority, and the `"module"` grant is
-    /// non-durable, so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
-    /// stays a subset of the guest's own reach: the child runs this guest's code, on this budget.
-    ///
-    /// Requires [`Host::set_self_module`] first (both powerboxes register the running module before
-    /// granting anything); with no running module registered, nothing is granted.
     /// [`temen_ir::spawns_detached`] over the running module ([`Host::set_self_module`]); `false`
     /// with none registered.
     pub fn self_module_spawns_detached(&self) -> bool {

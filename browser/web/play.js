@@ -4708,7 +4708,7 @@ async function startDebug(c) {
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
   // output streams back as `output` events instead of trapping; so does an `onramp`-recipe Temen card,
-  // which resolves its powerbox by name (`instantiator`/`module`/`budget`, #1528) exactly as its Run
+  // which resolves its powerbox by name (`instantiator`/`budget`/`child`, #1528) exactly as its Run
   // does. Every other hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
   if (c.ex.kind === 'chibicc' || c.ex.mode === 'onramp') launchArgs.powerbox = 'onramp';
@@ -4859,7 +4859,7 @@ async function runText(c) {
 
   // The `onramp` recipe: the same single-threaded host the pre-built C/C++ cards run on
   // (`temen_run_onramp`) — a `_start` that resolves its powerbox **by name** (`self.resolve`), the
-  // named `instantiator`/`module`/`budget` grants a detached spawn needs, and a stdout pane. No
+  // named `instantiator`/`budget`/`child` grants a detached spawn needs, and a stdout pane. No
   // Workers: a pre-mapped SharedRegion aliases the parent's pages into the child's window, which
   // has no analogue across separate `WebAssembly.Memory`s (the par driver refuses it, by design).
   if (mode === 'onramp') {

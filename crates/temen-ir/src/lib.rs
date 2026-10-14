@@ -3918,9 +3918,8 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 15` in any function
 /// (the only spelling — an executor op reaches its seam through a static `call.cap`, never a
 /// manifest-bound `call.sym`; chibicc's `__vm_instantiate_detached` emits exactly that). The two
-/// reference powerboxes grant the by-name spawn set (`"module"`, `"budget"`) **only** to such a
-/// guest — least authority, and the `"module"` grant is non-durable, so a guest that never spawns
-/// keeps a powerbox a warm snapshot can freeze.
+/// reference powerboxes grant the by-name spawn set (`"budget"`, and `"child"` for a program that
+/// exports `_child`) **only** to such a guest: least authority.
 pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
