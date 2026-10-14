@@ -2555,7 +2555,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
 
     const REC: u64 = 80 * 1024; // 5 * 16 KiB — in the reserved tail (prefix 64 KiB), page-aligned
                                 // The record's words as stores: the page is grown at run time, so no data segment can hold it.
-    let words: String = temen_ir::SpawnRec::v1(0)
+    let words: String = temen_ir::SpawnRec::v1()
         .encode()
         .chunks(8)
         .enumerate()

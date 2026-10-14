@@ -1,6 +1,6 @@
 //! **Run a no-C-built nimony phase over real work, and diff it against native** (#1599, #763).
 //!
-//! The phase is a `.temen` built by `build_nim_hello_temen --posix` — nimony → Leng → `temen-leng`,
+//! The phase is a `.temen` built by `build_nim_temen --posix` — nimony → Leng → `temen-leng`,
 //! with **no C compiler anywhere**. Its retained syscall imports bind to one `temen_posix`
 //! personality over an in-memory filesystem seeded with the nimony stdlib and a `nimcache`.
 //!

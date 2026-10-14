@@ -35,7 +35,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    smod, slog, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged, childMem, ticket, start, seedLen } = e.data;
   // Liveness backstop. The `temen_par_run` loop below already catches host traps, but not the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
@@ -66,9 +66,11 @@ self.onmessage = async (e) => {
   const x2_now_ms = () => performance.timeOrigin + performance.now();
   // The thread's emitted tier (#1414 B6-3): the coop driver's (`emittedTier`), over the run's
   // dispatch table as `temen_x2_*` reads it during a call — made at the thread's first call, with the
-  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set and
-  // writes its results at `out`, returning how many, or -(1 + the code the emitted code trapped
-  // with). The emitted code runs on a slice of fuel: each time it spends one it asks for another,
+  // run's tier-up module as its program. A call runs `f(win, env, ...argv)` with `"mapped"` set (and,
+  // on a page-checked tier, `"pagestate"` at its thread's page-state table) and writes its results at
+  // `out`, returning how many, or -(1 + the code the emitted code trapped with). On a spilling tier
+  // its frames push to the thread's spill stack, which lives as long as the thread. The emitted code
+  // runs on a slice of fuel: each time it spends one it asks for another,
   // which it gets unless the run's `over` byte is set, so a run that ends while this thread is in
   // emitted code stops it within a slice. The emitted tier is not metered: the slice is only how
   // often it looks.
@@ -91,15 +93,15 @@ self.onmessage = async (e) => {
         slotUnit: (slot) => ex.temen_x2_slot_unit(slot),
         slotUnitBytes: (slot) => x2Bytes(ex.temen_x2_slot_wasm_len(slot)),
         shimBytes: (slot) => x2Bytes(ex.temen_x2_shim_len(slot)),
-        callInterp: (target, argsPtr) => ex.temen_x2_call_interp(target, argsPtr),
-        paged: () => 0,
+        callInterp: (target, argsPtr, spillLen) => ex.temen_x2_call_interp(target, argsPtr, spillLen),
+        paged: () => ex.temen_x2_paged(),
         mapped: () => x2Mapped,
         mappedNow: () => ex.temen_x2_mapped_now(),
-        pagestatePtr: () => 0,
+        pagestatePtr: () => ex.temen_x2_pagestate_ptr(),
         winPtr: () => x2Win,
         deliverFaultAddr: () => {},
-        spillBytes: () => 0,
-        spillPtr: () => 0,
+        spillBytes: () => ex.temen_x2_spill_bytes(),
+        spillPtr: () => ex.temen_x2_spill_ptr(),
         fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
       });
       const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
@@ -110,6 +112,10 @@ self.onmessage = async (e) => {
     }
     x2Tier.syncTableSync();
     for (const g of x2Tier.mappedGlobals) g.value = mapped;
+    if (ex.temen_x2_paged()) {
+      const ps = Number(ex.temen_x2_pagestate_ptr());
+      for (const g of x2Tier.pagestateGlobals) g.value = ps;
+    }
     for (const g of x2Tier.fuelGlobals) g.value = X2_SLICE;
     x2Tier.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
@@ -202,14 +208,15 @@ self.onmessage = async (e) => {
   let fi32v = new Int32Array(fmem.buffer);
   const fi32 = () => fi32v.byteLength === fmem.buffer.byteLength ? fi32v : (fi32v = new Int32Array(fmem.buffer));
 
-  // Start a §5 detached child the engine admitted (ticket `t`, window `1 << cslog`, `am` =
-  // `(module << 32) | entry`): mint it a fresh shared Memory — one host header page (env cell,
-  // page-state, DETACHED_JIT.md §3.1) + the declared window, growable in place to the detached
-  // ceiling — and post it with the ticket to a new Worker, which starts the child over it; the engine
-  // seeds it there. A shared Memory posts by reference. Returns the child's completion slot. Used for
-  // an interpreted spawn (`PAR_INSTANTIATE_DETACHED`) and one from emitted code (`env.instantiate_rec`).
+  // Start a §5 detached child the engine admitted (ticket `t`, window `1 << cslog`, `am` = its
+  // module, non-zero for a child of the granted unit): mint it a fresh shared Memory — one host
+  // header page (env cell, page-state, DETACHED_JIT.md §3.1) + the declared window, growable in
+  // place to the detached ceiling — and post it with the ticket to a new Worker, which starts the
+  // child over it; the engine seeds it there. A shared Memory posts by reference. Returns the
+  // child's completion slot. Used for an interpreted spawn (`PAR_INSTANTIATE_DETACHED`) and one
+  // from emitted code (`env.instantiate_rec`).
   const postDetached = (t, cslog, am) => {
-    const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+    const csmod = Number(am);
     const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
     const cmem = new WebAssembly.Memory({
       initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
@@ -223,7 +230,7 @@ self.onmessage = async (e) => {
     // it binds the engine memory (a child of the granted unit runs that unit's emit instead).
     self.postMessage({
       kind: 'spawn', role: 'detached', ticket: t.toString(), childMem: cmem, slog: cslog,
-      smod: csmod, entry: centry, win: 0, winSize: 2 ** cslog, tierup: false,
+      smod: csmod, win: 0, winSize: 2 ** cslog, tierup: false,
       slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
     });
     return cslot;
@@ -394,11 +401,12 @@ self.onmessage = async (e) => {
   };
 
   // §14 instantiate real codegen (BROWSER.md slice 5, detached #1865): a §5 detached child of the
-  // granted unit whose entry is eligible runs it on EMITTED WASM here and fills the completion slot
-  // its parent joins. The emit binds the child's OWN `WebAssembly.Memory` (`childMem`; the unit's
-  // `min 0 / max 65536, shared` memory import binds any shared memory): its window starts one header
-  // page in (`fbase`) and its env cell sits at the bottom of that header. The engine sent `smod ≠ 0`
-  // only for a child that runs the granted unit (a child of any other module stays interpreted).
+  // granted unit whose entry, its function 0, is eligible runs it on EMITTED WASM here and fills
+  // the completion slot its parent joins. The emit binds the child's OWN `WebAssembly.Memory`
+  // (`childMem`; the unit's `min 0 / max 65536, shared` memory import binds any shared memory): its
+  // window starts one header page in (`fbase`) and its env cell sits at the bottom of that header.
+  // The engine sent `smod ≠ 0` only for a child that runs the granted unit (a child of any other
+  // module stays interpreted).
   //
   // The child vCPU is built anyway — never `temen_par_run` — to service every `env.call_interp` leaf
   // with the child's OWN powerbox (`temen_par_inst_call_interp` → `bounce_call`), so a leaf may store,
@@ -410,7 +418,7 @@ self.onmessage = async (e) => {
   // grandchildren (`env.instantiate_rec`), its threads run over the same child memory, and a carve
   // spawn traps, as the interpreter's detached vCPU does.
   if (role === 'detached' && smod !== 0 && instCodegen
-      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible(entry) === 1) {
+      && ex.temen_par_enable_inst_codegen() === 1 && ex.temen_par_inst_eligible() === 1) {
     const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
     const envBytes = ex.temen_wasmjit_env_bytes();
@@ -547,7 +555,7 @@ self.onmessage = async (e) => {
     for (let i = 0; i < nargs; i++) args.push(i64()[(aptr >> 3) + i]);
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
     try {
-      const ret = uinst.exports['f' + entry](fbase, envCell, ...args);
+      const ret = uinst.exports.f0(fbase, envCell, ...args); // a child starts at its function 0
       i64()[(slot + 8) >> 3] = BigInt(ret); // publish result...
       Atomics.store(i32(), slot >> 2, 1); // ...set done flag...
       Atomics.notify(i32(), slot >> 2); // ...and wake the joiner

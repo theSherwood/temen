@@ -7,6 +7,7 @@
 //   node browser-play-editor-test.mjs
 import { startServer } from './serve.mjs';
 import { benignAssetMiss } from './play-test-errors.mjs';
+import { NIM_PROGRAMS } from './web/nim-programs.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -192,20 +193,6 @@ try {
     console.log('  SKIP: MicroPython card (micropython_repl.temen not built)');
   }
 
-  // The "run real Nim" card: runs the committed nim_hello.temen — a real Nim program
-  // (`write(stdout, "hello, temen\n")`) compiled through nimony → temen-leng → the nim→powerbox bridge to a
-  // runnable module — and shows its **real stdout**, a Nim program printing on the Temen, client-side.
-  // The asset is committed (always present), so no build guard.
-  const nimCard = 'nim (Nim → Temen, runs)';
-  await runCard(page, nimCard, 30_000);
-  const nim = await page.evaluate((sel) => ({
-    state: document.querySelector(`${sel} .state`).dataset.state,
-    stdout: document.querySelector(`${sel} .stdout`).textContent,
-  }), card(nimCard));
-  nim.state === 'done' && nim.stdout.includes('hello, temen')
-    ? ok('run-real-Nim card: nim_hello.temen printed its greeting in-browser')
-    : fail(`nim run: state=${nim.state} stdout=${nim.stdout.slice(0, 80)}`);
-
   // The temen-leng self-host card (NIM.md §3e): its editor is pre-filled with a real hexer Leng file, and
   // running it pipes that to the committed `temen-leng.temen` (always present) on stdin — the translator
   // emits Temen IR text on stdout and exits 0. The IR carries `func`/`block` (temen-text), proving the real
@@ -252,7 +239,7 @@ try {
   // compiler, nimony's library and that library prebuilt) builds the editor's program **client-side**
   // and runs it, in one POSIX process tree. Assert the editor holds the default program and the run
   // prints its real stdout. A whole build per Run, so a generous timeout.
-  const nimcCard = 'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)';
+  const nimcCard = 'nim: compile & run a Nim program (nimony, in your browser)';
   const nimcSrc = await page.evaluate(
     (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(),
     card(nimcCard),
@@ -261,6 +248,21 @@ try {
     nimcSrc.includes('echo greet')
     ? ok('nim compiler card → editor holds a whole Nim program')
     : fail(`nim compiler editor: ${nimcSrc.slice(0, 80)}`);
+  // The card's dropdown (#2374) lists every program in `nim-programs.js`, and picking one loads it into
+  // the editor. Pick the Threads program, then Hello again, the default the run below builds.
+  // (`browser-nim-card-tierup-test.mjs` builds and runs every program.)
+  const pick = (name) => page.selectOption(`${card(nimcCard)} select.program`, name);
+  const editorSrc = () => page.evaluate(
+    (sel) => document.querySelector(`${sel} .CodeMirror`).CodeMirror.getValue(), card(nimcCard));
+  const listed = await page.$$eval(`${card(nimcCard)} select.program option`, (os) => os.map((o) => o.value));
+  await pick('Threads');
+  const threadsSrc = await editorSrc();
+  await pick('Hello');
+  const helloSrc = await editorSrc();
+  JSON.stringify(listed) === JSON.stringify(NIM_PROGRAMS.map((p) => p.name)) &&
+    threadsSrc === NIM_PROGRAMS.find((p) => p.name === 'Threads').src && helloSrc === NIM_PROGRAMS[0].src
+    ? ok(`nim compiler card → its dropdown lists ${listed.length} programs and loads the picked one`)
+    : fail(`nim dropdown: listed=${JSON.stringify(listed)} threads=${threadsSrc.slice(0, 60)}`);
   await runCard(page, nimcCard, 180_000);
   const nimc = await page.evaluate((sel) => ({
     state: document.querySelector(`${sel} .state`).dataset.state,

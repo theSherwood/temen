@@ -11,6 +11,7 @@ import {
   runJitModule, runWarmCoop, runJitCompiler, runJitSelfhost, nimToolchain, nimCompileRun,
 } from './wasmjit-module.js';
 import { SnapshotClient } from './snapshot-client.js';
+import { NIM_PROGRAMS } from './nim-programs.js';
 import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
@@ -335,11 +336,11 @@ block 0 (v0: i32, vbud: i32) {
   vcn = i64.const 16384
   vcl = i64.const 5
   vchild = self.resolve vcn vcl         ; this program's child image, by name
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
   ; Everything else — offset, quota, grants, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
@@ -456,11 +457,11 @@ block 0 () {
   i32.store vg1 vln
   vg2 = i64.const 17544
   i32.store vg2 vout
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | entry
+  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
   ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
   ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, entry 0
+  vf0 = i64.const 1                     ; version 1, reserved 0
   i64.store vr0 vf0
   vr2 = i64.const 17424
   vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
@@ -1397,21 +1398,7 @@ int main(void) {
       '(gated in CI). On the wasm-JIT even the 3400-line giants compile in a few hundred milliseconds; ' +
       '“Prove interp ≡ JIT” recompiles on both engines and checks the objects match to the byte.',
   },
-  'nim (Nim → Temen, runs)': {
-    kind: 'module',
-    url: './assets/nim_hello.temen',
-    mode: 'io',
-    desc: "A **real Nim program** — `import std/syncio` / `write(stdout, \"hello, temen\\n\")` — compiled " +
-      "all the way to a runnable Temen module and **run client-side in the sandbox**. The full nimony " +
-      "toolchain (nifler → nimony → hexer) lowered the Nim to Leng, `temen-leng` translated + linked it " +
-      "against the real compiled `system` module on Nim's **capability edge**, which gives the program " +
-      "the sandbox's streams and exit and nothing else (nimony's `write(1, buf, len)` → the powerbox " +
-      "stdout stream). Click Run: the " +
-      "output below is the guest's **real stdout** — a Nim program printing on the Temen. (The Nim→Leng " +
-      "front end runs at build time for now, unlike the `temen-leng` card below, which runs the translator " +
-      "itself in your browser; committed `nim_hello.temen`, gated by `nim_hello_asset.rs`.)",
-  },
-  'nim: compile & run a whole Nim program → Temen (the full toolchain, in your browser)': {
+  'nim: compile & run a Nim program (nimony, in your browser)': {
     kind: 'nimc',
     editable: true,
     lang: 'nim',
@@ -1419,34 +1406,22 @@ int main(void) {
     // nimony's own toolchain, each tool built by nimony with no C compiler (`scripts/nim-toolchain.sh`),
     // with nimony's library and that library prebuilt: one gzipped registry blob (`nimbuild --bundle`).
     url: './assets/nimony.blob.gz',
-    desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Click " +
-      "Run and `nimony t -r --isMain prog.nim` builds your program the way it does on a host, then runs " +
-      "it: nimony plans the build and nifmake runs every step through `/bin/sh` — `nifler2` parses each " +
-      "module, `nimsem` checks it (and builds and runs a program of its own for anything evaluated at " +
-      "compile time), `hexer` lowers it, and `temen-link` links the whole program into one Temen module. " +
-      "Every tool is a verified Temen module that **nimony built from its own source, " +
-      "with no C compiler**; they fork, exec and wait on each other in one sandboxed process tree over " +
-      "an in-memory filesystem. The tree runs on the interpreter, while the processes that only compute " +
-      "(the parser, the lowering, your program) run on emitted wasm — suspended by JSPI where one waits " +
-      "on a pipe. Most of the standard library comes prebuilt (`strutils`, `sequtils`, `tables`, `sets`, " +
-      "`math`, `options`, …), so a build compiles only your own modules. The output below is your " +
-      "program's real stdout. (The toolchain ships as one ~5 MB gzipped asset and inflates in-browser.)",
-    src: `# Edit this Nim, then Run. nimony's own toolchain compiles it in your browser —
-# nifler2 (parse) -> nimsem (check) -> hexer (lower) -> temen-link — and the
-# result runs on the Temen. The text below is your program's real stdout.
-import std/[syncio, strutils]
-
-proc greet(name: string): string =
-  "hello, " & name
-
-var words = 0
-for word in "the quick brown fox jumps over the lazy dog".split(' '):
-  inc words
-
-echo greet("Nim")
-echo "words: ", words
-echo toUpperAscii("temen")
-`,
+    // The dropdown (`nim-programs.js`): picking one loads it into the editor (#2374).
+    programs: NIM_PROGRAMS,
+    desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Pick " +
+      "a program, or write your own, and click Run: `nimony t -r --isMain prog.nim` builds it the way it " +
+      "does on a host, then runs it. nimony plans the build and nifmake runs every step through " +
+      "`/bin/sh`: `nifler2` parses each module, `nimsem` checks it (and builds and runs a program of its " +
+      "own for a macro, or for anything evaluated at compile time), `hexer` lowers it, and `temen-link` " +
+      "links the whole program into one Temen module. Every tool is a verified Temen module that " +
+      "**nimony built from its own source, with no C compiler**; they fork, exec and wait on each other " +
+      "in one sandboxed process tree over an in-memory filesystem. The tree runs on the interpreter, " +
+      "while the processes that only compute (the parser, the lowering, and your program unless it " +
+      "starts threads) run on emitted wasm, suspended by JSPI where one waits on a pipe. Your program " +
+      "can start threads and processes of its own: all of them run on this card's one Worker, taking " +
+      "turns. Most of the standard library comes prebuilt (`strutils`, `tables`, `json`, `macros`, " +
+      "`osproc`, `rawthreads`, …), so a build compiles only your own modules. The output below is your " +
+      "program's real stdout. (The toolchain ships as one gzipped asset and inflates in-browser.)",
   },
   'temen-leng: translate real nimony Leng → Temen IR (self-host)': {
     kind: 'module',
@@ -4708,7 +4683,7 @@ async function startDebug(c) {
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
   // output streams back as `output` events instead of trapping; so does an `onramp`-recipe Temen card,
-  // which resolves its powerbox by name (`instantiator`/`module`/`budget`, #1528) exactly as its Run
+  // which resolves its powerbox by name (`instantiator`/`budget`/`child`, #1528) exactly as its Run
   // does. Every other hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
   if (c.ex.kind === 'chibicc' || c.ex.mode === 'onramp') launchArgs.powerbox = 'onramp';
@@ -4859,7 +4834,7 @@ async function runText(c) {
 
   // The `onramp` recipe: the same single-threaded host the pre-built C/C++ cards run on
   // (`temen_run_onramp`) — a `_start` that resolves its powerbox **by name** (`self.resolve`), the
-  // named `instantiator`/`module`/`budget` grants a detached spawn needs, and a stdout pane. No
+  // named `instantiator`/`budget`/`child` grants a detached spawn needs, and a stdout pane. No
   // Workers: a pre-mapped SharedRegion aliases the parent's pages into the child's window, which
   // has no analogue across separate `WebAssembly.Memory`s (the par driver refuses it, by design).
   if (mode === 'onramp') {
@@ -5074,7 +5049,11 @@ function buildCard(name, ex) {
   // Temen text (no `kind`) and editable modules (Lua/SQL/Postgres) get an editor; a fixed C guest or a
   // reactor gets a lightweight read-only note (its "source" is a pre-built binary).
   const editable = !ex.kind || !!ex.editable;
-  const dflt = ex.src || '';
+  // A card with a dropdown of programs (`ex.programs`, the Nim card's): the picked program is the
+  // editor's default source, so Reset restores it, and the pick persists as an edit does.
+  const programs = ex.programs || null;
+  let program = programs && (programs.find((p) => p.name === loadSaved(id + ':program')) || programs[0]);
+  let dflt = program ? program.src : (ex.src || '');
   let editor = null;
   if (editable) {
     const ta = el('textarea');
@@ -5149,6 +5128,15 @@ function buildCard(name, ex) {
     }
     const l = el('label', null, 'translation unit ');
     l.appendChild(tuSel);
+    controls.appendChild(l);
+  }
+  let progSel = null;
+  if (programs) {
+    progSel = el('select', 'program');
+    for (const p of programs) progSel.appendChild(el('option', null, p.name));
+    progSel.value = program.name;
+    const l = el('label', null, 'program ');
+    l.appendChild(progSel);
     controls.appendChild(l);
   }
   const runBtn = el('button', 'run', 'Run');
@@ -5453,6 +5441,16 @@ function buildCard(name, ex) {
     const prove = c.ex.kind === 'chibicc' ? proveChibiccParity : c.ex.kind === 'selfhost' ? proveSelfhostParity : c.ex.kind === 'module' ? proveModuleParity : proveParity;
     proveBtn.addEventListener('click', () => prove(c));
   }
+  // Picking a program replaces the editor's contents with it, as Reset would.
+  if (progSel) progSel.addEventListener('change', () => {
+    program = programs.find((p) => p.name === progSel.value);
+    dflt = program.src;
+    editor.setValue(dflt);
+    clearSaved(id);
+    saveSrc(id + ':program', program.name, programs[0].name);
+    editor.clearError();
+    setState(c, 'ready', `loaded the ${program.name} program`);
+  });
   if (resetBtn) resetBtn.addEventListener('click', () => {
     editor.setValue(dflt);
     clearSaved(id);

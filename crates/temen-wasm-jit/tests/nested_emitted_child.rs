@@ -59,10 +59,7 @@ struct HostState {
 /// window at [`WIN_BASE`] (its emitted `"mapped"` self-inits to that window), with its own copy of the
 /// nested imports. Bank its result under a dense handle and return that handle. Nothing of the
 /// parent's memory is reachable from it.
-fn spawn_detached_child(
-    caller: &mut Caller<'_, HostState>,
-    entry: u32,
-) -> Result<i32, wasmi::Error> {
+fn spawn_detached_child(caller: &mut Caller<'_, HostState>) -> Result<i32, wasmi::Error> {
     let st = caller.data();
     let module = st.child_module.clone().expect("child module emitted");
     let declared = st
@@ -84,7 +81,7 @@ fn spawn_detached_child(
         .instantiate(&mut *caller, &module)?
         .start(&mut *caller)?;
     let f = inst
-        .get_func(&*caller, &format!("f{entry}"))
+        .get_func(&*caller, "f0") // a child starts at its function 0 (#2219)
         .expect("child entry export");
     let mut r = [Val::I64(0)];
     f.call(
@@ -148,7 +145,7 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
                 let st = caller.data_mut();
                 st.saw_emit = true;
                 st.saw_module = true;
-                spawn_detached_child(&mut caller, rec.entry)
+                spawn_detached_child(&mut caller)
             },
         )
         .unwrap();
@@ -387,7 +384,7 @@ const REC_AT: u64 = 18432;
 /// the child's result plus its own byte 16392. [`CHILD_ABOVE_GUARD`] stores `55` at *its* 16392 and
 /// returns it, so a child that ran in the parent's window would make this `110`, not `62`.
 fn parent_op17() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
     let modh_at = REC_AT + 24;
     format!(
         r#"memory 16

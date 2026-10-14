@@ -769,7 +769,7 @@ them to a `temen_posix` personality: files, processes, pipes and a working direc
 host. nimony's own build links there (`temen-link`). The **capability edge** gives a program the host's
 streams for fd 0, 1 and 2 and its `exit`, and nothing ambient: files, processes and the environment
 fail closed on the shim's stubs, so nim raises `IOError` or `OSError`. It is for a host with no
-POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it; `nim_hello` is its demo.
+POSIX, such as a capability OS, and `temen-link --edge:caps` builds for it.
 The two share the compute shim, the heap hook and the guest libc, whose streams and exit each edge
 serves. The corpus runs every case on both.
 
@@ -955,8 +955,8 @@ start a thread?** A nim program gets a second vCPU in its window only through th
 
 **It cannot: a `tvar` is a plain global.** A program with one thread has one instance of each
 thread-local, so a global *is* it. This is every program that does not import `std/rawthreads`,
-directly or through `std/threadpool` or `std/parfor`: nimony's own tools and the nim card's programs
-among them. They pay nothing for threads.
+directly or through `std/threadpool` or `std/parfor`: nimony's own tools among them, and every program
+in the nim card's dropdown but Threads. They pay nothing for threads.
 
 **It can: a `tvar` is a thread-local in the IR's sense** (#1715), the class C's `_Thread_local`
 uses:

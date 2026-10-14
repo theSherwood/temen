@@ -2,7 +2,7 @@
 # Rebuild **every committed `.temen` playground/self-host asset** in one pass — the single entry point
 # for the "a wire-format / encoder / IR change invalidated the prebuilt binary assets" chore (which
 # recurs on every such change: the committed modules decode as `BadOpcode` under the new format and
-# their asset-gate tests — leng_selfhost_asset, nim_hello_asset, browser/tests/nimony.rs, and the
+# their asset-gate tests — leng_selfhost_asset, browser/tests/nimony.rs, and the
 # real-browser play cards — go red until regenerated).
 #
 # This orchestrates the existing per-asset builders (it does NOT reimplement them) and, crucially,
@@ -16,13 +16,13 @@
 # (decode → verify → bytecode-compile) via `prep_temen`. A final summary lists ✓ / SKIP / ✗.
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
-#           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_hello
-#           nim_card lua_snapshot
+#           ONLY=leng,nim_card bash scripts/...         # rebuild a subset (comma-separated step names)
+#   Steps:  leng chibicc pg_libc pg_heap coop_grow onramp shell coreutils forth uxn nim_card
+#           lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp/pg_heap need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
-# in-tree chibicc; nim_hello & nim_card need the nimony toolchain (Nim + nimony/bin, as
+# in-tree chibicc; nim_card needs the nimony toolchain (Nim + nimony/bin, as
 # scripts/ci/provision-nimony.sh builds it).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -191,18 +191,6 @@ if want uxn; then
   fi
 fi
 
-# --- 5) nim_hello.temen (nimony → temen-leng powerbox bridge) ----------------------------------------
-if want nim_hello; then
-  echo "=== [nim_hello] build_nim_hello_temen example ==="
-  if cargo run --release -p temen-run --example build_nim_hello_temen -- \
-       crates/temen-run/demos/nim_hello/hello.nim browser/web/assets/nim_hello.temen; then
-    validate browser/web/assets/nim_hello.temen \
-      && note "nim_hello ✓" || note "nim_hello ✗ (rebuilt but failed re-validate)"
-  else
-    note "nim_hello SKIP/✗ (NIMONY_BIN/NIM_BIN + nimony/bin/nimony?)"
-  fi
-fi
-
 # --- 6) nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
 # no C compiler (scripts/nim-toolchain.sh — the self-hosted lane's), with nimony's library and that
 # library prebuilt. `nimbuild --bundle` builds the program below with them at `/nim`, where the card
@@ -216,10 +204,11 @@ if want nim_card; then
   # modules; the `const` makes compile-time evaluation build its helper too. `std/macros` brings the
   # plugins its grammar declares (parsegen, regex), which the pack carries built, so a program's
   # macro builds only its own plugin, in the program's cache (#2049). `std/json` costs the pack
-  # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070).
+  # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070). `rawthreads`, `osproc`
+  # and `cmdline` are what the card's Threads and Processes programs import (#2374).
   cat >"$T/card/prelude.nim" <<'NIM'
 import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
-  parseutils, bitops, intsets, macros, json]
+  parseutils, bitops, intsets, macros, json, rawthreads, osproc, cmdline]
 
 proc prelude(s: string): int = s.len
 const atCompileTime = prelude("prebuilt")

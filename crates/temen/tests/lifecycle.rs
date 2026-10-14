@@ -25,9 +25,10 @@ use temen_verify::verify_module;
 /// `src` with its spawn record (at 20480), and a host for it: the guest's three args, an
 /// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
 /// The host also holds a 64 KiB `SharedRegion` the guest can resolve as `"region"`, over an OS
-/// shared-memory object so the JIT can alias it into a child's window.
+/// shared-memory object so the JIT can alias it into a child's window, and a stdout stream it can
+/// resolve as `"out"`, a cap it may grant into a child.
 fn setup(src: &str) -> (Module, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1(0)));
+    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();
@@ -36,6 +37,8 @@ fn setup(src: &str) -> (Module, Host, [i32; 3]) {
     let region =
         h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10).expect("a region"));
     h.register_cap_name("region", region);
+    let out = h.grant_stream(temen_interp::StreamRole::Out);
+    h.register_cap_name("out", out);
     let ch = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     (m, h, [ih, bh, ch])
 }
@@ -394,5 +397,137 @@ fn jit_poll_observes_a_concurrently_running_child() {
         "jit: the first poll must see the child still running (0) — proof it runs concurrently on its \
          own thread (async); got {jo:?} (11 would mean the child ran synchronously before instantiate \
          returned)"
+    );
+}
+
+// ---- #2378: a spent or forged child handle gets the oracle's answer on the JIT ------------------
+
+/// A root that spawns three children (func 1, each returning 7: handles 0, 1 and 2), resolves its
+/// `"out"` stream as `vout`, then runs `ops`, which leaves its answer in `vr`.
+fn three_children(ops: &str) -> String {
+    format!(
+        "memory 17
+data 24000 \"out\"
+func (i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vb: i32, vmod: i32) {{
+  vrb = i64.const 20508
+  i32.store vrb vb
+  vrm = i64.const 20504
+  i32.store vrm vmod
+  vrp = i64.const 20480
+  vh0 = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vh1 = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vh2 = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vop = i64.const 24000
+  vol = i64.const 3
+  vout = self.resolve vop vol
+{ops}
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vci: i64) {{
+  vseven = i64.const 7
+  return vseven
+  }}
+}}
+"
+    )
+}
+
+/// `src` on both engines, as one result shape.
+fn both(src: &str) -> [Result<Vec<i64>, temen_interp::Trap>; 2] {
+    let interp = run_interp(src).map(|v| {
+        v.into_iter()
+            .map(|x| match x {
+                Value::I64(x) => x,
+                other => panic!("an i64 result, got {other:?}"),
+            })
+            .collect()
+    });
+    let jit = match run_jit(src) {
+        JitOutcome::Returned(v) => Ok(v),
+        JitOutcome::Trapped(k) => {
+            Err(temen_interp::Trap::from_code(k as i64).expect("a trap code"))
+        }
+        other => panic!("the JIT run ended as {other:?}"),
+    };
+    [interp, jit]
+}
+
+/// Every child op resolves a handle by the join's rule (`temen_ir::handle_slot`): child 0 spent by a
+/// join or a detach, a negative handle, and 3, past the table (the span is 4, and slot 3 was never
+/// issued). `join`, `poll`, `detach` and `kill` trap `ThreadFault`; `child_offer` and `grant` answer
+/// `-EINVAL`. The JIT trapped `CapFault` on a bad `poll` or `detach`, and killed a joined child.
+#[test]
+fn a_spent_or_forged_handle_gets_the_oracles_answer_on_the_jit() {
+    use temen_interp::Trap;
+    let spend = [
+        (
+            "joined",
+            "  vs0, vv0 = call.cap 6 1 (i32) -> (i64, i64) vinst (vh0)\n  vbad = i32.const 0\n",
+        ),
+        (
+            "detached",
+            "  vd0 = call.cap 6 10 (i32) -> (i32) vinst (vh0)\n  vbad = i32.const 0\n",
+        ),
+        ("negative", "  vbad = i32.const -1\n"),
+        ("past the table", "  vbad = i32.const 3\n"),
+    ];
+    let fault = Err(Trap::ThreadFault);
+    let einval = Ok(vec![temen_ir::errno::EINVAL]);
+    let ops = [
+        ("join", "  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vbad)\n", &fault),
+        ("poll", "  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
+        ("detach", "  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
+        ("kill", "  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n  vr = i64.extend_i32_s vo\n", &fault),
+        (
+            "child_offer",
+            "  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vinst (vbad, vx)\n  vr = i64.extend_i32_s vo\n",
+            &einval,
+        ),
+        (
+            "grant",
+            "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n  vr = i64.extend_i32_s vo\n",
+            &einval,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (handle, prelude) in spend {
+        for (op, call, want) in &ops {
+            let got = both(&three_children(&format!("{prelude}{call}")));
+            if got.iter().any(|g| g != *want) {
+                wrong.push(format!(
+                    "{op} on a {handle} handle: interp {:?}, JIT {:?}",
+                    got[0], got[1]
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "want the oracle's answer:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A handle past the table that the mask folds onto a live child names that child on the JIT too:
+/// `join(5)` joins child 1, and `detach(5)` detaches it, so child 1's own handle is spent after.
+#[test]
+fn a_masked_handle_names_the_same_child_on_the_jit() {
+    let joined = both(&three_children(
+        "  vn = i32.const 5\n  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vn)\n",
+    ));
+    assert_eq!(joined, [Ok(vec![7]), Ok(vec![7])], "join(5) joins child 1");
+    let detached = both(&three_children(
+        "  vn = i32.const 5\n  vd = call.cap 6 10 (i32) -> (i32) vinst (vn)\n  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh1)\n",
+    ));
+    assert_eq!(
+        detached,
+        [
+            Err(temen_interp::Trap::ThreadFault),
+            Err(temen_interp::Trap::ThreadFault)
+        ],
+        "detach(5) detaches child 1"
     );
 }

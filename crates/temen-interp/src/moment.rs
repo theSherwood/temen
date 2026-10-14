@@ -103,7 +103,8 @@ pub enum Refusal {
     Durable,
     /// A task is inside a §22 `Jit.invoke`, or the guest has installed units.
     Invoke,
-    /// A live detached child's powerbox is not plain values, so it cannot be rebuilt.
+    /// A live detached child's powerbox holds a binding other than plain values and module grants,
+    /// so it cannot be rebuilt.
     ChildPowerbox,
 }
 

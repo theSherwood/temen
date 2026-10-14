@@ -766,9 +766,10 @@ impl Compiled {
 pub struct SharedSlots {
     slots: Box<[std::sync::atomic::AtomicU64]>,
     /// The modules this domain's `Jit.install`s put in the source, each with its unit's `(table,
-    /// unit)` on the domain's host ([`super::Host::resolve_jit_code`]). A frame of one reports it when
-    /// it spawns, so its `module = -1` names the unit's program (#2143). Per domain, not on the shared
-    /// [`Compiled`]: a child whose program is that same unit runs it as its own.
+    /// unit)` on the domain's host ([`super::Host::resolve_jit_code`]): what a host mirroring the
+    /// table in emitted code fetches each slot's unit by ([`SharedSlots::slot_unit`]), and where a
+    /// unit that names its own functions runs ([`SharedSlots::own_module`]). Per domain, not on the
+    /// shared [`Compiled`].
     jit_units: std::sync::Mutex<Vec<(usize, (u32, u32))>>,
     /// Bumped by every install and uninstall, after the slot it changed (#1009), so a host that
     /// mirrors the table in emitted code rebuilds only when it moved ([`SharedSlots::gen`]).
@@ -1238,19 +1239,6 @@ fn build_table_for(n_funcs: usize, table_log2: u8, module: u32) -> SharedSlots {
 /// Build the primary's natural module-0 dispatch table.
 fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
     SharedSlots::new(n_funcs, table_log2, 0)
-}
-
-/// The program a **same-module** §14 child (op 0 / op 11, a detached `-1`) runs: the **spawning
-/// frame's** module — the primary for a plain guest, the unit itself for an installed §22 unit — as
-/// `(index, program)`. Every driver validates the child's entry against, and builds the child over,
-/// this one module, so the two cannot disagree (#1726: they used to validate or build against module
-/// 0, so an installed unit's child ran the base program's function of the same index). The
-/// module-aware rule `thread.spawn` already follows (`VcpuEvent::Spawn { module }`). `None` only for a
-/// module index the source does not hold, which a running frame cannot have.
-fn spawner_module(source: &ModuleSource, spawner: &Vm) -> Option<(u32, std::sync::Arc<Compiled>)> {
-    source
-        .get(spawner.module)
-        .map(|c| (spawner.module as u32, c))
 }
 
 /// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
@@ -1820,9 +1808,8 @@ pub(crate) fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
 struct DetachedSpawn {
     /// The `Budget` handle whose `mem` quota pays for the window.
     budget: i32,
-    /// The granted `Module` handle the child runs.
+    /// The granted `Module` handle the child runs, from its function 0 (#2219).
     module: i32,
-    entry: i64,
     /// The window: `1 << size_log2` bytes, the module's declared memory.
     size_log2: i64,
     /// The child's fuel quota (`<= 0` inherits the parent's remaining).
@@ -1844,7 +1831,6 @@ impl DetachedSpawn {
         DetachedSpawn {
             budget: sr.budget,
             module: sr.modh,
-            entry: sr.entry as i64,
             size_log2: sr.size_log2,
             quota: sr.quota,
             grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
@@ -1854,22 +1840,9 @@ impl DetachedSpawn {
     }
 }
 
-/// What an admitted child runs.
-enum ChildProgram {
-    /// The spawning frame's own module (#1726): a same-module child (op 0, a module-less op 17).
-    Spawner(u32, std::sync::Arc<Compiled>),
-    /// A granted separate module, as the run compiled it once ([`granted_program`]).
-    Granted(u32, std::sync::Arc<Compiled>),
-}
-
-impl ChildProgram {
-    /// The module index the child runs in the run's source, and its compiled unit.
-    fn unit(self) -> (u32, std::sync::Arc<Compiled>) {
-        match self {
-            ChildProgram::Spawner(m, p) | ChildProgram::Granted(m, p) => (m, p),
-        }
-    }
-}
+/// What an admitted child runs: its granted module's index in the run's source, and its program as
+/// the run compiled it once ([`granted_program`]).
+type ChildProgram = (u32, std::sync::Arc<Compiled>);
 
 /// The program a child of granted module `g` runs: the unit this run compiled from the same module
 /// (by content digest), or a fresh compile, added to `source` (#2219). Every child is a granted module,
@@ -1885,7 +1858,7 @@ fn granted_program(
         .unit_of(&g.digest, || compile_granted(host, g, source))
         .ok_or(Trap::Malformed)?;
     let p = source.get(i).ok_or(Trap::Malformed)?;
-    Ok(ChildProgram::Granted(i as u32, p))
+    Ok((i as u32, p))
 }
 
 /// A §5 detached child as every in-process bytecode driver builds it — the **one definition** of
@@ -1928,12 +1901,11 @@ struct BuiltChild {
 }
 
 impl AdmittedChild {
-    /// Build the child's task at `entry` ([`child_task`]), for the driver to schedule — or refuse
-    /// it: with no `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`), or an
-    /// entry its program cannot start at. A refused child hands its window lease to `refund`, its
-    /// spawner's budget, so a spawn refused after its admission charges nothing (#1975, #2006), as the
-    /// oracle's undo does.
-    fn build(self, entry: i64, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
+    /// Build the child's task ([`child_task`]), for the driver to schedule — or refuse it: with no
+    /// `room` under the driver's vCPU ceiling (the instantiate bomb, `ThreadFault`). A refused child
+    /// hands its window lease to `refund`, its spawner's budget, so a spawn refused after its
+    /// admission charges nothing (#1975, #2006), as the oracle's undo does.
+    fn build(self, room: bool, refund: impl FnOnce(Lease)) -> Result<BuiltChild, Trap> {
         let AdmittedChild {
             mem,
             host,
@@ -1945,9 +1917,9 @@ impl AdmittedChild {
         let built = match room {
             false => Err(Trap::ThreadFault), // instantiate bomb
             true => {
-                let (module, prog) = program.unit();
+                let (module, prog) = program;
                 let payer = Some(host.own_node());
-                child_task(module, &prog, entry, &args, host.jit_table_log2(), payer)
+                child_task(module, &prog, &args, host.jit_table_log2(), payer)
                     .map(|(vt, table)| (module, vt, table))
             }
         };
@@ -1974,19 +1946,18 @@ impl AdmittedChild {
     }
 }
 
-/// A child's entry task in `module` (`prog`, its landed program) and its own natural dispatch table
-/// over that module — no installed §22 units; #1296: sized for the install slots its re-granted
-/// `Jit` carries.
+/// A child's task in `module` (`prog`, its landed program), entered at function 0, the module's
+/// child bootstrap (#2219), and its own natural dispatch table over that module — no installed §22
+/// units; #1296: sized for the install slots its re-granted `Jit` carries.
 fn child_task(
     module: u32,
     prog: &Compiled,
-    entry: i64,
     args: &[Value],
     jit_table_log2: u8,
     payer: Option<NodeRef>,
 ) -> Result<(VTask, SharedSlots), Trap> {
     let table = build_table_for(prog.progs.len(), jit_table_log2, module);
-    let vt = entry_task(prog, module as usize, entry as usize, args, payer)?;
+    let vt = entry_task(prog, module as usize, 0, args, payer)?;
     Ok((vt, table))
 }
 
@@ -2093,37 +2064,22 @@ impl FreshWindow {
 /// durable domain's detached spawn refuses (#1893).
 ///
 /// `source`: the run's compiled modules, where a granted module's program is found or added
-/// ([`granted_program`]). `spawner`: the spawning frame's module in it ([`spawner_module`]), and
-/// `unit`, the `Jit` unit that module is when the spawning domain installed it
-/// ([`SharedSlots::jit_unit`]): `module = -1` then names the unit's program (#2143). A child of the
-/// frame's module runs it, with no second compile; `None` (an emitted frame's spawn, whose code is
-/// never a unit's) runs the child's program as a granted module's.
+/// ([`granted_program`]).
 fn admit_detached_child(
     host: &mut Host,
     pm: Option<&Mem>,
     s: DetachedSpawn,
     freezes_detached: bool,
     source: &ModuleSource,
-    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
-    unit: Option<(u32, u32)>,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
     // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
     // other value fails closed, checked first as the tree-walker's op-15 arm does.
     if s.quota != 0 {
         return Err(Trap::CapFault);
     }
-    // A child of the spawning frame's own module runs it, as a same-module confined child does
-    // (#1726): no second compile, and the child's code keeps the identity the debugger keys
-    // breakpoints and §6 debug info on (#2076). `-1` always names that module; a grant of the
-    // domain's program does too when the frame runs the program rather than a unit.
-    let runs_spawner =
-        s.module == super::SELF_MODULE || (unit.is_none() && host.is_self_module(s.module));
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
-        let g = host.resolve_spawn_module(s.module, unit)?;
-        let program = match spawner {
-            Some((m, p)) if runs_spawner => ChildProgram::Spawner(m, p),
-            _ => granted_program(host, source, g)?,
-        };
+        let g = host.resolve_module(s.module)?;
+        let program = granted_program(host, source, g)?;
         (
             program,
             g.memory_log2(),
@@ -2132,9 +2088,7 @@ fn admit_detached_child(
             g.durable,
         )
     };
-    let sig = match &program {
-        ChildProgram::Spawner(_, p) | ChildProgram::Granted(_, p) => p.sigs.get(s.entry as usize),
-    };
+    let sig = program.1.sigs.first();
     let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let size_log2 = temen_ir::detached_size_log2(s.size_log2, cmem_log2);
@@ -2212,14 +2166,10 @@ fn admit_detached_child(
         }
     }
     child_host.set_self_module(&cmodule);
-    // A child of the running module itself binds leniently (#1234 — its manifest is the parent's
-    // whole import surface, not one written for the child).
-    let bound = if host.is_self_module(s.module) {
-        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
-    } else {
-        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
-    };
-    if bound.is_err() {
+    if child_host
+        .bind_child_manifest(&cmodule.imports, &cmodule.types)
+        .is_err()
+    {
         host.undo_detached_spawn(lease, lane);
         return Ok(None);
     }
@@ -2258,13 +2208,9 @@ fn admit_detached_in_process(
     pm: Option<&Mem>,
     s: DetachedSpawn,
     source: &ModuleSource,
-    spawner: Option<(u32, std::sync::Arc<Compiled>)>,
-    unit: Option<(u32, u32)>,
     emit: impl FnOnce(&AdmittedChild) -> Option<ProgramEmit>,
 ) -> Result<Option<(AdmittedChild, Option<ProgramEmit>)>, Trap> {
-    let Some((mut child, window)) =
-        admit_detached_child(host, pm, s, false, source, spawner, unit)?
-    else {
+    let Some((mut child, window)) = admit_detached_child(host, pm, s, false, source)? else {
         return Ok(None);
     };
     let tierup = emit(&child);
@@ -3909,7 +3855,7 @@ impl VcpuProgram {
     }
 
     /// The module this program was compiled from: the running module a host registers
-    /// ([`Host::set_self_module`]), so a spawn record's `module = -1` names it.
+    /// ([`Host::set_self_module`]).
     pub fn module(&self) -> &std::sync::Arc<Module> {
         &self.module
     }
@@ -4345,7 +4291,6 @@ struct VcpuChild {
 pub struct PendingChild {
     host: Host,
     module: u32,
-    entry: u32,
     args: Vec<Value>,
     fuel: Fuel,
     /// Its fresh window (§5), seeded when it is built.
@@ -4358,10 +4303,11 @@ const _: fn() = || {
 };
 
 impl PendingChild {
-    /// The module the child runs, as its spawner's program source numbers it, and its entry — what
-    /// a host that runs the child on an emitted tier checks its emit against.
-    pub fn module_entry(&self) -> (u32, u32) {
-        (self.module, self.entry)
+    /// The module the child runs, as its spawner's program source numbers it — what a host that
+    /// runs the child on an emitted tier checks its emit against. The child starts at its function
+    /// 0 (#2219).
+    pub fn module(&self) -> u32 {
+        self.module
     }
 
     /// The module the child's program is (its powerbox's running module) — how a host that emitted
@@ -4379,15 +4325,7 @@ impl PendingChild {
         back: std::sync::Arc<super::Region>,
     ) -> Result<Vcpu<'_>, Trap> {
         let mem = self.window.build(Some(back), &mut self.host)?;
-        Vcpu::child_over(
-            prog,
-            self.module,
-            self.entry,
-            mem,
-            self.fuel,
-            self.host,
-            self.args,
-        )
+        Vcpu::child_over(prog, self.module, mem, self.fuel, self.host, self.args)
     }
 
     /// The child's powerbox and its entry's starter handles — its `Instantiator` and `AddressSpace`,
@@ -4620,7 +4558,6 @@ impl<'p> Vcpu<'p> {
     fn child_over(
         prog: &'p VcpuProgram,
         module: u32,
-        entry: u32,
         mem: Mem,
         fuel: Fuel,
         host: Host,
@@ -4634,7 +4571,6 @@ impl<'p> Vcpu<'p> {
         let (vt, table) = child_task(
             module,
             &cunit,
-            i64::from(entry),
             &args,
             host.jit_table_log2(),
             Some(host.own_node()),
@@ -5165,8 +5101,6 @@ impl<'p> Vcpu<'p> {
                 // its embedder's freeze.
                 Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
                     let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-                    let spawner = spawner_module(&dom.source, &self.vt.active);
-                    let unit = dom.table.jit_unit(self.vt.active.module);
                     let admitted = match self.shared_host {
                         Some(m) => admit_detached_child(
                             &mut m.lock_unpoisoned(),
@@ -5174,8 +5108,6 @@ impl<'p> Vcpu<'p> {
                             spawn,
                             true,
                             &dom.source,
-                            spawner,
-                            unit,
                         ),
                         None => admit_detached_child(
                             &mut self.host,
@@ -5183,14 +5115,12 @@ impl<'p> Vcpu<'p> {
                             spawn,
                             true,
                             &dom.source,
-                            spawner,
-                            unit,
                         ),
                     };
                     match admitted {
                         Ok(Some((child, window))) => {
                             let (size_log2, lease) = (window.size_log2, child.lease);
-                            match self.pending_child(child, spawn.entry as u32, window) {
+                            match self.pending_child(child, window) {
                                 Ok(child) => {
                                     // The window lease, filed against the handle the host delivers.
                                     self.pending_lease = lease;
@@ -5217,14 +5147,12 @@ impl<'p> Vcpu<'p> {
     fn pending_child(
         &self,
         child: AdmittedChild,
-        entry: u32,
         window: FreshWindow,
     ) -> Result<PendingChild, Trap> {
-        let (module, _) = child.program.unit();
+        let (module, _) = child.program;
         Ok(PendingChild {
             host: child.host,
             module,
-            entry,
             args: child.args,
             fuel: child.fuel,
             window,
@@ -5307,24 +5235,14 @@ impl<'p> Vcpu<'p> {
                 spawn,
                 true,
                 source,
-                None,
-                None,
             ),
-            None => admit_detached_child(
-                &mut self.host,
-                self.mem.as_ref(),
-                spawn,
-                true,
-                source,
-                None,
-                None,
-            ),
+            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, source),
         }?;
         let Some((child, window)) = admitted else {
             return Ok(None);
         };
         let (size_log2, lease) = (window.size_log2, child.lease);
-        let child = self.pending_child(child, spawn.entry as u32, window)?;
+        let child = self.pending_child(child, window)?;
         self.pending_lease = lease;
         Ok(Some((child, size_log2)))
     }
@@ -6483,8 +6401,8 @@ fn emit_access(
 /// only — and takes its spans from [`watch_accesses`](super::watch_accesses), the same per-op analysis
 /// the watchpoint check runs, so bulk `mem.copy`/`mem.fill` and v128 stores are covered on the one
 /// definition and no store path is touched. Inert while the journal is disarmed, and for `mem: None`:
-/// a caller passes the root window only for a task that writes it, since a child of the root's own
-/// program runs module 0 in its own window (#2076), which each anchor carries whole (#2058).
+/// a caller passes the root window only for a task that writes it; a child runs in its own window
+/// (#2076), which each anchor carries whole (#2058).
 fn journal_op(
     journal: &mut super::journal::Journal,
     vm: &Vm,
@@ -7305,8 +7223,8 @@ struct DbgEnv {
     mem: Option<Mem>,
     host: Host,
     table: SharedSlots,
-    /// The unit of the run's source the domain runs (the root's is module 0): a child of its own
-    /// program runs it too (#2076), and a checkpoint rebuilds the env's table over it.
+    /// The unit of the run's source the domain runs (the root's is module 0, a child's the unit of the
+    /// module it was granted): a checkpoint rebuilds the env's table over it.
     program: u32,
     /// A fixed allowance (#1944 slice 3): a checkpoint captures it whole, and a seek replays it.
     fuel: Fuel,
@@ -7435,10 +7353,9 @@ impl ScheduledContinuation {
 struct EnvSnapshot {
     win_base: u64,
     size_log2: u8,
-    /// The unit the child's domain runs ([`DbgEnv::program`]): `0` for a child of the root's own
-    /// program (a same-module `instantiate`, or a detached child of it, #2076); `>= 1` for a
-    /// **separate** module's, whose pushed unit is captured in the run snapshot's `extra_units`. Its
-    /// natural dispatch table is rebuilt over this index.
+    /// The unit the child's domain runs ([`DbgEnv::program`]): the granted module's, whose pushed unit
+    /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
+    /// index.
     module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
@@ -8017,9 +7934,9 @@ fn service_advance(
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
                 *turn += 1;
-                if let Err(t) = dbg_instantiate_detached(
-                    tasks, ti, extra_envs, source, table, mem, host, spawn, dst,
-                ) {
+                if let Err(t) =
+                    dbg_instantiate_detached(tasks, ti, extra_envs, source, mem, host, spawn, dst)
+                {
                     complete(tasks, ti, Err(t));
                 }
             }
@@ -8125,7 +8042,6 @@ fn dbg_start_child(
     extra_envs: &mut Vec<DbgEnv>,
     host: &mut Host,
     child: AdmittedChild,
-    entry: i64,
     dst: u32,
     place: EnvPlace,
 ) -> Result<(), Trap> {
@@ -8139,7 +8055,7 @@ fn dbg_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |lease| match spawner {
+    } = child.build(room, |lease| match spawner {
         None => host.release_detached(lease),
         Some(k) => extra_envs[k].host.release_detached(lease),
     })?;
@@ -8176,17 +8092,11 @@ fn dbg_instantiate_detached(
     ti: usize,
     extra_envs: &mut Vec<DbgEnv>,
     source: &ModuleSource,
-    table: &SharedSlots,
     shared_mem: &Option<Mem>,
     host: &mut Host,
     spawn: DetachedSpawn,
     dst: u32,
 ) -> Result<(), Trap> {
-    // The spawning frame's module, which a child of its own program runs (#2076, #2143), and the
-    // unit it is when the spawning domain installed it.
-    let spawner = spawner_module(source, &tasks[ti].vm.vt.active);
-    let table = tasks[ti].env.map_or(table, |k| &extra_envs[k].table);
-    let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
     // The parent's window and the powerbox its handles resolve in: its own (#1727).
     let (pm, owner) = match tasks[ti].env {
         None => (shared_mem.as_ref(), &mut *host),
@@ -8195,16 +8105,14 @@ fn dbg_instantiate_detached(
             (e.mem.as_ref(), &mut e.host)
         }
     };
-    let Some((child, _)) =
-        admit_detached_in_process(owner, pm, spawn, source, spawner, unit, |_| None)?
-    else {
+    let Some((child, _)) = admit_detached_in_process(owner, pm, spawn, source, |_| None)? else {
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
     let place = EnvPlace::Detached {
         spawner: tasks[ti].env,
     };
-    dbg_start_child(tasks, ti, extra_envs, host, child, spawn.entry, dst, place)
+    dbg_start_child(tasks, ti, extra_envs, host, child, dst, place)
 }
 
 /// #2220 — `Instantiator.grant` (op 19) from task `ti` into the child handle `child` names
@@ -9079,7 +8987,7 @@ impl ScheduledDebugRun {
                         // A window-range watch (cross-thread) stops *before* the access; a value
                         // watch (#1229) stops when a watched SSA-held variable's value changed.
                         // Both name the root's window, which a task in a child's window does not
-                        // run in, though a child of the root's own program runs module 0 (#2076).
+                        // run in (#2076).
                         Some(pc) if tasks[ti].env.is_none() => watch_stop_before(
                             cur_vm,
                             &*mem,
@@ -12959,8 +12867,8 @@ struct ChildEnv {
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
     /// it was a client of (#1217), as the oracle's does for a nested or detached child's.
     nested: bool,
-    /// The unit of the run's [`ModuleSource`] this env's domain runs — its own program, which a
-    /// detached spawn of it reuses (#2078). The root domain's is unit 0.
+    /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
+    /// too. The root domain's is unit 0.
     program: u32,
 }
 
@@ -13023,7 +12931,6 @@ fn coop_start_child(
     root: &DomainCell,
     ti: usize,
     child: AdmittedChild,
-    entry: i64,
     dst: u32,
     tierup: Option<ProgramEmit>,
 ) -> Result<(), Trap> {
@@ -13037,7 +12944,7 @@ fn coop_start_child(
         host: child_host,
         fuel,
         lease,
-    } = child.build(entry, room, |lease| {
+    } = child.build(room, |lease| {
         task_host(root, extra_envs, spawner)
             .lock_unpoisoned()
             .release_detached(lease)
@@ -13890,8 +13797,8 @@ impl ProgramEmits {
         host: &Host,
         source: &ModuleSource,
     ) -> Option<ProgramEmit> {
-        let (ChildProgram::Spawner(m, _) | ChildProgram::Granted(m, _)) = program;
-        if let (ChildProgram::Granted(..), Some(emit)) = (program, &self.modules) {
+        let (m, _) = program;
+        if let Some(emit) = &self.modules {
             if !self.granted.iter().any(|&(g, _)| g == *m) {
                 let offer = host.self_module().zip(source.digest_of(*m as usize));
                 let answer = offer.and_then(|(image, digest)| {
@@ -15154,9 +15061,9 @@ impl SchedCore {
                 // `thread.spawn` handle, whose domain is the caller's own: no domain holds an
                 // offer into itself, so a step never locks its own cell twice.
                 let export = arg as u32;
-                let callee = usize::try_from(child)
+                let callee = super::resolve_thread(&tasks[ti].threads, child)
                     .ok()
-                    .and_then(|h| tasks[ti].threads.get(h).copied().flatten())
+                    .and_then(|slot| tasks[ti].threads[slot])
                     .and_then(|cidx| tasks[cidx].env)
                     .filter(|&k| Some(k) != tasks[ti].env)
                     .map(|k| std::sync::Arc::clone(&extra_envs[k].host));
@@ -15671,19 +15578,11 @@ impl SchedCore {
                     None => mem.as_ref(),
                     Some(k) => extra_envs[k].mem.as_ref(),
                 };
-                // #2078 — a child of the spawning frame's own module runs it, as a same-module
-                // confined child does: no second compile (#2143: an installed unit's, from a
-                // frame of one).
-                let spawner = spawner_module(&dom.source, &tasks[ti].vm.vt.active);
-                let table = tasks[ti].env.map_or(&*dom.table, |k| &*extra_envs[k].table);
-                let unit = table.jit_unit(tasks[ti].vm.vt.active.module);
                 let admitted = admit_detached_in_process(
                     &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
                     pm,
                     spawn,
                     &dom.source,
-                    spawner,
-                    unit,
                     |c| programs.for_child(&c.program, &c.host, &dom.source),
                 );
                 let (child, tierup) = match admitted {
@@ -15701,8 +15600,7 @@ impl SchedCore {
                 // program's emit while the driver can address its window flatly, which only a
                 // failed flat allocation prevents.
                 let tierup = tierup.filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
-                let started =
-                    coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
+                let started = coop_start_child(tasks, extra_envs, root, ti, child, dst, tierup);
                 if let Err(t) = started {
                     complete(tasks, ti, Err(t));
                 }
@@ -16875,7 +16773,7 @@ mod live_cap_tests {
         let child = AdmittedChild {
             mem: None,
             host: Host::new(),
-            program: ChildProgram::Spawner(0, std::sync::Arc::new(unit())),
+            program: (0, std::sync::Arc::new(unit())),
             args: Vec::new(),
             fuel: Fuel::fixed(0),
             lease: Some(lease),
@@ -16905,7 +16803,7 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, 0, None);
+        let r = coop_start_child(&mut tasks, &mut Vec::new(), &root, 0, child, 0, None);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(
@@ -16922,16 +16820,7 @@ mod live_cap_tests {
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
         let place = EnvPlace::Detached { spawner: None };
-        let r = dbg_start_child(
-            &mut tasks,
-            0,
-            &mut Vec::new(),
-            &mut host,
-            child,
-            0,
-            0,
-            place,
-        );
+        let r = dbg_start_child(&mut tasks, 0, &mut Vec::new(), &mut host, child, 0, place);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(held(&host), (0, 0), "nothing stays charged");
@@ -17040,6 +16929,14 @@ pub struct ThreadTier {
     /// Per-module-0-function eligibility, as the pump's root emit ([`ProgramEmit::eligible`]): a
     /// module-0 task's direct call to an eligible function runs on the emitted tier.
     pub eligible: std::sync::Arc<[bool]>,
+    /// The emitted code checks each access against a page-state table (#750), as the pump's
+    /// ([`TierUpConfig::page_checked`]): each call carries its thread's
+    /// ([`EmittedCall::pagestate`]).
+    pub page_checked: bool,
+    /// The words of the spill stack each thread keeps for its emitted frames to push their live words
+    /// to (#1627), as the coop driver's spilling emit does; `0` when the emit does not spill. A bounce
+    /// under a tier-up hands the interpreter's `gc.roots` what the frames beneath it pushed.
+    pub spill: usize,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
@@ -17066,7 +16963,8 @@ pub struct EmittedCall<'a> {
     pub target: EmittedTarget<'a>,
     /// The arguments, as raw i64 slots.
     pub argv: &'a [i64],
-    /// The window's committed extent, the emitted `"mapped"` global (#717).
+    /// The window's committed extent, the emitted `"mapped"` global (#717). On a page-checked tier,
+    /// the coverage of the call's page-state table ([`EmittedCall::pagestate`]).
     pub mapped: u64,
     /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
     pub win: *const u8,
@@ -17079,6 +16977,8 @@ pub struct EmittedCall<'a> {
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
+    pagestate: &'a std::cell::Cell<*const u8>,
+    spill: (*mut u64, usize),
 }
 
 impl EmittedCall<'_> {
@@ -17113,6 +17013,54 @@ impl EmittedCall<'_> {
     pub fn mapped_now(&self) -> u64 {
         self.now.get()
     }
+
+    /// The base of the call's page-state table, a byte per page ([`build_pagestate_table`]), on a
+    /// page-checked tier (`None` otherwise): the emitted `"pagestate"` global. A bounce rebuilds
+    /// the table if the page map moved, so read it again after one, with
+    /// [`mapped_now`](Self::mapped_now).
+    pub fn pagestate(&self) -> Option<*const u8> {
+        let p = self.pagestate.get();
+        (!p.is_null()).then_some(p)
+    }
+
+    /// The thread's spill stack, `(base, words)`, on a spilling tier (`None` otherwise): it lives
+    /// as long as the thread, and a bounce takes how many words the frames beneath it pushed.
+    pub fn spill(&self) -> Option<(*mut u64, usize)> {
+        (self.spill.1 > 0).then_some(self.spill)
+    }
+}
+
+/// A thread's page-state table for a page-checked emitted tier ([`build_pagestate_table`]), from
+/// its task's page map. It is rebuilt only when the map moves ([`Mem::map_version`]), and starts
+/// over when the thread's window does.
+#[derive(Default)]
+struct PageTable {
+    /// The map version the table was built at.
+    version: Option<u64>,
+    table: Vec<u8>,
+    /// The bytes the table covers.
+    cover: u64,
+}
+
+impl PageTable {
+    /// Bring the table up to `m`'s page map; returns its coverage.
+    fn sync(&mut self, m: &Mem) -> u64 {
+        let version = m.map_version();
+        if self.version != Some(version) {
+            (self.table, self.cover) = build_pagestate_table(&m.map_info(), m.win_flat_len());
+            self.version = Some(version);
+        }
+        self.cover
+    }
+}
+
+/// What a thread keeps for its emitted calls: its page-state table, and its spill stack
+/// ([`ThreadTier::spill`]), made at its first emitted call and never moved after, since its emitted
+/// tier keeps the address.
+#[derive(Default)]
+struct TierState {
+    pages: PageTable,
+    spill: Vec<u64>,
 }
 
 /// A §22 invoke the rules surfaced to run on the emitted tier ([`CoopStep::JitInvoke`]): its task's
@@ -17133,8 +17081,9 @@ type NewTask = (usize, Option<Mem>, Fuel);
 
 /// A call out of emitted code back into the interpreter (`env.call_interp`): function
 /// `target` of the task's dispatch table, its arguments in `io` and its results written back over
-/// them, run over the task's live window and powerbox. Returns how many results it wrote.
-pub type Bounce<'a> = dyn FnMut(u32, &mut [i64]) -> Result<usize, Trap> + 'a;
+/// them, run over the task's live window and powerbox, with how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`EmittedCall::spill`]). Returns how many results it wrote.
+pub type Bounce<'a> = dyn FnMut(u32, &mut [i64], usize) -> Result<usize, Trap> + 'a;
 
 /// A thread steps this many tier-ups at most before it looks at the run, as a preemption makes it:
 /// a loop of calls that each tier up never spends a quantum.
@@ -17226,7 +17175,7 @@ fn drive_threads(
     let programs = ProgramEmits {
         root: platform.tier.as_ref().map(|t| ProgramEmit {
             eligible: std::sync::Arc::clone(&t.eligible),
-            page_checked: false,
+            page_checked: t.page_checked,
         }),
         ..ProgramEmits::default()
     };
@@ -17319,6 +17268,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     // A §22 invoke the rules surfaced at the task's last stop, which the thread runs on the emitted
     // tier before it steps the task on.
     let mut invoke = None;
+    let mut tier = TierState::default();
     'run: loop {
         loop {
             if g.over.is_some() {
@@ -17336,6 +17286,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         if exec || g.core.tasks[ti].env != env {
             env = g.core.tasks[ti].env;
             (mem, fuel) = g.hand(env);
+            tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
         let exits = g.core.hooked_twins.len();
@@ -17351,9 +17302,9 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         };
         let stop = match invoke.take() {
             Some(inv) => run
-                .invoke(&mut vm, &mut ctx, inv)
-                .and_then(|()| run.step(&mut vm, env, &mut ctx)),
-            None => run.step(&mut vm, env, &mut ctx),
+                .invoke(&mut vm, &mut ctx, &mut tier, inv)
+                .and_then(|()| run.step(&mut vm, env, &mut ctx, &mut tier)),
+            None => run.step(&mut vm, env, &mut ctx, &mut tier),
         };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
@@ -17403,6 +17354,7 @@ impl ThreadRun {
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
+        state: &mut TierState,
     ) -> Result<VcpuStop, Trap> {
         let mut fibers = FiberCell::Core(&self.state, env);
         for _ in 0..TIERUP_LOOK {
@@ -17429,7 +17381,9 @@ impl ThreadRun {
                         .filter(|_| module == 0)
                         .ok_or(Trap::Malformed)?;
                     let target = EmittedTarget::Region(func);
-                    let vals = self.emitted(tier, &mut fibers, true, ctx, target, &argv, mapped)?;
+                    let task = Some(&vm.vt);
+                    let vals =
+                        self.emitted(tier, &mut fibers, task, ctx, state, target, &argv, mapped)?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
@@ -17446,7 +17400,13 @@ impl ThreadRun {
     /// tier ([`ThreadTier::run`]), and hand its results to the task as the interpreted invoke would.
     /// Its calls back into the interpreter share a registry of their own, whose fibers die with the
     /// invoke, as `run_invoke`'s do.
-    fn invoke(&self, vm: &mut TaskVm, ctx: &mut RunCtx, inv: SurfacedInvoke) -> Result<(), Trap> {
+    fn invoke(
+        &self,
+        vm: &mut TaskVm,
+        ctx: &mut RunCtx,
+        state: &mut TierState,
+        inv: SurfacedInvoke,
+    ) -> Result<(), Trap> {
         let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
         let mut fibers = FiberTables::default();
         let target = EmittedTarget::Unit {
@@ -17456,7 +17416,9 @@ impl ThreadRun {
             results: &inv.results,
         };
         let mut cell = fibers.cell();
-        let vals = self.emitted(tier, &mut cell, false, ctx, target, &inv.argv, inv.mapped)?;
+        let vals = self.emitted(
+            tier, &mut cell, None, ctx, state, target, &inv.argv, inv.mapped,
+        )?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
             return Err(Trap::Malformed);
@@ -17467,15 +17429,20 @@ impl ThreadRun {
 
     /// Run one call on this thread's emitted tier ([`ThreadTier::run`]): `target`, over the task's
     /// window and dispatch table. Its calls back into the interpreter run over the task's live
-    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up
-    /// (`run_level`), as the pump's are, or an invoke's own.
+    /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up,
+    /// as the pump's are, or an invoke's own. A tier-up's `task` is what a `gc.roots` in a bounce
+    /// scans beneath it, with what its emitted frames pushed to the thread's spill stack (#1627),
+    /// as the pump's bounce does. On a page-checked tier the call reads the thread's page-state
+    /// table, brought up to the task's page map, and is bounded by its coverage instead of the
+    /// reserved size the stop surfaced with (#750).
     #[allow(clippy::too_many_arguments)]
     fn emitted(
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        run_level: bool,
+        task: Option<&VTask>,
         ctx: &mut RunCtx,
+        state: &mut TierState,
         target: EmittedTarget<'_>,
         argv: &[i64],
         mapped: u64,
@@ -17489,12 +17456,31 @@ impl ThreadRun {
             HostCell::Shared(h) => *h,
             HostCell::Excl(_) => return Err(Trap::Malformed),
         };
+        let TierState { pages, spill } = state;
+        if spill.is_empty() {
+            spill.resize(tier.spill, 0);
+        }
+        let paged = tier.page_checked && ctx.mem.is_some();
+        let (mapped, at) = match ctx.mem.as_ref().filter(|_| paged) {
+            Some(m) => (pages.sync(m), pages.table.as_ptr()),
+            None => (mapped, std::ptr::null()),
+        };
+        let spilled = (spill.as_mut_ptr(), spill.len());
         let now = std::cell::Cell::new(mapped);
+        let pagestate = std::cell::Cell::new(at);
         let RunCtx {
             table, fuel, mem, ..
         } = ctx;
         let table: &SharedSlots = table;
-        let mut bounce = |target: u32, io: &mut [i64]| {
+        let mut bounce = |target: u32, io: &mut [i64], pushed: usize| {
+            // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
+            // scan that cannot see the emitted frames' words would miss roots.
+            let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
+            let beneath = task.zip(words).map(|(vt, words)| {
+                let mut b = Beneath::task(vt, FiberRegRef::Owned(&[]));
+                b.words.push(words);
+                b
+            });
             let ran = coop_bounce(
                 &self.dom.source,
                 table,
@@ -17502,13 +17488,20 @@ impl ThreadRun {
                 mem,
                 &mut HostCell::Shared(host),
                 fibers,
-                run_level.then_some(BounceRunCtx { park: None }),
+                task.map(|_| BounceRunCtx { park: None }),
                 target,
                 io,
-                None,
+                beneath.as_ref(),
             );
-            // The bounce may have grown the window, which the emitted code reads again after it.
-            now.set(mem.as_ref().map_or(0, |m| m.scalar_extent().unwrap_or(0)));
+            // The bounce may have grown the window or moved its page map, which the emitted code
+            // reads again after it.
+            match mem.as_ref() {
+                Some(m) if paged => {
+                    now.set(pages.sync(m));
+                    pagestate.set(pages.table.as_ptr());
+                }
+                m => now.set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
+            }
             ran
         };
         let mut call = EmittedCall {
@@ -17522,6 +17515,8 @@ impl ThreadRun {
             table,
             host,
             now: &now,
+            pagestate: &pagestate,
+            spill: spilled,
         };
         (tier.run)(&mut call).map(|()| call.results)
     }
@@ -20119,10 +20114,14 @@ impl Vm {
                 } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
+                    // #2219 — a child starts at its module's function 0, its child bootstrap, so the
+                    // entry operand must be 0, as the record's word at 4 must.
+                    if r!(*entry).i64() != 0 {
+                        return Err(Trap::CapFault);
+                    }
                     let spawn = DetachedSpawn {
                         budget: r!(*budget).i64() as i32,
                         module: r!(*module_reg).i64() as i32,
-                        entry: r!(*entry).i64(),
                         size_log2: r!(*size_log2).i64(),
                         quota: r!(*quota).i64(),
                         grants: grants

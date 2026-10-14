@@ -48,7 +48,7 @@ block 0 (v0: i32) {
 /// paid from `budget` + `join` it (the dedicated import bounce), folding both results. The child
 /// mirrors the driver contract (`(i64) -> (i64)`, ignores its starter arg) and returns 9.
 fn composed() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1(0));
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
     let module_at = REC_AT + 24;
     let budget_at = REC_AT + 28;
     format!(
@@ -245,7 +245,7 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
                 let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
                 let st = caller.data_mut();
                 assert!(
-                    Some(rec.modh) == st.child && rec.entry == 0,
+                    Some(rec.modh) == st.child,
                     "a v1 spawn of the child's image: {rec:?}"
                 );
                 st.inst_bounces += 1;

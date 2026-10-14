@@ -756,8 +756,8 @@ pub const PAR_JIT_INVOKE: i32 = 8;
 /// The Worker mints the child a fresh shared `Memory` (one host header page + the declared window,
 /// growable to `temen_detached_max_bytes()`) and posts it and the ticket to a new Worker, which starts
 /// the child over it through `Region::Foreign` ([`temen_par_child_detached`] — the engine seeds the
-/// window). `_d` = `(module << 32) | entry` (`detached_operands`): `module` is non-zero only for a
-/// child that runs the run's granted unit, which the Worker may run on the wasm tier. Joined through
+/// window). `_d` = the child's module (`detached_operands`), non-zero only for a child that runs the
+/// run's granted unit, which the Worker may run on the wasm tier from its function 0. Joined through
 /// the same completion-slot protocol as [`PAR_SPAWN`]. Children run **concurrently**, each in its
 /// own Worker over its own memory — the reason this is a Worker event and not an in-Rust one.
 pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
@@ -1431,7 +1431,7 @@ fn par_inst_powerbox(
     module: &std::sync::Arc<temen_ir::Module>,
 ) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    host.set_self_module(module); // a record's `module = -1`
+    host.set_self_module(module);
     let inst = host.grant_instantiator(0, cfg.win_size);
     let mut args = vec![Value::I32(inst)];
     if let Some(m) = &cfg.module {
@@ -1460,8 +1460,8 @@ fn par_inst_powerbox(
 /// The emitted wasm of the run's granted §14 unit (per-instance stash; `(null, 0)` ⇒ none).
 static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// The granted unit's per-function eligibility ([`temen_wasm_jit::compile_nested`]'s `emitted` bitmap):
-/// `f{i}` is emitted + safe to call directly. A child of the unit whose entry is eligible runs on
-/// wasm; else it interprets.
+/// `f{i}` is emitted + safe to call directly. A child of the unit runs on wasm when its function 0, the
+/// child's entry, is eligible; else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
 /// Whether [`INST_UNIT_WASM`] was emitted **paged** (the unit reaches an ADDRESS_SPACE page op) — the
 /// Worker then seeds + re-syncs its `"pagestate"`/`"mapped"` globals from the child vCPU (#1151).
@@ -1545,15 +1545,13 @@ pub extern "C" fn temen_par_inst_unit_wasm_len() -> usize {
     unsafe { (*core::ptr::addr_of!(INST_UNIT_WASM)).1 }
 }
 
-/// Whether the granted unit's function `entry` is emitted (safe to run `f{entry}` on wasm). `0` when
-/// codegen isn't enabled, `entry` is out of range, or that function is out of the emitter subset.
+/// Whether the granted unit's function 0, where every child starts (#2219), is emitted (safe to run
+/// `f0` on wasm). `0` when codegen isn't enabled or that function is out of the emitter subset.
 #[no_mangle]
-pub extern "C" fn temen_par_inst_eligible(entry: u32) -> i32 {
+pub extern "C" fn temen_par_inst_eligible() -> i32 {
     // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
     let e = unsafe { (*core::ptr::addr_of!(INST_ELIGIBLE)).as_ref() };
-    e.and_then(|v| v.get(entry as usize))
-        .copied()
-        .map_or(0, |b| b as i32)
+    e.and_then(|v| v.first()).copied().map_or(0, |b| b as i32)
 }
 
 /// Whether the run's emitted §14 unit is **paged** (see [`INST_PAGED`]): the Worker must then call
@@ -1618,8 +1616,8 @@ pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_pt
 /// its `instantiate_rec` arrived as the Worker's `env.instantiate_rec` bounce. The engine admits it as
 /// the interpreted op ([`bytecode::Vcpu::admit_record`]: `inst` resolved in `v`'s powerbox, the record
 /// read from `v`'s window, a v1 record through the one detached admission) and returns the admitted
-/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and `(module << 32) | entry`
-/// in `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
+/// child's ticket for its Worker, with `size_log2` in `temen_par_ev_b(v)` and its module in
+/// `temen_par_ev_d(v)`, the operands of a [`PAR_INSTANTIATE_DETACHED`] event. `-EINVAL` for a
 /// refusal, which the emitted parent reads as the spawn's result; `0` for a trap, which the Worker
 /// raises, its wire code staged in [`temen_par_ev_e`]. Once the child's Worker is started, file it
 /// with [`temen_par_inst_file_child`].
@@ -2271,16 +2269,18 @@ fn ticket(child: bytecode::PendingChild) -> i64 {
     Box::into_raw(Box::new(child)) as usize as i64
 }
 
-/// A detached child's `(module << 32) | entry`, the `_d` operand of [`PAR_INSTANTIATE_DETACHED`].
-/// `module`, the child's index in its spawner's program source, is kept only when the child runs the
-/// run's granted unit — the one module the Workers emit — and is `0` otherwise, so a Worker runs the
-/// emitted unit for exactly the children whose program it is. A child of the root's own module (a
-/// spawn record's `module = -1`) stays interpreted.
+/// A detached child's module, the `_d` operand of [`PAR_INSTANTIATE_DETACHED`]: the child's index in
+/// its spawner's program source, kept only when the child runs the run's granted unit — the one
+/// module the Workers emit — and `0` otherwise, so a Worker runs the emitted unit for exactly the
+/// children whose program it is. Every child starts at its module's function 0 (#2219).
 fn detached_operands(child: &bytecode::PendingChild) -> i64 {
-    let (module, entry) = child.module_entry();
     let unit = par_inst().and_then(|c| c.module.as_ref());
     let runs_unit = unit.is_some() && unit == child.self_module().map(|m| &**m);
-    (if runs_unit { (module as i64) << 32 } else { 0 }) | entry as i64
+    if runs_unit {
+        child.module() as i64
+    } else {
+        0
+    }
 }
 
 /// Start a §5 **detached child** (#1286 slice 3b) from its ticket over its own `WebAssembly.Memory`,
@@ -3080,15 +3080,17 @@ fn x2_keep(bytes: Option<std::sync::Arc<[u8]>>) -> usize {
 
 /// The emitted code's call back into the interpreter (`env.call_interp`): function `target`, with
 /// its arguments at `args_ptr` (the call scratch, `XCALL_MAX_SLOTS` i64s) and its results written
-/// back there, over the running call's task. `0` on success; `1` when it trapped.
+/// back there, over the running call's task. `spill_len` is how many words the emitted frames beneath
+/// it pushed to the thread's spill stack ([`temen_x2_spill_ptr`]). `0` on success; `1` when it
+/// trapped.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
-pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_x2_call_interp(target: u32, args_ptr: *mut u8, spill_len: usize) -> i32 {
     // SAFETY: the emitted code passes its env cell's call scratch, `XCALL_MAX_SLOTS` i64s wide.
     let io = unsafe {
         core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
     };
-    match x2_call(|c| (c.bounce)(target, io)) {
+    match x2_call(|c| (c.bounce)(target, io, spill_len)) {
         Some(Ok(_)) => 0,
         Some(Err(t)) => {
             X2_BOUNCE_TRAP.with(|c| c.set(Some(t)));
@@ -3178,6 +3180,42 @@ pub extern "C" fn temen_x2_mapped_now() -> u64 {
     x2_call(|c| c.mapped_now()).unwrap_or(0)
 }
 
+/// Whether the running call is page-checked ([`bytecode::EmittedCall::pagestate`]): 1 or 0.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_paged() -> i32 {
+    x2_call(|c| c.pagestate().is_some() as i32).unwrap_or(0)
+}
+
+/// The base of the running thread's spill stack ([`bytecode::EmittedCall::spill`]), which lives as
+/// long as the thread: null when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_ptr() -> *mut u64 {
+    x2_call(|c| c.spill().map(|(base, _)| base))
+        .flatten()
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// The size of the running thread's spill stack in bytes ([`bytecode::EmittedCall::spill`]): `0`
+/// when its tier does not spill.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_spill_bytes() -> usize {
+    x2_call(|c| c.spill().map_or(0, |(_, words)| words * 8)).unwrap_or(0)
+}
+
+/// The running call's page-state table ([`bytecode::EmittedCall::pagestate`]): what a Worker gives
+/// its instances' `"pagestate"` at the call and after each bounce. Null when the call is not
+/// page-checked.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_pagestate_ptr() -> *const u8 {
+    x2_call(|c| c.pagestate())
+        .flatten()
+        .unwrap_or(core::ptr::null())
+}
+
 /// A thread of a parallel-driver run, boxed for the Worker that runs it ([`temen_x2_thread`]).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 type X2Thread = Box<dyn FnOnce() + Send>;
@@ -3223,13 +3261,14 @@ pub extern "C" fn temen_x2_thread(start: *mut X2Thread) {
 /// so [`temen_par_stdout_len`] reads the run's output. `[seed_ptr, seed_len)` is written into the
 /// window from offset 0 before the data segments: the unit blobs a runtime-compile guest reads.
 ///
-/// With `tierup` set, a module-0 task's calls to the functions the threads tier-up emit takes
-/// ([`threads_tierup`]) run on it, each on its thread's Worker. With §22 codegen on
+/// With `tierup` set, a module-0 task's calls to the functions the coop driver's region emit takes
+/// ([`coop_emit_for`], its tier-up floor included: [`temen_coop_set_tierup_floor`]) run on it, each
+/// on its thread's Worker, and the run is of the module that emit outlined. With §22 codegen on
 /// ([`temen_par_jit_set_codegen`]), a guest's `Jit.invoke` of a unit with emitted wasm runs it there
 /// too, its `call.dyn`s reaching the run's dispatch table through each Worker's mirror of it. The
 /// emitted code addresses the root's window as one span, so then the window is a flat one of the
-/// declared size or `win_size`, whichever is larger, and it cannot grow past that; otherwise it is
-/// the driver's own, which grows on demand.
+/// declared size or `win_size`, whichever is larger, rounded up to a power of two, and it cannot
+/// grow past that; otherwise it is the driver's own, which grows on demand.
 ///
 /// Returns the guest's `i64` result; [`temen_status`], [`temen_exit_code`] and [`temen_trap_ptr`]
 /// tell the rest, as for [`temen_run_onramp`].
@@ -3251,6 +3290,30 @@ pub extern "C" fn temen_x2_start(
     let Ok(m) = temen_encode::decode_module(bytes) else {
         set(STATUS_DECODE_ERR);
         return 0;
+    };
+    // Emitted code addresses the window as one flat span masked to `1 << win_log2`, so a run with an
+    // emitted tier gets a flat window of exactly that size: the declared size or `win_size`,
+    // whichever is larger, rounded up to a power of two.
+    let win_log2 = m
+        .memory
+        .map_or(0, |mc| mc.size_log2)
+        .max(win_size.next_power_of_two().trailing_zeros() as u8);
+    // With `tierup`, regions run on the coop driver's emit, which outlines the guest's cap calls into
+    // the module both tiers then run. A paged emit checks each access against its thread's page-state
+    // table, and a spilling one pushes its frames' live words to its thread's spill stack.
+    let emit = (tierup != 0)
+        .then(|| coop_emit_for(&m, true, win_log2).ok())
+        .flatten();
+    let (m, regions) = match emit {
+        Some(e) => {
+            // A local-table emit leaves the run's table as it is.
+            let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
+            (
+                e.m,
+                Some((e.wasm, e.eligible, table_log2, e.paged, e.spill)),
+            )
+        }
+        None => (m, None),
     };
     let m = std::sync::Arc::new(m);
     let io = par_io();
@@ -3281,12 +3344,8 @@ pub extern "C" fn temen_x2_start(
             pb => {
                 // SAFETY: published by `temen_par_powerbox` and taken out of `PAR_PB` above, so
                 // this run owns it: no Worker of another run reads it.
-                let mut pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
+                let pb = unsafe { Box::from_raw(pb as *mut ParPowerbox) };
                 codegen = par_jit_codegen();
-                if codegen {
-                    // The per-Worker driver emits the host's unit itself; here the host does.
-                    pb.host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
-                }
                 (
                     pb.host,
                     vec![Value::I32(pb.jit), Value::I32(pb.code)],
@@ -3295,23 +3354,32 @@ pub extern "C" fn temen_x2_start(
             }
         }
     };
-    let regions = if tierup != 0 {
-        threads_tierup(&m)
-    } else {
-        None
-    };
+    // §22 units run emitted when codegen asks and the run's table can fill every slot their
+    // `call.dyn`s may reach, as on the coop driver.
+    let codegen = codegen && all_shimmable(&m);
     let mut back = None;
     let mut platform = X2_PLATFORM;
     if regions.is_some() || codegen {
-        let declared = m.memory.map_or(0, |mc| 1usize << mc.size_log2);
         let page = temen_interp::host_page_size();
-        let Some(flat) = temen_interp::Region::owned_zeroed(declared.max(win_size) as u64, page)
-        else {
+        let Some(flat) = temen_interp::Region::owned_zeroed(1u64 << win_log2, page) else {
             set(STATUS_UNSUPPORTED);
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible) = regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()]));
+        let (wasm, eligible, table_log2, paged, spill) =
+            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0, false, false));
+        // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
+        host.set_jit_table_log2(table_log2);
+        // The units emit as the coop driver's do, over this run's window and table, or none does
+        // and every invoke interprets.
+        if codegen {
+            TIERUP_UNIT_SHARED.store(true, Ordering::Relaxed);
+            TIERUP_UNIT_WIN_LOG2.store(win_log2, Ordering::Relaxed);
+            TIERUP_UNIT_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
+            host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
+        } else {
+            host.set_jit_wasm_emitter(|_| None);
+        }
         *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = wasm;
         *X2_SIGS.lock().unwrap_or_else(|e| e.into_inner()) = m
             .funcs
@@ -3321,6 +3389,9 @@ pub extern "C" fn temen_x2_start(
         X2_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
         platform.tier = Some(bytecode::ThreadTier {
             eligible: eligible.into(),
+            page_checked: paged,
+            // Each thread's spill stack is the size of the coop run's.
+            spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
             run: x2_run,
         });
     }
@@ -4101,11 +4172,10 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set, only for a guest that spawns detached: the `"module"` grant is
-        // non-durable, so granting it everywhere would make every reactor that saves a warm
-        // snapshot unfreezable.
+        // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only
+        // for a guest that spawns detached: least authority.
         if temen_ir::spawns_detached(m) {
-            host.grant_detached_spawn_caps(win, temen_ir::spawns_by_module_handle(m));
+            host.grant_detached_spawn_caps(win);
         }
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
@@ -10197,7 +10267,7 @@ fn op13_mini_driver() -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1(0)
+        ..temen_ir::SpawnRec::v1()
     };
     let (seg, stores) = plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     format!(
@@ -12359,7 +12429,8 @@ block 0 (v0: i64) {
 
 /// The tier-up run's §22 unit-emit parameters (#835), read by [`onramp_tierup_unit_emitter`]
 /// (a bare `fn` — [`Host::set_jit_wasm_emitter`] stores no closure state): the run's memory-share
-/// flag and its window log2. Stored at [`temen_coop_open`]; single-threaded wasm.
+/// flag and its window log2. Stored when a run opens ([`temen_coop_open`], and the parallel
+/// driver's `temen_x2_start`); one such run at a time.
 static TIERUP_UNIT_SHARED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -12379,7 +12450,8 @@ static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
 static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
 
-/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846):
+/// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846), and
+/// the parallel driver for a run whose §22 units run emitted (`temen_x2_start`):
 /// emit a validated unit whole-module in **Model B2** shape (`compile_module_b2` — its
 /// `call.dyn` dispatches through the driver's shared funcref table, so a **linked** unit's
 /// Slot callbacks reach installed units / eligible program `f{i}`s natively and everything else
@@ -12848,6 +12920,29 @@ struct CoopEmit {
     spill: bool,
 }
 
+/// Whether every function of `m` can take a bounce shim (scalar operands, arity ≤ the env
+/// scratch's slot count): what a B2 dispatch table needs to fill each slot an emitted `call.dyn`
+/// may reach.
+fn all_shimmable(m: &temen_ir::Module) -> bool {
+    let scalar = |t: &temen_ir::ValType| {
+        matches!(
+            t,
+            temen_ir::ValType::I32
+                | temen_ir::ValType::I64
+                | temen_ir::ValType::F32
+                | temen_ir::ValType::F64
+        )
+    };
+    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
+    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
+    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
+    m.funcs.iter().all(|f| {
+        f.params.iter().all(scalar)
+            && f.results.iter().all(scalar)
+            && f.params.len().max(f.results.len()) <= max_slots
+    })
+}
+
 fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<CoopEmit, i32> {
     if onramp_check(m0).is_err() || m0.memory.is_none() {
         return Err(STATUS_UNSUPPORTED);
@@ -12870,29 +12965,13 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
         mc.size_log2 = win_log2;
     }
     // #926 slice 2f — B2 vs non-B2 emit (#880's parity gate for the shared-table world).
-    // A guest whose every function has a shimmable signature (scalar operands, arity ≤ the env
-    // scratch's slot count) emits over the **shared reserved table** (Model B2): `call.dyn`-bearing
-    // functions tier up (the language-runtime dispatch-loop shape), their indirect calls reaching
-    // installed §22 units natively (old→new) and interpreter-resident targets through the live bounce.
-    // A non-shimmable guest (v128 / over-arity) emits in the old local-table mode, where a null
-    // shared-table slot can never diverge from the interpreter's dispatch. An unsupported shape declines.
-    let scalar = |t: &temen_ir::ValType| {
-        matches!(
-            t,
-            temen_ir::ValType::I32
-                | temen_ir::ValType::I64
-                | temen_ir::ValType::F32
-                | temen_ir::ValType::F64
-        )
-    };
-    // The cross-tier call scratch capacity (NOT the whole env cell — #1120 Slice 3 enlarged the cell
-    // with a separate group-edge region; the shimmable-arity gate stays tied to the call scratch).
-    let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
-    let all_shimmable = m.funcs.iter().all(|f| {
-        f.params.iter().all(scalar)
-            && f.results.iter().all(scalar)
-            && f.params.len().max(f.results.len()) <= max_slots
-    });
+    // A guest whose every function has a shimmable signature emits over the **shared reserved
+    // table** (Model B2): `call.dyn`-bearing functions tier up (the language-runtime dispatch-loop
+    // shape), their indirect calls reaching installed §22 units natively (old→new) and
+    // interpreter-resident targets through the live bounce. A non-shimmable guest (v128 /
+    // over-arity) emits in the old local-table mode, where a null shared-table slot can never
+    // diverge from the interpreter's dispatch. An unsupported shape declines.
+    let all_shimmable = all_shimmable(&m);
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());

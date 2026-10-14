@@ -90,7 +90,7 @@ block 0 (vx: i64) {
 
 /// [`SERVICER`] with the grandchild's spawn record: the module's entry 0 in its declared window.
 fn servicer() -> String {
-    format!("{SERVICER}{}", rec::segment(17408, &SpawnRec::v1(0)))
+    format!("{SERVICER}{}", rec::segment(17408, &SpawnRec::v1()))
 }
 
 fn module(src: &str) -> Arc<temen_ir::Module> {
@@ -228,18 +228,18 @@ fn sibling_driven() -> String {
     let s = SpawnRec {
         grants_ptr: 16656,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!(
         "{SIBLING_DRIVEN}{}{}{}",
         rec::segment(17664, &s),
         rec::segment(17760, &c),
-        rec::segment(18432, &SpawnRec::v1(0))
+        rec::segment(18432, &SpawnRec::v1())
     )
 }
 

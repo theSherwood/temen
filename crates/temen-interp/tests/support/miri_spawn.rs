@@ -43,7 +43,7 @@ fn module(src: &str) -> Module {
 pub fn root() -> Module {
     let rec = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     let (m, b, r) = (rec::MODULE_AT, rec::BUDGET_AT, rec::REGION_AT);
     module(&format!(

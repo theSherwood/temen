@@ -162,7 +162,8 @@ type Call<'a> = (u32, u32, usize, &'a [(&'a str, i64)]);
 
 /// A guest making one `call.cap {type_id} {op}` on the powerbox handle at `cap`, with constant
 /// `args` (type, value), declaring `results` `i64` results. It returns the second result when it
-/// declares two, else `7777`, a value defined after the call.
+/// declares two, else `7777`, a value defined after the call. Its function 1 is the harness's child
+/// entry, as every generated guest's is.
 fn one_call(
     type_id: u32,
     op: u32,
@@ -191,7 +192,7 @@ fn one_call(
         vec!["i64"; results].join(", "),
         names.join(", "),
         if results == 2 { "r1" } else { "vr" },
-    );
+    ) + cap_abi::CHILD_ENTRY;
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     m
@@ -244,59 +245,5 @@ fn every_engine_defines_the_results_a_call_declares() {
                 "({type_id}, {op}) declaring {results} results: {outcomes:?}"
             );
         }
-    }
-}
-
-/// A guest that spawns one detached child of its own module (its second function, which returns its
-/// argument), binds the child's handle to `vch`, runs `body`, and returns `vr`, which `body` defines.
-fn spawn_then(body: &str) -> temen_ir::Module {
-    let ps: Vec<String> = (0..15).map(|i| format!("p{i}: i32")).collect();
-    let src = format!(
-        "memory 20\nfunc ({}) -> (i64) {{\nblock 0 ({}) {{\n  vb = i64.extend_i32_u p5\n  \
-         vmod = i64.extend_i32_u p6\n  vz = i64.const 0\n  ve = i64.const 1\n  vsz = i64.const 20\n  \
-         vch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) p3 \
-         (vb, vmod, vz, vz, ve, vsz, vz)\n{body}  return vr\n  }}\n}}\n\
-         func (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  return v0\n  }}\n}}\n",
-        ["i32"; 15].join(", "),
-        ps.join(", "),
-    );
-    let m = temen_text::parse_module(&src).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    m
-}
-
-/// Every engine resolves a child handle by one rule (`temen_ir::join_slot`): a negative handle names
-/// nothing, any other is masked to the join table's power-of-two span, and a joined or detached
-/// child is gone. One that names nothing is a `ThreadFault` to `join`, `poll`, `detach` and `kill`.
-/// The Cranelift JIT trapped `CapFault` for the last three, indexed its table unmasked, and killed a
-/// joined child (#2400).
-#[test]
-fn every_engine_resolves_a_child_handle_alike() {
-    use temen_ir::{cap_id::INSTANTIATOR, trap_code::THREAD_FAULT};
-    // With no child, handle 7 names nothing.
-    for op in [1, 9, 10, 12] {
-        let (_, results) = temen_ir::served_contract(INSTANTIATOR, op).expect("a live op");
-        let m = one_call(INSTANTIATOR, op, 3, &[("i32", 7)], results.len());
-        let outcomes = cap_abi::on_every_engine(&m);
-        assert!(
-            outcomes.iter().all(|o| *o == Some(Err(THREAD_FAULT))),
-            "op {op}: {outcomes:?}"
-        );
-    }
-    // With one child, handle 7 masks onto its slot: detaching by it detaches the child, so the
-    // child's own handle names nothing after.
-    let detach7 = "  v7 = i32.const 7\n  vd = call.cap 6 10 (i32) -> (i32) p3 (v7)\n";
-    for (body, want) in [
-        (format!("{detach7}  vr = i64.extend_i32_s vd\n"), Ok(vec![0])),
-        (
-            format!("{detach7}  vd2 = call.cap 6 10 (i32) -> (i32) p3 (vch)\n  vr = i64.extend_i32_s vd2\n"),
-            Err(THREAD_FAULT),
-        ),
-    ] {
-        let outcomes = cap_abi::on_every_engine(&spawn_then(&body));
-        assert!(
-            outcomes.iter().all(|o| *o == Some(want.clone())),
-            "{body}: {outcomes:?}"
-        );
     }
 }

@@ -115,7 +115,7 @@ block 0 (va: i64, vb: i64) {{
             &SpawnRec {
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1(0)
+                ..SpawnRec::v1()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),

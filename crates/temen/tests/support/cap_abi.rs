@@ -55,6 +55,10 @@ unsafe impl GlobalAlloc for Bounded {
     }
 }
 
+/// Every guest's function 1: a child entry, which the powerbox grants as the module a spawn runs
+/// (#2219).
+pub const CHILD_ENTRY: &str = "func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n";
+
 /// The guest's window: 1 MiB.
 const WINDOW_LOG2: u8 = 20;
 const WINDOW: i64 = 1 << WINDOW_LOG2;
@@ -75,7 +79,7 @@ const CAPS: [u32; 15] = [
     cap_id::INSTANTIATOR,  // 3
     cap_id::ADDRESS_SPACE, // 4
     cap_id::BUDGET,        // 5
-    cap_id::MODULE,        // 6 the program itself
+    cap_id::MODULE,        // 6 the program's child image
     cap_id::MODULE_LOADER, // 7
     cap_id::CLOCK,         // 8
     cap_id::SHARED_REGION, // 9
@@ -382,8 +386,7 @@ fn program(data: &[u8]) -> (String, Vec<u32>) {
         p.body,
         rets.join(" ")
     );
-    // A child entry, for a spawn to start.
-    src.push_str("func (i64) -> (i64) {\nblock 0 (v0: i64) {\n  return v0\n  }\n}\n");
+    src.push_str(CHILD_ENTRY);
     (src, p.results.iter().map(|v| v.type_id).collect())
 }
 
@@ -406,7 +409,9 @@ fn powerbox(m: &temen_ir::Module) -> (Host, Vec<i32>) {
         h.grant_instantiator(0, WINDOW as u64),
         h.grant_address_space(0, WINDOW as u64),
         h.grant_budget(FUEL as i64, 4 << 20, 4),
-        h.grant_module(m),
+        // #2219: a spawn starts at its module's function 0, so the program is granted as the child
+        // image of its child entry, function 1.
+        h.grant_module(&temen_ir::child_image_at(m, 1).expect("function 1 is a child entry")),
         temen_run::grant_module_loader(&mut h),
         h.grant_clock(),
         h.grant_shared_region(1 << 16),

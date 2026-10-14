@@ -143,7 +143,7 @@ fn run_handoff(
 /// `src` with the v1 record at `at` that spawns its serve loop: func 1's child image (#2219), whose
 /// handle the root stores in it.
 fn with_record(src: &str, at: u64) -> String {
-    format!("{src}{}", rec::segment(at, &SpawnRec::v1(0)))
+    format!("{src}{}", rec::segment(at, &SpawnRec::v1()))
 }
 
 /// **4d.1 — run-to-completion handoff ≡ enqueue+park.** The same program serves its second live

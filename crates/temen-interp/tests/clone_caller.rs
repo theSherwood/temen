@@ -19,7 +19,7 @@ use temen_ir::SpawnRec;
 /// The server's spawn record at 17536: S, func 1's child image (#2219), in the window the module
 /// declares.
 fn server() -> String {
-    rec::segment(17536, &SpawnRec::v1(0))
+    rec::segment(17536, &SpawnRec::v1())
 }
 
 /// `src` with its spawn records: the server S at 17536, and the caller C at 17664, granted `"svc"`
@@ -29,7 +29,7 @@ fn forking(src: &str) -> String {
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1(0)
+        ..SpawnRec::v1()
     };
     format!("{src}{}{}", server(), rec::segment(17664, &c))
 }
