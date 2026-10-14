@@ -52,7 +52,7 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     let imports = Imports::new()
         .provide(
             "add_seven",
-            HostCap::host_proc(0, || {
+            HostCap::host_proc(0, |_| {
                 (
                     Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 7])),
                     temen_interp::CapState::Stateless,
@@ -61,7 +61,7 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
         )
         .provide(
             "triple",
-            HostCap::host_proc(0, || {
+            HostCap::host_proc(0, |_| {
                 (
                     Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 3])),
                     temen_interp::CapState::Stateless,
@@ -111,7 +111,7 @@ fn module_bindings_share_one_instance() {
         // One provider, two fields: `set` is op 0, `get` is op 1 — one closure, one cell.
         let imports = Imports::new().provide_module(
             "kv",
-            HostCap::host_proc(0, || {
+            HostCap::host_proc(0, |_| {
                 let mut cell = 0i64;
                 let h: temen_interp::HostProc = Box::new(move |op, args, _mem, _| {
                     Ok(vec![match op {
@@ -147,7 +147,7 @@ fn unbound_name_fails_closed() {
     // Provide only one of the two imports.
     let imports = Imports::new().provide(
         "add_seven",
-        HostCap::host_proc(0, || {
+        HostCap::host_proc(0, |_| {
             (
                 Box::new(|_op, args, _mem, _| Ok(vec![args[0]])),
                 temen_interp::CapState::Stateless,

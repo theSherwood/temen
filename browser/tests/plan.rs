@@ -198,7 +198,7 @@ fn a_card_module_runs_nested_as_built() {
     let out = run(&plan, &[&m], host, &[stdout, exit]).expect("the nested run completes");
 
     assert_eq!(
-        *sink.lock().unwrap(),
+        sink.lock().unwrap().to_vec(),
         direct.stdout,
         "same stdout, nested or not"
     );
@@ -304,7 +304,7 @@ fn a_pipe_edge_carries_one_nodes_stdout_to_anothers_stdin() {
             .expect("the bytecode engine runs the root");
 
     assert_eq!(out, Ok(vec![Value::I64(12)]), "echo wrote its whole line");
-    assert_eq!(&*sink.lock().unwrap(), b"hello, pipe\n", "cat echoed it");
+    assert_eq!(&sink.lock().unwrap()[..], b"hello, pipe\n", "cat echoed it");
     // The same plan cannot run on the spawn-to-completion driver: it is refused, not half-run.
     assert_eq!(
         run(&plan, &[&cat, &echo], Host::new(), &[stdout]),

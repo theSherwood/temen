@@ -291,7 +291,7 @@ impl Moment {
         if let Some((images, table)) = &self.regions {
             let backings: Vec<_> = images
                 .iter()
-                .map(|i| host.rebuild_region(&i.layout().bytes))
+                .map(|i| host.rebuild_moment_region(&i.layout().bytes))
                 .collect();
             host.restore_regions(&backings, table);
         }

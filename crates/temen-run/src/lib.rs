@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use temen_interp::{
     cap_id, run_capture_reserved_with_host, run_with_host, run_with_host_fast, CapPageMap,
-    GuestMem, Host, HostProc, RegionBacking, RootWindow, StreamRole, Trap,
+    GuestMem, Host, HostProc, NodeRef, RegionBacking, RootWindow, StreamRole, Trap,
 };
 // `SharedBacking` is implemented by the per-OS shared-mapping backing (unix `ShmBacking`, windows
 // `WinShmBacking`) the JIT aliases into the window for §13.
@@ -44,6 +44,9 @@ pub use temen_interp::Value;
 // Re-export the mem-hook instrumentation stats so [`Instance::mem_hook_stats`] consumers need not
 // also depend on `temen-opt`.
 pub use temen_opt::instrument::MemHookStats;
+mod descriptors;
+pub use descriptors::raise_descriptor_limit;
+use descriptors::Descriptor;
 pub mod exec;
 pub mod fs;
 mod jit_proc;
@@ -4643,8 +4646,9 @@ unsafe fn mapped_atomic(
 struct ShmBacking {
     fd: std::os::fd::OwnedFd,
     ptr: *mut u8,
-    cap: usize, // page-rounded mapping length (the fd size)
-    len: usize, // logical region size the guest sees
+    cap: usize,        // page-rounded mapping length (the fd size)
+    len: usize,        // logical region size the guest sees
+    _held: Descriptor, // #2306 — `fd`'s share of the process's descriptors
 }
 
 // SAFETY: `ptr` is a `MAP_SHARED` mapping of `fd` — a process-wide shared object, not thread-local.
@@ -4657,7 +4661,7 @@ unsafe impl Sync for ShmBacking {}
 
 #[cfg(unix)]
 impl ShmBacking {
-    fn new(len: usize) -> std::io::Result<ShmBacking> {
+    fn new(len: usize, held: Descriptor) -> std::io::Result<ShmBacking> {
         use std::os::fd::AsRawFd;
         let page = host_page_size() as usize;
         let cap = len.max(1).div_ceil(page) * page;
@@ -4681,6 +4685,7 @@ impl ShmBacking {
             ptr: p as *mut u8,
             cap,
             len,
+            _held: held,
         })
     }
 }
@@ -4724,9 +4729,13 @@ impl Drop for ShmBacking {
 
 /// Create a §13 `SharedRegion` backing over a fresh `len`-byte OS shared-memory object — install it
 /// with [`temen_interp::Host::grant_shared_region_backed`] so the JIT can `mmap` it for real aliasing.
+/// #2306 — the guest-minted region's factory too ([`temen_interp::Host::set_region_factory`]), so
+/// it never panics: `Err` is the errno, `-EMFILE` past the process's descriptors ([`Descriptor`]),
+/// or what the OS refused.
 #[cfg(unix)]
-pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::sync::Arc::new(ShmBacking::new(len).expect("create shared region"))
+pub fn new_shared_region(len: usize) -> Result<RegionBacking, i64> {
+    let backing = ShmBacking::new(len, Descriptor::take()?).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// A §13 `SharedRegion` backing over a **real host file** (not a fresh memfd) — the bridge that makes
@@ -4743,6 +4752,7 @@ struct FileBacking {
     ptr: *mut u8,
     cap: usize, // page-rounded mapping length (≤ the file size, so no access faults past EOF)
     len: usize, // logical region size the guest sees
+    _held: Descriptor, // #2306 — `file`'s share of the process's descriptors
 }
 
 // SAFETY: identical rationale to `ShmBacking` — `ptr` is a `MAP_SHARED` mapping of a process-wide
@@ -4755,7 +4765,7 @@ unsafe impl Sync for FileBacking {}
 
 #[cfg(unix)]
 impl FileBacking {
-    fn new(file: std::fs::File, len: usize) -> std::io::Result<FileBacking> {
+    fn new(file: std::fs::File, len: usize, held: Descriptor) -> std::io::Result<FileBacking> {
         use std::os::fd::AsRawFd;
         let page = host_page_size() as usize;
         let cap = len.max(1).div_ceil(page) * page;
@@ -4784,6 +4794,7 @@ impl FileBacking {
             ptr: p as *mut u8,
             cap,
             len,
+            _held: held,
         })
     }
 
@@ -4846,9 +4857,16 @@ impl Drop for FileBacking {
 /// zero-copy file-mmap bridge (MMAP_CAPABILITY.md §4b). Install it with
 /// [`temen_interp::Host::grant_shared_region_backed`] and the guest maps it with the built-in
 /// `SharedRegion.map`, aliasing the real file into its window. Unix only for now.
+///
+/// The backing holds its **own** descriptor, a dup of `file`'s, so it outlives the caller's and
+/// both share one page cache. #2306 — that descriptor is one of the process's ([`Descriptor`]):
+/// `Err` is the errno, `-EMFILE` past them, or what the OS refused.
 #[cfg(unix)]
-pub fn new_file_region(file: std::fs::File, len: usize) -> std::io::Result<RegionBacking> {
-    Ok(std::sync::Arc::new(FileBacking::new(file, len)?))
+pub fn new_file_region(file: &std::fs::File, len: usize) -> Result<RegionBacking, i64> {
+    let held = Descriptor::take()?;
+    let dup = file.try_clone().map_err(|e| fs::io_errno(&e))?;
+    let backing = FileBacking::new(dup, len, held).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// A §13 `SharedRegion` backing over a Windows **pagefile-backed section** (`CreateFileMappingW` with
@@ -4861,7 +4879,8 @@ pub fn new_file_region(file: std::fs::File, len: usize) -> std::io::Result<Regio
 struct WinShmBacking {
     section: windows_sys::Win32::Foundation::HANDLE,
     ptr: *mut u8,
-    len: usize, // logical region size the guest sees
+    len: usize,        // logical region size the guest sees
+    _held: Descriptor, // #2306 — `section`'s share of the process's descriptors (unbounded here)
 }
 
 // SAFETY: `ptr`/`section` name a process-wide file mapping, not thread-local state. A §13 region is
@@ -4874,7 +4893,7 @@ unsafe impl Sync for WinShmBacking {}
 
 #[cfg(windows)]
 impl WinShmBacking {
-    fn new(len: usize) -> std::io::Result<WinShmBacking> {
+    fn new(len: usize, held: Descriptor) -> std::io::Result<WinShmBacking> {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MapViewOfFile, FILE_MAP_ALL_ACCESS, PAGE_READWRITE,
@@ -4908,6 +4927,7 @@ impl WinShmBacking {
             section,
             ptr: view.Value as *mut u8,
             len,
+            _held: held,
         })
     }
 }
@@ -4956,9 +4976,11 @@ impl Drop for WinShmBacking {
 
 /// Create a §13 `SharedRegion` backing over a fresh `len`-byte Windows section — install it with
 /// [`temen_interp::Host::grant_shared_region_backed`] so the JIT can alias it via `MapViewOfFile3`.
+/// #2306 — `Err` is the errno, as on unix.
 #[cfg(windows)]
-pub fn new_shared_region(len: usize) -> RegionBacking {
-    std::sync::Arc::new(WinShmBacking::new(len).expect("create shared region"))
+pub fn new_shared_region(len: usize) -> Result<RegionBacking, i64> {
+    let backing = WinShmBacking::new(len, Descriptor::take()?).map_err(|e| fs::io_errno(&e))?;
+    Ok(std::sync::Arc::new(backing))
 }
 
 /// How a guest program ended: its entry returned values, or it invoked `Exit(code)` (§3e).
@@ -5860,7 +5882,16 @@ pub fn nim_posix_imports(
     // The slot carries temen-posix's OWN fork factory rather than `HostCap::host_proc`'s
     // shared-state default, which re-mints a twin's handler over the **parent's** `Proc` — wrong
     // for a personality with real per-process state (the twin would write the parent's fd table).
-    let slot = SharedHostProc::new(move || (*make)(), temen_posix::cap_fork_factory(posix));
+    let slot = SharedHostProc::new(
+        {
+            let posix = posix.clone();
+            move |payer| {
+                posix.bind(payer); // #2306 — the domain it is granted to pays for its state
+                (*make)()
+            }
+        },
+        temen_posix::cap_fork_factory(posix),
+    );
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
@@ -6814,6 +6845,11 @@ struct OfferBinding {
     policy: temen_interp::OfferPolicy,
 }
 
+/// What makes a host capability's handler and its [`CapState`](temen_interp::CapState) (#1699) at
+/// a grant, handed the node of the domain it is granted to, which pays for what the guest grows its
+/// state by (#2306).
+type MakeHostProc = dyn Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync;
+
 /// #1645 — a **shared** `host_proc` slot: ONE powerbox entry serving many import slots.
 ///
 /// [`HostCap::host_proc`] and its forkable sibling grant a fresh entry per slot, which is right for
@@ -6840,7 +6876,7 @@ struct OfferBinding {
 /// cheap `Arc` bump and shares the memo — clones of one slot are one slot.
 #[derive(Clone)]
 pub struct SharedHostProc {
-    make: Arc<dyn Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync>,
+    make: Arc<MakeHostProc>,
     fork: temen_interp::HostProcFork,
     /// `(domain_id, handle)` per `Host` this slot has been granted on. A `Vec` because the count is
     /// one or two (interp, JIT) for the life of an `Imports`, and a linear scan says so.
@@ -6848,13 +6884,16 @@ pub struct SharedHostProc {
 }
 
 impl SharedHostProc {
-    /// A slot over `make` (the provider's handler factory, each mint with its [`CapState`], #1699)
-    /// and `fork` (its own fork factory — the per-process split a personality needs; see
-    /// [`HostCap::host_proc_forkable`]).
+    /// A slot over `make` (the provider's handler factory, each mint with its [`CapState`], #1699,
+    /// and paid for by the node it is handed, #2306) and `fork` (its own fork factory — the
+    /// per-process split a personality needs; see [`HostCap::host_proc_forkable`]).
     ///
     /// [`CapState`]: temen_interp::CapState
     pub fn new(
-        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState)
+            + Send
+            + Sync
+            + 'static,
         fork: temen_interp::HostProcFork,
     ) -> Self {
         Self {
@@ -6875,7 +6914,7 @@ impl SharedHostProc {
         if let Some((_, h)) = g.iter().find(|(d, _)| *d == dom) {
             return *h;
         }
-        let (f, state) = (self.make)();
+        let (f, state) = (self.make)(&host.own_node());
         let handle = host.grant_host_proc_forkable(f, Arc::clone(&self.fork), state);
         g.push((dom, handle));
         handle
@@ -6961,25 +7000,39 @@ impl HostCap {
     /// fresh handler per host (called once per backend, so it must be re-buildable). The handler is
     /// `(op, args, guest_mem) -> result slots | Trap`. Each mint comes with the provider's
     /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
-    /// where the handler is made.
+    /// where the handler is made. `make` is handed the node of the domain the capability is granted
+    /// to (#2306), which pays for the host memory a guest grows that state by
+    /// ([`temen_interp::HostCharge`]).
     pub fn host_proc(
         op: u32,
-        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
-        // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
-        // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider state
-        // (`ForkedProc::shared`), the right default for an arbitrary host cap whose state the
-        // runtime cannot split. A personality with real per-process state supplies its own factory
-        // via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`).
-        let fork: temen_interp::HostProcFork = Arc::new({
-            let make = Arc::clone(&make);
-            move |_pid| {
-                let (h, state) = make();
-                temen_interp::ForkedProc::shared(h, state)
-            }
-        });
-        Self::host_proc_forkable(op, move || make(), fork)
+        HostCap {
+            type_id: cap_id::HOST_PROC,
+            op,
+            grant: Arc::new(move |h, _| {
+                // FORK.md PR 5 / #863: with no provider-supplied fork factory, `make` doubles as a
+                // shared-state one — a `fork()` twin re-mints a fresh closure over the SAME provider
+                // state (`ForkedProc::shared`), the right default for an arbitrary host cap whose
+                // state the runtime cannot split. A personality with real per-process state supplies
+                // its own factory via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`). What a twin
+                // mints is paid for by the grantee, as a child's re-grant is (#2306).
+                let payer = h.own_node();
+                let fork: temen_interp::HostProcFork = Arc::new({
+                    let (make, payer) = (Arc::clone(&make), payer.clone());
+                    move |_pid| {
+                        let (h, state) = make(&payer);
+                        temen_interp::ForkedProc::shared(h, state)
+                    }
+                });
+                let (f, state) = make(&payer);
+                h.grant_host_proc_forkable(f, fork, state)
+            }),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
     }
 
     /// [`HostCap::host_proc`] with a **provider-supplied fork factory** (#863): the factory decides
@@ -6988,14 +7041,14 @@ impl HostCap {
     /// re-mints through this factory (`Host::fork_powerbox`).
     pub fn host_proc_forkable(
         op: u32,
-        make: impl Fn() -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
         fork: temen_interp::HostProcFork,
     ) -> HostCap {
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
             grant: Arc::new(move |h, _| {
-                let (f, state) = make();
+                let (f, state) = make(&h.own_node());
                 h.grant_host_proc_forkable(f, Arc::clone(&fork), state)
             }),
             unbound: false,
@@ -7024,14 +7077,16 @@ impl HostCap {
     /// like a plain `host_proc`.
     pub fn host_proc_region(
         op: u32,
-        make: impl Fn() -> (temen_interp::HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef) -> (temen_interp::HostProc, temen_interp::CapState)
+            + Send
+            + Sync
+            + 'static,
     ) -> HostCap {
-        let make = Arc::new(make);
         HostCap {
             type_id: cap_id::HOST_PROC,
             op,
             grant: Arc::new(move |h, _| {
-                let (f, state) = make();
+                let (f, state) = make(&h.own_node());
                 h.grant_host_proc_region(f, state)
             }),
             unbound: false,
@@ -8504,7 +8559,7 @@ mod file_region_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let backing = new_file_region(file, 8192).expect("map file region");
+        let backing = new_file_region(&file, 8192).expect("map file region");
 
         // 1. The file's existing bytes are visible through the alias (no copy-in, no staleness).
         let seen: Vec<u8> = (0..8).map(|i| backing.read_byte(i)).collect();
@@ -8570,7 +8625,7 @@ mod file_region_tests {
             .write(true)
             .open(&path)
             .unwrap();
-        let backing = new_file_region(file, 4096).expect("map file region");
+        let backing = new_file_region(&file, 4096).expect("map file region");
         // The whole region is addressable (reads return the zero-fill, not a fault).
         assert_eq!(backing.read_byte(0), 0);
         assert_eq!(backing.read_byte(4095), 0);

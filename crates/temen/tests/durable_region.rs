@@ -633,7 +633,7 @@ block 4 (vd: i64) {
 fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
     let child = confined(SHARING_CHILD);
     let parent = confined(SHARING_PARENT);
-    let shm = || temen_run::new_shared_region(LEN);
+    let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (mut host, args) = sharing_host(&child, shm());
     assert_eq!(
@@ -894,7 +894,7 @@ fn a_region_granted_into_a_running_child_rides_a_freeze() {
 #[test]
 fn a_region_granted_into_a_running_child_rides_a_jit_freeze() {
     let child = confined(GRANTED_CHILD);
-    let shm = || temen_run::new_shared_region(LEN);
+    let shm = || temen_run::new_shared_region(LEN).expect("a region");
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
     let (mut host, args) = granting_host(&child, shm(), shm());
     let image = || MemLayout::image(fresh.clone());

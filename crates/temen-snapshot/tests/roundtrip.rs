@@ -1530,7 +1530,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let seen: CapLog = Default::default();
     let log = std::sync::Arc::clone(&seen);
     let mut thost = Host::new();
-    thost.set_named_cap_registrar(Box::new(move |name, state| {
+    thost.set_named_cap_registrar(Box::new(move |name, state, _payer| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
         Some(temen_interp::NamedCapGrant {
             handler: Box::new(|_op, _args, _mem, _| Ok(vec![99])),

@@ -401,7 +401,7 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
     // The shared stdout carries BOTH replies — the twin resumed the same continuation with reply_twin
     // (200) over its own private window and duplicated powerbox. The original reaped the twin before
     // returning (I53), so both writes are on the sink deterministically; order is scheduler-dependent.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(bytes.len(), 16, "two i64 writes reached the shared sink");
     let mut vals: Vec<i64> = bytes
         .chunks_exact(8)
@@ -439,7 +439,7 @@ fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
         &mut host,
     )
     .expect("oracle run");
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     (r, bytes)
 }
 
@@ -465,7 +465,7 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     )
     .expect("the fork module runs natively on the bytecode engine (not folded to the oracle)")
     .expect("bytecode run");
-    let bc_bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bc_bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
 
     assert_eq!(
         bc_r, oracle_r,
@@ -682,7 +682,7 @@ fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
     );
     // Both copies wrote their fork() return (parent 3, child 0). The parent reaped the twin before
     // returning (I53), so the child's write is on the sink deterministically before teardown.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(bytes.len(), 16, "both copies wrote their fork() return");
     let mut vals: Vec<i64> = bytes
         .chunks_exact(8)
@@ -850,7 +850,7 @@ fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
     );
     // Exactly ONE write reached stdout: the parent's reaped status. The twin took the `else` branch
     // (exit 42) and never wrote — proving the branch-on-fork-return split parent from child.
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(
         bytes.len(),
         8,
@@ -1012,7 +1012,7 @@ fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
         vec![Value::I64(0)],
         "WNOHANG returned 0 for a still-running (never-exiting) twin"
     );
-    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let bytes = sink.lock().unwrap_or_else(|e| e.into_inner()).to_vec();
     assert_eq!(bytes.len(), 8, "the parent wrote its WNOHANG result once");
     let status = i64::from_le_bytes(bytes[..8].try_into().unwrap());
     assert_eq!(status, 0, "WNOHANG on a running child is 0");

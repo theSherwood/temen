@@ -578,7 +578,7 @@ fn driver_hands_off_a_file_between_phases_through_a_shared_memfs() {
         // A fresh shared store per run: both phase children are granted one grant each from the same
         // factory, so `gen`'s write and `use`'s read hit the same filesystem.
         let (factory, _handle) = temen_run::fs::mem_fs_shared_factory(vec![], vec![]);
-        let child_fs = HostCap::host_proc(0, factory);
+        let child_fs = HostCap::host_proc(0, move |_| factory());
         let phases = vec![fs_phase("gen", GEN_PHASE), fs_phase("use", USE_PHASE)];
         let r = inst
             .run_with_caps(
@@ -653,7 +653,7 @@ fn a_child_gets_fs_only_when_the_parent_grants_it() {
                     "exec",
                     domain_exec_with_fs(
                         vec![fs_phase("probe", PROBE_PHASE)],
-                        HostCap::host_proc(0, factory),
+                        HostCap::host_proc(0, move |_| factory()),
                     ),
                 )],
             )

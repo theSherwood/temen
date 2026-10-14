@@ -194,7 +194,7 @@ fn ending_an_alias_leaves_the_region_alone() {
     // SAFETY: the page at `at` is committed read/write at every access below.
     let p = unsafe { r.base.add(at) };
     for (how, by_protect) in [("map over it", false), ("protect(none)", true)] {
-        let region = temen_run::new_shared_region(page);
+        let region = temen_run::new_shared_region(page).expect("a region");
         assert_eq!(
             w.map_region(at as u64, 0, page as u64, PROT_RW, 1, region.clone()),
             0

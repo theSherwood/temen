@@ -439,6 +439,10 @@ pub enum RestoreError {
     /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
     /// the thaw may narrow that, never widen it (INVARIANTS #3).
     BudgetRefused(BudgetThawRefused),
+    /// #2306 — the restoring host could not rebuild a carried §13 region: the OS or the process's
+    /// descriptor pool refused it, or its memory could not be had. Carries the errno. Nothing is
+    /// restored: a thaw never runs without a region its artifact names.
+    RegionRefused(i64),
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -1595,7 +1599,11 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
     if depth == 0 {
-        cut.regions = carried.iter().map(|b| host.rebuild_region(b)).collect();
+        cut.regions = carried
+            .iter()
+            .map(|b| host.rebuild_region(b))
+            .collect::<Result<_, _>>()
+            .map_err(RestoreError::RegionRefused)?;
         cut.regions_reached = vec![false; carried.len()];
     }
     let mut region_named = BTreeSet::new();

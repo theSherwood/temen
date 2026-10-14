@@ -67,7 +67,7 @@ struct Spawn {
     host: Host,
     args: [i32; 7],
     fs: temen_run::fs::MemFsHandle,
-    stdout: Arc<Mutex<Vec<u8>>>,
+    stdout: Arc<Mutex<temen_interp::HostBuffer>>,
 }
 
 /// The grant list is `[extra, exit, stdout, fs]`: the two caps the child uses sit at records 2 and 3.
@@ -106,7 +106,12 @@ fn spawn() -> Spawn {
 
 /// The child joined back with its `fs` write's byte count, wrote the file through record 3 (`fs`), and
 /// wrote the stream through record 2 (`stdout`).
-fn check(joined: i64, fs: &temen_run::fs::MemFsHandle, stdout: &Mutex<Vec<u8>>, engine: &str) {
+fn check(
+    joined: i64,
+    fs: &temen_run::fs::MemFsHandle,
+    stdout: &Mutex<temen_interp::HostBuffer>,
+    engine: &str,
+) {
     assert_eq!(
         joined,
         FILE_BODY.len() as i64,
@@ -121,7 +126,7 @@ fn check(joined: i64, fs: &temen_run::fs::MemFsHandle, stdout: &Mutex<Vec<u8>>, 
             panic!("{engine}: the child wrote no out.bin — record 3 (`fs`) did not resolve")
         });
     assert_eq!(emitted, FILE_BODY.as_bytes());
-    let streamed = stdout.lock().unwrap().clone();
+    let streamed = stdout.lock().unwrap().to_vec();
     assert_eq!(
         String::from_utf8_lossy(&streamed),
         STREAM_BODY,

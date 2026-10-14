@@ -19306,7 +19306,8 @@ impl SharedBacking for VecBacking {
 
 /// #2111 — a region the run's domains made (a guest's `create_region` or a file mapping, or a thaw's
 /// rebuild): its backing, charged to `node` and every ancestor for as long as it lives — its `bytes`
-/// of `channel`, and (#2268) the mapping the host holds of it ([`region_cost`]). The charge rides the
+/// of `channel`, and (#2268, #2306) the mapping the host holds of it and that mapping's address space
+/// ([`region_cost`]). The charge rides the
 /// shared backing, as a pipe's does ([`ChannelCharge`]), so whichever domain lets go of it last
 /// refunds the node that paid. A domain lets go of its regions when it ends
 /// ([`Host::release_memory`]), so the refund lands at the same point on every engine.
@@ -19317,9 +19318,10 @@ struct ChargedRegion {
 }
 
 /// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
-/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it.
-fn region_cost(bytes: u64) -> [(usize, u64); 2] {
-    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1)]
+/// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it, whose
+/// `size` (#2306) is address space the process's pool of it counts ([`RESERVED_POOL`]).
+fn region_cost(bytes: u64, size: u64) -> [(usize, u64); 3] {
+    [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1), (RESERVED, size)]
 }
 
 impl SharedBacking for ChargedRegion {
@@ -19348,9 +19350,10 @@ impl SharedBacking for ChargedRegion {
 
 impl Drop for ChargedRegion {
     fn drop(&mut self) {
-        self.node
-            .tree
-            .refund_set(self.node.node, &region_cost(self.bytes));
+        self.node.tree.refund_set(
+            self.node.node,
+            &region_cost(self.bytes, self.backing.size()),
+        );
     }
 }
 
@@ -20007,10 +20010,10 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2305 — how much address space the windows of this process's guests may reserve between them:
-/// 64 TiB, half of what a 47-bit host gives a process, so the host's own mappings keep the other
-/// half. Every window reserves its whole mask domain up front, 128 GiB by default
-/// ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
+/// #2305 — how much address space the windows of this process's guests may reserve between them,
+/// and (#2306) the host's mappings of their regions: 64 TiB, half of what a 47-bit host gives a
+/// process, so the host's own mappings keep the other half. Every window reserves its whole mask
+/// domain up front, 128 GiB by default ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
 /// only be refused where it is built, which differs by engine (the interpreter falls back to a
 /// heap-backed window, the JIT cannot); so every domain's window is held against this at its
 /// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
@@ -20022,18 +20025,25 @@ pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
 };
 
 /// #2268, #2305 — what every run in this process holds between them of a resource the process has a
-/// fixed amount of: its OS mappings ([`maps_pool`]) or its address space ([`RESERVED_POOL`]).
-struct Pool(AtomicU64);
+/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`RESERVED_POOL`]), or
+/// (#2306, `temen-run`'s) its file descriptors.
+#[derive(Debug, Default)]
+pub struct Pool(AtomicU64);
 
 /// #2268 — what every run holds of [`maps_pool`].
-static MAPS_IN_USE: Pool = Pool(AtomicU64::new(0));
-/// #2305 — what every run's windows hold of [`RESERVED_POOL`].
-static RESERVED_IN_USE: Pool = Pool(AtomicU64::new(0));
+static MAPS_IN_USE: Pool = Pool::new();
+/// #2305 — what every run's windows and regions hold of [`RESERVED_POOL`].
+static RESERVED_IN_USE: Pool = Pool::new();
 
 impl Pool {
+    /// A pool nothing holds any of yet.
+    pub const fn new() -> Pool {
+        Pool(AtomicU64::new(0))
+    }
+
     /// Take `n` for a charge: `false`, taking nothing, when that would hold more than `size`
     /// (`check`). A [`Fits::Forced`] charge takes it regardless.
-    fn take(&self, n: u64, size: u64, check: bool) -> bool {
+    pub fn take(&self, n: u64, size: u64, check: bool) -> bool {
         n == 0
             || self.update(|used| {
                 let now = used.saturating_add(n);
@@ -20042,7 +20052,7 @@ impl Pool {
     }
 
     /// Hand `n` back.
-    fn give(&self, n: u64) {
+    pub fn give(&self, n: u64) {
         self.update(|used| Some(used.saturating_sub(n)));
     }
 
@@ -20726,6 +20736,239 @@ pub type LiveVcpu = Held<VcpuCost>;
 /// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
 /// `cont.new` makes it ([`Host::fiber_charge`]) and handed back when it returns or its registry goes.
 pub type LiveFiber = Held<FiberCost>;
+
+/// #2306 — the size from which an allocation is an OS mapping of its own: glibc's default
+/// `M_MMAP_THRESHOLD`. A [`HostCharge`] this large holds one `maps` besides its bytes, so no
+/// allocator needs tuning to keep the guests' mappings inside [`maps_pool`].
+pub const MAPPED_BUFFER: u64 = 128 << 10;
+
+/// #2306 — what one entry of a table a guest fills through a capability costs the host besides its
+/// contents: its slot, and its allocations' headers. A capability charges it ([`HostCharge`]) for
+/// each name, descriptor, listing entry, mapping or job its guest holds, so their number is
+/// bounded with the bytes they hold.
+pub const TABLE_ENTRY: u64 = 128;
+
+/// #2306 — host memory a guest causes through a capability: a file's bytes, a pipe's or a socket's
+/// queue, a listing it holds open, the entries of a table it fills. Charged to its **payer**, the
+/// node of the domain the capability's state was granted to, and every ancestor: its bytes of
+/// `channel`, and one `maps` while those reach [`MAPPED_BUFFER`]. Growing is all or nothing, refused
+/// at any ceiling or at the process's pool of mappings; shrinking hands the difference back, and
+/// dropping it the rest. One with no payer charges nothing: state an embedder keeps for itself.
+#[derive(Default)]
+pub struct HostCharge {
+    payer: Option<NodeRef>,
+    bytes: u64,
+}
+
+impl HostCharge {
+    /// One that holds nothing yet, charging `payer` as it grows.
+    pub fn new(payer: Option<NodeRef>) -> HostCharge {
+        HostCharge { payer, bytes: 0 }
+    }
+
+    /// Who it charges.
+    pub fn payer(&self) -> Option<&NodeRef> {
+        self.payer.as_ref()
+    }
+
+    /// What it holds.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Hold `bytes` from now on: `false`, holding what it held, when growing to them would pass a
+    /// ceiling or the pool.
+    pub fn resize(&mut self, bytes: u64) -> bool {
+        self.set(bytes, Fits::All)
+    }
+
+    /// [`Self::resize`] past every limit: what a restore rebuilds, which existed before it.
+    pub fn force(&mut self, bytes: u64) {
+        self.set(bytes, Fits::Forced);
+    }
+
+    /// Room in `bytes` for `len` of them, charged as this holds it and then allocated, fallibly: what a
+    /// [`HostBuffer`] grows by, for a buffer its embedder also reads as a plain `Vec` (a host's
+    /// captured stdout). The room grows by doubling, or to exactly `len` when the doubling does not
+    /// fit: `false`, with nothing charged or allocated, when neither does.
+    pub fn reserve(&mut self, bytes: &mut Vec<u8>, len: u64) -> bool {
+        let had = self.bytes;
+        let room = if len <= had {
+            had
+        } else {
+            match [had.saturating_mul(2), len]
+                .into_iter()
+                .find(|&r| r >= len && usize::try_from(r).is_ok() && self.resize(r))
+            {
+                Some(room) => room,
+                None => return false,
+            }
+        };
+        if bytes.capacity() < len as usize
+            && bytes
+                .try_reserve_exact((room as usize).saturating_sub(bytes.len()))
+                .is_err()
+        {
+            self.resize(had);
+            return false;
+        }
+        true
+    }
+
+    /// Charge `payer` for what it holds, past every limit, if it charged no one yet: state made
+    /// before its capability was granted (a seeded store), which the grantee pays for from then on.
+    pub fn bind(&mut self, payer: &NodeRef) {
+        if self.payer.is_none() {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.payer = Some(payer.clone());
+            self.force(bytes);
+        }
+    }
+
+    fn set(&mut self, bytes: u64, fits: Fits) -> bool {
+        if let Some(n) = self.payer.as_ref().filter(|_| bytes != self.bytes) {
+            let maps = |b: u64| u64::from(b >= MAPPED_BUFFER);
+            let (lo, hi) = (self.bytes.min(bytes), self.bytes.max(bytes));
+            let diff = [
+                (BUDGET_CHANNEL, hi - lo),
+                (BUDGET_MAPS, maps(hi) - maps(lo)),
+            ];
+            if bytes < self.bytes {
+                n.tree.refund_set(n.node, &diff);
+            } else if !n.tree.add(n.node, &diff, fits) {
+                return false;
+            }
+        }
+        self.bytes = bytes;
+        true
+    }
+}
+
+impl Drop for HostCharge {
+    fn drop(&mut self) {
+        self.set(0, Fits::All);
+    }
+}
+
+/// #2306 — bytes a guest grows through a capability, their allocation held as a [`HostCharge`]: a
+/// file's contents, a pipe's or a socket's queue, a captured stream. Room for them is charged before
+/// it is allocated, and allocated fallibly, so running out is the guest's errno and never the host's
+/// abort. It grows by doubling, or to exactly what it needs when the doubling does not fit, and gives
+/// the room back once it holds under a quarter of it. A reader can consume it from the front as a
+/// queue, each byte moved at most once on average.
+#[derive(Default)]
+pub struct HostBuffer {
+    bytes: Vec<u8>,
+    /// How many of `bytes` a reader consumed ([`Self::consume`]) that have yet to be dropped.
+    head: usize,
+    room: HostCharge,
+}
+
+impl HostBuffer {
+    /// An empty one, charging `payer` as it grows.
+    pub fn new(payer: Option<NodeRef>) -> HostBuffer {
+        HostBuffer::from_parts(Vec::new(), HostCharge::new(payer))
+    }
+
+    /// `bytes`, charged to `payer` past every limit: what a restore rebuilds, or a seed is made of.
+    pub fn forced(payer: Option<NodeRef>, bytes: Vec<u8>) -> HostBuffer {
+        let mut room = HostCharge::new(payer);
+        room.force(bytes.capacity() as u64);
+        HostBuffer::from_parts(bytes, room)
+    }
+
+    /// `bytes` and the room they were charged as: a buffer an embedder kept as a plain `Vec` until it
+    /// shared it ([`Host::shared_stdout`]).
+    pub fn from_parts(bytes: Vec<u8>, room: HostCharge) -> HostBuffer {
+        HostBuffer {
+            bytes,
+            head: 0,
+            room,
+        }
+    }
+
+    /// [`HostCharge::bind`].
+    pub fn bind(&mut self, payer: &NodeRef) {
+        self.room.bind(payer);
+    }
+
+    /// Hold `bytes` instead, charged past every limit: what a rewind puts back, which it held before.
+    pub fn restore(&mut self, bytes: Vec<u8>) {
+        self.room.force(bytes.capacity() as u64);
+        (self.bytes, self.head) = (bytes, 0);
+    }
+
+    /// Make it `len` long, zero-filled past its end: `false`, unchanged, when it cannot grow to it.
+    pub fn resize(&mut self, len: u64) -> bool {
+        let Some(end) = len.checked_add(self.head as u64) else {
+            return false;
+        };
+        if !self.room.reserve(&mut self.bytes, end) {
+            return false;
+        }
+        self.bytes.resize(end as usize, 0);
+        self.settle();
+        true
+    }
+
+    /// Write `data` at `at`, zero-filling from its end to `at`: `false`, unchanged, when it cannot
+    /// grow to hold them.
+    pub fn write_at(&mut self, at: u64, data: &[u8]) -> bool {
+        let Some(end) = at.checked_add(data.len() as u64) else {
+            return false;
+        };
+        if end > self.len() as u64 && !self.resize(end) {
+            return false;
+        }
+        self[at as usize..end as usize].copy_from_slice(data);
+        true
+    }
+
+    /// Append `data`: [`Self::write_at`] its end.
+    pub fn push(&mut self, data: &[u8]) -> bool {
+        self.write_at(self.len() as u64, data)
+    }
+
+    /// Drop its first `n` bytes, as a queue's reader consumes them.
+    pub fn consume(&mut self, n: usize) {
+        self.head += n.min(self.len());
+        self.settle();
+    }
+
+    /// Its bytes, handed out; it is left empty, holding nothing.
+    pub fn take(&mut self) -> Vec<u8> {
+        let mut bytes = std::mem::take(&mut self.bytes);
+        bytes.drain(..std::mem::take(&mut self.head));
+        self.room.resize(0);
+        bytes
+    }
+
+    /// Drop what was consumed once it is as much as what is left, so each byte is moved at most once
+    /// on average, and give the room back once it holds under a quarter of it.
+    fn settle(&mut self) {
+        if self.head > 0 && self.head >= self.bytes.len() - self.head {
+            self.bytes.drain(..self.head);
+            self.head = 0;
+        }
+        if (self.bytes.len() as u64) < self.room.bytes() / 4 {
+            self.bytes.shrink_to_fit();
+            self.room.resize(self.bytes.capacity() as u64);
+        }
+    }
+}
+
+impl core::ops::Deref for HostBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[self.head..]
+    }
+}
+
+impl core::ops::DerefMut for HostBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[self.head..]
+    }
+}
 
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
@@ -21974,7 +22217,10 @@ pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 /// run" includes forkability. A capability granted forkable (so it can be re-granted into a §14
 /// child — `Host::can_regrant` — or carried into a `fork()` twin) must come back forkable, or a
 /// thawed domain could no longer hand a child what the same domain could before its freeze.
-pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<NamedCapGrant> + Send>;
+///
+/// #2306 — the node it is handed is the thawing domain's, which pays for the host memory the
+/// rebuilt state holds and the guest grows it by, as a fresh grant's state is paid for by its grantee.
+pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8], &NodeRef) -> Option<NamedCapGrant> + Send>;
 
 /// What a [`NamedCapRegistrar`] re-grants: the handler, its fork factory when the capability is
 /// forkable (#1718), and its [`CapState`] (#1699) — so a thawed stateful capability is captured by
@@ -22598,12 +22844,11 @@ fn translate_cap_slots(
 // forwards to the ordinary grant path; nothing else of the `Host` is exposed through this trait.
 impl RegionMinter for Host {
     /// #2268 — the region a capability maps a file as (§4b) is the guest's: its mapping is charged
-    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives.
+    /// to this domain's node, all or nothing (`-ENOMEM`), and held while the region lives. #2306 — so
+    /// is the address space the host maps it over, the whole file.
     fn grant_region(&mut self, backing: RegionBacking) -> i32 {
-        if !self
-            .budgets
-            .add(self.own_budget, &region_cost(0), Fits::All)
-        {
+        let cost = region_cost(0, backing.size());
+        if !self.budgets.add(self.own_budget, &cost, Fits::All) {
             return ENOMEM as i32;
         }
         let backing: RegionBacking = Arc::new(ChargedRegion {
@@ -23052,14 +23297,19 @@ pub struct Host {
     /// Bytes written by `Stream{Out}` / `Stream{Err}` `write`s.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// #2306 — the room `stdout` and `stderr` hold for the guest's writes, charged to this domain's
+    /// node ([`HostCharge::reserve`]) until [`Host::take_stdout`] drains them. A shared sink holds its
+    /// own ([`Host::shared_stdout`]).
+    out_room: HostCharge,
+    err_room: HostCharge,
     /// PROCESS.md S2: optional **shared** stdout/stderr sinks. `None` (default) ⇒ writes go to the
     /// local `stdout`/`stderr` Vec (the existing public API — untouched for hosts that never share).
     /// `Some` ⇒ writes go to the shared buffer instead — set on a **child** host whose stdout/stderr
     /// was re-granted from a parent (`instantiate_granted`), so the child's output reaches the same
     /// buffer the granting embedder observes (POSIX stdio inheritance). Promoted lazily by
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
-    out_sink: Option<Arc<Mutex<Vec<u8>>>>,
-    err_sink: Option<Arc<Mutex<Vec<u8>>>>,
+    out_sink: Option<Arc<Mutex<HostBuffer>>>,
+    err_sink: Option<Arc<Mutex<HostBuffer>>>,
     /// Optional **live tee** on stdout: when set, every `Stream(Out)` write is handed to this callback
     /// *in addition to* the normal buffering (the local `stdout` Vec / shared sink are untouched, so
     /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
@@ -23076,7 +23326,7 @@ pub struct Host {
     stdin_source: Option<StdinSource>,
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
-    sinks: Vec<Arc<Mutex<Vec<u8>>>>,
+    sinks: Vec<Arc<Mutex<HostBuffer>>>,
     /// §7c stdin inheritance (#1720): once promoted, this host's own stdin (see [`SharedStdin`]).
     in_shared: Option<Arc<Mutex<SharedStdin>>>,
     /// The shared stdins carried by re-granted `Stream(In)`s, indexed by the id their `sink` holds —
@@ -23199,7 +23449,7 @@ pub struct Host {
     /// `None` (the default) mints the pure-Rust reference [`VecBacking`]; a flat-window embedder
     /// installs an OS-shared-memory factory ([`Host::set_region_factory`], e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints for real aliasing.
-    region_factory: Option<fn(usize) -> RegionBacking>,
+    region_factory: Option<fn(usize) -> Result<RegionBacking, i64>>,
     /// §12 `Blocking` capability backings, indexed by the id a [`Binding::Blocking`] carries. Each is
     /// a `Send + Sync` [`AsyncState`] a `submit` batch can run on the offload pool.
     blockings: Vec<Arc<AsyncState>>,
@@ -24107,6 +24357,8 @@ impl Host {
             sig_interrupt: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            out_room: HostCharge::default(),
+            err_room: HostCharge::default(),
             out_sink: None,
             err_sink: None,
             out_tee: None,
@@ -25650,7 +25902,7 @@ impl Host {
     /// [`journal_invertible`](Host::journal_invertible) instead of being restored wrongly.
     pub(crate) fn journal_cursor(&self) -> HostCursor {
         // #2055: a stream promoted into a shared cell (a child re-granted it) writes there.
-        let len = |cell: &Option<Arc<Mutex<Vec<u8>>>>, own: &Vec<u8>| {
+        let len = |cell: &Option<Arc<Mutex<HostBuffer>>>, own: &Vec<u8>| {
             cell.as_ref()
                 .map_or(own.len(), |c| c.lock_unpoisoned().len())
         };
@@ -25682,11 +25934,15 @@ impl Host {
         self.stdin_pos = c.stdin_pos;
         // #2055: truncate where the bytes went — the shared cell, once promoted.
         match &self.out_sink {
-            Some(cell) => cell.lock_unpoisoned().truncate(c.stdout_len),
+            Some(cell) => {
+                cell.lock_unpoisoned().resize(c.stdout_len as u64);
+            }
             None => self.stdout.truncate(c.stdout_len),
         }
         match &self.err_sink {
-            Some(cell) => cell.lock_unpoisoned().truncate(c.stderr_len),
+            Some(cell) => {
+                cell.lock_unpoisoned().resize(c.stderr_len as u64);
+            }
             None => self.stderr.truncate(c.stderr_len),
         }
         self.clock_ns = c.clock_ns;
@@ -25789,11 +26045,11 @@ impl Host {
             None => self.stdin_pos = s.stdin_pos,
         }
         match &self.out_sink {
-            Some(cell) => *cell.lock_unpoisoned() = s.stdout.clone(),
+            Some(cell) => cell.lock_unpoisoned().restore(s.stdout.clone()),
             None => self.stdout = s.stdout.clone(),
         }
         match &self.err_sink {
-            Some(cell) => *cell.lock_unpoisoned() = s.stderr.clone(),
+            Some(cell) => cell.lock_unpoisoned().restore(s.stderr.clone()),
             None => self.stderr = s.stderr.clone(),
         }
         self.clock_ns = s.clock_ns;
@@ -26684,25 +26940,51 @@ impl Host {
         })
     }
 
-    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: the
-    /// embedder's factory, as a guest mint uses, else the heap. #2111 — charged to this domain's
-    /// node whatever its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a
-    /// freeze carries no node's `channel` use.
-    pub fn rebuild_region(&self, bytes: &[u8]) -> RegionBacking {
-        let backing = match self.region_factory {
-            Some(f) => f(bytes.len()),
-            None => Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))),
-        };
+    /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: a backing
+    /// as a guest mint gets one ([`Self::new_region`]). #2111 — charged to this domain's node whatever
+    /// its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a freeze carries
+    /// no node's `channel` use. #2306 — `Err`, the errno, when no backing can be had: the thaw
+    /// refuses, rather than run without the region.
+    pub fn rebuild_region(&self, bytes: &[u8]) -> Result<RegionBacking, i64> {
+        Ok(self.refill_region(self.new_region(bytes.len())?, bytes))
+    }
+
+    /// #2306 — a debugger moment's region, as [`Self::rebuild_region`] makes it, else on the heap: a
+    /// moment is the interpreter's, which any backing serves, so a seek is never refused for want of
+    /// an OS object.
+    pub(crate) fn rebuild_moment_region(&self, bytes: &[u8]) -> RegionBacking {
+        let backing = self
+            .new_region(bytes.len())
+            .unwrap_or_else(|_| Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))));
+        self.refill_region(backing, bytes)
+    }
+
+    /// `backing` holding `bytes`, charged to this domain's node past any ceiling ([`ChargedRegion`]).
+    fn refill_region(&self, backing: RegionBacking, bytes: &[u8]) -> RegionBacking {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        let cost = region_cost(bytes.len() as u64);
+        let cost = region_cost(bytes.len() as u64, backing.size());
         self.budgets.add(self.own_budget, &cost, Fits::Forced);
         Arc::new(ChargedRegion {
             backing,
             node: self.own_node(),
             bytes: bytes.len() as u64,
         })
+    }
+
+    /// #2306 — a fresh, zeroed backing of `len` bytes for a §13 region: the embedder's factory (OS
+    /// shared memory under the JIT, [`Self::set_region_factory`]), else the heap. `Err`, the errno,
+    /// when the one it uses refuses: the OS, the process's descriptor pool, or an allocation the host
+    /// cannot make. Never a panic: a guest's mint reaches it.
+    fn new_region(&self, len: usize) -> Result<RegionBacking, i64> {
+        if let Some(f) = self.region_factory {
+            return f(len);
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+        bytes.resize(len, 0);
+        Ok(Arc::new(VecBacking(Mutex::new(bytes))))
     }
 
     /// #2025 — hold a rebuilt region under a new id, for the thaw to re-pin the handles and window
@@ -26926,7 +27208,10 @@ impl Host {
                 // An index no live handle named: keep the slot so later indices line up, but install
                 // a handler that traps rather than one that silently answers.
                 None => None,
-                Some(c) => match registrar.as_mut().and_then(|r| r(&c.name, &c.state)) {
+                Some(c) => match registrar
+                    .as_mut()
+                    .and_then(|r| r(&c.name, &c.state, &self.own_node()))
+                {
                     Some(g) => Some(g),
                     None => {
                         refused.get_or_insert_with(|| c.name.clone());
@@ -27809,12 +28094,38 @@ impl Host {
     /// host can be pointed at the same buffer (stdio inheritance via `instantiate_granted`).
     /// Idempotent (a second call returns the same sink). After promotion, new writes go to the sink;
     /// read the effective bytes via [`Host::stdout_bytes`] (`stdout` itself no longer receives them).
-    pub fn shared_stdout(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    /// #2306: what every writer appends to it is charged to this domain's node, the domain its stdout
+    /// was granted to, until it is drained.
+    pub fn shared_stdout(&mut self) -> Arc<Mutex<HostBuffer>> {
         if self.out_sink.is_none() {
-            let taken = std::mem::take(&mut self.stdout);
-            self.out_sink = Some(Arc::new(Mutex::new(taken)));
+            let sink = self.capture_sink(StreamRole::Out);
+            self.out_sink = Some(Arc::new(Mutex::new(sink)));
         }
         Arc::clone(self.out_sink.as_ref().unwrap())
+    }
+
+    /// #2306 — this host's own `stdout` (or `stderr`) and the room it holds for the guest's writes,
+    /// charged to this domain's node from the first.
+    fn capture(&mut self, role: StreamRole) -> (&mut Vec<u8>, &mut HostCharge) {
+        let unbound = match role {
+            StreamRole::Out => self.out_room.payer().is_none(),
+            _ => self.err_room.payer().is_none(),
+        };
+        let payer = unbound.then(|| self.own_node());
+        let (bytes, room) = match role {
+            StreamRole::Out => (&mut self.stdout, &mut self.out_room),
+            _ => (&mut self.stderr, &mut self.err_room),
+        };
+        if let Some(payer) = payer {
+            room.bind(&payer);
+        }
+        (bytes, room)
+    }
+
+    /// #2306 — [`Self::capture`], moved into a buffer a shared sink keeps.
+    fn capture_sink(&mut self, role: StreamRole) -> HostBuffer {
+        let (bytes, room) = self.capture(role);
+        HostBuffer::from_parts(std::mem::take(bytes), std::mem::take(room))
     }
 
     /// Install a **live stdout tee** (see [`Host::out_tee`]): `tee` is called with each `Stream(Out)`
@@ -27861,10 +28172,10 @@ impl Host {
     }
 
     /// S2 — the stderr analogue of [`Host::shared_stdout`].
-    pub fn shared_stderr(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    pub fn shared_stderr(&mut self) -> Arc<Mutex<HostBuffer>> {
         if self.err_sink.is_none() {
-            let taken = std::mem::take(&mut self.stderr);
-            self.err_sink = Some(Arc::new(Mutex::new(taken)));
+            let sink = self.capture_sink(StreamRole::Err);
+            self.err_sink = Some(Arc::new(Mutex::new(sink)));
         }
         Arc::clone(self.err_sink.as_ref().unwrap())
     }
@@ -27874,7 +28185,7 @@ impl Host {
     /// have inherited this host's stdout.
     pub fn stdout_bytes(&self) -> Vec<u8> {
         match &self.out_sink {
-            Some(s) => s.lock_unpoisoned().clone(),
+            Some(s) => s.lock_unpoisoned().to_vec(),
             None => self.stdout.clone(),
         }
     }
@@ -27882,7 +28193,7 @@ impl Host {
     /// S2 — the stderr analogue of [`Host::stdout_bytes`].
     pub fn stderr_bytes(&self) -> Vec<u8> {
         match &self.err_sink {
-            Some(s) => s.lock_unpoisoned().clone(),
+            Some(s) => s.lock_unpoisoned().to_vec(),
             None => self.stderr.clone(),
         }
     }
@@ -27892,18 +28203,25 @@ impl Host {
     /// `stdout` directly: the first stdio-inheriting child spawn *moves* this host's buffer into a
     /// shared sink ([`Host::shared_stdout`]), so a guest that spawned one would otherwise appear to
     /// have written nothing at all — its own writes included (#1234).
+    /// #2306: drained, the bytes' room is handed back.
     pub fn take_stdout(&mut self) -> Vec<u8> {
         match &self.out_sink {
-            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
-            None => std::mem::take(&mut self.stdout),
+            Some(s) => s.lock_unpoisoned().take(),
+            None => {
+                self.out_room.resize(0);
+                std::mem::take(&mut self.stdout)
+            }
         }
     }
 
     /// S2 — the stderr analogue of [`Host::take_stdout`].
     pub fn take_stderr(&mut self) -> Vec<u8> {
         match &self.err_sink {
-            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
-            None => std::mem::take(&mut self.stderr),
+            Some(s) => s.lock_unpoisoned().take(),
+            None => {
+                self.err_room.resize(0);
+                std::mem::take(&mut self.stderr)
+            }
         }
     }
     pub fn grant_exit(&mut self) -> i32 {
@@ -30365,7 +30683,9 @@ impl Host {
     /// §13/§14). A flat-window embedder passes an OS-shared-memory factory (e.g.
     /// `temen_run::new_shared_region`) so a JIT guest can `map` what it mints; without one, mints use
     /// the pure-Rust reference [`VecBacking`] (fine for the interpreter, unmappable by the JIT).
-    pub fn set_region_factory(&mut self, f: fn(usize) -> RegionBacking) {
+    /// #2306 — a factory refuses with the errno the guest gets, e.g. `-EMFILE` past the process's
+    /// descriptors: a guest's mint reaches it, so it must never panic.
+    pub fn set_region_factory(&mut self, f: fn(usize) -> Result<RegionBacking, i64>) {
         self.region_factory = Some(f);
     }
 
@@ -32585,15 +32905,18 @@ impl Host {
                     if len <= 0 || len > MAX_MINTED_REGION {
                         return Ok(vec![EINVAL]);
                     }
-                    if !self
-                        .budgets
-                        .add(self.own_budget, &region_cost(len as u64), Fits::All)
-                    {
+                    let cost = region_cost(len as u64, len as u64);
+                    if !self.budgets.add(self.own_budget, &cost, Fits::All) {
                         return Ok(vec![ENOMEM]);
                     }
-                    let backing = match self.region_factory {
-                        Some(f) => f(len as usize),
-                        None => Arc::new(VecBacking(Mutex::new(vec![0u8; len as usize]))),
+                    // #2306 — a backing the host cannot make is the guest's errno, its charge
+                    // handed back.
+                    let backing = match self.new_region(len as usize) {
+                        Ok(backing) => backing,
+                        Err(errno) => {
+                            self.budgets.refund_set(self.own_budget, &cost);
+                            return Ok(vec![errno]);
+                        }
                     };
                     let backing: RegionBacking = Arc::new(ChargedRegion {
                         backing,
@@ -32930,24 +33253,32 @@ impl Host {
                         (tee.lock_unpoisoned())(&bytes);
                     }
                 }
+                // #2306 — the bytes are host memory until their reader drains them, charged to the
+                // domain the stream was granted to: a write it has no room for is `-ENOMEM`.
                 if let Some(i) = sink {
                     let Some(s) = self.sinks.get(i as usize) else {
                         return ret(EINVAL);
                     };
-                    s.lock_unpoisoned().extend_from_slice(&bytes);
-                    return ret(len as i64);
+                    let fits = s.lock_unpoisoned().push(&bytes);
+                    return ret(if fits { len as i64 } else { ENOMEM });
                 }
                 let own = if role == StreamRole::Out {
                     &self.out_sink
                 } else {
                     &self.err_sink
                 };
-                match own {
-                    Some(s) => s.lock_unpoisoned().extend_from_slice(&bytes),
-                    None if role == StreamRole::Out => self.stdout.extend_from_slice(&bytes),
-                    None => self.stderr.extend_from_slice(&bytes),
-                }
-                ret(len as i64)
+                let fits = match own {
+                    Some(s) => s.lock_unpoisoned().push(&bytes),
+                    None => {
+                        let (buf, room) = self.capture(role);
+                        let fits = room.reserve(buf, (buf.len() + bytes.len()) as u64);
+                        if fits {
+                            buf.extend_from_slice(&bytes);
+                        }
+                        fits
+                    }
+                };
+                ret(if fits { len as i64 } else { ENOMEM })
             }
             2 => ret(0), // close: no-op in the MVP (exit reclaims all)
             _ => ret(EINVAL),
@@ -36767,6 +37098,167 @@ mod exec_maps_tests {
 }
 
 #[cfg(test)]
+mod host_buffer_tests {
+    //! #2306 — a host buffer charges its payer's `channel` for its room, and one `maps` while that
+    //! reaches [`MAPPED_BUFFER`], all or nothing, and hands both back as it shrinks and goes.
+    use super::*;
+
+    /// A host whose own node's `channel` and `maps` ceilings are these, with nothing charged yet.
+    fn host(channel: i64, maps: i64) -> Host {
+        let mut h = Host::new();
+        h.set_grant(-1, channel, -1, maps);
+        h
+    }
+
+    fn maps(h: &Host) -> i64 {
+        h.budgets.used(h.own_budget, BUDGET_MAPS)
+    }
+
+    #[test]
+    fn a_buffer_charges_its_room_and_hands_it_back() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.push(&[1; 100]));
+        assert_eq!(h.channel_used(), 100, "exactly what its first write needs");
+        assert!(b.push(&[2; 10]));
+        assert_eq!(h.channel_used(), 200, "then by doubling");
+        assert!(b.write_at(1000, &[3]));
+        assert_eq!((b.len(), h.channel_used()), (1001, 1001));
+        assert!(
+            b[110..1000].iter().all(|&x| x == 0),
+            "a write past the end zero-fills to it"
+        );
+        b.consume(1000);
+        assert_eq!(
+            (&b[..], h.channel_used()),
+            (&[3][..], 1),
+            "a quarter empty, it shrinks"
+        );
+        drop(b);
+        assert_eq!(h.channel_used(), 0, "and gone, it holds nothing");
+    }
+
+    #[test]
+    fn a_queue_reads_back_what_was_pushed_in_order() {
+        let h = host(-1, -1);
+        let mut q = HostBuffer::new(Some(h.own_node()));
+        let (mut sent, mut out) = (0, Vec::new());
+        for round in 1..200 {
+            let chunk: Vec<u8> = (sent..sent + round % 37).map(|i| i as u8).collect();
+            sent += chunk.len();
+            assert!(q.push(&chunk));
+            let n = ((round * 7) % 41).min(q.len());
+            out.extend_from_slice(&q[..n]);
+            q.consume(n);
+            assert!(
+                h.channel_used() as usize >= q.len(),
+                "its room covers what it holds"
+            );
+        }
+        out.extend_from_slice(&q.take());
+        assert!(
+            out.iter().copied().eq((0..sent).map(|i| i as u8)),
+            "in order, none lost"
+        );
+        assert_eq!(h.channel_used(), 0, "taken, it holds nothing");
+    }
+
+    #[test]
+    fn growth_past_a_ceiling_is_refused_and_charges_nothing() {
+        let h = host(1000, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.push(&[1; 600]));
+        assert!(
+            b.push(&[1; 300]),
+            "the doubling does not fit, but what it needs does"
+        );
+        assert_eq!(h.channel_used(), 900);
+        assert!(!b.push(&[1; 101]), "a byte past the ceiling is refused");
+        assert_eq!(
+            (b.len(), h.channel_used()),
+            (900, 900),
+            "and changes nothing"
+        );
+        assert!(
+            !b.write_at(u64::MAX, &[1]),
+            "as is a write no buffer can reach"
+        );
+        assert!(b.push(&[1; 100]));
+    }
+
+    #[test]
+    fn a_buffer_large_enough_to_be_mapped_holds_one_maps() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.resize(MAPPED_BUFFER - 1));
+        assert_eq!(maps(&h), 0);
+        assert!(b.resize(MAPPED_BUFFER));
+        assert_eq!(maps(&h), 1);
+        assert!(b.resize(0));
+        assert_eq!((maps(&h), h.channel_used()), (0, 0));
+
+        let h = host(-1, 0);
+        let mut b = HostBuffer::new(Some(h.own_node()));
+        assert!(b.resize(MAPPED_BUFFER - 1));
+        assert!(
+            !b.resize(MAPPED_BUFFER),
+            "with no `maps` left, it stays on the heap"
+        );
+        assert_eq!(h.channel_used(), (MAPPED_BUFFER - 1) as i64);
+    }
+
+    /// A host's captured stdout is charged to its own node as the guest writes it, a write past the
+    /// ceiling is `-ENOMEM`, and draining it hands the room back. So is a sink a child shares.
+    #[test]
+    fn captured_output_is_charged_until_it_is_drained() {
+        let mut h = host(4096, -1);
+        let out = h.grant_stream(StreamRole::Out);
+        let mut win = vec![7u8; 4096];
+        let mut write = |h: &mut Host, len: i64| {
+            let mut wm = WindowMem::new(&mut win, 4096);
+            h.cap_dispatch_slots(cap_id::STREAM, 1, out, &[0, len], Some(&mut wm))
+                .expect("dispatch")[0]
+        };
+        assert_eq!(write(&mut h, 3000), 3000);
+        assert_eq!(write(&mut h, 2000), ENOMEM, "past the ceiling");
+        assert_eq!(h.take_stdout().len(), 3000);
+        assert_eq!(h.channel_used(), 0, "drained, its room is handed back");
+        let sink = h.shared_stdout();
+        assert_eq!(write(&mut h, 4096), 4096);
+        assert_eq!(
+            write(&mut h, 1),
+            ENOMEM,
+            "the sink is charged as the buffer was"
+        );
+        assert_eq!(sink.lock_unpoisoned().take().len(), 4096);
+        assert_eq!(h.channel_used(), 0);
+    }
+
+    #[test]
+    fn an_unpaid_buffer_charges_nothing_until_its_grantee_binds_it() {
+        let h = host(-1, -1);
+        let mut b = HostBuffer::forced(None, vec![7; 300]);
+        assert!(b.push(&[1; 10]));
+        assert_eq!(h.channel_used(), 0, "state its embedder keeps");
+        b.bind(&h.own_node());
+        assert_eq!(
+            h.channel_used(),
+            600,
+            "bound, its grantee pays for all it holds"
+        );
+        let other = host(-1, -1);
+        b.bind(&other.own_node());
+        assert_eq!(
+            (h.channel_used(), other.channel_used()),
+            (600, 0),
+            "the first grantee"
+        );
+        drop(b);
+        assert_eq!(h.channel_used(), 0);
+    }
+}
+
+#[cfg(test)]
 mod region_charge_tests {
     //! #2111 — a guest-minted region spends `channel` of its minter's node and every ancestor until
     //! no domain holds it.
@@ -36843,7 +37335,7 @@ mod region_charge_tests {
     #[test]
     fn a_thaw_charges_a_region_it_rebuilds_to_the_rebuilding_domain() {
         let (parent, node, mut child, _) = child(-1);
-        let id = child.adopt_region(child.rebuild_region(&[7; 64]));
+        let id = child.adopt_region(child.rebuild_region(&[7; 64]).expect("rebuilt"));
         assert_eq!(child.regions[id as usize].read_byte(63), 7);
         assert_eq!(used(&parent, node), 64);
         child.release_memory();

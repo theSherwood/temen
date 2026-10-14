@@ -129,10 +129,11 @@ fn a_posix_guest_freezes_mid_loop_and_thaws_through_the_codec() {
     let mut th = Host::new();
     th.set_durable(true);
     let slot = Arc::clone(&thawed);
-    th.set_named_cap_registrar(Box::new(move |name, state| {
+    th.set_named_cap_registrar(Box::new(move |name, state, payer| {
         let posix = (name == "libc")
             .then(|| temen_posix::Posix::from_state(state).ok())
             .flatten()?;
+        posix.bind(payer);
         let g = temen_posix::named_grant(&posix);
         *slot.lock().unwrap() = Some(posix);
         Some(g)

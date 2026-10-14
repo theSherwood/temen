@@ -105,11 +105,7 @@ pub(crate) fn capture(w: &World, p: &Proc) -> Vec<u8> {
     }
     b.uleb(pipes_d.len() as u64);
     for q in pipes_d {
-        let q = q.lock().unwrap_or_else(|e| e.into_inner());
-        let (x, y) = q.as_slices();
-        b.uleb((x.len() + y.len()) as u64);
-        b.0.extend_from_slice(x);
-        b.0.extend_from_slice(y);
+        b.bytes(&q.lock().unwrap_or_else(|e| e.into_inner()));
     }
     b.uleb(tokens_d.len() as u64);
     for t in tokens_d {
@@ -205,7 +201,7 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     let mut files = HashMap::new();
     for _ in 0..r.len()? {
         let path = r.str()?;
-        let bytes = r.bytes()?;
+        let bytes = HostBuffer::forced(w.payer(), r.bytes()?);
         let mtime = r.ileb()?;
         files.insert(path, MemFile { bytes, mtime });
     }
@@ -233,7 +229,10 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     }
     let mut pipes_d: Vec<PipeBuf> = Vec::new();
     for _ in 0..r.len()? {
-        pipes_d.push(Arc::new(Mutex::new(r.bytes()?.into())));
+        pipes_d.push(Arc::new(Mutex::new(HostBuffer::forced(
+            w.payer(),
+            r.bytes()?,
+        ))));
     }
     let mut tokens_d = Vec::new();
     for _ in 0..r.len()? {
@@ -274,10 +273,9 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     let mut dirs = Vec::new();
     for _ in 0..r.len()? {
         dirs.push(r.opt(|r| {
-            Ok(DirStream {
-                entries: r.strs()?,
-                pos: r.uleb()? as usize,
-            })
+            let entries = r.strs()?;
+            let pos = r.uleb()? as usize;
+            Ok(DirStream::forced(entries, pos, w.tables.payer()))
         })?);
     }
     let args = r.strs()?;
@@ -322,6 +320,8 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     w.files = files;
     w.fs_clock = fs_clock;
     w.explicit_dirs = explicit_dirs;
+    let names = w.tables_cost(); // #2306 — what the restored names cost, past any ceiling
+    w.tables.force(names);
     w.net_listeners.clear();
     w.net_next_port = net_next_port;
     w.procs.retain(|_, e| matches!(e, ProcEntry::Live(_)));
@@ -529,12 +529,12 @@ mod tests {
             pos: 3,
             writable: true,
         }));
-        let pipe: PipeBuf = Arc::new(Mutex::new(b"xy".iter().copied().collect()));
+        let pipe: PipeBuf = Arc::new(Mutex::new(HostBuffer::forced(None, b"xy".to_vec())));
         p.fds.push(Some(FdEntry::File(Arc::clone(&file))));
         p.fds.push(Some(FdEntry::File(file)));
         p.fds.push(Some(FdEntry::PipeRead(Arc::clone(&pipe))));
         p.fds.push(Some(FdEntry::PipeWrite(pipe)));
-        let (sock, _) = mem_pair(NetAddr::loopback(1), NetAddr::loopback(2));
+        let (sock, _) = mem_pair(NetAddr::loopback(1), NetAddr::loopback(2), None);
         p.fds.push(Some(FdEntry::NetSock(sock)));
         p.env.insert("K".into(), "v".into());
         p.cwd = "/d".into();
