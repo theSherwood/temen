@@ -1655,6 +1655,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 shadow: r
                     .shadow
                     .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
+                digest: launch.digest,
                 image: window.bytes().to_vec(),
                 prots: window.dense_prots().into_iter().map(window_prot).collect(),
                 // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
