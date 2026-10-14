@@ -1654,8 +1654,11 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     // op-15 `mod_ok`); it grows into its own reservation, so no superset room is needed.
     let mod_ok = mod_mem == Some(size_log2 as i32);
     // The optional payload, read from THIS window (reserved-bounded — an out-of-window range is a
-    // MemoryFault, as any window read); an over-long one refuses probeably.
-    let payload: Vec<u8> = if args_len > 0 {
+    // MemoryFault, as any window read). An over-long one refuses probeably, before anything is read:
+    // its length is the guest's, and a negative one is a length past the args region too (#2338).
+    let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
+    let payload_ok = args_len as u64 <= args_room;
+    let payload: Vec<u8> = if args_len > 0 && payload_ok {
         let (p, l) = (args_ptr as u64, args_len as u64);
         match p.checked_add(l) {
             Some(end) if end <= mem_size => {
@@ -1670,7 +1673,6 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     } else {
         Vec::new()
     };
-    let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
     let durable_ok = !durable
         || (rt.child_module_durable(module, unit)
             && child_shadow != temen_ir::durable_abi::ShadowArena::EMPTY);
@@ -1678,7 +1680,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         || child_size == 0
         || !mod_ok
         || !durable_ok
-        || payload.len() as u64 > args_room
+        || !payload_ok
         || size_log2 as u8 > crate::MAX_JIT_WINDOW_LOG2
     {
         return EINVAL as i32;

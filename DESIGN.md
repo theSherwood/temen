@@ -2184,7 +2184,10 @@ One mechanism for every sharing relationship: host↔guest, guest↔guest
 
 - A **`SharedRegion`** is a host-backed memory object (anonymous, `shm`/`memfd`,
   or file-backed). Operations: create, **map into a window** at some offset,
-  unmap, and **grant** the capability to another domain so it can map the same
+  unmap, **grant** the capability to another domain so it can map the same
+  object, and **close** the handle, which gives up the domain's hold: the object
+  goes when no domain holds it (#2358). A window that still maps it refuses the
+  close (`-EBUSY`): a mapping is no hold of its own, so it must not outlive the
   object. Granting `SharedRegion` *is* how two domains come to share memory.
 - The same physical pages appear in each window, possibly at **different
   offsets**. Loads/stores are ordinary masked window accesses → **zero

@@ -115,8 +115,9 @@ its admission, #2305), and everything it makes after, its growth and its process
 only a thaw of an artifact frozen around one can still re-create, charges no node: `MAX_VCPUS` alone
 bounds its vCPUs and `MAX_FIBERS` its fibers until #1867 deletes the carve. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
-region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
-for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111).
+region a guest mints is charged there too, its bytes, until no domain holds it; a domain lets go of a
+region when it closes its handle (`SharedRegion.close`, #2358), and a domain a budget paid for lets go
+of the rest when it ends, while a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
 stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
 listings or mappings) is `channel` of

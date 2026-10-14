@@ -42,7 +42,7 @@ enum {
 };
 enum { CAP_O_READ = 1, CAP_O_WRITE = 2, CAP_O_APPEND = 4, CAP_O_TRUNC = 8, CAP_O_CREATE = 16 };
 /* SharedRegion ops (called on the region handle FS_MAP_REGION returns, not on the fs handle). */
-enum { SR_MAP = 0, SR_UNMAP = 1, SR_PAGE_SIZE = 3 };
+enum { SR_MAP = 0, SR_UNMAP = 1, SR_PAGE_SIZE = 3, SR_CLOSE = 5 };
 /* Capability prot bits (map_region in temen-run): read = 1, write = 2. */
 enum { CAP_PROT_READ = 1, CAP_PROT_WRITE = 2 };
 
@@ -200,7 +200,8 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
         }
         __builtin_free(base);
       }
-      /* region minted but the map failed → fall back (the region handle leaks until run end). */
+      /* region minted but the map failed → give it up, and fall back. */
+      __vm_region_call((int)region, SR_CLOSE, 0, 0, 0, 0);
     }
   }
 
@@ -224,7 +225,9 @@ int munmap(void *addr, size_t len) {
   struct maprec *m = map_containing(addr);
   if (!m) return 0;
   if (m->region >= 0) {
+    /* Unmap, then give the region up: the file's backing goes with its last holder (#2358). */
     __vm_region_call((int)m->region, SR_UNMAP, (long)m->addr, (long)m->len, 0, 0);
+    __vm_region_call((int)m->region, SR_CLOSE, 0, 0, 0, 0);
   } else {
     hc(FS_MUNMAP, (long)m->addr, 0, 0, 0);
   }
