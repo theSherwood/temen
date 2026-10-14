@@ -37352,12 +37352,13 @@ mod grant_list_tests {
     //! instead of making the host loop or allocate.
     use super::*;
 
-    /// A window holding `n` records, each naming the 4-byte string at 4096 with `name_len`.
+    /// A window holding `n` records, each naming the string just past them, `name_len` bytes long.
     fn window(n: usize, name_len: u32) -> Vec<u8> {
-        let mut w = vec![b'x'; 8192];
+        let name = n * 16;
+        let mut w = vec![b'x'; name + MAX_GRANT_NAME];
         for i in 0..n {
             let rec = &mut w[i * 16..i * 16 + 16];
-            rec[..4].copy_from_slice(&4096u32.to_le_bytes());
+            rec[..4].copy_from_slice(&(name as u32).to_le_bytes());
             rec[4..8].copy_from_slice(&name_len.to_le_bytes());
             rec[8..12].copy_from_slice(&7i32.to_le_bytes());
         }
@@ -37392,7 +37393,7 @@ mod grant_list_tests {
         let read = |o, l| read_slice(&w, o, l);
         assert_eq!(
             read_grant_records(0, MAX_SPAWN_GRANTS, read).map(|l| l.len()),
-            Ok(256)
+            Ok(MAX_SPAWN_GRANTS as usize)
         );
     }
 }
