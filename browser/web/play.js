@@ -6,7 +6,7 @@
 // authority either way — all of it is Rust-side, in shared linear memory.
 
 import { loadEngine, makeRunner, readParStdout } from './par.js';
-import { openJitReactor } from './wasmjit-reactor.js';
+import { openReactor } from './reactor.js';
 import {
   runJitModule, runWarmCoop, runJitCompiler, runJitSelfhost, nimToolchain, nimCompileRun,
 } from './wasmjit-module.js';
@@ -3544,8 +3544,22 @@ async function runPg(c) {
 // Open a reactor module once, then drive it one `tick` per requestAnimationFrame. Only one reactor
 // runs at a time; `activeReactorCard` is the card it belongs to (for teardown + the GPU canvas).
 let reactorRAF = null; // the pending requestAnimationFrame id while a reactor loop runs (else null)
-let jitReactor = null; // the wasm-JIT reactor driver while a JIT loop runs (else null → interpreter)
+// The open reactor (`openReactor`) and its tier: whether its frames offer `tick` to the emitted tier.
+let reactor = null;
+let reactorJit = false;
 let activeReactorCard = null;
+// Reactor work, one piece at a time (#1414 S4-4). A frame is a run the engine pumps across `await`s,
+// so an open, a close, a seek or a save that landed between them would find the reactor's window lent
+// to the run. Each goes through `reactorDo`, after whatever is already in hand.
+let reactorQueue = Promise.resolve();
+function reactorDo(fn) {
+  const p = reactorQueue.then(fn);
+  reactorQueue = p.catch(() => {});
+  return p;
+}
+// Bumped whenever the run the loop serves ends, so a frame that was in flight then does not go on to
+// schedule the next one.
+let reactorGen = 0;
 // Instrumentation for the live reactor loop: the run recorder plus a live frame count / start time, so a
 // user Stop (which cancels the loop out-of-band) can still emit the console summary the loop's own
 // terminal path would. `finalizeReactor` is the single close-out; it no-ops once consumed.
@@ -3587,9 +3601,8 @@ function finalizeReactor(how) {
 // bigger.
 //
 // The engine exports only the **split** tick: `begin_tick` (take a keyframe if due, hand the guest its
-// input), then whatever this page uses to run a tick, then `end_tick`. That is not a concession, it is
-// the only thing that can work on the emitted tier, where the tick is wasm this page compiled and
-// calls itself.
+// input), then this page's frame, then `end_tick`. That is not a concession: a frame is a run the page
+// pumps, on the emitted tier as well, so only the page can say when one has ended.
 const SCRUB_STRIDE = 30; // frames between keyframes
 const SCRUB_KEYFRAMES = 8; // ring size
 // …and a byte ceiling, because a keyframe's cost is the guest's window: a bounce keyframe is a few KiB,
@@ -3598,11 +3611,10 @@ const SCRUB_KEYFRAMES = 8; // ring size
 const SCRUB_BUDGET_BYTES = 96 * 1024 * 1024;
 let scrub = null; // the page half of a live recording (see `scrubOpen`), else null
 
-// The tier shim: how to run one tick on whichever reactor is live, so everything below is written once
-// (INVARIANTS #15) rather than branched per tier. Note there is no take/restore here any more — the
-// engine's timeline reaches whichever reactor is open by itself.
-function scrubEngine() {
-  return jitReactor ? { frame: () => jitReactor.frame() } : { frame: () => eng.ex.temen_onramp_frame() };
+// Run one frame of the open reactor on its tier, resolving to its status. Called only from inside
+// `reactorDo` work, so it is the one frame in flight.
+function reactorFrame(counts = {}) {
+  return reactor ? reactor.frame(reactorJit, counts) : Promise.resolve(2 /* STATUS_UNSUPPORTED */);
 }
 
 // Start recording a freshly opened reactor. `tick` counts frames the guest has completed, so the state
@@ -3699,16 +3711,15 @@ function scrubOldest() {
 // Returns the frame landed on, or `null` if there is nothing to seek in. The guest presents a frame per
 // re-run tick; only the last is drawn, so a scrub shows the frame the user asked for rather than
 // flickering through the ones before it.
-function scrubSeek(target) {
+async function scrubSeek(target) {
   if (!scrub) return null;
-  const e = scrubEngine();
   target = Math.max(0, Math.min(target, scrubLen()));
   if (eng.ex.temen_onramp_timeline_seek_begin(target) !== 0) return null;
   scrub.stale = true; // whatever is in the framebuffer belongs to the timeline we just left
   let ran = 0;
   while (scrubTick() < target) {
     scrubBeginTick();
-    if (e.frame() !== 0) break; // the guest exited/trapped here on the recorded run too
+    if (await reactorFrame() !== 0) break; // the guest exited/trapped here on the recorded run too
     scrubEndTick();
     ran++;
   }
@@ -3729,7 +3740,7 @@ function scrubSeek(target) {
       scrub.stale = true;
       while (scrubTick() < target) {
         scrubBeginTick();
-        if (e.frame() !== 0) break;
+        if (await reactorFrame() !== 0) break;
         scrubEndTick();
       }
       live();
@@ -3764,6 +3775,9 @@ globalThis.__scrubState = () => scrub && {
     (_, i) => eng.ex.temen_onramp_timeline_taped_at(i),
   ),
 };
+// …and a promise that settles once the reactor work queued so far has run: a seek, say, whose frames
+// are runs the page pumps, so it lands after the event that asked for it has returned.
+globalThis.__reactorIdle = () => reactorQueue;
 
 // Paint the scrub row from the live state: range bounds, the frame label, and which controls apply.
 function scrubRender() {
@@ -3812,7 +3826,6 @@ function sendReactorKey(keyCode, pressed) {
   // the same instant the direct call would have, since the guest polls its queue inside the tick.
   // Routed direct only when nothing is recording, so it is never delivered twice.
   if (scrub) eng.ex.temen_onramp_timeline_key(keyCode, pressed);
-  else if (jitReactor) eng.ex.temen_onramp_jit_key(keyCode, pressed);
   else eng.ex.temen_onramp_key(keyCode, pressed);
 }
 
@@ -3821,8 +3834,7 @@ function sendReactorKey(keyCode, pressed) {
 // (payload `((dx & 0xffff) << 16) | (dy & 0xffff)`). A no-op when no reactor loop is running.
 function sendReactorMouse(kind, payload) {
   if (reactorRAF === null) return;
-  if (jitReactor) eng.ex.temen_onramp_jit_mouse(kind, payload | 0);
-  else eng.ex.temen_onramp_mouse(kind, payload | 0);
+  eng.ex.temen_onramp_mouse(kind, payload | 0);
 }
 
 // ---- save-states: the same instant, written down (#1458) ------------------------------------------
@@ -3852,41 +3864,18 @@ function fmtBytes(n) {
   return `${n} B`;
 }
 
-// Freeze the live reactor over `bytes` (the module it was opened over — the artifact binds its digest),
-// on whichever tier is running. Returns the artifact, or null if the engine refused. The bytes are
-// copied straight out of the cdylib-managed buffer; a view would alias memory the next freeze reclaims.
+// Freeze the live reactor over `bytes` (the module it was opened over — the artifact binds its digest).
+// Returns the artifact, or null if the engine refused. The bytes are copied straight out of the
+// cdylib-managed buffer; a view would alias memory the next freeze reclaims. Called inside `reactorDo`
+// work, between frames.
 function freezeReactor(bytes) {
   const p = eng.ex.temen_alloc(bytes.length);
   new Uint8Array(eng.memory.buffer).set(bytes, p);
-  const n = jitReactor ? eng.ex.temen_onramp_jit_freeze(p, bytes.length) : eng.ex.temen_onramp_freeze(p, bytes.length);
+  const n = eng.ex.temen_onramp_freeze(p, bytes.length);
   eng.ex.temen_dealloc(p, bytes.length);
   if (!n) return null;
   const a = eng.ex.temen_onramp_artifact_ptr();
   return new Uint8Array(eng.memory.buffer).slice(a, a + n);
-}
-
-// Open the interpreter reactor from `artifact` instead of from `_start` — the twin of
-// `openInterpReactor`, same module and same served file, so the guest comes back with the same `fs`
-// under it. Returns the thaw status (0 = ok).
-function thawInterpReactor(artifact, bytes, file) {
-  const nameBytes = file ? new TextEncoder().encode(file.name) : new Uint8Array(0);
-  const data = file ? file.data : new Uint8Array(0);
-  const artP = eng.ex.temen_alloc(artifact.length);
-  const modP = eng.ex.temen_alloc(bytes.length);
-  const nameP = eng.ex.temen_alloc(nameBytes.length);
-  const dataP = eng.ex.temen_alloc(data.length);
-  const view = new Uint8Array(eng.memory.buffer);
-  view.set(artifact, artP);
-  view.set(bytes, modP);
-  if (nameBytes.length) view.set(nameBytes, nameP);
-  if (data.length) view.set(data, dataP);
-  const status = eng.ex.temen_onramp_thaw(
-    artP, artifact.length, modP, bytes.length, nameP, nameBytes.length, dataP, data.length);
-  eng.ex.temen_dealloc(artP, artifact.length);
-  eng.ex.temen_dealloc(modP, bytes.length);
-  eng.ex.temen_dealloc(nameP, nameBytes.length);
-  eng.ex.temen_dealloc(dataP, data.length);
-  return status;
 }
 
 // Freeze whatever this card's reactor is right now — live or paused mid-scrub, both are frame
@@ -3894,8 +3883,8 @@ function thawInterpReactor(artifact, bytes, file) {
 // cannot be taken against a module the guest wasn't opened over.
 async function saveStateWrite(c) {
   if (c !== activeReactorCard) return;
-  const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
-  const artifact = c.reactorBytes && freezeReactor(c.reactorBytes);
+  const tier = reactorJit ? 'wasm-JIT' : 'interpreter';
+  const artifact = await reactorDo(() => c.reactorBytes && freezeReactor(c.reactorBytes));
   if (!artifact) {
     // The engine stashes *why* it refused (the `FreezeError`) where a stdout delta would go.
     const n = eng.ex.temen_stdout_len();
@@ -3909,9 +3898,8 @@ async function saveStateWrite(c) {
   // The frame the artifact *is* — which is where the scrub is looking when one is paused mid-ladder,
   // not how far the run had got before it was paused.
   const at = scrub ? (scrub.viewing ?? scrubTick()) : 0;
-  // The tier rides along because a window image is only meaningful in a window its own size, and the
-  // two tiers reserve different ones: a JIT save-state thawed on the interpreter would be refused. The
-  // page remembers which tier took it and loads it back there, rather than letting the toggle decide.
+  // The tier rides along so that Load resumes on the tier the save was taken on. The artifact itself
+  // serves either: both tiers run the one reactor over the one window (#1414 S4-4).
   const record = { artifact, tier, at };
   try {
     await idbPut(SAVE_DB, SAVE_STORE, saveKey(c), record);
@@ -3970,26 +3958,26 @@ function saveStateRender(c) {
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 // "Running" is not the same as "open": a reactor **paused for scrubbing** has no pending rAF but is
-// very much still open, so what to tear down is keyed on `activeReactorCard`, not on the loop.
+// very much still open, so what to tear down is keyed on `activeReactorCard`, not on the loop. The
+// reactor closes once the frame in flight, if any, has ended; the returned promise resolves then.
 function stopReactor() {
   teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
   if (activeReactorCard) activeReactorCard.el.gpucanvas.hidden = true;
-  const open = activeReactorCard !== null;
   if (reactorRAF !== null) {
     cancelAnimationFrame(reactorRAF);
     reactorRAF = null;
   }
   reactorLoop = null;
-  scrubClose(); // hand every held keyframe back before the window they image goes away
+  reactorGen++; // a frame in flight ends without scheduling the next
   finalizeReactor({ ended: 'stopped', ok: true }); // a live loop was cancelled by the user / a superseding Run
-  if (!open) { activeReactorCard = null; return; }
-  if (jitReactor) {
-    jitReactor.close();
-    jitReactor = null;
-  } else {
-    eng.ex.temen_onramp_close();
-  }
   closeReactorCard();
+  return reactorDo(() => {
+    scrubClose(); // hand every held keyframe back before the window they image goes away
+    if (reactor) {
+      reactor.close();
+      reactor = null;
+    }
+  });
 }
 
 // Let go of the card the reactor belonged to. The module bytes go with it: they exist only to freeze a
@@ -4005,20 +3993,20 @@ function closeReactorCard() {
 // Run this card's reactor. `opts.thaw` is a save-state artifact: the guest is rebuilt from it instead
 // of from `_start`, and everything else about the run — the fetch, the served file, the frame loop, the
 // scrub ladder — is identical. One run path with the first window as its parameter, not a second one
-// (INVARIANTS #15). `opts.tier` ('interpreter' | 'wasm-JIT') pins the tier a thaw comes back on,
-// overriding the toggle: a window image only fits the window it was taken from.
+// (INVARIANTS #15). `opts.tier` ('interpreter' | 'wasm-JIT') is the tier a thaw comes back on, the one
+// its save was taken on, in place of the toggle.
 async function runReactor(c, opts = {}) {
   const ex = c.ex;
   const thaw = opts.thaw || null;
-  stopReactor();
+  await stopReactor();
   activeReactorCard = c;
   setState(c, 'running', 'fetching module…');
   c.el.result.textContent = '';
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
-  // The "wasm-JIT" toggle runs an emittable reactor's whole tick() on emitted wasm (near-native) rather
-  // than the interpreter. Only offered for JIT-capable examples (Doom); falls back if the emit fails.
-  // A thaw comes back on the tier its artifact was frozen on — see `opts.tier`.
+  // The "wasm-JIT" toggle offers the reactor's whole tick() to the emitted tier (near-native) rather
+  // than the interpreter; a tick the engine cannot emit runs interpreted. Only offered for JIT-capable
+  // examples (Doom). A thaw comes back on the tier its save was taken on — see `opts.tier`.
   const useJit = thaw ? opts.tier === 'wasm-JIT' : !!(ex.jit && c.el.jit && c.el.jit.checked);
   const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let bytes;
@@ -4077,45 +4065,28 @@ async function runReactor(c, opts = {}) {
       : ex.file ? `booting… (${file.name} read through fs at _start — Doom builds its renderer here, a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
         : 'running…');
   const tOpen = performance.now();
-  if (useJit) {
-    try {
-      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data, thaw);
-      logTo(c, thaw
-        ? `wasm-JIT reactor thawed from a ${fmtBytes(thaw.length)} save-state: ${ex.url} — resuming on emitted wasm`
-        : `wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
-    } catch (e) {
-      jitReactor = null;
-      logTo(c, `wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
-      runNote(rec, { jitFallbackReason: e.message });
-      // A thaw that fell back has nothing to fall back *to*: the interpreter would boot a fresh guest
-      // under a Load button, which is not what was asked for. Refuse rather than quietly start over.
-      if (thaw) {
-        setState(c, 'error', 'save-state could not be loaded on the wasm-JIT tier it was taken on');
-        closeReactorCard();
-        runEnd(rec, { ok: false });
-        return;
-      }
-    }
+  const opened = await reactorDo(() => {
+    reactor = openReactor(eng.ex, eng.memory, bytes, file, thaw);
+    return reactor !== null;
+  });
+  if (!opened) {
+    setState(c, 'error', `reactor ${thaw ? 'thaw' : 'open'} failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
+    logTo(c, `temen_onramp_${thaw ? 'thaw' : 'open'} failed: status ${eng.ex.temen_status()}`);
+    closeReactorCard();
+    runNote(rec, { openStatus: eng.ex.temen_status(), thawed: !!thaw });
+    runEnd(rec, { ok: false });
+    return;
   }
-  if (!jitReactor) {
-    const opened = thaw ? thawInterpReactor(thaw, bytes, file) : openInterpReactor(bytes, file);
-    if (opened !== 0) {
-      setState(c, 'error', `reactor ${thaw ? 'thaw' : 'open'} failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
-      logTo(c, `temen_onramp_${thaw ? 'thaw' : 'open'} failed: ${opened}`);
-      closeReactorCard();
-      runNote(rec, { openStatus: eng.ex.temen_status(), thawed: !!thaw });
-      runEnd(rec, { ok: false });
-      return;
-    }
-    logTo(c, thaw
-      ? `reactor thawed from a ${fmtBytes(thaw.length)} save-state: ${ex.url} — resuming where it was frozen`
-      : `reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
-  }
+  reactorJit = useJit;
+  const which = useJit ? 'wasm-JIT reactor' : 'reactor';
+  logTo(c, thaw
+    ? `${which} thawed from a ${fmtBytes(thaw.length)} save-state: ${ex.url} — resuming where it was frozen`
+    : `${which} opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
   // Hold the module (and its served file) beside the run: a save-state freezes against exactly the
   // module the guest was opened over, and this is where that is known.
   c.reactorBytes = bytes;
   saveStateRender(c);
-  const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
+  let tier = reactorJit ? 'wasm-JIT' : 'interpreter';
   runStage(rec, `open:${tier}`, performance.now() - tOpen);
   runTier(rec, tier);
   setState(c, 'running', `running (${tier}) — arrow keys to steer, Stop to end`);
@@ -4129,10 +4100,25 @@ async function runReactor(c, opts = {}) {
   reactorRun = { rec, t0, frames: 0 };
   // Start the keyframe ladder + input tape, so the run can be scrubbed back through (#1457).
   scrubOpen(c);
-  const loop = () => {
+  const gen = reactorGen;
+  // One frame per animation frame, as `reactorDo` work: nothing else touches the reactor while its
+  // frame's run is in flight, and a Stop or a pause on the scrub bar that lands meanwhile takes effect
+  // when it has ended.
+  const paused = () => scrub !== null && scrub.viewing != null;
+  const loop = () => reactorDo(async () => {
+    if (gen !== reactorGen || paused()) return; // stopped or paused before this frame began
     scrubBeginTick(); // the engine takes a keyframe if one is due and feeds this tick's input
-    const status = scrubEngine().frame();
+    const counts = {};
+    const status = await reactorFrame(counts);
     scrubAfterFrame();
+    if (gen !== reactorGen) return; // stopped while it ran: nothing more to show or schedule
+    // A tick the engine could not emit runs interpreted: say so once, on the first frame.
+    if (frames === 0 && reactorJit && counts.leaves === 0) {
+      tier = 'interpreter';
+      logTo(c, 'wasm-JIT: the engine could not emit tick(), so it runs interpreted');
+      runNote(rec, { jitFallbackReason: 'tick not emittable' });
+      runTier(rec, tier);
+    }
     presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
     // The tick's stdout (a guest's console output; the Uxntal card's assembly error) — appended live.
     const outLen = eng.ex.temen_stdout_len();
@@ -4151,26 +4137,23 @@ async function runReactor(c, opts = {}) {
       fpsT0 = now;
     }
     if (status === 0) {
-      reactorRAF = requestAnimationFrame(loop);
+      if (!paused()) reactorRAF = requestAnimationFrame(loop); // a pause holds until Resume re-arms it
       return;
     }
     reactorRAF = null;
     let trapDetail = '';
     if (status !== 0 && status !== 5) {
-      const n = jitReactor ? eng.ex.temen_onramp_jit_trap_len() : eng.ex.temen_onramp_trap_len();
+      const n = eng.ex.temen_onramp_trap_len();
       if (n > 0) {
         trapDetail = new TextDecoder().decode(
           new Uint8Array(eng.memory.buffer).slice(eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + n));
       }
     }
     reactorLoop = null;
+    reactorGen++;
     scrubClose(); // the guest is gone; its keyframes image a window that no longer exists
-    if (jitReactor) {
-      jitReactor.close();
-      jitReactor = null;
-    } else {
-      eng.ex.temen_onramp_close();
-    }
+    reactor.close();
+    reactor = null;
     closeReactorCard();
     c.el.run.disabled = broken;
     c.el.stop.disabled = true;
@@ -4180,7 +4163,7 @@ async function runReactor(c, opts = {}) {
         : `reactor trapped: status ${status}${trapDetail ? ` (${trapDetail})` : ''}`);
     logTo(c, `reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
     finalizeReactor({ ended: status === 5 ? 'exit' : 'trap', ok: status === 5, status, trap: trapDetail || undefined });
-  };
+  });
   reactorLoop = loop;
   reactorRAF = requestAnimationFrame(loop);
 }
@@ -4203,56 +4186,31 @@ function hashFB() {
   return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
 }
 
-// Open the interpreter reactor over `bytes`: alloc, copy the module in, run _start (decode + grant the
-// powerbox). A guest that needs a served file (Doom's WAD, Uxn's ROM) is opened with
-// temen_onramp_open_fs, which grants the `fs` capability over `file.data` under `file.name`; every other
-// reactor guest uses plain temen_onramp_open. Returns the open status (0 = ok).
-function openInterpReactor(bytes, file) {
-  let opened;
-  if (file) {
-    const nameBytes = new TextEncoder().encode(file.name);
-    const modP = eng.ex.temen_alloc(bytes.length);
-    const nameP = eng.ex.temen_alloc(nameBytes.length);
-    const dataP = eng.ex.temen_alloc(file.data.length);
-    const view = new Uint8Array(eng.memory.buffer);
-    view.set(bytes, modP);
-    view.set(nameBytes, nameP);
-    view.set(file.data, dataP);
-    opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
-    eng.ex.temen_dealloc(modP, bytes.length);
-    eng.ex.temen_dealloc(nameP, nameBytes.length);
-    eng.ex.temen_dealloc(dataP, file.data.length);
-  } else {
-    const p = eng.ex.temen_alloc(bytes.length);
-    new Uint8Array(eng.memory.buffer).set(bytes, p);
-    opened = eng.ex.temen_onramp_open(p, bytes.length);
-    eng.ex.temen_dealloc(p, bytes.length);
+// Open a reactor over `bytes` (serving `file` if given), run up to `n` frames on one tier — `tick`
+// offered to the emitted tier when `jit` — hashing each presented frame, then close it. Throws when
+// the open is refused, or when `jit` and the engine could not emit `tick`: a parity run that compared
+// the interpreter with itself would prove nothing.
+async function framesOn(bytes, file, n, jit) {
+  const r = await reactorDo(() => openReactor(eng.ex, eng.memory, bytes, file));
+  if (!r) throw new Error(`reactor open failed: status ${eng.ex.temen_status()}`);
+  const hs = [];
+  try {
+    for (let i = 0; i < n; i++) {
+      const counts = {};
+      const status = await reactorDo(() => r.frame(jit, counts));
+      if (jit && i === 0 && counts.leaves === 0) throw new Error('the engine could not emit tick()');
+      if (status !== 0) break;
+      hs.push(hashFB());
+    }
+  } finally {
+    await reactorDo(() => r.close());
   }
-  return opened;
-}
-
-// Open the interpreter reactor, run up to `n` frames, hashing each presented frame; close. Synchronous.
-function framesInterp(bytes, file, n) {
-  const opened = openInterpReactor(bytes, file);
-  if (opened !== 0) throw new Error(`interpreter open failed: status ${eng.ex.temen_status()}`);
-  const hs = [];
-  for (let i = 0; i < n; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
-  eng.ex.temen_onramp_close();
-  return hs;
-}
-
-// Open the wasm-JIT reactor (throws if the tick isn't emittable), run up to `n` frames, hashing each.
-async function framesJit(bytes, file, n) {
-  const r = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
-  const hs = [];
-  for (let i = 0; i < n; i++) { if (r.frame() !== 0) break; hs.push(hashFB()); }
-  r.close();
   return hs;
 }
 
 async function proveParity(c) {
   if (broken) return;
-  stopReactor(); // a parity run supersedes any running reactor loop
+  await stopReactor(); // a parity run supersedes any running reactor loop
   const ex = c.ex;
   setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
   c.el.run.disabled = true;
@@ -4273,8 +4231,8 @@ async function proveParity(c) {
   try {
     // Yield a paint so "proving…" lands before the synchronous interpreter frames block the thread.
     await new Promise((r) => setTimeout(r, 30));
-    const interpH = framesInterp(bytes, file, N);
-    const jitH = await framesJit(bytes, file, N);
+    const interpH = await framesOn(bytes, file, N, false);
+    const jitH = await framesOn(bytes, file, N, true);
     const n = Math.min(interpH.length, jitH.length);
     let mismatch = -1;
     for (let i = 0; i < n; i++) if (interpH[i] !== jitH[i]) { mismatch = i; break; }
@@ -4301,7 +4259,7 @@ async function proveParity(c) {
 // it per-frame instead). This is exactly what browser-jit-module-test.mjs asserts in CI.
 async function proveModuleParity(c) {
   if (broken) return;
-  stopReactor();
+  await stopReactor();
   const ex = c.ex;
   setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
   c.el.run.disabled = true;
@@ -4394,7 +4352,7 @@ async function proveModuleParity(c) {
 // guest, its stdout is the IR. This is exactly what `chibicc_jit.rs` asserts natively.
 async function proveChibiccParity(c) {
   if (broken) return;
-  stopReactor();
+  await stopReactor();
   const ex = c.ex;
   setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
   c.el.run.disabled = true;
@@ -4462,7 +4420,7 @@ async function proveChibiccParity(c) {
 // interp≡JIT guarantee `chibicc_jit.rs` proves natively, now over chibicc's own source.
 async function proveSelfhostParity(c) {
   if (broken) return;
-  stopReactor();
+  await stopReactor();
   const ex = c.ex;
   setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
   c.el.run.disabled = true;
@@ -4707,7 +4665,7 @@ async function chibiccCompileIR(c) {
 // capability — e.g. `printf` → `write` — CapFaults; compute-only programs debug cleanly.)
 async function startDebug(c) {
   if (broken) return;
-  stopReactor();
+  await stopReactor();
   if (dapCard) endDebug(dapCard, null); // supersede any running session
   let programText;
   if (c.ex.kind === 'chibicc') {
@@ -4974,7 +4932,7 @@ async function runDemo(c) {
   if (broken) return;
   if (c.editor) c.editor.clearError();
   if (dapCard) endDebug(dapCard, null); // a fresh Run supersedes any debug session
-  stopReactor(); // a fresh Run supersedes any running reactor loop
+  await stopReactor(); // a fresh Run supersedes any running reactor loop
   const ex = c.ex;
   if (ex.kind === 'reactor') return runReactor(c);
   if (ex.kind === 'pg') return runPg(c);
@@ -5300,15 +5258,33 @@ function buildCard(name, ex) {
     wrap.append(back, range, fwd, label, resume);
     section.appendChild(wrap);
     scrubRow = { wrap, range, label, resume, back, fwd };
-    const seekTo = (t) => { scrubPause(); scrubSeek(t); };
+    // A seek is reactor work: it runs the frames it crosses, so it waits for a frame in flight. A drag
+    // fires faster than frames replay, so a seek waiting its turn takes the latest target instead of
+    // queueing another. The bar shows the target at once, so a step taken before the seek lands counts
+    // from where it is going.
+    let seekWanted = null;
+    const seekTo = (t) => {
+      if (!scrub) return;
+      scrubPause();
+      scrub.viewing = Math.max(0, Math.min(t, scrubLen()));
+      scrubRender();
+      const waiting = seekWanted !== null;
+      seekWanted = t;
+      if (waiting) return;
+      reactorDo(async () => {
+        const target = seekWanted;
+        seekWanted = null;
+        await scrubSeek(target);
+      });
+    };
     range.addEventListener('input', () => seekTo(Number(range.value)));
     back.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrubTick()) : 0) - 1));
     fwd.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrubTick()) : 0) + 1));
-    resume.addEventListener('click', () => {
+    resume.addEventListener('click', () => reactorDo(() => {
       if (!scrub || scrub.viewing == null) return;
       scrubResumeFrom(scrub.viewing);
       resumeReactorLoop();
-    });
+    }));
   }
 
   // …and a **save-state** row (#1458): freeze this guest to a §12 artifact in IndexedDB and come back

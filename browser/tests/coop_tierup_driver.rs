@@ -24,7 +24,13 @@ use temen_browser::{
     temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr,
     temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
     temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
-    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator,
+    temen_coop_win_len, temen_coop_win_ptr, temen_framebuffer_height, temen_framebuffer_len,
+    temen_framebuffer_ptr, temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
+    temen_onramp_frame_begin, temen_onramp_freeze, temen_onramp_key, temen_onramp_moment_free,
+    temen_onramp_moment_restore, temen_onramp_moment_take, temen_onramp_open, temen_onramp_open_fs,
+    temen_onramp_set_grant_instantiator, temen_onramp_thaw, temen_onramp_timeline_begin_tick,
+    temen_onramp_timeline_close, temen_onramp_timeline_end_tick, temen_onramp_timeline_key,
+    temen_onramp_timeline_open, temen_onramp_timeline_seek_begin, temen_onramp_timeline_tick,
     temen_run_onramp_fs, temen_run_value, temen_status, temen_stdout_len, temen_stdout_ptr,
     temen_trap_len, temen_trap_ptr, temen_warm_close, temen_warm_coop_open,
     temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, temen_wasmjit_spill_sp_off,
@@ -5997,4 +6003,278 @@ fn coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf() {
     let (run, _) = pump(&[], None, &mut |cap, _| panic!("no cap is declared: {cap}"));
     assert_eq!((run.status, run.tierups, run.parks), (status, 1, 0));
     assert!(run.stdout == ir, "the same IR as the interpreter's compile");
+}
+
+// ---- #1414 S4-4: the reactor's frames on the emitted tier -----------------------------------------
+//
+// One reactor serves both tiers: each frame is a pump run of the guest's `tick` over the reactor's
+// live window, interpreted or with `tick` offered whole to the emitted tier. These drive the FFI as
+// the page does — `temen_onramp_frame_begin`, then `pump` playing `driveCoopTierupRun` on wasmi.
+
+/// The `bounce` and `life` reactor fixtures the interactive cards run. `life` keeps its grids in a
+/// heap it grows past the declared window.
+const BOUNCE: &[u8] = include_bytes!("fixtures/bounce.temen");
+const LIFE: &[u8] = include_bytes!("fixtures/life.temen");
+/// The JS keyCodes `bounce` steers on.
+const LEFT: i32 = 37;
+const RIGHT: i32 = 39;
+
+/// Open the FFI's reactor over `bytes`. `_start` runs interpreted, as on the page.
+fn reactor_open(bytes: &[u8]) {
+    assert_eq!(temen_onramp_open(bytes.as_ptr(), bytes.len()), 0, "open");
+}
+
+/// One frame of the open reactor — `tick` offered to the emitted tier when `jit` — and a hash of the
+/// frame it presented. A frame on the emitted tier that kept going ran `tick` there whole.
+fn reactor_frame(jit: bool) -> (i32, u64) {
+    assert_eq!(
+        temen_onramp_frame_begin(jit as i32, 0),
+        0,
+        "start the frame"
+    );
+    let (run, _) = pump(&[], None, &mut |cap, _| panic!("no caps: {cap}"));
+    if jit && run.status == STATUS_OK {
+        assert_eq!(run.tierups, 1, "tick ran whole on the emitted tier");
+    }
+    (run.status, presented_hash())
+}
+
+/// A hash of the frame the last run presented (dimensions and pixels).
+fn presented_hash() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let (w, h) = (temen_framebuffer_width(), temen_framebuffer_height());
+    // SAFETY: the framebuffer slot stays live until the next run replaces it.
+    let px =
+        unsafe { std::slice::from_raw_parts(temen_framebuffer_ptr(), temen_framebuffer_len()) };
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    (w, h, px).hash(&mut s);
+    s.finish()
+}
+
+/// `n` frames of the open reactor on one tier, each one's status `STATUS_OK`.
+fn reactor_frames(jit: bool, n: usize) -> Vec<u64> {
+    (0..n)
+        .map(|i| {
+            let (status, hash) = reactor_frame(jit);
+            assert_eq!(status, STATUS_OK, "frame {i} (jit {jit})");
+            hash
+        })
+        .collect()
+}
+
+/// **The reactor's emitted tier is its interpreter's twin** (#1414 S4-4): the same guest presents the
+/// same frames whether `tick` runs whole on the emitted tier or interpreted. `life` is the grown-heap
+/// case: its grids live past the declared window, which emitted code reaches through the reactor's
+/// window as it grows.
+#[test]
+fn reactor_frames_on_the_emitted_tier_match_the_interpreter() {
+    let _g = ffi_guard();
+    for (name, fixture) in [("bounce", BOUNCE), ("life", LIFE)] {
+        let on = |jit| {
+            reactor_open(fixture);
+            let hs = reactor_frames(jit, 12);
+            temen_onramp_close();
+            hs
+        };
+        let (interpreted, emitted) = (on(false), on(true));
+        assert_eq!(
+            emitted, interpreted,
+            "{name}: the tiers present the same frames"
+        );
+        let distinct: std::collections::HashSet<_> = emitted.iter().collect();
+        assert!(
+            distinct.len() > 1,
+            "{name} animates, so the check is not vacuous"
+        );
+    }
+}
+
+/// **Doom presents the same frames on either tier**: the guest the reactor's emitted tier is for, its
+/// WAD served behind `fs`. `#[ignore]`d: it needs the built `doom.temen` (`demos/doom/build.sh`; not
+/// vendored). Paths as `doom_reactor.rs` takes them: `DOOM_TEMEN`, and `DOOM_WAD`, which defaults to
+/// the vendored shareware IWAD.
+#[test]
+#[ignore = "needs demos/doom/build.sh's doom.temen; slow"]
+fn doom_frames_on_the_emitted_tier_match_the_interpreter() {
+    let _g = ffi_guard();
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let doom = std::fs::read(var("DOOM_TEMEN", "/tmp/doomgeneric_cache/bc/doom.temen"))
+        .expect("built doom.temen — run demos/doom/build.sh first");
+    let wad_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/temen-run/demos/doom/doom1.wad"
+    );
+    let wad = std::fs::read(var("DOOM_WAD", wad_path)).expect("shareware doom1.wad");
+    let name = b"doom1.wad";
+    let on = |jit| {
+        let opened = temen_onramp_open_fs(
+            doom.as_ptr(),
+            doom.len(),
+            name.as_ptr(),
+            name.len(),
+            wad.as_ptr(),
+            wad.len(),
+        );
+        assert_eq!(opened, 0, "open Doom");
+        let hs = reactor_frames(jit, 3);
+        // SAFETY: the framebuffer slot stays live until the next run replaces it.
+        let px =
+            unsafe { std::slice::from_raw_parts(temen_framebuffer_ptr(), temen_framebuffer_len()) };
+        assert!(
+            px.iter().any(|&b| b != 0),
+            "Doom presented a picture (jit {jit})"
+        );
+        temen_onramp_close();
+        hs
+    };
+    assert_eq!(on(true), on(false), "the tiers present the same frames");
+}
+
+/// **A moment taken between emitted frames replays on either tier** (#1457): the window is the whole
+/// of the guest on the emitted tier too — the env cell and the globals emitted code reads outside it
+/// are rewritten every frame — so a rewound reactor presents the recorded frames again, emitted or
+/// interpreted. A keypress queued before the moment and not yet drained rides it.
+#[test]
+fn a_moment_between_emitted_frames_replays_on_either_tier() {
+    let _g = ffi_guard();
+    reactor_open(BOUNCE);
+    reactor_frames(true, 4);
+    temen_onramp_key(LEFT, 1);
+    let slot = temen_onramp_moment_take();
+    assert!(slot >= 0, "the reactor's window is capturable");
+    let recorded = reactor_frames(true, 8);
+    for jit in [true, false] {
+        assert_eq!(temen_onramp_moment_restore(slot), 0, "restore (jit {jit})");
+        assert_eq!(reactor_frames(jit, 8), recorded, "replayed (jit {jit})");
+    }
+    temen_onramp_moment_free(slot);
+    temen_onramp_close();
+}
+
+/// **A save-state serves both tiers** (#1458): frozen between frames on one tier, thawed into a fresh
+/// reactor, it presents the frames the original went on to present, on the other tier too, without
+/// `_start` running again. `life`'s grown heap rides the artifact.
+#[test]
+fn a_save_state_thaws_onto_either_tier() {
+    let _g = ffi_guard();
+    for (froze_jit, thaw_jit) in [(true, false), (false, true), (true, true)] {
+        reactor_open(LIFE);
+        reactor_frames(froze_jit, 5);
+        let n = temen_onramp_freeze(LIFE.as_ptr(), LIFE.len());
+        assert!(n > 0, "freeze (jit {froze_jit})");
+        // SAFETY: the artifact slot stays live until the next freeze.
+        let artifact =
+            unsafe { std::slice::from_raw_parts(temen_onramp_artifact_ptr(), n) }.to_vec();
+        let recorded = reactor_frames(froze_jit, 6);
+        temen_onramp_close();
+        let thawed = temen_onramp_thaw(
+            artifact.as_ptr(),
+            artifact.len(),
+            LIFE.as_ptr(),
+            LIFE.len(),
+            core::ptr::null(),
+            0,
+            core::ptr::null(),
+            0,
+        );
+        assert_eq!(thawed, 0, "thaw");
+        assert_eq!(
+            reactor_frames(thaw_jit, 6),
+            recorded,
+            "frozen with jit {froze_jit}, thawed with jit {thaw_jit}"
+        );
+        temen_onramp_close();
+    }
+}
+
+/// **The scrub bar's timeline over emitted frames** (#1457): driven the page's way — `begin_tick`,
+/// a frame on the emitted tier, `end_tick` — it records a steered run, and a seek to any recorded tick
+/// replays the frame that tick presented.
+#[test]
+fn a_timeline_seeks_through_emitted_frames() {
+    let _g = ffi_guard();
+    reactor_open(BOUNCE);
+    assert_eq!(temen_onramp_timeline_open(6, 4, 0), 0);
+    let tick = |key: Option<i32>| {
+        if let Some(k) = key {
+            assert_eq!(temen_onramp_timeline_key(k, 1), 0);
+        }
+        assert_eq!(temen_onramp_timeline_begin_tick(), 0);
+        let (status, hash) = reactor_frame(true);
+        assert_eq!(status, STATUS_OK);
+        temen_onramp_timeline_end_tick();
+        hash
+    };
+    let recorded: Vec<u64> = (0..24)
+        .map(|i| {
+            tick(match i % 6 {
+                0 => Some(RIGHT),
+                3 => Some(LEFT),
+                _ => None,
+            })
+        })
+        .collect();
+    for target in [21usize, 2, 13, 0, 23] {
+        assert_eq!(
+            temen_onramp_timeline_seek_begin(target as i32),
+            0,
+            "seek {target}"
+        );
+        while (temen_onramp_timeline_tick() as usize) < target {
+            tick(None);
+        }
+        assert_eq!(tick(None), recorded[target], "tick {target} replays");
+    }
+    temen_onramp_timeline_close();
+    temen_onramp_close();
+}
+
+/// **A `tick` that stores into its own read-only data traps on the emitted tier, as interpreted**
+/// (#2302). The reactor's whole-`tick` tier this replaces emitted `tick` without the page check and
+/// ran on past the store; offered as a leaf, `tick` is page-checked because its image has read-only
+/// data, and the frame ends `MemoryFault` on both tiers.
+#[test]
+fn a_tick_storing_to_its_read_only_data_traps_on_either_tier() {
+    let _g = ffi_guard();
+    let src = r#"memory 16
+data ro 34816 "abcdefgh"
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  return vz
+  }
+}
+func (i64) -> (i64) {
+block 0 (vsp: i64) {
+  va = i64.const 34816
+  vb = i64.const 106
+  i64.store va vb
+  vx = i64.load va
+  return vx
+  }
+}
+export 0 func "_start" 0
+export 1 func "tick" 1
+"#;
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    for (jit, tierups) in [(false, 0), (true, 1)] {
+        reactor_open(&bytes);
+        assert_eq!(temen_onramp_frame_begin(jit as i32, 0), 0);
+        let (run, _) = pump(&[], None, &mut |cap, _| panic!("no caps: {cap}"));
+        assert_eq!(
+            (run.status, run.tierups),
+            (STATUS_TRAP, tierups),
+            "jit {jit}"
+        );
+        // SAFETY: the end-of-run trap-name slot, read before anything else runs.
+        let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
+        assert_eq!(
+            std::str::from_utf8(trap).unwrap(),
+            "MemoryFault",
+            "jit {jit}"
+        );
+        temen_onramp_close();
+    }
 }

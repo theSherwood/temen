@@ -19,16 +19,16 @@ const page = await browser.newPage();
 const errors = []; page.on('pageerror', e => errors.push(String(e))); page.on('console', m => { if (m.type()==='error') errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const res = await page.evaluate(async () => {
-  const par = await import('./par.js'); const wg = await import('./webgpu.js');
+  const par = await import('./par.js'); const wg = await import('./webgpu.js'); const { openReactor } = await import('./reactor.js');
   if (!wg.webgpuAvailable()) return { skip: 'no webgpu' };
   const eng = await par.loadEngine();
   const bytes = new Uint8Array(await (await fetch('./assets/gpu_shader.temen')).arrayBuffer());
   const canvas = document.createElement('canvas'); canvas.width=640; canvas.height=480; document.body.append(canvas);
   await wg.initWebGPU(canvas);
-  const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
-  const opened = eng.ex.temen_onramp_open(p, bytes.length); eng.ex.temen_dealloc(p, bytes.length);
+  const r = openReactor(eng.ex, eng.memory, bytes);
+  const opened = r ? 0 : -eng.ex.temen_status();
   if (opened !== 0) return { opened };
-  const statuses = []; for (let i=0;i<12;i++) statuses.push(eng.ex.temen_onramp_frame());
+  const statuses = []; for (let i=0;i<12;i++) statuses.push(await r.frame(false));
   const px = await wg.readbackForTest(60, 320, 240);
   let black=0, colored=0; for (let i=0;i<px.length;i+=4){ if(px[i]===0&&px[i+1]===0&&px[i+2]===0) black++; else colored++; }
   return { opened, statuses, black, colored, total: px.length/4 };
