@@ -32964,6 +32964,15 @@ impl Host {
                             EINVAL // `dst` is not under this node (itself, a peer, an ancestor)
                         }])
                     }
+                    // close() -> 0 (#2384): give the handle up, as a `Stream`'s or a region's is
+                    // ([`Host::close`]): a later use answers `-EBADF`. The node stays in the tree,
+                    // where charges name it by id, so a child spawned from it is capped and charged
+                    // as before. A parent that splits a node per child closes its handle once the
+                    // child holds its own, or its table fills with them.
+                    3 => {
+                        self.close(handle);
+                        Ok(vec![0])
+                    }
                     _ => Ok(vec![EINVAL]),
                 }
             }

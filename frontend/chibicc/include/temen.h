@@ -63,6 +63,10 @@ long __vm_instantiate_join(int inst, long child);
 // (a run of pages of one protection in a window, a thread, a region). The powerbox's `"budget"` holds
 // one window's worth.
 long __vm_budget_read(int budget, long field);
+// `__vm_budget_close(budget)` — give a `Budget` handle up (0; the handle answers -EBADF after). The
+// node stays, so a child you spawned from it is still capped by it: close a node you split for a
+// child once the child is spawned, or a parent that spawns many fills its handle table (#2384).
+long __vm_budget_close(int budget);
 //
 // **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
 // authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many

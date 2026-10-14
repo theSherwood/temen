@@ -180,7 +180,9 @@ pub mod cap_id {
     /// sub_handle | -errno`: mint a child node, each ceiling clamped to the holder's (`-1` =
     /// unbounded on its own), deducting nothing. op 1 `read(field) -> room | -EINVAL`: the room left
     /// along the chain — the §15 monitoring readout. op 2 `transfer(dst, fuel, mem, spawn) -> 0 |
-    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's.
+    /// -errno`: raise the ceilings of a node under the holder, clamped to the holder's. op 3
+    /// `close() -> 0` (#2384): give the handle up; the node stays in the tree, so a child spawned
+    /// from it is still capped and charged.
     pub const BUDGET: u32 = 14;
     /// PROCESS.md §5 **window minter** — the authority to mint **detached** windows: a child
     /// spawned through it (`Instantiator.instantiate_detached`, op 15) gets a fresh platform
