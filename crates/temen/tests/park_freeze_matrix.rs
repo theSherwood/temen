@@ -14,6 +14,9 @@
 //! ([`arm_freeze_after`]), which the rows that fire the freeze in a sibling use; the oracle and the
 //! bytecode engine keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]), which the one-vCPU rows use.
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use temen_durable::{
@@ -24,7 +27,7 @@ use temen_interp::{
     run_capture_reserved_with_host, CapState, FreezeRule, FreezeScope, Host, ParkSite,
     SignalSource, StreamRole, Value,
 };
-use temen_ir::{Memory, Module};
+use temen_ir::{Memory, Module, SpawnRec};
 use temen_jit::JitOutcome;
 
 const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
@@ -820,7 +823,7 @@ block 0 (vx: i64) {
 }
 
 /// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one
-/// dispatch (op 15 spawning func 2's child image (#2219), then `child_offer`), while the root
+/// dispatch (a v1 record spawning func 2's child image (#2219), then `child_offer`), while the root
 /// resumes a fiber, where the countdown fires. The root unwinds and rings `C`, which unwinds in its
 /// `svc.wait` without serving; `T` then enqueues its call and parks on the reply, and the freeze
 /// re-admits it: its wait is abandoned, its dispatch stays queued on `C`, and the ticket rides the
@@ -891,11 +894,13 @@ type 1 interface { bump: 0 }
 export 0 interface "counter" 1 { bump: 3 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
   vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vex = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vc, vex)
   vcap64 = i64.extend_i32_u vcap
@@ -939,7 +944,16 @@ block 0 (vx: i64) {
   }
 }
 "#;
-    let src = format!("{src}{t}{server}{FIBER}{CALLING_FIBER}");
+    // The root's spawn record, above the shadow arena: `C`'s 128 KiB window, the module and budget
+    // stored there.
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::v1()
+    };
+    let src = format!(
+        "{src}{t}{server}{FIBER}{CALLING_FIBER}{}",
+        rec::segment(65536, &spawn)
+    );
     let inst = instrumented(&src);
     let c = instrumented_image(&src, 2);
     let powerbox = || {

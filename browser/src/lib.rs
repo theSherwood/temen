@@ -749,7 +749,7 @@ pub const PAR_TIERUP: i32 = 7;
 /// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
 /// Worker runs the emitted `f{entry}(win, env, …args)` and calls `temen_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
-/// §5 `instantiate_detached` (op 15, #1286 slice 3b): the vCPU spawned a **detached** child — a
+/// §5 detached spawn (op 17, #1286 slice 3b): the vCPU spawned a **detached** child — a
 /// separate-module child in its OWN `WebAssembly.Memory`, not a carve of this window. The engine
 /// admitted it (the `Instantiator` resolved, the `WindowMinter` quota taken, the module compiled and
 /// pushed, its powerbox built) and hands it over as a ticket (`temen_par_ev_a`); `_b` = `size_log2`.
@@ -1382,7 +1382,7 @@ static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// Publish the §14 run recipe: the root's `Instantiator` will span `[0, win_size)`; a non-empty
 /// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
 /// grant); a non-zero `minter_quota` grants the root a `WindowMinter` of that many bytes (#1286 — the
-/// admission for `instantiate_detached`; its handle follows the module's in the root's args). Returns
+/// admission for a detached spawn; its handle follows the module's in the root's args). Returns
 /// `1`, or `0` on a bad module. Call once (on the main thread) before the run.
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_inst(
@@ -4958,7 +4958,7 @@ pub(crate) fn args_init_mem(argv: &[&[u8]]) -> Vec<u8> {
     init_mem
 }
 
-/// [`args_init_mem`] for an already-built args blob (the op-15 spawn-time payload, #1286, and an
+/// [`args_init_mem`] for an already-built args blob (a spawn record's args payload, #1286, and an
 /// on-ramp run's environment, [`onramp_env_init`]): zeros up to `module_args_base()`, then the blob
 /// verbatim. An empty payload seeds nothing.
 pub(crate) fn args_init_mem_raw(blob: &[u8]) -> Vec<u8> {
@@ -10451,7 +10451,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     let budget = host.grant_budget(-1, DETACHED_DEFAULT_MAX_BYTES as i64, -1);
     // #1527: a driver whose entry takes a fourth arg gets an `AddressSpace` over its window — so a
     // detached driver can mint a region (`create_region`), map it for itself and pre-map it into
-    // the child (the op-15 11-arg form). The three-arg drivers are unchanged.
+    // the child (the spawn record's `region`). The three-arg drivers are unchanged.
     let mut args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
     if driver.funcs.first().is_some_and(|f| f.params.len() == 4) {
         args.push(Value::I32(host.grant_address_space(0, win)));
@@ -10527,7 +10527,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 return OP13JIT_DONE;
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
-            // #1286 — a DETACHED child (op 17 v1 / op 15): its window is its own backing
+            // #1286 — a DETACHED child (an op-17 v1 record): its window is its own backing
             // ([`mint_detached_backing`] — in the browser a fresh `WebAssembly.Memory`, reached only
             // through `Region::Foreign`), and the emitted `_start` runs bound to it (`driveDetachedRun`).
             // No carve, no alias — the driver cannot address a byte of it. The engine admitted the child through the one admission every driver uses: its
@@ -10567,7 +10567,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 let back = std::sync::Arc::new(back);
                 // The child's entry gets the starter handles the interpreter passes.
                 let (mut host, cinst, cas) = child.into_powerbox();
-                // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
+                // #1527: a spawn's pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
                 // cannot alias, but a detached child runs to completion before its parent resumes
                 // (the handle is delivered only after `driveDetachedRun`; `join` reads the banked
                 // result), so with no interleaving an alias is observationally **copy-in before
@@ -10637,7 +10637,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
 /// returning `-EINVAL`.
 ///
 /// The value is `-EINVAL`, the same answer a driver gives a declined op (#1415; every bytecode
-/// driver services op 15 since #1528, but the shape stands) —
+/// driver services the detached spawn since #1528, but the shape stands) —
 /// one mechanism for "this tier does not do that", at both the op and the child level. `Malformed`
 /// was the wrong trap twice over: its definition is "structurally invalid in a way a verified
 /// module never is", and a verified module that `thread.spawn`s inside a leaf is not that.
@@ -13099,8 +13099,8 @@ fn emit_module(
     shared: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
-    let paged = m.data.iter().any(|d| d.readonly)
-        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let paged =
+        m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let (wasm, emit) =
         temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;

@@ -3628,34 +3628,65 @@ int main(void) {
 }
 "#;
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 /// The parent, over `(Instantiator, AddressSpace, Nim producer, C module, Budget)`: it mints a 64 KiB
 /// region, spawns the Nim child (the producer's image, its 16 MiB window, the region at 8 MiB) and
 /// the C child (its 128 KiB window, the region at 64 KiB, above its data and stack), each detached
-/// at entry 0 with the region pre-mapped, and returns both children's results. A pre-map must lie
-/// inside the window the child's module declares.
+/// from a spawn record of its own (the Nim child's at 17408, the C child's at 17536) with the region
+/// pre-mapped, and returns both children's results. A pre-map must lie inside the window the child's
+/// module declares.
 fn ring_parent() -> temen_ir::Module {
-    let text = "memory 17
-func (i32, i32, i32, i32, i32) -> (i64, i64) {
-block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {
+    let nim_child = temen_ir::SpawnRec {
+        size_log2: 24,
+        child_off: 8388608,
+        ..temen_ir::SpawnRec::v1()
+    };
+    let c_child = temen_ir::SpawnRec {
+        size_log2: 17,
+        child_off: 65536,
+        ..temen_ir::SpawnRec::v1()
+    };
+    let text = format!(
+        "memory 17
+func (i32, i32, i32, i32, i32) -> (i64, i64) {{
+block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
   len = i64.const 65536
   region = call.cap 5 5 (i64) -> (i64) aspace (len)
-  b = i64.extend_i32_u budget
-  z = i64.const 0
-  nm = i64.extend_i32_u nim
-  nl = i64.const 24
-  no = i64.const 8388608
-  pn = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, nm, z, z, z, nl, z, z, z, region, no)
-  cm = i64.extend_i32_u c
-  cl = i64.const 17
-  co = i64.const 65536
-  pc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, cm, z, z, z, cl, z, z, z, region, co)
+  rh = i32.wrap_i64 region
+  nma = i64.const {nim_module}
+  i32.store nma nim
+  nba = i64.const {nim_budget}
+  i32.store nba budget
+  nra = i64.const {nim_region}
+  i32.store nra rh
+  nrec = i64.const 17408
+  pn = call.cap 6 17 (i64) -> (i32) inst (nrec)
+  cma = i64.const {c_module}
+  i32.store cma c
+  cba = i64.const {c_budget}
+  i32.store cba budget
+  cra = i64.const {c_region}
+  i32.store cra rh
+  crec = i64.const 17536
+  pc = call.cap 6 17 (i64) -> (i32) inst (crec)
   jn_st, jn = call.cap 6 1 (i32) -> (i64, i64) inst (pn)
   jc_st, jc = call.cap 6 1 (i32) -> (i64, i64) inst (pc)
   return jn, jc
-  }
-}
-";
-    let m = temen_text::parse_module(text).expect("parse the parent");
+  }}
+}}
+{nim_rec}{c_rec}",
+        nim_module = 17408 + rec::MODULE_AT,
+        nim_budget = 17408 + rec::BUDGET_AT,
+        nim_region = 17408 + rec::REGION_AT,
+        c_module = 17536 + rec::MODULE_AT,
+        c_budget = 17536 + rec::BUDGET_AT,
+        c_region = 17536 + rec::REGION_AT,
+        nim_rec = rec::segment(17408, &nim_child),
+        c_rec = rec::segment(17536, &c_child),
+    );
+    let m = temen_text::parse_module(&text).expect("parse the parent");
     temen_verify::verify_module(&m).expect("verify the parent");
     m
 }

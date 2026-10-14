@@ -1,14 +1,15 @@
 //! #2219 — **a child runs a module the spawner holds, from its function 0, on every engine.** A spawn
 //! that names `-1`, which once named the spawner's own program, faults: `-1` is a forged `Module`
-//! handle like any other. So does an entry other than 0, in a record's word at 4 or op 15's entry
-//! operand: a child starts at its module's child bootstrap. And `Module` op 0, which looked an
-//! export up by name to pick an entry, is gone: a `Module` handle has no callable op. Each traps
-//! `CapFault` on the tree-walker, each bytecode driver and the Cranelift JIT alike, so no engine runs
-//! a spawn another refuses (INVARIANTS #9).
+//! handle like any other. So does an entry other than 0 in a record's word at 4: a child starts at
+//! its module's child bootstrap. And `Module` op 0, which looked an export up by name to pick an
+//! entry, is gone: a `Module` handle has no callable op. #2067 — so is op 15, the positional spawn:
+//! the v1 record (op 17) is the one spawn form. Each traps `CapFault` on the tree-walker, each
+//! bytecode driver and the Cranelift JIT alike, so no engine runs a spawn another refuses
+//! (INVARIANTS #9).
 //!
 //! Each form is otherwise well-formed — a budget that pays, a child module whose function 0 is a
 //! child entry, an export the lookup would find — so only the retired part is refused, and the same
-//! harness runs the record and op 15 to their join with the granted module at entry 0.
+//! harness runs the record to its join with the granted module at entry 0.
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -53,8 +54,7 @@ fn record(entry: u32) -> String {
 /// A parent `(inst, module, budget) -> i64` that runs `body` and returns its `vr`, then func 1, an
 /// entry that returns 7, which a spawn of the parent's own program would reach. `body` sees `vi`
 /// (the `Instantiator`), `vmod` and `vb` (the module and the `Budget`), `vm` and `vb64` (both as
-/// `i64`s), `vone` (1), `vneg` (-1), `vz` (0) and `vp` (the record at [`REC`]), whose `budget` is
-/// already stored.
+/// `i64`s), `vz` (0) and `vp` (the record at [`REC`]), whose `budget` is already stored.
 fn parent(body: &str, data: &str) -> Module {
     module(&format!(
         "memory 17
@@ -62,8 +62,6 @@ func (i32, i32, i32) -> (i64) {{
 block 0 (vi: i32, vmod: i32, vb: i32) {{
   vm = i64.extend_i32_s vmod
   vb64 = i64.extend_i32_s vb
-  vone = i64.const 1
-  vneg = i64.const -1
   vz = i64.const 0
   vp = i64.const {REC}
   vba = i64.const {budget_at}
@@ -95,14 +93,11 @@ fn module_is(handle: &str) -> String {
 const SPAWN_REC: &str = "  vh = call.cap 6 17 (i64) -> (i32) vi (vp)
   vst, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)";
 
-/// Op 15's 7-arg form `(budget, module, grants_ptr, grants_n, entry, size_log2, quota)` with
-/// `module` and `entry`; join the child and return its result.
-fn op15(module: &str, entry: &str) -> String {
-    format!(
-        "  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb64, {module}, vz, vz, {entry}, vz, vz)
-  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)"
-    )
-}
+/// The retired op 15's 7-arg form `(budget, module, grants_ptr, grants_n, entry, size_log2, quota)`,
+/// naming the granted module at entry 0 — the spawn the record makes; join the child and return its
+/// result.
+const OP15: &str = "  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb64, vm, vz, vz, vz, vz, vz)
+  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)";
 
 fn forms() -> Vec<(&'static str, Module)> {
     vec![
@@ -117,14 +112,7 @@ fn forms() -> Vec<(&'static str, Module)> {
             "a record with entry 1",
             parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record(1)),
         ),
-        (
-            "op 15 naming module -1",
-            parent(&op15("vneg", "vz"), &record(0)),
-        ),
-        (
-            "op 15 with entry 1",
-            parent(&op15("vm", "vone"), &record(0)),
-        ),
+        ("op 15, the retired positional spawn", parent(OP15, &record(0))),
         (
             "Module op 0",
             parent(
@@ -186,17 +174,14 @@ fn every_engine_traps_a_self_spawn_or_an_entry_with_capfault() {
     }
 }
 
-/// The control: the record and op 15, each naming the granted module at entry 0, spawn and join to
-/// its 42 on every engine — so the harness can spawn, and each refusal above is the retired part's.
+/// The control: the record, naming the granted module at entry 0, spawns and joins to its 42 on
+/// every engine — so the harness can spawn, and each refusal above is the retired part's.
 #[test]
 fn the_same_harness_runs_a_granted_module_from_function_0() {
-    for (form, m) in [
-        (
-            "the record",
-            parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record(0)),
-        ),
-        ("op 15", parent(&op15("vm", "vz"), &record(0))),
-    ] {
+    for (form, m) in [(
+        "the record",
+        parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record(0)),
+    )] {
         for driver in drivers::ALL {
             let ran = drivers::run_on(driver, &m, &setup)
                 .unwrap_or_else(|| panic!("{form}: {driver:?} declined the module"));

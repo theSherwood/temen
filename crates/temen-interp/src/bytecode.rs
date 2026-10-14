@@ -520,29 +520,11 @@ enum Op {
         handle: u32,
         dst: u32,
     },
-    /// PROCESS.md §5 `Instantiator.instantiate_detached(budget, module, grants_ptr, grants_n, entry,
-    /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
-    /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
-    /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
-    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve"); the
-    /// further optional `(region, child_off)` pre-maps a `SharedRegion` whole into the child's window
-    /// at `child_off` before it starts (the 11-arg form).
-    InstantiateDetached {
-        handle: u32,
-        budget: u32,
-        module: u32,
-        grants: Option<(u32, u32)>,
-        entry: u32,
-        size_log2: u32,
-        quota: u32,
-        args: Option<(u32, u32)>,
-        premap: Option<(u32, u32)>,
-        dst: u32,
-    },
-    /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
-    /// The record ([`SpawnRec`]) is **runtime data**, so unlike op 15's scalars its fields are read
-    /// from the vCPU's confined window at **exec** time; the op then folds onto the same
-    /// [`Outcome::InstantiateDetached`] op 15 produces (#1863).
+    /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the one spawn form (#1863), a
+    /// separate-module child in a **fresh window** minted through a `Budget` — no carve, no alias;
+    /// the host owns the window. The record ([`SpawnRec`]) is **runtime data**, so its fields are read
+    /// from the vCPU's confined window at **exec** time; the op then yields
+    /// [`Outcome::InstantiateDetached`].
     InstantiateRec {
         handle: u32,
         rec: u32,
@@ -1802,8 +1784,8 @@ pub(crate) fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
     SpawnRec::parse(&m.read_window(rp, temen_ir::SPAWN_REC_LEN)?).ok_or(Trap::CapFault)
 }
 
-/// A §5 detached spawn (op 15, #1286) as its lowering resolved it: a separate module in a fresh
-/// window of its own, never a carve of the spawner's.
+/// A §5 detached spawn (#1286) as its record (op 17) names it: a separate module in a fresh window
+/// of its own, never a carve of the spawner's.
 #[derive(Clone, Copy)]
 struct DetachedSpawn {
     /// The `Budget` handle whose `mem` quota pays for the window.
@@ -1812,8 +1794,6 @@ struct DetachedSpawn {
     module: i32,
     /// The window: `1 << size_log2` bytes, the module's declared memory.
     size_log2: i64,
-    /// The child's fuel quota (`<= 0` inherits the parent's remaining).
-    quota: i64,
     /// The by-name grant list's `(ptr, count)` in the spawner's window; `None` grants only the
     /// starter caps.
     grants: Option<(u64, u64)>,
@@ -1826,13 +1806,12 @@ struct DetachedSpawn {
 }
 
 impl DetachedSpawn {
-    /// A v1 (detached) op-17 record's spawn: op 15 as data (#1863).
+    /// A v1 (detached) op-17 record's spawn (#1863).
     fn of(sr: &SpawnRec) -> DetachedSpawn {
         DetachedSpawn {
             budget: sr.budget,
             module: sr.modh,
             size_log2: sr.size_log2,
-            quota: sr.quota,
             grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
             args: (sr.args.1 > 0).then_some(sr.args),
             premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
@@ -2048,7 +2027,7 @@ impl FreshWindow {
     }
 }
 
-/// Admit an op-15 spawn against `host` (the parent powerbox) and build the child, with its window
+/// Admit a detached spawn against `host` (the parent powerbox) and build the child, with its window
 /// still to be built over a backing the driver supplies. `pm` is the parent's window (the grant list
 /// and the args payload are read from it). `Ok(None)` is a **probeable refusal** — the driver lands
 /// `-EINVAL` and nothing was charged; `Err` is a trap (a forged handle, an unreadable payload, a
@@ -2072,11 +2051,6 @@ fn admit_detached_child(
     freezes_detached: bool,
     source: &ModuleSource,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
-    // #1944 slice 3 — `quota` is retired: the budget is the one way to limit a child's fuel, so any
-    // other value fails closed, checked first as the tree-walker's op-15 arm does.
-    if s.quota != 0 {
-        return Err(Trap::CapFault);
-    }
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         let program = granted_program(host, source, g)?;
@@ -2885,21 +2859,6 @@ fn compile_inst(
                 (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
-                    dst,
-                },
-                // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
-                // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
-                // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
-                (cap_id::INSTANTIATOR, 15) => Op::InstantiateDetached {
-                    handle: g(*handle),
-                    budget: g(args[0]),
-                    module: g(args[1]),
-                    grants: Some((g(args[2]), g(args[3]))),
-                    entry: g(args[4]),
-                    size_log2: g(args[5]),
-                    quota: g(args[6]),
-                    args: (args.len() >= 9).then(|| (g(args[7]), g(args[8]))),
-                    premap: (args.len() >= 11).then(|| (g(args[9]), g(args[10]))),
                     dst,
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
@@ -4134,8 +4093,7 @@ pub enum VcpuEvent {
         results: Box<[ValType]>,
         mapped: Option<u64>,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17; THREADS.md
-    /// 4c-domain §14-D2): start a child in a **fresh window the host mints** — nothing of it in the
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286; THREADS.md 4c-domain §14-D2): start a child in a **fresh window the host mints** — nothing of it in the
     /// parent's window. The engine already admitted it with the one admission every driver uses
     /// ([`admit_detached_child`]): the entry, the window = the declared memory, the `Budget` quota;
     /// its powerbox built (the starter caps span the reservation, as a root's do, so `vm_map` grows
@@ -4300,7 +4258,7 @@ struct VcpuChild {
     live: LiveVcpu,
 }
 
-/// A child that a [`VcpuEvent::InstantiateDetached`] (§5, ops 15 and 17) announced, as the engine
+/// A child that a [`VcpuEvent::InstantiateDetached`] (§5, op 17) announced, as the engine
 /// admitted it. The one admission every driver uses ([`admit_detached_child`]) built its powerbox — the starter
 /// `Instantiator`/`AddressSpace`, the by-name re-grants, the module it serves and its import
 /// manifest, a funding budget's channel ceiling, a pre-mapped region — charged its budget, and landed
@@ -5114,7 +5072,7 @@ impl<'p> Vcpu<'p> {
                         mapped,
                     };
                 }
-                // op 15 (`instantiate_detached`, #1286) and a §3d record (op 17): admitted by
+                // A §3d record (op 17, #1286): admitted by
                 // `admit_detached_child`, the one admission every driver uses, against this vCPU's
                 // own window and powerbox. A refusal lands `-EINVAL` in place and the run continues; a
                 // forged handle traps. The child's window is fresh, so the host mints its backing and
@@ -6111,7 +6069,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
 }
 
 /// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
-/// it (already rebuilt: envs come back in spawn order). Its window is built as op 15 builds it, then
+/// it (already rebuilt: envs come back in spawn order). Its window is built as a spawn builds it, then
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
@@ -7397,7 +7355,7 @@ struct DetachedEnv {
     live: Option<DetachedLive>,
 }
 
-/// #1866 — a live detached child's window (its image, and the geometry op 15 built it with) and its
+/// #1866 — a live detached child's window (its image, and the geometry its spawn built it with) and its
 /// powerbox.
 #[derive(Clone)]
 struct DetachedLive {
@@ -7950,7 +7908,7 @@ fn service_advance(
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
-            // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
+            // §5 detached spawn (op 17): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
             Outcome::InstantiateDetached { spawn, dst } => {
@@ -8104,7 +8062,7 @@ fn dbg_start_child(
     Ok(())
 }
 
-/// §5 `instantiate_detached` (op 15) on the debugger path — [`dbg_instantiate_confined`]'s twin over
+/// §5 detached spawn (op 17) on the debugger path — [`dbg_instantiate_confined`]'s twin over
 /// a **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
 /// (the executor's); the child is scheduled by [`dbg_start_child`], joined like a confined child.
 #[allow(clippy::too_many_arguments)]
@@ -10712,7 +10670,7 @@ enum Outcome {
     PipeWrite {
         pipe: u32,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17): the driver
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286): the driver
     /// admits the separate-module child `spawn` describes, in a fresh window of its own
     /// ([`admit_detached_child`]), and writes the join handle (or `EINVAL`) to `dst`. The child runs
     /// on the scheduler, joinable via the shared thread machinery (`Instantiator.join` compiles to
@@ -12442,7 +12400,7 @@ enum VcpuStop {
         dst: u32,
         status: bool,
     },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
+    /// §5 `Instantiator.instantiate_rec` (op 17, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
         spawn: DetachedSpawn,
         dst: u32,
@@ -15610,9 +15568,9 @@ impl SchedCore {
                 tasks[ti].threads.push(Some(cidx));
                 tasks[ti].deliver(dst, Reg::from_i32(handle));
             }
-            // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
+            // §5 detached spawn (op 17): the child is a task of this executor over a
             // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
-            // tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative driver.
+            // tree-walk oracle's spawn (`run_with_host`'s op-17 arm) on the cooperative driver.
             // Admission first (entry shape, the window = the module's declared memory, the args
             // payload, `premap_admit`, no durable domain, then the `Budget.mem` take — a refused
             // spawn lands `-EINVAL` and charges nothing); then the child powerbox: starter
@@ -20149,50 +20107,12 @@ impl Vm {
                         personality: false,
                     });
                 }
-                // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
-                // CapFault, as every op above); the budget's quota take and the module resolve happen at
-                // the driver's commit site (`admit_detached_child`), peek-then-drain like op 13.
-                Op::InstantiateDetached {
-                    handle,
-                    budget,
-                    module: module_reg,
-                    grants,
-                    entry,
-                    size_log2,
-                    quota,
-                    args,
-                    premap,
-                    dst,
-                } => {
-                    let ih = r!(*handle).i32();
-                    host.with(|p| p.resolve_instantiator(ih))?;
-                    // #2219 — a child starts at its module's function 0, its child bootstrap, so the
-                    // entry operand must be 0, as the record's word at 4 must.
-                    if r!(*entry).i64() != 0 {
-                        return Err(Trap::CapFault);
-                    }
-                    let spawn = DetachedSpawn {
-                        budget: r!(*budget).i64() as i32,
-                        module: r!(*module_reg).i64() as i32,
-                        size_log2: r!(*size_log2).i64(),
-                        quota: r!(*quota).i64(),
-                        grants: grants
-                            .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
-                            .filter(|(_, n)| *n != 0),
-                        args: args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64)),
-                        premap: premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64)),
-                    };
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::InstantiateDetached { spawn, dst });
-                }
-                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the record from this vCPU's
+                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): the Instantiator is the authority
+                // (a forged one is a CapFault, as every op above); read the record from this vCPU's
                 // confined window and fail closed exactly as the tree-walker's arm does (bad version
-                // or reserved field → `CapFault`). A record is op 15 as data (#1863): the same outcome
-                // op 15 produces, served by every driver's detached arm. This tier never natively
+                // or reserved field → `CapFault`). The outcome is served by every driver's detached
+                // arm, where the budget's take and the module resolve happen at the driver's commit
+                // site (`admit_detached_child`). This tier never natively
                 // demand-pages: the module-level entries decline any op-17 module with a pager-shaped
                 // export ([`compile_module_for`]), so a surviving pager field can only come from a
                 // module without one — which `CapFault`s identically on the tree-walker.

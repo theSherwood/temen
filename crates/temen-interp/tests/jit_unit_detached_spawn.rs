@@ -2,36 +2,44 @@
 //!
 //! The two reference powerboxes grant `"child"` (the running program's child image, for a program
 //! that exports `_child`) and `"budget"` (the detached-window allowance) only to a guest that can
-//! spawn detached — `spawns_detached`, a
-//! static scan of the **root** module for `call.cap 6 15`. A guest whose only op 15 lives in a unit
-//! it submits at runtime (`Jit.compile`) therefore resolved neither name and its spawn refused
-//! `-EINVAL`: fail-closed and probeable, but a surprise, since the same op in the same domain works
-//! when the root module happens to contain one too.
+//! spawn detached — `spawns_detached`, a static scan of the **root** module for a detached spawn
+//! (`call.cap 6 17`). A guest whose only spawn lives in a unit it submits at runtime
+//! (`Jit.compile`) therefore resolved neither name and its spawn refused `-EINVAL`: fail-closed and
+//! probeable, but a surprise, since the same op in the same domain works when the root module
+//! happens to contain one too.
 //!
-//! `Host::jit_compile_linked` now grants the set on the first install of a unit that contains op 15
-//! — the same least-authority rule, evaluated at install instead of at powerbox build. It is the
-//! only point that sees both the validated unit and the host (the injected validator is a bare
-//! `fn`), and it stays a strict subset of what the guest holds: a named `"instantiator"` must
+//! `Host::jit_compile_linked` now grants the set on the first install of a unit that spawns
+//! detached — the same least-authority rule, evaluated at install instead of at powerbox build. It
+//! is the only point that sees both the validated unit and the host (the injected validator is a
+//! bare `fn`), and it stays a strict subset of what the guest holds: a named `"instantiator"` must
 //! already be granted (its window sizes the budget), `"child"` is the guest's own code, and a
-//! durable domain is excluded (it may spawn only an attested-freezable module, which the child image
-//! is not).
+//! durable domain is excluded (it may spawn only an attested-freezable module, which the child
+//! image is not).
 //!
 //! The blob validator is stubbed inline (the `invoke_fibers.rs` pattern), so this stays in the
 //! temen-interp suite with no Cranelift dependency.
 
+#[path = "support/rec.rs"]
+mod rec;
+
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, JitValidated, Trap, Value};
+use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
 /// What the detached child returns — read back through the unit's `join`.
 const CHILD: i64 = 42;
-/// The guest's declared window: the child's window too (op 15 admits only the module's own size).
+/// The guest's declared window: the child's window too (a detached spawn admits only the module's
+/// own size).
 const WIN_LOG2: u8 = 16;
 
-/// Pack `name` as the little-endian `i64` words a guest stores before `self.resolve` (a unit keeps
-/// no data segments — the validator hands back functions only — so it writes its own names).
-fn packed(name: &str) -> Vec<i64> {
-    name.as_bytes()
+/// Where the unit writes its v1 spawn record, in the guest's window.
+const REC_AT: u64 = 17408;
+
+/// Pack `bytes` as the little-endian `i64` words a guest stores (a unit keeps no data segments —
+/// the validator hands back functions only — so it writes its own names and spawn record).
+fn packed(bytes: &[u8]) -> Vec<i64> {
+    bytes
         .chunks(8)
         .map(|c| {
             let mut w = [0u8; 8];
@@ -41,35 +49,46 @@ fn packed(name: &str) -> Vec<i64> {
         .collect()
 }
 
+/// The IR storing `bytes` at `addr` a word at a time, its registers named for `p`.
+fn store_bytes(p: &str, addr: u64, bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for (i, w) in packed(bytes).iter().enumerate() {
+        let at = addr + 8 * i as u64;
+        s += &format!("  vp{p}{i} = i64.const {at}\n  vw{p}{i} = i64.const {w}\n  i64.store vp{p}{i} vw{p}{i}\n");
+    }
+    s
+}
+
 /// Store `name` at `addr` and resolve it, yielding the IR for `dst = self.resolve(name)`.
 fn resolve_by_name(dst: &str, addr: u64, name: &str) -> String {
-    let mut s = String::new();
-    for (i, w) in packed(name).iter().enumerate() {
-        let at = addr + 8 * i as u64;
-        s += &format!("  vp{dst}{i} = i64.const {at}\n  vw{dst}{i} = i64.const {w}\n  i64.store vp{dst}{i} vw{dst}{i}\n");
-    }
+    let mut s = store_bytes(dst, addr, name.as_bytes());
     s += &format!("  vb{dst} = i64.const {addr}\n  vl{dst} = i64.const {}\n  {dst} = self.resolve vb{dst} vl{dst}\n", name.len());
     s
 }
 
 /// The **unit** the guest submits at runtime: it resolves `instantiator` / `child` / `budget` by
-/// name and spawns the guest's child image, whose bootstrap runs func 1, as a detached child (op 15,
-/// the 7-arg form, entry 0), returning the spawn's own result. A name it cannot resolve is `-1`, and
-/// op 15 through a `-1` handle is a `CapFault` — so reaching a non-negative child handle at all is
-/// the proof the set was granted.
+/// name, writes a v1 spawn record at [`REC_AT`] (no grants, no payload) with the module and budget
+/// it resolved, and spawns the guest's child image, whose bootstrap runs func 1, as a detached child
+/// from it, returning the spawn's own result. A name it cannot resolve is `-1`, and a spawn through
+/// a `-1` handle is a `CapFault` — so reaching a non-negative child handle at all is the proof the
+/// set was granted.
 ///
 /// It does **not** `join` — [`joining_unit_src`] does.
 fn unit_src() -> String {
+    let child = SpawnRec {
+        size_log2: WIN_LOG2.into(),
+        ..SpawnRec::v1()
+    };
     format!(
         r#"memory {WIN_LOG2}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-{inst}{module}{budget}  vmh = i64.extend_i32_u vmod
-  vmin = i64.extend_i32_u vbud
-  vz = i64.const 0
-  vent = i64.const 0
-  vlog = i64.const {WIN_LOG2}
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vmin, vmh, vz, vz, vent, vlog, vz)
+{inst}{module}{budget}{rec}  vma = i64.const {module_at}
+  i32.store vma vmod
+  vba = i64.const {budget_at}
+  i32.store vba vbud
+  vrp = i64.const {REC_AT}
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
   vr = i64.extend_i32_s vh
   return vr
   }}
@@ -78,6 +97,9 @@ block 0 (v0: i64) {{
         inst = resolve_by_name("vinst", 20480, "instantiator"),
         module = resolve_by_name("vmod", 20512, "child"),
         budget = resolve_by_name("vbud", 20544, "budget"),
+        rec = store_bytes("rec", REC_AT, &child.encode()),
+        module_at = REC_AT + rec::MODULE_AT,
+        budget_at = REC_AT + rec::BUDGET_AT,
     )
 }
 
@@ -113,8 +135,8 @@ const INVOKE: &str = r#"  vc = i64.extend_i32_u v1
   return vr"#;
 
 /// The guest **program**: func 0 `(jit, code)` reaches the unit by `route`; func 1, exported as
-/// `_child`, is where its child image starts. Crucially func 0 carries **no** `call.cap 6 15`, so the
-/// root-module scan grants nothing — the whole point.
+/// `_child`, is where its child image starts. Crucially func 0 carries **no** spawn
+/// (`call.cap 6 17`), so the root-module scan grants nothing — the whole point.
 fn guest_by(route: &str) -> temen_ir::Module {
     let src = format!(
         r#"memory {WIN_LOG2}
@@ -200,7 +222,7 @@ fn installing_a_spawning_unit_grants_the_by_name_spawn_set() {
     install(&mut host, &unit_src());
     assert!(
         host.resolve_cap_name("child").is_some() && host.resolve_cap_name("budget").is_some(),
-        "installing a unit that issues op 15 grants `child` + `budget`"
+        "installing a unit that spawns detached grants `child` + `budget`"
     );
 }
 

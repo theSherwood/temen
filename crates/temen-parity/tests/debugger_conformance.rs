@@ -28,8 +28,8 @@
 //!
 //! ## Why the arity sweep
 //!
-//! The lowering's arms are arity-guarded (`(INSTANTIATOR, 15) if args.len() >= 7`), so calling an op
-//! with too few arguments makes it look unsupported when it is merely miscalled. The question the
+//! The lowering's arms are arity-guarded, so calling an op with too few arguments makes it look
+//! unsupported when it is merely miscalled. The question the
 //! column asks is "**can** the debug tier run this op", so each op is tried across a range of
 //! arities and the **best** verdict wins. Argument *values* are all zero and deliberately so: a
 //! `-EINVAL` or a trap is a serviced answer — the op reached its seam and the engine drove it —
@@ -80,9 +80,10 @@ fn drive(
     };
     let mut fuel = 1_000_000u64;
     // For the Instantiator the shared contract says which calls match their op's arm (#2066); the
-    // probe declares the contract's results, so its arity decides.
+    // probe declares the contract's results, so its arity decides, and the contract's counts are
+    // exact.
     let matched = iface == temen_ir::cap_id::INSTANTIATOR
-        && temen_ir::instantiator_contract(op).is_some_and(|(args, _)| argc >= args.len());
+        && temen_ir::instantiator_contract(op).is_some_and(|(args, _)| argc == args.len());
     match run.run_until_stop(&mut fuel) {
         SchedStop::Declined => Some(Verdict::Declined),
         // A cap fault is the harness miscalling, not an answer: the signature did not match any

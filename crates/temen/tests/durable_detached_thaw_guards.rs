@@ -1,37 +1,41 @@
-//! #1733 — a thawed detached (op 15) child keeps the protections its window was built with: the
-//! NULL guard and its `readonly` data segments. A thaw is indistinguishable from not freezing, so each
-//! probe answers the same on a fresh run and after a freeze → codec → thaw, whichever engine froze
-//! the tree and whichever thaws it.
+//! #1733 — a thawed detached child keeps the protections its window was built with: the NULL guard
+//! and its `readonly` data segments. A thaw is indistinguishable from not freezing, so each probe
+//! answers the same on a fresh run and after a freeze → codec → thaw, whichever engine froze the tree
+//! and whichever thaws it.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
     all(windows, target_arch = "x86_64")
 ))]
 
+#[path = "../../temen-interp/tests/support/rec.rs"]
+mod rec;
+
 use std::time::Duration;
 use temen_durable::{
-    begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
-    write_state, STATE_UNWINDING,
+    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::errno::EINVAL;
+use temen_ir::SpawnRec;
 use temen_jit::{JitError, JitOutcome};
 
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
-/// Spawn the child detached (op 15: budget, module, no grants, entry 0, `size_log2` 17, no quota),
-/// join it, return `status * 1000 + value`: what it returns, or its trap's wire code times 1000
-/// (#2066).
+/// Spawn the child detached through the v1 record at 65536 ([`parent_of`] lays it), its module and
+/// budget stored there, join it, return `status * 1000 + value`: what it returns, or its trap's wire
+/// code times 1000 (#2066).
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 1000
   vs = i64.mul vr_st vk
@@ -118,9 +122,21 @@ fn parent() -> temen_ir::Module {
     parent_of(PARENT)
 }
 
-/// A parent from its source, instrumented as [`PARENT`] is.
+/// A parent from its source, instrumented as [`PARENT`] is, with the spawn record every parent here
+/// spawns through: at 65536, above the shadow arena, for the child's 128 KiB window.
 fn parent_of(src: &str) -> temen_ir::Module {
-    verified(transform_module(&parse(src)).expect("transform"))
+    let spawn = SpawnRec {
+        size_log2: 17,
+        ..SpawnRec::v1()
+    };
+    parent_with(src, &spawn)
+}
+
+/// [`parent_of`] with `spawn` as the record. A parent stores the module and budget in its record, so
+/// it takes the confined transform, as a child does.
+fn parent_with(src: &str, spawn: &SpawnRec) -> temen_ir::Module {
+    let src = format!("{src}{}", rec::segment(65536, spawn));
+    verified(transform_module_assume_confined(&parse(&src)).expect("transform"))
 }
 
 /// The child touches memory, so it takes the confined transform: its data sits above the arena, and
@@ -309,11 +325,12 @@ fn a_thawed_detached_childs_null_load_faults() {
 const PARENT_ROOM: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vf = i64.const 1
   vroom = call.cap 14 1 (i64) -> (i64) v2 (vf)
@@ -404,11 +421,13 @@ fn a_thawed_detached_childs_grown_page_is_seen_by_its_memory_capability() {
 const JOINING_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
   vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vt = thread.spawn 1 vz vz
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vj = thread.join vt
@@ -476,7 +495,7 @@ block 0 (v0: i64, v1: i64) {{
 fn a_detached_child_its_parent_is_joining_rides_the_freeze() {
     use temen_durable::arm_freeze_after;
     use Engine::*;
-    let parent = verified(transform_module(&parse(JOINING_PARENT)).expect("transform"));
+    let parent = parent_of(JOINING_PARENT);
     let child = child_module(&waiting_child(50));
     let mut wrong = Vec::new();
     for e in [Interp, Jit] {
@@ -608,11 +627,12 @@ fn controller_freeze(
 const WAITING_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   va = i64.const 100000
   ve = i32.const 0
   vto = i64.const 200000000
@@ -623,10 +643,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 ";
 
-/// [`WAITING_PARENT`], instrumented. Its wait touches memory, so it takes the confined transform, as
-/// a child does.
+/// [`WAITING_PARENT`], instrumented as every parent here is ([`parent_of`]).
 fn waiting_parent() -> temen_ir::Module {
-    verified(transform_module_assume_confined(&parse(WAITING_PARENT)).expect("transform"))
+    parent_of(WAITING_PARENT)
 }
 
 /// **#1937 — a detached child's wait ends on its own freeze word, not its parent's.** The embedder
@@ -818,9 +837,9 @@ fn a_thawed_thread_is_charged_to_its_childs_budget_again() {
     check_child(CHILD_THREAD_ROOM, Out::Ret(2));
 }
 
-/// #2219 — [`PARENT`] with one grant record: an empty grant ([`temen_interp::GRANT_EMPTY`]) under
-/// `exit`, above the shadow arena.
-fn parent_empties_exit() -> String {
+/// #2219 — [`PARENT`] with one grant record, which its spawn record names: an empty grant
+/// ([`temen_interp::GRANT_EMPTY`]) under `exit`, above the shadow arena. Instrumented.
+fn parent_empties_exit() -> temen_ir::Module {
     const REC: u64 = 131072;
     const NAME: u64 = 131200;
     let record = [
@@ -831,25 +850,31 @@ fn parent_empties_exit() -> String {
     ]
     .concat();
     let esc: String = record.iter().map(|b| format!("\\x{b:02x}")).collect();
-    format!(
+    let src = format!(
         "memory 18 shadow 16448 65536
 data {REC} \"{esc}\"
 data {NAME} \"exit\"
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vmh = i64.extend_i32_u v1
-  vb = i64.extend_i32_u v2
-  vz = i64.const 0
-  vgp = i64.const {REC}
-  vgn = i64.const 1
-  vlog = i64.const 17
-  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vgp, vgn, vz, vlog, vz)
+  vrm = i64.const 65560
+  i32.store vrm v1
+  vrb = i64.const 65564
+  i32.store vrb v2
+  vrp = i64.const 65536
+  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }}
 }}
 "
-    )
+    );
+    let spawn = SpawnRec {
+        size_log2: 17,
+        grants_ptr: REC,
+        grants_n: 1,
+        ..SpawnRec::v1()
+    };
+    parent_with(&src, &spawn)
 }
 
 /// #2219: an empty grant survives a freeze. The child imports `exit`, which nothing grants, so only
@@ -858,5 +883,5 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 #[test]
 fn a_thawed_detached_child_keeps_its_empty_grant() {
     let src = child("  pr = i64.const 42\n").replacen('\n', "\nimport 0 \"exit\" (i32) -> ()\n", 1);
-    check_with(&parent_of(&parent_empties_exit()), &src, Out::Ret(42));
+    check_with(&parent_empties_exit(), &src, Out::Ret(42));
 }

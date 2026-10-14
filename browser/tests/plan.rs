@@ -166,7 +166,7 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     assert!(err(plan(&wide, vec![node(&[])])).contains("do not fit"));
 }
 
-/// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 15 answers
+/// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 17 answers
 /// `-EINVAL`) ends the run with a trap when the root joins the refused handle. It used to panic the
 /// driver (`drive_op13` indexed its child list with the negative handle).
 #[test]

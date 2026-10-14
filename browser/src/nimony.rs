@@ -192,9 +192,8 @@ pub fn library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8
                 posix
                     .read_file(&format!("{cache}{stem}.p.nif"))
                     .is_some_and(|nif| {
-                        nif_source(&nif).is_some_and(|src| {
-                            src.starts_with("lib/") || src.starts_with("src/")
-                        })
+                        nif_source(&nif)
+                            .is_some_and(|src| src.starts_with("lib/") || src.starts_with("src/"))
                     })
             });
         if keep {

@@ -114,7 +114,7 @@ fn c_card_grants_stdout_to_one_child_only() {
     );
 }
 
-/// The `detached` card (§5 op 15 over a pre-mapped SharedRegion) through the same `onramp_exec` the
+/// The `detached` card (§5 op 17 over a pre-mapped SharedRegion) through the same `onramp_exec` the
 /// page's on-ramp recipe calls: the parent finds `child` (its child image, #2219) and `budget` by name
 /// and spawns the image detached — 1000 × 42 + 82. `budget` cannot cross into a §14 child yet, so a
 /// card that spawns detached runs at the root (#1720); this pins that it still runs at all.

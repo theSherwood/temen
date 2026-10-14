@@ -1,11 +1,11 @@
 //! **#1412 / #1299 — the three engines agree about a durable domain's detached spawn.**
 //!
-//! `Instantiator.instantiate_detached` (op 15) under a **durable** host is the cell where the tree
-//! silently diverged for six days: #1299 added a `!durable` gate to the resumable engine on
-//! 2026-09-07 "like the other two engines", and #1289 R1 lifted that same gate from the tree-walker
-//! on 2026-09-08 — touching only `lib.rs`. Both sides then carried comments asserting they agreed
-//! with each other, so nothing in the tree pointed at the contradiction. The contradiction was not
-//! *in* any file; it was between two files that each described the other.
+//! A **detached spawn** under a **durable** host is the cell where the tree silently diverged for
+//! six days: #1299 added a `!durable` gate to the resumable engine on 2026-09-07 "like the other
+//! two engines", and #1289 R1 lifted that same gate from the tree-walker on 2026-09-08 — touching
+//! only `lib.rs`. Both sides then carried comments asserting they agreed with each other, so
+//! nothing in the tree pointed at the contradiction. The contradiction was not *in* any file; it
+//! was between two files that each described the other.
 //!
 //! #1299's own note said "no test pins any of the three". This is that test.
 //!
@@ -25,30 +25,42 @@ mod rec;
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_ir::SpawnRec;
 
 /// `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`.
 ///
-/// Spawns a detached child (op 15, 7-arg form) and returns the result sign-extended. A refusal is a
-/// negative errno; an admission is a non-negative child slot. The guest does nothing else, so the
-/// return value *is* the engine's answer.
-const SPAWN: &str = r#"memory 16
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 15
-  vq = i64.const 0
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+/// Spawns a detached child from its v1 record at 17408 (no grants, no payload) and returns the
+/// result sign-extended. A refusal is a negative errno; an admission is a non-negative child slot.
+/// The guest does nothing else but store the module and budget into the record, so the return value
+/// *is* the engine's answer.
+fn spawn() -> String {
+    format!(
+        r#"memory 16
+func (i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32) {{
+  vma = i64.const 17432
+  i32.store vma v1
+  vba = i64.const 17436
+  i32.store vba v2
+  vrp = i64.const 17408
+  vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vr = i64.extend_i32_s vh
   return vr
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17408,
+            &SpawnRec {
+                size_log2: 15,
+                ..SpawnRec::v1()
+            }
+        ),
+    )
 }
-"#;
 
-/// The child: `memory 15` to match the op-15 `size_log2` (§14 transparency — a detached window equals
-/// the module's declared memory).
+/// The child: `memory 15` to match the record's `size_log2` (§14 transparency — a detached window
+/// equals the module's declared memory).
 const CHILD: &str = r#"memory 15
 func (i64) -> (i64) {
 block 0 (v0: i64) {
@@ -83,8 +95,8 @@ fn classify(r: Result<Vec<Value>, Trap>) -> Answer {
     }
 }
 
-/// Grant the three caps op 15 needs. The quota is generous on purpose: a quota miss also refuses with
-/// `-EINVAL`, which would make a refusal assertion pass for the wrong reason.
+/// Grant the three caps a detached spawn needs. The quota is generous on purpose: a quota miss also
+/// refuses with `-EINVAL`, which would make a refusal assertion pass for the wrong reason.
 /// …and, when `authority`, freeze authority over detached progeny (#1440).
 fn powerbox_with(
     host: &mut Host,
@@ -118,7 +130,7 @@ fn oracle_with(durable: bool, marked: bool) -> Answer {
 }
 
 fn oracle_full(durable: bool, marked: bool, authority: bool) -> Answer {
-    let parent = module(SPAWN);
+    let parent = module(&spawn());
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_durable(durable);
@@ -141,7 +153,7 @@ fn resumable_with(durable: bool, marked: bool) -> Answer {
 }
 
 fn resumable_full(durable: bool, marked: bool, authority: bool) -> Answer {
-    let parent = module(SPAWN);
+    let parent = module(&spawn());
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_durable(durable);
@@ -158,7 +170,7 @@ fn resumable_full(durable: bool, marked: bool, authority: bool) -> Answer {
         // The engine did the authority-bearing work and handed the host a window to mint: an
         // admission, even though this test never services it.
         bytecode::VcpuEvent::InstantiateDetached { .. } => Answer::Admitted,
-        _ => panic!("unexpected event from a guest that only issues op 15"),
+        _ => panic!("unexpected event from a guest that only spawns"),
     }
 }
 
@@ -171,8 +183,9 @@ fn the_oracle_and_the_resumable_engine_agree_about_a_detached_spawn() {
         let b = resumable(durable);
         assert_eq!(
             a, b,
-            "durable={durable}: the tree-walk oracle and the resumable engine must agree about op 15 \
-             (INVARIANTS #9). A ruling that moves one engine must move the others in the same change."
+            "durable={durable}: the tree-walk oracle and the resumable engine must agree about a \
+             detached spawn (INVARIANTS #9). A ruling that moves one engine must move the others in \
+             the same change."
         );
     }
 }
@@ -185,7 +198,8 @@ fn a_durable_domain_spawns_detached_iff_it_holds_detached_freeze_authority() {
     assert_eq!(
         oracle(false),
         Answer::Admitted,
-        "a non-durable domain spawns detached children — the rule is about durability, not op 15"
+        "a non-durable domain spawns detached children — the rule is about durability, not the \
+         spawn"
     );
     for (name, run) in [
         ("oracle", oracle_full as fn(bool, bool, bool) -> Answer),
@@ -221,9 +235,9 @@ fn the_durable_refusal_is_a_value_on_both_engines() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// #1501 — DURABILITY.md §4 on op 15: "a durable domain admits only freezable modules and may only
-// spawn durable children." The nested spawn enforced both halves; the detached spawn, built
-// fail-closed on `durable` from the start, enforced neither — the `!durable` gate was the only
+// #1501 — DURABILITY.md §4 on the detached spawn: "a durable domain admits only freezable modules
+// and may only spawn durable children." The nested spawn enforced both halves; the detached spawn,
+// built fail-closed on `durable` from the start, enforced neither — the `!durable` gate was the only
 // thing between a durable parent and a child no freeze could ever capture. R1 slice 1 lifted that
 // gate without adding either half, which is one more reason it would have failed even with #1361's
 // capture built.
@@ -243,7 +257,7 @@ type Engine = fn(bool, bool) -> Answer;
 fn a_durable_domain_never_admits_an_uninstrumented_module_detached() {
     let engines: [(&str, Engine); 2] = [("oracle", oracle_with), ("resumable", resumable_with)];
     for (name, run) in engines {
-        // Live today: durability is what gates the un-instrumented module, not op 15 itself — a
+        // Live today: durability is what gates the un-instrumented module, not the spawn itself — a
         // non-durable domain admits it. Proves the mark is the only variable in play.
         assert_eq!(
             run(false, false),
@@ -278,12 +292,12 @@ block 0 (v0: i64) {
 "#;
 
 /// The detached child for the inheritance probe. Entry `(i64) -> (i64)`: `v0` is its own starter
-/// `Instantiator` handle, as the op-15 arm passes it. It resolves the named grant `"m"` (LEAF) and
-/// its own `"budget"`, writes both into its v1 record at 24576 (entry 0), tries to spawn LEAF as a
-/// detached grandchild (op 17), and returns the grandchild's joined result (≥ 0) — or the spawn's
-/// `-EINVAL` if the child's **own** durability refused the un-instrumented module (§4, the detached
-/// admission's durability check). So the value that comes back through the parent's join is a
-/// direct observation of the bit the child inherited.
+/// `Instantiator` handle, as a detached spawn passes it. It resolves the named grant `"m"` (LEAF)
+/// and its own `"budget"`, writes both into its v1 record at 24576 (entry 0), tries to spawn LEAF
+/// as a detached grandchild (op 17), and returns the grandchild's joined result (≥ 0) — or the
+/// spawn's `-EINVAL` if the child's **own** durability refused the un-instrumented module (§4, the
+/// detached admission's durability check). So the value that comes back through the parent's join
+/// is a direct observation of the bit the child inherited.
 fn probe_child() -> String {
     format!(
         r#"memory 16
@@ -318,18 +332,20 @@ block 2 (vi2: i32, vs2: i32) {{
 data 20480 "m"
 data 20488 "budget"
 {}"#,
-        rec::segment(24576, &temen_ir::SpawnRec::v1())
+        rec::segment(24576, &SpawnRec::v1())
     )
 }
 
 /// The parent for the inheritance probe: lays one op-11-format grant record at 16384 —
 /// `{name_off=16400, name_len=1, handle=v3, flags=0}` with `"m"` at 16400 — spawns [`probe_child`]
-/// detached (op 15: budget `v2`, module `v1`, grants `(16384, 1)`, entry 0, `memory 16`, no quota),
-/// and returns the child's joined answer, or the spawn's own `-EINVAL` if op 15 refused.
+/// detached (its v1 record at 17408: module `v1`, budget `v2`, grants `(16384, 1)`, `memory 16`),
+/// and returns the child's joined answer, or the spawn's own `-EINVAL` if the spawn was refused.
 /// Args: `(instantiator, child module, budget, leaf module)`.
-const PROBE_PARENT: &str = r#"memory 16
-func (i32, i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+fn probe_parent() -> String {
+    format!(
+        r#"memory 16
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   r0 = i64.const 16384
   n16400 = i32.const 16400
   i32.store r0 n16400
@@ -344,33 +360,42 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   q = i64.const 16400
   cm = i32.const 109
   i32.store8 q cm
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vgp = i64.const 16384
-  vgn = i64.const 1
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgp, vgn, ve, vlog, vq)
+  vma = i64.const 17432
+  i32.store vma v1
+  vba = i64.const 17436
+  i32.store vba v2
+  vrp = i64.const 17408
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   vneg = i32.lt_s vs z
   br_if vneg 1(vs) 2(v0, vs)
-  }
-block 1 (ve1: i32) {
+  }}
+block 1 (ve1: i32) {{
   vr = i64.extend_i32_s ve1
   return vr
-  }
-block 2 (vi2: i32, vs2: i32) {
+  }}
+block 2 (vi2: i32, vs2: i32) {{
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vs2)
   return vj
-  }
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17408,
+            &SpawnRec {
+                size_log2: 16,
+                grants_ptr: 16384,
+                grants_n: 1,
+                ..SpawnRec::v1()
+            }
+        ),
+    )
 }
-"#;
 
 /// Run the inheritance probe on the tree-walk oracle (the engine that runs the detached child
 /// inline, so its answer can come back through `join`). Returns the parent's i64: ≥ 0 iff the
 /// grandchild was admitted.
 fn probe(durable: bool) -> i64 {
-    let parent = module(PROBE_PARENT);
+    let parent = module(&probe_parent());
     let child = module(&probe_child());
     let leaf = module(LEAF);
     let mut host = Host::new();
@@ -403,10 +428,11 @@ fn probe(durable: bool) -> i64 {
 /// grandchild probe above: a durable child refuses the un-instrumented LEAF, a non-durable one
 /// admits it.
 ///
-/// Today a durable parent's op 15 refuses before any child exists, so the durable arm reads the
-/// parent's `-EINVAL`; after the re-lift it reads the *child's* `-EINVAL` — the same value, for the
-/// right reason. What this pins is the third case: a re-lift that forgot `set_durable` would admit
-/// the child non-durable, the child would admit the grandchild, and a slot would come back.
+/// Today a durable parent's detached spawn refuses before any child exists, so the durable arm
+/// reads the parent's `-EINVAL`; after the re-lift it reads the *child's* `-EINVAL` — the same
+/// value, for the right reason. What this pins is the third case: a re-lift that forgot
+/// `set_durable` would admit the child non-durable, the child would admit the grandchild, and a
+/// slot would come back.
 #[test]
 fn a_detached_childs_durability_follows_its_parents() {
     // Live today, and the probe's own sanity check: a non-durable parent's detached child is

@@ -1,6 +1,6 @@
 // Real-browser (V8) test for #1286 slice 3b: **concurrent detached children on the parallel Worker
 // driver**. A root vCPU (on its own Worker) holds an `Instantiator`, a child `Module` and a
-// `WindowMinter` (the §14 recipe + `minter`), and issues three §5 `instantiate_detached` (op 15) spawns
+// `WindowMinter` (the §14 recipe + `minter`), and issues three §5 detached spawns (op-17 records)
 // back to back — each child lands in its OWN fresh shared `WebAssembly.Memory` on its OWN Worker (the
 // spawning Worker mints the memory and posts it with the admitted child's ticket; the child's Worker
 // starts it, and the engine seeds the window; the page relays the Worker start) — then a fourth the
@@ -47,9 +47,28 @@ page.on('console', (m) => { if (m.type() === 'error' && !benign(m.text())) error
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 // The root: v0 Instantiator, v1 the child Module, v2 the WindowMinter. Three payload words at
-// 18432/18440/18448 (above the 16 KiB NULL guard), three 9-arg spawns (payload `(addr, 8)`), one 7-arg
-// spawn the minter refuses, three joins.
-const OP15 = 'call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, ';
+// 18432/18440/18448 (above the 16 KiB NULL guard), three spawns with a payload `(addr, 8)`, one without
+// that the minter refuses, three joins.
+//
+// `spawn(dst, at, payload)`: a v1 spawn record (op 17) laid at `at` by stores, then the spawn into
+// `dst`: version 1, a 64 KiB window, no pager, the child Module (v1) paid from the minter (v2), no
+// region, and the 8-byte payload at `payload` if there is one. Every field left 0 is none.
+const spawn = (dst, at, payload) => `  ${dst}a = i64.const ${at}
+  ${dst}v = i32.const 1
+  i32.store ${dst}a ${dst}v
+  ${dst}l = i32.const 16
+  i32.store ${dst}a ${dst}l offset=16
+  ${dst}n = i32.const -1
+  i32.store ${dst}a ${dst}n offset=20
+  i32.store ${dst}a v1 offset=24
+  i32.store ${dst}a v2 offset=28
+  i32.store ${dst}a ${dst}n offset=72
+${payload === undefined ? '' : `  ${dst}p = i64.const ${payload}
+  i64.store ${dst}a ${dst}p offset=56
+  ${dst}s = i64.const 8
+  i64.store ${dst}a ${dst}s offset=64
+`}  ${dst} = call.cap 6 17 (i64) -> (i32) v0 (${dst}a)
+`;
 const ROOT_SRC = `memory 16
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -62,18 +81,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vb2 = i64.const 18448
   vw2 = i64.const 3000
   i64.store vb2 vw2
-  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vz = i64.const 0
-  ve = i64.const 0
-  vlog = i64.const 16
-  vq = i64.const 0
-  vl = i64.const 8
-  vh0 = ${OP15}vb0, vl)
-  vh1 = ${OP15}vb1, vl)
-  vh2 = ${OP15}vb2, vl)
-  vh3 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
-  vr0_st, vr0 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh0)
+${spawn('vh0', 17408, 18432)}${spawn('vh1', 17496, 18440)}${spawn('vh2', 17584, 18448)}${spawn('vh3', 17672)}  vr0_st, vr0 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh0)
   vr1_st, vr1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
   vr2_st, vr2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vs0 = i64.add vr0 vr1
