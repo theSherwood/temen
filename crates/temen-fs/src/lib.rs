@@ -405,11 +405,26 @@ impl MemFsState {
             return;
         }
         self.tables.bind(payer);
-        let opens = self.open.iter().flatten().map(|o| &o.data);
-        let mapped = self.maps.iter().map(|m| &m.data);
-        for data in self.files.values().chain(opens).chain(mapped) {
+        for data in self.buffers() {
             data.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
         }
+    }
+
+    /// #2318 — [`Self::bind`] for a store a thaw rebuilt from its artifact, past any ceiling but never
+    /// past the process's pools ([`HostBuffer::rebind`]): `false` at the first part they have no room
+    /// for. Its caller then drops the store, and each part hands back what it was charged.
+    fn rebind(&mut self, payer: &NodeRef) -> bool {
+        self.tables.rebind(payer)
+            && self
+                .buffers()
+                .all(|data| data.lock().unwrap_or_else(|e| e.into_inner()).rebind(payer))
+    }
+
+    /// Every buffer the store holds: its files', its open descriptors' and its mappings'.
+    fn buffers(&self) -> impl Iterator<Item = &FileData> {
+        let opens = self.open.iter().flatten().map(|o| &o.data);
+        let mapped = self.maps.iter().map(|m| &m.data);
+        self.files.values().chain(opens).chain(mapped)
     }
 }
 
@@ -1138,13 +1153,22 @@ impl MemFsHandle {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
     }
 
-    /// A store rebuilt from a [`capture_state`](Self::capture_state) — what a thaw's registrar mints
-    /// for a `vm_fs`/`fs` the artifact names, and binds to the thawing domain ([`Self::bind`]).
-    /// `Err` on bytes this version cannot fully read.
+    /// A store rebuilt from a [`capture_state`](Self::capture_state), unbound. `Err` on bytes this
+    /// version cannot fully read.
     pub fn from_state(bytes: &[u8]) -> Result<MemFsHandle, String> {
         Ok(MemFsHandle(Arc::new(Mutex::new(MemFsState::decode(
             bytes,
         )?))))
+    }
+
+    /// A store a thaw rebuilds from a [`capture_state`](Self::capture_state), bound to the thawing
+    /// domain `payer`: what a thaw's registrar mints for a `vm_fs`/`fs` the artifact names. `None` on
+    /// bytes this version cannot fully read, or (#2318) when the process's pools have no room for what
+    /// it holds, which then stays charged to no one.
+    pub fn rebuild(bytes: &[u8], payer: &NodeRef) -> Option<MemFsHandle> {
+        let mut st = MemFsState::decode(bytes).ok()?;
+        st.rebind(payer)
+            .then(|| MemFsHandle(Arc::new(Mutex::new(st))))
     }
 
     /// #1491 — the **whole** store as bytes: every file, directory, open descriptor (with its
@@ -1287,9 +1311,8 @@ pub fn regrant_vm_fs(
     payer: &NodeRef,
 ) -> Option<temen_interp::NamedCapGrant> {
     let fs = (name == "vm_fs")
-        .then(|| MemFsHandle::from_state(state).ok())
+        .then(|| MemFsHandle::rebuild(state, payer))
         .flatten()?;
-    fs.bind(payer);
     Some(temen_interp::NamedCapGrant {
         handler: vm_fs_handler(&fs),
         fork: Some(vm_fs_fork(&fs)),

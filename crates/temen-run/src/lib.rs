@@ -1598,7 +1598,19 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             // re-drawn; the child keeps its own cap either way.
         }
         // #1971 — the lease the spawn filed for its window, filed again for the thawed child's end.
-        let window_lease = host.relaunch_lease(&mut r.host, r.memory_log2);
+        // #2318 — refused when the process's pools have no room for it: the child is not relaunched,
+        // and ends with `ThreadFault` (its window went back), as the interpreter's thaw ends it.
+        let runs = window
+            .page_map()
+            .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+        let Ok(window_lease) = host.relaunch_lease(&mut r.host, r.memory_log2, runs) else {
+            out.push(temen_jit::DetachedSeed::Completed {
+                slot,
+                result: 0,
+                trap: temen_interp::Trap::ThreadFault.code(),
+            });
+            continue;
+        };
         let children = detached_seeds(&mut r.host)?;
         // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
         // from the id an interpreter capture gave it.
@@ -2654,8 +2666,8 @@ impl temen_jit::BudgetNode for HostNode {
     fn charge_vcpu(&self) -> bool {
         self.0.charge_vcpu()
     }
-    fn force_vcpu(&self) {
-        self.0.force_vcpu()
+    fn rebuild_vcpu(&self) -> bool {
+        self.0.rebuild_vcpu()
     }
     fn vcpu_ended(&self) {
         self.0.vcpu_ended()

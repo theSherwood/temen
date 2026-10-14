@@ -2685,29 +2685,19 @@ fn seed_domain(
                 let Some(parent) = live(&live_ids, fd.parent_task) else {
                     continue;
                 };
-                let cid = s.next_task;
-                s.next_task += 1;
-                s.results.insert(
-                    cid,
-                    Outcome {
-                        result: fd.completed_result.map(|x| vec![Value::I64(x)]),
-                        mem: None,
-                        trap_bt: Vec::new(),
-                        trap_fiber: None,
-                        trap_fault: None,
-                    },
-                );
                 let spawner = if parent == id {
                     Some(&mut *root)
                 } else {
                     children.get_mut(&parent).map(|p| &mut **p)
                 };
-                if let Some(p) = spawner {
-                    while p.threads.len() <= fd.slot {
-                        p.threads.push(None);
+                let result = fd.completed_result.map(|x| vec![Value::I64(x)]);
+                match spawner {
+                    Some(p) => deliver_detached(s, p, fd.slot, result),
+                    None => {
+                        let cid = s.next_task;
+                        s.next_task += 1;
+                        s.results.insert(cid, Outcome::ended(result));
                     }
-                    p.threads[fd.slot] = Some(cid);
-                    p.delivered_detached.push((fd.slot, cid));
                 }
             }
         }
@@ -2751,6 +2741,25 @@ fn seed_domain(
             s.runnable.push_back(child);
         }
     }
+}
+
+/// A detached child of `spawner`'s, at its join `slot`, that the thaw delivers ended with `result`
+/// rather than relaunch: one that completed before the freeze, or (#2318) one it cannot relaunch,
+/// which ends with `ThreadFault`. The spawner's rewound join reloads it.
+fn deliver_detached(
+    s: &mut Sched,
+    spawner: &mut VCpu,
+    slot: usize,
+    result: Result<Vec<Value>, Trap>,
+) {
+    let cid = s.next_task;
+    s.next_task += 1;
+    s.results.insert(cid, Outcome::ended(result));
+    while spawner.threads.len() <= slot {
+        spawner.threads.push(None);
+    }
+    spawner.threads[slot] = Some(cid);
+    spawner.delivered_detached.push((slot, cid));
 }
 
 /// A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
@@ -2804,18 +2813,19 @@ fn seed_thread(
     // #1685 — a child that finished unjoined is not re-created: its result waits in the scheduler
     // for the rewound `join`, as it did before the freeze.
     if let Some(r) = ff.completed_result {
-        s.results.insert(
-            cid,
-            Outcome {
-                result: Ok(vec![Value::I64(r)]),
-                mem: None,
-                trap_bt: Vec::new(),
-                trap_fiber: None,
-                trap_fault: None,
-            },
-        );
+        s.results
+            .insert(cid, Outcome::ended(Ok(vec![Value::I64(r)])));
         return;
     }
+    // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
+    // it: charged again past any ceiling. #2318 — never past the process's pools: a thread they
+    // have no room for is one the process cannot hold, so it ends with `ThreadFault`, which its
+    // rewound join answers, and nothing it spawned is re-created.
+    let Some(live) = LiveVcpu::rebuild(p.host.lock_unpoisoned().own_node()) else {
+        s.results
+            .insert(cid, Outcome::ended(Err(Trap::ThreadFault)));
+        return;
+    };
     live_ids.insert(ff.task as TaskId, cid);
     s.live += 1;
     let ctx = p.arena().ctx_of_sp(ff.shadow_sp);
@@ -2838,9 +2848,7 @@ fn seed_thread(
     ));
     child.registry = Arc::clone(&p.registry);
     child.kill = p.kill.clone();
-    // #2001 — the thread handed its `spawn` back when it unwound for the freeze, and lived before
-    // it: charged again past any ceiling.
-    child.live = LiveVcpu::force(p.host.lock_unpoisoned().own_node());
+    child.live = live;
     child.durable = true;
     child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
     child.root_shadow_sp = ff.shadow_sp;
@@ -2885,11 +2893,20 @@ fn relaunch_detached(
         .prepare_detached_relaunch(&launch, host, window.page_map())?;
     // #1971 — the lease op 15 filed at the spawn, filed again: the child's window goes back to the
     // budget that paid for it when the child ends, on the spawner's handle, as an unfrozen child's does.
-    let lease = spawner
+    // #2318 — refused when the process's pools have no room for it: the child is not relaunched, and
+    // ends with `ThreadFault` (its window went back).
+    let runs = window
+        .page_map()
+        .window_runs(temen_ir::module_null_guard(), 1u64 << reserved_log2);
+    let filed = spawner
         .host
         .lock_unpoisoned()
-        .relaunch_lease(&mut host, memory_log2)
-        .map(|lease| (Arc::clone(&spawner.host), lease));
+        .relaunch_lease(&mut host, memory_log2, runs);
+    let Ok(lease) = filed else {
+        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
+        return None;
+    };
+    let lease = lease.map(|lease| (Arc::clone(&spawner.host), lease));
     // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
     // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
     // `begin_thaw`, on the child's own window.
@@ -2902,15 +2919,25 @@ fn relaunch_detached(
         ..WindowSpec::default()
     });
     mem.restore_layout(&window);
-    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds.
-    if !host.realias_regions(&mut mem, &window.dense_prots()) {
+    // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds. #2268 —
+    // then the window has started, with the runs its artifact gave it, which its lease paid for.
+    let started = host.realias_regions(&mut mem, &window.dense_prots()) && {
+        host.start_window(mem.window_runs());
+        mem.durable_set_state(STATE_NORMAL);
+        let thaw_off = mem.thaw_state_off(0);
+        mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())
+            .is_some()
+    };
+    if !started {
+        // #2318 — a relaunch refused once its lease is filed hands the child's window back, as its
+        // end would: it never runs, and ends with `ThreadFault`.
+        host.release_memory();
+        if let Some((spawner_host, lease)) = lease {
+            spawner_host.lock_unpoisoned().release_detached(lease);
+        }
+        deliver_detached(s, spawner, slot, Err(Trap::ThreadFault));
         return None;
     }
-    // #2268 — the window has started, with the runs its artifact gave it.
-    host.start_window(mem.window_runs());
-    mem.durable_set_state(STATE_NORMAL);
-    let thaw_off = mem.thaw_state_off(0);
-    mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())?;
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
@@ -5056,6 +5083,20 @@ struct Outcome {
     /// address survives the join that answers its trap as a bare code (#2066) — the parent's window
     /// has no record of it. `None` on a clean finish or a non-address trap.
     trap_fault: Option<u64>,
+}
+
+impl Outcome {
+    /// What a task the thaw does not run leaves its join: a result from before the freeze, or a
+    /// trap.
+    fn ended(result: Result<Vec<Value>, Trap>) -> Outcome {
+        Outcome {
+            result,
+            mem: None,
+            trap_bt: Vec::new(),
+            trap_fiber: None,
+            trap_fault: None,
+        }
+    }
 }
 
 /// What the first vCPU to trap recorded about *its own* trap — the run-shared, first-wins capture
@@ -20003,10 +20044,11 @@ impl NodeRef {
         self.tree.add(self.node, VcpuCost::SET, Fits::All)
     }
 
-    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the
-    /// freeze.
-    pub fn force_vcpu(&self) {
-        self.tree.add(self.node, VcpuCost::SET, Fits::Forced);
+    /// [`Self::charge_vcpu`] past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools (#2318): a vCPU a thaw re-creates. `false` when they have no room, and the thaw
+    /// then ends the vCPU with `ThreadFault` rather than re-create it.
+    pub fn rebuild_vcpu(&self) -> bool {
+        self.tree.add(self.node, VcpuCost::SET, Fits::Pool)
     }
 
     /// Hand back a vCPU's charge when it ends.
@@ -20067,10 +20109,18 @@ impl<C: Cost> Held<C> {
         held.then(|| Held(Some(node), core::marker::PhantomData))
     }
 
-    /// Charge `node` past any ceiling: what a thaw re-creates, which lived before the freeze.
+    /// Charge `node` past any ceiling: what a debugger's rewind re-creates, whose tree it puts back
+    /// right after, or a fiber, which costs the process's pools nothing.
     pub(crate) fn force(node: NodeRef) -> Self {
         node.tree.add(node.node, C::SET, Fits::Forced);
         Held(Some(node), core::marker::PhantomData)
+    }
+
+    /// #2318 — charge `node` past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools: what a thaw re-creates. `None`, with nothing charged, when they have no room.
+    pub(crate) fn rebuild(node: NodeRef) -> Option<Self> {
+        let held = node.tree.add(node.node, C::SET, Fits::Pool);
+        held.then(|| Held(Some(node), core::marker::PhantomData))
     }
 
     /// One that holds no charge.
@@ -20208,11 +20258,27 @@ impl HostCharge {
     /// Charge `payer` for what it holds, past every limit, if it charged no one yet: state made
     /// before its capability was granted (a seeded store), which the grantee pays for from then on.
     pub fn bind(&mut self, payer: &NodeRef) {
-        if self.payer.is_none() {
-            let bytes = std::mem::take(&mut self.bytes);
-            self.payer = Some(payer.clone());
-            self.force(bytes);
+        self.bind_as(payer, Fits::Forced);
+    }
+
+    /// #2318 — [`Self::bind`] for state a thaw rebuilt from its artifact: past any ceiling, since the
+    /// artifact's use was granted, but never past the process's pools. `false`, charging no one,
+    /// when they have no room.
+    pub fn rebind(&mut self, payer: &NodeRef) -> bool {
+        self.bind_as(payer, Fits::Pool)
+    }
+
+    fn bind_as(&mut self, payer: &NodeRef, fits: Fits) -> bool {
+        if self.payer.is_some() {
+            return true;
         }
+        let bytes = std::mem::take(&mut self.bytes);
+        self.payer = Some(payer.clone());
+        if self.set(bytes, fits) {
+            return true;
+        }
+        (self.payer, self.bytes) = (None, bytes);
+        false
     }
 
     /// What holding `bytes` costs: its `channel` (or a stack's `mem`), and its `maps`.
@@ -20293,6 +20359,11 @@ impl HostBuffer {
     /// [`HostCharge::bind`].
     pub fn bind(&mut self, payer: &NodeRef) {
         self.room.bind(payer);
+    }
+
+    /// [`HostCharge::rebind`].
+    pub fn rebind(&mut self, payer: &NodeRef) -> bool {
+        self.room.rebind(payer)
     }
 
     /// Hold `bytes` instead, charged past every limit: what a rewind puts back, which it held before.
@@ -26300,29 +26371,36 @@ impl Host {
     /// #2025 — a fresh backing holding a captured region's bytes, as a thaw rebuilds it: a backing
     /// as a guest mint gets one ([`Self::new_region`]). #2111 — charged to this domain's node whatever
     /// its ceilings, as a thaw re-charges each pipe it rebuilds to the thawing root: a freeze carries
-    /// no node's `channel` use. #2306 — `Err`, the errno, when no backing can be had: the thaw
-    /// refuses, rather than run without the region.
+    /// no node's `channel` use. #2318 — but never past the process's pools, of mappings and of address
+    /// space. #2306 — `Err`, the errno, when no backing can be had or the pools have no room for it:
+    /// the thaw refuses, rather than run without the region.
     pub fn rebuild_region(&self, bytes: &[u8]) -> Result<RegionBacking, i64> {
-        Ok(self.refill_region(self.new_region(bytes.len())?, bytes))
+        let backing = self.new_region(bytes.len())?;
+        let cost = region_cost(bytes.len() as u64, backing.size());
+        if !self.budgets.add(self.own_budget, &cost, Fits::Pool) {
+            return Err(ENOMEM);
+        }
+        Ok(self.refill_region(backing, bytes))
     }
 
     /// #2306 — a debugger moment's region, as [`Self::rebuild_region`] makes it, else on the heap: a
     /// moment is the interpreter's, which any backing serves, so a seek is never refused for want of
-    /// an OS object.
+    /// an OS object. Charged past every limit: a seek puts back a state the run held.
     pub(crate) fn rebuild_moment_region(&self, bytes: &[u8]) -> RegionBacking {
         let backing = self
             .new_region(bytes.len())
             .unwrap_or_else(|_| Arc::new(VecBacking(Mutex::new(vec![0u8; bytes.len()]))));
+        let cost = region_cost(bytes.len() as u64, backing.size());
+        self.budgets.add(self.own_budget, &cost, Fits::Forced);
         self.refill_region(backing, bytes)
     }
 
-    /// `backing` holding `bytes`, charged to this domain's node past any ceiling ([`ChargedRegion`]).
+    /// `backing` holding `bytes`, which their caller charged to this domain's node ([`ChargedRegion`]
+    /// hands it back).
     fn refill_region(&self, backing: RegionBacking, bytes: &[u8]) -> RegionBacking {
         for (o, &b) in bytes.iter().enumerate() {
             backing.write_byte(o as u64, b);
         }
-        let cost = region_cost(bytes.len() as u64, backing.size());
-        self.budgets.add(self.own_budget, &cost, Fits::Forced);
         Arc::new(ChargedRegion {
             backing,
             node: self.own_node(),
@@ -26959,30 +27037,53 @@ impl Host {
     /// #1971 — the lease a thaw's relaunch of `child`, a detached child this domain spawned, files for
     /// its window: this domain's handle on the budget that paid for it (the node `child` holds as its
     /// `"budget"`), and the window's size, `1 << window_log2`. The same lease op 15 filed at the spawn,
-    /// so the thawed child's end hands its window back as an unfrozen child's does. `None` when `child`
-    /// holds no budget or this domain no handle on it.
+    /// so the thawed child's end hands its window back as an unfrozen child's does. `Ok(None)` when
+    /// `child` holds no budget or this domain no handle on it.
     ///
     /// #2268 — a freeze carries no `maps` (each process's mappings are its own), so the lease's are
-    /// charged again here, past any ceiling: the bound on its window's runs from its program
-    /// ([`window_runs_bound`]), which `child`'s window is paid for up to ([`Self::paid_runs`]); what
-    /// it holds past them, its §13 pages among them, is counted once it starts. #2305 — nor any
-    /// address space, so the lease's is charged again with them.
-    pub fn relaunch_lease(&self, child: &mut Host, window_log2: u8) -> Option<Lease> {
-        let node = child.budget_node(child.resolve_cap_name("budget")?)?;
-        let slot = self
-            .table
-            .iter()
-            .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))?;
+    /// charged again here: the bound on its window's runs from its program ([`window_runs_bound`]),
+    /// which `child`'s window is paid for up to ([`Self::paid_runs`]), and (#2318) what its restored
+    /// window holds past them, of its `runs` ([`PageMap::window_runs`]), its §13 pages among them.
+    /// #2305 — nor any address space, so the lease's is charged again with them. #2318 — past any
+    /// ceiling, since the artifact's use was granted, but never past the process's pools: `-ENOMEM`
+    /// when they have no room, and then the window the freeze kept charged goes back, as the child's
+    /// end would hand it back. The relaunch is refused, and the child never runs.
+    pub fn relaunch_lease(
+        &self,
+        child: &mut Host,
+        window_log2: u8,
+        runs: u64,
+    ) -> Result<Option<Lease>, i64> {
+        let node = child
+            .resolve_cap_name("budget")
+            .and_then(|h| child.budget_node(h));
+        let slot = node.and_then(|node| {
+            self.table
+                .iter()
+                .position(|s| matches!(s.entry, Some(Binding::Budget(n)) if n == node))
+        });
+        let (Some(node), Some(slot)) = (node, slot) else {
+            return Ok(None);
+        };
         let data = child.self_module.as_ref().map_or(&[][..], |m| &m.data[..]);
         let lease = Lease {
             budget: handle_of(slot as u32, self.table[slot].generation),
             bytes: 1u64 << window_log2,
             runs: window_runs_bound(data, false),
         };
-        let held = [(BUDGET_MAPS, lease.maps()), (RESERVED, lease.reserved())];
-        self.budgets.add(node, &held, Fits::Forced);
-        (child.paid_runs, child.leased) = (lease.runs, lease.bytes);
-        Some(lease)
+        let past = runs.saturating_sub(lease.runs);
+        let held = [
+            (BUDGET_MAPS, lease.maps() + past),
+            (RESERVED, lease.reserved()),
+        ];
+        if !self.budgets.add(node, &held, Fits::Pool) {
+            let kept = [(BUDGET_MEM, lease.bytes), (BUDGET_SPAWN, 1)];
+            self.budgets.refund_set(node, &kept);
+            child.release_memory();
+            return Err(ENOMEM);
+        }
+        (child.paid_runs, child.leased, child.maps) = (lease.runs, lease.bytes, past);
+        Ok(Some(lease))
     }
 
     /// The node a live `Budget` handle names.
