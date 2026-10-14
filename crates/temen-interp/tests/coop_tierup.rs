@@ -73,13 +73,15 @@ fn oracle(m: &temen_ir::Module) -> Result<Vec<Value>, Trap> {
     bytecode::compile_and_run(m, 0, &[], &mut fuel).expect("supported")
 }
 
-/// Drive the cooperative run with tier-up enabled, emulating the browser host: each `TierUp(func,
-/// argv)` is serviced by running `func` standalone (what the emitted region computes) and delivering
-/// its i64 results back. Returns the whole-run result and the number of tier-ups serviced.
+/// Drive the cooperative run under `host` with tier-up enabled, emulating the browser host: each
+/// `TierUp(func, argv)` is serviced by running `func` standalone (what the emitted region computes)
+/// and delivering its i64 results back. Returns the whole-run result and the functions that tiered
+/// up, in order.
 fn coop_tierup_run(
     m: &temen_ir::Module,
     eligible: std::sync::Arc<[bool]>,
-) -> (Result<Vec<Value>, Trap>, u32) {
+    host: Host,
+) -> (Result<Vec<Value>, Trap>, Vec<u32>) {
     let tierup = TierUpConfig {
         root: ProgramEmit {
             eligible,
@@ -88,10 +90,10 @@ fn coop_tierup_run(
         leaf: None,
         modules: None,
     };
-    let mut run = coop::coop_run(m, 0, &[], FUEL, Host::new(), Some(tierup))
+    let mut run = coop::coop_run(m, 0, &[], FUEL, host, Some(tierup))
         .expect("supported")
         .expect("entry in range");
-    let mut tierups = 0u32;
+    let mut tierups = Vec::new();
     loop {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
@@ -108,11 +110,11 @@ fn coop_tierup_run(
                 panic!("unexpected JitInvoke (no vm_jit guest here)")
             }
             bytecode::CoopEvent::TierUp { func, argv, .. } => {
-                tierups += 1;
+                tierups.push(func);
                 // A regression that fails to advance the paused task would tier up unboundedly; cap it
                 // so the test fails fast instead of hanging (the real runs need at most one per call).
                 assert!(
-                    tierups < 50,
+                    tierups.len() < 50,
                     "runaway tier-ups (last func={func}, argv={argv:?})"
                 );
                 // Emulate `f{func}(win, env, ...argv)`: run the callee standalone over its i64 args.
@@ -156,7 +158,7 @@ fn coop_tierup_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible);
+    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
 
     // f(x) = 3x + 7: root f(3)=16, worker f(5)=22 → 16 + 22 = 38.
     assert_eq!(want, Ok(vec![Value::I64(38)]), "oracle value");
@@ -167,9 +169,37 @@ fn coop_tierup_matches_pure_interp() {
     // Non-vacuity: exactly two tier-ups — one on the root task, one on the worker. (If eligibility
     // failed to propagate to the spawned child this would be 1, not 2.)
     assert_eq!(
-        tierups, 2,
-        "expected 2 tier-ups (root + worker), got {tierups}"
+        tierups,
+        [2, 2],
+        "expected 2 tier-ups (root + worker), got {tierups:?}"
     );
+}
+
+/// #1414 ED-1 — a task the run starts tiers up at its entry when its program's emit makes the
+/// entry eligible, as a call to it would, and its results end it: here the worker's entry, func 1.
+/// The root's entry never does, since the root leaf is its rule. Nor does a durable run's thread:
+/// a thaw replays its entry interpreted.
+#[test]
+fn a_thread_tiers_up_at_its_entry() {
+    let m = parse_module(SRC).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let want = oracle(&m);
+    // `(eligible, durable, the functions that tier up)`.
+    for (eligible, durable, want_funcs) in [
+        ([false, true, true], false, &[1, 2][..]),
+        ([true, false, true], false, &[2, 2]),
+        ([false, true, true], true, &[2, 2]),
+    ] {
+        let mut host = Host::new();
+        host.set_durable(durable);
+        let (got, mut tierups) = coop_tierup_run(&m, std::sync::Arc::from(eligible), host);
+        tierups.sort();
+        assert_eq!(got, want, "eligible {eligible:?}, durable {durable}");
+        assert_eq!(
+            tierups, want_funcs,
+            "eligible {eligible:?}, durable {durable}"
+        );
+    }
 }
 
 // A tier-up region that **traps** must surface exactly where the interpreter would. Here the leaf
@@ -211,7 +241,7 @@ fn coop_tierup_trap_parity() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, _) = coop_tierup_run(&m, eligible);
+    let (got, _) = coop_tierup_run(&m, eligible, Host::new());
 
     // The worker divides 100/(5-5) → div-by-zero: the run must trap, exactly as the interpreter does.
     assert!(
@@ -273,12 +303,13 @@ fn a_task_tiers_up_once_per_call() {
         let m = parse_module(&SRC_LOOP.replace("N_ITERS", &n.to_string())).unwrap();
         temen_verify::verify_module(&m).expect("verify");
         let want = oracle(&m);
-        let (got, tierups) = coop_tierup_run(&m, std::sync::Arc::from(vec![false, true]));
+        let eligible = std::sync::Arc::from(vec![false, true]);
+        let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
         assert_eq!(
             want, got,
             "the tier-up run diverged from the oracle at n={n}"
         );
-        assert_eq!(tierups as i64, n, "one tier-up per call at n={n}");
+        assert_eq!(tierups.len() as i64, n, "one tier-up per call at n={n}");
         if n == 5 {
             // sum over i < 5 of (3i + 7) = 30 + 35.
             assert_eq!(want, Ok(vec![Value::I64(65)]));
@@ -548,7 +579,7 @@ fn coop_tierup_fiber_scheduler_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible);
+    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
 
     // fiber A f(3)=16, fiber B f(5)=22, root f(9)=34 → 72.
     assert_eq!(want, Ok(vec![Value::I64(72)]), "oracle value");
@@ -563,8 +594,9 @@ fn coop_tierup_fiber_scheduler_matches_pure_interp() {
     // still fires and marshals correctly on the root while the cooperative scheduler juggles live fibers
     // (a regression that dropped tier-up under fiber activity would read 0).
     assert_eq!(
-        tierups, 1,
-        "expected 1 tier-up (the root's leaf; fibers run their leaf interpreted), got {tierups}"
+        tierups,
+        [3],
+        "expected 1 tier-up (the root's leaf; fibers run their leaf interpreted), got {tierups:?}"
     );
 }
 
@@ -624,7 +656,7 @@ fn coop_tierup_live_futex_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible);
+    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
 
     // The fiber wakes WAIT_WOKEN(0), then the leaf f(4) = 19 → 0 + 19 = 19.
     assert_eq!(want, Ok(vec![Value::I64(19)]), "oracle value");
@@ -634,8 +666,9 @@ fn coop_tierup_live_futex_matches_pure_interp() {
     );
     // Non-vacuity: the compute leaf tiers up after the live futex park/wake completes single-threaded.
     assert_eq!(
-        tierups, 1,
-        "expected exactly one tier-up (the root's compute leaf), got {tierups}"
+        tierups,
+        [2],
+        "expected exactly one tier-up (the root's compute leaf), got {tierups:?}"
     );
 }
 
@@ -851,7 +884,9 @@ fn coop_tierup_child_env_tasks_tier_up() {
 }
 
 /// #2248 — a granted module is offered to the host once per run, and every child that runs it
-/// tiers up through the one emit. The root spawns two children of the image and joins each.
+/// tiers up through the one emit. The root spawns two children of the image and joins each. The
+/// image's emit takes its leaf, or its entry (#1414 ED-1): the image's bootstrap function 0, which
+/// nothing calls, so each child tiers up at its entry and the entry's result ends it.
 #[test]
 fn coop_tierup_offers_a_granted_module_once() {
     const SRC: &str = r#"
@@ -899,24 +934,29 @@ block 0 (vx: i64) {
         "oracle: two children, f(7) = 28 each"
     );
 
-    let (modules, offered) = modules_emitter(Some(ProgramEmit {
-        eligible: std::sync::Arc::from(vec![false, false, true]),
-        page_checked: false,
-    }));
-    let tierup = TierUpConfig {
-        root: ProgramEmit::default(),
-        leaf: None,
-        modules: Some(modules),
-    };
-    let (got, named) = run_spawner(&m, &image, Some(tierup), &offered);
-    assert_eq!(got, want, "the tier-up run diverged from the oracle");
-    assert_eq!(
-        named,
-        vec![1, 1],
-        "each child's leaf call tiers up, in the image"
-    );
-    let offers: Vec<u32> = offered.lock().unwrap().iter().map(|(k, _)| *k).collect();
-    assert_eq!(offers, vec![1], "the image is offered once");
+    for eligible in [[false, false, true], [true, false, false]] {
+        let (modules, offered) = modules_emitter(Some(ProgramEmit {
+            eligible: std::sync::Arc::from(eligible),
+            page_checked: false,
+        }));
+        let tierup = TierUpConfig {
+            root: ProgramEmit::default(),
+            leaf: None,
+            modules: Some(modules),
+        };
+        let (got, named) = run_spawner(&m, &image, Some(tierup), &offered);
+        assert_eq!(
+            got, want,
+            "the tier-up run diverged from the oracle ({eligible:?})"
+        );
+        assert_eq!(
+            named,
+            vec![1, 1],
+            "each child tiers up once, in the image ({eligible:?})"
+        );
+        let offers: Vec<u32> = offered.lock().unwrap().iter().map(|(k, _)| *k).collect();
+        assert_eq!(offers, vec![1], "the image is offered once ({eligible:?})");
+    }
 }
 
 // #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is

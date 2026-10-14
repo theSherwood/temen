@@ -415,8 +415,9 @@ property, so in practice:
   them with the task beneath (B6-3b-4c). A detached child's window is a `WebAssembly.Memory` of its
   own, as on the per-Worker driver (`ThreadPlatform::child_window`): the spawning thread's Worker
   mints it, and the Worker of each of the child's threads is handed it, so the child's threads
-  interpret over it through `Region::Foreign` (B6-3c-1). Emitted children (B6-3c-2, 3c-3) follow;
-  then it replaces the per-Worker `Vcpu` driver (B6-4).
+  interpret over it through `Region::Foreign` (B6-3c-1). A thread whose entry is eligible runs the
+  entry itself on its Worker's tier, and the results end the thread (#1414 ED-1). Emitted children
+  on their own memories follow (ED-2); then it replaces the per-Worker `Vcpu` driver (B6-4).
 
 ### Known wrinkles — all resolved in `4c-wasm`
 

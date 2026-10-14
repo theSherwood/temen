@@ -200,6 +200,77 @@ block 3 () {
 // func 2 is reachable **only** through `thread.spawn`, so `compile_module_tierup` (not the func-0
 // whole-module path) is what emits it. Result 4000 on every interleaving (asserted in the JS host,
 // like the plain threads kernel); tiers up once per worker (8×).
+/// #1414 ED-1 — eight threads, each counting to 500 in its entry, which is pure compute: no call, no
+/// atomic. The root sums what it joins, 4000. Each thread's entry runs whole on the emitted tier.
+const THREADS_ENTRY_TIERUP: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  br 1(v0)
+}
+block 1 (v1: i64) {
+  v2 = i64.const 8
+  v3 = i64.lt_u v1 v2
+  br_if v3 2(v1) 3()
+}
+block 2 (v4: i64) {
+  v5 = i64.const 500
+  v6 = thread.spawn 1 v5 v5
+  v7 = i64.const 4
+  v8 = i64.mul v4 v7
+  v9 = i64.const 16400
+  v10 = i64.add v9 v8
+  i32.store v10 v6
+  v11 = i64.const 1
+  v12 = i64.add v4 v11
+  br 1(v12)
+}
+block 3 () {
+  v13 = i64.const 0
+  br 4(v13, v13)
+}
+block 4 (v14: i64, v15: i64) {
+  v16 = i64.const 8
+  v17 = i64.lt_u v14 v16
+  br_if v17 5(v14, v15) 6(v15)
+}
+block 5 (v18: i64, v19: i64) {
+  v20 = i64.const 4
+  v21 = i64.mul v18 v20
+  v22 = i64.const 16400
+  v23 = i64.add v22 v21
+  v24 = i32.load v23
+  v25 = thread.join v24
+  v26 = i64.add v19 v25
+  v27 = i64.const 1
+  v28 = i64.add v18 v27
+  br 4(v28, v26)
+}
+block 6 (v29: i64) {
+  return v29
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+"#;
+
 const THREADS_TIERUP: &str = r#"
 memory 16
 func () -> (i64) {
@@ -2383,6 +2454,7 @@ fn main() {
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);
+    emit("threads_entry_tierup", THREADS_ENTRY_TIERUP);
     // Dynamic-linking corpus — §22 compile_linked: resolve the unit's "clock" import via the symbol
     // table (link=1 → 777) or leave it unresolved (link=0 → fail-closed trap). One guest, both cases.
     {

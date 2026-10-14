@@ -2480,7 +2480,15 @@ declared window, because every window a child of the module runs in is at least 
 dispatches through a table of the module's own functions, because the driver's shared table mirrors
 only the run's own dispatch table (#2273): a `call.dyn` site emits only when the whole module does.
 The parallel driver's tier (`ThreadTier`, #1414 B6-3a) emits the run's own program only, so there a
-child of a granted module interprets until its tier takes the module emitter too (#1414 ED-1).
+child of a granted module interprets until its tier takes the module emitter too (#1414 ED-2).
+
+**A task the run starts tiers up at its entry (#1414 ED-1).** A thread, or a detached child, whose
+entry its program's emit makes eligible runs the entry emitted, as a call to it would: the task's
+first resume surfaces the entry (`Vm::jit_entry`), and the results end the task, as a leaf image's
+do. It is as safe as the call: region eligibility already keeps every op a bounce cannot serve out of
+an emitted function's whole callee closure. The root's entry keeps its own rule, the root leaf, whose
+slicing and suspension a region lacks; a durable run's tasks enter interpreted, since a thaw replays
+their entries.
 
 ---
 

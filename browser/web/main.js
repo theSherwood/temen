@@ -183,6 +183,9 @@ async function main() {
     // leaves interpreted: the harness lowers it on these runs' engines, as coop's own tests do.
     const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    // #1414 ED-1: a thread whose entry is eligible runs it whole on its Worker's emitted tier, and
+    // its results end the thread: each of the 8 counters' entries is one region.
+    const te = await runPath('/corpus/threads_entry_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     // #1414 B6-3b-4b: paged regions. An on-ramp guest protects a page read-only, and each of its 5
     // tasks reads it through the emitted leaf, checked against its thread's page-state table; the
     // twin's leaf stores there and traps. The run reports where, as it does interpreted (#2275).
@@ -210,6 +213,7 @@ async function main() {
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
+      te.value === 4000n && te.tierups === 8 &&
       pg.value === 35n && pg.tierups === 5 && pgt.why.includes('MemoryFault') && pgt.at === 65536n &&
       pgi.why.includes('MemoryFault') && pgi.at === 65536n &&
       gs.value === 55n && gs.tierups === 5 &&
@@ -224,6 +228,7 @@ async function main() {
       ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
+      `thread entries ${te.value} (want 4000), ${te.tierups} on emitted wasm (want 8) · ` +
       `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt.why)} ` +
       `at ${pgt.at} (want MemoryFault at 65536), interpreted ${JSON.stringify(pgi.why)} at ${pgi.at} · ` +
       `collector over spilled words ${gs.value} (want 55), ${gs.tierups} regions (want 5) · ` +

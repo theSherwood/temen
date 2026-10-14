@@ -550,7 +550,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         temen_status()
     );
 
-    let mut jit_invokes = 0u32;
+    let (mut jit_invokes, mut entries) = (0u32, 0u32);
     loop {
         match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => {
@@ -569,7 +569,16 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
                     Err(code) => temen_coop_deliver_jit_trap(code),
                 }
             }
-            COOP_RUN_TIERUP => panic!("unexpected TIERUP from the leafless vm_jit_* guest"),
+            // The worker's entry, which returns 0 at once, is the one function that tiers up
+            // (#1414 ED-1).
+            COOP_RUN_TIERUP => {
+                entries += 1;
+                assert_eq!(temen_coop_func(), 1, "only the worker's entry tiers up");
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
             COOP_RUN_DONE => break,
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
@@ -580,6 +589,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
         jit_invokes, 1,
         "expected exactly one emitted Jit.invoke, got {jit_invokes}"
     );
+    assert_eq!(entries, 1, "the worker's entry tiered up");
 
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
@@ -630,14 +640,14 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
         temen_status()
     );
 
+    // The worker's entry f1 and the leaf f2 both return one value.
     let n_results = m.funcs[2].results.len();
-    let mut tierups = 0u32;
+    let mut funcs = Vec::new();
     loop {
         match temen_coop_run() {
             COOP_RUN_TIERUP => {
-                tierups += 1;
-                assert!(tierups < 50, "runaway tier-ups");
-                assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) tiers up");
+                assert!(funcs.len() < 50, "runaway tier-ups");
+                funcs.push(temen_coop_func());
                 match service_coop_on_wasmi(n_results) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                     Err(code) => temen_coop_deliver_trap(code),
@@ -647,12 +657,14 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    // Non-vacuity: exactly two tier-ups — the root's `call 2` and the worker's — proving the
-    // cooperative driver tiered up across both vCPUs (the single-vCPU pump would have declined the
-    // spawn entirely).
+    // Non-vacuity: exactly two tier-ups — the root's `call 2` and the worker's entry, which runs
+    // its own call to the leaf in emitted code (#1414 ED-1) — proving the cooperative driver tiered
+    // up across both vCPUs (the single-vCPU pump would have declined the spawn entirely).
+    funcs.sort();
     assert_eq!(
-        tierups, 2,
-        "expected 2 tier-ups (root + worker), got {tierups}"
+        funcs,
+        [1, 2],
+        "the worker's entry and the root's leaf call tier up"
     );
 
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
@@ -725,7 +737,11 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
                 COOP_RUN_TIERUP => {
                     tierups += 1;
                     assert!(tierups < 50, "runaway tier-ups");
-                    assert_eq!(temen_coop_func(), 2, "only the leaf (func 2) can tier up");
+                    // The worker's entry f1 is the leaf's size, and tiers up with it (#1414 ED-1).
+                    assert!(
+                        matches!(temen_coop_func(), 1 | 2),
+                        "only the worker's entry and the leaf can tier up"
+                    );
                     match service_coop_on_wasmi(n_results) {
                         Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                         Err(code) => temen_coop_deliver_trap(code),
@@ -752,8 +768,8 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
         tierups
     };
 
-    // A floor comfortably below the leaf's estimate ⇒ eligible (the predicate is `>=`) ⇒ both the
-    // root's and the worker's `call 2` tier up. (Floors are held off the exact estimate to stay
+    // A floor comfortably below the leaf's estimate ⇒ eligible (the predicate is `>=`) ⇒ the root's
+    // `call 2` and the worker's entry tier up. (Floors are held off the exact estimate to stay
     // robust to a byte or two of encode/outline drift between here and the open.)
     assert_eq!(
         drive_at_floor(leaf_sz / 2),
@@ -3619,9 +3635,10 @@ export 1 func "_child" 1
     )
 }
 
-/// The child, the guest's child image, tiers up over its own window: its bootstrap's call to f1,
-/// through the image's own emit (#2248), which runs f1's call to the leaf in emitted code too. The
-/// image is the first module the run compiles after the guest: program 1.
+/// The child, the guest's child image, tiers up over its own window, at its entry (#1414 ED-1): the
+/// image's bootstrap f0, through the image's own emit (#2248), which runs the child's call to the
+/// leaf in emitted code too. The image is the first module the run compiles after the guest:
+/// program 1.
 #[test]
 fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     let _g = instantiator_guard();
@@ -3686,7 +3703,7 @@ fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     };
     assert_eq!(
         (child_call, root_call),
-        ((1, 1), (0, 2)),
+        ((1, 0), (0, 2)),
         "each event's (program, function): its task's program's"
     );
     assert_eq!(
@@ -3840,11 +3857,12 @@ block 0 (vx: i64) {
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
-    // The worker's call first (the root is parked on the join), then the root's.
+    // The worker's entry first (the root is parked on the join), which runs its f1 call in emitted
+    // code (#1414 ED-1), then the root's f1 call.
     assert_eq!(
         calls,
-        vec![(1, 1), (0, 1)],
-        "each f1 call tiers up in its own program, (program, function)"
+        vec![(1, 0), (0, 1)],
+        "each tiers up in its own program, (program, function)"
     );
     assert_eq!(
         (temen_status(), temen_coop_value()),
@@ -4189,11 +4207,11 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
     }
 
     // Non-vacuity: the child's paged code tiered up (and trapped) in emitted wasm, in its own
-    // program's emit: the image's bootstrap's call to f1, which bounces to the `unmap` and calls
-    // the leaf in emitted code.
+    // program's emit, at its entry (#1414 ED-1): the image's bootstrap f0, whose code bounces to the
+    // `unmap` and calls the leaf in emitted code.
     assert_eq!(
         calls,
-        vec![(1, 1)],
+        vec![(1, 0)],
         "the child tiers up once, (program, function)"
     );
     // #1822: the child's trap is the oracle's — the emitted leaf's `env.trap(MEMORY_FAULT)` code
@@ -5120,8 +5138,9 @@ fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity");
     // Non-vacuity: the leaf tiered up and bounced into the helper; the invoke was serviced on that
-    // nested interpretation (never surfaced as a JIT_INVOKE event).
-    assert_eq!(tierups, 1, "the leaf tiered up");
+    // nested interpretation (never surfaced as a JIT_INVOKE event). The worker's entry, which
+    // returns 0 at once, tiers up too (#1414 ED-1).
+    assert_eq!(tierups, 2, "the leaf and the worker's entry tiered up");
     // (The target is the outlined `call.import` wrapper's slot, not `f3`'s own index — #889 outlining
     // appends the wrapper — so pin the count, not the slot.)
     assert_eq!(
@@ -5253,8 +5272,9 @@ fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
     assert_eq!(got_out, want.stdout, "stdout parity");
     // Non-vacuity: the leaf tiered up; the region bounced exactly twice — into the installing helper
     // and the uninstalling one — and the installed slot's `call.dyn` between them was native (a third
-    // bounce would mean the mirror move went unseen and the edge fell to a shim or trapped).
-    assert_eq!(tierups, 1, "the leaf tiered up");
+    // bounce would mean the mirror move went unseen and the edge fell to a shim or trapped). The
+    // worker's entry, which returns 0 at once, tiers up too (#1414 ED-1).
+    assert_eq!(tierups, 2, "the leaf and the worker's entry tiered up");
     assert_eq!(
         invokes, 0,
         "no task-level JIT event: both ops ran inside bounces"
