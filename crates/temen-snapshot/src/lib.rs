@@ -61,9 +61,9 @@ use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     capture_cut_regions, Attestation, BudgetState, BudgetThawRefused, CapturedDetached,
     DetachedLaunch, DurableBinding, DurableBudget, DurableHandle, DurableJitTable, DurableJitUnit,
-    DurableNamedCap, DurablePipe, DurableRegion, FreezeScope, FrozenChildState, FrozenDetached,
-    FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle, RegionBacking,
-    RegionNotCaptured, RegionRefusal, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
+    DurableNamedCap, DurablePipe, DurableRegion, FrozenDetached, FrozenFiber, FrozenVCpu, Host,
+    MemLayout, NonDurableHandle, RegionBacking, RegionNotCaptured, RegionRefusal, ShadowArena,
+    StreamRole, SvcDispatch, ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -268,7 +268,11 @@ use temen_ir::Module;
 /// v43 (#2219): a detached child's launch record drops its entry function and its same-module flag. A
 /// child runs a module its spawner holds, from the module's function 0, and binds its manifest
 /// strictly, so neither varies.
-const FORMAT_VERSION: u16 = 43;
+/// v44 (#1867): the §14 nested (carve) child is gone, and with it Section 2's nested-child block and
+/// each record's host state. The completed detached-child block follows the vCPU residue directly,
+/// present iff non-empty. Freeze authority has one scope, detached progeny, so `B_FREEZE_DETACHED`
+/// carries it and `B_FREEZE_AUTHORITY` (12), the carve range, is retired.
+const FORMAT_VERSION: u16 = 44;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -330,14 +334,12 @@ const B_JIT_CODE: u8 = 9;
 const B_NAMED: u8 = 10;
 /// #1502, #1944 — a `Budget` handle: its node's artifact number in [`TAG_BUDGETS`].
 const B_BUDGET: u8 = 11;
-/// `FreezeAuthority` (#1440): the `(base, size)` sub-range an ancestor may snapshot. A durable
+// B_FREEZE_AUTHORITY (12) — freeze authority over a carve's range — retired with the carve (#1867);
+// the tag stays reserved.
+/// `FreezeAuthority` (#1440): all-or-nothing authority over the holder's detached children. A durable
 /// binding because the authority has to survive a round trip — a thawed parent must hold over its
 /// thawed child what it held before, or a freeze/thaw would quietly launder a domain's exposure away
 /// and `attest.freeze_exposed` would start lying.
-const B_FREEZE_AUTHORITY: u8 = 12;
-/// `FreezeAuthority(DetachedProgeny)` (#1440): all-or-nothing authority over the holder's detached
-/// children. Its own tag rather than a scope byte on `B_FREEZE_AUTHORITY`, so a v25 artifact — whose
-/// only scope was the carve — still decodes unchanged.
 const B_FREEZE_DETACHED: u8 = 13;
 /// #1361 — a durable §14 module handle, carried as the 32-byte §4 content digest of the grant. A
 /// *name*, not a payload: the restore resolves it against the modules the restoring host itself
@@ -387,9 +389,6 @@ pub enum FreezeError {
     /// #1680 — a pipe has an end outside the cut (held by a domain the freeze does not carry, such
     /// as a fork twin or a detached child). The cut's boundary is not yet carried (#1680 slice 2).
     PipeCrossesCut,
-    /// #1944 — a nested (carve) child's table holds a `Budget`. No spawn gives a carve child one, so
-    /// nothing carries it; carves retire with #1867.
-    NestedBudget { slot: u32 },
     /// #1944 slice 2 — a captured detached child holds budget nodes of a tree other than the root's.
     /// A child's `"budget"` is its spawner's node, so the cut is one tree and its numbers name nodes
     /// across every artifact; a child outside it could not be numbered.
@@ -508,12 +507,7 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
             size: u64::MAX,
         } => return true,
         DurableBinding::AddressSpace { base, size }
-        | DurableBinding::Instantiator { base, size }
-        // #1440: a carve-scoped freeze authority names a window sub-range too, so it takes the same
-        // bounds check. Falling through to the permissive arm would let an artifact carry authority
-        // over a range outside the window it restores into — laundering exposure past the very check
-        // this is. `DetachedProgeny` names no range, so it has nothing to bound and falls through.
-        | DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => (base, size),
+        | DurableBinding::Instantiator { base, size } => (base, size),
         _ => return true,
     };
     size != 0
@@ -649,21 +643,6 @@ fn freeze_at(
     if let Some(h) = first_out_of_window(&handles, 1u64 << reserved_log2) {
         return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
     }
-    // ... and on each nested child's handles against the child's own window, as restore reads them
-    // (#1700). A child's host state rides only beside its nested record, so that names the window.
-    for c in host.frozen_child_state() {
-        let Some(n) = host
-            .frozen_nested()
-            .iter()
-            .find(|n| n.parent_task == c.parent_task && n.slot == c.slot)
-        else {
-            continue;
-        };
-        let size = 1u64.checked_shl(n.size_log2 as u32).unwrap_or(0);
-        if let Some(h) = first_out_of_window(&c.handles, size) {
-            return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
-        }
-    }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
     fibers.sort_by_key(|f| f.slot);
@@ -672,29 +651,14 @@ fn freeze_at(
     // shared active-SP word holds only the last child's extent at freeze end).
     let mut vcpus = host.frozen_vcpus().to_vec();
     vcpus.sort_by_key(|v| v.task);
-    // The §14 nested-child residue (DURABILITY.md §4, v8). Each child's continuation is in its own
-    // carve inside the window image; this is the re-attach record. v12 carries each record's
-    // `parent_task` on the wire (see the encode below), so the format now represents nesting to
-    // **arbitrary depth** and the interp thaw reconstructs the subtree topologically from it. Canonical
-    // order is `(parent_task, slot)` — `slot` is only unique *within* a parent's namespace (the root's
-    // first child and that child's first grandchild are both `slot 0`), so the parent tag is the
-    // primary key. This matches the interp thaw's own sort (parents before children). For a depth-1
-    // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
-    let mut nested = host.frozen_nested().to_vec();
-    nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-    // #1361 step 2 — the completed detached-child residue, same canonical `(parent_task, slot)` order.
+    // #1361 step 2 — the completed detached-child residue, canonical `(parent_task, slot)` order:
+    // `slot` is only unique *within* a spawner's join table, so the spawner is the primary key.
     let mut detached = host.frozen_detached().to_vec();
     detached.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-    // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
-    let mut child_state = host.frozen_child_state().to_vec();
     let mut handles = handles;
-    let pipes = number_pipes(
-        &host.capture_durable_pipes(),
-        &mut handles,
-        &mut child_state,
-    )?;
-    number_budgets(&cut.budgets, &mut handles, &child_state)?;
-    let prots = number_regions(&cut.regions, host, &mut handles, &child_state, prots)?;
+    let pipes = number_pipes(&host.capture_durable_pipes(), &mut handles)?;
+    number_budgets(&cut.budgets, &mut handles);
+    let prots = number_regions(&cut.regions, host, &mut handles, prots)?;
     let prots = &prots[..];
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
@@ -765,7 +729,7 @@ fn freeze_at(
     // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
     // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
     // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
-    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() || !detached.is_empty() {
+    if !fibers.is_empty() || !vcpus.is_empty() || !detached.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
             write_uleb(b, fibers.len() as u64);
             for f in &fibers {
@@ -800,65 +764,10 @@ fn freeze_at(
                 }
                 write_uleb(b, root_sp); // the root vCPU's flattened extent (its implicit residue)
             }
-            // §4 subtree freeze (v8): the nested-child re-attach residue is **appended** after the
-            // fiber + vCPU residue and only when present, so fiber-/vCPU-only artifacts keep the
-            // pre-nesting Section-2 byte layout (only the container version differs).
-            // #1361 step 2: emitted when nested OR detached residue is present — a nested count
-            // (possibly 0) must precede the detached block so the decoder's positional read lines up.
-            if !nested.is_empty() || !detached.is_empty() {
-                write_uleb(b, nested.len() as u64);
-                for n in &nested {
-                    write_uleb(b, n.slot as u64);
-                    // v12: the task that instantiated this child (depth-2+ nesting). `0` for a direct
-                    // child of the root; a grandchild carries its parent-child's task. The interp thaw
-                    // groups the residue by this to re-attach parents before their children.
-                    write_uleb(b, n.parent_task as u64);
-                    write_uleb(b, n.task as u64); // v30 (#1687): the child's own task
-                    write_uleb(b, n.carve_off);
-                    write_uleb(b, n.size_log2 as u64);
-                    write_uleb(b, n.entry as u64);
-                    // v11: a separate-module child carries its module content digest (1 + 32 bytes)
-                    // so a thaw resolves it against the restore host's re-granted modules; a
-                    // same-module child writes 0 (runs the parent's own funcs).
-                    match n.module_digest {
-                        None => write_uleb(b, 0),
-                        Some(d) => {
-                            write_uleb(b, 1);
-                            b.extend_from_slice(&d);
-                        }
-                    }
-                    // v9/v31: a completed-but-unjoined child carries its join outcome; a still-running
-                    // child writes 0 (re-attached + rewound on thaw instead).
-                    write_join_outcome(b, n.completed_result);
-                    // v14 (§13.4 slice 4c): the child's host state — serve trio + durable
-                    // handle table — when its self-unwind recorded one; 0 for a plain child.
-                    let cs = child_state
-                        .iter()
-                        .find(|c| c.parent_task == n.parent_task && c.slot == n.slot);
-                    match cs {
-                        None => write_uleb(b, 0),
-                        Some(c) => {
-                            write_uleb(b, 1);
-                            write_serve_trio(b, &c.svc_queue, &c.svc_results, c.svc_next_ticket);
-                            write_handle_recs(b, &c.handles);
-                            // v19 (#1296): the child's §22 unit tables, when it holds a `Jit` cap —
-                            // the same `table_log2` + domains shape Section 5 uses. Elided (presence
-                            // byte 0) for a child with no JIT, so a plain child block grows by one byte.
-                            match c.jit_tables.is_empty() {
-                                true => write_uleb(b, 0),
-                                false => {
-                                    write_uleb(b, 1);
-                                    write_jit(b, c.jit_table_log2, &c.jit_tables);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // #1361 step 2 — the completed detached-child residue trails the nested block: each is
+            // #1361 step 2 — the completed detached-child residue trails the vCPU residue: each is
             // `(parent_task, slot, join-result)`. A detached child's separate window need not ride (it
-            // is completed), so unlike a nested record there is no carve/entry/digest — only the join
-            // edge and its result. Present iff bytes remain after the nested block on decode.
+            // is completed) — only the join edge and its result. Present iff non-empty (v44), so on
+            // decode it is exactly "bytes remain".
             if !detached.is_empty() {
                 write_uleb(b, detached.len() as u64);
                 for d in &detached {
@@ -1017,27 +926,14 @@ fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegi
 }
 
 /// #2025 — rewrite each region id this artifact's domain names, its handles' and its window pages',
-/// to the region's number in the cut ([`number_cut_regions`]); returns the renumbered page map. A
-/// nested (carve) child's host is not this one, so a region it holds is not one this artifact can
-/// name; carves retire with #1867, and until then such a child declines the freeze.
+/// to the region's number in the cut ([`number_cut_regions`]); returns the renumbered page map.
 fn number_regions(
     regions: &[DurableRegion],
     host: &Host,
     root: &mut [DurableHandle],
-    children: &[FrozenChildState],
     prots: &[PageProt],
 ) -> Result<Vec<PageProt>, FreezeError> {
     let refused = |region, why| FreezeError::RegionNotCaptured(RegionNotCaptured { region, why });
-    if let Some(region) = children
-        .iter()
-        .flat_map(|c| &c.handles)
-        .find_map(|h| match h.binding {
-            DurableBinding::SharedRegion { region } => Some(region),
-            _ => None,
-        })
-    {
-        return Err(refused(region, RegionRefusal::HolderOutsideCut));
-    }
     let number = |id: u32| {
         host.region_key(id)
             .and_then(|key| regions.iter().position(|r| r.key == key))
@@ -1114,25 +1010,12 @@ fn number_cut_budgets(host: &Host) -> Result<CutBudgets, FreezeError> {
 }
 
 /// Rewrite each of this artifact's `Budget` bindings from its live node id to its number in the cut.
-/// A nested (carve) child's table holds no `Budget`: the freeze refuses one.
-fn number_budgets(
-    cut: &CutBudgets,
-    root: &mut [DurableHandle],
-    children: &[FrozenChildState],
-) -> Result<(), FreezeError> {
-    if let Some(h) = children
-        .iter()
-        .flat_map(|c| c.handles.iter())
-        .find(|h| matches!(h.binding, DurableBinding::Budget { .. }))
-    {
-        return Err(FreezeError::NestedBudget { slot: h.slot });
-    }
+fn number_budgets(cut: &CutBudgets, root: &mut [DurableHandle]) {
     for h in root.iter_mut() {
         if let DurableBinding::Budget { node } = &mut h.binding {
             *node = cut.numbers[node]; // the cut reaches every handle's node
         }
     }
-    Ok(())
 }
 
 /// A budget vector's six fields, in `read`'s order.
@@ -1207,22 +1090,16 @@ fn decode_budgets(body: Option<&[u8]>) -> Result<Vec<DurableBudget>, RestoreErro
 
 /// #1680 — number the pipes the cut's ends name, and check the cut holds every end of each.
 ///
-/// A pipe's number is the order its first end appears in: the root's table by slot, then each nested
-/// child's table in canonical record order (`(parent_task, slot)`, as Section 2 writes them). That
-/// order is structural, so a thawed tree re-freezes to the same numbers (§12.6). Each `PipeEnd`'s live
-/// id is rewritten to its number. A pipe whose live end counts exceed the ends the cut holds has an
-/// end outside it, and fails the freeze. Returns each pipe's bytes, by number.
+/// A pipe's number is the order its first end appears in the domain's table, by slot. That order is
+/// structural, so a thawed tree re-freezes to the same numbers (§12.6). Each `PipeEnd`'s live id is
+/// rewritten to its number. A pipe whose live end counts exceed the ends the cut holds has an end
+/// outside it, and fails the freeze. Returns each pipe's bytes, by number.
 fn number_pipes(
     live: &[DurablePipe],
-    root: &mut [DurableHandle],
-    children: &mut [FrozenChildState],
+    handles: &mut [DurableHandle],
 ) -> Result<Vec<Vec<u8>>, FreezeError> {
-    children.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     let mut order: Vec<(u32, usize, usize)> = Vec::new(); // (live id, write ends, read ends)
-    let ends = root
-        .iter_mut()
-        .chain(children.iter_mut().flat_map(|c| c.handles.iter_mut()));
-    for h in ends {
+    for h in handles.iter_mut() {
         let DurableBinding::PipeEnd { pipe, write } = &mut h.binding else {
             continue;
         };
@@ -1701,10 +1578,9 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
 
-    // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue. The section is
-    // present iff there are fibers or spawned vCPUs (canonical). Decoded before anything is granted,
-    // so the pipe check below sees every nested child's ends too. ----
-    let (fibers, vcpus, root_sp, nested, mut child_state, detached) = decode_control(
+    // ---- Control state (§12.4): decode the frozen-fiber, spawned-vCPU and completed detached-child
+    // residue. The section is present iff any of them is (canonical). ----
+    let (fibers, vcpus, root_sp, detached) = decode_control(
         control_body,
         fiber_count,
         spawned_count,
@@ -1714,15 +1590,11 @@ fn restore_at(
             .unwrap_or(ShadowArena::EMPTY)
             .region_base(0),
     )?;
-    // ---- Pipes inside the cut (#1680, v32): every end, the root's or a nested child's, must name a
-    // carried pipe, and every carried pipe must be named (canonical: a freeze carries only pipes with
-    // an end in the cut). ----
+    // ---- Pipes inside the cut (#1680, v32): every end must name a carried pipe, and every carried
+    // pipe must be named (canonical: a freeze carries only pipes with an end in the cut). ----
     // Each pipe's end counts are the ends the cut carries, so they are rebuilt here, not stored.
     let mut pipes = decode_pipes(pipes_body)?;
-    let ends = handles
-        .iter()
-        .chain(child_state.iter().flat_map(|c| c.handles.iter()));
-    for h in ends {
+    for h in &handles {
         if let DurableBinding::PipeEnd { pipe, write } = h.binding {
             let p = pipes
                 .get_mut(pipe as usize)
@@ -1738,16 +1610,9 @@ fn restore_at(
         return Err(RestoreError::Malformed);
     }
     // ---- Budget nodes (#1944, v37): the depth-0 artifact carries the whole cut's; a detached
-    // child's names them by number, and a nested (carve) child holds none (the freeze refuses one).
+    // child's names them by number.
     let mut budgets = decode_budgets(budgets_body)?;
     if depth > 0 && !budgets.is_empty() {
-        return Err(RestoreError::Malformed);
-    }
-    if child_state
-        .iter()
-        .flat_map(|c| c.handles.iter())
-        .any(|h| matches!(h.binding, DurableBinding::Budget { .. }))
-    {
         return Err(RestoreError::Malformed);
     }
     let named_budgets = handles
@@ -1826,17 +1691,13 @@ fn restore_at(
     let ids = host
         .restore_durable_pipes(&pipes)
         .map_err(|_| RestoreError::Malformed)?;
-    let ends = handles
-        .iter_mut()
-        .chain(child_state.iter_mut().flat_map(|c| c.handles.iter_mut()));
-    for h in ends {
+    for h in handles.iter_mut() {
         if let DurableBinding::PipeEnd { pipe, .. } = &mut h.binding {
             *pipe = ids[*pipe as usize];
         }
     }
-    // #2025: every region handle names a region of the cut; a nested child names none (the freeze
-    // refuses one). This domain holds each region it names under one new id, adopted in number order,
-    // and each number is rewritten to it.
+    // #2025: every region handle names a region of the cut. This domain holds each region it names
+    // under one new id, adopted in number order, and each number is rewritten to it.
     for h in &handles {
         if let DurableBinding::SharedRegion { region } = h.binding {
             if region as usize >= cut.regions.len() {
@@ -1844,13 +1705,6 @@ fn restore_at(
             }
             region_named.insert(region);
         }
-    }
-    if child_state
-        .iter()
-        .flat_map(|c| &c.handles)
-        .any(|h| matches!(h.binding, DurableBinding::SharedRegion { .. }))
-    {
-        return Err(RestoreError::Malformed);
     }
     let region_ids: BTreeMap<u32, u32> = region_named
         .into_iter()
@@ -1871,21 +1725,16 @@ fn restore_at(
     }
     host.restore_durable_handles(&handles);
 
-    // ---- Control state (§12.4): seed the frozen-fiber + spawned-vCPU residue (decoded above) for
-    // the thaw, so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
+    // ---- Control state (§12.4): seed the residue (decoded above) for the thaw, so the next
+    // (REWINDING) run re-creates the fibers, re-spawns the vCPUs and delivers the completed
+    // detached children's results. ----
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
         host.set_frozen_vcpus(vcpus);
         host.set_frozen_root_sp(root_sp);
     }
-    if !nested.is_empty() {
-        host.set_frozen_nested(nested);
-    }
     if !detached.is_empty() {
         host.set_frozen_detached(detached);
-    }
-    if !child_state.is_empty() {
-        host.set_frozen_child_state(child_state);
     }
 
     // ---- Serve state (§13.4 step 3, v13): decode the serve trio and the reply waits (v35, #1901)
@@ -2040,8 +1889,9 @@ fn decode_detached(
 
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
 /// `spawned_count > 0` (slice 3.2.1) — the spawned-vCPU residue (canonical ascending task) and the
-/// root's extent. Enforces the header's counts. A `None` body is valid only when both counts are zero
-/// (the section is elided then). Returns `(fibers, vcpus, root_sp, nested)`.
+/// root's extent, then — present iff bytes remain — the completed detached-child residue (canonical
+/// ascending `(parent_task, slot)`). Enforces the header's counts. A `None` body is valid only when
+/// both counts are zero (the section is elided then). Returns `(fibers, vcpus, root_sp, detached)`.
 #[allow(clippy::type_complexity)]
 fn decode_control(
     body: Option<&[u8]>,
@@ -2049,29 +1899,10 @@ fn decode_control(
     spawned_count: u64,
     // The root's empty extent when the artifact carries no residue: the module's arena base.
     root_default: u64,
-) -> Result<
-    (
-        Vec<FrozenFiber>,
-        Vec<FrozenVCpu>,
-        u64,
-        Vec<FrozenNested>,
-        Vec<FrozenChildState>,
-        Vec<FrozenDetached>,
-    ),
-    RestoreError,
-> {
+) -> Result<(Vec<FrozenFiber>, Vec<FrozenVCpu>, u64, Vec<FrozenDetached>), RestoreError> {
     let body = match (body, fiber_count, spawned_count) {
-        (None, 0, 0) => {
-            return Ok((
-                Vec::new(),
-                Vec::new(),
-                root_default,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ));
-            // no residue ⇒ no section
-        }
+        // no residue ⇒ no section
+        (None, 0, 0) => return Ok((Vec::new(), Vec::new(), root_default, Vec::new())),
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
         (Some(b), _, _) => b,
     };
@@ -2148,108 +1979,14 @@ fn decode_control(
         }
         root_sp = cr.uleb()?;
     }
-    // §4 subtree freeze (v8): the optional nested-child residue trails the section; its presence is
-    // exactly "bytes remain" (canonical: absent when empty, ascending `(parent_task, slot)` — `slot`
-    // is only unique within a parent's namespace, so the parent tag is the primary key; v12).
-    let mut nested = Vec::new();
-    let mut child_state = Vec::new();
-    if !cr.at_end() {
-        let nn = cr.uleb()?;
-        let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
-        for _ in 0..nn {
-            let slot = cr.uleb()?;
-            // v12: the task that instantiated this child (depth-2+ nesting); `0` for a direct child of
-            // the root. The interp thaw reconstructs the subtree topologically from it.
-            let parent_task_raw = cr.uleb()?;
-            let key = (parent_task_raw, slot);
-            if last.is_some_and(|p| key <= p) {
-                return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
-            }
-            last = Some(key);
-            let parent_task =
-                usize::try_from(parent_task_raw).map_err(|_| RestoreError::Malformed)?;
-            // v30 (#1687): the child's own task, which its children's `parent_task` names.
-            let task = usize::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let carve_off = cr.uleb()?;
-            let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-            // v11: separate-module child's module content digest.
-            let module_digest = match cr.uleb()? {
-                0 => None,
-                _ => Some(
-                    cr.take(32)?
-                        .try_into()
-                        .map_err(|_| RestoreError::Malformed)?,
-                ),
-            };
-            // v9/v31: completed-but-unjoined child's join outcome.
-            let completed_result = read_join_outcome(&mut cr)?;
-            // v14 (§13.4 slice 4c): the child's optional host state.
-            if cr.uleb()? != 0 {
-                let (svc_queue, svc_results, svc_next_ticket) = read_serve_trio(&mut cr)?;
-                let nh = cr.uleb()?;
-                let mut handles = Vec::with_capacity(nh as usize);
-                for _ in 0..nh {
-                    let hslot = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let generation =
-                        u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let type_id = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
-                    let binding = read_binding(&mut cr)?;
-                    // The child-window containment gate, mirroring the root handle table's
-                    // `binding_in_window`: a child's AddressSpace/Instantiator base/size are
-                    // carve-relative and must stay inside its own window.
-                    if !binding_in_window(&binding, 1u64 << size_log2) {
-                        return Err(RestoreError::BindingOutOfWindow);
-                    }
-                    handles.push(DurableHandle {
-                        slot: hslot,
-                        generation,
-                        type_id,
-                        binding,
-                    });
-                }
-                // v19 (#1296): the child's optional §22 unit tables (presence byte, then the
-                // Section-5 body shape). Canonical: presence 1 ⇒ a non-empty set (an empty one elides).
-                let (jit_tables, jit_table_log2) = if cr.uleb()? != 0 {
-                    let (tl, ds) = read_jit_body(&mut cr)?;
-                    if ds.is_empty() {
-                        return Err(RestoreError::Malformed);
-                    }
-                    (ds, tl)
-                } else {
-                    (Vec::new(), 0)
-                };
-                child_state.push(FrozenChildState {
-                    parent_task,
-                    slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
-                    svc_queue,
-                    svc_results,
-                    svc_next_ticket,
-                    handles,
-                    jit_tables,
-                    jit_table_log2,
-                });
-            }
-            nested.push(FrozenNested {
-                // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
-                // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
-                parent_task,
-                task,
-                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
-                carve_off,
-                size_log2,
-                entry,
-                module_digest,
-                completed_result,
-            });
-        }
-    }
-    // #1361 step 2 — the detached residue trails the nested block, present iff bytes remain after it.
-    // A nested count (possibly 0) always precedes it (see the encoder), so reaching here means the
-    // nested block was consumed and any remaining bytes are the detached block.
+    // #1361 step 2 — the completed detached-child residue trails the section, present iff bytes
+    // remain; canonical: absent when empty (v44).
     let mut detached = Vec::new();
     if !cr.at_end() {
         let nd = cr.uleb()?;
+        if nd == 0 {
+            return Err(RestoreError::Malformed);
+        }
         let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
         for _ in 0..nd {
             let parent_task_raw = cr.uleb()?;
@@ -2271,7 +2008,7 @@ fn decode_control(
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok((fibers, vcpus, root_sp, nested, child_state, detached))
+    Ok((fibers, vcpus, root_sp, detached))
 }
 
 /// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
@@ -2479,14 +2216,7 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
-        DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => {
-            b.push(B_FREEZE_AUTHORITY);
-            write_uleb(b, base);
-            write_uleb(b, size);
-        }
-        DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny) => {
-            b.push(B_FREEZE_DETACHED);
-        }
+        DurableBinding::FreezeAuthority => b.push(B_FREEZE_DETACHED),
         DurableBinding::LiveImpl { slot, export } => {
             b.push(B_LIVE_IMPL);
             write_uleb(b, slot as u64);
@@ -2545,11 +2275,8 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             base: r.uleb()?,
             size: r.uleb()?,
         },
-        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority(FreezeScope::Carve {
-            base: r.uleb()?,
-            size: r.uleb()?,
-        }),
-        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny),
+        // B_FREEZE_AUTHORITY (12): the carve range, retired with the carve (#1867) — fails closed.
+        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority,
         B_INSTANTIATOR => DurableBinding::Instantiator {
             base: r.uleb()?,
             size: r.uleb()?,
@@ -2735,33 +2462,24 @@ mod pipe_numbering_tests {
         }
     }
 
-    /// #1680: pipes are numbered by first appearance (root by slot, then children in record order),
-    /// not by their process-global ids, so a thawed tree re-freezes to the same numbers.
+    /// #1680: pipes are numbered by first appearance (by slot), not by their process-global ids, so
+    /// a thawed tree re-freezes to the same numbers.
     #[test]
     fn pipes_are_numbered_by_first_appearance() {
-        let mut root = vec![end(1, 90, false), end(2, 40, true)];
-        let mut children = vec![FrozenChildState {
-            parent_task: 0,
-            slot: 0,
-            svc_queue: Vec::new(),
-            svc_results: Vec::new(),
-            svc_next_ticket: 0,
-            handles: vec![end(0, 90, true), end(1, 40, false)],
-            jit_tables: Vec::new(),
-            jit_table_log2: 0,
-        }];
-        let bytes = number_pipes(&[live(40, 1, 1), live(90, 1, 1)], &mut root, &mut children)
+        let mut handles = vec![
+            end(1, 90, false),
+            end(2, 40, true),
+            end(3, 90, true),
+            end(4, 40, false),
+        ];
+        let bytes = number_pipes(&[live(40, 1, 1), live(90, 1, 1)], &mut handles)
             .expect("every end is inside the cut");
         assert_eq!(
             bytes,
             vec![vec![90], vec![40]],
             "numbered in appearance order"
         );
-        let pipes: Vec<_> = root
-            .iter()
-            .chain(&children[0].handles)
-            .map(|h| h.binding)
-            .collect();
+        let pipes: Vec<_> = handles.iter().map(|h| h.binding).collect();
         assert_eq!(
             pipes,
             vec![
@@ -2792,7 +2510,7 @@ mod pipe_numbering_tests {
     fn a_pipe_with_an_end_outside_the_cut_refuses() {
         let mut root = vec![end(1, 7, false), end(2, 7, true)];
         assert_eq!(
-            number_pipes(&[live(7, 2, 1)], &mut root, &mut []),
+            number_pipes(&[live(7, 2, 1)], &mut root),
             Err(FreezeError::PipeCrossesCut)
         );
     }
