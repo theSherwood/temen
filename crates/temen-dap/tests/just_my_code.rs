@@ -278,3 +278,86 @@ fn step_in_finds_a_callback_the_library_makes() {
         );
     }
 }
+
+// Startup code with no source (func 0, like a linker's `_start`) calls a library's initialisation
+// (func 1, lib.c:30–31) and then the program's `main` (func 2, main.c:2–3).
+const STARTUP_DBG: &str = r#"
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = call 1 (v0)
+  v2 = call 2 (v1)
+  return v2
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  return v2
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+  }
+}
+
+debug.file 0 "lib.c"
+debug.file 1 "main.c"
+debug.lib 0
+debug.loc 1 0 0 0 30 1
+debug.loc 1 0 1 0 31 1
+debug.loc 2 0 0 1 2 1
+debug.loc 2 0 1 1 3 1
+"#;
+
+/// Under `justMyCode`, `stopOnEntry` stops on the program's own first line: past the sourceless
+/// startup code and the library's initialisation, where without it the stop is the first op.
+#[test]
+fn stop_on_entry_stops_on_the_programs_first_line_under_just_my_code() {
+    for engine in ENGINES {
+        for just_my_code in [false, true] {
+            let mut s = DapServer::new();
+            s.handle(&req(1, "initialize", Json::obj(vec![])));
+            let mut launch = vec![
+                ("programText", Json::s(STARTUP_DBG)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![Json::i(5)])),
+                ("stopOnEntry", Json::Bool(true)),
+                ("justMyCode", Json::Bool(just_my_code)),
+            ];
+            if let Some(e) = engine {
+                launch.push(("engine", Json::s(e)));
+            }
+            s.handle(&req(2, "launch", Json::obj(launch)));
+            let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+            let reason = event(&out, "stopped")
+                .and_then(|e| e.get("body"))
+                .and_then(|b| b.get("reason"))
+                .and_then(|r| r.as_str())
+                .map(str::to_owned);
+            assert_eq!(
+                reason.as_deref(),
+                Some("entry"),
+                "{engine:?} {just_my_code}"
+            );
+            let frames = frames(&mut s);
+            let line = frames[0].get("line").and_then(|l| l.as_i64());
+            if just_my_code {
+                assert_eq!(
+                    top(&mut s),
+                    ("main.c:2".to_string(), 2),
+                    "{engine:?}: main's first line, below the startup code"
+                );
+            } else {
+                assert_eq!(
+                    (line, frames.len()),
+                    (Some(0), 1),
+                    "{engine:?}: the startup code's first op, which has no line"
+                );
+            }
+        }
+    }
+}

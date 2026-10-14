@@ -745,6 +745,13 @@ impl DapServer {
         // The interpreter starts paused before the first op. If `stopOnEntry`, surface that as a
         // stop; otherwise run to the first breakpoint (or completion).
         if self.stop_on_entry {
+            let has_debug = self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.inspector.debug_info(0).is_some());
+            if self.just_my_code && has_debug {
+                return (true, Json::Null, self.enter_program());
+            }
             let ev = stopped_event("entry", 1);
             (true, Json::Null, vec![ev])
         } else if self.session.is_none() {
@@ -1640,6 +1647,27 @@ impl DapServer {
             }
         }
         stop
+    }
+
+    /// Under `justMyCode`, `stopOnEntry` stops on the program's own first line (#2341), as a C
+    /// debugger stops at `main` rather than at `_start`'s first op: step in past the startup code,
+    /// which has no source, and past any library's (its initialisation). A breakpoint, a fault or the
+    /// end of the run on the way reports as itself.
+    fn enter_program(&mut self) -> Vec<Event> {
+        let stop = self.step_source_line(StepKind::In);
+        let stop = self.past_library(stop, |s| s.step_source_line(StepKind::In));
+        if matches!(
+            stop,
+            Stop::Break {
+                reason: StopReason::Step,
+                ..
+            }
+        ) {
+            let mut events = self.output_events();
+            events.push(stopped_event("entry", self.stopped_thread_id()));
+            return events;
+        }
+        self.stop_events(stop)
     }
 
     /// Whether the focused thread's innermost frame runs a library's code (#2341).

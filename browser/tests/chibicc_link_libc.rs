@@ -920,4 +920,46 @@ fn a_resident_librarys_code_is_library_code_under_the_debugger() {
         ("/in.c", 5, None),
         "with it the step goes through printf to the program's next line"
     );
+
+    // And `stopOnEntry` under `justMyCode` stops on `main`'s first line: past the linked program's
+    // sourceless `_start` and chibicc's bootstrap, instead of on the first op.
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(linked.as_str())),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            ("stopOnEntry", Json::Bool(true)),
+            ("justMyCode", Json::Bool(true)),
+        ]),
+    ));
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    let out = s.handle(&req(
+        4,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let resp = out
+        .iter()
+        .find(|m| m.get("type").and_then(|t| t.as_str()) == Some("response"))
+        .expect("a response");
+    let top = &resp
+        .get("body")
+        .and_then(|b| b.get("stackFrames"))
+        .and_then(|f| f.as_array())
+        .expect("frames")[0];
+    let at = (
+        top.get("source")
+            .and_then(|src| src.get("path"))
+            .and_then(|p| p.as_str())
+            .unwrap_or(""),
+        top.get("line").and_then(|l| l.as_i64()).unwrap_or(0),
+    );
+    eprintln!("ENTRY {at:?}");
+    assert_eq!(at, ("/in.c", 3), "the entry is main's first line");
 }
