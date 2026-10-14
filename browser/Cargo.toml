@@ -99,6 +99,8 @@ panic = "abort"
 # The native wasm-JIT reactor differential (`tests/jit_reactor.rs`) runs the emitted `tick` on `wasmi`
 # (playing the browser's JS host) against the interpreter reactor oracle. Matches temen-wasmjit's dev-dep.
 wasmi = { version = "0.47", features = ["simd"] }
+# `tests/foreign_accessor.rs` assembles the WAT `web/foreign-mem.js` embeds, to pin its bytes (#2416).
+wat = { version = "1", default-features = false }
 
 # Same rule as `crates/temen-llvm` (see that manifest for the measurement): this crate's host-side
 # Rust gates — `browser-host-guests`, `browser-jit-host-gates` and the `gencorpus` run inside
