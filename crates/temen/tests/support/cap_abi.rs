@@ -438,49 +438,61 @@ pub struct Runs {
     pub results: Vec<(u32, i64)>,
 }
 
-/// Run the guest `data` becomes on the tree-walker, the bytecode engine and the Cranelift JIT,
-/// each over a fresh powerbox. A host panic or abort is the find; anything the guest sees is not.
-pub fn fuzz_one(data: &[u8]) -> Runs {
-    let (src, types) = program(data);
-    let m = temen_text::parse_module(&src).expect("the generated guest parses");
-    temen_verify::verify_module(&m).expect("the generated guest verifies");
-    let mut runs = Runs::default();
-    // What a run returned (its results, all `i64`), or `Err` when it ended without returning (a
-    // trap, an exit, an exec); `None` when the engine declined the module.
-    let mut tally = |r: Option<Result<Vec<i64>, ()>>| match r {
-        Some(Ok(vals)) => {
-            runs.completed += 1;
-            runs.results.extend(types.iter().copied().zip(vals));
-        }
-        Some(Err(())) => runs.trapped += 1,
-        None => runs.declined += 1,
-    };
+/// How a run ended: what it returned, each result as an `i64`, or the wire code it ended with
+/// (`temen_ir::trap_code`: a trap, an exit, a host unwind); `None` when the engine declined the
+/// module.
+pub type Outcome = Option<Result<Vec<i64>, i64>>;
+
+/// `m`'s entry on the tree-walker, the bytecode engine and the Cranelift JIT, each over a fresh
+/// powerbox, which it takes as its arguments.
+pub fn on_every_engine(m: &temen_ir::Module) -> [Outcome; 3] {
     let interp = |r: Result<Vec<Value>, temen_interp::Trap>| {
         let wide = |v: &Value| match v {
             Value::I64(x) => *x,
             _ => i64::MIN,
         };
-        r.map(|vals| vals.iter().map(wide).collect()).map_err(drop)
+        r.map(|vals| vals.iter().map(wide).collect())
+            .map_err(temen_interp::Trap::code)
     };
-    let (mut h, handles) = powerbox(&m);
+    let (mut h, handles) = powerbox(m);
     let args: Vec<Value> = handles.into_iter().map(Value::I32).collect();
     let mut fuel = FUEL;
-    tally(Some(interp(temen_interp::run_with_host(
-        &m, 0, &args, &mut fuel, &mut h,
-    ))));
-    let (mut h, handles) = powerbox(&m);
+    let tree_walker = Some(interp(temen_interp::run_with_host(
+        m, 0, &args, &mut fuel, &mut h,
+    )));
+    let (mut h, handles) = powerbox(m);
     let args: Vec<Value> = handles.into_iter().map(Value::I32).collect();
     let mut fuel = FUEL;
-    tally(bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut h).map(interp));
-    let (mut h, handles) = powerbox(&m);
+    let bytecode = bytecode::compile_and_run_with_host(m, 0, &args, &mut fuel, &mut h).map(interp);
+    let (mut h, handles) = powerbox(m);
     let args: Vec<i64> = handles.into_iter().map(i64::from).collect();
     let window = MemLayout::image(vec![0; WINDOW as usize]);
-    tally(
-        match temen_run::jit_cap_run(&m, 0, &args, &window, 0, TABLE_LOG2, &mut h, None) {
-            Ok((JitOutcome::Returned(vals), _)) => Some(Ok(vals)),
-            Ok(_) => Some(Err(())),
-            Err(_) => None,
-        },
-    );
+    let jit = match temen_run::jit_cap_run(m, 0, &args, &window, 0, TABLE_LOG2, &mut h, None) {
+        Ok((JitOutcome::Returned(vals), _)) => Some(Ok(vals)),
+        Ok((JitOutcome::Trapped(kind), _)) => Some(Err(kind as i64)),
+        Ok((JitOutcome::Exited(code), _)) => Some(Err(temen_ir::trap_code::exit(code))),
+        Ok((JitOutcome::HostUnwound, _)) => Some(Err(temen_jit::HOST_UNWIND_CODE.into())),
+        Err(_) => None,
+    };
+    [tree_walker, bytecode, jit]
+}
+
+/// Run the guest `data` becomes on every engine ([`on_every_engine`]). A host panic or abort is the
+/// find; anything the guest sees is not.
+pub fn fuzz_one(data: &[u8]) -> Runs {
+    let (src, types) = program(data);
+    let m = temen_text::parse_module(&src).expect("the generated guest parses");
+    temen_verify::verify_module(&m).expect("the generated guest verifies");
+    let mut runs = Runs::default();
+    for outcome in on_every_engine(&m) {
+        match outcome {
+            Some(Ok(vals)) => {
+                runs.completed += 1;
+                runs.results.extend(types.iter().copied().zip(vals));
+            }
+            Some(Err(_)) => runs.trapped += 1,
+            None => runs.declined += 1,
+        }
+    }
     runs
 }

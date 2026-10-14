@@ -14682,12 +14682,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     });
                     continue 'frames;
                 }
+                // The arms below serve their ops here, each delivering the results its op's contract
+                // names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, is a `CapFault` before any of them runs, as on
+                // every engine: no arm numbers a result it doesn't push (#2066, #2361).
+                Inst::CapCall {
+                    type_id, op, sig, ..
+                } if !temen_ir::served_shape_ok(*type_id, *op, call_sig(&cur_types, *sig)) => {
+                    return Err(Trap::CapFault);
+                }
                 Inst::CapCall {
                     type_id: cap_id::INSTANTIATOR,
                     op,
-                    sig,
                     handle,
                     args,
+                    ..
                 } => {
                     // #1578 — DESIGN §22: an **invoked** unit is a seam-free leaf, so the whole
                     // `Instantiator` is unavailable inside a `Jit.invoke` (a non-empty `below` — the
@@ -14696,12 +14705,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // never installed, and its handle names this transient vCPU's child, which no
                     // one can join. An *installed* unit spawns like the base module (#1726).
                     if !below.is_empty() {
-                        return Err(Trap::CapFault);
-                    }
-                    // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
-                    // every engine: an op that isn't live, or a call that would number a result this
-                    // arm doesn't push, is a `CapFault` (#2066).
-                    if !temen_ir::instantiator_shape_ok(*op, call_sig(&cur_types, *sig)) {
                         return Err(Trap::CapFault);
                     }
                     let h = get_i32(&frames[top].vals, *handle)?;
@@ -15315,7 +15318,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: op @ (CAP_SELF_SVC_POLL | CAP_SELF_SVC_WAIT),
-                    sig,
                     args,
                     ..
                 } => {
@@ -15325,9 +15327,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // frame is a parked ancestor): probeable refusal — the serve loop
                             // is the domain's outermost dispatcher (re-entry into a domain is
                             // a fresh dispatch, never a nested drain).
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(EINVAL));
-                            }
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
                             continue;
                         }
                     }
@@ -15382,9 +15382,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         && serve_run.is_none()
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING)
                     {
-                        if !call_sig(&cur_types, *sig).results.is_empty() {
-                            frames[top].vals.push(Reg::from_i64(0));
-                        }
+                        frames[top].vals.push(Reg::from_i64(0));
                         continue;
                     }
                     // Switch into handler-fiber frames: the `cont.resume` tail with the serve
@@ -15542,9 +15540,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         };
                         return Ok(Inner::Park(Blocked::SvcWait { key, deadline_ns }));
                     }
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(*serve_count));
-                    }
+                    frames[top].vals.push(Reg::from_i64(*serve_count));
                     *serve_count = 0;
                 }
                 // FORK.md PR 1/PR 5 — `clone_caller` (self-namespace op 11): serviced here because it
@@ -15567,7 +15563,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_CLONE_CALLER,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15610,9 +15605,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `reap` (self-namespace op 12): serviced here (needs the eval-loop
                 // -local `serve_run`). From within a handler, reap the twin named by the `pid` arg on
@@ -15625,7 +15618,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_REAP,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15679,16 +15671,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         _ => EINVAL,
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // FORK.md §8.6 — `pipe(fds)` (self-namespace op 16): the one mint ([`Host::mint_pipe`]),
                 // on the `Real` scheduler, whose `PipeEnd` parks the pipe's reads and writes need.
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_PIPE,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15702,9 +15691,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         EINVAL
                     };
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(r));
-                    }
+                    frames[top].vals.push(Reg::from_i64(r));
                 }
                 // CALLS.md §10.6 / increment 5 — `fuel.remaining` (self-namespace op 13): push this
                 // domain's remaining fuel. No handler context, no host lock — just the live counter,
@@ -15716,12 +15703,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_FUEL_REMAINING,
-                    sig,
                     ..
                 } => {
-                    if !call_sig(&cur_types, *sig).results.is_empty() {
-                        frames[top].vals.push(Reg::from_i64(fuel.remaining()));
-                    }
+                    frames[top].vals.push(Reg::from_i64(fuel.remaining()));
                 }
                 // FORK.md §8.6 — `exec_module(module, grants_ptr, grants_n, entry, size_log2)`
                 // (self-namespace op 14): **`execve` image-replace**. Resolve the command module + the
@@ -15734,7 +15718,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::CapCall {
                     type_id: temen_ir::CAP_SELF_TYPE_ID,
                     op: CAP_SELF_EXEC,
-                    sig,
                     args,
                     ..
                 } => {
@@ -15760,10 +15743,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         clean_root,
                     ) {
                         Ok(req) => return Ok(Inner::Exec(req)),
-                        Err(e) if !call_sig(&cur_types, *sig).results.is_empty() => {
-                            frames[top].vals.push(Reg::from_i64(e));
-                        }
-                        Err(_) => {}
+                        Err(e) => frames[top].vals.push(Reg::from_i64(e)),
                     }
                 }
                 Inst::CapCall {
@@ -15815,9 +15795,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -15858,9 +15840,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -15978,9 +15962,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // Degenerate blocking wait (slice 1): single-fiber guests, durable
                         // callers, non-i64 signatures, the deterministic explorer.
                         let r = comps.wait(id);
-                        if let Some(ty) = call_sig(&cur_types, *sig).results.first() {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, r)));
-                        }
+                        push_results(
+                            &mut frames[top].vals,
+                            &[r],
+                            &call_sig(&cur_types, *sig).results,
+                        );
                         continue;
                     }
                     // §3.6 slice 1 — the two revocation-unparks hooks, direct-call route:
@@ -16048,22 +16034,26 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::PipeRead(pipe) => pipe_park!(top, pipe, false),
                         Decision::PipeWrite(pipe) => pipe_park!(top, pipe, true),
                         Decision::Eintr => {
-                            frames[top].vals.push(Reg::from_i64(EINTR));
+                            push_results(
+                                &mut frames[top].vals,
+                                &[EINTR],
+                                &call_sig(&cur_types, *sig).results,
+                            );
                             eintr_done = true;
                         }
                         Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7 executable named import (IMPORTS.md phase 1): dispatch through the reserved
@@ -16092,6 +16082,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         .lock_unpoisoned()
                         .import_binding(*import)
                         .ok_or(Trap::CapFault)?;
+                    // The bound op is served here too, so the import's declared shape is held to
+                    // its contract as a `call.cap`'s is (#2361).
+                    if !temen_ir::served_shape_ok(b.type_id, b.op, call_sig(&cur_types, *sig)) {
+                        return Err(Trap::CapFault);
+                    }
                     let h = b.handle;
                     match b.op {
                         3 => jit_install_body!(h, args),
@@ -16147,9 +16142,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16190,9 +16187,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16260,15 +16259,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
@@ -16313,9 +16312,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             let served =
                                                 callee.lock_unpoisoned().svc_results.remove(&t);
                                             if let Some(rv) = served {
-                                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                                    frames[top].vals.push(Reg::from_i64(rv));
-                                                }
+                                                push_results(
+                                                    &mut frames[top].vals,
+                                                    &[rv],
+                                                    &call_sig(&cur_types, *sig).results,
+                                                );
                                                 continue;
                                             }
                                         }
@@ -16352,9 +16353,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 return Ok(Inner::Park(Blocked::CapReply { ticket: t, callee }));
                             }
                             None => {
-                                if !call_sig(&cur_types, *sig).results.is_empty() {
-                                    frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                }
+                                push_results(
+                                    &mut frames[top].vals,
+                                    &[EAGAIN],
+                                    &call_sig(&cur_types, *sig).results,
+                                );
                                 continue;
                             }
                         }
@@ -16423,15 +16426,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 dynamic-mode dispatch by type-section reference: the reserved dyn entry
@@ -16508,18 +16511,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Decision::None => {}
                     }
                     if !eintr_done {
-                        if let Some(e) = refused {
-                            if !call_sig(&cur_types, *sig).results.is_empty() {
-                                frames[top].vals.push(Reg::from_i64(e));
-                            }
-                        } else {
-                            for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results)
-                            {
-                                frames[top]
-                                    .vals
-                                    .push(Reg::from_value(slot_to_val(*tyv, *s)));
-                            }
-                        }
+                        let results = match refused {
+                            Some(e) => vec![e],
+                            None => results,
+                        };
+                        push_results(
+                            &mut frames[top].vals,
+                            &results,
+                            &call_sig(&cur_types, *sig).results,
+                        );
                     }
                 }
                 // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
@@ -36855,6 +36855,19 @@ fn val_to_slot(v: Value) -> i64 {
 }
 
 /// Decode a capability-ABI result slot back to a `Value` of the declared type.
+/// #2361 — the values a host-served `call.cap` defines: one per declared result, each the host's
+/// result at that place converted to its declared type, or zero past the results the host returned.
+/// Results past the declared ones are dropped. Every engine defines the same: the Cranelift JIT's
+/// result slots start zeroed, and the bytecode engine zeroes its result registers.
+fn push_results(vals: &mut Vec<Reg>, results: &[i64], declared: &[ValType]) {
+    vals.extend(
+        declared
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| Reg::from_value(slot_to_val(ty, results.get(i).copied().unwrap_or(0)))),
+    );
+}
+
 fn slot_to_val(ty: ValType, s: i64) -> Value {
     match ty {
         ValType::I32 => Value::I32(s as i32),

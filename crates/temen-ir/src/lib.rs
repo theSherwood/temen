@@ -101,7 +101,7 @@ pub mod cap_id {
     /// memory half of the `Instantiator`: a guest carves a child's window from its own.
     pub const ADDRESS_SPACE: u32 = 5;
     /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
-    /// window of its own (VM-in-VM), and manage it. The live ops ([`super::instantiator_contract`]
+    /// window of its own (VM-in-VM), and manage it. The live ops ([`super::served_contract`]
     /// gives their shapes): 17 `instantiate_rec(record) -> child` spawns from a [`super::SpawnRec`]
     /// (15 is its retiring positional form, #2067); 1 `join(child) -> (status, value)` parks only
     /// the calling fiber until the child ends, then answers how it ended, never as a trap of the
@@ -211,44 +211,62 @@ pub mod cap_id {
     pub const GUEST_IMPL_BASE: u32 = 0x1000_0000;
 }
 
-/// The shape of each live [`cap_id::INSTANTIATOR`] op: the scalar-int argument prefix it reads and
-/// the results it answers. The verifier checks a `call.cap` against its *declared* signature only,
-/// so a verified module can call the Instantiator with any shape. Every engine checks the declared
-/// one against this table before running the op ([`instantiator_shape_ok`]), and a call that
-/// doesn't match, or names an op that isn't live, traps `CapFault`. One table, so no engine numbers
-/// a result that another doesn't deliver (#2066).
+/// The shape of each op an engine serves in its own arm rather than through the host's dispatch:
+/// the scalar-int argument prefix it reads and the results it answers. The verifier checks a
+/// `call.cap` against its *declared* signature only, so a verified module can call these ops with
+/// any shape. Every engine checks the declared one against this table before running the op
+/// ([`served_shape_ok`]), and a call that doesn't match traps `CapFault`, as a call on an
+/// Instantiator op that isn't live does. One table, so no engine numbers a result that another
+/// doesn't deliver (#2066, #2361).
 ///
-/// | op | | args | results |
-/// |---|---|---|---|
-/// | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
-/// | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
-/// | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
-/// | 15 | `instantiate_detached` | budget, module, grants ptr and count, entry, size_log2, quota | child or `-errno` |
-/// | 17 | `instantiate_rec` | record pointer | child or `-errno` |
-pub fn instantiator_contract(op: u32) -> Option<(&'static [ValType], &'static [ValType])> {
+/// | type | op | | args | results |
+/// |---|---|---|---|---|
+/// | Instantiator | 1 | `join` | child | status, value: `(0, its first result)` if it returned, `(its trap's [`trap_code`], 0)` if not |
+/// | Instantiator | 9, 10, 12 | `poll`, `detach`, `kill` | child | i32 |
+/// | Instantiator | 14, 19 | `child_offer`, `grant` | child, export or handle | the child's handle or `-errno` |
+/// | Instantiator | 15 | `instantiate_detached` | budget, module, grants ptr and count, entry, size_log2, quota | child or `-errno` |
+/// | Instantiator | 17 | `instantiate_rec` | record pointer | child or `-errno` |
+/// | Jit | 3, 4 | `install`, `uninstall` | code handle, or slot | slot or `-errno`, or `0` or `-EINVAL` |
+/// | self | 9, 10 | `svc.poll`, `svc.wait` | | dispatches served |
+/// | self | 11, 12 | `clone_caller`, `reap` | | the served caller or `-errno`, or the twin's exit status |
+/// | self | 13 | `fuel.remaining` | | fuel |
+/// | self | 14 | `exec_module` | module, grants ptr and count, entry, size_log2 | `-errno` of a refused exec |
+/// | self | 16 | `pipe` | | `0` or `-errno` |
+///
+/// Args an op reads only when present (`svc.wait`'s timeout, `clone_caller`'s replies, `reap`'s
+/// pid, `pipe`'s fds pointer) are past the prefix.
+pub fn served_contract(type_id: u32, op: u32) -> Option<(&'static [ValType], &'static [ValType])> {
     use ValType::{I32, I64};
-    match op {
-        1 => Some((&[I32], &[I64, I64])),
-        9 | 10 | 12 => Some((&[I32], &[I32])),
-        14 | 19 => Some((&[I32, I64], &[I32])),
-        15 => Some((&[I64; 7], &[I32])),
-        17 => Some((&[I64], &[I32])),
+    match (type_id, op) {
+        (cap_id::INSTANTIATOR, 1) => Some((&[I32], &[I64, I64])),
+        (cap_id::INSTANTIATOR, 9 | 10 | 12) => Some((&[I32], &[I32])),
+        (cap_id::INSTANTIATOR, 14 | 19) => Some((&[I32, I64], &[I32])),
+        (cap_id::INSTANTIATOR, 15) => Some((&[I64; 7], &[I32])),
+        (cap_id::INSTANTIATOR, 17) => Some((&[I64], &[I32])),
+        (cap_id::JIT, 3 | 4) => Some((&[I64], &[I64])),
+        (CAP_SELF_TYPE_ID, 9..=13 | 16) => Some((&[], &[I64])),
+        (CAP_SELF_TYPE_ID, 14) => Some((&[I64; 5], &[I64])),
         _ => None,
     }
 }
 
-/// Whether an Instantiator `call.cap` of `op` declared as `sig` matches [`instantiator_contract`].
-/// Width-tolerant: an `i32` or an `i64` matches either, since every engine reads an arg as an
-/// `i64` and coerces a result to its declared type (a chibicc guest widens every scalar to `i64`).
-/// Args past the contract's prefix are tolerated (op 15's optional args payload and region).
-pub fn instantiator_shape_ok(op: u32, sig: &FuncType) -> bool {
+/// Whether every engine lets a `call.cap` of `(type_id, op)` declared as `sig` run. One of an op
+/// [`served_contract`] names must match its contract. Any other runs on the host's dispatch, which
+/// takes any shape, save an Instantiator op: none but the named ones is live. Width-tolerant: an
+/// `i32` or an `i64` matches either, since every engine reads an arg as an `i64` and coerces a
+/// result to its declared type (a chibicc guest widens every scalar to `i64`). Args past the
+/// contract's prefix are tolerated (op 15's optional args payload and region).
+pub fn served_shape_ok(type_id: u32, op: u32, sig: &FuncType) -> bool {
     let int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
-    instantiator_contract(op).is_some_and(|(args, results)| {
-        sig.params.len() >= args.len()
-            && sig.params[..args.len()].iter().all(int)
-            && sig.results.len() == results.len()
-            && sig.results.iter().all(int)
-    })
+    match served_contract(type_id, op) {
+        Some((args, results)) => {
+            sig.params.len() >= args.len()
+                && sig.params[..args.len()].iter().all(int)
+                && sig.results.len() == results.len()
+                && sig.results.iter().all(int)
+        }
+        None => type_id != cap_id::INSTANTIATOR,
+    }
 }
 
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its

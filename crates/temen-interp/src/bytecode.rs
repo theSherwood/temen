@@ -398,9 +398,8 @@ enum Op {
     CloneCaller {
         /// The reply-value arg registers (0, 1, or 2), resolved to i64s in the driver.
         args: Box<[u32]>,
+        /// The twin handle (or an errno) lands here.
         dst: u32,
-        /// Whether the `call.cap` has a result slot (the twin handle / errno lands here).
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap` (self-op 12): the servicer side of `wait(pid)`. From within a serve
     /// handler, reap a twin `pid` a prior `clone_caller` minted, on behalf of the caller parked on
@@ -411,7 +410,6 @@ enum Op {
         /// The `pid` arg register (`None` = no arg → an out-of-range pid → `-ECHILD`).
         pid: Option<u32>,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (self-op 14): **`execve` image-replace** (#1080). The running vCPU
     /// replaces its own image with a granted *separate command module*, in place, keeping its task id
@@ -631,7 +629,7 @@ enum Op {
     },
     Unreachable,
     /// A `CapFault` trap: an `Instantiator` call that isn't a live op at its contracted shape
-    /// (`temen_ir::instantiator_contract`), which the oracle refuses after the handle resolves (a
+    /// (`temen_ir::served_contract`), which the oracle refuses after the handle resolves (a
     /// forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5 and 13, #1867), `wait`
     /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
@@ -1660,14 +1658,16 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
             }
             for inst in &b.insts {
                 match inst {
-                    // Every live op (`temen_ir::instantiator_contract`) drives executor children,
+                    // Every live op (`temen_ir::served_contract`) drives executor children,
                     // scheduler-driven. Every other INSTANTIATOR op traps `CapFault`
                     // (`Op::CapFault`), so it is no seam.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         op,
                         ..
-                    } if temen_ir::instantiator_contract(*op).is_some() => s.has_instantiate = true,
+                    } if temen_ir::served_contract(super::cap_id::INSTANTIATOR, *op).is_some() => {
+                        s.has_instantiate = true
+                    }
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         ..
@@ -2921,21 +2921,12 @@ fn compile_inst(
             args,
         } => {
             use super::cap_id;
-            // #2353 — the driver-served ops below deliver exactly one result, at `dst`. A call that
-            // declares another shape has no such slot (with none, `dst` lies past its frame), so it
-            // declines to the oracle rather than writing where its frame does not reach. The
-            // `Instantiator`'s are held to their contract instead (the first arm), which gives `join`
-            // its two result slots.
-            let one = view.sig(*sig).results.len() == 1;
             match (*type_id, *op) {
-                // The declared shape must be the op's (`temen_ir::instantiator_contract`), as on
-                // every engine: an op that isn't live, or a call shaped otherwise, traps `CapFault`
-                // (#2066). Past this arm every Instantiator call has its op's arg prefix.
-                (cap_id::INSTANTIATOR, op)
-                    if !temen_ir::instantiator_shape_ok(op, view.sig(*sig)) =>
-                {
-                    Op::CapFault
-                }
+                // The ops below are served here, each delivering at `dst` the results its op's
+                // contract names (`temen_ir::served_contract`). A call declaring another shape, or an
+                // Instantiator op that isn't live, traps `CapFault`, as on every engine (#2066,
+                // #2361). Past this arm every served call has its op's arg prefix and results.
+                _ if !temen_ir::served_shape_ok(*type_id, *op, view.sig(*sig)) => Op::CapFault,
                 (cap_id::INSTANTIATOR, 1) => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
@@ -2987,17 +2978,16 @@ fn compile_inst(
                 // §22 guest-driven JIT units: install/uninstall drive the dispatch table; compile /
                 // compile_linked (ops 0/5) are pure host ops, so they fall through to the generic
                 // dispatch below. `invoke` (op 1) is the next slice — reject it for now (fall back).
-                (cap_id::JIT, 3) if one && !args.is_empty() => Op::JitInstall {
+                (cap_id::JIT, 3) => Op::JitInstall {
                     handle: g(*handle),
                     code: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 4) if one && !args.is_empty() => Op::JitUninstall {
+                (cap_id::JIT, 4) => Op::JitUninstall {
                     handle: g(*handle),
                     slot: g(args[0]),
                     dst,
                 },
-                (cap_id::JIT, 3 | 4) => return None,
                 (cap_id::JIT, 1) if !args.is_empty() => Op::JitInvoke {
                     handle: g(*handle),
                     code: g(args[0]),
@@ -3017,24 +3007,18 @@ fn compile_inst(
                 // A live op this lowering has no arm for declines to the oracle.
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
-                // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
-                // shape compiles to the native serve-loop-core op — the module-level veto in
-                // [`compile_module`] guarantees its handlers cannot park mid-dispatch, so the
-                // rewind linkage runs each one to completion (or trap). `svc.wait`'s
-                // empty-queue park needs a waker topology (cross-domain callers, timers) the
-                // cooperative scheduler doesn't host yet, and a no-result `svc.poll` would
-                // leave the op without its result-slot scratch — both still decline, falling
-                // the whole module back to the tree-walk oracle, which serves.
+                // §3.6 service points (I36 slice 1): `svc.poll` compiles to the native
+                // serve-loop-core op — the module-level veto in [`compile_module`] guarantees its
+                // handlers cannot park mid-dispatch, so the rewind linkage runs each one to
+                // completion (or trap). `svc.wait`'s empty-queue park needs a waker topology
+                // (cross-domain callers, timers) the cooperative scheduler doesn't host yet, so it
+                // declines, falling the whole module back to the tree-walk oracle, which serves.
                 // (The timed `svc.wait` form — op 10 with the optional timeout arg — is
                 // oracle-only and declines below; `serve_qualifies` already vetoed the module.)
-                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10))
-                    if view.sig(*sig).results.len() == 1 && args.is_empty() =>
-                {
-                    Op::SvcPoll {
-                        dst,
-                        wait: op == 10,
-                    }
-                }
+                (temen_ir::CAP_SELF_TYPE_ID, op @ (9 | 10)) if args.is_empty() => Op::SvcPoll {
+                    dst,
+                    wait: op == 10,
+                },
                 (temen_ir::CAP_SELF_TYPE_ID, 9 | 10) => return None,
                 // FORK.md §9.2 — `clone_caller` (op 11) / `reap` (op 12): compiled to the native fork
                 // ops (the module reached here only via the [`Seams::bytecode_serves_fork`] escape).
@@ -3042,12 +3026,10 @@ fn compile_inst(
                 (temen_ir::CAP_SELF_TYPE_ID, 11) => Op::CloneCaller {
                     args: args.iter().map(|a| g(*a)).collect(),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 (temen_ir::CAP_SELF_TYPE_ID, 12) => Op::Reap {
                     pid: args.first().map(|a| g(*a)),
                     dst,
-                    has_result: !view.sig(*sig).results.is_empty(),
                 },
                 // CALLS.md §10.6 — `fuel.remaining` (op 13) reads the vCPU's live fuel counter, which
                 // the host-side `cap_dispatch_slots` can't see; rather than add a native bytecode op,
@@ -3061,7 +3043,7 @@ fn compile_inst(
                 // `-EINVAL` of a refused exec (a successful exec never returns to this activation).
                 // (The tree-walker folds this to `Step::Exec`; this tier does the replace natively so
                 // an exec-bearing module — bash — runs on the browser's bytecode engine.)
-                (temen_ir::CAP_SELF_TYPE_ID, 14) if args.len() >= 5 => Op::ExecModule {
+                (temen_ir::CAP_SELF_TYPE_ID, 14) => Op::ExecModule {
                     module: g(args[0]),
                     grants_ptr: g(args[1]),
                     grants_n: g(args[2]),
@@ -3069,9 +3051,6 @@ fn compile_inst(
                     size_log2: g(args[4]),
                     dst,
                 },
-                // A malformed `exec_module` (< 5 args) is outside the ABI — decline the module so it
-                // folds to the tree-walker rather than mis-lowering.
-                (temen_ir::CAP_SELF_TYPE_ID, 14) => return None,
                 // Generic synchronous powerbox dispatch (Stream/Clock/Memory/host-fn/JIT compile/…).
                 _ => Op::CapCall {
                     type_id: *type_id,
@@ -10739,19 +10718,17 @@ enum Outcome {
     /// twin. Driver-side (it owns the task/env set + the parked caller). `reply_orig` = `Some` in the
     /// explicit two-reply form, `None` in pid mode (the parent gets the twin's task id). The driver
     /// reads the handler's `serve_ticket` to name the caller; the twin handle (or an errno) lands at
-    /// `dst` when `has_result`.
+    /// `dst`.
     CloneCaller {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` (`execve` image-replace, #1080): the running vCPU asks the driver
     /// to replace its image with command module `mh`, granting the by-name cap list at `(grants_ptr,
@@ -12455,14 +12432,12 @@ enum VcpuStop {
         reply_orig: Option<i64>,
         reply_twin: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §9.2 — `reap`: reap twin `pid` on behalf of the caller parked on this handler's
     /// dispatch ([`Outcome::Reap`]).
     Reap {
         pid: i64,
         dst: u32,
-        has_result: bool,
     },
     /// FORK.md §8.6 — `exec_module` image-replace (#1080): surfaced to the cooperative driver, which
     /// owns the task/env set + `dom.source`. Cooperative-driver-only (like [`VcpuStop::CloneCaller`]);
@@ -12825,26 +12800,14 @@ fn step_vcpu(
                 reply_orig,
                 reply_twin,
                 dst,
-                has_result,
             } => {
                 return Ok(VcpuStop::CloneCaller {
                     reply_orig,
                     reply_twin,
                     dst,
-                    has_result,
                 })
             }
-            Outcome::Reap {
-                pid,
-                dst,
-                has_result,
-            } => {
-                return Ok(VcpuStop::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                })
-            }
+            Outcome::Reap { pid, dst } => return Ok(VcpuStop::Reap { pid, dst }),
             Outcome::Exec {
                 cmd,
                 grants_ptr,
@@ -15210,7 +15173,6 @@ impl SchedCore {
                 reply_orig,
                 reply_twin,
                 dst,
-                has_result,
             }) => {
                 // FORK.md §9.2 — fork-returns-twice on the cooperative driver. Duplicate the caller
                 // parked on this handler's dispatch into a live **twin** (private window +
@@ -15331,15 +15293,9 @@ impl SchedCore {
                     tasks[caller_ti].state = TaskState::Runnable;
                     twin_ti as i64
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
-            Ok(VcpuStop::Reap {
-                pid,
-                dst,
-                has_result,
-            }) => {
+            Ok(VcpuStop::Reap { pid, dst }) => {
                 // FORK.md §9.2 — the servicer side of `wait(pid)`. Reap fork twin `pid` on behalf of
                 // the caller parked on this handler's dispatch: deliver the twin's exit status now (if
                 // it finished) or park the caller until it does. `-ECHILD` for a pid this run did not
@@ -15394,9 +15350,7 @@ impl SchedCore {
                         0
                     }
                 };
-                if has_result {
-                    tasks[ti].deliver(dst, Reg::from_i64(result));
-                }
+                tasks[ti].deliver(dst, Reg::from_i64(result));
             }
             Ok(VcpuStop::Exec {
                 cmd,
@@ -19482,6 +19436,12 @@ impl Vm {
                     for a in args.iter() {
                         argv.push(r!(*a).i64());
                     }
+                    // #2361 — the call defines every result it declares: whatever lands below (the
+                    // host's results, an errno, a parked call's delivery) lands over zeros, as the
+                    // oracle and the Cranelift JIT define them.
+                    for i in 0..results.len() {
+                        self.regs[base + *dst as usize + i] = Reg::default();
+                    }
                     // #1904 — the oracle's stop see-through (#1672): a stopped domain runs under a
                     // landing freeze only to reach its next freeze point, so nothing may leave it on the
                     // way — a host call is abandoned rather than performed, for the thaw to re-issue.
@@ -19489,9 +19449,6 @@ impl Vm {
                     if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped())
                         && self.abandon_for_freeze(mem, host)
                     {
-                        for i in 0..results.len() {
-                            self.regs[base + *dst as usize + i] = Reg::default();
-                        }
                         pc += 1;
                         continue;
                     }
@@ -19503,9 +19460,7 @@ impl Vm {
                         let mut sole = mem.as_mut().map(super::SoleMem);
                         let gm = sole.as_mut().map(|m| m as &mut dyn GuestMem);
                         let r = host.with(|p| p.mint_pipe(fds, gm));
-                        if !results.is_empty() {
-                            self.regs[base + *dst as usize] = Reg::from_i64(r);
-                        }
+                        self.regs[base + *dst as usize] = Reg::from_i64(r);
                         pc += 1;
                         continue;
                     }
@@ -19523,8 +19478,16 @@ impl Vm {
                                 && b.type_id == super::cap_id::JIT
                                 && matches!(b.op, 1 | 3 | 4)
                             {
-                                if argv.is_empty() {
-                                    return Err(Trap::CapFault); // invoke/install/uninstall need arg0
+                                // invoke needs its code handle in arg0; install and uninstall are
+                                // held to their contract, as on the oracle (#2361).
+                                let sig = temen_ir::FuncType {
+                                    params: params.to_vec(),
+                                    results: results.to_vec(),
+                                };
+                                if argv.is_empty()
+                                    || !temen_ir::served_shape_ok(b.type_id, b.op, &sig)
+                                {
+                                    return Err(Trap::CapFault);
                                 }
                                 self.module = module;
                                 self.cur = cur;
@@ -20077,11 +20040,7 @@ impl Vm {
                         grant,
                     });
                 }
-                Op::CloneCaller {
-                    args,
-                    dst,
-                    has_result,
-                } => {
+                Op::CloneCaller { args, dst } => {
                     // Arity picks the mode (mirrors the oracle, `temen-interp` clone_caller arm):
                     // 2 args = explicit `(reply_orig, reply_twin)`; 0/1 args = pid mode
                     // (`reply_orig = None` → the parent gets the twin's task id).
@@ -20092,7 +20051,6 @@ impl Vm {
                         (None, twin)
                     };
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
@@ -20101,27 +20059,17 @@ impl Vm {
                         reply_orig,
                         reply_twin,
                         dst,
-                        has_result,
                     });
                 }
-                Op::Reap {
-                    pid,
-                    dst,
-                    has_result,
-                } => {
+                Op::Reap { pid, dst } => {
                     // The pid to reap (an out-of-range default → the driver answers -ECHILD).
                     let pid = pid.map(|p| r!(p).i64()).unwrap_or(-1);
                     let dst = *dst;
-                    let has_result = *has_result;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::Reap {
-                        pid,
-                        dst,
-                        has_result,
-                    });
+                    return Ok(Outcome::Reap { pid, dst });
                 }
                 // FORK.md §8.6 — `exec_module` (#1080): resolve the five register operands and surface
                 // the image-replace to the driver. The cursor is saved (pc+1) so a *refused* exec

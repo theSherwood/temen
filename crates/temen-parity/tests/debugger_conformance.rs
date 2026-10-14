@@ -82,7 +82,7 @@ fn drive(
     // For the Instantiator the shared contract says which calls match their op's arm (#2066); the
     // probe declares the contract's results, so its arity decides.
     let matched = iface == temen_ir::cap_id::INSTANTIATOR
-        && temen_ir::instantiator_contract(op).is_some_and(|(args, _)| argc >= args.len());
+        && temen_ir::served_contract(iface, op).is_some_and(|(args, _)| argc >= args.len());
     match run.run_until_stop(&mut fuel) {
         SchedStop::Declined => Some(Verdict::Declined),
         // A cap fault is the harness miscalling, not an answer: the signature did not match any
