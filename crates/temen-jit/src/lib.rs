@@ -1951,6 +1951,9 @@ pub struct CapturedSeed {
     pub funcs: Arc<[Func]>,
     pub types: Arc<[temen_ir::TypeEntry]>,
     pub shadow: temen_ir::durable_abi::ShadowArena,
+    /// temen#2168 — that digest, which names its code to the run's [`ChildCodeCache`], as a
+    /// spawn's grant does.
+    pub digest: [u8; 32],
     /// Its restored window image.
     pub image: Vec<u8>,
     /// Its restored page map, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733).
