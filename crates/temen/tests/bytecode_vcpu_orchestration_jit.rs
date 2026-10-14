@@ -297,7 +297,6 @@ fn drive<'s, 'e>(
             | bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::StdinPark
             | bytecode::VcpuEvent::CapPending { .. }
-            | bytecode::VcpuEvent::Instantiate { .. }
             | bytecode::VcpuEvent::InstantiateDetached { .. } => {
                 panic!("unexpected event in JIT orchestration kernel")
             }

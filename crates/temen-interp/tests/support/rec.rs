@@ -1,6 +1,7 @@
 //! #1867 — a v1 (detached) spawn record in a test module. [`segment`] renders one as a text `data`
-//! segment, which a module may carry after its funcs; a spawner that learns its module or `Budget`
-//! handle at run time stores it at [`MODULE_AT`] or [`BUDGET_AT`] before the spawn. Include with
+//! segment, which a module may carry after its funcs; a spawner that learns its module, `Budget` or
+//! region handle at run time stores it at [`MODULE_AT`], [`BUDGET_AT`] or [`REGION_AT`] before the
+//! spawn. Include with
 //! `#[path = "support/rec.rs"] mod rec;`.
 //!
 //! Place records above the durable control words, `[guard, guard + 32)`: the record's version word
@@ -14,6 +15,8 @@ use temen_ir::SpawnRec;
 pub const MODULE_AT: u64 = 24;
 /// Where a record's `Budget` handle sits, from the record's start.
 pub const BUDGET_AT: u64 = 28;
+/// Where a record's pre-mapped `SharedRegion` handle sits, from the record's start.
+pub const REGION_AT: u64 = 72;
 
 /// A text `data` segment holding `rec` at `at`.
 pub fn segment(at: u64, rec: &SpawnRec) -> String {

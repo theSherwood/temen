@@ -245,7 +245,7 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
                 let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
                 let st = caller.data_mut();
                 assert!(
-                    rec.detached && Some(rec.modh) == st.child && rec.entry == 0,
+                    Some(rec.modh) == st.child && rec.entry == 0,
                     "a v1 spawn of the child's image: {rec:?}"
                 );
                 st.inst_bounces += 1;

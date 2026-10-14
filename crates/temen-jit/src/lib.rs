@@ -811,8 +811,9 @@ pub fn unit_of(r: i64) -> Option<(u32, u32)> {
 /// A §14 **granted child** powerbox built host-side (PROCESS.md S2 JIT parity): an opaque child
 /// `Host` (`ctx`) holding an `Instantiator` + `AddressSpace` over the child's own window and the
 /// parent's re-granted coordinate-free capability, plus the three entry-arg handles the child
-/// receives (`Instantiator`, `AddressSpace`, grant). Filled by a [`GrantChildBuilder`]; `ctx` is
-/// owned by the caller and must be freed with the paired [`GrantChildReleaser`] after the child runs.
+/// receives (`Instantiator`, `AddressSpace`, grant). Filled by a [`GrantDetachedChildBuilder`];
+/// `ctx` is owned by the caller and must be freed with the paired [`GrantChildReleaser`] after the
+/// child runs.
 #[repr(C)]
 pub struct GrantChild {
     pub ctx: *mut core::ffi::c_void,
@@ -838,64 +839,30 @@ pub struct GrantChild {
     /// the child domain's id and lane cap (`-1` = unbounded), and its parent's. The child-domain
     /// executor gates each task's dispatch on every bounded cap along this chain
     /// (`temen_ir::lanes`), so a task runs only while its own lane *and* every enclosing one has
-    /// room — the oracle's `lane_chain`, arriving on this backend. Zero/`-1` from a builder that
-    /// does not carry lanes (every path but `build_detached`).
+    /// room — the oracle's `lane_chain`, arriving on this backend.
     pub domain: u64,
     pub lane_cap: i64,
     pub parent_domain: u64,
     pub parent_lane_cap: i64,
 }
 
-/// The host callback the §14 nesting runtime uses for **`instantiate_granted`** (Instantiator op 8):
-/// re-grant one of the parent's own coordinate-free capabilities (`Stream`/`Exit`/`Clock`, named by
-/// `grant_handle`) into a **fresh child powerbox** confined to `[0, child_size)`, so a JIT child can
-/// do I/O instead of being born destitute. Returns nonzero and fills `out` on success, `0` for a
-/// forged / non-copyable handle (an inert `CapFault`). Like [`ModuleResolver`], it is a *separate*
-/// callback from [`CapThunk`]: it yields a host pointer (the child `Host`), which must never be
-/// reachable from a guest-issued `call.cap`.
-///
-/// # Safety
-/// `ctx` is the run's `cap_ctx` (the parent `Host`); `out` points at a writable [`GrantChild`]. The
-/// filled `ctx` must stay valid until released with the paired [`GrantChildReleaser`].
-pub type GrantChildBuilder = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    grant_handle: i32,
-    child_size: u64,
-    out: *mut GrantChild,
-) -> i32;
-
-/// The host callback for **`instantiate_named`** (Instantiator op 11): the multi-cap, by-name analog
-/// of [`GrantChildBuilder`]. Reads `grants_n` 16-byte records `{name_off, name_len, handle, flags}` at
-/// window-relative `grants_ptr` (bounded to `[0, mem_size)`), re-grants each record's copyable handle
-/// into a fresh child powerbox **under its name** (the child finds them by `self.resolve`), and
-/// fills `out` (`grant_handle` unused). Returns nonzero on success; `0` with `*trap_out` set to a
-/// `MemoryFault` (out-of-window record/name) or `CapFault` (non-UTF-8 name / forged / non-copyable
-/// handle) — the whole spawn fails closed, matching the interpreter's op-11 path.
+/// The host callback for **`instantiate_detached`** (Instantiator op 15) and a record (op 17): build a
+/// fresh child powerbox from `grants_n` 16-byte records `{name_off, name_len, handle, flags}` at
+/// window-relative `grants_ptr` (bounded to `[0, mem_size)`), re-granting each record's copyable
+/// handle **under its name** (the child finds them by `self.resolve`), plus what the admission
+/// ([`BudgetMemTaker`]) just did: the `(budget, bytes, runs)`
+/// lease it charged for the child's window, whose budget becomes the child's `"budget"` and whose
+/// runs the child's window is paid for up to (#2268), and `lane`, the lane it reserved, which the
+/// child is stamped with. The thunk passes both from one spawn to the next hook, so a second vCPU's
+/// spawn between the two cannot hand this child its budget or lane (#1972). Returns nonzero and fills
+/// `out` on success; `0` with `*trap_out` set to a `MemoryFault` (out-of-window record/name) or
+/// `CapFault` (non-UTF-8 name / forged / non-copyable handle) — the whole spawn fails closed, as on
+/// the interpreter.
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`); `[mem_base, mem_base+mem_size)` is the parent's
 /// mapped window; `out`/`trap_out` are writable. The filled `ctx` is released with the
 /// [`GrantChildReleaser`] in the same [`GrantChildHooks`].
-pub type GrantNamedChildBuilder = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    mem_base: *mut u8,
-    mem_size: u64,
-    grants_ptr: u64,
-    grants_n: u64,
-    child_size: u64,
-    out: *mut GrantChild,
-    trap_out: *mut i64,
-) -> i32;
-
-/// The host callback for **`instantiate_detached`** (Instantiator op 15): [`GrantNamedChildBuilder`]'s
-/// by-name grants plus what the admission ([`BudgetMemTaker`]) just did: the `(budget, bytes, runs)`
-/// lease it charged for the child's window, whose budget becomes the child's `"budget"` and whose
-/// runs the child's window is paid for up to (#2268), and `lane`, the lane it reserved, which the
-/// child is stamped with. The thunk passes both from one spawn to the next hook, so a second vCPU's
-/// spawn between the two cannot hand this child its budget or lane (#1972).
-///
-/// # Safety
-/// As [`GrantNamedChildBuilder`].
 pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     mem_base: *mut u8,
@@ -911,8 +878,7 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     trap_out: *mut i64,
 ) -> i32;
 
-/// Free a child `Host` built by a [`GrantChildBuilder`] or [`GrantNamedChildBuilder`] — called once,
-/// after the granted child has run and its outcome is stashed for `join`. Deliberately paired with the
+/// Free a child `Host` built by a [`GrantDetachedChildBuilder`] — called once, after the child has run and its outcome is stashed for `join`. Deliberately paired with the
 /// builder (rather than, say, leaking the host for the run's lifetime like a `Module` grant) because a
 /// shell respawning applets would otherwise accumulate one child `Host` per spawn.
 ///
@@ -920,41 +886,10 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
 /// `ctx` is a [`GrantChild::ctx`] a builder returned and that has not yet been released.
 pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 
-/// The host callbacks a granted §14 child needs — build its powerbox (positional [`GrantChildBuilder`]
-/// for op 8, or by-name [`GrantNamedChildBuilder`] for op 11), then free it after the run. Threaded
-/// through the compile pipeline next to [`ModuleResolver`]; `None` ⇒ `instantiate_granted` (op 8) and
-/// `instantiate_named` (op 11) are inert `CapFault`s (a host that re-grants nothing), exactly as a
-/// missing module resolver makes the module ops a `CapFault`.
-/// §3c.2 — one Budget read/consume for the record spawn (op 17), host-side. `mode` 0 = **peek**
-/// (validate: resolve the handle, check `child_size` against the mem quota, report fuel/spawn —
-/// budget untouched); `mode` 1 = **drain** (consume to zero at spawn commit). Returns 1 = ok
-/// (`out` filled), 2 = refused (mem over a bounded quota — the spawn is a probeable `-EINVAL`,
-/// budget intact), 0 = `CapFault` set in `*trap_out` (dangling/mistyped handle). Mirrors the
-/// interpreter's peek-then-drain discipline at its op-17 arm.
-///
-/// # Safety
-/// `ctx` is the run's parent-`Host` pointer (the cap thunk's ctx); `out`/`trap_out` writable.
 /// #1810 — the embedder's report of how far a guest grew its window at `base` through the Memory
 /// capability: one past its highest page (`0` for none). The host keeps that page map; the JIT does
 /// not. `ctx` is the pointer the hook was installed with ([`CompiledModule::set_high_water`]).
 pub type HighWater = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, base: usize) -> u64;
-
-pub type BudgetTaker = unsafe extern "C" fn(
-    ctx: *mut core::ffi::c_void,
-    handle: i32,
-    child_size: u64,
-    mode: i32,
-    out: *mut BudgetTaken,
-    trap_out: *mut i64,
-) -> i32;
-
-/// §3c.2 — the Budget fields a record spawn consumes: `fuel` / `spawn` with the Budget object's
-/// `-1` = unbounded convention (`mem` is enforced inside the taker against `child_size`).
-#[repr(C)]
-pub struct BudgetTaken {
-    pub fuel: i64,
-    pub spawn: i64,
-}
 
 /// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
 /// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
@@ -1014,7 +949,7 @@ pub type PremapAdmit = unsafe extern "C" fn(
 /// `Host::stage_premap`. Nonzero on success.
 ///
 /// # Safety
-/// `ctx` is the parent host; `child_ctx` a child powerbox from a [`GrantNamedChildBuilder`].
+/// `ctx` is the parent host; `child_ctx` a child powerbox from a [`GrantDetachedChildBuilder`].
 pub type PremapStage = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,
@@ -1052,12 +987,10 @@ pub type ChildBudgetNode =
 
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
-    pub build: GrantChildBuilder,
-    pub build_named: GrantNamedChildBuilder,
-    /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list as
-    /// `build_named`, but the child attests `window_exposed = false`, its starter caps span
-    /// `child_size` = the window **reservation** (a root's shape — no carve bounds it), and the
-    /// budget that paid for its window is its own (see [`GrantDetachedChildBuilder`]).
+    /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list, the
+    /// child attesting `window_exposed = false`, its starter caps spanning `child_size` = the window
+    /// **reservation** (a root's shape), and the budget that paid for its window its own (see
+    /// [`GrantDetachedChildBuilder`]).
     pub build_detached: GrantDetachedChildBuilder,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
@@ -1115,10 +1048,9 @@ pub struct GrantChildHooks {
     /// Null is legal only when the hooks are never invoked.
     pub parent_ctx: *mut core::ffi::c_void,
     /// D66 — the parent domain's `(id, lane cap)`, read off the parent host when this family is
-    /// built (the same call that chooses the pointer above). A **carve** child (ops 0/5/8/11/13)
-    /// runs in its parent's lane — it has no lane of its own to be granted — so the executor gates
-    /// it on this alone; a detached child's `GrantChild` carries the same pair plus its own lane.
-    /// `-1` = unbounded.
+    /// built (the same call that chooses the pointer above): the run's own lane, which its domain's
+    /// vCPUs and its children's tasks draw on ([`CompiledModule::set_grant_child_hooks`]). `-1` =
+    /// unbounded.
     pub parent_domain: u64,
     pub parent_lane_cap: i64,
     /// #1956 — the [`ModuleResolver`] for `parent_ctx`'s shape: what a detached child's spawns
@@ -2602,15 +2534,12 @@ block 0 () {
     #[test]
     fn a_module_that_spawns_keeps_its_program() {
         let text = "memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  return v7
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 17408
+  v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
+  v3 = call.cap 6 1 (i32) -> (i64) v0 (v2)
+  return v3
   }
 }
 func () -> () {
@@ -2935,9 +2864,8 @@ pub struct CompiledModule {
     /// `None` ⇒ no run in flight (invoke is rejected).
     live_fault_range: Option<(usize, usize)>,
     /// #1296 — a §14 **child** module: its window is minted and owned by the nursery's spawn, never by
-    /// this module, so `live_fault_range` is never recorded (one plain child module runs in several
-    /// windows at once — the compile cache) and `invoke_extra` derives the range from the `mem_base`
-    /// the thunk was handed. `false` for a root, whose `run_code_raw` records its own window.
+    /// this module, so `live_fault_range` is never recorded and `invoke_extra` derives the range
+    /// from the `mem_base` the thunk was handed. `false` for a root, whose `run_code_raw` records its own window.
     caller_window: bool,
     /// The source backtrace of the most recent [`Self::run`] that **trapped** (§5 W3 Stage 1):
     /// innermost guest frame first, symbolized from the trap site the guard handler captured.
@@ -3648,7 +3576,6 @@ impl CompiledModule {
                 cap_ctx,
                 resolve_module,
                 epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
-                fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
                 // The run's thread `Domain` (always stood up for a nesting module, above): children
                 // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
                 // the parent rendezvous in one table.
@@ -3656,7 +3583,6 @@ impl CompiledModule {
                     .as_ref()
                     .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
                     .unwrap_or(0),
-                0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
                 std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
                 // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
@@ -3666,18 +3592,11 @@ impl CompiledModule {
                     .flat_map(|e| e.ops.iter().copied())
                     .collect::<Vec<u32>>()
                     .into_boxed_slice(),
-                shadow,
                 None, // the run's own child executor
             )))
         } else {
             None
         };
-        // #964: a marked module's carves may not dip into the reserved NULL region (the host
-        // seeds/copies carves outside the guarded call).
-        #[cfg(fiber_rt)]
-        if let Some(n) = &nursery {
-            n.set_null_guard(temen_ir::module_null_guard());
-        }
         #[cfg(fiber_rt)]
         let inst = nursery.as_deref().map_or(InstEnv::null(), InstEnv::over);
         #[cfg(not(fiber_rt))]
@@ -4531,19 +4450,6 @@ impl CompiledModule {
     /// window.
     pub fn set_restore_prots(&mut self, prots: Vec<WindowProt>) {
         self.restore_prots = prots;
-    }
-
-    /// §3c.2 — install the [`BudgetTaker`] the record spawn (op 17) consumes a Budget through.
-    /// `None` (or never calling this) leaves budget-funded records the probeable `-EINVAL` of
-    /// §3c (the interpreter-first gap). Separate from [`Self::set_grant_child_hooks`] so the
-    /// many existing hook constructors stay source-compatible.
-    pub fn set_budget_taker(&self, taker: Option<BudgetTaker>) {
-        #[cfg(fiber_rt)]
-        if let Some(n) = &self._nursery {
-            n.set_budget_take(taker.map_or(0, |t| t as usize));
-        }
-        #[cfg(not(fiber_rt))]
-        let _ = taker;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
@@ -5413,8 +5319,6 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         let inst = if self.inst.is_active() && funcs_use_instantiator(funcs) {
             let prog = Box::new(instantiator_rt::UnitProg {
-                funcs: funcs.into(),
-                types: types.into(),
                 unit: unit_ref(unit),
             });
             let self_prog = &*prog as *const instantiator_rt::UnitProg as i64;
@@ -5929,14 +5833,11 @@ pub(crate) unsafe fn compile_child_and_run(
                 &*child_win_size as *const u64 as *mut core::ffi::c_void,
                 None, // same-module grandchildren only (separate-module is a later slice)
                 epoch_addr,
-                fuel_addr, // §5 parent-fuel: a grandchild clamps its budget against this child's remaining
-                0,       // durable subtree: no shared futex domain (child futex ops stay rejected)
-                my_task, // this child's subtree task id (a grandchild it records gets `parent_task = my_task`)
+                0, // durable subtree: no shared futex domain (child futex ops stay rejected)
                 std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
                 std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
                 Box::new([]), // durable grandchildren are not offer targets (a later slice)
-                child_shadow,
-                None, // an executor of its own, with no domain: it files no task
+                None,         // an executor of its own, with no domain: it files no task
             ));
             n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
             n.set_freeze(freeze.clone());
@@ -6237,8 +6138,7 @@ pub unsafe fn handler_tramp_of(
 // `!Send`/`!Sync` only because of its raw code pointers; once `finalize_definitions` has run (before
 // a child is ever stored) the code arena and `fn_table` are read-execute memory the entry trampoline
 // reads and jumps into, never writes. So handing an `Arc<CompiledModule>` to a spawned child thread
-// and running the same **plain** child concurrently on N threads (the nursery's per-carve cache) is
-// sound: every thread only reads the same finalized bytes, and the single `OwnedJit` frees the arena
+// and running the same **plain** child concurrently on N threads is sound: every thread only reads the same finalized bytes, and the single `OwnedJit` frees the arena
 // once when the last `Arc` drops (after `join_children`, so no thread still runs the code). The one
 // mutable path — `define_extra`/`install` behind a re-granted `Jit` capability (#1296) — is reached
 // only through a **granted** child, which is compiled per spawn (never cached) and owned by exactly
@@ -6729,12 +6629,11 @@ fn compile_child_windowed(
             )
         })
         .collect();
-    // PROCESS.md S1: a child module was actually JIT-compiled (as opposed to served from the
-    // per-carve cache). Counting successful compiles is what lets a test prove the cache hits.
+    // PROCESS.md S1: a child module was actually JIT-compiled. Counting successful compiles is what
+    // lets a test prove a child ran compiled.
     CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
     Ok(CompiledModule {
-        // A §14 child's code is shared its own way — the nursery's per-carve cache — never through
-        // `share`.
+        // A §14 child's code is never shared through `share`: each spawn compiles its own.
         needs_runtime: true,
         fn_table,
         tramp_code: code,
@@ -6815,10 +6714,9 @@ fn compile_child_windowed(
     })
 }
 
-/// PROCESS.md S1: process-wide count of §14 child modules JIT-compiled. `instantiator_rt`'s
-/// per-carve compile cache serves repeat spawns of the same `(module, entry, size)` from one
-/// compilation — so a shell spawning the same applet N times compiles it once. Monotone; the
-/// public [`child_compiles`] reads it (a real metric, and the cache-hit test's observable).
+/// PROCESS.md S1: process-wide count of §14 child modules JIT-compiled — one per spawn, since the
+/// per-carve compile cache went with the carve spawn (#1867). Monotone; the public
+/// [`child_compiles`] reads it (a real metric, and the tests' proof that a child ran compiled).
 #[cfg(fiber_rt)]
 pub(crate) static CHILD_COMPILES: AtomicU64 = AtomicU64::new(0);
 
@@ -6834,8 +6732,7 @@ pub fn module_compiles() -> u64 {
 }
 
 /// PROCESS.md S1: how many §14 child modules this process has JIT-compiled (0 where nesting is
-/// unsupported — no child ever compiles). A repeat spawn of a cached `(module, entry, size)` does
-/// **not** advance this; the metric is the compile-cache's observable.
+/// unsupported — no child ever compiles): one per spawn.
 pub fn child_compiles() -> u64 {
     #[cfg(fiber_rt)]
     {
@@ -6845,46 +6742,6 @@ pub fn child_compiles() -> u64 {
     {
         0
     }
-}
-
-/// PROCESS.md S1: compile a **non-durable** §14 child — the cacheable case. Its powerbox is empty
-/// (an inert `call.cap` → `CapFault`) and it has no nesting `InstEnv`, so the compiled code depends
-/// only on `(funcs, entry, size_log2, epoch_addr)` — nothing per-spawn — which is what makes it
-/// safe to cache and reuse across carves (the base is a runtime arg to [`run_child_code`], not
-/// baked). The durable / nesting child keeps the per-call [`compile_child_and_run`] path (its baked
-/// per-child nursery makes its code un-shareable).
-#[cfg(fiber_rt)]
-#[allow(clippy::too_many_arguments)] // the per-spawn child parameters, as `compile_child`
-pub(crate) fn compile_nondurable_child(
-    funcs: &[Func],
-    // #922 — the child module's type section, threaded to `compile_child`.
-    types: &[temen_ir::TypeEntry],
-    child_entry: FuncIdx,
-    child_size_log2: u8,
-    epoch_addr: usize,
-    // This child's own counted-fuel cell (`0` ⇒ un-metered). Baked, so a fuel-armed run must not reuse
-    // this module across spawns — the caller (`instantiate`) skips the cache when this is nonzero.
-    fuel_addr: usize,
-    futex_sched: usize,
-    // The child module's declared shadow arena.
-    shadow: temen_ir::durable_abi::ShadowArena,
-) -> Result<CompiledModule, JitError> {
-    compile_child(
-        funcs,
-        types,
-        child_entry,
-        child_size_log2,
-        empty_cap_thunk,
-        core::ptr::null_mut(),
-        epoch_addr,
-        fuel_addr,
-        futex_sched,
-        InstEnv::null(),
-        &[], // a plain (ungranted) child is never an offer target — no serve trampolines
-        0,   // an empty powerbox holds no `Jit` — the natural table,
-        shadow,
-        ChildRun::Task, // a plain child runs as an executor task (#1469)
-    )
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
@@ -7261,7 +7118,6 @@ impl ThreadEnv {
 #[derive(Clone, Copy)]
 struct InstEnv {
     nursery_addr: i64,
-    instantiate_thunk: i64,
     join_thunk: i64,
     // op 18 (`wait`): join's park, answering how the child ended.
     wait_thunk: i64,
@@ -7269,13 +7125,7 @@ struct InstEnv {
     poll_thunk: i64,
     detach_thunk: i64,
     kill_thunk: i64,
-    // PROCESS.md S2 grant thunks — parity with the interpreter's re-grant of caps into a child's
-    // powerbox: op 8 (`instantiate_granted`, single positional cap) and op 11 (`instantiate_named`,
-    // multi-cap by name).
-    // STAGE1.md — op 13 (`instantiate_module_named`): run a separate `Module` *and* re-grant caps by
-    // name (the shell "exec" primitive — union of op 5 + op 11).
-    instantiate_module_named_thunk: i64,
-    // §3c — the config-record spawn (op 17): parse + delegate to the shapes above.
+    // §3c — the config-record spawn (op 17): parse + delegate to op 15's thunk.
     instantiate_rec_thunk: i64,
     // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
     // child's nursery-retained shared powerbox.
@@ -7296,13 +7146,11 @@ impl InstEnv {
     fn null() -> InstEnv {
         InstEnv {
             nursery_addr: 0,
-            instantiate_thunk: 0,
             join_thunk: 0,
             wait_thunk: 0,
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
-            instantiate_module_named_thunk: 0,
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
             child_grant_thunk: 0,
@@ -7315,15 +7163,12 @@ impl InstEnv {
     fn over(n: &instantiator_rt::Nursery) -> InstEnv {
         InstEnv {
             nursery_addr: (n as *const instantiator_rt::Nursery) as i64,
-            instantiate_thunk: instantiator_rt::instantiate as *const () as i64,
             join_thunk: instantiator_rt::join as *const () as i64,
             wait_thunk: instantiator_rt::wait as *const () as i64,
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
             instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
-            instantiate_module_named_thunk: instantiator_rt::instantiate_module_named as *const ()
-                as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
             child_grant_thunk: instantiator_rt::child_grant as *const () as i64,
             instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
@@ -10294,10 +10139,6 @@ fn lower_instantiator(
     // prefix are tolerated exactly like the interpreter (it never indexes past the op's arity).
     use ValType::{I32 as VI32, I64 as VI64};
     let contract: Option<(&[ValType], &[ValType])> = match op {
-        // instantiate: (entry, off, size_log2, fuel)
-        0 => Some((&[VI64, VI64, VI64, VI64], &[VI32])),
-        // instantiate_module: a leading `Module` handle (i64 slot), then the same four
-        5 => Some((&[VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // join(child) -> result; wait(child) -> 0 | trap code
         1 | 18 => Some((&[VI32], &[VI64])),
         // S3 lifecycle: poll / detach / kill (child) -> i32 status
@@ -10305,9 +10146,6 @@ fn lower_instantiator(
         // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn (§3d: the
         // scalar granted/named spawns, ops 8/11, died into it — grants are record data now)
         17 => Some((&[VI64], &[VI32])),
-        // STAGE1 instantiate_module_named: (module, grants_ptr, grants_n, entry, off, size_log2,
-        // quota) -> child handle — op 5's leading `Module` handle then op 11's grant list + carve args.
-        13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL); #2220
         // grant: (child, handle) -> the child's handle (probeable -EINVAL / -EMFILE).
         14 | 19 => Some((&[VI32, VI64], &[VI32])),
@@ -10315,13 +10153,15 @@ fn lower_instantiator(
         // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
         // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
         15 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
+        // Every other op — the retired carve spawns (ops 0, 5 and 13, #1867) and the deleted ones —
+        // is the oracle's `CapFault`.
         _ => None,
     };
     // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
     // coerces each result to the *declared* sig type): a call is admitted when its arg count covers
     // the op's contract prefix and every prefix arg + every result is a scalar int — i32 **or** i64.
     // The exact-width `== *need` / `== res` was too strict: a chibicc guest widens all scalars to i64
-    // (`int __spawn(...)` → `… -> (i64)`), so op 13's i32-result contract (and op 1/9/10/12's i32
+    // (`int __spawn(...)` → `… -> (i64)`), so a spawn's i32-result contract (and op 1/9/10/12's i32
     // child arg) never matched, and every compiled-C driver of the Instantiator fell to a CapFault
     // that the interpreter never raised. The per-arg coercions below (`slot_i64`/`slot_i32`/
     // `result_as`) reconcile the declared widths with each thunk's fixed ABI, so relaxing the gate
@@ -10351,43 +10191,6 @@ fn lower_instantiator(
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.vmctx_var);
     match op {
-        0 | 5 => {
-            // instantiate(nursery, mem_base, handle:i32, module:i64, entry:i64, off:i64,
-            //             size_log2:i64, fuel:i64, trap_out:i64) -> child_handle:i32. op 0 is a
-            // **self** child (module = -1); op 5 (`instantiate_module`, §14 separate-module child)
-            // passes a host-granted `Module` handle as its first arg and shifts the rest by one.
-            let h0 = get(vals, handle)?; // the Instantiator handle (resolved for authority)
-            let h = slot_i32(b, h0);
-            let (modh, a0) = if op == 5 {
-                (
-                    slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?),
-                    1,
-                )
-            } else {
-                (b.ins().iconst(I64, -1), 0)
-            };
-            let entry = slot_i64(b, get(vals, *args.get(a0).ok_or(JitError::Malformed)?)?);
-            let off = slot_i64(b, get(vals, *args.get(a0 + 1).ok_or(JitError::Malformed)?)?);
-            let size_log2 = slot_i64(b, get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?);
-            let fuel = slot_i64(b, get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.instantiate_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery, self_prog, mem_base, h, modh, entry, off, size_log2, fuel, trap_out,
-                ],
-            );
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
         1 | 18 => {
             // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
             // The nursery owns the child table for this run; the thunk still resolves the call.cap's
@@ -10440,10 +10243,9 @@ fn lower_instantiator(
         17 => {
             // §3c instantiate_rec(nursery, mem_base, mem_size:i64, handle:i32, record_ptr:i64,
             //   trap_out:i64) -> handle:i32 — the config-record spawn: the thunk parses the
-            //   56-byte record from the window (`mem_size` bounds the read) and delegates to
-            //   the op-0/5/11/13 bodies. Pager records CapFault (sound: modules with impl
-            //   exports fold to the oracle); budget records are the §3c.2 parity follow-up
-            //   (probeable -EINVAL, the durable-nesting precedent).
+            //   record from the window (`mem_size` bounds the read) and delegates to op 15's
+            //   thunk. Pager records CapFault (sound: modules with impl exports fold to the
+            //   oracle).
             //
             // #826: the bound is the **reserved** mask domain, not the compile-time `mapped` — a
             // record in a legitimately `map`-grown tail page must be read where the interpreter's
@@ -10501,47 +10303,6 @@ fn lower_instantiator(
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
-        13 => {
-            // STAGE1 instantiate_module_named(nursery, mem_base, mem_size, handle:i32, module:i64,
-            //   grants_ptr:i64, grants_n:i64, entry:i64, off:i64, size_log2:i64, fuel:i64,
-            //   trap_out:i64) -> handle:i32. Op 5's leading `Module` handle then op 11's grant-list
-            // args — runs a foreign module with a by-name granted powerbox (the shell "exec").
-            //
-            // #826: reserved-bounded grant-list reads, like op 17 above — a grant record in a
-            // grown tail page is admitted; an uncommitted page faults through the guard.
-            let h = slot_i32(b, get(vals, handle)?);
-            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
-            let mem_size = b.ins().iconst(I64, win_reserved as i64);
-            let modh = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let grants_ptr = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
-            let grants_n = slot_i64(b, get(vals, *args.get(2).ok_or(JitError::Malformed)?)?);
-            let entry = slot_i64(b, get(vals, *args.get(3).ok_or(JitError::Malformed)?)?);
-            let off = slot_i64(b, get(vals, *args.get(4).ok_or(JitError::Malformed)?)?);
-            let size_log2 = slot_i64(b, get(vals, *args.get(5).ok_or(JitError::Malformed)?)?);
-            let fuel = slot_i64(b, get(vals, *args.get(6).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [
-                I64, I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64,
-            ] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b
-                .ins()
-                .iconst(I64, lower.inst.instantiate_module_named_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
-                &[
-                    nursery, self_prog, mem_base, mem_size, h, modh, grants_ptr, grants_n, entry,
-                    off, size_log2, fuel, trap_out,
-                ],
-            );
-            emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
-        }
         15 => {
             // PROCESS.md §5 / #1287 instantiate_detached(nursery, mem_base, mem_size, handle:i32,
             //   budget:i64, module:i64, grants_ptr:i64, grants_n:i64, entry:i64, size_log2:i64,
@@ -10549,7 +10310,7 @@ fn lower_instantiator(
             // spawn: no carve — the thunk mints a root-shaped window (declared size committed, a
             // lazy reservation above it), seeds the module's data + the argv payload, and runs the
             // child there. Grant records and the payload are read from THIS window (reserved-bounded,
-            // as op 13). The 7-arg form passes `(0, 0)` for the payload — no seed. The optional
+            // as op 17's record). The 7-arg form passes `(0, 0)` for the payload — no seed. The optional
             // `(region, child_off)` (args 9–10) pre-maps a `SharedRegion` into the child's window
             // (`premap_region:i64, premap_off:i64` before `trap_out`; `-1` ⇒ none).
             let h = slot_i32(b, get(vals, handle)?);

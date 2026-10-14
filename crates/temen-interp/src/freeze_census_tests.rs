@@ -1,7 +1,7 @@
-//! #1671 — [`freeze_census`] cause by cause, over seats built by hand: the causes a guest program can
-//! reach cheaply are pinned end to end in `tests/freeze_declined.rs`; these are the rest, whose
-//! reaching shapes (a parked serve handler, a detached child minted without a doorbell, a §13-mapped
-//! detached window, a child holding a `Blocking`) are each a setup of their own.
+//! #1671 — [`freeze_census`] cause by cause, over seats built by hand. The causes a guest program
+//! reached cheaply were a nested child's, pinned end to end until the carve spawn went (#1867); the
+//! rest have reaching shapes (a parked serve handler, a detached child minted without a doorbell, a
+//! §13-mapped detached window, a child holding a `Blocking`) that are each a setup of their own.
 
 use super::*;
 use std::time::Duration;

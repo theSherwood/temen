@@ -1,6 +1,6 @@
 //! #1469 — a §14 child that uses §12 fibers runs on the **Cranelift JIT**, with a fiber registry of
-//! its own, as on the tree-walk oracle. Carved (op 5) and detached (op 15) children run as executor
-//! tasks, and each task carries its own fiber runtime: the child's `cont.*` handles number from 0
+//! its own, as on the tree-walk oracle. A detached (op 15) child runs as an executor task, and each
+//! task carries its own fiber runtime: the child's `cont.*` handles number from 0
 //! and never reach the parent's fibers. The parent parks a fiber of its own across the spawn, so a
 //! registry shared across domains shows up as a different result (the programs are
 //! `temen`'s `bytecode_spawn_fibers.rs`, the bytecode engine's half of the same guarantee).
@@ -57,12 +57,7 @@ block 0 (vs: i64) {{
 
 /// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns and
 /// joins the child, resumes the fiber to its return. Result: child status × 1000 + 11 + 25.
-fn parent_src(detached: bool) -> String {
-    let spawn = if detached {
-        "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
-    } else {
-        "ch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, gz, off, sl, gz)"
-    };
+fn parent_src() -> String {
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -75,9 +70,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  off = i64.const 4194304
   sl = i64.const {CHILD_LOG2}
-  {spawn}
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
   vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
@@ -160,30 +154,16 @@ fn parity(parent: &str, child: &str) -> Result<i64, String> {
 }
 
 #[test]
-fn a_carved_child_has_its_own_fiber_registry_on_the_jit() {
-    assert_eq!(
-        parity(&parent_src(false), &child_src()),
-        Ok(10 * 1000 + 11 + 25),
-        "the child's first fiber is its handle 0"
-    );
-}
-
-#[test]
 fn a_detached_child_has_its_own_fiber_registry_on_the_jit() {
     assert_eq!(
-        parity(&parent_src(true), &child_src()),
+        parity(&parent_src(), &child_src()),
         Ok(10 * 1000 + 11 + 25),
         "the child's first fiber is its handle 0"
     );
 }
 
 /// A parent with no fibers of its own: spawns the child, returns its join status.
-fn spawner_src(detached: bool) -> String {
-    let spawn = if detached {
-        "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
-    } else {
-        "ch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, gz, off, sl, gz)"
-    };
+fn spawner_src() -> String {
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -191,9 +171,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  off = i64.const 4194304
   sl = i64.const {CHILD_LOG2}
-  {spawn}
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
   vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
   return vr
   }}
@@ -215,13 +194,8 @@ block 0 (vs: i64) {{
   }}
 }}"
     );
-    for detached in [false, true] {
-        let got = parity(&spawner_src(detached), &child);
-        assert!(
-            got != Ok(7),
-            "detached {detached}: the suspend did not fault"
-        );
-    }
+    let got = parity(&spawner_src(), &child);
+    assert!(got != Ok(7), "the suspend did not fault");
 }
 
 /// The child's fiber waits on a window word with a 1 ms timeout. Its `cont.resume` reports
@@ -272,14 +246,12 @@ block 0 (vsp: i64, varg: i64) {{
 
 #[test]
 fn a_childs_fiber_parks_on_a_timed_wait() {
-    for detached in [false, true] {
-        for block in [false, true] {
-            assert_eq!(
-                parity(&spawner_src(detached), &waiting_child(block)),
-                Ok(9),
-                "detached {detached}, block {block}"
-            );
-        }
+    for block in [false, true] {
+        assert_eq!(
+            parity(&spawner_src(), &waiting_child(block)),
+            Ok(9),
+            "block {block}"
+        );
     }
 }
 
@@ -328,11 +300,8 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}"
     );
-    for detached in [false, true] {
-        assert_eq!(
-            parity(&spawner_src(detached), &child),
-            Ok(2 << 40 | 0x7ab0 << 20 | 0x7ab8),
-            "detached {detached}"
-        );
-    }
+    assert_eq!(
+        parity(&spawner_src(), &child),
+        Ok(2 << 40 | 0x7ab0 << 20 | 0x7ab8)
+    );
 }

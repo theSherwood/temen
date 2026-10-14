@@ -181,7 +181,8 @@ property, so in practice:
   native driver; the wasm-Worker shared-`Host` and order-sensitive-cap demos are follow-ons.)
 - [x] **4c-domain — §14 `instantiate` / §22 JIT install in parallel** *(fully landed: §22 A/B/C1/C2
   and §14 A/B/C/D — every domain-mutating op now runs on every driver: cooperative, native parallel,
-  resumable/orchestrated, and across real Web Workers in the browser)*. These mutate the `Domain` (`&mut`), which the parallel driver
+  resumable/orchestrated, and across real Web Workers in the browser; the carve spawns §14-A/B
+  brought there, ops 0 and 5, are since retired and trap `CapFault` on every driver, #1867)*. These mutate the `Domain` (`&mut`), which the parallel driver
   shares `&`-immutably, so they fail closed today. **Motivation:** web *interpreter playgrounds* — a
   guest that JITs/`eval`s user code (§22) or sandboxes sub-programs (§14) **and** runs in parallel.
   **Design (chosen: full-unify, mirroring the tree-walker's proven `DomainTable`).** The bytecode engine's
@@ -270,8 +271,8 @@ property, so in practice:
       handled in `run_vcpu_parallel` (the fail-closed catch-all is gone). Proven by the
       `spawn_coroutine_module` kernel in `bytecode_parallel_instantiate.rs` (8 module coroutines built
       + resumed by the root vCPU under the parallel driver → the cooperative oracle's value). (A
-      coroutine is single-vCPU by construction — `compile_module` rejects coroutine + `thread.spawn` in
-      one module — so there is no cross-thread case to Miri-check here.)
+      coroutine was single-vCPU by construction — `compile_module` rejected coroutine + `thread.spawn`
+      in one module — so there was no cross-thread case to Miri-check here.)
     - **§14-D — the resumable `Vcpu` / browser path.** Unlike §22 JIT (whose ops hand the *raw* cap
       handle to the orchestrating host to resolve), §14 resolves its `Instantiator` authority **in-Vm**
       during `resume`, so the resumable vCPU must carry a **real powerbox** (not the deny-all default)
@@ -441,12 +442,11 @@ cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerb
 cargo test -p temen --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
 cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in the parallel driver vs oracle
 cargo test -p temen --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
-cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain §14-A: instantiate in the parallel driver vs oracle
-cargo test -p temen --test bytecode_vcpu_orchestration_instantiate  # 4c-domain §14-D2: confined children via resumable Vcpu
+cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain: a child's trap ends only its domain, cooperative + parallel
 cargo +nightly miri test -p temen-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
 cargo +nightly miri test -p temen-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
-cargo +nightly miri test -p temen-interp --test parallel_instantiate_miri  # 4c-domain §14-A: confined child race-free
-cargo +nightly miri test -p temen-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: carve-region views race-free
+cargo +nightly miri test -p temen-interp --test parallel_instantiate_miri  # 4c-domain: detached children race-free
+cargo +nightly miri test -p temen-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: detached children + pre-mapped regions race-free
 cargo test -p temen --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox call.cap via resumable Vcpu vs oracle
 cargo +nightly miri test -p temen-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> call.cap race-free
 

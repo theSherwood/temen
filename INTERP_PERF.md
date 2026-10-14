@@ -560,8 +560,9 @@ fuel's purpose (bounding runaways), and it matches what the JIT already effectiv
    credit-back), owning the cells until teardown so async/coro children can decrement them. Because the
    per-spawn cell address is baked, a fuel-armed run skips the non-durable child-code cache (recompiles
    per spawn); un-armed runs keep the cache byte-identically. All five instantiation thunks
-   (`instantiate`, `_granted`, `_named`, `_module_named`, `coro_spawn`) arm the child. Validated by
-   `jit_instantiate_fuel.rs`: a runaway nested child now traps `OutOfFuel` via counted fuel (not the §5
+   (`instantiate`, `_granted`, `_named`, `_module_named`, `coro_spawn`) arm the child. (All five, the
+   cache and the test below are retired with the carve spawn and the coroutines, #1867, #2069; a
+   detached child's fuel is its budget's.) Validated by `jit_instantiate_fuel.rs`: a runaway nested child now traps `OutOfFuel` via counted fuel (not the §5
    watchdog), matching the interpreter, and a `quota`-capped child exhausts at its cap — both
    differentially pinned against the oracle. (Durable *thaw* re-attach of a frozen subtree child stays
    un-metered, consistent with the freeze slice's other durable-nesting deferrals.)

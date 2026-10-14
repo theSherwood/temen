@@ -134,7 +134,7 @@ fn drive(
                 let child = vcpu
                     .take_child()
                     .expect("an InstantiateDetached carries its admitted child")
-                    .start(prog, back, None)
+                    .start(prog, back)
                     .expect("detached child builds");
                 let r = drive(prog, child, spawns);
                 let token = children.len() as u64;

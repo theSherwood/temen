@@ -378,7 +378,7 @@ pub(crate) fn drive_op13<'p>(
                 let r = vcpu
                     .take_child()
                     .ok_or(Trap::Malformed)
-                    .and_then(|c| c.start(prog, back, None))
+                    .and_then(|c| c.start(prog, back))
                     .and_then(|c| drive_op13(prog, c));
                 let token = children.len() as u64;
                 children.push(Some(r));
@@ -415,7 +415,6 @@ pub(crate) fn drive_op13<'p>(
             // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
             // Named rather than `_` (see `VcpuEvent`).
             bytecode::VcpuEvent::TierUp { .. }
-            | bytecode::VcpuEvent::Instantiate { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }

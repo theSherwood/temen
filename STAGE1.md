@@ -350,13 +350,11 @@ differential-tests; the browser plumbing lives in the detached `temen-browser` c
   **bytecode** engine (the tree-walker uses OS threads + a wall clock, absent under wasm), with the
   editor text as stdin and the personality's captured stdout as output.
 
-- **Sequential subset only.** The browser's bytecode compiler rejects `Instantiator`/`SharedRegion`
-  call.caps, so the browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in
+- **Sequential subset only.** The browser fixture is built with `-DTEMEN_SHELL_SEQUENTIAL`: `#ifndef` guards in
   `shell_main.c` drop the **external-command spawn** (slice 5, above) and the **concurrent ring
   pipelines** (slice 6). What ships is the full Stage-0 surface — builtins, redirection, in-window
   memfs pipelines, `;`/`&&`/`||` lists, `if`, variables, globbing, and `#` comments. External
-  commands and concurrent pipelines stay native-only (they need the caps bytecode can't compile);
-  the full shell keeps both.
+  commands and concurrent pipelines stay native-only; the full shell keeps both.
 
 - **One source of truth.** The shell C source lives in `crates/temen-run/demos/shell/*.c`
   (`shim.c`/`ring.c`/`shell_main.c`), `include_str!`d by `c_shell.rs` and compiled into the committed
@@ -451,9 +449,10 @@ already running); the ~20% that gates everything is **`fork` + R8**.
 
 ### The browser-only constraint — and how much of it is *already* there
 
-> **Retiring:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns,
-> and the carve path is being deleted (INVARIANTS #13, 2026-09-29; #1289). The detached equivalent,
-> op 15, already runs on the bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
+> **Retired:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns.
+> Every engine now traps them `CapFault` (INVARIANTS #13; #1867), so the text below is history, and
+> the tests and ops it names are deleted. The detached spawn, op 15 and its op-17 record, runs on the
+> bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
 
 Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
 **bytecode-only** (the tree-walker uses OS threads + a wall clock, and the wasm-JIT tier is a
@@ -461,10 +460,10 @@ hot-compute tier only). But the gap is **narrower than it first looks** — the 
 cooperative, single-thread driver (`compile_and_run_with_host`, the exact entry the browser shell runs
 on) **already lowers and drives the core §14 ops, wasm-safely:**
 
-- **`instantiate` (op 0), `instantiate_module` (op 5), `join` (op 1) already work on bytecode,
-  single-thread.** Op 0 was covered by `bytecode_parallel_instantiate.rs` (cooperative arm); op 5 —
-  the "exec a command" primitive, a *separate-module* child — is pinned matching the tree-walk oracle
-  by `bytecode_separate_module.rs`. No OS threads, no clock. So **sequential spawn/wait is already a
+- **The spawn and `join` (op 1) already work on bytecode, single-thread.** The detached spawn
+  (op 15, and its op-17 record) — the "exec a command" primitive, a *separate-module* child — is
+  pinned matching the tree-walk oracle by `spawn_every_driver.rs`. (This plan started from the carve
+  spawns, ops 0 and 5, which every engine now refuses.) No OS threads, no clock. So **sequential spawn/wait is already a
   browser capability**, not a missing one.
 
 What the browser bytecode engine still **declines** (the real remaining gaps, in rough order):

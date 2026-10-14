@@ -186,9 +186,8 @@ struct Win<'e> {
     host: Option<&'e Mutex<Host>>,
 }
 
-/// Drive one `Vcpu` to completion on this thread, starting each child on its own scoped thread — a
-/// confined one over its carve, a detached one over a fresh backing — as the browser's per-Worker
-/// driver does with Workers. An event this harness does not orchestrate fails the test rather than
+/// Drive one `Vcpu` to completion on this thread, starting each child on its own scoped thread over a
+/// fresh backing, as the browser's per-Worker driver does with Workers. An event this harness does not orchestrate fails the test rather than
 /// guessing an answer.
 fn drive<'s, 'e>(
     scope: &'s std::thread::Scope<'s, 'e>,
@@ -201,25 +200,6 @@ fn drive<'s, 'e>(
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::Instantiate {
-                carve, size_log2, ..
-            } => {
-                if win.base.0.is_null() {
-                    unorchestrated("a confined spawn inside a detached child");
-                }
-                // SAFETY: the engine validated the carve inside this vCPU's window.
-                let base = WinPtr(unsafe { win.base.0.add(carve as usize) });
-                // SAFETY: `2^size_log2` valid bytes at the validated carve, alive for the scope.
-                let back = Arc::new(unsafe { Region::shared(base.0, 1u64 << size_log2) });
-                let child_win = Win {
-                    base,
-                    back,
-                    size_log2,
-                    host: None,
-                };
-                let child = take_child(&mut vcpu, prog, &child_win)?;
-                start(scope, prog, orch, &mut vcpu, child, child_win);
-            }
             bytecode::VcpuEvent::InstantiateDetached { size_log2 } => {
                 // A fresh reservation, as every driver's detached window has; the engine seeds it.
                 // Not flat on every host (no `mmap` on Windows), so its bytes are not addressed here.
@@ -320,7 +300,7 @@ fn take_child<'e>(
     let Some(pending) = vcpu.take_child() else {
         panic!("a spawn event carries its admitted child");
     };
-    pending.start(prog, Arc::clone(&win.back), None)
+    pending.start(prog, Arc::clone(&win.back))
 }
 
 /// Run `child` over `win` on its own scoped thread, and give `vcpu` its completion id as the token a

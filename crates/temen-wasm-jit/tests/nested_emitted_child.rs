@@ -1,101 +1,30 @@
 //! **§14 nested child on the *emitted* tier** (issue #1123) — the wasm-JIT twin of the native
-//! `compile_child` (`temen-llvm/tests/rust_guest_op13.rs`). Where
-//! `instantiate_rec.rs` services the spawn bounce by running the child on the tree-walk interpreter,
-//! this file services it by **emitting a *separate* child module and running it as its own `wasmi`
-//! instance** — so both the parent and the confined child execute on emitted wasm, exactly as the
-//! native Cranelift path runs a nimony phase child on emitted code.
+//! `compile_child` (`temen-llvm/tests/rust_guest_op13.rs`). Where `instantiate_rec.rs` services the
+//! spawn bounce by running the child on the tree-walk interpreter, this file services it by
+//! **emitting the child module and running it as its own `wasmi` instance** — so both the parent and
+//! the child execute on emitted wasm, exactly as the native Cranelift path runs a nimony phase child
+//! on emitted code.
 //!
-//! Three op flavors of the same mechanism:
-//!   1. `nested_child_runs_on_the_emitted_tier` — the op-0 transport (slice 1). The host resolves which
-//!      module to spawn (as a driver resolves a module capability) and emits it over the carve.
-//!   2. `op13_separate_module_parent_emits_and_spawns_child` — the op-13 `instantiate_module_named`
-//!      (this slice). The parent is now itself **emittable**: op 13 lowers to the conditional
-//!      `env.instantiate_module` import (which marshals the module handle + grant list), instead of
-//!      failing out-of-subset onto the interpreter. This is the parent-emitted separate-module path the
-//!      nimony phase driver needs.
-//!   3. `op17_detached_child_runs_on_the_emitted_tier_over_its_own_memory` — op 17 with a v1 record
-//!      (#1865), the one spawn that outlives the carve placement: the servicer decodes the record,
-//!      mints the child a memory of its own and emits the child over its declared window there.
+//! The spawn is op 17 with a v1 record (#1865): the servicer decodes the record, mints the child a
+//! memory of its own and emits the child over its declared window there. The carve spawns (ops 0
+//! and 13) are retired (#1867) and no longer lowered. Also pinned: an emitted child's own
+//! confinement — an out-of-window access faults, run directly or through the bounce — and its NULL
+//! guard.
 //!
-//! For ops 0 and 13 the host callback spawns the confined child by [`compile_module_nested`]-emitting the
-//! *distinct* child module and `call`ing its `f{entry}(carve, env)` on a second instance sharing the one
-//! linear memory. The child's confinement window base is `win+off`; its accesses mask to its own
-//! `1<<size_log2` (invariant I2).
-//!
-//! Oracle (INVARIANTS.md #9): the child run on the interpreter yields `WANT`; the emitted child must
-//! return the same value **and** leave the same bytes in its carve. `saw_emit`/`saw_module` are the
-//! non-vacuity guards (the handler really emitted + ran the child, not a silent interpreter fallback).
+//! Oracle (INVARIANTS.md #9): the child run on the interpreter gives the emitted child's answer.
+//! `saw_emit`/`saw_module` are the non-vacuity guards (the handler really emitted + ran the child,
+//! not a silent interpreter fallback).
 
 mod support;
 
 use temen_interp::{run, Value};
-use temen_wasm_jit::{check_child_carve, compile_module_nested};
-use wasmi::{
-    Caller, Engine, Func, Global, Linker, Memory, MemoryType, Module as WModule, Store, Val,
-};
+use temen_wasm_jit::compile_module_nested;
+use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_BASE: i32 = 0x1_0000; // parent window base (the env cell lives below it)
 const ENV_PTR: i32 = 1024; // parent dispatcher-fuel cell
 const CHILD_ENV_PTR: i32 = 512; // child dispatcher-fuel cell (below the parent's scratch)
-const CARVE_OFF: i64 = 16384; // the child's carve offset (mirrors PARENT's `voff`), one #1094 NULL guard up so the carve clears the parent's `[0,16384)` guard and stays 1 KiB (child `memory 10`)-aligned
-
-/// The **separate** child module: pure compute over its own carve. It stores the sentinel `42` at
-/// carve-relative offset 0, loads it back, doubles it, and returns `84`. The store proves the emitted
-/// child ran over its carve (the test reads `mem[win+off] == 42`); the doubled load proves real compute.
-const CHILD: &str = r#"memory 10
-func () -> (i64) {
-block 0 () {
-  vaddr = i64.const 0
-  vsent = i64.const 42
-  i64.store vaddr vsent
-  vgot = i64.load vaddr
-  vtwo = i64.const 2
-  vr = i64.mul vgot vtwo
-  return vr
-  }
-}
-"#;
-
-/// The parent: its entry takes its `Instantiator` handle (`v0`), `instantiate`s a child into a
-/// 1-KiB carve at `CARVE_OFF` (`vslog = 10`), `join`s it, and returns the child's result. Func 0 is the
-/// only func — the child it spawns is a *separate* module the host resolves (op-0 is the transport; the
-/// host decides which module to emit, as a real driver resolves a module capability).
-const PARENT: &str = r#"memory 16
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  vinst = i32.wrap_i64 v0
-  ventry = i64.const 0
-  voff = i64.const 16384
-  vslog = i64.const 10
-  vquota = i64.const 0
-  vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
-  return vr
-  }
-}
-"#;
-
-/// The **op-13** parent (#1123 this slice): a `call.cap 6 13` — `instantiate_module_named`, the
-/// *separate-module* spawn — running on emitted wasm. `v0` is the `Instantiator` handle, `v1` the child
-/// `Module` handle; it spawns the module into the same 1-KiB carve at `CARVE_OFF` with an empty grant
-/// list, `join`s it, and returns the child's result. Unlike op-0, op-13 marshals the module handle +
-/// grant list, so it lowers to the conditional `env.instantiate_module` import (this slice's addition).
-const PARENT_OP13: &str = r#"memory 16
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 0
-  vgn = i64.const 0
-  ventry = i64.const 0
-  voff = i64.const 16384
-  vsl = i64.const 10
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
-}
-"#;
+const CARVE_OFF: i64 = 16384; // where a directly-run child's window sits past `WIN_BASE`: one #1094 NULL guard up, 1 KiB (child `memory 10`)-aligned
 
 fn parse(src: &str) -> temen_ir::Module {
     let m = temen_text::parse_module(src).expect("parse");
@@ -115,75 +44,15 @@ fn oracle_child(child: &temen_ir::Module) -> i64 {
     }
 }
 
-/// Host state threaded through the wasmi `Store`: the pre-instantiated child's emitted entry `f0`, its
-/// exported live `"mapped"` global (routed to the carve size per spawn — #1123 slice 2), the child
-/// module + parent window geometry the confinement gate needs, each spawned child's result (indexed by
-/// the handle `env.instantiate` returns), the non-vacuity flags, and whether the gate refused a carve.
+/// Host state threaded through the wasmi `Store`: the emitted child module and its IR, each spawned
+/// child's result (indexed by the handle `env.instantiate_rec` returns), and the non-vacuity flags.
 struct HostState {
     /// The emitted child module, instantiated afresh over each detached (op-17) child's own memory.
     child_module: Option<WModule>,
-    child_entry: Option<Func>,
-    child_mapped: Option<Global>,
     child: Option<temen_ir::Module>,
-    win_mapped: u64,
     children: Vec<i64>,
     saw_emit: bool,
     saw_module: bool,
-    carve_rejected: bool,
-}
-
-/// Emit-and-run the pre-built child instance's entry over the carve `[win+off, win+off + 1<<slog)`, bank
-/// its result under a dense handle, and return that handle. Shared by the op-0 (`env.instantiate`) and
-/// op-13 (`env.instantiate_module`) bounce servicers — both spawn the confined child on emitted wasm.
-///
-/// #1123 slice 2 — the two confinement-critical steps a real servicer must do, mirroring native
-/// `instantiate_module_named` (`temen-jit/src/instantiator_rt.rs`):
-///  1. **Gate** the carve through [`check_child_carve`] (fail-closed): a carve that under-sizes the
-///     child, is misaligned, escapes the parent window, or dips into the NULL guard is refused — the
-///     child never runs and the servicer returns the `-1` error handle.
-///  2. **Route** the child's live `"mapped"` global to the carve size, so the child is confined to
-///     *this* carve (not its declared memory) and may use its whole carve — matching the interpreter
-///     confined child (`mapped == carve`). A child trap propagates out as a host error (`?`).
-fn spawn_emitted_child(
-    caller: &mut Caller<'_, HostState>,
-    win: i32,
-    off: i64,
-    slog: i64,
-) -> Result<i32, wasmi::Error> {
-    let st = caller.data();
-    let child = st.child.as_ref().expect("child module recorded");
-    let guard = temen_ir::module_null_guard();
-    let gate = check_child_carve(
-        child,
-        off as u64,
-        slog as u32,
-        st.win_mapped,
-        win as u64,
-        guard,
-    );
-    if gate.is_err() {
-        // Fail-closed: refuse the spawn. No child runs; a `-1` handle propagates to `join`, which maps
-        // it to a sentinel. The parent observes the failure without the run trapping.
-        caller.data_mut().carve_rejected = true;
-        return Ok(-1);
-    }
-    let child_entry = st.child_entry.expect("child instance pre-built");
-    let mapped = st.child_mapped.expect("child mapped global exported");
-    // Per-event window routing: this carve is the child's confinement bound for this spawn.
-    mapped.set(&mut *caller, Val::I64(1i64 << slog))?;
-    let carve = win + off as i32;
-    let mut r = [Val::I64(0)];
-    // Propagate a child trap (e.g. an out-of-carve access) out as a host error, so it surfaces at the
-    // parent's `f0` call — the escape-through-the-bounce confinement path.
-    child_entry.call(
-        &mut *caller,
-        &[Val::I32(carve), Val::I32(CHILD_ENV_PTR)],
-        &mut r,
-    )?;
-    let res = r[0].i64().expect("child returns i64");
-    let st = caller.data_mut();
-    st.children.push(res);
-    Ok((st.children.len() - 1) as i32)
 }
 
 /// Run the child module's `f{entry}` **detached**: in a fresh memory of its own, over its declared
@@ -228,8 +97,8 @@ fn spawn_detached_child(
     Ok((st.children.len() - 1) as i32)
 }
 
-/// Define the eight §14 nested imports on `linker`, sharing `memory`. `instantiate` emits + runs the
-/// separate child over the carve; `join` returns its banked result; the rest are unreachable here.
+/// Define the §14 nested imports on `linker`, sharing `memory`. `instantiate_rec` emits + runs the
+/// child detached; `join` returns its banked result; the rest are unreachable here.
 fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
     linker.define("env", "memory", memory).unwrap();
     linker
@@ -244,49 +113,19 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
             },
         )
         .unwrap();
-    // env.instantiate: EMIT the resolved child (already compiled + instantiated as its own wasmi
-    // instance in `child_entry`) over the carve `[win+off, ...)` and run it. This is the wasm-JIT twin of
-    // the native `compile_child`: the confined child executes on emitted wasm, not the interpreter.
+    // env.instantiate: the fixed carve-spawn slot (#1867). No emitted code calls it.
     linker
         .func_wrap(
             "env",
             "instantiate",
-            |mut caller: Caller<'_, HostState>,
-             win: i32,
+            |_: Caller<'_, HostState>,
+             _win: i32,
              _inst: i32,
              _entry: i64,
-             off: i64,
-             slog: i64,
+             _off: i64,
+             _slog: i64,
              _quota: i64|
-             -> Result<i32, wasmi::Error> {
-                caller.data_mut().saw_emit = true;
-                spawn_emitted_child(&mut caller, win, off, slog)
-            },
-        )
-        .unwrap();
-    // #1123 env.instantiate_module (op 13): the separate-module spawn. The servicer resolves the
-    // module handle + grant list (here: the pre-built child) and runs it on emitted wasm over the carve,
-    // exactly as `env.instantiate` does — the parent-emitted twin of the op-0 bounce.
-    linker
-        .func_wrap(
-            "env",
-            "instantiate_module",
-            |mut caller: Caller<'_, HostState>,
-             win: i32,
-             _inst: i32,
-             _module: i64,
-             _grants_ptr: i64,
-             _grants_n: i64,
-             _entry: i64,
-             off: i64,
-             slog: i64,
-             _quota: i64|
-             -> Result<i32, wasmi::Error> {
-                let st = caller.data_mut();
-                st.saw_emit = true;
-                st.saw_module = true;
-                spawn_emitted_child(&mut caller, win, off, slog)
-            },
+             -> i32 { unreachable!("no carve spawn is emitted") },
         )
         .unwrap();
     // §3c.3 env.instantiate_rec (op 17): a detached spawn. Read the record out of the parent's
@@ -305,7 +144,6 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
                     .read(&caller, (win as u64 + record_ptr as u64) as usize, &mut rec)
                     .expect("record in-window");
                 let rec = temen_ir::SpawnRec::parse(&rec).expect("a well-formed record");
-                assert!(rec.detached, "a v1 record");
                 assert_eq!(rec.modh, CHILD_MODULE_HANDLE, "the child module's handle");
                 let st = caller.data_mut();
                 st.saw_emit = true;
@@ -368,14 +206,13 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
 }
 
 /// The result of running a parent over its child: `(parent_result, [i64@addr for addr in reads],
-/// saw_module, carve_rejected)`. `carve_rejected` is set when the confinement gate refused the spawn.
-type ParentRun = (i64, Vec<i64>, bool, bool);
+/// saw_module)`.
+type ParentRun = (i64, Vec<i64>, bool);
 
 /// Build `parent_src` + `child_src` (both `compile_module_nested`), run the parent's `f0(params)` on
-/// wasmi with the child pre-emitted as its own instance over the carve, and return the [`ParentRun`] —
+/// wasmi, its op-17 spawn emitting the child into a memory of its own, and return the [`ParentRun`] —
 /// or the wasmi error if the parent call traps (e.g. an escaping child fault propagated through the
-/// bounce). Both instances share the one linear memory, so the carve is a real sub-window of the parent
-/// window; the child's live `"mapped"` global is handed to the servicer for per-event routing.
+/// bounce).
 fn try_run_parent_over_child(
     parent_src: &str,
     child_src: &str,
@@ -386,7 +223,6 @@ fn try_run_parent_over_child(
     let child = parse(child_src);
     let parent_wasm = compile_module_nested(&parent, false).expect("parent emits (nested)");
     let child_wasm = compile_module_nested(&child, false).expect("child module emits (nested)");
-    let win_mapped = parent.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
 
     let engine = Engine::default();
     let parent_module = WModule::new(&engine, &parent_wasm).expect("parent wasm validates");
@@ -396,14 +232,10 @@ fn try_run_parent_over_child(
         &engine,
         HostState {
             child_module: Some(child_module.clone()),
-            child_entry: None,
-            child_mapped: None,
             child: Some(child),
-            win_mapped,
             children: Vec::new(),
             saw_emit: false,
             saw_module: false,
-            carve_rejected: false,
         },
     );
     // Two pages (128 KiB) hold the parent window `[WIN_BASE, WIN_BASE + 64 KiB)`; the carve lives inside.
@@ -417,22 +249,6 @@ fn try_run_parent_over_child(
 
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wire_nested_imports(&mut linker, memory);
-
-    // Pre-build the child as its own wasmi instance over the shared memory; stash its emitted entry and
-    // its exported live `"mapped"` global so the servicer can route the carve size per spawn.
-    let child_instance = linker
-        .instantiate(&mut store, &child_module)
-        .unwrap()
-        .start(&mut store)
-        .unwrap();
-    let child_entry = child_instance
-        .get_func(&store, "f0")
-        .expect("child emitted f0 export");
-    let child_mapped = child_instance
-        .get_global(&store, "mapped")
-        .expect("child mapped global export");
-    store.data_mut().child_entry = Some(child_entry);
-    store.data_mut().child_mapped = Some(child_mapped);
 
     let parent_instance = linker
         .instantiate(&mut store, &parent_module)
@@ -462,7 +278,6 @@ fn try_run_parent_over_child(
         results[0].i64().expect("parent returns i64"),
         out,
         store.data().saw_module,
-        store.data().carve_rejected,
     ))
 }
 
@@ -474,66 +289,7 @@ fn run_parent_over_child(
     params: &[Val],
     reads: &[usize],
 ) -> (i64, Vec<i64>, bool) {
-    let (r, out, saw_module, _rejected) =
-        try_run_parent_over_child(parent_src, child_src, params, reads).expect("parent f0 runs");
-    (r, out, saw_module)
-}
-
-#[test]
-fn nested_child_runs_on_the_emitted_tier() {
-    let want = oracle_child(&parse(CHILD));
-    assert_eq!(want, 84, "child oracle: (42 stored, loaded) * 2");
-
-    // op-0 transport: `f0(win, env, instantiator_handle)`.
-    let params = [Val::I32(WIN_BASE), Val::I32(ENV_PTR), Val::I64(7)];
-    let (r, reads, _) = run_parent_over_child(
-        PARENT,
-        CHILD,
-        &params,
-        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
-    );
-    assert_eq!(
-        r, want,
-        "emitted §14 child (instantiate→join) != interpreter child result"
-    );
-    assert_eq!(
-        reads[0], 42,
-        "the emitted child wrote its sentinel into its carve (proof it ran over `win+off`)"
-    );
-}
-
-#[test]
-fn op13_separate_module_parent_emits_and_spawns_child() {
-    let want = oracle_child(&parse(CHILD));
-    assert_eq!(want, 84, "child oracle: (42 stored, loaded) * 2");
-
-    // The point of this slice: the op-13 parent is itself **emittable** now (its separate-module spawn
-    // lowers to the conditional `env.instantiate_module` import). Before, op 13 was out-of-subset.
-    // `f0(win, env, inst_handle, module_handle)` — the servicer resolves the module to the pre-built child.
-    let params = [
-        Val::I32(WIN_BASE),
-        Val::I32(ENV_PTR),
-        Val::I32(7),
-        Val::I32(99),
-    ];
-    let (r, reads, saw_module) = run_parent_over_child(
-        PARENT_OP13,
-        CHILD,
-        &params,
-        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
-    );
-    assert!(
-        saw_module,
-        "op-13 parent never bounced to env.instantiate_module (op 13 not lowered?)"
-    );
-    assert_eq!(
-        r, want,
-        "emitted op-13 parent (instantiate_module→join) != interpreter child result"
-    );
-    assert_eq!(
-        reads[0], 42,
-        "the emitted op-13 child wrote its sentinel into its carve"
-    );
+    try_run_parent_over_child(parent_src, child_src, params, reads).expect("parent f0 runs")
 }
 
 /// A child that stores **out of its `memory 10` window** — at byte 1040 (> 1024). The wasm tier's
@@ -564,14 +320,10 @@ fn emitted_child_out_of_window_access_faults_and_stays_confined() {
         &engine,
         HostState {
             child_module: None,
-            child_entry: None,
-            child_mapped: None,
             child: None,
-            win_mapped: 0,
             children: Vec::new(),
             saw_emit: false,
             saw_module: false,
-            carve_rejected: false,
         },
     );
     let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
@@ -619,62 +371,6 @@ fn emitted_child_out_of_window_access_faults_and_stays_confined() {
         0,
         "the faulting store never executed (no masked write either)"
     );
-}
-
-/// A module that uses **both** op-13 (func 0, the op-13 spawn entry) and op-17 (func 1, unreachable
-/// from the entry — it just forces `module_uses_rec`). Both conditional imports are then present:
-/// `env.instantiate_rec` at func import 8, `env.instantiate_module` at `8 + uses_rec = 9`. Running the
-/// op-13 entry must still bounce to import 9 (not 8) — the guard on the "compose deterministically"
-/// index arithmetic. Func 1 is dead code, so `env.instantiate_rec` never fires.
-const PARENT_OP13_AND_REC: &str = r#"memory 16
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 0
-  vgn = i64.const 0
-  ventry = i64.const 0
-  voff = i64.const 16384
-  vsl = i64.const 10
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }
-}
-func (i32) -> (i32) {
-block 0 (v0: i32) {
-  vrec = i64.const 0
-  vch = call.cap 6 17 (i64) -> (i32) v0 (vrec)
-  return vch
-  }
-}
-"#;
-
-#[test]
-fn op13_and_op17_conditional_imports_compose() {
-    let want = oracle_child(&parse(CHILD));
-    // op-13 entry (func 0) is `f0(win, env, inst, module)`; func 1 (op-17) is present but never called.
-    let params = [
-        Val::I32(WIN_BASE),
-        Val::I32(ENV_PTR),
-        Val::I32(7),
-        Val::I32(99),
-    ];
-    let (r, reads, saw_module) = run_parent_over_child(
-        PARENT_OP13_AND_REC,
-        CHILD,
-        &params,
-        &[(WIN_BASE as i64 + CARVE_OFF) as usize],
-    );
-    assert!(
-        saw_module,
-        "op-13 bounce must reach env.instantiate_module (index 9), not env.instantiate_rec (index 8)"
-    );
-    assert_eq!(
-        r, want,
-        "op-13 entry still spawns + joins the child when op-17 is also imported"
-    );
-    assert_eq!(reads[0], 42, "the emitted child ran over its carve");
 }
 
 /// The handle the op-17 test passes its parent as the child `Module` (the servicer checks the record
@@ -742,30 +438,6 @@ fn op17_detached_child_runs_on_the_emitted_tier_over_its_own_memory() {
 // #1123 slice 2 — confinement: per-event window routing + the fail-closed carve gate.
 // ---------------------------------------------------------------------------------------------------
 
-/// An op-13 parent spawning its child into the carve `[win+off, win+off + 1<<slog)` with an empty grant
-/// list — the [`PARENT_OP13`] shape parameterized on the carve offset + `size_log2`, so a test can drive
-/// a carve larger than (routing), equal to, or smaller than (fail-closed) the child's declared memory.
-fn op13_parent(off: i64, slog: i64) -> String {
-    format!(
-        r#"memory 16
-func (i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32) {{
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 0
-  vgn = i64.const 0
-  ventry = i64.const 0
-  voff = i64.const {off}
-  vsl = i64.const {slog}
-  vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#
-    )
-}
-
 /// Emit `child_src` (nested) and run its `f0` **directly** over a carve of `1 << carve_log2` bytes at
 /// `WIN_BASE`, routing its live `"mapped"` global to the carve size. Returns the child's `i64` result, or
 /// the wasmi error a confinement fault surfaces as. Probes a single child's emitted checks (the NULL
@@ -779,14 +451,10 @@ fn run_child_direct(child_src: &str, carve_log2: u32) -> Result<i64, wasmi::Erro
         &engine,
         HostState {
             child_module: None,
-            child_entry: None,
-            child_mapped: None,
             child: None,
-            win_mapped: 0,
             children: Vec::new(),
             saw_emit: false,
             saw_module: false,
-            carve_rejected: false,
         },
     );
     // Enough 64-KiB pages to back `[WIN_BASE, WIN_BASE + carve)`.
@@ -818,56 +486,6 @@ fn run_child_direct(child_src: &str, carve_log2: u32) -> Result<i64, wasmi::Erro
     Ok(r[0].i64().expect("child returns i64"))
 }
 
-/// A child that uses memory **past its declared `memory 10` (1 KiB) window** — it stores/loads `55` at
-/// byte 1536, which lies in `[1024, 2048)`. This models a real child whose heap grows above `1<<declared`
-/// into a larger carve (a malloc child; FORK.md §8.6). With per-event routing OFF the child's live
-/// `"mapped"` self-inits to `1024` and the access **faults**; slice 2 routes `"mapped"` to the carve so
-/// the child may use its whole window.
-const CHILD_USES_FULL_CARVE: &str = r#"memory 10
-func () -> (i64) {
-block 0 () {
-  vaddr = i64.const 1536
-  vsent = i64.const 55
-  i64.store vaddr vsent
-  vgot = i64.load vaddr
-  return vgot
-  }
-}
-"#;
-
-#[test]
-fn carve_larger_than_declared_routes_mapped_and_child_uses_its_whole_carve() {
-    // Carve `size_log2 = 11` (2 KiB) over a `memory 10` (1 KiB) child: `carve > declared`. The child
-    // touches `[1024, 2048)`, which only its routed carve — not its declared window — admits. (No root
-    // interpreter oracle exists for this: a root run of the child module has `mapped == declared == 1024`
-    // and would itself trap at 1536; the confined carve run with `mapped == carve` is the semantics under
-    // test, so the assertion is structural — the access lands, byte-exact, in the carve.)
-    let params = [
-        Val::I32(WIN_BASE),
-        Val::I32(ENV_PTR),
-        Val::I32(7),
-        Val::I32(99),
-    ];
-    let read_at = (WIN_BASE as i64 + CARVE_OFF + 1536) as usize;
-    let (r, reads, saw_module, rejected) = try_run_parent_over_child(
-        &op13_parent(CARVE_OFF, 11),
-        CHILD_USES_FULL_CARVE,
-        &params,
-        &[read_at],
-    )
-    .expect("routed carve lets the child use `[declared, carve)` — no fault");
-    assert!(saw_module, "op-13 bounce fired");
-    assert!(!rejected, "a `carve > declared` spawn passes the gate");
-    assert_eq!(
-        r, 55,
-        "the child stored+loaded 55 in `[declared, carve)` (routing worked)"
-    );
-    assert_eq!(
-        reads[0], 55,
-        "the store landed at `carve + 1536`, inside the routed carve"
-    );
-}
-
 #[test]
 fn escape_through_the_op17_bounce_faults_and_stays_confined() {
     // The op-17 parent spawns `CHILD_ESCAPE` detached (it stores at 1040, past its `memory 10` window:
@@ -884,54 +502,6 @@ fn escape_through_the_op17_bounce_faults_and_stays_confined() {
     assert!(
         res.is_err(),
         "an out-of-window child access must fault the whole run through the op-17 bounce, not proceed"
-    );
-}
-
-/// A trivially-correct child that declares `memory 12` (4 KiB) — used only to under-size its carve.
-const CHILD_MEM12: &str = r#"memory 12
-func () -> (i64) {
-block 0 () {
-  vaddr = i64.const 0
-  vsent = i64.const 7
-  i64.store vaddr vsent
-  vr = i64.const 7
-  return vr
-  }
-}
-"#;
-
-#[test]
-fn undersized_carve_is_rejected_fail_closed() {
-    // A `memory 12` (4 KiB) child spawned into a `slog = 10` (1 KiB) carve: `declared > carve`. The gate
-    // ([`check_child_carve`]) must refuse it — the child never runs (nothing is written into the carve),
-    // the servicer returns the `-1` error handle, and `join` maps that to the `i64::MIN` sentinel.
-    let params = [
-        Val::I32(WIN_BASE),
-        Val::I32(ENV_PTR),
-        Val::I32(7),
-        Val::I32(99),
-    ];
-    let carve = WIN_BASE as i64 + CARVE_OFF;
-    let (r, reads, saw_module, rejected) = try_run_parent_over_child(
-        &op13_parent(CARVE_OFF, 10),
-        CHILD_MEM12,
-        &params,
-        &[carve as usize],
-    )
-    .expect("a rejected spawn does not trap the parent — it returns the sentinel");
-    assert!(saw_module, "op-13 bounce fired");
-    assert!(
-        rejected,
-        "the gate refused a carve smaller than the child's declared memory"
-    );
-    assert_eq!(
-        r,
-        i64::MIN,
-        "join mapped the `-1` error handle to the sentinel"
-    );
-    assert_eq!(
-        reads[0], 0,
-        "fail-closed: the child never ran, so nothing was written into the carve"
     );
 }
 

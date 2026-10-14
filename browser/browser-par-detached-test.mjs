@@ -168,8 +168,8 @@ block 0 (v0: i64) {
   }
 }
 `;
-// A §14 carve spawn (op 0) on the par driver fails closed, as a `CapFault` trap: its children are
-// detached (#1865).
+// A §14 carve spawn (op 0) fails closed on the par driver as on every engine, a `CapFault` trap
+// (#1867).
 const CARVE_ROOT_SRC = `memory 20
 func (i32) -> (i64) {
 block 0 (v0: i32) {

@@ -58,7 +58,8 @@ re-issues.
 
 ## 4. How a parent names a child (the handle model — nesting-friendly by construction)
 
-The Instantiator ops (0 `instantiate`, 5/13 `instantiate_module`, `temen-interp:11376`) return an `i32`
+The Instantiator's spawns (op 15, and its op-17 record; the carve spawns 0 `instantiate` and 5/13
+`instantiate_module` this section was written against are retired, #1867) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
 (its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is being retired,
@@ -491,7 +492,8 @@ child runs in a window **at least** its declared memory (a larger window is a sa
 invariant 2, still masks every access to the *actual* window; only an out-of-declared-window access, a
 guest bug, wraps at the larger bound). Concretely, `exec_module` now bounds the command against the
 caller's **actual inherited window** (`GuestMem::window_size`), not the guest's `size_log2` hint (now
-advisory), and op-13 admits a module into any carve `≥` its declared memory. Defense-in-depth: a negative
+advisory), and op 13 admitted a module into any carve `≥` its declared memory (op 13 is retired,
+#1867; a detached spawn's window is the module's declared memory). Defense-in-depth: a negative
 "handle" to `join`/`poll`/`detach` now faults (invariant 5) instead of masking onto a live child, so a
 genuinely-too-small spawn surfaces observably rather than hanging. Proven by
 `c_fork.rs::a_shell_execs_a_command_with_a_large_bss_buffer`: a shell spawned into a 256 KiB window forks
@@ -550,7 +552,8 @@ in `c_fork.rs`:
   name. A raw host cap carries no typed interface, so there's no coverage walk — a flat import binds
   op-0 straight to the handle, and the `CAP_IMPORT_TYPE_ID` translation routes the call (with the fs op
   in `args[0]`) to the registered closure. This is the same op-in-arg0 wrapper `c_link.rs` uses at the
-  top level, now reachable through the op-13 grant list so a spawned/exec'd child inherits fs authority.
+  top level, now reachable through a spawn's grant list (op 13's then, op 15/17's now) so a spawned/exec'd child
+  inherits fs authority.
   The cap is granted **forkable** (`grant_host_proc_forkable`), the shape `regrant_into_child` re-mints
   into a child, so the memfs store is shared across the fork.
 

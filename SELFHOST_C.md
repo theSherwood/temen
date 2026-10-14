@@ -134,7 +134,7 @@ cover every deployment shape, layered by how far "inside" the loop runs:
    text — so this layer needs a small **binary emitter in `codegen_ir.c`** (guest code, the wire
    format is the simple single-pass `temen-encode` form). No host change.
 3. **Run-as-a-child-domain** (`cc x.c && ./x` as a separate process): today's spawn surface
-   (`instantiate_module` op 5/13, `domain_exec`) takes **host-verified `Module`s** from the
+   (the detached spawn, op 15/17, and `domain_exec`) takes **host-verified `Module`s** from the
    embedder's registry, not guest-window bytes — so for now the *embedder* mediates (it watches the
    output file, verifies, registers, and the shell spawns it by name). That is host-application
    glue, not substrate. A bytes-taking spawn op is **explicitly not needed** for this plan and

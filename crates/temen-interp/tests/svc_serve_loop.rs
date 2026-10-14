@@ -166,44 +166,30 @@ fn a_non_serving_tier_refuses_both_svc_ops_probeably() {
     }
 }
 
-/// §3.6 slice 3 — **caller-side parking, end to end**: a parent spawns a serving child
-/// (§14 same-module), mints a live-callee offer over the child's export
-/// (`Instantiator.child_offer`, op 14), and calls through it. The call enqueues on the
-/// child's queue and parks the parent; the child's `svc.wait` (op 10) wakes on the enqueue
-/// (or finds the work already queued — both orders are correct), serves `add(40, 2)` as a
-/// handler, and the reply wakes the parent with 42. The child returns its served count,
-/// which the parent reads back through `join` — proving the whole caller ↔ servicer
-/// round-trip parked and woke rather than deadlocked. The offer's structural type id is
-/// the first guest intern (`GUEST_IMPL_BASE` = 268435456), pinned by D59 determinism.
+/// §3.6 slice 3 — **caller-side parking, end to end**: a parent spawns a serving child (func 1's
+/// child image, #2219, the `Module` `v2`, spawned detached by the record [`caller_parking`] appends
+/// at 17536 and paid from the `Budget` `v1`), mints a live-callee offer over the child's export
+/// (`Instantiator.child_offer`, op 14), and calls through it. The call enqueues on the child's
+/// queue and parks the parent; the child's `svc.wait` (op 10) wakes on the enqueue (or finds the
+/// work already queued — both orders are correct), serves `add(40, 2)` as a handler, and the reply
+/// wakes the parent with 42. The child returns its served count, which the parent reads back
+/// through `join` — proving the whole caller ↔ servicer round-trip parked and woke rather than
+/// deadlocked. The offer's structural type id is the first guest intern (`GUEST_IMPL_BASE` =
+/// 268435456), pinned by D59 determinism.
 const CALLER_PARKING: &str = r#"
 memory 17
 type 0 func (i64, i64) -> (i64)
 type 1 interface { add: 0 }
 export 0 interface "adder" 1 { add: 2 }
 
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  ; spawn via record (op 17): entry=1 off=65536 sl=12 quota=0
-  q0v0 = i64.const 4294967296
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967284
-  q0v3 = i64.const 4294967295
-  q0v4 = i64.const 0
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v4
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v4
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v4
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vrm = i64.const 17560
+  i32.store vrm v2
+  vrb = i64.const 17564
+  i32.store vrb v1
+  vrp = i64.const 17536
+  v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
   va = i64.const 40
@@ -232,6 +218,11 @@ block 0 (va: i64, vb: i64) {
   }
 }
 "#;
+
+/// [`CALLER_PARKING`] with its spawn record.
+fn caller_parking() -> String {
+    format!("{CALLER_PARKING}{}", rec::segment(17536, &SpawnRec::v1(0)))
+}
 
 /// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
 /// attaches the live-callee cap into a rebindable import slot and calls `call.import 0` — the
@@ -334,93 +325,6 @@ fn svc_sugar_round_trips_and_desugars_to_the_reserved_dispatch() {
         m, m3,
         "wire round-trip (sugar is pure spelling — no wire change)"
     );
-}
-
-/// §3.6 — **separate-module serving children**: the child domain runs its OWN module
-/// (`instantiate_module`, op 5) with its own offers, and the parent wires a live offer over
-/// the child's export via the same `child_offer` (op 14). The offer's shape is the CHILD
-/// module's export — the parent registers no self module at all, pinning that the wirer's
-/// own program is irrelevant to the wire — interned structurally into the parent's table
-/// (D59: first guest intern = `GUEST_IMPL_BASE`, same as the same-module form). Same
-/// enqueue/park/`svc.wait`-serve/reply/join round-trip: join(served=1)*100 + add(40,2) = 142.
-const SEPARATE_MODULE_CALLER: &str = r#"
-memory 17
-
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  vmh = i64.extend_i32_u v1
-  ventry = i64.const 0
-  voff = i64.const 65536
-  vlog = i64.const 12
-  vq = i64.const 0
-  v5 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (vmh, ventry, voff, vlog, vq)
-  v6 = i64.const 0
-  v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)
-  va = i64.const 40
-  vb = i64.const 2
-  vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
-  vk = i64.const 100
-  vm = i64.mul vj vk
-  vs = i64.add vm vr
-  return vs
-  }
-}
-"#;
-
-/// The child's own program: its own memory declaration (the carve must equal it — §14
-/// transparency), its own offer, its own serve loop. Entry = func 0 (`svc.wait`, return the
-/// served count to the joiner); `add` = func 1.
-const SEPARATE_MODULE_SERVER: &str = r#"
-memory 12
-type 0 func (i64, i64) -> (i64)
-type 1 interface { add: 0 }
-export 0 interface "adder" 1 { add: 1 }
-
-func (i64) -> (i64) {
-block 0 (v0: i64) {
-  vz = i32.const 0
-  vn = svc.wait vz
-  return vn
-  }
-}
-
-func (i64, i64) -> (i64) {
-block 0 (va: i64, vb: i64) {
-  vs = i64.add va vb
-  return vs
-  }
-}
-"#;
-
-#[test]
-fn a_separate_module_child_serves_its_own_offers() {
-    let a = Arc::new({
-        let m = temen_text::parse_module(SEPARATE_MODULE_CALLER).expect("parse caller");
-        temen_verify::verify_module(&m).expect("verify caller");
-        m
-    });
-    let b = temen_text::parse_module(SEPARATE_MODULE_SERVER).expect("parse server");
-    temen_verify::verify_module(&b).expect("verify server");
-    let mut host = Host::new();
-    // Deliberately NO set_self_module on the parent: the offer's shape is the child's.
-    let hi = host.grant_instantiator(0, 1u64 << 17);
-    let hm = host.grant_module(&b);
-    let mut fuel = 5_000_000u64;
-    let r = run_with_host(
-        &a,
-        0,
-        &[Value::I32(hi), Value::I32(hm)],
-        &mut fuel,
-        &mut host,
-    )
-    .expect("run");
-    assert_eq!(
-        r,
-        vec![Value::I64(142)],
-        "join(served=1)*100 + add(40,2) — a foreign program served the parent's live call"
-    );
-    let _ = a;
 }
 
 /// A `child_offer` naming an export the child's module doesn't have refuses with a probeable
@@ -623,16 +527,15 @@ fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
 
 #[test]
 fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
-    let m = Arc::new({
-        let m = temen_text::parse_module(CALLER_PARKING).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        m
-    });
+    let m = temen_text::parse_module(&caller_parking()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    host.set_self_module(&m);
     let h = host.grant_instantiator(0, 1u64 << 17);
+    let b = host.grant_budget(-1, 1 << 20, -1);
+    let c = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     let mut fuel = 5_000_000u64;
-    let r = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host).expect("run");
+    let args = [h, b, c].map(Value::I32);
+    let r = run_with_host(&m, 0, &args, &mut fuel, &mut host).expect("run");
     assert_eq!(
         r,
         vec![Value::I64(142)],

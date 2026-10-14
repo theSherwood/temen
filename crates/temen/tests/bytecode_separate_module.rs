@@ -1,18 +1,17 @@
 //! Equality harness for the bytecode engine's **§14 separate-module executor child** (INTERP_PERF.md
-//! Slice 1c-5h): `Instantiator.instantiate_module` (op 5). The host verifies a *different* module and
-//! grants the parent a `Module` capability (iface 8); the parent passes it to op 5 to spawn a child
-//! **domain** running that module, confined to a carve of the parent's window — the "plugin-in-plugin"
-//! story. The child's data segments materialize into the carve at spawn, and the carve must equal the
-//! module's declared memory. Joined via the shared thread machinery (op 1), exactly like op 0.
+//! Slice 1c-5h). The host verifies a *different* module and grants the parent a `Module` capability
+//! (iface 8); the parent names it in a spawn record (op 17) to spawn a child **domain** running that
+//! module — the "plugin-in-plugin" story — and joins it via the shared thread machinery (op 1). A
+//! forged module handle is an inert `CapFault`.
 //!
-//! Adapted from `crates/temen/tests/separate_module.rs`. Each case is checked **bit-identical** to the
-//! tree-walker `run_with_host`; `.expect(Some)` gates that the bytecode engine drove the parent
-//! module (didn't fall back). The parent entry takes `(instantiator, module handle)`.
+//! Each case is checked **bit-identical** to the tree-walker `run_with_host`; `.expect(Some)` gates
+//! that the bytecode engine drove the parent module (didn't fall back). The parent entry takes
+//! `(instantiator, module handle)`.
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 
-use temen_interp::{bytecode, run_with_host, Host, Value};
+use temen_interp::{bytecode, run_with_host, Host, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 
@@ -50,7 +49,7 @@ fn host(child: &Module) -> (Host, i32, i32) {
 
 /// Run `parent_src`'s entry on both engines with `(instantiator over the whole window, module handle
 /// for `child_src`)` as its two args, and assert the results are identical and equal to `want`.
-fn check(parent_src: &str, child_src: &str, want: Result<Vec<Value>, ()>) {
+fn check(parent_src: &str, child_src: &str, want: Result<Vec<Value>, Trap>) {
     let parent = parse_module(parent_src).expect("parse parent");
     let child = parse_module(child_src).expect("parse child");
 
@@ -79,111 +78,16 @@ fn check(parent_src: &str, child_src: &str, want: Result<Vec<Value>, ()>) {
         tw, bc,
         "instantiate_module: tree-walker != bytecode\n{parent_src}"
     );
-    match want {
-        Ok(vals) => assert_eq!(bc, Ok(vals), "instantiate_module result\n{parent_src}"),
-        Err(()) => assert!(bc.is_err(), "expected a trap, got {bc:?}\n{parent_src}"),
-    }
+    assert_eq!(bc, want, "instantiate_module result\n{parent_src}");
 }
 
-/// `instantiate_module(module, entry 0, off 64 KiB, size_log2 16, fuel 0)` → `join` → the child's
-/// result. The child read its own data segment ('V' = 86) and returned `86 + 1000 = 1086`.
-const PARENT: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  return v7
-  }
-}
-"#;
-
-#[test]
-fn module_child_runs_with_its_data_segments() {
-    check(PARENT, CHILD_SRC, Ok(vec![Value::I64(1086)]));
-}
-
-/// The parent then reads the marker the module child wrote at the child's offset 16 KiB (→ backing
-/// 80 KiB) — proving the foreign module ran confined over the shared backing.
-const PARENT_READBACK: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 16
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  v8 = i64.const 81920
-  v9 = i32.load8_u v8
-  v10 = i64.extend_i32_u v9
-  v11 = i64.const 1000000
-  v12 = i64.mul v7 v11
-  v13 = i64.add v12 v10
-  return v13
-  }
-}
-"#;
-
-#[test]
-fn module_child_writes_visible_to_parent() {
-    // child returns 1086; marker at child offset 16 KiB is 7 → 1086 * 1_000_000 + 7.
-    check(
-        PARENT_READBACK,
-        CHILD_SRC,
-        Ok(vec![Value::I64(1_086_000_007)]),
-    );
-}
-
-/// A carve whose size doesn't equal the module's declared memory (size_log2 12 ≠ the child's 16) is
-/// rejected with `-EINVAL` — §14 transparency (the plugin must run exactly as it would standalone).
-const PARENT_BAD_SIZE: &str = r#"memory 17
-func (i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32) {
-  v2 = i64.extend_i32_s v1
-  v3 = i64.const 0
-  v4 = i64.const 65536
-  v5 = i64.const 12
-  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
-  v7 = i64.extend_i32_s v6
-  return v7
-  }
-}
-"#;
-
-#[test]
-fn carve_must_equal_declared_memory() {
-    check(PARENT_BAD_SIZE, CHILD_SRC, Ok(vec![Value::I64(-22)]));
-}
-
-/// A forged module handle is an inert `CapFault` on both engines (the parent passes 999 as the
-/// module handle, which was never granted).
+/// A forged module handle is an inert `CapFault` on both engines: the parent's v1 record at 17408
+/// names module 999, which was never granted.
 const PARENT_FORGED: &str = r#"memory 17
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
-  ; spawn via record (op 17): entry=0 off=65536 sl=16 quota=0
-  q0v0 = i64.const 0
-  q0v1 = i64.const 65536
-  q0v2 = i64.const -4294967280
-  q0v3 = i64.const 999
-  q0a0 = i64.const 17536
-  i64.store q0a0 q0v0
-  q0a1 = i64.const 17544
-  i64.store q0a1 q0v1
-  q0a2 = i64.const 17552
-  i64.store q0a2 q0v2
-  q0a3 = i64.const 17560
-  i64.store q0a3 q0v3
-  q0a4 = i64.const 17568
-  i64.store q0a4 q0v0
-  q0a5 = i64.const 17576
-  i64.store q0a5 q0v0
-  q0a6 = i64.const 17584
-  i64.store q0a6 q0v0
-  v6 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
+  rp = i64.const 17408
+  v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
   v7 = i64.extend_i32_s v6
   return v7
   }
@@ -192,7 +96,12 @@ block 0 (v0: i32, v1: i32) {
 
 #[test]
 fn forged_module_handle_faults_identically() {
-    check(PARENT_FORGED, CHILD_SRC, Err(()));
+    let forged = SpawnRec {
+        modh: 999,
+        ..SpawnRec::v1(0)
+    };
+    let parent = format!("{PARENT_FORGED}{}", rec::segment(17408, &forged));
+    check(&parent, CHILD_SRC, Err(Trap::CapFault));
 }
 
 /// A two-export child ("plugin"): `"alpha"` (func 0) → `byte+1000`, `"beta"` (func 1) → `byte+2000`.

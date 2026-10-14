@@ -523,45 +523,6 @@ enum Op {
         handle: u32,
         dst: u32,
     },
-    /// §14 `Instantiator.instantiate(entry, off, size_log2, quota)` (op 0): spawn a **confined
-    /// executor child** running `entry` over `[off, off+2^size_log2)` of the holder's range, with an
-    /// attenuated `Instantiator`+`AddressSpace` powerbox over its own window; its handle (or `EINVAL`)
-    /// lands at `dst`. `handle` is the Instantiator cap (authority). Scheduler-driven (joinable).
-    Instantiate {
-        handle: u32,
-        entry: u32,
-        off: u32,
-        size_log2: u32,
-        quota: u32,
-        dst: u32,
-        /// §14 `instantiate_named` (op 11, PROCESS.md S2): the `(grants_ptr, grants_n)` register pair
-        /// for the child's by-name grant list (op 0 is `None`). Same-module counterpart of op 13 — the
-        /// child runs the holder's *own* program at `entry`, but its powerbox additionally carries the
-        /// re-granted `grants_n × {name_off, name_len, handle, flags}` caps read from the parent window
-        /// (via the shared `Host::spawn_named_child`), so a spawned stage resolves an inherited region
-        /// (a ring end) or `stdout` by name — the concurrent-pipeline spawn.
-        grants: Option<(u32, u32)>,
-    },
-    /// §14 `Instantiator.instantiate_module(module, entry, off, size_log2, quota)` (op 5): like
-    /// [`Op::Instantiate`], but the child runs a host-granted **separate** `Module` (`module` is its
-    /// handle, crossing as the first i64 arg) rather than the holder's own program — the §14
-    /// "plugin-in-plugin" story. The driver resolves + compiles the module, materializes its data into
-    /// the carve, and runs it as a confined executor child. `handle` is the Instantiator cap.
-    InstantiateModule {
-        handle: u32,
-        module: u32,
-        entry: u32,
-        off: u32,
-        size_log2: u32,
-        quota: u32,
-        dst: u32,
-        /// §14 `instantiate_module_named` (op 13): the `(grants_ptr, grants_n)` register pair for the
-        /// child's by-name grant list (op 5 is `None`). The driver reads the `grants_n × {name_off,
-        /// name_len, handle, flags}` records from the parent window and re-grants each into the child
-        /// powerbox (via the shared `Host::spawn_named_child`), so a spawned command resolves an
-        /// inherited `stdout` by name — the shell "exec" primitive.
-        grants: Option<(u32, u32)>,
-    },
     /// PROCESS.md §5 `Instantiator.instantiate_detached(budget, module, grants_ptr, grants_n, entry,
     /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
     /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
@@ -582,10 +543,9 @@ enum Op {
         dst: u32,
     },
     /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
-    /// The 56-byte record is **runtime data** (entry, carve, module, budget, grants — see the
-    /// tree-walker's op-17 arm for the layout), so unlike the scalar spawns above the fields are
-    /// read from the vCPU's confined window at **exec** time; the op then folds onto the same
-    /// [`Outcome::Instantiate`] the drivers already service.
+    /// The record ([`SpawnRec`]) is **runtime data**, so unlike op 15's scalars its fields are read
+    /// from the vCPU's confined window at **exec** time; the op then folds onto the same
+    /// [`Outcome::InstantiateDetached`] op 15 produces (#1863).
     InstantiateRec {
         handle: u32,
         rec: u32,
@@ -675,6 +635,10 @@ enum Op {
         want_results: Box<[ValType]>,
     },
     Unreachable,
+    /// A `CapFault` trap: an `Instantiator` op the oracle has no arm for, which it refuses after the
+    /// handle resolves (a forged handle is a `CapFault` too) — the retired carve spawns (ops 0, 5
+    /// and 13, #1867) and the deleted coroutine ops (#2069).
+    CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
     /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
     /// **block-local** operand indices, so it's run against the sub-window `regs[base + block_base
@@ -1516,7 +1480,6 @@ fn jit_uninstall_from(
 /// escape.
 #[derive(Default)]
 struct Seams {
-    has_coro: bool,
     has_fiber: bool,
     has_thread: bool,
     has_instantiate: bool,
@@ -1557,7 +1520,6 @@ impl Seams {
             && (self.has_park_seam
                 || self.has_fiber
                 || self.has_thread
-                || self.has_coro
                 || self.has_instantiate
                 || self.has_gc
                 || self.has_fork)
@@ -1578,7 +1540,6 @@ impl Seams {
             && !self.has_park_seam
             && !self.has_fiber
             && !self.has_thread
-            && !self.has_coro
             && !self.has_gc
     }
 }
@@ -1598,7 +1559,6 @@ fn bytecode_serves_children(m: &Module) -> bool {
     if !(s.has_svc && s.has_instantiate)
         || s.has_fiber
         || s.has_thread
-        || s.has_coro
         || s.has_gc
         || s.has_fork
         || s.has_timed_wait
@@ -1615,7 +1575,7 @@ fn bytecode_serves_children(m: &Module) -> bool {
             .zip(reach)
             .filter_map(|(f, r)| r.then_some(f)),
     );
-    !(h.has_park_seam || h.has_instantiate || h.has_coro || h.has_opaque_call)
+    !(h.has_park_seam || h.has_instantiate || h.has_opaque_call)
 }
 
 /// Whether a `call.cap` on interface `type_id` can never park its caller, by the interface alone:
@@ -1650,24 +1610,19 @@ fn scan_seams<'a>(funcs: impl IntoIterator<Item = &'a Func>) -> Seams {
             }
             for inst in &b.insts {
                 match inst {
-                    // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
-                    // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec,
-                    // op 18 = wait, ops 9/10/12 = poll/detach/kill, ops 14/19 = child_offer/grant
-                    // (all executor children, scheduler-driven — the grant-carrying spawns re-grant
-                    // caps but spawn the same kind of confined task); every other INSTANTIATOR op is
-                    // a deleted one (#2069). Classifying the named spawns as `has_instantiate` (not `has_coro`) is
-                    // load-bearing: a concurrent pipeline mixes them with `memory.wait`/`notify`
-                    // (`has_thread`), and the `has_coro && has_thread` veto would otherwise fall the
-                    // whole module back to the tree-walker.
+                    // ops 1/18 = join/wait, op 15 = instantiate_detached, op 17 = instantiate_rec,
+                    // ops 9/10/12 = poll/detach/kill, ops 14/19 = child_offer/grant (all executor
+                    // children, scheduler-driven). Every other INSTANTIATOR op traps `CapFault`
+                    // (`Op::CapFault`), so it is no seam.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 9 | 10 | 12 | 13 | 14 | 15 | 17 | 18 | 19,
+                        op: 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
                         ..
-                    } => s.has_coro = true,
+                    } => {}
                     // I38's **timed** `svc.wait` (op 10 with the optional timeout arg) needs
                     // the scheduler's deadline machinery — oracle-only; veto like a park seam
                     // so both fast backends decline the module.
@@ -1792,71 +1747,6 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
     Some(c)
 }
 
-/// §3d — validate + **drain** a spawn record's `Budget` at a driver's commit site, returning the
-/// child's funded fuel. `Ok(None)` = refuse the spawn `-EINVAL` with the budget **intact** (mem
-/// quota short, or the compiled-tier narrowed gap: a bounded spawn ceiling / bounded-zero fuel,
-/// which this tier — like the Cranelift thunk — cannot represent; flip those when child vCPU
-/// quotas / zero-fuel children land here). `Err(CapFault)` = the handle vanished since the exec
-/// arm's peek (a shared-powerbox race). The fund rule is the tree-walker's: bounded fuel is
-/// `min(budget, parent_remaining)`, unbounded inherits the parent's remaining.
-fn take_spawn_budget(
-    host: &mut Host,
-    budget: i32,
-    child_size: u64,
-    parent_fuel: u64,
-) -> Result<Option<u64>, Trap> {
-    // Peek + mem-quota gate is the shared `Host::budget_for_spawn` (#911): `None` = dangling handle
-    // (CapFault), `Some(Err(()))` = bounded mem quota short (refuse `-EINVAL`, budget intact).
-    let (fuel, spawn) = match host.budget_for_spawn(budget, child_size, false) {
-        None => return Err(Trap::CapFault),
-        Some(Err(())) => return Ok(None), // mem quota short — refuse, budget intact
-        Some(Ok(v)) => v,
-    };
-    if spawn >= 0 || fuel == 0 {
-        return Ok(None); // narrowed gap (see doc) — refuse, budget intact
-    }
-    // Commit: drain to zero. `take_budget` returns the pre-drain state, so the fuel it reports
-    // equals the `fuel` peeked above — fund from that. Bounded fuel is `min(budget, parent)`,
-    // unbounded inherits the parent's remaining. (#989 slice 1b — the child's `channel` cap is
-    // peeked separately by the inline-building spawn arms before this drain; see `set_channel_cap`.)
-    host.take_budget(budget).ok_or(Trap::CapFault)?;
-    Ok(Some(if fuel >= 0 {
-        (fuel as u64).min(parent_fuel)
-    } else {
-        parent_fuel
-    }))
-}
-
-/// The §14 carve **geometry** check (D19), the single definition every spawn/instantiate driver and
-/// tree-walk arm shares: a child window of `1 << size_log2` bytes at offset `off` fits inside the
-/// parent's `[0, isize)` iff the size is a valid power of two (`size_log2` in `0..64`), `off` is
-/// size-aligned, and the whole span lies within `isize`. Overflow-free (an out-of-range `size_log2`
-/// or a `off + size` past `u64` yields `false`, not a shift/overflow). A future bound tweak lives
-/// here, not in ten pasted copies (#911).
-///
-/// #964: the carve may also not dip into the holder window's reserved NULL region — `ibase + off`
-/// (the carve's window-relative base; `ibase` is the holder's own base) must clear `null_guard`
-/// (`0` = unguarded, trivially true). The host seeds/copies a carve outside the guarded call, and
-/// the reserved region is permanent by design, so a below-guard carve is refused, not admitted.
-pub(crate) fn carve_fits(
-    off: u64,
-    size_log2: i64,
-    isize: u64,
-    ibase: u64,
-    null_guard: u64,
-) -> bool {
-    let child_size = if (0..64).contains(&size_log2) {
-        1u64 << size_log2
-    } else {
-        0
-    };
-    child_size != 0
-        && child_size <= isize
-        && off & (child_size - 1) == 0
-        && off.checked_add(child_size).is_some_and(|e| e <= isize)
-        && ibase.checked_add(off).is_some_and(|b| b >= null_guard)
-}
-
 /// The §14 entry-shape rule and the starter handles each shape takes live in `temen-ir`, the one
 /// crate every tier shares — the Cranelift JIT's spawn arms read the same definition (#911, #1720).
 pub use temen_ir::{child_entry_handles, child_entry_ok};
@@ -1868,37 +1758,11 @@ pub(crate) fn child_entry_args(arity: usize, inst: i32, space: i32) -> Vec<Value
         .collect()
 }
 
-/// A §14 confined spawn — op 0 (`instantiate`), op 5 / op 13 (`instantiate_module[_named]`), or a
-/// §3d record (op 17) — as its lowering resolved it. One event for all of them (INVARIANTS #15): a
-/// separate-module child is this spawn with a `module`, not a second variant.
-#[derive(Clone, Copy)]
-struct ConfinedSpawn {
-    /// The holder's `Instantiator` range `[ibase, ibase + isize)` in its own window.
-    ibase: u64,
-    isize: u64,
-    /// The granted `Module` handle a separate-module child runs; `None` runs the spawning frame's
-    /// own module (#1726).
-    module: Option<i32>,
-    entry: i64,
-    /// The carve: `1 << size_log2` bytes at holder-relative offset `off`.
-    off: i64,
-    size_log2: i64,
-    /// The child's fuel quota (`<= 0` inherits the parent's remaining) when no budget funds it.
-    quota: i64,
-    /// The by-name grant list's `(ptr, count)` in the holder's window (op 13, a record's); `None`
-    /// grants only the starter caps.
-    grants: Option<(u64, u64)>,
-    /// A record's `Budget` handle (`0` = none), drained at the commit site.
-    budget: i32,
-}
-
-/// Read the op-17 spawn record at window offset `rp`: its version word says how long it is (v0 carve,
-/// v1 detached). A bad version or reserved field is a `CapFault` (fail closed).
-fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
-    let head = m.read_window(rp, 56)?;
-    let head: &[u8; 56] = head.as_slice().try_into().map_err(|_| Trap::Malformed)?;
-    let len = SpawnRec::len_for(head).ok_or(Trap::CapFault)?;
-    SpawnRec::parse(&m.read_window(rp, len)?).ok_or(Trap::CapFault)
+/// Read the op-17 spawn record at window offset `rp`, for both interpreters. A record past the
+/// window is a `MemoryFault`, as a guest load would be; a bad version or reserved field is a
+/// `CapFault` (fail closed).
+pub(crate) fn read_spawn_rec(m: &Mem, rp: u64) -> Result<SpawnRec, Trap> {
+    SpawnRec::parse(&m.read_window(rp, temen_ir::SPAWN_REC_LEN)?).ok_or(Trap::CapFault)
 }
 
 /// A §5 detached spawn (op 15, #1286) as its lowering resolved it: a separate module in a fresh
@@ -1975,9 +1839,9 @@ fn granted_program(
     Ok(ChildProgram::Granted(i as u32, p))
 }
 
-/// A §14 confined or §5 detached child as every in-process bytecode driver builds it — the **one
-/// definition** of admission and of the child powerbox (INVARIANTS #15), made by
-/// [`admit_confined_child`] or [`admit_detached_child`] and shared by the cooperative executor
+/// A §5 detached child as every in-process bytecode driver builds it — the **one definition** of
+/// admission and of the child powerbox (INVARIANTS #15), made by [`admit_detached_child`] (and by
+/// `admit_confined_child` for the carve spawn, until it retired, #1867) and shared by the cooperative executor
 /// (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the debug scheduler. Only *how
 /// the child is scheduled* differs per driver: an executor task, an OS thread, a debug task. (Until
 /// #1855 each driver admitted a confined child its own way, and two of them trapped on a budget or a
@@ -2058,158 +1922,6 @@ impl AdmittedChild {
             }
         }
     }
-}
-
-/// Admit a §14 confined spawn and build the child. `host` is the spawning task's own powerbox, where
-/// its handles resolve and its budget is charged (#1727); `pm` its window — the holder the carve is
-/// cut from, the grant list is read from and a module's data segments land in; `parent_fuel` what it
-/// can still burn; `spawner` the spawning frame, whose module a same-module child runs.
-///
-/// `Ok(None)` is a **probeable refusal**: the driver lands `-EINVAL`, and the budget is intact. `Err`
-/// is a trap: a forged module handle, a module this engine cannot lower, an unreadable grant record,
-/// or a handle the parent may not re-grant. The order is the tree-walker's — program, entry and
-/// carve; then a module's data segments, the powerbox and its manifest; the budget last, so a refused
-/// spawn charges nothing. The vCPU ceiling is the scheduler's to check afterwards, as for op 15.
-fn admit_confined_child(
-    host: &mut Host,
-    pm: Option<&Mem>,
-    parent_fuel: u64,
-    source: &ModuleSource,
-    spawner: &Vm,
-    s: ConfinedSpawn,
-) -> Result<Option<AdmittedChild>, Trap> {
-    // The program, and for a separate module the module: its declared window and data segments.
-    let (program, granted) = match s.module {
-        None => {
-            let (m, p) = spawner_module(source, spawner).ok_or(Trap::Malformed)?;
-            (ChildProgram::Spawner(m, p), None)
-        }
-        Some(mh) => {
-            let g = host.resolve_module(mh)?;
-            let program = granted_program(host, source, g)?;
-            (program, Some(std::sync::Arc::clone(&g.module)))
-        }
-    };
-    let sig = match &program {
-        ChildProgram::Spawner(_, p) | ChildProgram::Granted(_, p) => p.sigs.get(s.entry as usize),
-    };
-    let arity = sig.map_or(0, |(p, _)| p.len());
-    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
-    let child_size = if (0..64).contains(&s.size_log2) {
-        1u64 << s.size_log2
-    } else {
-        0
-    };
-    let off = s.off as u64;
-    // #1094: the holder's own guard. A nested holder in a sub-guard carve is unguarded, so it may
-    // carve below the root's guard.
-    let guard = pm.map_or(0, |m| m.null_guard);
-    let fits = carve_fits(off, s.size_log2, s.isize, s.ibase, guard);
-    // A separate module's carve is at least its declared memory (FORK.md §8.6 / #773: the span above
-    // it is heap room an allocating phase grows into via `vm_map`; §2 still confines every access
-    // to the carve).
-    let mod_ok = granted.as_ref().is_none_or(|gm| {
-        gm.memory
-            .is_some_and(|mc| mc.size_log2 <= s.size_log2 as u8)
-    });
-    if !ok_entry || !fits || !mod_ok {
-        return Ok(None);
-    }
-    // Holder-relative → backing-absolute, so nesting composes at any depth.
-    let base = pm.map_or(0, |m| m.window.base()) + s.ibase + off;
-    // A module's data segments land in the carve now, as if the child wrote them (the verifier
-    // bounded them to its declared window). `readonly` is not enforced for a nested child —
-    // intra-domain self-corruption is a §1 non-goal — as on the tree-walker.
-    if let (Some(gm), Some(m)) = (&granted, pm) {
-        m.write_segments(base, &gm.data, child_size);
-    }
-    let module = granted.as_ref();
-    let Some((mut child_host, cinst, cas)) =
-        confined_child_host(host, pm, s.grants, child_size, module)?
-    else {
-        return Ok(None);
-    };
-    // §3d: a record's budget funds the child here, after every other refusal. #989 slice 1b: its
-    // `channel` ceiling is read before `take_spawn_budget` drains it.
-    // A carve child's fixed allowance, as it always was (#1944 slice 3 leaves the carve path's fuel
-    // alone until #1867 deletes it).
-    let fuel = Fuel::fixed(if s.budget != 0 {
-        let channel = host.peek_budget(s.budget).map(|b| b.channel);
-        let Some(fuel) = take_spawn_budget(host, s.budget, child_size, parent_fuel)? else {
-            return Ok(None);
-        };
-        if let Some(cap) = channel {
-            child_host.set_channel_cap(cap);
-        }
-        fuel
-    } else if s.quota <= 0 {
-        parent_fuel
-    } else {
-        (s.quota as u64).min(parent_fuel)
-    });
-    Ok(Some(AdmittedChild {
-        mem: pm.map(|m| m.nested_view(base, s.size_log2 as u8, m.shadow_arena())),
-        host: child_host,
-        program,
-        args: child_entry_args(arity, cinst, cas),
-        fuel,
-        lease: None,
-    }))
-}
-
-/// A §14 confined child's powerbox, built from the spawning task's own powerbox `host` (#1570,
-/// #1855). The by-name grant list — `grants_n` × 16-byte `{name_off:u32, name_len:u32, handle:i32,
-/// _:u32}` records in the holder's window `pm`, the tree-walker's format — re-grants each named cap
-/// via [`Host::spawn_named_child`]; with no list the child gets only its starter
-/// `Instantiator`/`AddressSpace` over `[0, child_size)`.
-///
-/// A separate-module child (`module`) serves its *own* offers and binds its own import manifest
-/// (§3.6; IMPORTS.md phase 3 — a chibicc child's `write`/`read`/`exit` resolve here, or its first
-/// `write` would `CapFault`). A same-module child serves over the parent's registered module and binds
-/// the parent's manifest leniently, and only when the spawn handed it caps by name: a grant-less
-/// child was given nothing to bind (#1234).
-///
-/// Returns the host and its starter handles. `Ok(None)` is a **probeable refusal**: a `required` import
-/// slot with nothing to bind, which the tree-walker answers `-EINVAL` for. `Err` is a trap: an
-/// unreadable record, a non-UTF-8 name, or a handle the parent may not re-grant.
-fn confined_child_host(
-    host: &mut Host,
-    pm: Option<&Mem>,
-    grants: Option<(u64, u64)>,
-    child_size: u64,
-    module: Option<&std::sync::Arc<Module>>,
-) -> Result<Option<(Host, i32, i32)>, Trap> {
-    let (mut child_host, cinst, cas) = match grants {
-        Some((grants_ptr, grants_n)) => {
-            let m = pm.ok_or(Trap::Malformed)?;
-            let list = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))?;
-            host.spawn_named_child(&list, child_size)
-                .ok_or(Trap::CapFault)?
-        }
-        None => {
-            let mut ch = host.child_host();
-            let (cinst, cas) = ch.grant_starter_caps(child_size);
-            (ch, cinst, cas)
-        }
-    };
-    let bound = match module {
-        Some(cm) => {
-            child_host.set_self_module(cm);
-            child_host
-                .bind_child_manifest(&cm.imports, &cm.types)
-                .is_ok()
-        }
-        None => {
-            child_host.set_self_module_opt(host.self_module.clone());
-            match (grants, &host.self_module) {
-                (Some(_), Some(sm)) => child_host
-                    .bind_same_module_manifest(&sm.imports, &sm.types)
-                    .is_ok(),
-                _ => true,
-            }
-        }
-    };
-    Ok(bound.then_some((child_host, cinst, cas)))
 }
 
 /// A child's entry task in `module` (`prog`, its landed program) and its own natural dispatch table
@@ -2607,9 +2319,7 @@ fn compile_module_with(
     // FORK.md §9.2 — the bytecode fork-serving escape: a fork-shaped module (`bytecode_serves_fork`)
     // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     // #744 — so is a module whose serve handlers cannot park, on a driver that serves its children.
-    if (s.has_coro && (s.has_fiber || s.has_thread))
-        || (s.svc_park_veto() && !s.bytecode_serves_fork() && !escape)
-    {
+    if s.svc_park_veto() && !s.bytecode_serves_fork() && !escape {
         return None;
     }
 
@@ -3148,51 +2858,12 @@ fn compile_inst(
         } => {
             use super::cap_id;
             match (*type_id, *op) {
-                // §14 executor children — instantiate (op 0) spawns a confined child on the scheduler;
-                // join (op 1) parks until it finishes, reusing the §12 thread join machinery (children
-                // share the `threads` handle namespace). The separate-module / demand variants (5/6/7
-                // and op 4) and the JIT / SharedRegion-grant variants need seams this slice doesn't
-                // drive: reject (fall back).
-                (cap_id::INSTANTIATOR, 0) if args.len() >= 4 => Op::Instantiate {
-                    handle: g(*handle),
-                    entry: g(args[0]),
-                    off: g(args[1]),
-                    size_log2: g(args[2]),
-                    quota: g(args[3]),
-                    dst,
-                    grants: None,
-                },
                 // op 18 = wait: join's park, delivering how the child ended (`join_delivery`).
                 (cap_id::INSTANTIATOR, op @ (1 | 18)) if !args.is_empty() => Op::InstJoin {
                     handle: g(*handle),
                     child: g(args[0]),
                     dst,
                     wait: op == 18,
-                },
-                // op 5 = instantiate_module: the first arg is the granted `Module` handle; the carve
-                // args (entry/off/size_log2/quota) follow. (join, op 1, serves both kinds.)
-                (cap_id::INSTANTIATOR, 5) if args.len() >= 5 => Op::InstantiateModule {
-                    handle: g(*handle),
-                    module: g(args[0]),
-                    entry: g(args[1]),
-                    off: g(args[2]),
-                    size_log2: g(args[3]),
-                    quota: g(args[4]),
-                    dst,
-                    grants: None,
-                },
-                // op 13 = instantiate_module_named: op 5 + a by-name grant list. Args:
-                // (module, grants_ptr, grants_n, entry, off, size_log2, quota). The driver reads the
-                // grant records from the parent window and re-grants each cap into the child powerbox.
-                (cap_id::INSTANTIATOR, 13) if args.len() >= 7 => Op::InstantiateModule {
-                    handle: g(*handle),
-                    module: g(args[0]),
-                    entry: g(args[3]),
-                    off: g(args[4]),
-                    size_log2: g(args[5]),
-                    quota: g(args[6]),
-                    dst,
-                    grants: Some((g(args[1]), g(args[2]))),
                 },
                 // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
                 // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
@@ -3266,6 +2937,13 @@ fn compile_inst(
                         .into(),
                     results: view.sig(*sig).results.clone().into(),
                 },
+                // Every Instantiator op the oracle has no arm for traps `CapFault` there (#1867,
+                // #2069). A known op with too few args declines: the oracle's answer is `Malformed`.
+                (cap_id::INSTANTIATOR, op)
+                    if !matches!(op, 1 | 9 | 10 | 12 | 14 | 15 | 17 | 18 | 19) =>
+                {
+                    Op::CapFault
+                }
                 (cap_id::INSTANTIATOR, _) => return None,
                 (cap_id::SHARED_REGION, 4) => return None,
                 // §3.6 service points (I36 slice 1): `svc.poll` with the canonical one-result
@@ -4382,7 +4060,6 @@ impl VcpuReactor {
                 | VcpuEvent::JitInstall { .. }
                 | VcpuEvent::JitUninstall { .. }
                 | VcpuEvent::JitInvoke { .. }
-                | VcpuEvent::Instantiate { .. }
                 | VcpuEvent::InstantiateDetached { .. }
                 | VcpuEvent::CapPending { .. }
                 | VcpuEvent::StdinPark => return Err(Trap::Malformed),
@@ -4469,7 +4146,6 @@ impl VcpuReactor {
                     | VcpuEvent::Join { .. }
                     | VcpuEvent::Wait { .. }
                     | VcpuEvent::Notify { .. }
-                    | VcpuEvent::Instantiate { .. }
                     | VcpuEvent::InstantiateDetached { .. }
                     | VcpuEvent::JitInstall { .. }
                     | VcpuEvent::JitUninstall { .. }
@@ -4597,37 +4273,16 @@ pub enum VcpuEvent {
         results: Box<[ValType]>,
         mapped: Option<u64>,
     },
-    /// §14 confined child (ops 0, 5, 13, 17; THREADS.md 4c-domain §14-D2): start the admitted child
-    /// over the carve, then call [`Vcpu::deliver_child`] with the host's token for it — exactly the
-    /// [`VcpuEvent::Spawn`] protocol. All the authority-bearing work already happened in
-    /// this vCPU, in the one admission every driver uses ([`admit_confined_child`]): the carve and entry
-    /// validated (`-EINVAL` never surfaces), a module child's program resolved, compiled and **pushed to
-    /// the shared source** and its data segments materialized into the carve, the child's powerbox
-    /// built, its budget charged. The host's job is mechanical: take the child
-    /// ([`Vcpu::take_child`]), start it over `[win + carve, win + carve + 2^size_log2)`
-    /// ([`PendingChild::start`]) on a Worker/thread, and wire its completion slot into `join` — a
-    /// confined child is just a child Worker with a shifted, smaller window (DESIGN.md §14: a
-    /// sub-window is indistinguishable from a top-level window).
-    Instantiate {
-        /// The child's module: the spawning frame's for a same-module child; the pushed
-        /// shared-source index for a separate module.
-        module: u32,
-        entry: u32,
-        /// Byte offset of the carve within **this vCPU's window** (the host adds its own window
-        /// base/pointer — nesting then composes with no special casing: a confined child's own
-        /// `Instantiate` events are relative to *its* window).
-        carve: u64,
-        size_log2: u8,
-    },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): start a child in a **fresh window the
-    /// host mints** — no carve, nothing of it in the parent's window. The engine already admitted it
-    /// with the one admission every driver uses ([`admit_detached_child`]): the entry, the window =
-    /// the declared memory, the `Budget` quota; its powerbox built (the starter caps span the
-    /// reservation, as a root's do, so `vm_map` grows the window), its module compiled and pushed.
-    /// The host takes the child ([`Vcpu::take_child`]), starts it over a backing it mints for the
-    /// window ([`PendingChild::start`], which seeds the data segments, the payload and a pre-mapped
-    /// region), and delivers its token ([`Vcpu::deliver_child`]) — the [`VcpuEvent::Instantiate`]
-    /// protocol minus the carve. A host that runs the child on an emitted tier takes its powerbox
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17; THREADS.md
+    /// 4c-domain §14-D2): start a child in a **fresh window the host mints** — nothing of it in the
+    /// parent's window. The engine already admitted it with the one admission every driver uses
+    /// ([`admit_detached_child`]): the entry, the window = the declared memory, the `Budget` quota;
+    /// its powerbox built (the starter caps span the reservation, as a root's do, so `vm_map` grows
+    /// the window), its module compiled and pushed. The host takes the child
+    /// ([`Vcpu::take_child`]), starts it over a backing it mints for the window
+    /// ([`PendingChild::start`], which seeds the data segments, the payload and a pre-mapped region)
+    /// on a Worker/thread, and delivers its token ([`Vcpu::deliver_child`]) — exactly the
+    /// [`VcpuEvent::Spawn`] protocol. A host that runs the child on an emitted tier takes its powerbox
     /// instead ([`PendingChild::into_powerbox`]), seeds the payload ([`PendingChild::payload`]) and,
     /// since its window cannot alias, copies a pre-mapped region ([`Host::take_premap`]) in before
     /// and out after the run.
@@ -4686,10 +4341,9 @@ enum Opens {
 /// engine semantics work whether the host orchestrates with native threads or wasm Workers. Scope:
 /// `thread.spawn`/`join` + `memory.wait`/`notify` + atomics + compute, §22
 /// guest-JIT (`install`/`uninstall`/`invoke`) serviced as host events against the **shared**
-/// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (`spawn_coroutine_module`
-/// serviced internally; the confined and detached spawns surfacing [`VcpuEvent::Instantiate`] and
-/// [`VcpuEvent::InstantiateDetached`], whose admitted child the host takes ([`Vcpu::take_child`]) and
-/// starts on its own Worker). By default carries a deny-all `Host` (an
+/// [`Domain`], and — for a vCPU carrying a powerbox — the §14 domain ops (a spawn surfacing
+/// [`VcpuEvent::InstantiateDetached`], whose admitted child the host takes ([`Vcpu::take_child`])
+/// and starts on its own Worker). By default carries a deny-all `Host` (an
 /// I/O `call.cap` is an inert `CapFault`); attach the run's shared powerbox with
 /// [`with_shared_host`](Vcpu::with_shared_host) (THREADS.md 4d) and `call.cap` host I/O works from
 /// every vCPU sharing it, serialized per call — the parallel driver's 4c-host model.
@@ -4752,8 +4406,8 @@ pub struct Vcpu<'p> {
     /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
     /// slots — the caller's window base is the one the spill persisted).
     pending_tierup: Option<(usize, Box<[ValType]>)>,
-    /// The child the last [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced
-    /// — admitted, and waiting for the host to take it ([`take_child`](Self::take_child)).
+    /// The child the last [`VcpuEvent::InstantiateDetached`] announced — admitted, and waiting for
+    /// the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
     /// The children this vCPU spawned — threads and §14 children — indexed by the handle the guest
     /// joins them by, issued densely (0, 1, …) as the host delivers each one
@@ -4786,9 +4440,8 @@ struct VcpuChild {
     ended: Option<Result<Vec<Value>, Trap>>,
 }
 
-/// A child that a [`VcpuEvent::Instantiate`] (§14, confined) or [`VcpuEvent::InstantiateDetached`]
-/// (§5, op 15) announced, as the engine admitted it. The one admission every driver uses
-/// ([`admit_confined_child`], [`admit_detached_child`]) built its powerbox — the starter
+/// A child that a [`VcpuEvent::InstantiateDetached`] (§5, ops 15 and 17) announced, as the engine
+/// admitted it. The one admission every driver uses ([`admit_detached_child`]) built its powerbox — the starter
 /// `Instantiator`/`AddressSpace`, the by-name re-grants, the module it serves and its import
 /// manifest, a funding budget's channel ceiling, a pre-mapped region — charged its budget, and landed
 /// its program in the run's shared source. What is left for the host is mechanism: a region for the
@@ -4802,21 +4455,14 @@ pub struct PendingChild {
     entry: u32,
     args: Vec<Value>,
     fuel: Fuel,
-    window: ChildWindow,
+    /// Its fresh window (§5), seeded when it is built.
+    window: FreshWindow,
 }
 
 const _: fn() = || {
     fn send<T: Send>() {}
     send::<PendingChild>();
 };
-
-/// The window a [`PendingChild`] runs in.
-enum ChildWindow {
-    /// A `1 << log2` carve of the spawner's window, already holding the child's bytes (§14).
-    Carve(u8),
-    /// A fresh window of its own (§5), seeded when it is built.
-    Fresh(FreshWindow),
-}
 
 impl PendingChild {
     /// The module the child runs, as its spawner's program source numbers it, and its entry — what
@@ -4831,33 +4477,15 @@ impl PendingChild {
         self.host.self_module.as_ref()
     }
 
-    /// Start the child as a vCPU over `back`. For a confined child, `back` covers exactly its carve —
-    /// `[win + carve, +2^size_log2)` of the parent's window, which per DESIGN.md §14 simply *is* the
-    /// child's window (anything the parent wrote there, a module child's data segments, is already in
-    /// it). For a detached child, `back` is a fresh backing the host minted; the engine seeds it (the
-    /// module's data segments under the NULL guard, the args payload, a pre-mapped region), as every
-    /// other driver's window is seeded. A carve is committed whole, as on every other driver, unless
-    /// `committed_log2` commits less at start and leaves the child to `vm_map` the rest (#1123 slice 4:
-    /// the op-13 phase lanes' shape, #1253); a fresh window always starts at its declared size.
+    /// Start the child as a vCPU over `back`, a fresh backing the host minted; the engine seeds it
+    /// (the module's data segments under the NULL guard, the args payload, a pre-mapped region), as
+    /// every other driver's window is seeded. The window starts at its declared size.
     pub fn start(
         mut self,
         prog: &VcpuProgram,
         back: std::sync::Arc<super::Region>,
-        committed_log2: Option<u8>,
     ) -> Result<Vcpu<'_>, Trap> {
-        let mem = match (&self.window, committed_log2) {
-            (ChildWindow::Carve(log2), committed) => {
-                let shadow = prog
-                    .dom
-                    .source
-                    .get(self.module as usize)
-                    .ok_or(Trap::Malformed)?
-                    .shadow;
-                carve_window(back, committed.unwrap_or(*log2), *log2, shadow)?
-            }
-            (ChildWindow::Fresh(w), None) => w.build(Some(back), &mut self.host)?,
-            (ChildWindow::Fresh(_), Some(_)) => return Err(Trap::Malformed),
-        };
+        let mem = self.window.build(Some(back), &mut self.host)?;
         Vcpu::child_over(
             prog,
             self.module,
@@ -4882,36 +4510,12 @@ impl PendingChild {
         (self.host, inst, space)
     }
 
-    /// The spawn-time args payload a detached child's window starts with at `module_args_base()`:
-    /// empty for a confined child, and for a detached spawn that passed none. For a host that runs
-    /// the child on an emitted tier and so seeds its window itself
-    /// ([`into_powerbox`](Self::into_powerbox)).
+    /// The spawn-time args payload the child's window starts with at `module_args_base()`, empty
+    /// for a spawn that passed none. For a host that runs the child on an emitted tier and so seeds
+    /// its window itself ([`into_powerbox`](Self::into_powerbox)).
     pub fn payload(&self) -> &[u8] {
-        match &self.window {
-            ChildWindow::Fresh(w) => &w.payload,
-            ChildWindow::Carve(_) => &[],
-        }
+        &self.window.payload
     }
-}
-
-/// A confined child's window over `back`, a region covering its `1 << carve_log2` carve: committed
-/// to `1 << committed_log2` at start and `vm_map`-growable to the carve (#1123 slice 4), under the
-/// NULL guard. #964/#1094/#1206: the guard is the one canonical layout — a carve reserves `[0,
-/// POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested arm and every
-/// cross-tier bounce over the same carve seed it; the emitted tier's guard compare is unconditional).
-/// `seed_null_guard` skips a carve smaller than the guard, so a tiny sub-window stays fully usable.
-fn carve_window(
-    back: std::sync::Arc<super::Region>,
-    committed_log2: u8,
-    carve_log2: u8,
-    shadow: Option<super::ShadowArena>,
-) -> Result<Mem, Trap> {
-    if carve_log2 >= 64 || committed_log2 > carve_log2 {
-        return Err(Trap::Malformed);
-    }
-    let mut mem = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, committed_log2, back, shadow);
-    mem.seed_null_guard(temen_ir::module_null_guard());
-    Ok(mem)
 }
 
 impl<'p> Vcpu<'p> {
@@ -5676,31 +5280,11 @@ impl<'p> Vcpu<'p> {
                         mapped,
                     };
                 }
-                // §14 confined children (ops 0, 5, 13, 17): admitted by `admit_confined_child`, the
-                // one admission every driver uses, against this vCPU's own window, fuel and powerbox.
-                // A refusal lands `-EINVAL` in place and the run continues; a forged handle traps. The
-                // admitted child waits in `pending_child` while [`VcpuEvent::Instantiate`] asks the
-                // host for mechanism only — a region over the carve and a thread or Worker to run it
-                // on ([`take_child`](Self::take_child)).
-                Ok(VcpuStop::Instantiate { spawn, dst }) => match self.admit_confined(spawn) {
-                    Ok(Some((child, carve))) => {
-                        let (module, entry) = (child.module, child.entry);
-                        self.pending = Some(dst);
-                        self.pending_child = Some(child);
-                        return VcpuEvent::Instantiate {
-                            module,
-                            entry,
-                            carve,
-                            size_log2: spawn.size_log2 as u8,
-                        };
-                    }
-                    Ok(None) => self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32)),
-                    Err(t) => return VcpuEvent::Trapped(t),
-                },
-                // op 15 (`instantiate_detached`, #1286): admitted by `admit_detached_child`, the one
-                // admission every driver uses, as the confined arm above. The child's window is fresh
-                // rather than a carve, so the host mints its backing and `PendingChild::start` seeds
-                // it. `true`: this engine leaves the capture of a durable domain's detached child to
+                // op 15 (`instantiate_detached`, #1286) and a §3d record (op 17): admitted by
+                // `admit_detached_child`, the one admission every driver uses, against this vCPU's
+                // own window and powerbox. A refusal lands `-EINVAL` in place and the run continues; a
+                // forged handle traps. The child's window is fresh, so the host mints its backing and
+                // `PendingChild::start` seeds it. `true`: this engine leaves the capture of a durable domain's detached child to
                 // its embedder's freeze.
                 Ok(VcpuStop::InstantiateDetached { spawn, dst }) => {
                     let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
@@ -5729,7 +5313,6 @@ impl<'p> Vcpu<'p> {
                     match admitted {
                         Ok(Some((child, window))) => {
                             let (size_log2, lease) = (window.size_log2, child.lease);
-                            let window = ChildWindow::Fresh(window);
                             match self.pending_child(child, spawn.entry as u32, window) {
                                 Ok(child) => {
                                     // The window lease, filed against the handle the host delivers.
@@ -5758,7 +5341,7 @@ impl<'p> Vcpu<'p> {
         &self,
         child: AdmittedChild,
         entry: u32,
-        window: ChildWindow,
+        window: FreshWindow,
     ) -> Result<PendingChild, Trap> {
         let (module, _) = child.program.unit();
         Ok(PendingChild {
@@ -5771,45 +5354,8 @@ impl<'p> Vcpu<'p> {
         })
     }
 
-    /// Admit a §14 confined spawn of this vCPU's with [`admit_confined_child`], the one admission
-    /// every driver uses, against its own window, fuel and powerbox: the child and where its carve
-    /// starts in this vCPU's window — the host adds its window pointer, so nesting composes with no
-    /// special casing. `Ok(None)` is a refusal (`-EINVAL`); `Err` a trap (a forged handle).
-    fn admit_confined(
-        &mut self,
-        spawn: ConfinedSpawn,
-    ) -> Result<Option<(PendingChild, u64)>, Trap> {
-        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
-        let admitted = match self.shared_host {
-            Some(m) => admit_confined_child(
-                &mut m.lock_unpoisoned(),
-                self.mem.as_ref(),
-                self.fuel.can_burn(),
-                source,
-                &self.vt.active,
-                spawn,
-            ),
-            None => admit_confined_child(
-                &mut self.host,
-                self.mem.as_ref(),
-                self.fuel.can_burn(),
-                source,
-                &self.vt.active,
-                spawn,
-            ),
-        }?;
-        let Some(child) = admitted else {
-            return Ok(None);
-        };
-        let window = ChildWindow::Carve(spawn.size_log2 as u8);
-        let child = self.pending_child(child, spawn.entry as u32, window)?;
-        let carve =
-            self.mem.as_ref().map_or(0, |m| m.window.base()) + spawn.ibase + spawn.off as u64;
-        Ok(Some((child, carve)))
-    }
-
-    /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`],
-    /// [`VcpuEvent::Instantiate`] or [`VcpuEvent::InstantiateDetached`] announced, once the host has
+    /// Deliver the host's `token` for the child the last [`VcpuEvent::Spawn`] or
+    /// [`VcpuEvent::InstantiateDetached`] announced, once the host has
     /// started it. The engine files it under the next handle — the spawn's result, which the guest
     /// joins it by — and hands the token back on that join ([`VcpuEvent::Join`]). A token is whatever
     /// finds the child again on the host's side: a completion slot, a thread id, an index.
@@ -5873,7 +5419,7 @@ impl<'p> Vcpu<'p> {
             None => self.host.resolve_instantiator(inst)?,
         };
         let sr = read_spawn_rec(self.mem.as_ref().ok_or(Trap::Malformed)?, rec)?;
-        if !sr.detached || sr.pager != u32::MAX {
+        if sr.pager != u32::MAX {
             return Err(Trap::CapFault);
         }
         let spawn = DetachedSpawn::of(&sr);
@@ -5902,7 +5448,7 @@ impl<'p> Vcpu<'p> {
             return Ok(None);
         };
         let (size_log2, lease) = (window.size_log2, child.lease);
-        let child = self.pending_child(child, spawn.entry as u32, ChildWindow::Fresh(window))?;
+        let child = self.pending_child(child, spawn.entry as u32, window)?;
         self.pending_lease = lease;
         Ok(Some((child, size_log2)))
     }
@@ -5915,8 +5461,8 @@ impl<'p> Vcpu<'p> {
         }
     }
 
-    /// Take the child the just-surfaced [`VcpuEvent::Instantiate`] or
-    /// [`VcpuEvent::InstantiateDetached`] announced — admitted, its powerbox built — to start it
+    /// Take the child the just-surfaced [`VcpuEvent::InstantiateDetached`] announced — admitted, its
+    /// powerbox built — to start it
     /// ([`PendingChild::start`]) or run it on an emitted tier ([`PendingChild::into_powerbox`]).
     /// One-shot per event; a host that declines the spawn simply never takes it.
     pub fn take_child(&mut self) -> Option<PendingChild> {
@@ -8571,16 +8117,6 @@ fn service_advance(
                 woken += wake_fiber_waiters(regs, key, want - woken);
                 tasks[ti].deliver(dst, Reg::from_i32(woken as i32));
             }
-            // §14 confined children (ops 0, 5, 13, 17): the executor's admission, scheduled as a debug
-            // task over its own `DbgEnv`, so a spawning guest stays steppable through its child.
-            Outcome::Instantiate { spawn, dst } => {
-                *turn += 1;
-                if let Err(t) = dbg_instantiate_confined(
-                    tasks, ti, extra_envs, source, mem, fuel, host, spawn, dst,
-                ) {
-                    complete(tasks, ti, Err(t));
-                }
-            }
             // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
             // cooperative executor's spawn on this path, so a spawning guest stays steppable through
             // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
@@ -8680,54 +8216,6 @@ fn service_advance(
         },
     }
     Serviced::Ran
-}
-
-/// §14 confined children (ops 0, 5, 13, 17) under the debug scheduler: [`admit_confined_child`] —
-/// the executor's admission and child powerbox — then [`dbg_start_child`]. Writes the handle (or
-/// `EINVAL`) to `dst`; `Err` is a trap the caller completes `ti` with: a forged module handle, an
-/// un-lowerable module, an unreadable grant list, or the vCPU-count bomb.
-#[allow(clippy::too_many_arguments)]
-fn dbg_instantiate_confined(
-    tasks: &mut Vec<TaskSlot>,
-    ti: usize,
-    extra_envs: &mut Vec<DbgEnv>,
-    source: &ModuleSource,
-    shared_mem: &Option<Mem>,
-    shared_fuel: &Fuel,
-    host: &mut Host,
-    spawn: ConfinedSpawn,
-    dst: u32,
-) -> Result<(), Trap> {
-    // The spawning task's window and fuel, and the powerbox its handles resolve in: its own (#1727).
-    let (pm, owner, pfuel) = match tasks[ti].env {
-        None => (shared_mem.as_ref(), &mut *host, shared_fuel),
-        Some(k) => {
-            let e = &mut extra_envs[k];
-            (e.mem.as_ref(), &mut e.host, &e.fuel)
-        }
-    };
-    let Some(child) = admit_confined_child(
-        owner,
-        pm,
-        pfuel.can_burn(),
-        source,
-        &tasks[ti].vm.vt.active,
-        spawn,
-    )?
-    else {
-        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-        return Ok(());
-    };
-    dbg_start_child(
-        tasks,
-        ti,
-        extra_envs,
-        host,
-        child,
-        spawn.entry,
-        dst,
-        EnvPlace::Carve,
-    )
 }
 
 /// Schedule an admitted §14/§5 child as a debug task over its own [`DbgEnv`], registered as a child
@@ -11376,19 +10864,11 @@ enum Outcome {
     PipeWrite {
         pipe: u32,
     },
-    /// §14 `Instantiator.instantiate` / `instantiate_module[_named]` / a §3d record (ops 0, 5, 13,
-    /// 17): the authority `(ibase, isize)` is resolved; the driver builds the **confined executor
-    /// child** `spawn` describes with its own attenuated powerbox, registers it (handle = thread
-    /// slot), and writes the handle (or `EINVAL`) to `dst`. Unlike a coroutine, the child runs on the
-    /// scheduler — joinable via the shared thread machinery (`Instantiator.join` compiles to
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) or a §3d record (op 17): the driver
+    /// admits the separate-module child `spawn` describes, in a fresh window of its own
+    /// ([`admit_detached_child`]), and writes the join handle (or `EINVAL`) to `dst`. The child runs
+    /// on the scheduler, joinable via the shared thread machinery (`Instantiator.join` compiles to
     /// [`Outcome::ThreadJoin`]).
-    Instantiate {
-        spawn: ConfinedSpawn,
-        dst: u32,
-    },
-    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): the driver admits the separate-module
-    /// child `spawn` describes, in a fresh window of its own ([`admit_detached_child`]), and writes
-    /// the join handle (or `EINVAL`) to `dst`.
     InstantiateDetached {
         spawn: DetachedSpawn,
         dst: u32,
@@ -12958,8 +12438,7 @@ fn drive_nested(
             // the same way (its `below` guard) and the native tier before it trampolines
             // (`temen_run::invoke_refuses`). An *installed* unit spawns like the base module (#1726).
             // (A tier-up bounce — `run_meta` `Some` — keeps the catch-all's refusal below.)
-            Outcome::Instantiate { .. }
-            | Outcome::InstantiateDetached { .. }
+            Outcome::InstantiateDetached { .. }
             | Outcome::ChildOffer { .. }
             | Outcome::ChildCtl { .. }
                 if run_meta.is_none() =>
@@ -13095,12 +12574,6 @@ enum VcpuStop {
         handle: i32,
         dst: u32,
         wait: bool,
-    },
-    /// §14 confined child (ops 0, 5, 13, 17): the driver (which owns the task set / extra
-    /// environments) admits it with [`admit_confined_child`] and registers it as a joinable thread.
-    Instantiate {
-        spawn: ConfinedSpawn,
-        dst: u32,
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
@@ -13416,7 +12889,6 @@ fn step_vcpu(
             Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
             Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
             Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
-            Outcome::Instantiate { spawn, dst } => return Ok(VcpuStop::Instantiate { spawn, dst }),
             Outcome::InstantiateDetached { spawn, dst } => {
                 return Ok(VcpuStop::InstantiateDetached { spawn, dst })
             }
@@ -16215,60 +15687,6 @@ impl SchedCore {
                 let handle = tasks[ti].threads.len() as i32;
                 tasks[ti].threads.push(Some(cidx));
                 tasks[ti].deliver(dst, Reg::from_i32(handle));
-            }
-            // §14 confined children (ops 0, 5, 13, 17): admitted by the one shared
-            // `admit_confined_child` against the spawning task's own window, fuel and powerbox
-            // (#1727), then a task of this executor over its own environment — a nested child is
-            // its own domain (a fresh natural table over the module it runs, no installed §22
-            // units). `join` is the shared seam below.
-            Ok(VcpuStop::Instantiate { spawn, dst }) => {
-                let pm: Option<&Mem> = match tasks[ti].env {
-                    None => mem.as_ref(),
-                    Some(k) => extra_envs[k].mem.as_ref(),
-                };
-                let pfuel = match tasks[ti].env {
-                    None => fuel.can_burn(),
-                    Some(k) => extra_envs[k].fuel.can_burn(),
-                };
-                let spawner = &tasks[ti].vm.vt.active;
-                let admitted = admit_confined_child(
-                    &mut task_host(root, extra_envs, tasks[ti].env).lock_unpoisoned(),
-                    pm,
-                    pfuel,
-                    &dom.source,
-                    spawner,
-                    spawn,
-                );
-                let child = match admitted {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
-                        return None;
-                    }
-                    Err(t) => {
-                        complete(tasks, ti, Err(t));
-                        return None;
-                    }
-                };
-                // #816 env-routed tier-up, #2248: the child tiers up the program it runs when that
-                // program has an emit — the spawner's own, or a granted module's, offered to the
-                // host the first time a child runs it — and its window is servable (`nested_view`
-                // shares the parent backing, so a root-lineage carve always is; a fork twin's
-                // descendant is gated by its backing like the twin). The driver serves each of the
-                // child's tier-ups over its own carve via the pending-env routing
-                // (`CoopRun::pending_win`/`mem_map_info`). The emitted module's per-access live
-                // bound confines them to the carve; an access whose bound the emitter elided stays
-                // inside the window the module was emitted for, which its carve is at least
-                // ([`ModuleOffer`]; elision is off for instantiator-bearing modules, temen-wasm-jit
-                // `elide_bound`).
-                let tierup = programs
-                    .for_child(&child.program, &child.host, &dom.source)
-                    .filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
-                let started =
-                    coop_start_child(tasks, extra_envs, root, ti, child, spawn.entry, dst, tierup);
-                if let Err(t) = started {
-                    complete(tasks, ti, Err(t));
-                }
             }
             // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
             // **fresh window of its own** (`Mem::from_spec`, its own guard) — not a carve — the
@@ -20616,85 +20034,6 @@ impl Vm {
                         personality: false,
                     });
                 }
-                Op::Instantiate {
-                    handle,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                } => {
-                    let ih = r!(*handle).i32();
-                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
-                    let entry = r!(*entry).i64();
-                    let off = r!(*off).i64();
-                    let size_log2 = r!(*size_log2).i64();
-                    let quota = r!(*quota).i64();
-                    // op 11: resolve the grant-list `(ptr, count)` from their registers (op 0 is None).
-                    let grants = grants.map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64));
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::Instantiate {
-                        spawn: ConfinedSpawn {
-                            ibase,
-                            isize: isz,
-                            module: None,
-                            entry,
-                            off,
-                            size_log2,
-                            quota,
-                            grants,
-                            budget: 0,
-                        },
-                        dst,
-                    });
-                }
-                // §14 separate-module executor child — like `Instantiate`, but the first arg is a
-                // granted `Module` handle (the slot ABI crosses it as an i64; low 32 bits) whose
-                // program the driver resolves + compiles + runs.
-                Op::InstantiateModule {
-                    handle,
-                    module: module_reg,
-                    entry,
-                    off,
-                    size_log2,
-                    quota,
-                    dst,
-                    grants,
-                } => {
-                    let ih = r!(*handle).i32();
-                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
-                    let mh = r!(*module_reg).i64() as i32;
-                    let entry = r!(*entry).i64();
-                    let off = r!(*off).i64();
-                    let size_log2 = r!(*size_log2).i64();
-                    let quota = r!(*quota).i64();
-                    // op 13: resolve the grant-list `(ptr, count)` from their registers (op 5 is None).
-                    let grants = grants.map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64));
-                    let dst = *dst;
-                    self.module = module;
-                    self.cur = cur;
-                    self.base = base;
-                    self.pc = pc + 1;
-                    return Ok(Outcome::Instantiate {
-                        spawn: ConfinedSpawn {
-                            ibase,
-                            isize: isz,
-                            module: Some(mh),
-                            entry,
-                            off,
-                            size_log2,
-                            quota,
-                            grants,
-                            budget: 0,
-                        },
-                        dst,
-                    });
-                }
                 // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
                 // CapFault, as every op above); the budget's quota take and the module resolve happen at
                 // the driver's commit site (`admit_detached_child`), peek-then-drain like op 13.
@@ -20731,75 +20070,28 @@ impl Vm {
                     self.pc = pc + 1;
                     return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
-                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from
-                // this vCPU's confined window and fail closed exactly as the tree-walker's arm does
-                // (bad version / pager / budget-quota mix / dangling budget handle → `CapFault`).
-                // This tier never natively demand-pages: the module-level entries decline any
-                // op-17 module with impl exports ([`compile_module_for`]), so a surviving pager
-                // field can only come from an export-less module — which `CapFault`s identically
-                // on the tree-walker. Geometry validation and the budget **drain** stay in the one
-                // admission (`admit_confined_child`), after every refusal, so a refused spawn
-                // leaves the budget intact — the tree-walker's peek-then-drain discipline. (One
-                // known error-order seam, shared with ops 11/13: an invalid grant list *plus* bad
-                // geometry lands `-EINVAL` here but `CapFault` on the tree-walker, because the
-                // admission parses grant records after the geometry.)
+                // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the record from this vCPU's
+                // confined window and fail closed exactly as the tree-walker's arm does (bad version
+                // or reserved field → `CapFault`). A record is op 15 as data (#1863): the same outcome
+                // op 15 produces, served by every driver's detached arm. This tier never natively
+                // demand-pages: the module-level entries decline any op-17 module with a pager-shaped
+                // export ([`compile_module_for`]), so a surviving pager field can only come from a
+                // module without one — which `CapFault`s identically on the tree-walker.
                 Op::InstantiateRec { handle, rec, dst } => {
                     let ih = r!(*handle).i32();
-                    let (ibase, isz) = host.with(|p| p.resolve_instantiator(ih))?;
+                    host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
-                    // Shared layout decode (#911); pager/budget handling stays tier-local.
                     let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
-                    if sr.detached {
-                        // #1863: a v1 record is op 15 as data — the same outcome op 15 produces,
-                        // served by every driver's detached arm. No pager on this tier (see above).
-                        if sr.pager != u32::MAX {
-                            return Err(Trap::CapFault);
-                        }
-                        let dst = *dst;
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc + 1;
-                        let spawn = DetachedSpawn::of(&sr);
-                        return Ok(Outcome::InstantiateDetached { spawn, dst });
-                    }
-                    let entry = sr.entry as i64;
-                    let off = sr.off as i64;
-                    let size_log2 = sr.size_log2;
-                    let modh = sr.modh;
-                    let budget = sr.budget;
-                    let quota = sr.quota;
                     if sr.pager != u32::MAX {
-                        return Err(Trap::CapFault); // no impl exports here (see above) — fail closed
+                        return Err(Trap::CapFault);
                     }
-                    if budget != 0 {
-                        if quota != 0 {
-                            return Err(Trap::CapFault); // budget + raw quota is ambiguous
-                        }
-                        // Validate the handle now (dangling → CapFault, as the tree-walker);
-                        // the drain waits for the drivers' commit.
-                        host.with(|p| p.peek_budget(budget).map(|_| ()).ok_or(Trap::CapFault))?;
-                    }
-                    let grants = (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    return Ok(Outcome::Instantiate {
-                        spawn: ConfinedSpawn {
-                            ibase,
-                            isize: isz,
-                            module: (modh >= 0).then_some(modh),
-                            entry,
-                            off,
-                            size_log2,
-                            quota,
-                            grants,
-                            budget,
-                        },
-                        dst,
-                    });
+                    let spawn = DetachedSpawn::of(&sr);
+                    return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
                 // (executor children live in the same `threads` handle namespace as `thread.spawn`).
@@ -20963,6 +20255,7 @@ impl Vm {
                     LAST_UNREACHABLE_FUNC.with(|c| c.set(cur as u32)); // #1382: record where we trapped
                     return Err(Trap::Unreachable);
                 }
+                Op::CapFault => return Err(Trap::CapFault),
                 Op::Eval {
                     inst,
                     block_base,

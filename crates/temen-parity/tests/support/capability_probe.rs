@@ -64,24 +64,22 @@ pub struct Row {
     /// serviced answer, so zeros are enough to ask "can this driver run this op at all". They are
     /// *not* enough to ask "do the drivers agree about a **valid** call", because a zero handle is
     /// forged and every driver rightly rejects it before reaching the interesting code. #1570 is
-    /// exactly that trap: op 13's drivers agreed on a forged module handle while disagreeing about a
-    /// real one, so a zeros-only probe would have scored the cell green over a live divergence.
+    /// exactly that trap: the retired op 13's drivers agreed on a forged module handle while
+    /// disagreeing about a real one, so a zeros-only probe would have scored the cell green over a
+    /// live divergence.
     pub mint: Mint,
 }
 
-/// `instantiate_module_named`'s argument slots the probe fills with real values: the `Module` handle
-/// (argument 0) and a `size_log2` matching that module's declared memory (argument 5). Arguments 1
-/// and 2 are `grants_ptr`/`grants_n`, and 3/4/6 are entry/off/quota, which zeros suit.
+/// `instantiate_detached`'s (op 15's) argument slot the probe fills with a real value: the `Module`
+/// handle (argument 1). Argument 0 is the `Budget`, and the rest are grants/entry/size/quota, which
+/// zeros suit.
 ///
-/// With zeros in both of these the call dies at its handle resolve (`CapFault`), so the admission
-/// path where the drivers differed (#1570) went untested. With them, the sweep reaches admission and
-/// the two drivers' answers are comparable. It does not reach a *completed* spawn with a non-empty
-/// grant list — that needs records planted in the parent window — so the column's claim is agreement
-/// through admission, which is where the divergence was.
-pub const OP13_MODULE_ARG: usize = 0;
-pub const OP13_SIZE_LOG2_ARG: usize = 5;
-/// The declared memory of [`a_module`], the module the probe grants.
-pub const PROBE_MODULE_SIZE_LOG2: i64 = 15;
+/// With a zero there the call dies at its handle resolve (`CapFault`), so the admission path where the
+/// drivers once differed (#1570, on the retired op 13) goes untested. With it, the sweep reaches
+/// admission — refused for want of a `Budget` — and the two drivers' answers are comparable. It does
+/// not reach a *completed* spawn, so the column's claim is agreement through admission, which is where
+/// the divergence was. Op 17 runs the same admission once it has read its record.
+pub const OP15_MODULE_ARG: usize = 1;
 
 /// How far past a no-op capability's (empty) interface to probe when checking that nothing on it
 /// reaches either gate.
@@ -165,28 +163,20 @@ pub fn rows() -> Vec<Row> {
                 (h, x)
             }),
         ),
-        // The spawn family: instantiate/join (0/1), the module spawns (5/13), child_offer (14),
-        // instantiate_detached (15), instantiate_rec (17). The coroutine variants (6/7) are the
-        // legacy residue the lowering rejects wholesale.
+        // The spawn family: join (1), child_offer (14), instantiate_detached (15) and
+        // instantiate_rec (17). The carve spawns (0/5/13) and the coroutine variants (6/7) are
+        // retired: every engine traps them `CapFault` (#1867, `carve_spawn_refused.rs`).
         Row {
             cap: Capability::Instantiator,
             iface: c::INSTANTIATOR,
-            ops: &[0, 1, 5, 6, 7, 13, 14, 15, 17],
-            // op 13 (`instantiate_module_named`) takes a real `Module` handle in argument
-            // `OP13_MODULE_ARG`; with the sweep's zero there it never gets past its handle resolve,
-            // so the valid-handle path where the drivers differed (#1570) went untested.
+            ops: &[1, 14, 15, 17],
+            // op 15 takes a real `Module` handle in argument `OP15_MODULE_ARG`; with the sweep's
+            // zero there it never gets past its handle resolve, so admission would go untested.
             mint: Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_instantiator(0, 1 << 16);
                 let modh = h.grant_module(&a_module());
-                (
-                    h,
-                    x,
-                    vec![
-                        (13, OP13_MODULE_ARG, modh as i64),
-                        (13, OP13_SIZE_LOG2_ARG, PROBE_MODULE_SIZE_LOG2),
-                    ],
-                )
+                (h, x, vec![(15, OP15_MODULE_ARG, modh as i64)])
             }),
         },
         row(
@@ -249,7 +239,7 @@ pub fn rows() -> Vec<Row> {
 }
 
 /// Ops are tried across this many arities: the lowering's arms are arity-guarded
-/// (`(INSTANTIATOR, 5) if args.len() >= 5`), so calling an op with too few arguments makes it look
+/// (`(INSTANTIATOR, 15) if args.len() >= 7`), so calling an op with too few arguments makes it look
 /// unsupported when it is merely miscalled. The widest arm takes 9.
 pub const MAX_ARGC: usize = 10;
 

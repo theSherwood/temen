@@ -542,29 +542,6 @@ fn a_grant_to_an_ended_child_fails() {
     );
 }
 
-/// #2220 — a grant into a carve child (op 0) is refused `-EINVAL`, live as the child is: the carve
-/// path is retired (INVARIANTS #13, #1867), and no new feature lands on it. The parent grants into a
-/// carve child that spins until it is killed, then kills and waits for it: `grant * 1000 + wait`.
-#[test]
-fn a_grant_into_a_carve_child_is_refused() {
-    let body = format!(
-        "{}  ve = i64.const 1\n  voff = i64.const {MAILBOX}\n  vsl = i64.const 16\n\
-         \x20 vq = i64.const 0\n\
-         \x20 vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ve, voff, vsl, vq)\n{}\
-         \x20 vk1 = call.cap 6 12 (i32) -> (i32) vinst (vch)\n\
-         \x20 vj = call.cap 6 18 (i32) -> (i64) vinst (vch)\n  vg64 = i64.extend_i32_s vgot\n\
-         \x20 vk = i64.const 1000\n  vx = i64.mul vg64 vk\n  vr = i64.add vx vj\n",
-        mint_and_map("g", "vreg", GRANTED),
-        grant("q", "vch", "vreg", "vgot"),
-    );
-    let m = module(&parent(&[], &body, &[("child", CHILD_SPINS)]));
-    agree_everywhere(
-        "a grant into a carve child",
-        &m,
-        &ok(-22 * 1000 + temen_ir::trap_code::THREAD_FAULT),
-    );
-}
-
 /// #2220 — a forged handle faults as a spawn grant's does (`CapFault`), and so does a handle no spawn
 /// may grant (the parent's `AddressSpace`, which names its own window's coordinates): the handle is
 /// checked before the child, so the answer does not depend on how far the child has got.

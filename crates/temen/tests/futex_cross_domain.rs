@@ -1,167 +1,167 @@
-//! PROCESS.md S0 spike (O2): do futex `wait`/`notify` rendezvous **across domains** on shared
-//! backing? The §12 futex key is the *confined absolute* address (`Mem::confine_checked` returns
-//! `window.base() + offset`, indexing the possibly-parent-sized backing), and a §14 nested child
-//! shares the parent's backing `Arc` (`Mem::nested_view`) and the parent's executor — so a parent
-//! and its nested child should rendezvous on the *same byte* under *different guest addresses*
-//! (parent: `carve_off + a`; child: `a`). These tests pin that this works by construction on the
-//! interpreter — the load-bearing fact for building endpoints as a **library** over shared memory
-//! + futex (PROCESS.md §4 "library first") instead of new runtime rendezvous machinery.
+//! PROCESS.md S0 spike (O2): do futex `wait`/`notify` rendezvous **across domains** on shared memory?
+//! A parent and its detached child share a §13 `SharedRegion`: the parent maps it at 128 KiB in its
+//! own window, and op 15 pre-maps it into the child's window at 64 KiB. The futex key of a
+//! region-aliased page is `(backing, byte offset within the region)` (`FutexKey::Region`), so the two
+//! rendezvous on the *same region byte* under *different guest addresses* in *different domains*
+//! (parent: `128 KiB + a`; child: `64 KiB + a`). That is the load-bearing fact for building endpoints
+//! as a **library** over shared memory + futex (PROCESS.md §4 "library first") instead of new runtime
+//! rendezvous machinery.
 //!
-//! Scope note (the S0 boundary, recorded): this covers the **nested** (same-backing) case only.
-//! Two *siblings* aliasing a §13 `SharedRegion` mapped at different window offsets would compute
-//! *different* keys (each keys on its own window-absolute alias address, not the region's canonical
-//! byte) — the sibling-pipe case needs its own slice if library endpoints are to span it.
+//! Pinned on every driver that schedules a child itself (`drivers::SCHEDULING`): the `Vcpu` harness
+//! runs a child to completion when it is spawned and orchestrates no `wait`.
 
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
-use temen_text::parse_module;
-use temen_verify::verify_module;
+#[path = "../../temen-interp/tests/support/drivers.rs"]
+mod drivers;
 
-/// Run `src`'s func 0 with an `Instantiator` over the whole `1<<win_log2` window.
-fn run(src: &str, win_log2: u8, fuel: u64) -> Result<Vec<Value>, Trap> {
-    let m = parse_module(src).expect("parse");
-    verify_module(&m).expect("verify");
-    let mut host = Host::new();
-    let h = host.grant_instantiator(0, 1u64 << win_log2);
-    let init = vec![0u8; 1usize << win_log2];
-    let mut f = fuel;
-    run_capture_reserved_with_host(&m, 0, &[Value::I32(h)], &mut f, &init, 0, &mut host).0
+use temen_interp::{Host, Value};
+use temen_ir::Module;
+
+fn module(src: &str) -> Module {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
 }
 
-/// Deterministic rendezvous — the key-space proof. The parent instantiates a child in a 64 KiB
-/// carve at 64 KiB, then parks on `atomic.wait` at **parent** address `64K + 20480` (expected 0,
-/// no store ever changes it; both addresses above the #1094 NULL guard). The child spin-`notify`s
-/// **its** address `20480` — the same backing
-/// byte under a different guest address — until the notify reports a waiter woken. If the keys
-/// did not collide, the parent would sleep to the wait cap and the child would spin to fuel
-/// exhaustion; instead the parent wakes (status 0 = woken, never 1 = not-equal since the value
-/// stays 0) and joins the child's 7.
+/// The parent `(Instantiator, AddressSpace, child Module, Budget) -> i64`: mints a 64 KiB region, maps
+/// it at 128 KiB, spawns the child detached with the region pre-mapped at 64 KiB of the child's
+/// window, then runs `body` (which sees the child as `vc` and the region byte 20480 as `va`) and
+/// returns its `vr`.
+fn parent(body: &str) -> Module {
+    module(&format!(
+        "memory 18
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 131072
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vmh = i64.extend_i32_u v2
+  vb = i64.extend_i32_u v3
+  vz = i64.const 0
+  vlog = i64.const 17
+  vreg = i64.extend_i32_u vrh
+  voff = i64.const 65536
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  va = i64.const 151552
+{body}
+  return vr
+  }}
+}}
+"
+    ))
+}
+
+/// The powerbox: an `Instantiator` and an `AddressSpace` over the parent's 256 KiB window, the child
+/// module, and a `Budget` for exactly one 128 KiB child window.
+fn setup(child: &str) -> impl Fn() -> (Host, Vec<Value>) {
+    let child = module(child);
+    move || {
+        let mut host = Host::new();
+        let inst = host.grant_instantiator(0, 1 << 18);
+        let aspace = host.grant_address_space(0, 1 << 18);
+        let modh = host.grant_module(&child);
+        let budget = host.grant_budget(-1, 1 << 17, -1);
+        (host, [inst, aspace, modh, budget].map(Value::I32).to_vec())
+    }
+}
+
+/// Deterministic rendezvous — the key-space proof. The parent parks on `atomic.wait` at its address
+/// of region byte 20480 (expected 0; no store ever changes it). The child spin-`notify`s **its**
+/// address of that byte, `64 KiB + 20480`, until the notify reports a waiter woken. If the keys did
+/// not collide, the parent would never wake and the child would spin to fuel exhaustion; instead the
+/// parent wakes (status 0 = woken, never 1 = not-equal since the value stays 0) and joins the
+/// child's 7.
 ///
-/// Ordering is safe on every executor shape: on a single cooperative worker the parent runs
-/// until it parks (instantiate enqueues, no switch), so the child's first notify finds it; with
+/// Ordering is safe on every executor shape: on a single cooperative worker the parent runs until
+/// it parks (the spawn enqueues the child, no switch), so the child's first notify finds it; with
 /// real parallel workers the child spins until the park lands.
 #[test]
 fn parent_waits_child_notifies_across_domains() {
-    const SRC: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0\n\
-  q0v0 = i64.const 4294967296\n\
-  q0v1 = i64.const 65536\n\
-  q0v2 = i64.const -4294967280\n\
-  q0v3 = i64.const 4294967295\n\
-  q0v4 = i64.const 0\n\
-  q0a0 = i64.const 17536\n\
-  i64.store q0a0 q0v0\n\
-  q0a1 = i64.const 17544\n\
-  i64.store q0a1 q0v1\n\
-  q0a2 = i64.const 17552\n\
-  i64.store q0a2 q0v2\n\
-  q0a3 = i64.const 17560\n\
-  i64.store q0a3 q0v3\n\
-  q0a4 = i64.const 17568\n\
-  i64.store q0a4 q0v4\n\
-  q0a5 = i64.const 17576\n\
-  i64.store q0a5 q0v4\n\
-  q0a6 = i64.const 17584\n\
-  i64.store q0a6 q0v4\n\
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)\n\
-  v6 = i64.const 86016\n\
-  v7 = i32.const 0\n\
-  v8 = i64.const -1\n\
-  v9 = i32.atomic.wait v6 v7 v8\n\
-  v10 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
-  v11 = i64.extend_i32_u v9\n\
-  v12 = i64.const 100\n\
-  v13 = i64.mul v11 v12\n\
-  v14 = i64.add v13 v10\n\
-  return v14\n\
-  }\n\
-}\n\
-func (i64) -> (i64) {\n\
-block 0 (v0: i64) {\n\
-  br 1()\n\
-}\n\
-block 1 () {\n\
-  v1 = i64.const 20480\n\
-  v2 = i32.const 1\n\
-  v3 = atomic.notify v1 v2\n\
-  v4 = i32.const 0\n\
-  v5 = i32.lt_u v4 v3\n\
-  br_if v5 2() 1()\n\
-}\n\
-block 2 () {\n\
-  v6 = i64.const 7\n\
-  return v6\n\
-  }\n\
-}\n";
+    let m = parent(
+        "  vexp = i32.const 0
+  vinf = i64.const -1
+  vw = i32.atomic.wait va vexp vinf
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vw64 = i64.extend_i32_u vw
+  vh = i64.const 100
+  vwh = i64.mul vw64 vh
+  vr = i64.add vwh vj",
+    );
+    let child = "memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  br 1()
+}
+block 1 () {
+  v1 = i64.const 86016
+  v2 = i32.const 1
+  v3 = atomic.notify v1 v2
+  v4 = i32.const 0
+  v5 = i32.lt_u v4 v3
+  br_if v5 2() 1()
+}
+block 2 () {
+  v6 = i64.const 7
+  return v6
+  }
+}
+";
     // status 0 (woken) * 100 + child result 7 — any other status means the keys diverged.
-    assert_eq!(
-        run(SRC, 17, 50_000_000).expect("run ok"),
-        vec![Value::I64(7)],
-        "parent must be woken (status 0) by the child's notify of the same backing byte"
+    drivers::agree_on(
+        &drivers::SCHEDULING,
+        "the parent is woken by the child's notify of the same region byte",
+        &m,
+        &setup(child),
+        &drivers::Ran {
+            result: Ok(vec![Value::I64(7)]),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
     );
 }
 
 /// The inverse direction, racy by nature (the parent cannot spin-notify without starving a
-/// single-worker executor, so it stores + notifies once). Child `atomic.wait`s its address 20480
-/// (expected 0); parent stores 1 and notifies once at its alias `64K + 20480` (both above the
-/// #1094 NULL guard), then joins. The
-/// futex compare-and-park makes every interleaving safe, and both legal outcomes prove the
-/// cross-domain semantics:
+/// single-worker executor, so it stores + notifies once). The child `atomic.wait`s its address of
+/// region byte 20480 (expected 0); the parent stores 1 and notifies once at its own address of that
+/// byte, then joins. The futex compare-and-park makes every interleaving safe, and both legal
+/// outcomes prove the cross-domain semantics:
 ///   child parked first  → notify wakes it:   child status 0, parent saw 1 woken → result  1
 ///   store landed first  → compare sees 1:    child status 1, notify woke 0      → result 10
-/// A hang or any other value means the shared-backing futex contract is broken.
+/// A hang or any other value means the shared-region futex contract is broken.
 #[test]
 fn child_waits_parent_notifies_across_domains() {
-    const SRC: &str = "memory 17\n\
-func (i32) -> (i64) {\n\
-block 0 (v0: i32) {\n\
-  ; spawn via record (op 17): entry=1 off=65536 sl=16 quota=0\n\
-  q1v0 = i64.const 4294967296\n\
-  q1v1 = i64.const 65536\n\
-  q1v2 = i64.const -4294967280\n\
-  q1v3 = i64.const 4294967295\n\
-  q1v4 = i64.const 0\n\
-  q1a0 = i64.const 17600\n\
-  i64.store q1a0 q1v0\n\
-  q1a1 = i64.const 17608\n\
-  i64.store q1a1 q1v1\n\
-  q1a2 = i64.const 17616\n\
-  i64.store q1a2 q1v2\n\
-  q1a3 = i64.const 17624\n\
-  i64.store q1a3 q1v3\n\
-  q1a4 = i64.const 17632\n\
-  i64.store q1a4 q1v4\n\
-  q1a5 = i64.const 17640\n\
-  i64.store q1a5 q1v4\n\
-  q1a6 = i64.const 17648\n\
-  i64.store q1a6 q1v4\n\
-  v5 = call.cap 6 17 (i64) -> (i32) v0 (q1a0)\n\
-  v6 = i64.const 86016\n\
-  v7 = i32.const 1\n\
-  i32.atomic.store v6 v7\n\
-  v8 = atomic.notify v6 v7\n\
-  v9 = call.cap 6 1 (i32) -> (i64) v0 (v5)\n\
-  v10 = i64.const 10\n\
-  v11 = i64.mul v9 v10\n\
-  v12 = i64.extend_i32_u v8\n\
-  v13 = i64.add v11 v12\n\
-  return v13\n\
-  }\n\
-}\n\
-func (i64) -> (i64) {\n\
-block 0 (v0: i64) {\n\
-  v1 = i64.const 20480\n\
-  v2 = i32.const 0\n\
-  v3 = i64.const -1\n\
-  v4 = i32.atomic.wait v1 v2 v3\n\
-  v5 = i64.extend_i32_u v4\n\
-  return v5\n\
-  }\n\
-}\n";
-    let r = run(SRC, 17, 50_000_000).expect("run ok");
-    assert!(
-        r == vec![Value::I64(1)] || r == vec![Value::I64(10)],
-        "expected (woken,1)=1 or (not-equal,0)=10, got {r:?}"
+    let m = parent(
+        "  vone = i32.const 1
+  i32.atomic.store va vone
+  vn = atomic.notify va vone
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vten = i64.const 10
+  vj10 = i64.mul vj vten
+  vn64 = i64.extend_i32_u vn
+  vr = i64.add vj10 vn64",
     );
+    let child = "memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 86016
+  v2 = i32.const 0
+  v3 = i64.const -1
+  v4 = i32.atomic.wait v1 v2 v3
+  v5 = i64.extend_i32_u v4
+  return v5
+  }
+}
+";
+    for driver in drivers::SCHEDULING {
+        let r = drivers::run_on(driver, &m, &setup(child))
+            .unwrap_or_else(|| panic!("{driver:?} declined the module"))
+            .result;
+        assert!(
+            r == Ok(vec![Value::I64(1)]) || r == Ok(vec![Value::I64(10)]),
+            "{driver:?}: expected (woken,1)=1 or (not-equal,0)=10, got {r:?}"
+        );
+    }
 }

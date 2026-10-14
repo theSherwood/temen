@@ -88,9 +88,9 @@ budgets below it, since what is left of it differs by engine (each draws on its 
 host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
 compile-once programs, which re-arm their fuel cell for each run (#2113). *Node 0's other dimensions
 (owner, 2026-10-06):* once #1867 deletes the carve, a guest sees node 0's `mem`, `channel` and
-`spawn` too; until then showing them would bound every budget's `spawn`, which the carve's
-budget-funded spawns refuse. The
-carve ops (0/5/13, v0 records) keep a fixed allowance until #1867 deletes them. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+`spawn` too; while the carve spawned, showing them would have bounded every budget's `spawn`, which
+the carve's budget-funded spawns refused. Every engine now refuses the carve spawn, and showing them
+is #2337. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
 with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
@@ -109,9 +109,9 @@ it as a child is to its budget, on every engine: its window and main vCPU when a
 (`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, but
 never past the process's pools of mappings and of address space (a run the process cannot hold ends
 with `ThreadFault` before it starts; every domain's window is held against the address-space pool at
-its admission, #2305), and everything it makes after, its growth and its processes' windows included. A carve child (ops 0/5/13, v0
-records) charges no node: `MAX_VCPUS` alone bounds its vCPUs and `MAX_FIBERS` its fibers until #1867
-deletes the carve. A pipe's worst-case FIFO is charged to the
+its admission, #2305), and everything it makes after, its growth and its processes' windows included. A carve child, which
+only a thaw of an artifact frozen around one can still re-create, charges no node: `MAX_VCPUS` alone
+bounds its vCPUs and `MAX_FIBERS` its fibers until #1867 deletes the carve. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain a budget paid
 for lets go of its regions when it ends, and a run's root keeps its own for its embedder (#2111). A
@@ -321,26 +321,26 @@ one parameterized one, *that* is the #13 violation — closed by a dated deletio
 #1289 Decision-B convergence), never by keeping both.
 
 **Ruling — the nested carve placement is retired; the escape hatch above is invoked (owner,
-2026-09-29, #1814, tracked in #1289):** the two placements *have* diverged into two mechanisms. The
-tree-walker, the bytecode engine and the wasm-JIT run a carve child directly over its parent's
-backing, so parent and child see each other's stores live; the Cranelift JIT runs it in its own
-window seeded from the carve and copied back at finish. A parent and a carve child that talk through
-the carve while both run complete on the oracle and deadlock on the Cranelift JIT (#1814) — a
-guest-visible divergence on the backend axis, so this is also an **invariant 14 violation**, not a
-parked difference. The resolution is the one this ruling reserved: **every §14 child is placed in a
+2026-09-29, #1814, tracked in #1289):** the two placements *had* diverged into two mechanisms. The
+tree-walker, the bytecode engine and the wasm-JIT ran a carve child directly over its parent's
+backing, so parent and child saw each other's stores live; the Cranelift JIT ran it in its own
+window seeded from the carve and copied back at finish. A parent and a carve child that talked
+through the carve while both ran completed on the oracle and deadlocked on the Cranelift JIT (#1814)
+— a guest-visible divergence on the backend axis, so this was also an **invariant 14 violation**, not
+a parked difference. The resolution is the one this ruling reserved: **every §14 child is placed in a
 detached window, and the carve path is deleted** — on every engine, with its spawn forms, its
 host-side machinery, and the docs that describe it. No live-aliasing fix is built for carves, and no
 new feature lands on the carve path. Retiring it is invariant-14 work: *in flight*, prioritized as the
 frontier's own repair, never parked. Until it is gone:
 
-- **The carve's contract is a hand-off.** The parent may write a child's carve before the spawn and
-  read it after the join. Parent and child using the carve concurrently — stores, futex rendezvous —
-  is not a supported channel; #1814 is the tracked divergence (invariant 9's "tracked debt with a
-  convergence plan", the plan being this deletion).
+- **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 and the version-0 record trap
+  `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. A thaw
+  of an artifact frozen around a carve child still re-creates one, until the nested freeze goes.
 - **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
   detached, with the spawn-time args payload and the pre-mapped region as fields, `module = -1` the
-  spawner's own program. Op 15's positional form and the v0 carve record retire with the carve path
-  (#1867); the version word is that migration's scaffolding. The window is always the child module's
+  spawner's own program. The v0 carve record is retired (it traps `CapFault`), and op 15's positional form
+  retires too (#2067); the version word, always 1 now, is that migration's scaffolding (#2091).
+  The window is always the child module's
   declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
   module it did not build need not know its size — any other value must equal it. A query for the
   size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
@@ -350,8 +350,7 @@ frontier's own repair, never parked. Until it is gone:
 - **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
   its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
   freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
-  `FreezeScope`'s carve-named form folds into the detached one); and every producer still emitting a
-  carve spawn. The carve-specific escape oracle and fuzz targets retire with the path they test, once
+  `FreezeScope`'s carve-named form folds into the detached one). The carve-specific escape oracle and fuzz targets retire with the path they test, once
   detached-window twins cover the same confinement property.
 
 ## 14. One frontier, consistent across every axis
@@ -423,7 +422,7 @@ platform lifecycle action the guest cannot see coming, killing the domain, which
 terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
 three engines is therefore the resting state until (a) freeze authority is **represented in code** —
 `Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
-carve names it: granted at spawn, containment-covering so one grant serves every child of an
+carve names it: granted at spawn while the carve spawned (#1867), containment-covering so one grant serves every child of an
 instantiator range, durable so a thawed parent holds what it held, and askable through
 `Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
 sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never

@@ -1,10 +1,10 @@
 //! A module that both spawns §14 children and uses §12 fibers runs on the bytecode engine, and each
 //! domain has its **own** fiber registry, as on the tree-walk oracle. The parent parks a fiber of its
-//! own, spawns a child (carved, op 5, or detached, op 15) that creates and drives fibers of its own,
-//! joins it, and then resumes its parked fiber. The child reports its first fiber's handle, so a
-//! registry shared across domains (the child's handles numbered after the parent's, or the parent's
-//! fiber reachable from the child) shows up as a different result. Checked on the cooperative
-//! driver, the OS-thread parallel driver and the debug scheduler.
+//! own, spawns a child (detached, op 15) that creates and drives fibers of its own, joins it, and
+//! then resumes its parked fiber. The child reports its first fiber's handle, so a registry shared
+//! across domains (the child's handles numbered after the parent's, or the parent's fiber reachable
+//! from the child) shows up as a different result. Checked on the cooperative driver, the OS-thread
+//! parallel driver and the debug scheduler.
 #![cfg(any(
     all(unix, target_arch = "x86_64"),
     all(unix, target_arch = "aarch64"),
@@ -59,12 +59,7 @@ block 0 (vs: i64) {{
 
 /// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns and
 /// joins the child, resumes the fiber to its return. Result: child status × 1000 + 11 + 25.
-fn parent_src(detached: bool) -> String {
-    let spawn = if detached {
-        "ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)"
-    } else {
-        "ch = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) vinst (me, gz, off, sl, gz)"
-    };
+fn parent_src() -> String {
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
@@ -77,9 +72,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   me = i64.extend_i32_s vmod
   vb = i64.extend_i32_s vbud
   gz = i64.const 0
-  off = i64.const 4194304
   sl = i64.const {CHILD_LOG2}
-  {spawn}
+  ch = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, me, gz, gz, gz, sl, gz)
   vr = call.cap 6 1 (i32) -> (i64) vinst (ch)
   b = i64.const 20
   s2, r2 = cont.resume pf b
@@ -154,28 +148,18 @@ fn debug(parent: &Module, child: &Module) -> Result<Vec<Value>, Trap> {
     }
 }
 
-fn every_driver(detached: bool) {
-    let how = if detached { "detached" } else { "carved" };
-    let (parent, child) = (parse(&parent_src(detached)), parse(&child_src()));
+#[test]
+fn a_detached_child_has_its_own_fiber_registry() {
+    let (parent, child) = (parse(&parent_src()), parse(&child_src()));
     let want = oracle(&parent, &child);
     assert_eq!(
         want,
         Ok(vec![Value::I64(10 * 1000 + 11 + 25)]),
-        "oracle, {how}: the child's first fiber is its handle 0"
+        "oracle: the child's first fiber is its handle 0"
     );
-    assert_eq!(cooperative(&parent, &child), want, "cooperative, {how}");
-    assert_eq!(parallel(&parent, &child), want, "parallel, {how}");
-    assert_eq!(debug(&parent, &child), want, "debug, {how}");
-}
-
-#[test]
-fn a_carved_child_has_its_own_fiber_registry() {
-    every_driver(false);
-}
-
-#[test]
-fn a_detached_child_has_its_own_fiber_registry() {
-    every_driver(true);
+    assert_eq!(cooperative(&parent, &child), want, "cooperative");
+    assert_eq!(parallel(&parent, &child), want, "parallel");
+    assert_eq!(debug(&parent, &child), want, "debug");
 }
 
 /// The parent (args `(instantiator, child module, budget, address space)`): creates a 64 KiB region,
