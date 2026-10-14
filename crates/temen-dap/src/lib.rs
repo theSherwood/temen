@@ -34,6 +34,9 @@ pub struct DapServer {
     session: Option<Session>,
     /// `launch` arg: pause at the entry op instead of running to the first breakpoint.
     stop_on_entry: bool,
+    /// `launch` arg `justMyCode` (#2341): a library's code has no source line to step to
+    /// ([`step_position`](DapServer::step_position)), so a step does not end in it.
+    just_my_code: bool,
     /// Set once the guest has finished (or the client disconnected).
     terminated: bool,
 }
@@ -322,6 +325,10 @@ impl DapServer {
         };
         self.stop_on_entry = args
             .get("stopOnEntry")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.just_my_code = args
+            .get("justMyCode")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -737,6 +744,13 @@ impl DapServer {
         // The interpreter starts paused before the first op. If `stopOnEntry`, surface that as a
         // stop; otherwise run to the first breakpoint (or completion).
         if self.stop_on_entry {
+            let has_debug = self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.inspector.debug_info(0).is_some());
+            if self.just_my_code && has_debug {
+                return (true, Json::Null, self.enter_program());
+            }
             let ev = stopped_event("entry", 1);
             (true, Json::Null, vec![ev])
         } else if self.session.is_none() {
@@ -817,13 +831,17 @@ impl DapServer {
                 ),
             ];
             if let Some(src) = &source {
-                fields.push((
-                    "source",
-                    Json::obj(vec![
-                        ("name", Json::s(basename(&src.file))),
-                        ("path", Json::s(src.file.clone())),
-                    ]),
-                ));
+                let mut src_fields = vec![
+                    ("name", Json::s(basename(&src.file))),
+                    ("path", Json::s(src.file.clone())),
+                ];
+                if src.library {
+                    // A library's frame (#2341) reads as one: DAP's `subtle` frame over
+                    // `deemphasize`d source, which a client collapses or dims.
+                    src_fields.push(("presentationHint", Json::s("deemphasize")));
+                    fields.push(("presentationHint", Json::s("subtle")));
+                }
+                fields.push(("source", Json::obj(src_fields)));
             }
             out.push(Json::Obj(
                 fields
@@ -1020,7 +1038,13 @@ impl DapServer {
                 if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
                     let summary = self.place_summary(types, base, tid_ref);
                     let vr = self.alloc_place(module, tid, base, tid_ref);
-                    out.push(var_json(&name, &summary, &ty, vr));
+                    out.push(var_json(
+                        &name,
+                        &summary,
+                        &ty,
+                        vr,
+                        type_info(types, Some(tid_ref)),
+                    ));
                     continue;
                 }
             }
@@ -1047,14 +1071,26 @@ impl DapServer {
                         type_id,
                         rvalue: true,
                     });
-                    out.push(var_json(&name, &format!("0x{addr:x}"), &ty, vr));
+                    out.push(var_json(
+                        &name,
+                        &format!("0x{addr:x}"),
+                        &ty,
+                        vr,
+                        type_info(types, Some(type_id)),
+                    ));
                     continue;
                 }
                 let rendered = match (&val, type_id) {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(types, tid, b),
                     _ => fmt_var(&val),
                 };
-                out.push(var_json(&name, &rendered, &ty, 0));
+                out.push(var_json(
+                    &name,
+                    &rendered,
+                    &ty,
+                    0,
+                    type_info(types, type_id),
+                ));
             }
         }
         Some(out)
@@ -1103,8 +1139,8 @@ impl DapServer {
                 };
                 match ptr {
                     // A null pointer has no pointee; an unreadable one can't be followed.
-                    Ok(0) => return Some(vec![var_json("*", "<null>", "", 0)]),
-                    Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0)]),
+                    Ok(0) => return Some(vec![var_json("*", "<null>", "", 0, None)]),
+                    Err(_) => return Some(vec![var_json("*", "<unreadable>", "", 0, None)]),
                     Ok(ptr) => members.push(("*".to_string(), ptr, *pointee)),
                 }
             }
@@ -1117,7 +1153,13 @@ impl DapServer {
             if is_expandable(types, mty) {
                 let summary = self.place_summary(types, addr, mty);
                 let vr = self.alloc_place(module, tid, addr, mty);
-                out.push(var_json(&name, &summary, &ty_name, vr));
+                out.push(var_json(
+                    &name,
+                    &summary,
+                    &ty_name,
+                    vr,
+                    type_info(types, Some(mty)),
+                ));
             } else {
                 let size = type_size(types, mty) as usize;
                 let session = self.session.as_ref()?;
@@ -1125,7 +1167,13 @@ impl DapServer {
                     Ok(bytes) => fmt_scalar(types, mty, &bytes),
                     Err(_) => "<unreadable>".to_string(),
                 };
-                out.push(var_json(&name, &value, &ty_name, 0));
+                out.push(var_json(
+                    &name,
+                    &value,
+                    &ty_name,
+                    0,
+                    type_info(types, Some(mty)),
+                ));
             }
         }
         Some(out)
@@ -1583,7 +1631,16 @@ impl DapServer {
             None => return (false, Json::Null, vec![]),
         };
         let stop = match kind {
-            StepKind::Out => self.session.as_mut().unwrap().inspector.step_out(),
+            StepKind::Out => {
+                let stop = self.session.as_mut().unwrap().inspector.step_out();
+                // Under `justMyCode`, a step out into a library's code (a callback returning to
+                // `qsort`) goes on as a `next` from there would: out of it, to the program's code.
+                if is_step(&stop) && self.step_position().1 {
+                    self.step_source_line(StepKind::Over)
+                } else {
+                    stop
+                }
+            }
             StepKind::In | StepKind::Over if has_debug => self.step_source_line(kind),
             StepKind::In => self.session.as_mut().unwrap().inspector.step(),
             StepKind::Over => self.session.as_mut().unwrap().inspector.step_over(),
@@ -1591,49 +1648,74 @@ impl DapServer {
         (true, Json::Null, self.stop_events(stop))
     }
 
+    /// Under `justMyCode`, `stopOnEntry` stops on the program's own first line (#2341), as a C
+    /// debugger stops at `main` rather than at `_start`'s first op: a step in from the first op, which
+    /// passes the startup code (it has no source) and any library's initialisation (its code has no
+    /// line). A breakpoint, a fault or the end of the run on the way reports as itself.
+    fn enter_program(&mut self) -> Vec<Event> {
+        let stop = self.step_source_line(StepKind::In);
+        if is_step(&stop) {
+            let mut events = self.output_events();
+            events.push(stopped_event("entry", self.stopped_thread_id()));
+            return events;
+        }
+        self.stop_events(stop)
+    }
+
     /// Op-step (in / over) until the focused frame's *source line* changes — so DAP `next`/`stepIn`
     /// advance one source line, not one IR op (DEBUGGING.md W5). Stops early on a breakpoint, a
     /// finish, or a generous op cap (defensive against unmapped code). Skips ops with no source line
-    /// and ops still on the starting line.
+    /// and ops still on the starting line. Under `justMyCode` a library's code has no line either
+    /// ([`step_position`](Self::step_position)): `stepIn` op-steps through it, so a callback it makes
+    /// into the program still stops, and `next` leaves it with a step out rather than op-stepping it.
     fn step_source_line(&mut self, kind: StepKind) -> Stop {
         const CAP: usize = 1_000_000;
-        let start = self.current_source_line();
+        let (start, mut in_library) = self.step_position();
         let mut last = Stop::Blocked;
         for _ in 0..CAP {
             last = match self.session.as_mut() {
                 Some(s) => match kind {
                     StepKind::In => s.inspector.step(),
+                    _ if in_library => s.inspector.step_out(),
                     _ => s.inspector.step_over(),
                 },
                 None => return Stop::Blocked,
             };
-            match last {
-                Stop::Break {
-                    reason: StopReason::Step,
-                    ..
-                } => {
-                    let now = self.current_source_line();
-                    if now.is_some() && now != start {
-                        return last; // reached a different source line
-                    }
-                    // else: same line or an unmapped op — keep stepping
-                }
-                _ => return last, // a real breakpoint, finish, or block preempts the line-step
+            if !is_step(&last) {
+                return last; // a real breakpoint, finish, or block preempts the line-step
             }
+            let now;
+            (now, in_library) = self.step_position();
+            if now.is_some() && now != start {
+                return last; // reached a different source line
+            }
+            // else: same line or an unmapped op — keep stepping
         }
         last
     }
 
-    /// The `(file, line)` of the focused thread's innermost frame, if it maps to source. Line 0 is
+    /// Where a line step finds the focused thread's innermost frame: the `(file, line)` it can stop
+    /// on, if any, and whether the frame runs a library's code that `justMyCode` passes. Line 0 is
     /// not a line: the compiler gives it to ops that belong to none (the code around a call), so a
-    /// line step passes them like any unmapped op instead of stopping there.
+    /// line step passes them like any unmapped op instead of stopping there. Under `justMyCode` a
+    /// library's code has no line either (#2341).
+    fn step_position(&self) -> (Option<(String, u32)>, bool) {
+        let Some(src) = self
+            .session
+            .as_ref()
+            .and_then(|s| s.inspector.source_loc(*s.inspector.frame_pcs().first()?))
+        else {
+            return (None, false);
+        };
+        let library = self.just_my_code && src.library;
+        let line = (src.line != 0 && !library).then_some((src.file, src.line));
+        (line, library)
+    }
+
+    /// The line a step can stop on at the focused thread's innermost frame, if any
+    /// ([`step_position`](Self::step_position)).
     fn current_source_line(&self) -> Option<(String, u32)> {
-        let s = self.session.as_ref()?;
-        let pc = *s.inspector.frame_pcs().first()?;
-        s.inspector
-            .source_loc(pc)
-            .map(|src| (src.file, src.line))
-            .filter(|&(_, line)| line != 0)
+        self.step_position().0
     }
 
     fn on_step_back(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
@@ -1828,15 +1910,8 @@ impl DapServer {
                     (VarValue::Bytes(b), Some(tid)) => fmt_scalar(&debug.types, tid, b),
                     _ => fmt_var(&val),
                 };
-                return (
-                    true,
-                    Json::obj(vec![
-                        ("result", Json::s(rendered)),
-                        ("type", Json::s(var.ty.clone())),
-                        ("variablesReference", Json::i(0)),
-                    ]),
-                    vec![],
-                );
+                let info = type_info(&debug.types, var.type_id);
+                return (true, eval_json(rendered, var.ty.clone(), info), vec![]);
             }
         }
 
@@ -1853,11 +1928,11 @@ impl DapServer {
             frame_idx,
             func,
         };
-        let (result, ty) = match expr::eval(&expr, &mut env) {
-            Some(expr::Value::Int(n)) => (n.to_string(), String::new()),
-            Some(expr::Value::Float(x)) => (x.to_string(), String::new()),
+        let (result, ty, type_id) = match expr::eval(&expr, &mut env) {
+            Some(expr::Value::Int(n)) => (n.to_string(), String::new(), None),
+            Some(expr::Value::Float(x)) => (x.to_string(), String::new(), None),
             // A bare pointer rvalue renders as its address value (navigate it with `->`/`[]`/`*`).
-            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new()),
+            Some(expr::Value::Ptr { addr, .. }) => (addr.to_string(), String::new(), None),
             Some(expr::Value::Place { addr, type_id }) => {
                 if matches!(
                     types.get(type_id as usize),
@@ -1867,6 +1942,7 @@ impl DapServer {
                     (
                         type_summary(types, type_id),
                         type_render_name(types, type_id),
+                        Some(type_id),
                     )
                 } else {
                     let size = type_size(types, type_id) as usize;
@@ -1874,6 +1950,7 @@ impl DapServer {
                         Ok(bytes) => (
                             fmt_scalar(types, type_id, &bytes),
                             type_render_name(types, type_id),
+                            Some(type_id),
                         ),
                         Err(_) => return fail,
                     }
@@ -1883,11 +1960,7 @@ impl DapServer {
         };
         (
             true,
-            Json::obj(vec![
-                ("result", Json::s(result)),
-                ("type", Json::s(ty)),
-                ("variablesReference", Json::i(0)),
-            ]),
+            eval_json(result, ty, type_info(types, type_id)),
             vec![],
         )
     }
@@ -2221,14 +2294,84 @@ fn var_to_i64(v: &VarValue) -> Option<i64> {
     })
 }
 
-/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference.
-fn var_json(name: &str, value: &str, ty: &str, vref: i64) -> Json {
-    Json::obj(vec![
+/// Whether `stop` is a step's own: it ran its course, with no breakpoint, fault or finish on the way.
+fn is_step(stop: &Stop) -> bool {
+    matches!(
+        stop,
+        Stop::Break {
+            reason: StopReason::Step,
+            ..
+        }
+    )
+}
+
+/// Build a DAP `variables` entry. `vref` is `0` for a leaf scalar, or an expandable reference;
+/// `info` is the value's [`type_info`], when its type is structured.
+fn var_json(name: &str, value: &str, ty: &str, vref: i64, info: Option<Json>) -> Json {
+    let mut fields = vec![
         ("name", Json::s(name.to_string())),
         ("value", Json::s(value.to_string())),
         ("type", Json::s(ty.to_string())),
         ("variablesReference", Json::i(vref)),
-    ])
+    ];
+    if let Some(info) = info {
+        fields.push(("typeInfo", info));
+    }
+    Json::obj(fields)
+}
+
+/// Build a DAP `evaluate` body: `result`, of type `ty`, with `info` as in [`var_json`].
+fn eval_json(result: String, ty: String, info: Option<Json>) -> Json {
+    let mut fields = vec![
+        ("result", Json::s(result)),
+        ("type", Json::s(ty)),
+        ("variablesReference", Json::i(0)),
+    ];
+    if let Some(info) = info {
+        fields.push(("typeInfo", info));
+    }
+    Json::obj(fields)
+}
+
+/// The structured shape of type `id` (#2341), for a client to render a value by without parsing its
+/// render name (`char *` is a C spelling): its `name`, `kind` (`scalar`, `pointer`, `array`,
+/// `aggregate` — a struct or a union — or `opaque`) and `size`; a scalar's `encoding` (`signed`,
+/// `unsigned`, `float`, `bool`); an array's `count`; and as `target`, the same summary of a
+/// pointer's pointee or an array's element, one level down. `None` with no structured type.
+fn type_info(types: &[TypeDef], id: Option<TypeId>) -> Option<Json> {
+    fn summary(types: &[TypeDef], id: TypeId, outer: bool) -> Option<Json> {
+        let mut fields = vec![("name", Json::s(type_render_name(types, id)))];
+        let (kind, target) = match types.get(id as usize)? {
+            TypeDef::Base { encoding, .. } => {
+                let encoding = match encoding {
+                    Encoding::Signed => "signed",
+                    Encoding::Unsigned => "unsigned",
+                    Encoding::Float => "float",
+                    Encoding::Bool => "bool",
+                };
+                fields.push(("encoding", Json::s(encoding)));
+                ("scalar", None)
+            }
+            TypeDef::Pointer { pointee, .. } => ("pointer", Some(*pointee)),
+            TypeDef::Array { elem, count, .. } => {
+                fields.push(("count", Json::i(*count as i64)));
+                ("array", Some(*elem))
+            }
+            TypeDef::Aggregate { .. } => ("aggregate", None),
+            TypeDef::Opaque { .. } => ("opaque", None),
+        };
+        fields.push(("kind", Json::s(kind)));
+        fields.push(("size", Json::i(type_size(types, id) as i64)));
+        // One level down only: a struct that points at itself would otherwise never end.
+        if let Some(target) = target
+            .filter(|_| outer)
+            .and_then(|t| summary(types, t, false))
+        {
+            fields.push(("target", target));
+        }
+        Some(Json::obj(fields))
+    }
+    summary(types, id?, true)
 }
 
 /// The render name of a structured type (every [`TypeDef`] variant carries one), or `"?"`.

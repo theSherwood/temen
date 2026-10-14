@@ -8389,7 +8389,9 @@ const LINK_SETS_MAX: usize = 4;
 /// module-scoped globals are implementation internals: their debug vars are dropped here (#1806).
 /// Otherwise every frame's Locals and the shared-state `globals` list would carry them beside the
 /// program's own (a playground libc's `__pg_std`, `__pg_rng`, …). The library's line table and its
-/// functions' locals stay, so a step into it still shows where it is.
+/// functions' locals stay, so a step into it still shows where it is — and every one of its files is
+/// marked library code (`lib_files`, #2341), so a debugger shows its frames as library frames and
+/// steps past them under just-my-code. `link` carries the mark into every program linked against it.
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
@@ -8400,9 +8402,7 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
             return -1;
         }
     };
-    if let Some(debug) = module.debug_info.as_mut() {
-        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
-    }
+    make_resident(&mut module);
     let exports = link_lib_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.
     let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
@@ -8419,6 +8419,15 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
     };
     set(STATUS_OK);
     h as i32
+}
+
+/// What a library unit becomes as it goes resident ([`temen_link_lib_open`]): its module-scoped
+/// globals' debug vars dropped (#1806), and every one of its files marked library code (#2341).
+pub fn make_resident(module: &mut temen_ir::Module) {
+    if let Some(debug) = module.debug_info.as_mut() {
+        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+        debug.lib_files = (0..debug.files.len() as u32).collect();
+    }
 }
 
 /// Drop the resident library `handle` ([`temen_link_lib_open`]). Unknown / already-closed handles are

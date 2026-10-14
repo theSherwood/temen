@@ -882,6 +882,7 @@ fn build_debug_info(
         blobs,
         func_names,
         tls_root: None,
+        lib_files: Vec::new(),
     })
 }
 

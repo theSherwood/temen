@@ -974,6 +974,8 @@ pub struct SourceLoc {
     pub line: u32,
     /// 0 means "no column".
     pub col: u32,
+    /// `file` holds a library's code, not the program's (`DebugInfo::lib_files`, #2341).
+    pub library: bool,
 }
 
 /// Resolve an [`IrPc`] to its source position using `m`'s `-g` debug info (nearest-preceding `loc`
@@ -1017,6 +1019,7 @@ pub fn source_loc_in(di: &DebugInfo, pc: IrPc) -> Option<SourceLoc> {
         file,
         line: l.line,
         col: l.col,
+        library: di.is_lib_file(l.file),
     })
 }
 
