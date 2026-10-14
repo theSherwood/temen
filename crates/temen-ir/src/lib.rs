@@ -251,6 +251,20 @@ pub fn instantiator_shape_ok(op: u32, sig: &FuncType) -> bool {
     })
 }
 
+/// The slot a §12 thread or §14 child handle names in a table of `len` slots, by the one rule every
+/// engine resolves one by (#2378). A negative handle names none: it is a forgery, or a failed
+/// spawn's `-errno` passed on unchecked (#773), and folding it onto a live slot would wedge a join on
+/// a child that never ends. Any other is masked into the table padded to a power of two, so a handle
+/// past the table names a slot only where the mask folds it onto one. Whether that slot is live
+/// (issued and neither joined nor detached) is the caller's table's to say.
+pub fn handle_slot(len: usize, handle: i32) -> Option<usize> {
+    if handle < 0 || len == 0 {
+        return None;
+    }
+    let slot = (handle as u32 as usize) & (len.next_power_of_two() - 1);
+    (slot < len).then_some(slot)
+}
+
 /// Guest-facing **errno values** — the negative `-errno` a fallible capability op returns on its
 /// own error path (INVARIANTS #5: "errors are values"). **One definition** here, in the wire-IR
 /// crate every host crate already depends on, so the values and their **sign** cannot drift between

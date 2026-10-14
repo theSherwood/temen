@@ -58,17 +58,19 @@ async function main() {
   // forever. So the run after one takes a fresh engine (`loadEngine(prev)`: a new memory over the
   // compiled module). Not every run: each engine's memory holds a large address-space reservation
   // until the page collects it, and a page of quick runs runs out of them. A run returns its engine,
-  // for reading its output back.
+  // for reading its output back. `tierupFloor` sets the tier-up size floor (#1026), which is the
+  // engine's, so a run that sets it takes an engine of its own.
   let cur = eng;
-  const run = async (guest, opts) => {
-    const own = cur;
+  const run = async (guest, { tierupFloor, ...opts } = {}) => {
+    const own = tierupFloor === undefined ? cur : await loadEngine(eng);
+    if (tierupFloor !== undefined) own.ex.temen_coop_set_tierup_floor(tierupFloor);
     let returned = false;
     try {
       const r = await makeRunner(own)(guest, opts);
       returned = r.value !== null;
       return { ...r, eng: own };
     } finally {
-      if (!returned) cur = await loadEngine(eng);
+      if (!returned && own === cur) cur = await loadEngine(eng);
     }
   };
   const runPath = async (guestPath, opts = {}) => {
@@ -176,9 +178,20 @@ async function main() {
     const sv = await runPath('/corpus/live_caller.temenc', { ...x2, inst: true, unitPath: '/corpus/live_caller_child.temenc', winSize: 1 << 17, minter: 1 << 20 });
     // #1414 B6-3: each thread runs its task's tier-ups on its own Worker — the `tierup` kernel's 8
     // workers each call the emitted leaf once. Then a root that returns while its thread counts
-    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns.
-    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true });
-    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true });
+    // forever in an emitted leaf: the run's end stops the emitted code, so the run returns. The
+    // regions are the coop driver's emit (B6-3b-4), whose size floor (#1026) would keep these small
+    // leaves interpreted: the harness lowers it on these runs' engines, as coop's own tests do.
+    const tu = await runPath('/corpus/threads_tierup.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    const sp = await runPath('/corpus/root_leaves_a_spinner.temenc', { ...x2, tierup: true, tierupFloor: 0 });
+    // #1414 B6-3b-4b: paged regions. An on-ramp guest protects a page read-only, and each of its 5
+    // tasks reads it through the emitted leaf, checked against its thread's page-state table; the
+    // twin's leaf stores there and traps.
+    const paged = { ...x2, onramp: true, tierup: true, tierupFloor: 0 };
+    const pg = await runPath('/corpus/threads_paged.temenc', paged);
+    const pgt = await runPath('/corpus/threads_paged_trap.temenc', paged).then(() => 'no trap', (e) => e.message);
+    // #1414 B6-3b-4c: a collecting guest. Each of its 5 tasks' emitted leaf pushes the words it holds
+    // across its call to the collector to its thread's spill stack, and the collector counts them.
+    const gs = await runPath('/corpus/threads_gc_spill.temenc', { ...x2, tierup: true, tierupFloor: 0 });
     // #1414 B6-3b: §22 units on emitted wasm, each invoke on its own thread's Worker — the host's
     // unit (i32 and f64 signatures), units the guest compiles itself, and a B2 dispatcher whose
     // `call.dyn` lands in the unit its thread installed, through its Worker's copy of the run's
@@ -195,6 +208,8 @@ async function main() {
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
+      pg.value === 35n && pg.tierups === 5 && pgt.includes('MemoryFault') &&
+      gs.value === 55n && gs.tierups === 5 &&
       jc32.value === 1136n && jc32.tierups > 0 && jc64.value === 1136n && jc64.tierups > 0 &&
       jr.value === 56n && jr.tierups > 0 && jb.value === 56n && jb.tierups > 0;
     set('x2', ok ? 'pass' : 'fail',
@@ -206,6 +221,9 @@ async function main() {
       ` · deadlock ${JSON.stringify(dl)} (want ThreadFault) · served live call ${sv.value} (want 142) ` +
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
+      `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt)} ` +
+      `(want MemoryFault) · ` +
+      `collector over spilled words ${gs.value} (want 55), ${gs.tierups} regions (want 5) · ` +
       `§22 units on emitted wasm: host's i32 ${jc32.value}/${jc32.tierups}, f64 ${jc64.value}/${jc64.tierups} ` +
       `(want 1136), runtime ${jr.value}/${jr.tierups}, B2 ${jb.value}/${jb.tierups} (want 56) ` +
       `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
