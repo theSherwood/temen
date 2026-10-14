@@ -1532,25 +1532,15 @@ pub fn jit_cap_run(
 
 /// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
 /// durable, seeded with the **whole** residue a restore re-created on it — fibers, spawned vCPUs and
-/// the root's extent, §14 nested children — taken, as the interp's thaw consumes them. A plain host
+/// the root's extent, detached children — taken, as the interp's thaw consumes them. A plain host
 /// leaves the run byte-identical.
 ///
-/// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): a
-/// separate-module nested child, a nested child's host state (#1692), and the detached children
-/// [`jit_relaunches`] refuses. The embedder then thaws on the interpreter, which carries all of it.
+/// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): the
+/// detached children [`jit_relaunches`] refuses. The embedder then thaws on the interpreter, which
+/// carries all of it.
 fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
-    }
-    let jit_unrepresentable = host
-        .frozen_nested()
-        .iter()
-        .any(|n| n.module_digest.is_some())
-        || !host.frozen_child_state().is_empty();
-    if jit_unrepresentable {
-        return Err(temen_jit::JitError::Unsupported(
-            "durable JIT thaw: residue the JIT cannot re-create (#1692)",
-        ));
     }
     let detached = detached_seeds(host)?;
     cm.set_detached_seed(detached);
@@ -1564,26 +1554,10 @@ fn take_residue(host: &mut Host) -> temen_jit::DurableResidue {
     let r = temen_jit::DurableResidue {
         fibers: host.frozen_fibers().iter().map(jit_fiber).collect(),
         vcpus: host.frozen_vcpus().iter().map(jit_vcpu).collect(),
-        nested: host
-            .frozen_nested()
-            .iter()
-            .map(|n| temen_jit::FrozenNested {
-                parent_task: n.parent_task,
-                task: n.task,
-                slot: n.slot,
-                carve_off: n.carve_off,
-                size_log2: n.size_log2,
-                entry: n.entry,
-                completed_result: n
-                    .completed_result
-                    .map(|r| r.map_err(temen_interp::Trap::code)),
-            })
-            .collect(),
         root_sp: host.take_frozen_root_sp(),
     };
     host.set_frozen_fibers(Vec::new());
     host.set_frozen_vcpus(Vec::new());
-    host.set_frozen_nested(Vec::new());
     r
 }
 
@@ -1685,10 +1659,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
 }
 
 /// #2010 — whether the JIT can re-create every detached child a restore seeded on `host`, at every
-/// depth: its program is granted, and its own powerbox holds no residue but its children (captured
-/// or completed, #2041), its fibers (#2031) and its `thread.spawn` vCPUs. Nested children and child
-/// state the JIT re-creates only for a run's root (`jit_durable_enter`), so a child carrying either
-/// refuses rather than drops it.
+/// depth: its program is granted, and its own powerbox's residue — its children (captured or
+/// completed, #2041), its fibers (#2031) and its `thread.spawn` vCPUs — is one the JIT re-creates.
 ///
 /// #2041 — and no two of a domain's detached children claim one join slot. The interpreter keeps a
 /// join table per spawning vCPU, so two children of different spawners can share a slot number; the
@@ -1707,8 +1679,6 @@ fn jit_relaunches(host: &Host) -> bool {
             let c = &td.host;
             host.durable_module_by_digest(&td.launch.digest).is_some()
                 && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
-                && c.frozen_nested().is_empty()
-                && c.frozen_child_state().is_empty()
                 && jit_relaunches(c)
         })
 }
@@ -1917,28 +1887,6 @@ fn leave_residue(host: &mut Host, r: temen_jit::DurableResidue) {
     }
     if let Some(sp) = r.root_sp {
         host.set_frozen_root_sp(sp);
-    }
-    if !r.nested.is_empty() {
-        host.set_frozen_nested(
-            r.nested
-                .into_iter()
-                .map(|n| temen_interp::FrozenNested {
-                    parent_task: n.parent_task,
-                    task: n.task,
-                    slot: n.slot,
-                    carve_off: n.carve_off,
-                    size_log2: n.size_log2,
-                    entry: n.entry,
-                    module_digest: None,
-                    completed_result: n.completed_result.map(|r| {
-                        r.map_err(|c| {
-                            temen_interp::Trap::from_code(c)
-                                .unwrap_or(temen_interp::Trap::Malformed)
-                        })
-                    }),
-                })
-                .collect(),
-        );
     }
 }
 
@@ -6246,7 +6194,8 @@ pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
 }
 
 /// A nim program's modules as nimony's backends link them: the DCE'd Leng of each, `<stem>.c.nif`,
-/// from the program's own build directory `<nimcache>/<main>/`, as `(stem, NIF bytes)` by stem — the
+/// from the program's own build directory under the C backend's, `<nimcache>/c/<main>/`
+/// (nim-lang/nimony#2616), as `(stem, NIF bytes)` by stem — the
 /// bytes for `temen_leng::nif_text`, since NIF is not UTF-8 text. It is
 /// what `nimony t` hands `temen-link`, and what `nimony c` hands `lengc`: exactly the program's
 /// modules, whatever else a shared `nimcache` holds — the programs its compile-time evaluation
@@ -6261,7 +6210,7 @@ pub fn nim_program_units(
     search_paths: &[&str],
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
     let main = nim_module_suffix(src, search_paths);
-    let dir = nimcache.join(&main);
+    let dir = nimcache.join("c").join(&main);
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("{src}: no build directory {}: {e}", dir.display()))?;
     let mut units = Vec::new();
@@ -8819,13 +8768,14 @@ mod nim_module_suffix_tests {
     #[test]
     fn it_reproduces_the_build_directories_nimony_names_in_its_own_tree() {
         use super::NIMONY_TREE_PATHS;
-        // Observed verbatim: nimony 6ca46f17, run at the root of its tree, built these programs in
-        // `nimcache/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
+        // Observed verbatim: nimony 650bebb2, run at the root of its tree, built these programs in
+        // `nimcache/c/<stem>/`. `src/lib` is on its search path, so the stem is hashed from a `../`
         // walk, one character shorter than the spelling it was given.
         for (prog, stem) in [
             ("src/nifmake/nifmake.nim", "niffw7j0b1"),
             ("src/nifler2/nifler2.nim", "nif6gnbnq1"),
             ("src/nimony/nimony.nim", "nimwe39eh1"),
+            ("src/lengc/shoggoth/shoggoth.nim", "shonb1wwj"),
         ] {
             assert_eq!(nim_module_suffix(prog, &NIMONY_TREE_PATHS), stem, "{prog}");
         }

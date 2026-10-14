@@ -105,7 +105,7 @@ fn powerbox_with(
     authority: bool,
 ) -> Vec<Value> {
     if authority {
-        host.grant_freeze_authority(temen_interp::FreezeScope::DetachedProgeny);
+        host.grant_freeze_authority();
     }
     let inst = host.grant_instantiator(0, 1 << 16);
     // `marked`: the host attests the grant as freeze-instrumented (`grant_durable_module`) — the

@@ -21,10 +21,11 @@ that means the nested subtree freeze that rides the parent's window image (the `
 into a child's carve, `FrozenNested` re-attach records, thaw's in-place carve re-attach, the
 carve-named `FreezeAuthority`) is the path being deleted; the surviving mechanism is the detached
 child's own root-shaped artifact (Section 8), rung to unwind by its freeze doorbell under
-`FreezeScope::DetachedProgeny` (§4, "Detached children"). Carve descriptions below are marked
-**Retiring**. Every engine now traps the carve spawn `CapFault` (#1867 slice 2), so no new carve child
-arises; the machinery below still re-attaches one that a thaw finds in an older artifact, until the
-nested freeze goes. The tests that pinned it by spawning a carve child are deleted with the spawn
+freeze authority over the holder's detached progeny (§4, "Detached children"). Carve descriptions below
+are marked **Retiring**. Every engine traps the carve spawn `CapFault` (#1867 slice 2), and the nested
+freeze/thaw is deleted on every engine (#1867 slice 3): snapshot v44 drops Section 2's nested-child
+block and the carve-named freeze authority, so an older artifact carrying either is refused by its
+version, and the **Retiring** descriptions below are history. The tests that pinned it by spawning a carve child are deleted with the spawn
 (`durable_nesting.rs`'s nested half, `durable_nesting_jit.rs`); the detached path's twins are
 `durable_detached_jit.rs` and temen-interp's `durable_detached_parity.rs`. New work targets the
 detached path, and planned work below that would extend the carve path (JIT nesting parity,
@@ -577,8 +578,9 @@ capture — step 3). A **completed-but-unjoined** one, though, needs nothing of 
 only its `thread.join` result crosses, exactly as for a completed nested child. It rides as a
 `FrozenDetached { parent_task, slot, completed_result }` in **Section 2**, trailing the nested block
 (which is emitted with count 0 when only detached residue is present, so the decoder always reads a
-nested count first); a domain that froze no detached child is byte-identical to v22 but for the
-version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
+nested count first; since v44, #1867, the nested block is gone and the detached block follows the
+vCPU residue directly, present iff non-empty); a domain that froze no detached child is
+byte-identical to v22 but for the version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
 edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (the spawn is a
 `call.cap` checkpoint, so the rewind reloads its spilled slot handle rather than re-running the
 spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
@@ -676,7 +678,7 @@ own, so its children are durable too, and the freeze reaches them through it:
   flattened (#1684). A thaw seeds them back into its table before its threads and its root.
 
 **The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
-holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
+holds freeze authority (#1440) and the module is attested freezable (#1501) — the
 authority half inside the one shared admission, `Host::admit_detached_spawn`, which the oracle, the
 JIT's budget-take hook and the resumable engine all call. A durable detached child holds that
 authority only if its parent hands it down as one of the spawn's named grants (#2018). Nothing mints
@@ -1327,6 +1329,9 @@ construction. What's stored:
   fiber/funcref handles stay valid across restore; its in-window shadow-stack
   location; and `suspended | runnable` status. The pending `Suspend`/`ContResume`
   value is already spilled in-window at the resume point, so it is *not* stored here.
+- **Per completed-but-unjoined detached child** (v23; straight after the vCPU residue since v44):
+  `(parent_task, slot, join outcome)`, which the spawner's rewound `join` reloads. A live detached
+  child rides as its own artifact in Section 8.
 - **Dispatch table** (`DomainTable`, `temen-interp:2002`): the table's **identity** part is
   module-derived — `slot i → (module 0, func i)` plus trapping padding — so it is re-created
   bit-identically on thaw from the same module, and only the runtime mutation needs capturing.
@@ -1340,9 +1345,9 @@ construction. What's stored:
 
 ### 12.5 Section 3 — Handle table (durability classification)
 
-> **Retiring:** the `FreezeAuthority` row's carve-named form (a carve's `base`/`size`) rests on the
-> carve path, which is being deleted (INVARIANTS #13, 2026-09-29). The detached equivalent is the
-> same row's detached-progeny scope, `FreezeScope::DetachedProgeny`, into which the carve form folds.
+> **Retired (#1867, v44):** the `FreezeAuthority` row's carve-named form (a carve's `base`/`size`,
+> tag 12) went with the carve path (INVARIANTS #13, 2026-09-29). Freeze authority has one scope, the
+> holder's detached progeny, into which the carve form folded.
 
 Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 
@@ -1360,10 +1365,10 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants, or its program's child image (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant or the running program's child image (#2245) |
-| `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
-| `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
+| `FreezeAuthority` (#1440, v26; one scope since v44) | — (all-or-nothing over the holder's detached progeny) | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
+| `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance in the domain's table, by slot) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
 | `SharedRegion { region }` (#2025, v39) | the region's number in the depth-0 artifact's Section 11 | the depth-0 restore rebuilds each region once (`Host::rebuild_region`: the embedder's region factory, else a heap backing) with the frozen bytes; each domain adopts the ones it names (`Host::adopt_region`) and its handles and `Backed` pages re-open on them, so a region shared across the tree stays shared. Durable only for a region whose holders are all inside the cut (D-region, §12.3) |
-| `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its six **ceilings** (fuel, mem, spawn, channel, lane, maps — v41; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. Its `maps` use too, since each process's mappings are its own: the thaw re-charges every window, vCPU and region it rebuilds, #2268, v41. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared. A nested (carve) child's `Budget` refuses `FreezeError::NestedBudget`: no spawn gives a carve child one |
+| `Budget { node }` (#1502, v22; `lane` D66, v28; node form #1944, v37) | the node's number in the depth-0 artifact's Section 10, which carries every node a handle of the whole cut reaches (the root's and every detached descendant's, which name the same numbers), parents first: its parent, its six **ceilings** (fuel, mem, spawn, channel, lane, maps — v41; `-1` = unbounded) and what its subtree has **used** (its `channel` use carried as 0, since the thaw re-charges every pipe it rebuilds; #1944 slice 3, v38. Its `maps` use too, since each process's mappings are its own: the thaw re-charges every window, vCPU and region it rebuilds, #2268, v41. A thread hands its `spawn` back as it unwinds, and the thaw that re-creates it charges it again, #2001). A ceiling caps a subtree and is never a stock (INVARIANTS #3) | `Host::restore_durable_budgets` re-mints the nodes into the thawing run's tree with their links and charges, and the handle re-opens on its node. The thaw's **budget hook** (`set_budget_thaw_hook`) may lower a node's ceilings, never raise them; no hook ⇒ verbatim. A node a parent and its detached child share is rebuilt once, so it stays shared |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so
@@ -1381,8 +1386,9 @@ the Slice-3 follow-on.)*
 **Freezable module grants — `Module` left the non-durable set (#1361, v27).** A `Module` grant is a
 host-side registration, so the grant itself cannot be serialized; what *can* is the §4 **content
 digest** of the module it names (`module_digest`), and the restoring host re-grants the module. That
-is not a new mechanism: a separate-module `FrozenNested` child has re-attached by exactly this digest
-since v11 (below), so the handle now rides the same rule instead of a second one (INVARIANTS #15).
+was not a new mechanism: a separate-module nested child re-attached by exactly this digest from v11
+(below) until the carve went (#1867), so the handle rode the same rule instead of a second one
+(INVARIANTS #15).
 Carried as `DurableBinding::Module { digest }` / `B_MODULE`; the restore resolves every carried digest
 against this host's durable grants **before** any slot is pinned (`Host::check_modules_for_thaw`) and
 fails closed with `RestoreError::ModuleUnresolved` otherwise. **Ordering contract:** the restoring

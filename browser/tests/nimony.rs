@@ -5,7 +5,7 @@
 //! evaluation's is, and `temen-link` is there without being given. The real driver is measured by
 //! `src/nimbuild.rs`.
 
-use temen_browser::{blob_entries, library_pack, nim_build, STATUS_EXIT};
+use temen_browser::{blob_entries, library_pack, module_suffix, nim_build, STATUS_EXIT};
 
 /// Returns 7: exec'd, the process exits 7.
 const SEVEN: &str = "memory 17\n\
@@ -246,18 +246,20 @@ fn temen_link_is_served_natively_at_its_paths() {
 
 /// A build's library pack is what it wrote under its `nimcache/` for library modules — each module
 /// told by the source its `.p.nif` records, in nimony's `lib/` or `src/` — the plugins it built
-/// into the cache's root, and nimony's options memo, in the order they were written, which is the
-/// order that keeps them newer than their sources when seeded.
+/// into the cache's root, and nimony's memos of the options it was built with, the program's too, in
+/// the order they were written, which is the order that keeps them newer than their sources when
+/// seeded.
 #[test]
 fn a_library_pack_is_the_librarys_cache_in_write_order() {
     let mut host = temen_interp::Host::new();
     let (_px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
     let executable = temen_encode::encode_module(&module(SEVEN));
-    let files: [(&str, &[u8]); 14] = [
+    let files: [(&str, &[u8]); 16] = [
         ("/w/lib/std/sys.nim", b"proc x() = discard"),
         ("/w/src/lib/nifcore.nim", b"proc y() = discard"),
         ("/w/prog.nim", b"echo 1"),
-        ("/w/nimcache/cachedconfigfile.txt", b" -d:temen"),
+        // nimony's options memos (nim-lang/nimony#2616): the frontend's, and each program's backend one.
+        ("/w/nimcache/config.nif", b"(.nif24)\n(config (frontend))"),
         (
             "/w/nimcache/sys1.p.nif",
             b"(.nif24)\n(stmts@,1,lib/std/sys.nim (proc))",
@@ -275,10 +277,14 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
         ("/w/nimcache/pro2.s.nif", b"sem"),
         // A plugin the library declares, which nimony links into the cache's root.
         ("/w/nimcache/regex", &executable),
-        ("/w/nimcache/sys1.temen/sys1.c.nif", b"lowered"),
-        ("/w/nimcache/pro2.temen/sys1.c.nif", b"lowered for pro2"),
-        // The program: an executable too, but in its own backend directory.
-        ("/w/nimcache/pro2.temen/prog.temen", &executable),
+        // The Temen backend's directory (nim-lang/nimony#2616): every module's `.x.nif`, and a
+        // directory for each program built.
+        ("/w/nimcache/t/sys1.x.nif", b"lowered"),
+        ("/w/nimcache/t/sys1/sys1.c.nif", b"lowered for sys1"),
+        ("/w/nimcache/t/pro2/sys1.c.nif", b"lowered for pro2"),
+        // The program: an executable too, but in its own directory.
+        ("/w/nimcache/t/pro2/prog.temen", &executable),
+        ("/w/nimcache/t/pro2/config.nif", b"(.nif24)\n(config (frontend) (backend))"),
     ];
     for (path, bytes) in files {
         posix.write_file(path, bytes);
@@ -290,12 +296,14 @@ fn a_library_pack_is_the_librarys_cache_in_write_order() {
     assert_eq!(
         names,
         [
-            "/w/nimcache/cachedconfigfile.txt",
+            "/w/nimcache/config.nif",
             "/w/nimcache/nif3.p.nif",
             "/w/nimcache/sys1.s.nif",
             "/w/nimcache/nif3.s.nif",
             "/w/nimcache/regex",
-            "/w/nimcache/sys1.temen/sys1.c.nif",
+            "/w/nimcache/t/sys1.x.nif",
+            "/w/nimcache/t/sys1/sys1.c.nif",
+            "/w/nimcache/t/pro2/config.nif",
             "/w/nimcache/sys1.p.nif",
         ]
     );
@@ -330,8 +338,8 @@ fn committed_toolchain() -> Option<Vec<u8>> {
 /// wire change invalidates them: each must still decode and verify. Rebuild it with
 /// `ONLY=nim_card bash scripts/rebuild-assets.sh`. The card runs the first, nimony, with the others
 /// where nimony and the shell's `PATH` find them, over the files a build at the toolchain's directory
-/// needs: nimony's library, the library pack (nimony's options memo with it, and newer than every
-/// source), and the guest libc.
+/// needs: nimony's library, the library pack (nimony's options memos with it, the card program's
+/// among them, and newer than every source), and the guest libc.
 #[test]
 fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
     let Some(blob) = committed_toolchain() else {
@@ -345,7 +353,7 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
     let tool = |t: &str| format!("{cwd}/bin/{t}\n/bin/{t}");
     assert_eq!(
         paths,
-        ["nimony", "nifmake", "nimsem", "nifler2", "hexer"]
+        ["nimony", "nifmake", "nimsem", "nifler2", "shoggoth"]
             .map(tool)
             .into_iter()
             .chain(["/bin/sh".to_string()])
@@ -371,8 +379,12 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
         "nimony's library"
     );
     assert!(
-        at(&format!("{cache}cachedconfigfile.txt")).is_some(),
-        "the options memo, without which a build re-runs every step"
+        at(&format!("{cache}config.nif")).is_some(),
+        "the frontend's options memo, without which a build checks every module again"
+    );
+    assert!(
+        at(&format!("{cache}t/{}/config.nif", module_suffix("prog.nim"))).is_some(),
+        "the card program's backend memo, without which its build lowers every module again"
     );
     assert!(
         last_source < first_cached,

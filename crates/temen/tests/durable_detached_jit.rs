@@ -16,9 +16,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module,
     transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{
-    run_capture_reserved_with_host, FreezeScope, Host, MemLayout, StreamRole, Value,
-};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, StreamRole, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::SpawnRec;
 use temen_jit::{JitError, JitOutcome};
@@ -103,7 +101,7 @@ fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (host, vec![inst as i64, modh as i64, budget as i64])
 }
 
@@ -151,7 +149,7 @@ fn a_durable_domain_refuses_its_own_program_detached() {
         host.set_self_module(&std::sync::Arc::new(m.clone()));
         let inst = host.grant_instantiator(0, 1 << 17);
         let budget = host.grant_budget(-1, 1 << 20, -1);
-        host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+        host.grant_freeze_authority();
         host.grant_child_image();
         let image = host
             .resolve_cap_name("child")
@@ -913,7 +911,7 @@ fn nest_powerbox(nest: &Nest, settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let (modh, [nest1, nest2]) = nest.grant(&mut host);
     let budget = host.grant_budget(-1, 1 << 20, live + 2);
-    let freeze = host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    let freeze = host.grant_freeze_authority();
     let out = host.grant_stream(StreamRole::Out);
     let args = [inst, modh, budget, freeze, settle_ms, out, nest1, nest2].map(i64::from);
     (host, args.to_vec())

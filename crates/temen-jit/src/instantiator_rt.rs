@@ -1,31 +1,29 @@
 //! The JIT host side of the §14 **`Instantiator`** capability — VM-in-VM nesting. A guest holding an
-//! `Instantiator` `instantiate`s a child confined to a power-of-two sub-window of its own window and
-//! `join`s it. Unlike the interpreter (which spawns a child vCPU on its M:N executor), the JIT bakes
-//! confinement into machine code, so a child confined to a *different* sub-window needs its own
-//! compilation — "**nesting cost is paid at setup, not at runtime**" (§14): [`instantiate`] re-compiles
-//! the child entry with the child's `mask`/`sub_base` ([`crate::compile_child_and_run`]) and runs it
-//! over the **parent's live window** (so the parent intrinsically sees the child's writes — the §14
-//! superset), under the caller's already-installed detect-and-kill guard.
+//! `Instantiator` spawns a child (op 17, the v1 spawn record) that runs a module its spawner holds in
+//! a window of its own, and `join`s it. Unlike the interpreter (which spawns a child vCPU on its M:N
+//! executor), the JIT bakes confinement into machine code, so a child needs its own compilation —
+//! "**nesting cost is paid at setup, not at runtime**" (§14) — which every spawn of the same module
+//! shares ([`crate::ChildCodeCache`]). The child runs as a task on the run's child executor
+//! (`child_exec`), its outcome landing in a per-child completion cell `join` parks on.
 //!
-//! Authority lives in the host capability table (the same `Host` the interpreter uses): `instantiate`
-//! resolves its `Instantiator` handle through the run's `call.cap` thunk (op 0 → the carve range
-//! `[base, base+size)`), so a forged/wrong handle is an inert `CapFault` exactly as for any cap. The
-//! child gets an **empty powerbox** for now (an inert `call.cap`); attenuated child caps + recursion +
-//! "park only the calling fiber" (vs. today's synchronous run-at-`instantiate`) are follow-ups.
+//! Authority lives in the host capability table (the same `Host` the interpreter uses): a spawn
+//! resolves its `Instantiator` handle through the run's `call.cap` thunk, so a forged/wrong handle is
+//! an inert `CapFault` exactly as for any cap, and builds the child's powerbox through the host's
+//! grant hooks.
 
 use crate::{CapThunk, TrapKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Func, SpawnRec, TypeEntry};
+use temen_ir::{Func, SpawnRec};
 
 /// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
 use temen_ir::errno::EINVAL;
 
 /// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
-/// `0` = clean), or `None` while it is still running. An async child's OS thread fills it from the
-/// child's *own* thread — until then `join` parks on `cv` and `poll` reports *running* (`0`); a
-/// synchronous (durable) child's cell is `Some` before `instantiate` returns. `Arc` so `join` can
-/// clone it and drop the `children` lock before parking (no lock held across a wait).
+/// `0` = clean), or `None` while it is still running. The child's task fills it — until then `join`
+/// parks on `cv` and `poll` reports *running* (`0`); a cell a thaw delivers as completed is `Some`
+/// from the start. `Arc` so `join` can clone it and drop the `children` lock before parking (no lock
+/// held across a wait).
 pub(crate) struct ChildDone {
     pub(crate) state: Mutex<Option<(i64, i64)>>,
     pub(crate) cv: Condvar,
@@ -149,9 +147,6 @@ struct Child {
     /// Released exactly once via the grant hooks' releaser: once its claim has ended and its
     /// subtree is torn down ([`Nursery::forget`], #2359), else at [`Nursery::join_children`].
     retained: usize,
-    /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
-    /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
-    nested: Option<(crate::FrozenNested, bool)>,
     /// #2010 — the nursery this child spawns its own children through, if it has one (#1956; also
     /// held in [`Nursery::kids`]). A freeze reaches them through it, and its harvest nests theirs.
     kid: Option<std::sync::Arc<Nursery>>,
@@ -179,28 +174,25 @@ impl Child {
         }
     }
 
-    /// A child whose outcome is **already known** (the synchronous path): a cell pre-filled with
-    /// `(result, trap)`.
+    /// A child whose outcome is **already known** (a thaw's delivery, or a slot's padding): a cell
+    /// pre-filled with `(result, trap)`.
     fn finished(result: i64, trap: i64) -> Child {
         Child {
             done: std::sync::Arc::new(ChildDone::new(Some((result, trap)), None)),
             joined: false,
             retained: 0,
-            nested: None,
             kid: None,
             delivered: false,
             task: 0,
         }
     }
 
-    /// A child whose OS thread is **still running** (the async path): the empty cell the thread fills on
-    /// completion.
+    /// A child whose task is **still running**: the empty cell the task fills on completion.
     fn pending(done: std::sync::Arc<ChildDone>) -> Child {
         Child {
             done,
             joined: false,
             retained: 0,
-            nested: None,
             kid: None,
             delivered: false,
             task: 0,
@@ -219,16 +211,15 @@ enum Filed {
     Refused,
 }
 
-/// D66 — **the one child filing** for every non-durable §14 child (INVARIANTS #15): reserve the §15
-/// slot, build the task around `code` in a fresh window (`init` seeds it — a carve image or data
-/// segments + payload; `premap` aliases a spawn's region; `copy_back` writes a carve child's image
-/// back at finish), register it in the join table with its retained powerbox ref, and hand it to
-/// the executor. `teardown` (release the powerbox, return the lane) runs exactly once — after the
+/// D66 — **the one child filing** for every §14 child (INVARIANTS #15): reserve the §15 slot, build
+/// the task around `code` in a fresh window (`init` seeds it — data segments + payload, or a thawed
+/// image; `premap` aliases a spawn's region), register it in the join table with its retained
+/// powerbox ref, and hand it to the executor. `teardown` (release the powerbox, return the lane) runs exactly once — after the
 /// task's last residency, or right here if the filing is refused.
 ///
 /// # Safety
 /// `code` was compiled by `compile_child_windowed` for `(mapped_log2, reserved_log2)`; `args`
-/// matches the entry's arity; the `SendRaw` pointers `init`/`premap`/`copy_back`/`teardown` capture
+/// matches the entry's arity; the `SendRaw` pointers `init`/`premap`/`teardown` capture
 /// are live for the run (the parent window, joined-after; the child powerbox, owned by the task).
 #[allow(clippy::too_many_arguments)]
 unsafe fn file_task(
@@ -238,7 +229,6 @@ unsafe fn file_task(
     reserved_log2: u8,
     init: impl FnOnce(&mut crate::mem::GuestWindow),
     premap: impl FnOnce(*mut u8, u64, u64) -> bool,
-    copy_back: Option<crate::child_exec::CopyBack>,
     args: Vec<i64>,
     n_results: usize,
     chain: Vec<(usize, i64)>,
@@ -249,8 +239,7 @@ unsafe fn file_task(
     slot: Option<usize>,
     // #1361 step 4 — a durable detached child's freeze cell (see [`DurableCell`]).
     durable: Option<DurableCell>,
-    // #2001 — a detached child's own budget node, which its threads are charged to; `None` for a
-    // carve child.
+    // #2001 — the child's own budget node, which its threads are charged to (`None`: no hook).
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
     // #2010 — the nursery `code` was compiled against, if the child spawns (see [`Child::kid`]).
     kid: Option<std::sync::Arc<Nursery>>,
@@ -280,7 +269,6 @@ unsafe fn file_task(
             n_results,
             chain,
             std::sync::Arc::clone(&done),
-            copy_back,
             teardown,
             node,
         )
@@ -447,20 +435,10 @@ unsafe fn register_serve(
 }
 
 /// The per-run §14 nesting runtime, baked into the module's `Instantiator` `call.cap` sites. Holds
-/// what compiling + running a child needs: the module's functions, the run's `call.cap` thunk/ctx
-/// (to resolve an `Instantiator` handle's authority), and — supplied post-finalize via [`set_env`] —
-/// the live window's detect-and-kill fault range. Non-durable children (plain and granted) run
-/// **asynchronously** on their own OS threads; outcomes land in per-child completion cells `join`
-/// parks on. Only durable children still run synchronously at `instantiate`.
+/// what compiling + running a child needs: the run's `call.cap` thunk/ctx (to resolve an
+/// `Instantiator` handle's authority), the host's grant hooks, and the child executor. Children run
+/// **asynchronously** as executor tasks; outcomes land in per-child completion cells `join` parks on.
 pub(crate) struct Nursery {
-    /// The module's own program, which a thaw re-runs a frozen §14 carve child in over its carve
-    /// ([`Nursery::funcs`]): empty when the module names no `Instantiator`, as a nursery stood up for
-    /// §22 units alone (#2312).
-    funcs: std::sync::Arc<[Func]>,
-    /// #922 — the parent module's type section, threaded into every same-module child compile so
-    /// the child's interned `call.dyn` type indices resolve (a separate-module child resolves
-    /// against its own resolved type section instead — see [`Nursery::resolve_child`]).
-    types: std::sync::Arc<[TypeEntry]>,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
     /// §14 separate-module children: the host callback resolving a guest's `Module` handle to the
@@ -472,8 +450,8 @@ pub(crate) struct Nursery {
     /// every child it spawned (a runaway child would otherwise hang the parent inside `instantiate` /
     /// `resume`, where the parent's own epoch checks can't fire).
     epoch_addr: usize,
-    /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none — the durable
-    /// nested nursery). Children compile their `atomic.wait`/`notify` against this **shared** futex
+    /// Address of the parent run's thread [`crate::os_thread_rt::Domain`] (`0` ⇒ none). Children
+    /// compile their `atomic.wait`/`notify` against this **shared** futex
     /// table, so concurrent children (and the parent's own vCPUs) rendezvous — the pipeline
     /// primitive; spawns also register in its live count for the wait/join deadlock detection.
     futex_sched: usize,
@@ -483,27 +461,9 @@ pub(crate) struct Nursery {
     /// to quiescence at teardown ([`Nursery::join_children`]) before the parent window is freed.
     child_exec: std::sync::Arc<crate::child_exec::ChildExec>,
     /// DURABILITY.md §4: the run is **durable** (set by [`Nursery::set_durable`] at run entry —
-    /// the durable flag is applied after compile, where this nursery is built). A durable run's
-    /// `instantiate`/`coro_spawn` **fail closed** (`-EINVAL`): this child runner re-compiles and
-    /// runs children with no durable state (no shadow init, no instrumented-admission check), so a
-    /// child it spawned could never drain-then-unwind — silently breaking "the snapshot unit is
-    /// the domain closed over its nesting subtree". The interpreter is the reference for durable
-    /// nesting; JIT parity is a follow-up.
+    /// the durable flag is applied after compile, where this nursery is built), so its children are
+    /// durable detached children, which a freeze of it reaches and captures.
     durable: AtomicBool,
-    /// #1693 — the run's async freeze controller, if any (set at run entry, like `durable`): each
-    /// durable child registers its window with it, so a request reaches the child mid-run.
-    freeze: Mutex<Option<std::sync::Arc<crate::FreezeController>>>,
-    /// §4 depth-2: the **shared** subtree task-id counter — the next id to hand a nested child's
-    /// nursery. Threaded down the subtree (every nursery in one freeze shares the `Arc`) so ids are
-    /// assigned in instantiate order across all levels, matching the interpreter's dense scheme.
-    task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// §4 freeze export: the §14 nested-child re-attach residue captured during a durable freeze — one
-    /// [`crate::FrozenNested`] per child that unwound into its carve (`instantiate` records it when
-    /// `compile_child_and_run` reports the child left `UNWINDING`). This is the **shared** subtree sink
-    /// (every nursery in one freeze holds the same `Arc`), so a grandchild's residue — recorded by its
-    /// parent-child's nursery — coalesces at the **root**, where the top-level run drains it
-    /// (`take_frozen_nested`). The JIT analog of the interpreter's `VCpu::freeze_sink`.
-    frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
     /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `Budget` taker
     /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ a spawn is an
     /// inert `CapFault`, like the other grant ops without hooks).
@@ -569,30 +529,23 @@ pub(crate) struct Nursery {
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
 // only ever used on the run's threads while that host (and window) are alive. The interior tables
-// are `Mutex`-guarded. (A child runs synchronously on the calling thread today, so there is in fact
-// no cross-thread sharing yet; the bounds keep the door open for concurrent children later.)
+// are `Mutex`-guarded or atomic.
 unsafe impl Send for Nursery {}
 unsafe impl Sync for Nursery {}
 
 impl Nursery {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        funcs: std::sync::Arc<[Func]>,
-        types: std::sync::Arc<[TypeEntry]>,
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         resolve_module: Option<crate::ModuleResolver>,
         epoch_addr: usize,
         futex_sched: usize,
-        task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
         // #1956 — the executor this nursery files its children on: a run's own (`None`, made here),
         // or the run's, shared by a detached child's nursery.
         child_exec: Option<std::sync::Arc<crate::child_exec::ChildExec>>,
     ) -> Nursery {
         Nursery {
-            funcs,
-            types,
             cap_thunk,
             cap_ctx,
             resolve_module,
@@ -617,9 +570,6 @@ impl Nursery {
             unclaimed: Mutex::new(Vec::new()),
             grant_as_parent: std::sync::atomic::AtomicUsize::new(0),
             durable: AtomicBool::new(false),
-            freeze: Mutex::new(None),
-            task_counter,
-            frozen_nested_sink,
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
@@ -758,9 +708,8 @@ impl Nursery {
     /// no [`crate::AsParent`] installed, or a powerbox nothing retains. Its powerbox `gc` is the
     /// host its `Instantiator` resolves against and the parent its hooks charge, through the family
     /// `as_parent` builds over it; the executor, futex domain, kill cell and child code are the run's.
-    /// The
-    /// program, shadow and fuel a carve child would take are empty: it files none. It is durable
-    /// when this one is (#2010): a durable domain's children are durable, and so are theirs.
+    /// It is durable when this one is (#2010): a durable domain's children are durable, and so are
+    /// theirs.
     ///
     /// # Safety
     /// `gc` is the live powerbox the installed hooks just built for the child.
@@ -780,15 +729,11 @@ impl Nursery {
         }
         let hooks = core::mem::transmute::<usize, crate::AsParent>(as_parent)(gc.ctx);
         let mut n = Nursery::new(
-            Vec::new().into(),
-            Vec::new().into(),
             hooks.thunk,
             gc.ctx,
             Some(hooks.resolve_module),
             self.epoch_addr,
             self.futex_sched,
-            self.task_counter(),
-            self.nested_sink(),
             Some(std::sync::Arc::clone(&self.child_exec)),
         );
         n.ancestors = self.lane_chain_of(gc);
@@ -830,75 +775,9 @@ impl Nursery {
         (node, fuel)
     }
 
-    /// A clone of the shared subtree residue sink + task counter, to hand to a nested child's nursery
-    /// so its (and its descendants') freeze residue coalesces at the root.
-    pub(crate) fn nested_sink(&self) -> std::sync::Arc<Mutex<Vec<crate::FrozenNested>>> {
-        std::sync::Arc::clone(&self.frozen_nested_sink)
-    }
-    pub(crate) fn task_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
-        std::sync::Arc::clone(&self.task_counter)
-    }
-
-    /// §4 — this nursery's owner is unwinding for a freeze: record each of its still-unjoined durable
-    /// §14 children into the **shared** subtree sink (coalesces at the root). A child that unwound
-    /// into its carve is re-attached on thaw; one that finished first carries its result, which the
-    /// thaw delivers to the owner's rewound `join` without re-running it (#1692), as the interpreter
-    /// does: its value, or the trap its `join` answers (#1674).
-    pub(crate) fn freeze_unjoined(&self) {
-        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sink = self
-            .frozen_nested_sink
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for c in children.iter().filter(|c| !c.joined) {
-            let Some((rec, unwound)) = &c.nested else {
-                continue;
-            };
-            let mut rec = rec.clone();
-            if !unwound {
-                let (result, trap) = c
-                    .done
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .expect("a durable child runs synchronously, so it has finished");
-                rec.completed_result = Some(if trap == 0 { Ok(result) } else { Err(trap) });
-            }
-            sink.push(rec);
-        }
-    }
-
-    /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
-    /// [`Nursery::frozen_nested_sink`]). Called by the top-level run after the root unwinds; drains the
-    /// whole subtree's residue (it coalesced here via the shared sink).
-    pub(crate) fn take_frozen_nested(&self) -> Vec<crate::FrozenNested> {
-        std::mem::take(
-            &mut self
-                .frozen_nested_sink
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        )
-    }
-
-    /// The module's functions (for a thaw to re-run a frozen §14 **same-module** child over its carve).
-    pub(crate) fn funcs(&self) -> std::sync::Arc<[Func]> {
-        std::sync::Arc::clone(&self.funcs)
-    }
-
-    /// The module's type section (#922 — resolves a re-run same-module child's interned call types).
-    pub(crate) fn types(&self) -> std::sync::Arc<[TypeEntry]> {
-        std::sync::Arc::clone(&self.types)
-    }
-
-    /// The parent run's §5 kill-path interrupt cell (a re-attached thaw child polls the same cell).
-    pub(crate) fn epoch_addr(&self) -> usize {
-        self.epoch_addr
-    }
-
-    /// §4 thaw: publish a re-attached child's (rewound) result at its join-table `slot`, so the
-    /// parent's re-executed `join` resolves without re-running the child; and (#2041) a detached child
-    /// that had completed but was not joined. The freeze recorded slots in ascending order; pad any gap
-    /// with an inert placeholder to keep the index alignment.
+    /// #2041 — a thaw: publish the outcome of a detached child that had completed but was not joined
+    /// at its join-table `slot`, so the parent's re-executed `join` reloads it without re-running the
+    /// child. Pad any gap with an inert placeholder to keep the index alignment.
     pub(crate) fn seed_child_result(&self, slot: usize, result: i64, trap: i64) {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         while children.len() <= slot {
@@ -1214,8 +1093,6 @@ impl Nursery {
             impl_exports: &impl_exports,
             table_reserve_log2: gc.jit_table_log2,
             shadow,
-            // A thawed child runs as a durable executor task, as at its spawn.
-            run: crate::ChildRun::DurableTask,
         }) else {
             release(gc.ctx);
             release(gc.retained_ctx);
@@ -1259,7 +1136,6 @@ impl Nursery {
                 Some(apply) => apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0) != 0,
                 None => true,
             },
-            None,
             vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
             n_results,
             self.lane_chain_of(&gc),
@@ -1279,24 +1155,10 @@ impl Nursery {
         matches!(filed, Filed::Slot(_))
     }
 
-    /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
-    /// thunks then fail closed. Called at run entry (`run_code_raw`), after the entry wrappers
-    /// have applied the compile-side durable flag.
+    /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field. Called at run
+    /// entry (`run_code_raw`), after the entry wrappers have applied the compile-side durable flag.
     pub(crate) fn set_durable(&self, durable: bool) {
         self.durable.store(durable, Ordering::Release);
-    }
-
-    /// Set the run's async freeze controller (#1693) — see [`Nursery::freeze`].
-    pub(crate) fn set_freeze(&self, fc: Option<std::sync::Arc<crate::FreezeController>>) {
-        *self.freeze.lock().unwrap_or_else(|e| e.into_inner()) = fc;
-    }
-
-    /// The run's async freeze controller, for a durable child to register with (#1693).
-    pub(crate) fn freeze(&self) -> Option<std::sync::Arc<crate::FreezeController>> {
-        self.freeze
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     /// Resolve a `Module` handle through the host (`temen-run`'s `module_resolver`) to the granted
@@ -1522,7 +1384,6 @@ unsafe fn spawn_detached_child(
             Some(ready) => ready(premap_ctx.0, base, mapped, reserved, ro.as_ptr(), ro.len()) != 0,
             None => true,
         },
-        None,
         args,
         n_results,
         rt.lane_chain_of(gc),
@@ -1810,12 +1671,6 @@ unsafe fn spawn_detached(
         // #1296: slots for the units a `Jit`-holding child installs.
         table_reserve_log2: gc.jit_table_log2,
         shadow: child_shadow,
-        // An executor task (#1469), durable when its parent is: its vCPUs unwind with it (#2010).
-        run: if durable {
-            crate::ChildRun::DurableTask
-        } else {
-            crate::ChildRun::Task
-        },
     };
     // temen#2168 — an instance of the run's one compile of this child, unless the child holds a
     // `Jit`: it extends its own code, so it compiles its own.
@@ -2239,39 +2094,4 @@ pub(crate) unsafe extern "C" fn kill(
 fn epoch_fired(addr: usize) -> bool {
     addr != 0
         && unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed) != 0 }
-}
-
-/// A durable §14 child's baked `call.cap` thunk (DURABILITY.md §4, "JIT parity"): its powerbox holds
-/// exactly one capability — an `Instantiator` over the child's **own full window** `[0, child_size)`,
-/// so the child can carve and run a grandchild of its own. `Nursery::resolve` calls this with iface-6
-/// op-0 to read the holder's `[base, size]`; the child is confined to its window by the masking
-/// lowering and can forge no other cap, so any handle resolves to `[0, child_size]` (full authority
-/// over its own window, and nothing beyond). Anything else is an inert `CapFault`, matching the
-/// interpreter's single-binding child powerbox (`grant_instantiator(0, child_size)`).
-///
-/// # Safety
-/// `ctx` points at a live `u64` (the child's window size) for the call; `results`/`trap_out` are the
-/// call-site slot buffers (`Nursery::resolve` / the `call.cap` lowering guarantee them).
-pub(crate) unsafe extern "C" fn child_instantiator_thunk(
-    ctx: *mut core::ffi::c_void,
-    _mem_base: *mut u8,
-    _mem_size: u64,
-    _mem_reserved: u64,
-    type_id: u32,
-    op: u32,
-    _handle: i32,
-    _args: *const i64,
-    _n_args: u64,
-    results: *mut i64,
-    n_results: u64,
-    trap_out: *mut i64,
-) {
-    if type_id == temen_ir_iface_instantiator() && op == 0 && n_results >= 2 {
-        let child_size = *(ctx as *const u64);
-        *results = 0; // base, window-relative — the child's own window starts at 0
-        *results.add(1) = child_size as i64; // size
-        *trap_out = 0;
-    } else {
-        *trap_out = TrapKind::CapFault as i64;
-    }
 }

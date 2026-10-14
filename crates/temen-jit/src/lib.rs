@@ -555,37 +555,6 @@ pub struct FrozenVCpu {
     pub completed_result: Option<i64>,
 }
 
-/// A §14 **nested-child** re-attach record captured by a durable freeze (DURABILITY.md §4, "JIT
-/// parity") — the JIT mirror of `temen_interp::FrozenNested`. Unlike a `thread.spawn` child
-/// ([`FrozenVCpu`], its own vCPU with an entry+args to re-spawn), a §14 child is a nested *domain*
-/// whose whole continuation lives in its **carve** — a `2^size_log2` sub-window of the parent's window
-/// at `carve_off` (already inside the frozen window image). This carries only what a thaw needs to
-/// re-create the child domain around that carve and re-enter it under `REWINDING`. Same-module +
-/// still-running only for now (the freeze-export slice); a separate-module child's module digest and a
-/// completed-but-unjoined child's join result are follow-ups (see the interp's fuller record).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FrozenNested {
-    /// The task that **instantiated** this child — `0` for the root's direct child; a grandchild
-    /// carries its parent-child's task (depth-2, a follow-up). Mirror of [`FrozenVCpu::parent_task`];
-    /// a thaw groups by it to re-attach parents before children.
-    pub parent_task: usize,
-    /// The child's own task id in the frozen run — what its children's `parent_task` names, so a thaw
-    /// re-attaches each grandchild to the parent it recorded (#1687).
-    pub task: usize,
-    /// The parent's join-table slot for this child (the guest-held handle value).
-    pub slot: usize,
-    /// The carve's window-relative base (`sub_base`), inside the frozen window image.
-    pub carve_off: u64,
-    /// The carve's (= the child window's) size, `log2`.
-    pub size_log2: u8,
-    /// The child's entry function index into the parent's own table (same-module).
-    pub entry: u32,
-    /// `Some(outcome)` for a child that finished before the freeze but was not yet joined: its value,
-    /// or its trap-cell code (#1674). The thaw hands it to the parent's rewound `join` without
-    /// re-running the child (#1692).
-    pub completed_result: Option<Result<i64, i64>>,
-}
-
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
 /// `temen-interp`'s `DURABLE_SNAPSHOT_PAGE`): a restored protection map has one entry per this many
 /// bytes. Host-page-independent for artifact portability; a 4 KiB codec page sits within one host
@@ -1650,21 +1619,10 @@ pub struct FreezeController {
     /// `0` = window not live yet (spin); a live window base; [`STORING`] while a request writes;
     /// [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
     base: AtomicUsize,
-    /// #1693 — the durable §14 children running now, each in its own window: a request rings them
-    /// too (see [`Self::enter_child`]).
-    children: std::sync::Mutex<RungChildren>,
-}
-
-/// [`FreezeController::children`]: the live child window bases (they run synchronously and nested,
-/// so this is a stack) and whether a request has landed.
-#[derive(Default)]
-struct RungChildren {
-    bases: Vec<usize>,
-    requested: bool,
 }
 
 /// Store `UNWINDING` into the durable state word of the window at `base` — what a request does to the
-/// root's window and to each live child's.
+/// run's window.
 ///
 /// # Safety
 /// `base` is a live durable window: `base + STATE_OFF` is in its committed RW control region.
@@ -1674,22 +1632,6 @@ unsafe fn ring(base: usize) {
     // store the guest's back-edge poll loads (defined under §12 races).
     let state = base + temen_ir::durable_abi::STATE_OFF as usize;
     (*(state as *const AtomicI32)).store(1, Ordering::Release);
-}
-
-/// A live durable child's registration with its run's [`FreezeController`]; dropping it deregisters
-/// the window, which must happen before the window is freed.
-pub(crate) struct ChildRing<'a> {
-    fc: &'a FreezeController,
-    base: usize,
-}
-
-impl Drop for ChildRing<'_> {
-    fn drop(&mut self) {
-        let mut c = self.fc.children.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = c.bases.iter().rposition(|&b| b == self.base) {
-            c.bases.remove(i);
-        }
-    }
 }
 
 /// [`FreezeController::base`] while a request's store is in flight.
@@ -1704,7 +1646,6 @@ impl FreezeController {
     pub fn new() -> Arc<Self> {
         Arc::new(FreezeController {
             base: AtomicUsize::new(0),
-            children: std::sync::Mutex::new(RungChildren::default()),
         })
     }
 
@@ -1726,36 +1667,11 @@ impl FreezeController {
                     // SAFETY: `base` was the live window and `retire` cannot complete while this
                     // request holds `STORING`, so the window is mapped.
                     unsafe { ring(base) };
-                    // #1693: then every live durable child, each polling only its own window. The
-                    // root first: a child that unwinds returns into its parent's `instantiate`, whose
-                    // trailing poll must already see the freeze. SAFETY: a registered window is live
-                    // until its `ChildRing` drops, which takes this lock.
-                    let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
-                    c.requested = true;
-                    for &b in &c.bases {
-                        unsafe { ring(b) };
-                    }
-                    drop(c);
                     self.base.store(LANDED, Ordering::Release);
                     return;
                 }
             }
         }
-    }
-
-    /// #1693 — a durable §14 child starts running in its own window at `base`: register it so a
-    /// request rings it too, and if one has already landed, ring it now (it was born `NORMAL` from a
-    /// parent that had not polled yet). The window stays registered until the returned guard drops.
-    ///
-    /// # Safety
-    /// `base` is the child's live durable window, and outlives the returned guard.
-    pub(crate) unsafe fn enter_child(&self, base: usize) -> ChildRing<'_> {
-        let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        if c.requested {
-            ring(base);
-        }
-        c.bases.push(base);
-        ChildRing { fc: self, base }
     }
 
     /// Run-side: publish the live window base (the run is now blocked in the guest).
@@ -1854,7 +1770,7 @@ mod freeze_controller_tests {
     }
 }
 
-/// A durable JIT run's **whole** freeze/thaw residue (DURABILITY.md §12.4, §12.8, §4): what a thaw
+/// A durable JIT run's **whole** freeze/thaw residue (DURABILITY.md §12.4, §12.8): what a thaw
 /// re-creates before the root re-enters under `REWINDING`, and what a freeze hands back — the same
 /// pieces the interpreter's `ThawResidue` carries, so one embedder hand-off serves both engines
 /// (#1690: each durable entry used to carry a different subset, silently dropping the rest).
@@ -1864,8 +1780,6 @@ pub struct DurableResidue {
     pub fibers: Vec<FrozenFiber>,
     /// `thread.spawn`ed vCPUs that unwound under the freeze (slice 3.3).
     pub vcpus: Vec<FrozenVCpu>,
-    /// §14 nested children that unwound into their carves (§4).
-    pub nested: Vec<FrozenNested>,
     /// The root vCPU's flattened shadow-SP extent (slice 3.3): reported beside the vCPUs because the
     /// shared active-SP word ends at the last child's. `None` ⇒ the root's extent is the window's own
     /// active-SP word (a single-vCPU run).
@@ -1897,9 +1811,9 @@ pub struct DetachedHarvest {
 pub struct DetachedCapture {
     /// Its window image.
     pub image: Vec<u8>,
-    /// What a run's root leaves beside its image, less nested children (a detached child spawns
-    /// none): its fibers (#2031), its `thread.spawn` vCPUs, including each that finished unjoined,
-    /// which its root's re-issued join is owed (#2010), and its root's extent.
+    /// What a run's root leaves beside its image: its fibers (#2031), its `thread.spawn` vCPUs,
+    /// including each that finished unjoined, which its root's re-issued join is owed (#2010), and
+    /// its root's extent.
     pub residue: DurableResidue,
 }
 
@@ -2469,74 +2383,6 @@ mod trap_capture_tests {
     }
 }
 
-/// #2312 — a nursery holds the module's own program only for a module that names an
-/// `Instantiator`, the only code that spawns a self child of it. One stood up for §22 units alone,
-/// as for every image temen-run compiles, copies none of the module's code: a unit's self child
-/// runs the unit's program (`crates/temen/tests/unit_instantiator.rs`).
-#[cfg(all(test, fiber_rt))]
-mod nursery_program_tests {
-    use super::{CompiledModule, INERT_CAP_THUNK};
-
-    fn nursery_program(text: &str, table_reserve_log2: u8) -> (usize, usize) {
-        let m = temen_text::parse_module(text).expect("parse");
-        let cm = CompiledModule::compile(
-            &m,
-            0,
-            INERT_CAP_THUNK,
-            core::ptr::null_mut(),
-            temen_ir::DEFAULT_RESERVED_LOG2,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            table_reserve_log2,
-        )
-        .expect("compile");
-        let n = cm._nursery.as_ref().expect("a nursery");
-        (n.funcs().len(), n.types().len())
-    }
-
-    #[test]
-    fn a_nursery_for_units_alone_holds_no_program() {
-        let text = "memory 17
-func () -> (i64) {
-block 0 () {
-  v0 = i64.const 7
-  return v0
-  }
-}
-";
-        assert_eq!(nursery_program(text, 10), (0, 0));
-    }
-
-    #[test]
-    fn a_module_that_spawns_keeps_its_program() {
-        let text = "memory 17
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  v1 = i64.const 17408
-  v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
-  v3_st, v3 = call.cap 6 1 (i32) -> (i64, i64) v0 (v2)
-  return v3
-  }
-}
-func () -> () {
-block 0 () {
-  return
-  }
-}
-";
-        let m = temen_text::parse_module(text).expect("parse");
-        assert_eq!(
-            nursery_program(text, 0),
-            (m.funcs.len(), m.types.len()),
-            "its own code spawns self children of it"
-        );
-    }
-}
-
 /// Owner decision 2026-07-24 — **domain-teardown semantics** (DESIGN.md §12; ISSUES.md I37; D37
 /// death-is-revocation): `exit(n)` / any trap from ANY vCPU, and the **root vCPU's completion**
 /// (plain clean return included), tear the whole domain down — PARKED siblings included — and the
@@ -2897,11 +2743,6 @@ pub struct CompiledModule {
     /// run inline single-worker by `thread.spawn`). Drained from the `Domain` after the root unwinds,
     /// read back by the durable entry point. Empty unless a freeze caught a live child.
     frozen_vcpus_out: Vec<FrozenVCpu>,
-    /// Durable **freeze** residue (§4 "JIT parity"): the §14 **nested children** that unwound under the
-    /// freeze, each a [`FrozenNested`] re-attach record. Drained from the run's `Nursery` after the root
-    /// unwinds, read back by the durable-nested entry point. Empty unless a freeze caught a live §14
-    /// child.
-    frozen_nested_out: Vec<FrozenNested>,
     /// Durable **freeze** residue (slice 3.3): the **root** vCPU's flattened shadow-SP extent, captured
     /// after the freeze driver (before the children overwrite the shared active-SP word). The root's
     /// continuation rides in the window image like everyone's, but the active-SP word ends at the last
@@ -2911,9 +2752,6 @@ pub struct CompiledModule {
     /// Durable **thaw** seed (slice 3.3): the spawned vCPUs to re-attach + run before the root re-enters
     /// under `REWINDING`. Empty for a freeze / ordinary run.
     frozen_vcpu_seed: Vec<FrozenVCpu>,
-    /// Durable **thaw** seed (§4 "JIT parity"): the §14 **nested children** to re-attach + rewind before
-    /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
-    frozen_nested_seed: Vec<FrozenNested>,
     /// #1361 step 4 — the durable **detached** children a freeze reached, after teardown (see
     /// [`DetachedHarvest`]); taken by the embedder. Empty unless a freeze caught one.
     detached_out: Vec<DetachedHarvest>,
@@ -3535,17 +3373,7 @@ impl CompiledModule {
         // installed unit that instantiates runs in this module's frames, so it needs this nursery
         // even when the module itself names no `Instantiator` (it may only pass the handle on).
         let nursery: Option<Box<instantiator_rt::Nursery>> = if spawns || table_reserve_log2 > 0 {
-            // The module's own program, which a self child of its own code runs (and a thaw re-runs).
-            // Only a module that names an `Instantiator` has such code: a unit's self child runs the
-            // unit's program, so a nursery stood up for units alone holds none (#2312).
-            let (funcs, types) = if spawns {
-                (m.funcs.clone().into(), m.types.clone().into())
-            } else {
-                (Vec::new().into(), Vec::new().into())
-            };
             Some(Box::new(instantiator_rt::Nursery::new(
-                funcs,
-                types,
                 cap_thunk,
                 cap_ctx,
                 resolve_module,
@@ -3557,8 +3385,6 @@ impl CompiledModule {
                     .as_ref()
                     .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
                     .unwrap_or(0),
-                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
                 None, // the run's own child executor
             )))
         } else {
@@ -4011,10 +3837,8 @@ impl CompiledModule {
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
-            frozen_nested_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
-            frozen_nested_seed: Vec::new(),
             detached_out: Vec::new(),
             detached_seed: Vec::new(),
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
@@ -4237,10 +4061,8 @@ impl CompiledModule {
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
-            frozen_nested_out: Vec::new(),
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
-            frozen_nested_seed: Vec::new(),
             detached_out: Vec::new(),
             detached_seed: Vec::new(),
             thaw_root_sp: self.shadow.frame_base(0),
@@ -4295,7 +4117,6 @@ impl CompiledModule {
     pub fn set_durable(&mut self, seed: DurableResidue) {
         self.frozen_seed = seed.fibers;
         self.frozen_vcpu_seed = seed.vcpus;
-        self.frozen_nested_seed = seed.nested;
         if let Some(sp) = seed.root_sp {
             self.thaw_root_sp = sp;
         }
@@ -4309,7 +4130,6 @@ impl CompiledModule {
         DurableResidue {
             fibers: std::mem::take(&mut self.frozen_out),
             vcpus: std::mem::take(&mut self.frozen_vcpus_out),
-            nested: std::mem::take(&mut self.frozen_nested_out),
             root_sp: (root_sp != 0).then_some(root_sp),
         }
     }
@@ -4452,11 +4272,10 @@ impl CompiledModule {
     /// reads/writes the guest's own memory in place, dispatches its own `call.cap`s into the same
     /// powerbox, and a trap in it propagates exactly like a guest trap.
     ///
-    /// Runs under a **nested** detect-and-kill recovery (`run_guarded_range` is re-entrant —
-    /// the same §14 child-fault pattern as `compile_child_and_run`): a memory fault in the
-    /// invoked code is caught *here*, written to the trap cell as `MemoryFault`, and this returns
-    /// normally — the guest's `call.cap` trap-propagation check then unwinds the domain. Traps
-    /// in invoked code are **terminal for the domain** (DESIGN.md §22); a guest wanting
+    /// Runs under a **nested** detect-and-kill recovery (`run_guarded_range` is re-entrant): a
+    /// memory fault in the invoked code is caught *here*, written to the trap cell as `MemoryFault`,
+    /// and this returns normally — the guest's `call.cap` trap-propagation check then unwinds the
+    /// domain. Traps in invoked code are **terminal for the domain** (DESIGN.md §22); a guest wanting
     /// trap isolation uses the `Instantiator`, not `Jit`.
     ///
     /// # Safety
@@ -4560,7 +4379,6 @@ impl CompiledModule {
             let t = &*this;
             if let Some(n) = &t._nursery {
                 n.set_durable(t.durable);
-                n.set_freeze(t.freeze_ctl.clone());
             }
         }
         // ---- Setup: references into `*this` live only inside this block. ----
@@ -4770,70 +4588,6 @@ impl CompiledModule {
             }
         }
 
-        // §4 nested thaw (JIT parity): re-attach + **rewind** the frozen §14 children before the parent
-        // re-enters, so its re-executed `join` resolves to each child's (rewound) result. Unlike a
-        // `thread.spawn` child (a peer vCPU, above), a §14 child is a nested *domain* re-run over its
-        // carve in thaw mode (rewind from the carve's frozen continuation, not a fresh start); the
-        // result is published at the child's join slot for the parent's `join`. Depth-2: re-attach only
-        // the **root's direct children** (`parent_task == 0`) here — each re-runs in thaw mode, and
-        // `compile_child_and_run` recursively re-attaches *its* grandchildren before it runs. Each
-        // re-attached child runs as its recorded `task`, so a grandchild's `parent_task` names it
-        // (#1687); the shared counter starts above every recorded task, for children minted afresh.
-        #[cfg(fiber_rt)]
-        if (*this).durable && !(*this).frozen_nested_seed.is_empty() {
-            let seed = std::mem::take(&mut (*this).frozen_nested_seed);
-            if let Some(n) = &(*this)._nursery {
-                let funcs = n.funcs();
-                let types = n.types();
-                let epoch = n.epoch_addr();
-                let first_free = seed.iter().map(|s| s.task + 1).max().unwrap_or(1);
-                let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(first_free));
-                let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new())); // thaw captures none
-                let mut roots: Vec<&FrozenNested> =
-                    seed.iter().filter(|s| s.parent_task == 0).collect();
-                roots.sort_by_key(|s| s.slot);
-                for rec in roots {
-                    if let Some(r) = rec.completed_result {
-                        // Finished before the cut (#1692), with a value or a trap (#1674).
-                        n.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
-                        continue;
-                    }
-                    let my_task = rec.task;
-                    let entry = rec.entry as FuncIdx;
-                    let nargs = funcs
-                        .get(entry as usize)
-                        .map(|f| f.params.len())
-                        .unwrap_or(0);
-                    let args = vec![0i64; nargs];
-                    // SAFETY: the carve `[carve_off, carve_off + 2^size_log2)` is committed in the
-                    // restored window at `mem_base` (it rode the artifact); `compile_child_and_run`
-                    // copies it into the child's own guarded window, rewinds it, and copies it back.
-                    match compile_child_and_run(
-                        &funcs,
-                        &types,
-                        entry,
-                        rec.carve_off,
-                        rec.size_log2,
-                        mem_base,
-                        &args,
-                        epoch,
-                        0, // durable thaw re-attach: metering a frozen subtree child is a later slice
-                        true, // durable
-                        (*this).shadow, // a nested durable child is same-module (§4)
-                        true, // thaw: rewind from the carve's frozen continuation
-                        my_task,
-                        std::sync::Arc::clone(&sink),
-                        std::sync::Arc::clone(&counter),
-                        &seed, // the full subtree residue — each level re-attaches its own children
-                        n.freeze(),
-                    ) {
-                        Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
-                        Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
-                    }
-                }
-            }
-        }
-
         // #1361 step 4 — re-create the detached children at their recorded slots before the root
         // re-enters: a captured one re-launched on its own restored window under `REWINDING`, a
         // completed one (#2041) as its outcome. The root's rewound `join` then parks on, or reloads,
@@ -5039,14 +4793,9 @@ impl CompiledModule {
                 // append order doesn't affect the artifact.
                 (*this).frozen_out.extend(d.take_frozen_fibers());
             }
-            // §4 freeze export: the §14 nested children that unwound under the freeze recorded their
-            // `FrozenNested` residue into the run's `Nursery`; drain it now that the root has unwound,
-            // read back by the durable-nested entry point.
+            // #1361 step 4 — reach its detached children, which own windows the freeze word above
+            // is not in: ring each one's own; they unwind and are harvested at teardown.
             if let Some(n) = &(*this)._nursery {
-                n.freeze_unjoined();
-                (*this).frozen_nested_out = n.take_frozen_nested();
-                // #1361 step 4 — and reach its detached children, which own windows the freeze word
-                // above is not in: ring each one's own; they unwind and are harvested at teardown.
                 n.ring_detached();
             }
         }
@@ -5723,315 +5472,6 @@ impl CompiledModule {
     }
 }
 
-/// Compile `func` (and the module's other functions, which `call`/`call.dyn` may reach) as a
-/// **top-level guest over its own fresh `2^child_size_log2`-byte window**, seeded from the parent's
-/// sub-region `[parent_mem_base + sub_base, … + child_size)` and copied back into it on completion.
-/// This is the JIT side of §14 nesting (the `Instantiator`): "nesting cost is paid at setup, not at
-/// runtime" — the child is compiled once (steady-state per-access cost is the same single AND+ADD as
-/// any guest, the masking already fuzzed by the escape-oracle). Running the child over its **own**
-/// guarded window (rather than the live parent window) means its confinement, width-overrun guard
-/// (detect-and-kill at *its* guard page), and `map`/`unmap` are the ordinary, fully-fuzzed top-level
-/// paths — no new escape-TCB codegen — and the parent sees the child's effect as the copy-back at
-/// `instantiate`-completion (the §14 superset, materialized at join for a synchronous child). The
-/// child runs under a **nested** detect-and-kill guard (`trap_shim`/VEH save+restore the parent's
-/// recovery state), so a child fault is caught at the child and the parent's guard stays intact.
-///
-/// Returns the child's `(result_slot, trap_cell)` — one `i64` result (the Instantiator child returns
-/// one `i64`); the trap cell is `0`, a `TrapKind`, or an `Exit` encoding. The child gets an **empty
-/// powerbox** (an inert `call.cap`) for now; a child using §12 fibers/threads is rejected
-/// (`Unsupported`) — those need per-child runtimes (a follow-up), and null thunks would be unsound.
-///
-/// # Safety
-/// `parent_mem_base` must point at the caller's live guest window with `[sub_base, sub_base +
-/// child_size)` committed (the Instantiator checks `sub_base + child_size ≤ holder size`); it must
-/// outlive the call. A guest window must already be installed on this thread (`install_guard`).
-#[cfg(fiber_rt)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn compile_child_and_run(
-    funcs: &[Func],
-    // #922 — the child module's type section, threaded to `compile_child_windowed` (and on to a
-    // grandchild).
-    types: &[temen_ir::TypeEntry],
-    child_entry: FuncIdx,
-    sub_base: u64,
-    child_size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: &[i64],
-    epoch_addr: usize,
-    // This child's own counted-fuel cell (`0` ⇒ un-metered). Baked into the child's code *and* handed
-    // to its grandchild nursery as the parent-fuel cell, so a grandchild clamps against this child's
-    // remaining budget — the recursive form of the `min(quota, parent_remaining)` contract.
-    fuel_addr: usize,
-    durable: bool,
-    // The child module's declared shadow arena (its own window's ctx-0 words live here).
-    child_shadow: temen_ir::durable_abi::ShadowArena,
-    thaw: bool,
-    my_task: usize,
-    nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
-    task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    nested_seeds: &[FrozenNested],
-    // #1693 — the run's async freeze controller: the child registers its window with it while it
-    // runs, and hands it to its own nursery for its grandchildren.
-    freeze: Option<std::sync::Arc<FreezeController>>,
-) -> Result<(i64, i64, bool), JitError> {
-    // Bounded ≤ MAX by `compile_child_windowed`'s reject (audit #3).
-    let child_size = 1u64 << child_size_log2;
-
-    // §4 (DURABILITY.md, "JIT parity"): a **durable** child gets an attenuated `Instantiator` powerbox
-    // so it can nest a grandchild of its own — the freeze slice's prerequisite (an instrumented child
-    // that can be *live* mid-computation is one that reached a `call.cap`). Build a child `Nursery`
-    // over the child's own funcs, boxed here so its stable address (the child's instance's nursery)
-    // outlives the run; its `instantiate` re-enters `compile_child_and_run` for the grandchild
-    // (recursion), re-checking the same durable + same-module guard. The child's powerbox holds one
-    // capability — an `Instantiator` over its **own** window (`child_instantiator_thunk`, ctx = the
-    // boxed window size); non-`Instantiator` caps and `AddressSpace` are a follow-up. A non-durable
-    // child keeps the pre-existing `InstEnv::null()` (can't nest) — behavior unchanged. `child_win_size`
-    // is declared before `child_nursery` so it outlives the nursery that borrows it.
-    let child_win_size: Box<u64> = Box::new(child_size);
-    let child_nursery: Option<Box<instantiator_rt::Nursery>> =
-        if durable && funcs_use_instantiator(funcs) {
-            let n = Box::new(instantiator_rt::Nursery::new(
-                funcs.to_vec().into(),
-                types.to_vec().into(),
-                instantiator_rt::child_instantiator_thunk,
-                &*child_win_size as *const u64 as *mut core::ffi::c_void,
-                None, // same-module grandchildren only (separate-module is a later slice)
-                epoch_addr,
-                0, // durable subtree: no shared futex domain (child futex ops stay rejected)
-                std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
-                std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
-                None, // an executor of its own, with no domain: it files no task
-            ));
-            n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
-            n.set_freeze(freeze.clone());
-            Some(n)
-        } else {
-            None
-        };
-    // The synchronous child's non-nesting powerbox is empty (an inert `call.cap` → `CapFault`); its
-    // `Instantiator` (if any) spawns through `child_nursery` above. A durable nested child never
-    // installs grant hooks, and the thunks fail its granted spawns closed anyway, so of that nursery
-    // only `instantiate` and the lifecycle ops do anything.
-    let child = compile_child_windowed(&ChildCompile {
-        funcs,
-        types,
-        entry: child_entry,
-        mapped_log2: child_size_log2,
-        reserved_log2: child_size_log2,
-        thunk: empty_cap_thunk,
-        addrs: InstanceAddrs {
-            epoch: epoch_addr as *const AtomicU64, // §5 kill-path: it polls the parent's cell
-            // Counted fuel: its own budget cell (null ⇒ un-metered).
-            fuel: fuel_addr as *mut FuelCell,
-            // The durable path has no shared futex domain, so child futex ops stay rejected.
-            nursery: child_nursery.as_deref().map_or(core::ptr::null(), |n| {
-                n as *const instantiator_rt::Nursery as *const core::ffi::c_void
-            }),
-            ..InstanceAddrs::NONE
-        },
-        impl_exports: &[], // the durable/sync nested child is never an offer target
-        table_reserve_log2: 0, // an empty powerbox holds no `Jit` — the natural table
-        shadow: child_shadow,
-        run: ChildRun::Inline, // on its parent's thread: no fiber runtime or thread domain of its own
-    })?;
-    let n_results = funcs[child_entry as usize].results.len();
-    let code = child.tramp_code;
-    let fn_table_ptr = child.fn_table.as_ptr();
-
-    // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
-    // child starts from the bytes the parent placed there (the §14 data plane is shared memory). #2305
-    // — one the address space has no room for ends the child as a run it cannot hold: `ThreadFault`
-    // before it starts, its carve untouched.
-    let Some(mut child_window) =
-        mem::GuestWindow::try_new(child_size as usize, child_size as usize)
-    else {
-        return Ok((0, TrapKind::ThreadFault as i64, false));
-    };
-    let child_base = child_window.base();
-    {
-        // SAFETY: `[parent_mem_base + sub_base, … + child_size)` is committed parent-window memory
-        // (the Instantiator bounded `sub_base + child_size ≤ holder size ≤ parent size`).
-        let src =
-            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
-        child_window.rw_mut().copy_from_slice(src);
-    }
-
-    // §4: a durable child runs its (possibly instrumented) funcs in the carve as **context 0** of its
-    // own window. Seed the ctx-0 durable control words exactly as the interpreter does at the child's
-    // first dispatch (`temen-interp` `durable_store_dstate(0, NORMAL)` + `durable_set_sp`): the global
-    // state word (at `STATE_OFF`, relocated above the #1094 NULL guard) and the ctx-0 thaw word to
-    // `NORMAL`, and the ctx-0 shadow-SP word (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the
-    // empty frame base `shadow_frame_base(0)`. So an instrumented child's prologue sees `NORMAL` and its
-    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ the arena `end`
-    // (64 KiB), so these offsets fit; the size guard keeps a malformed (too-small) guest-requested carve
-    // from panicking the host here — such a child instead traps at runtime when its instrumented code
-    // reaches past its window.
-    const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
-    let ctx0_sp_off = child_shadow.region_base(0) as usize;
-    let ctx0_thaw_off = child_shadow.thaw_state_off(0) as usize;
-    // Born into a freeze (its parent's window was already `UNWINDING`) — see `unwound` below.
-    let mut born_unwinding = false;
-    if durable && (child_size as usize) >= ctx0_thaw_off + 4 {
-        let ctx0_frame_base = child_shadow.frame_base(0);
-        const STATE_REWINDING: i32 = 2;
-        let w = child_window.rw_mut();
-        if thaw {
-            // §4 thaw: the carve (from the restored artifact) holds the child's frozen continuation —
-            // its spilled shadow stack + the ctx-0 SP word pointing at the top of it. Prepare it to
-            // **rewind** exactly as `temen-durable::begin_thaw` does for a context: global state word →
-            // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
-            // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
-            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
-            w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
-        } else {
-            // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
-            // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
-            // so an instrumented child is born unwinding and unwinds at its first poll; under `NORMAL`
-            // it runs to completion. Read the parent window's ctx-0 state word (at `STATE_OFF`).
-            let parent_phase = {
-                let p = std::slice::from_raw_parts(parent_mem_base.add(STATE_OFF), 4);
-                i32::from_le_bytes([p[0], p[1], p[2], p[3]])
-            };
-            w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
-            born_unwinding = parent_phase == temen_ir::durable_abi::STATE_UNWINDING;
-            w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
-            w[ctx0_sp_off..ctx0_sp_off + 8].copy_from_slice(&ctx0_frame_base.to_le_bytes());
-            // ctx-0 SP
-        }
-    }
-
-    // §4 depth-2 thaw: before the child runs, recursively re-attach + rewind **its own** grandchildren
-    // (residue tagged `parent_task == my_task`) over the **child's** window, and publish each result at
-    // its slot in the child's nursery — so when the rewinding child re-executes its `join(grandchild)`
-    // it resolves without re-running the grandchild (parents-before-children, one level down). The
-    // grandchild's `carve_off` is child-window-relative (its `instantiate` resolved the child's own
-    // window to `base 0`), so it re-runs over `child_base`, as its recorded `task` (#1687).
-    if thaw && durable {
-        if let Some(cn) = &child_nursery {
-            let mut gkids: Vec<&FrozenNested> = nested_seeds
-                .iter()
-                .filter(|s| s.parent_task == my_task)
-                .collect();
-            gkids.sort_by_key(|s| s.slot);
-            for rec in gkids {
-                if let Some(r) = rec.completed_result {
-                    // Finished before the cut (#1692), with a value or a trap (#1674).
-                    cn.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
-                    continue;
-                }
-                let gc_task = rec.task;
-                let gc_entry = rec.entry as FuncIdx;
-                let gc_nargs = funcs
-                    .get(gc_entry as usize)
-                    .map(|f| f.params.len())
-                    .unwrap_or(0);
-                let gc_args = vec![0i64; gc_nargs];
-                let out = compile_child_and_run(
-                    funcs,
-                    types,
-                    gc_entry,
-                    rec.carve_off,
-                    rec.size_log2,
-                    child_base,
-                    &gc_args,
-                    epoch_addr,
-                    0, // durable thaw re-attach: metering a frozen subtree child is a later slice
-                    true, // durable
-                    child_shadow, // a nested durable grandchild is same-module (§4)
-                    true, // thaw
-                    gc_task,
-                    std::sync::Arc::clone(&nested_sink),
-                    std::sync::Arc::clone(&task_counter),
-                    nested_seeds,
-                    freeze.clone(),
-                );
-                match out {
-                    Ok((r, t, _)) => cn.seed_child_result(rec.slot, r, t),
-                    Err(_) => cn.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
-                }
-            }
-        }
-    }
-
-    let mut results = vec![0i64; n_results];
-    // The child runs as its own instance (its empty powerbox + the parent's kill-path cell and its
-    // own budget cell, as its compile recorded them).
-    let vm = VmCtx::new(child.instance);
-    // SAFETY: `code` honours the `Entry` ABI; it accesses only its own window `[child_base, …+size)`
-    // (baked masking; a width-overrun hits this window's guard page), reads the child `fn_table`, and
-    // writes its result/trap slots. The guard is re-entrant, so a child fault is caught here and the
-    // parent's recovery state is restored.
-    // §4: while a durable child runs (synchronously, this OS thread), point the per-thread durable
-    // shadow-base register at the child's own ctx-0 region and restore the parent's after. Every
-    // nesting level is ctx 0 of its *own* window, so the value is always `DURABLE_SHADOW_BASE` — the
-    // save/restore is value-neutral here but keeps the register correct if a level ever runs at a
-    // non-zero context.
-    let saved_shadow = durable.then(|| {
-        let s = durable_shadow::get();
-        durable_shadow::seed(child_shadow.region_base(0));
-        s
-    });
-    // #1693: the child polls only its own window, so an async freeze must reach it here too.
-    // SAFETY: the window is live until after the ring is dropped below.
-    let ring = freeze
-        .as_ref()
-        .filter(|_| durable)
-        .map(|fc| fc.enter_child(child_base as usize));
-    let faulted = mem::run_guarded(
-        &child_window,
-        code,
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        child_base,
-        fn_table_ptr as *const core::ffi::c_void,
-        &vm,
-    );
-    drop(ring);
-    if let Some(s) = saved_shadow {
-        durable_shadow::seed(s);
-    }
-    let trap_cell = if faulted {
-        mem::FAULT_TRAP
-    } else {
-        vm.trap.load(Ordering::Relaxed)
-    };
-    // Copy the child's final window back into the parent's sub-region — the parent (the superset) now
-    // sees the child's writes (materialized at `instantiate`-completion for a synchronous child). A
-    // guest with no Memory cap leaves every page mapped; `restore_rw` is defensive.
-    // §4 freeze export: a durable child that left its carve `UNWINDING` unwound mid-run under a freeze
-    // (spilled its continuation into the carve + returned a placeholder) instead of completing. Detect
-    // it from the carve's state word before the copy-back carries the carve into the parent window.
-    // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
-    // A child that trapped did not unwind, even under a freeze: it finished, with that trap. Nor did
-    // one an async request rang after its last poll (#1693): it ran to the end, its shadow stack still
-    // empty, as the root's late-request check reads it. A child born unwinding keeps its rule: it is
-    // recorded, and a thaw re-runs it.
-    let unwound = durable
-        && !faulted
-        && trap_cell == 0
-        && fiber_rt::window_is_unwinding(child_base as u64)
-        && (born_unwinding
-            || fiber_rt::read_shadow_sp(child_base as u64, child_shadow.region_base(0))
-                > child_shadow.frame_base(0));
-    // Its own unjoined children ride too (depth-2+).
-    if unwound {
-        if let Some(n) = &child_nursery {
-            n.freeze_unjoined();
-        }
-    }
-    child_window.restore_rw();
-    {
-        let dst = std::slice::from_raw_parts_mut(
-            parent_mem_base.add(sub_base as usize),
-            child_size as usize,
-        );
-        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
-    }
-    drop(child_window);
-    drop(child); // frees the child's executable memory now the call has returned
-    Ok((results.first().copied().unwrap_or(0), trap_cell, unwound))
-}
-
 /// #2166 — invoke a serve handler's trampoline over its domain's **live** window: the one handler
 /// call of every JIT serve route — the domain's own serve loop (root or §14 child) and a caller's
 /// direct handoff (CALLS.md 5c.2). Arms detect-and-kill over the window's whole fault range
@@ -6209,21 +5649,6 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
         .collect()
 }
 
-/// How a §14 child runs, which decides the fiber and thread runtimes its code may call (#1469).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum ChildRun {
-    /// Synchronously on its parent's thread (the durable nested path): the running fiber runtime
-    /// is the parent's, so `cont.*` and `thread.*` stay refused.
-    Inline,
-    /// As a child-executor task (`child_exec`): a fiber runtime of its own, and a domain of its
-    /// own for `thread.spawn`/`join`.
-    Task,
-    /// As a **durable** task (a durable parent's detached child, or a thawed one): a fiber runtime
-    /// of its own, and a domain of its own, whose window's freeze word ends its waits (#1937). Its
-    /// `thread.spawn` vCPUs unwind under that word too, and their residue rides its capture (#2010).
-    DurableTask,
-}
-
 /// What a §14 child's compile is given ([`compile_child_windowed`]). All of it but the module itself
 /// (its functions, types and shadow arena, which the module's digest names) is what else its code
 /// depends on, so a [`ChildCodeKey`] is made of exactly these fields.
@@ -6252,8 +5677,6 @@ pub(crate) struct ChildCompile<'a> {
     pub(crate) table_reserve_log2: u8,
     /// The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
-    /// How it runs (see [`ChildRun`]): only a task has a fiber runtime and a thread domain of its own.
-    pub(crate) run: ChildRun,
 }
 
 /// Compile a §14 child: every function confined to its own window — `mapped_log2` committed bytes
@@ -6287,9 +5710,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         impl_exports,
         table_reserve_log2,
         shadow,
-        run,
     } = *c;
-    let in_task = run != ChildRun::Inline;
     let epoch_addr = addrs.epoch as usize;
     let fuel_addr = addrs.fuel as usize;
     let futex_sched = addrs.sched as usize;
@@ -6319,14 +5740,13 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         ensure_supported(f, types)?;
         // `thread.spawn`/`join` need the task's own domain, and its parent's to share the futex
         // with; without them they would compile against null thread thunks — reject. Likewise
-        // `cont.*` in a child that has no fiber runtime of its own (not a task), or no domain for
-        // `cont.resume.block` to bake.
-        if f.uses_threads() && !(in_task && cfg!(fiber_rt) && futex_sched != 0) {
+        // `cont.*` with no domain for `cont.resume.block` to bake.
+        if f.uses_threads() && !(cfg!(fiber_rt) && futex_sched != 0) {
             return Err(JitError::Unsupported(
                 "a §14 JIT child using thread.spawn/join needs a task and its parent's domain",
             ));
         }
-        if !(in_task && cfg!(fiber_rt) && futex_sched != 0) && f.uses_fibers_or_threads() {
+        if !(cfg!(fiber_rt) && futex_sched != 0) && f.uses_fibers_or_threads() {
             return Err(JitError::Unsupported(
                 "a §14 JIT child using fibers needs a task and its parent's domain",
             ));
@@ -6366,7 +5786,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     intern_unit_sigs(&mut distinct, funcs, types)?;
     // A task child using `cont.*` or `gc.roots` gets the fiber thunks, as a root does
     // (`compile_with_signal`); the fiber-entry signature is interned the same way.
-    let uses_fibers = in_task && funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots());
+    let uses_fibers = funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots());
     // Thread ops passed the check above only in a task that can host them.
     let uses_threads = funcs.iter().any(|f| f.uses_threads());
     #[cfg(fiber_rt)]
@@ -6626,10 +6046,8 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         frozen_seed: Vec::new(),
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),
-        frozen_nested_out: Vec::new(),
         frozen_root_sp_out: 0,
         frozen_vcpu_seed: Vec::new(),
-        frozen_nested_seed: Vec::new(),
         detached_out: Vec::new(),
         detached_seed: Vec::new(),
         thaw_root_sp: shadow.frame_base(0),
@@ -6672,7 +6090,6 @@ struct ChildCodeKey {
     /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain, and the nursery.
     cells: [bool; 4],
     table_reserve_log2: u8,
-    run: ChildRun,
 }
 
 impl ChildCodeKey {
@@ -6691,7 +6108,6 @@ impl ChildCodeKey {
                 !a.nursery.is_null(),
             ],
             table_reserve_log2: c.table_reserve_log2,
-            run: c.run,
         }
     }
 }

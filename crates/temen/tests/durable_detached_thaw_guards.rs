@@ -15,7 +15,7 @@ use std::time::Duration;
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, MemLayout, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, MemLayout, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::errno::EINVAL;
 use temen_ir::SpawnRec;
@@ -153,7 +153,7 @@ fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, 4);
-    host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (host, vec![inst as i64, modh as i64, budget as i64])
 }
 

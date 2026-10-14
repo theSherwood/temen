@@ -508,7 +508,6 @@ mod jit {
                 vcpus: r.vcpus.iter().map(to_jit).collect(),
                 fibers: r.fibers.iter().map(fiber_to_jit).collect(),
                 root_sp: r.root_sp,
-                ..Default::default()
             },
             None => DurableResidue {
                 root_sp: Some(arena(inst).region_base(0)),

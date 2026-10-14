@@ -570,7 +570,7 @@ fn sharing_host(child: &Module, backing: Arc<dyn SharedBacking>) -> (Host, [Valu
         backing.write_byte(8 + o as u64, b);
     }
     let rh = host.grant_shared_region_backed(backing);
-    host.grant_freeze_authority(temen_interp::FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (
         host,
         [

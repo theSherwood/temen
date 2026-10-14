@@ -6,9 +6,10 @@ nifmake is a classic-Nim-only program: it uses stdlib conveniences nimony's stdl
 (`setLastModificationTime`, `tables.withValue`, `align`/`alignLeft`, `getCurrentProcessId`,
 `moveFile`/`removeFile`, a one-element `seq.insert`, `wait4` with a `rusage`, `foldl`, int `/`
 yielding a float, multi-argument `writeLine`, `except ValueError`/`OSError`, a capturing `sort`
-comparator, a nil `ptr`, raising table and OS calls outside `try`). It also fixes a latent bug:
+comparator, a nil `ptr`, raising table and OS calls outside `try`, globals with no word on their
+synchronization). It also fixes a latent bug:
 `countProcessors()` is 0 when the count cannot be detected, and `-j` then scheduled nothing and
-reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master 6ca46f17 (2026-09-30).
+reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master 650bebb2 (2026-10-14).
 
 What: every change is either `when defined(nimony)` or shared code valid under both compilers,
 using upstream's own dual-compile idioms (`lib/compat2.nim`'s `onRaiseQuit` / `getOrQuit`).
@@ -17,11 +18,13 @@ Behaviour is unchanged, except that a nimony-built nifmake's `--profile` reports
 pinned devel) and with nimony, and either binary drives `nimony c` to the same result.
 
 Applied to a COPY of the pinned sources at build time (`scripts/nim-toolchain.sh`); the
-vendored `nimony/` submodule is never modified. Against the submodule pin (6ca46f17).
+vendored `nimony/` submodule is never modified. Against the submodule pin (650bebb2).
 Drop it when upstream nifmake builds with nimony.
+diff --git a/src/nifmake/nifmake.nim b/src/nifmake/nifmake.nim
+index 7b6e92cc..dfa08aca 100644
 --- a/src/nifmake/nifmake.nim
 +++ b/src/nifmake/nifmake.nim
-@@ -12,9 +12,37 @@ import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes
+@@ -12,9 +12,39 @@ import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes
  import ".." / lib / [bitabs, lineinfos, nifreader, tooldirs, argsfinder, vfs, nifpools, nimversion]
  when defined(windows):
    import std/winlean
@@ -36,6 +39,8 @@ Drop it when upstream nifmake builds with nimony.
 +  # Built by nimony too (Temen's self-hosted toolchain, #1609), whose stdlib lacks a few of
 +  # classic Nim's conveniences. Each shim is exactly what the call site needs.
 +  import std/cpuinfo
++  # nifmake runs its jobs as processes, on one thread, so its globals need no synchronization.
++  {.feature: "assumeSync".}
 +
 +  proc align(s: string; width: int): string =
 +    result = repeat(' ', max(0, width - s.len)) & s
@@ -59,7 +64,7 @@ Drop it when upstream nifmake builds with nimony.
  # Inspired by https://gittup.org/tup/build_system_rules_and_algorithms.pdf
  #[
  build_partial_DAG(DAG, change_list)
-@@ -228,7 +256,7 @@ proc expandInputsOf(dag: var Dag) =
+@@ -233,7 +263,7 @@ proc expandInputsOf(dag: var Dag) =
      let name = dag.commands[node.cmdIdx].name
      if name notin byCommand: byCommand[name] = @[]
      for output in node.outputs:
@@ -68,16 +73,16 @@ Drop it when upstream nifmake builds with nimony.
    for nodeId in 0 ..< dag.nodes.len:
      if dag.nodes[nodeId].inputsOf.len == 0: continue
      var seen = initHashSet[string]()
-@@ -236,7 +264,7 @@ proc expandInputsOf(dag: var Dag) =
-     for cmdName in dag.nodes[nodeId].inputsOf:
-       if cmdName notin byCommand:
-         quit "`inputsof` names a command with no nodes: " & cmdName
--      for output in byCommand[cmdName]:
-+      for output in byCommand.getOrQuit(cmdName):
-         if not seen.containsOrIncl(output):
+@@ -241,7 +271,7 @@ proc expandInputsOf(dag: var Dag) =
+     for x in dag.nodes[nodeId].inputsOf:
+       if x.cmd notin byCommand:
+         quit "`inputsof` names a command with no nodes: " & x.cmd
+-      for output in byCommand[x.cmd]:
++      for output in byCommand.getOrQuit(x.cmd):
+         if output.endsWith(x.suffix) and not seen.containsOrIncl(output):
            dag.nodes[nodeId].inputs.add output
  
-@@ -246,7 +274,7 @@ proc findDependencies(dag: var Dag; nodeId: int) =
+@@ -251,7 +281,7 @@ proc findDependencies(dag: var Dag; nodeId: int) =
  
    for input in node.inputs:
      if input in dag.nameToId:
@@ -86,7 +91,7 @@ Drop it when upstream nifmake builds with nimony.
        if depId != nodeId and depId notin node.deps:
          node.deps.add(depId)
  
-@@ -256,14 +284,19 @@ proc touchOutputs(node: Node; opt: set[CliOption]) =
+@@ -261,14 +291,19 @@ proc touchOutputs(node: Node; opt: set[CliOption]) =
    ## deleting the outputs first: a const-eval or plugin sub-compile shares the
    ## nimcache and may be reading them right now (writes are atomic renames,
    ## so replacing a file under a reader is fine; removing it is not).
@@ -109,7 +114,7 @@ Drop it when upstream nifmake builds with nimony.
  
  type
    StatEntry = tuple[exists: bool, mtime: int64]
-@@ -277,8 +310,8 @@ type
+@@ -282,8 +317,8 @@ type
      entries: Table[string, StatEntry]
  
  proc stat(sc: var StatCache; path: string): StatEntry =
@@ -120,7 +125,7 @@ Drop it when upstream nifmake builds with nimony.
    let exists = vfsExists(path)
    result = (exists, if exists: vfsMtime(path) else: low(int64))
    sc.entries[path] = result
-@@ -352,8 +385,12 @@ proc topologicalSort(dag: var Dag): seq[int] =
+@@ -356,8 +391,12 @@ proc topologicalSort(dag: var Dag): seq[int] =
        if not visit(dag.nodes, i, result, dag.maxDepth):
          quit "Circular dependency detected in build graph"
  
@@ -135,7 +140,7 @@ Drop it when upstream nifmake builds with nimony.
  
  proc failed(command: string; exitCode = 0) =
    ## Name the command that failed. A build that fans out over many processes is
-@@ -486,7 +523,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
+@@ -490,7 +529,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
      if success and fileExists(tmp):
        try:
          moveFile(tmp, node.outputs[i])
@@ -144,7 +149,7 @@ Drop it when upstream nifmake builds with nimony.
          # Windows refuses to replace a file that is open, e.g. while another
          # build links it. That build produced the same output the same way,
          # so it is as good as ours.
-@@ -494,7 +531,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
+@@ -498,7 +537,7 @@ proc commitAtomic(node: Node; tmpOutputs: seq[string]; success: bool) =
            quit "nifmake: cannot move " & tmp & " to " & node.outputs[i]
      if fileExists(tmp):
        try: removeFile(tmp)
@@ -153,7 +158,7 @@ Drop it when upstream nifmake builds with nimony.
  
  proc initScheduler(dag: Dag; sortedNodes: seq[int]): Scheduler =
    result = Scheduler(
-@@ -578,6 +615,19 @@ proc waitForAnyJob(pool: seq[RunningJob]; exitCode, peakKiB: var int): int =
+@@ -582,6 +621,19 @@ proc waitForAnyJob(pool: seq[RunningJob]; exitCode, peakKiB: var int): int =
            exitCode = try: peekExitCode(pool[idx].process) except CatchableError: -1
            return idx
        sleep 1
@@ -173,8 +178,8 @@ Drop it when upstream nifmake builds with nimony.
    else:
      # Reaps with `wait4` rather than through osproc because only `wait4` hands
      # back the child's `ru_maxrss`, which covers the `sh -c` wrapper's own
-@@ -633,9 +683,11 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
-   # dependencies have actually been written, so `OnlyIfChanged` outputs keep
+@@ -642,9 +694,11 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+   # dependencies have actually been written, so unchanged interface files keep
    # pruning their dependents exactly as before. A sequential run is this with
    # a single slot: `rank` dispatches in topological order.
 +  # `countProcessors` is 0 when the count cannot be detected; zero slots would dispatch nothing
@@ -186,7 +191,7 @@ Drop it when upstream nifmake builds with nimony.
    var sched = initScheduler(dag, sortedNodes)
    var pool: seq[RunningJob] = @[]
    var aborted = false
-@@ -657,8 +709,8 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+@@ -666,8 +720,8 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
          if Verbose in opt:
            echo "Command: ", expandedCmd
          pool.add RunningJob(
@@ -197,7 +202,7 @@ Drop it when upstream nifmake builds with nimony.
            nodeId: nodeId,
            command: expandedCmd,
            cmdName: dag.commands[node.cmdIdx].name,
-@@ -680,7 +732,7 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
+@@ -689,7 +743,7 @@ proc runDag(dag: var Dag; opt: set[CliOption]; profile: ptr ProfileData = nil;
      let k = waitForAnyJob(pool, exitCode, peakKiB)
      let job = pool[k]
      pool.del k
@@ -206,7 +211,7 @@ Drop it when upstream nifmake builds with nimony.
      if profile != nil:
        profile[].recordCmd(job.cmdName, job.label, job.start, getMonoTime(),
                            peakKiB)
-@@ -756,7 +808,7 @@ proc generateMakefile(dag: Dag; filename: string) =
+@@ -765,7 +819,7 @@ proc generateMakefile(dag: Dag; filename: string) =
        content.add " " & mescape(output)
    content.add "\n"
  
@@ -215,7 +220,7 @@ Drop it when upstream nifmake builds with nimony.
  
  proc parseCommandDefinition(n: var Cursor; dag: var Dag) =
    if n.kind == SymbolDef:
-@@ -983,36 +1035,38 @@ proc concurrentPeak(profile: ProfileData): tuple[kib, jobs: int] =
+@@ -999,36 +1053,38 @@ proc concurrentPeak(profile: ProfileData): tuple[kib, jobs: int] =
      if cur > result.kib: result = (cur, live)
  
  proc fmtKiB(kib: int): string =
@@ -263,7 +268,7 @@ Drop it when upstream nifmake builds with nimony.
    stderr.writeLine "---"
  
  proc main() =
-@@ -1025,7 +1079,8 @@ proc main() =
+@@ -1041,7 +1097,8 @@ proc main() =
      progressLo = 0
      progressHi = 100
  
@@ -273,7 +278,7 @@ Drop it when upstream nifmake builds with nimony.
    for kind, key, val in p.getopt():
      case kind
      of cmdArgument:
-@@ -1053,7 +1108,7 @@ proc main() =
+@@ -1069,7 +1126,7 @@ proc main() =
          if val.len > 0:
            try:
              gMaxJobs = parseInt(val)
@@ -282,7 +287,7 @@ Drop it when upstream nifmake builds with nimony.
              quit "invalid value for --parallel: " & val
            if gMaxJobs < 1: quit "--parallel value must be >= 1"
        of "makefile": outputMakefile = val
-@@ -1073,7 +1128,7 @@ proc main() =
+@@ -1089,7 +1146,7 @@ proc main() =
              try:
                progressLo = parseInt(parts[0])
                progressHi = parseInt(parts[1])
@@ -291,7 +296,7 @@ Drop it when upstream nifmake builds with nimony.
                quit "invalid --progress range: " & val
            else:
              quit "invalid --progress range: " & val
-@@ -1090,19 +1145,16 @@ proc main() =
+@@ -1106,19 +1163,16 @@ proc main() =
      if inputFile == "":
        quit "Input file required for 'run' command"
  

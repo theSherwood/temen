@@ -153,3 +153,38 @@ fn oconstr_in_expression_position() {
     );
     assert_eq!(run(&m, 0, &[24576, 7]), 7);
 }
+
+#[test]
+fn a_conversion_to_an_aggregate_assigns_its_operand() {
+    // `(conv T X)` to an aggregate moves no bits. A closure's `default(T)` is `T(nil)`, which hexer
+    // lowers to `(conv T (oconstr T …))`. sum(n) = { var p = Pair(Pair(a: n, b: 7)); p.a + p.b }
+    let leng = "\
+(stmts
+ (type :Pair.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64))))
+ (proc :sum.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :p.0 . Pair.0. .)
+   (asgn p.0 (conv Pair.0. (oconstr Pair.0. (kv a.0 n.0) (kv b.0 7))))
+   (ret (add (i +64) (dot p.0 a.0 0) (dot p.0 b.0 0))))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    // The aggregate local makes `sum` frame-needing: ($sp, n) -> i64.
+    assert_eq!(run(&m, 0, &[20480, 5]), 12);
+    assert_eq!(run(&m, 0, &[20480, -7]), 0);
+}
+
+#[test]
+fn a_branch_that_never_runs_may_dereference_a_typed_nil() {
+    // nimony types a `nil` by the pointer type it meets (nim-lang/nimony#2611), and hexer inlines a
+    // `ref`'s copy hook with a `nil` source: `fs.f = nil` carries `if (nil (ptr T)): arcInc(addr
+    // (nil (ptr T))[].r)`. The branch never runs, but it must lower.
+    let leng = "\
+(stmts
+ (type :Box.0. . (object . (fld :r.0 . (i +64))))
+ (proc :set_get.0 (params (param :p.0 . (ptr Box.0.)) (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (if (elif (nil (ptr Box.0.)) (stmts (asgn (dot (deref (nil (ptr Box.0.))) r.0 0) 1))))
+   (asgn (dot (deref p.0) r.0 0) v.0)
+   (ret (dot (deref p.0) r.0 0)))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[16512, 41]), 41);
+}

@@ -1,6 +1,6 @@
 // nimony's own driver in a real browser (#958): the wasm export `temen_nim_open` opens a build of a nim
 // program the way `scripts/ci/nim-selfhost-lane.sh`'s step 4 builds it natively — `nimony t --isMain
-// prog.nim`, which forks and execs nifmake, `/bin/sh`, nifler2, nimsem, hexer and temen-link, and a
+// prog.nim`, which forks and execs nifmake, `/bin/sh`, nifler2, nimsem, shoggoth and temen-link, and a
 // compile-time evaluation's own build — and the cooperative driver (`driveCoopTierupRun`) runs it inside
 // Chromium: the process tree on the interpreter tier, each leaf process that cannot park whole on the
 // emitted tier (#1896), and temen-link natively. Reports the build's wall-clock and the engine's linear
@@ -28,7 +28,7 @@ if (!LANE || !NIM_TREE || !NIM_PROG || !existsSync(WASM)) {
   console.log('SKIP: set NIM_LANE_DIR, NIM_TREE and NIM_PROG, and build the threads wasm');
   process.exit(0);
 }
-const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'hexer'];
+const TOOLS = ['nimony', 'nifmake', 'nimsem', 'nifler2', 'shoggoth'];
 const tree = realpathSync(NIM_TREE);
 const dir = NIM_AT || tree;
 
@@ -148,13 +148,13 @@ const res = await page.evaluate(async ({ maxPages }) => {
   const text = (p, n) => new TextDecoder().decode(new Uint8Array(memory.buffer, p, n).slice());
   const stdout = text(ex.temen_stdout_ptr(), ex.temen_stdout_len());
   const stderr = text(ex.temen_stderr_ptr(), ex.temen_stderr_len());
-  // The linked program, `nimcache/<main>.temen/<prog>.temen`, where `<main>` is nimony's stem for the
+  // The linked program, `nimcache/t/<main>/<prog>.temen`, where `<main>` is nimony's stem for the
   // path it was given; read back from the build's memfs.
   const [qp, ql] = put(enc.encode(m.prog));
   const ml = ex.temen_nim_module_suffix(qp, ql); // onto the stdout slot, read above
   const main = text(ex.temen_stdout_ptr(), ml);
   const prog = m.prog.replace(/^.*\//, '').replace(/\.nim$/, '');
-  const [pp, pl] = put(enc.encode(`${m.dir}/nimcache/${main}.temen/${prog}.temen`));
+  const [pp, pl] = put(enc.encode(`${m.dir}/nimcache/t/${main}/${prog}.temen`));
   const n = Number(ex.temen_nim_file(pp, pl));
   const built = n >= 0 ? new Uint8Array(memory.buffer, ex.temen_nim_file_ptr(), n).slice() : null;
   const digest = built && [...new Uint8Array(await crypto.subtle.digest('SHA-256', built))]

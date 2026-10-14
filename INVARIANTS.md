@@ -373,7 +373,7 @@ frontier's own repair, never parked. Until it is gone:
 - **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
   its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
   freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
-  `FreezeScope`'s carve-named form folds into the detached one). The carve-specific escape oracle and fuzz targets retire with the path they test, once
+  freeze authority's carve-named form folds into the detached one — both done, #1867). The carve-specific escape oracle and fuzz targets retire with the path they test, once
   detached-window twins cover the same confinement property.
 
 ## 14. One frontier, consistent across every axis
@@ -444,19 +444,18 @@ safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap:
 platform lifecycle action the guest cannot see coming, killing the domain, which invariant 5 forbids in
 terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
 three engines is therefore the resting state until (a) freeze authority is **represented in code** —
-`Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
-carve names it: granted at spawn while the carve spawned (#1867), containment-covering so one grant serves every child of an
-instantiator range, durable so a thawed parent holds what it held, and askable through
-`Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
-sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never
-self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
+`Binding::FreezeAuthority` is that representation (#1440): durable so a thawed parent holds what it
+held, and askable through `Host::holds_freeze_authority`. Its first form named a §14 **nested
+carve** by the carve's range and went with the carve (#1867). A **detached** child, which owns its
+own window and has no sub-range to be named by, is covered by the all-or-nothing form, the one that
+remains — and never self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
 whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very
 isolation the spawn asked for. Authority over detached children therefore arrives from above or not at
 all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
 **It came out on 2026-09-23 (#1361 step 4):** all three engines now admit a durable parent's detached
-spawn of an attested-freezable module iff the parent holds `FreezeScope::DetachedProgeny` — asked in the
+spawn of an attested-freezable module iff the parent holds freeze authority — asked in the
 one shared admission, `Host::admit_detached_spawn` — and the oracle's and the JIT's freezes capture the
 child as its own artifact inside the parent's (DURABILITY.md §4).
 

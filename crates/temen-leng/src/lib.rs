@@ -2311,7 +2311,7 @@ pub fn link_command(
     let mut srcs = Vec::new();
     for &p in &inputs {
         let Some(bytes) = read(p) else { return 2 };
-        // A module's stem is its file's name to the first dot: `nimcache/x.temen/sysvq0asl.c.nif`.
+        // A module's stem is its file's name to the first dot: `nimcache/t/x/sysvq0asl.c.nif`.
         let name = p.rsplit('/').next().unwrap_or(p);
         let stem = name.split('.').next().unwrap_or(name);
         srcs.push((stem, nif_text(&bytes).into_owned()));

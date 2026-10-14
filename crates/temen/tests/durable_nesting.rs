@@ -21,7 +21,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module,
     transform_module_assume_confined, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, FreezeScope, Host, Trap, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -165,7 +165,7 @@ fn detached_powerbox() -> (Host, [Value; 3]) {
     let inst = host.grant_instantiator(0, WINDOW as u64);
     let modh = host.grant_durable_module(&child());
     let budget = host.grant_budget(-1, 1 << 20, -1);
-    host.grant_freeze_authority(FreezeScope::DetachedProgeny);
+    host.grant_freeze_authority();
     (
         host,
         [Value::I32(inst), Value::I32(modh), Value::I32(budget)],
