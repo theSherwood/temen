@@ -9,7 +9,12 @@ flags, so every artifact up to there is byte-identical to `nimony c`'s), then ON
 node in place of lengc + cc + link: `temen-link -o:<prog.temen> <every module's .c.nif, main
 first>`, which writes one verified Temen module. It sits beside the web backends (`backendWasm` /
 `backendJs`, whose whole-program tool is jorogumo): the same shape, an output-naming helper beside
-theirs (`temenFile`), and its own backend directory (`t/<main>/`, beside `c/<main>/`; nim-lang/nimony#2616). A Temen module runs under a Temen host, so `nimony t -r`
+theirs (`temenFile`), and its own backend directory (`t/<main>/`, beside `c/<main>/`;
+nim-lang/nimony#2616). Its options memo there leaves out the modules' `{.passC.}`, since a Temen
+build compiles no C, and a program's first build in a cache runs by staleness instead of rerunning
+the stage. Otherwise a program that imports other modules than the last build did, and every
+compile-time evaluation and macro plugin (each a program of its own), would lower every module
+again. A Temen module runs under a Temen host, so `nimony t -r`
 runs it only where nimony itself runs on one: it execs it there, as a native nimony execs its
 executable, and refuses anywhere else. `temen-link` itself lives in this repo
 (`crates/temen-run/demos/temen_link`).
@@ -45,7 +50,7 @@ index 580e27ea..cc1bd779 100644
  proc moduleSuffix*(path: string; searchPaths: openArray[string]): string =
    # `getCurrentDir`/`relativePath` are `.raises`, but the only reason they can
 diff --git a/src/nimony/deps.nim b/src/nimony/deps.nim
-index 09607460..12ace69a 100644
+index 09607460..6c73e743 100644
 --- a/src/nimony/deps.nim
 +++ b/src/nimony/deps.nim
 @@ -82,6 +82,7 @@ proc backendTag(config: NifConfig): string =
@@ -166,7 +171,21 @@ index 09607460..12ace69a 100644
            discard  # no per-module codegen: the single whole-program node
                     # (see "Link executable" above) consumes the .c.nif
          elif native:
-@@ -2424,6 +2473,8 @@ proc buildGraph*(config: sink NifConfig; project: string;
+@@ -2043,7 +2092,12 @@ proc addBackendKey(b: var Builder; c: DepContext; passC, passL: string) =
+       b.addStrLit c.config.linker
+     b.withTree "passc":
+       b.addStrLit passC
+-      for x in c.passC: b.addStrLit x
++      # A Temen build compiles no C, so a module's `{.passC.}` (rawthreads'
++      # `-pthread`) changes none of its artifacts. In the memo it would rerun
++      # the stage whenever a program imports other modules than the last one
++      # built in this cache did.
++      if c.config.backend != backendTemen:
++        for x in c.passC: b.addStrLit x
+     b.withTree "passl":
+       b.addStrLit passL
+     if c.config.layoutFile.len > 0:
+@@ -2424,13 +2478,23 @@ proc buildGraph*(config: sink NifConfig; project: string;
        exeOutPath = c.config.wasmFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
      elif c.config.backend == backendJs:
        exeOutPath = c.config.jsFile(c.rootNode.files[0], c.config.backendDirName(c.rootNode.files[0]))
@@ -175,7 +194,23 @@ index 09607460..12ace69a 100644
      let exeOutDir = exeOutPath.parentDir
      if exeOutDir.len > 0:
        onRaiseQuit createDir(path(exeOutDir))
-@@ -2480,5 +2531,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
+     let beMemoFile = backendMemoFile(c)
+     let beMemo = backendMemo(c, passC, passL)
+     let backendChanged = memoDiffers(c, beMemoFile, beMemo)
+-    execBackend nifmakeBase & (if backendChanged: " --rerun" else: "") &
++    # A Temen program's first build in this cache (no memo yet) runs by
++    # staleness, not `--rerun`: no option of a `t` backend stage changes an
++    # artifact without changing its name (`--opt` links `.oc.nif`), and the
++    # shared `.x.nif` go stale through their `.s.nif`. A rerun would lower every
++    # module again for each compile-time evaluation and macro plugin, each a
++    # program of its own.
++    let rerun = backendChanged and
++      (c.config.backend != backendTemen or semos.fileExists(beMemoFile))
++    execBackend nifmakeBase & (if rerun: " --rerun" else: "") &
+         jobsArg(config) & " run " & progArg(flags, 50, 100) & quoteShell(buildFinalFilename),
+       beMemoFile, beMemo, backendChanged
+ 
+@@ -2480,5 +2544,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
          # around it — node runs the file as it stands.
          exec "node " &
               quoteShell(c.config.jsFile(c.rootNode.files[0], backend)) & executableArgs

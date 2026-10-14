@@ -205,8 +205,11 @@ if want nim_card; then
   # plugins its grammar declares (parsegen, regex), which the pack carries built, so a program's
   # macro builds only its own plugin, in the program's cache (#2049). `std/json` costs the pack
   # 0.45 MB gzipped and saves a json program two-thirds of its build (#2070). `rawthreads`, `osproc`
-  # and `cmdline` are what the card's Threads and Processes programs import (#2374).
-  cat >"$T/card/prelude.nim" <<'NIM'
+  # and `cmdline` are what the card's Threads and Processes programs import (#2374). It is built as
+  # `prog.nim`, the program the card builds, so the pack carries that program's options memo
+  # (`nimcache/t/<main>/config.nif`, nim-lang/nimony#2616): a card build that found none would rerun
+  # its whole backend stage, every module of the library lowered again.
+  cat >"$T/card/prog.nim" <<'NIM'
 import std/[syncio, strutils, sequtils, tables, sets, hashes, algorithm, math, options, deques,
   parseutils, bitops, intsets, macros, json, rawthreads, osproc, cmdline]
 
@@ -222,7 +225,7 @@ NIM
   if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
      && ln -s "$T/nimony/lib" "$T/card/lib" && ln -s "$T/nimony/src" "$T/card/src" \
      && ( cd browser && cargo build --release -q --bin nimbuild ) \
-     && browser/target/release/nimbuild "$T" "$T/card" prelude.nim --at /nim --leaves --bundle "$T/nimony.blob" \
+     && browser/target/release/nimbuild "$T" "$T/card" prog.nim --at /nim --leaves --bundle "$T/nimony.blob" \
      && gzip -9 -n -c "$T/nimony.blob" > browser/web/assets/nimony.blob.gz; then
     note "nim_card ✓ (nimony.blob.gz — gated by browser/tests/nimony.rs)"
   else
