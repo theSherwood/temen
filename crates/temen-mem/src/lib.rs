@@ -129,7 +129,10 @@ pub enum Region {
 
 /// The accessor table behind [`Region::Foreign`]: how to reach the bytes of foreign backing `id`.
 /// Offsets are region-relative and already bounded to `[0, len)` by `Region` before the call, so an
-/// implementation may trust them. `atomic` is the one seq-cst primitive: `kind` 0 = load, 1 = store
+/// implementation may trust them. `read`/`write` copy a span; `load`/`store` move one little-endian
+/// word of `width` 1, 2, 4 or 8 bytes, zero-extended on load and truncated on store, and serve every
+/// byte and word access, so an embedder can answer them without a buffer (#2416). `atomic` is the
+/// one seq-cst primitive: `kind` 0 = load, 1 = store
 /// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
 /// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
 /// `grow` asks the embedder to make at least `len` bytes addressable (a `memory.grow` of the foreign
@@ -137,6 +140,8 @@ pub enum Region {
 pub struct ForeignOps {
     pub read: fn(id: u32, off: u64, out: &mut [u8]),
     pub write: fn(id: u32, off: u64, data: &[u8]),
+    pub load: fn(id: u32, off: u64, width: u32) -> u64,
+    pub store: fn(id: u32, off: u64, width: u32, val: u64),
     pub fill: fn(id: u32, off: u64, len: u64, b: u8),
     pub copy_within: fn(id: u32, dst: u64, src: u64, len: u64),
     pub atomic: fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
@@ -159,13 +164,10 @@ pub struct Foreign {
 
 impl Foreign {
     fn word(&self, off: u64, width: u32) -> u64 {
-        let mut b = [0u8; 8];
-        (self.ops.read)(self.id, off, &mut b[..width as usize]);
-        u64::from_le_bytes(b)
+        (self.ops.load)(self.id, off, width)
     }
     fn set_word(&self, off: u64, width: u32, val: u64) {
-        let b = val.to_le_bytes();
-        (self.ops.write)(self.id, off, &b[..width as usize]);
+        (self.ops.store)(self.id, off, width, val)
     }
 }
 
@@ -2204,6 +2206,14 @@ mod mock_foreign {
         let o = off as usize;
         g[id as usize][o..o + data.len()].copy_from_slice(data);
     }
+    fn load(id: u32, off: u64, width: u32) -> u64 {
+        let mut b = [0u8; 8];
+        read(id, off, &mut b[..width as usize]);
+        u64::from_le_bytes(b)
+    }
+    fn store(id: u32, off: u64, width: u32, val: u64) {
+        write(id, off, &val.to_le_bytes()[..width as usize]);
+    }
     fn fill(id: u32, off: u64, len: u64, b: u8) {
         let mut g = MEMS.lock().unwrap();
         let o = off as usize;
@@ -2260,6 +2270,8 @@ mod mock_foreign {
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
+        load,
+        store,
         fill,
         copy_within,
         atomic,

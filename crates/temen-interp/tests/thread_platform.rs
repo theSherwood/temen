@@ -890,6 +890,16 @@ fn fake_write(id: u32, off: u64, data: &[u8]) {
     FAKE_MEMS.lock().unwrap()[id as usize][o..o + data.len()].copy_from_slice(data);
 }
 
+fn fake_load(id: u32, off: u64, width: u32) -> u64 {
+    let mut b = [0u8; 8];
+    fake_read(id, off, &mut b[..width as usize]);
+    u64::from_le_bytes(b)
+}
+
+fn fake_store(id: u32, off: u64, width: u32, val: u64) {
+    fake_write(id, off, &val.to_le_bytes()[..width as usize]);
+}
+
 fn fake_fill(id: u32, off: u64, len: u64, b: u8) {
     FAKE_MEMS.lock().unwrap()[id as usize][off as usize..(off + len) as usize].fill(b);
 }
@@ -930,6 +940,8 @@ fn fake_grow(id: u32, len: u64) -> bool {
 static FAKE_OPS: ForeignOps = ForeignOps {
     read: fake_read,
     write: fake_write,
+    load: fake_load,
+    store: fake_store,
     fill: fake_fill,
     copy_within: fake_copy,
     atomic: fake_atomic,
