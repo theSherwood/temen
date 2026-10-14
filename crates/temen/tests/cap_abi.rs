@@ -23,7 +23,7 @@ fn seeds(n: usize) -> impl Iterator<Item = Vec<u8>> {
     })
 }
 
-/// Every seed's guest runs to an answer, a trap or a refusal on both engines, and the host survives
+/// Every seed's guest runs to an answer, a trap or a refusal on every engine, and the host survives
 /// it. A panic names the seed and prints its guest; an abort (a refused allocation) does not unwind,
 /// so `CAP_ABI_TRACE=1` prints each seed's number before it runs.
 #[test]
