@@ -13414,12 +13414,16 @@ fn lower_vm_builtin(
         // `Budget` (PROCESS.md S5): `long __vm_budget_split(int budget, long fuel, long mem, long
         // spawn)` → `call.cap BUDGET 0` mints a node under `budget` with those ceilings (`-1`:
         // only its ancestors cap it), returning its handle or `-errno`; `long __vm_budget_read(int
-        // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain. The
-        // split is how a spawner bounds what one child may spend, by handing it the node.
-        "__vm_budget_split" | "__vm_budget_read" => {
-            let split = name == "__vm_budget_split";
+        // budget, long field)` → `call.cap BUDGET 1` answers the room left along its chain;
+        // `long __vm_budget_close(int budget)` → `call.cap BUDGET 3` gives the handle up (#2384).
+        // The split is how a spawner bounds what one child may spend, by handing it the node.
+        "__vm_budget_split" | "__vm_budget_read" | "__vm_budget_close" => {
+            let (op, n) = match name {
+                "__vm_budget_split" => (0, 3),
+                "__vm_budget_read" => (1, 1),
+                _ => (3, 0),
+            };
             let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Budget handle
-            let n = if split { 3 } else { 1 };
             let args = (1..=n)
                 .map(|i| ctx.operand_i64(vm_arg(c, i)?))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -13430,7 +13434,7 @@ fn lower_vm_builtin(
             let sig = ctx.intern_sig(sig); // #922
             let r = ctx.push(Inst::CapCall {
                 type_id: temen_ir::cap_id::BUDGET,
-                op: if split { 0 } else { 1 },
+                op,
                 sig,
                 handle,
                 args,

@@ -1028,6 +1028,7 @@ impl ChildExec {
         let result = task.results.first().copied().unwrap_or(0);
         task.done.publish(result, trap, self.domain());
         let retiring = task.retiring;
+        let done = Arc::clone(&task.done);
         drop(task);
         // `settle` dropped a retiring task's live count when its root returned.
         if !retiring {
@@ -1035,6 +1036,8 @@ impl ChildExec {
                 d.child_finished();
             }
         }
+        // #2359 — nothing of the task is left: its parent's nursery may let go of its powerbox.
+        done.torn_down.store(true, Ordering::Release);
     }
 
     /// #1469 — the root of a task whose vCPUs still run has returned: publish its outcome now, as

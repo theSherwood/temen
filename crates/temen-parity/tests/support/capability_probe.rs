@@ -225,10 +225,11 @@ pub fn rows() -> Vec<Row> {
                 (h, x)
             }),
         ),
+        // op 3 is `close` (#2384).
         row(
             Capability::Budget,
             c::BUDGET,
-            &[0, 1],
+            &[0, 1, 3],
             Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_budget(-1, 1 << 16, 4);
