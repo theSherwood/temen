@@ -996,8 +996,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    (wasm tables aren't shareable across Workers). Proofs: `crates/temen-wasm-jit/tests/tierup.rs` (4
    differential cases pinning the emit set — spawn-only leaf, transitive leaves, a dropped
    unroutable caller, all-in-subset — each emitted `f{i}` matched to the bytecode oracle over an arg
-   sweep); the native `crates/temen-interp/tests/vcpu_tierup.rs` (the `TierUp` seam on the resumable
-   `Vcpu`, value + trap parity vs pure interp); the single-vCPU Node FFI harness `browser/tierup.mjs`
+   sweep); the native `crates/temen-interp/tests/coop_tierup.rs` (the `TierUp` seam, value + trap
+   parity vs pure interp — on the resumable `Vcpu` until #1414 moved it to the pump); the single-vCPU Node FFI harness `browser/tierup.mjs`
    (the real emitted-call + deliver path over shared memory, compute + trap); the multi-Worker Node
    twin `threads-spawn.mjs` (`TEMEN_TIERUP=1`: the 4000 kernel across 9 `worker_threads`, 8 tier-ups
    fired, result identical to the all-interp run); and the **Chromium** `#tierup` page item (the same

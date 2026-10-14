@@ -3966,37 +3966,27 @@ pub use temen_interp::moment::{
 // named-capability section (#1455). `Moment::capture` takes both halves at one instant, so
 // they always describe the same one.
 
-/// Drive an [`OnrampReactor`]-shaped reactor through the shared [`MomentReactor`] surface. Both
-/// reactors present the identical frame/input/moment API over different window backings,
-/// so the two impls are the same six forwarders and are written with one macro rather than twice.
-macro_rules! impl_moment_reactor {
-    ($t:ty) => {
-        impl SteppableReactor for $t {
-            fn step(&mut self) -> i32 {
-                let (status, _stdout) = self.frame();
-                status
-            }
-        }
-
-        impl MomentReactor for $t {
-            fn push_key(&self, keycode: i32, pressed: i32) {
-                <$t>::push_key(self, keycode, pressed);
-            }
-            fn push_mouse(&self, kind: i32, payload: i32) {
-                <$t>::push_mouse(self, kind, payload);
-            }
-            fn moment(&self) -> Result<Moment, Refusal> {
-                <$t>::moment(self)
-            }
-            fn restore(&mut self, m: &Moment) -> bool {
-                <$t>::restore(self, m)
-            }
-        }
-    };
+impl SteppableReactor for OnrampReactor {
+    fn step(&mut self) -> i32 {
+        let (status, _stdout) = self.frame();
+        status
+    }
 }
 
-impl_moment_reactor!(OnrampReactor);
-impl_moment_reactor!(SharedOnrampReactor);
+impl MomentReactor for OnrampReactor {
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        OnrampReactor::push_key(self, keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        OnrampReactor::push_mouse(self, kind, payload);
+    }
+    fn moment(&self) -> Result<Moment, Refusal> {
+        OnrampReactor::moment(self)
+    }
+    fn restore(&mut self, m: &Moment) -> bool {
+        OnrampReactor::restore(self, m)
+    }
+}
 
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
@@ -5961,195 +5951,6 @@ impl OnrampReactor {
             return false;
         }
         moment.restore_host(host);
-        true
-    }
-}
-
-/// Like [`OnrampReactor`], but the guest window lives in a **caller-provided region of this module's
-/// own linear memory** (a [`Region::shared`](temen_interp::Region::shared) over `[win_ptr, win_size)`)
-/// rather than a window the engine backs internally. That relocation is the substrate the wasm-JIT
-/// **reactor** tier needs (BROWSER.md § "wasm-JIT tier", slice 5b): the emitted `tick` — a JS-compiled
-/// wasm module that imports `env.memory` = *this* cdylib's linear memory — must read and write the same
-/// bytes the interpreter seeds, so `_start` (interpreter), the per-frame `tick`, and any cross-tier
-/// interpreter bounce all operate over **one** window. Backed by the resumable, tier-up-capable
-/// [`bytecode::VcpuReactor`]; with no eligibility set (this slice) every `tick` interprets, so it is a
-/// faithful, **byte-identical** substitute for [`OnrampReactor`] — the differential the reactor tests
-/// assert — with the window merely relocated into shared linear memory. The emitted-`tick` path (slice
-/// 5c) rides the same window and shared host.
-pub struct SharedOnrampReactor {
-    reactor: bytecode::VcpuReactor,
-    /// The powerbox (granted caps + stashed `_start` handles), shared across `open` and every `frame`
-    /// so the `display`/`keyboard`/`fs` caps and their state persist frame-to-frame.
-    host: std::sync::Mutex<Host>,
-    /// Keep-alive for an **owned** backing (the native/test path allocates it here); `None` when the
-    /// window is caller-owned (the FFI path hands in a pointer into this module's linear memory). The
-    /// `Region::shared` in `reactor`/`_back` addresses these bytes, so this must outlive the reactor —
-    /// a `Box<[u8]>`'s heap allocation is stable across moves of the struct.
-    _backing: Option<Box<[u8]>>,
-    /// The shared backing region (kept so its lifetime is tied to the reactor's).
-    _back: std::sync::Arc<temen_interp::Region>,
-    entry_sp: u64,
-    tick: temen_ir::FuncIdx,
-    /// The stateful host capabilities this reactor granted — the half of its state that is not the
-    /// window (see [`OnrampCaps`]).
-    caps: OnrampCaps,
-    last_trap: Option<String>,
-}
-
-impl SharedOnrampReactor {
-    /// Open a shared-window reactor over `m` with an **owned** backing of `1 << win_log2` bytes
-    /// (allocated + kept alive here) — the native/test entry. `win_log2` must be ≥ the module's mapped
-    /// size and large enough for the guest's grown heap. See [`open_shared`](Self::open_shared) for the
-    /// FFI entry that borrows a caller-owned window.
-    pub fn open_owned(m: &temen_ir::Module, win_log2: u8) -> Result<SharedOnrampReactor, i32> {
-        Self::open_owned_inner(m, win_log2, None)
-    }
-
-    /// Like [`open_owned`](Self::open_owned) but also grant an `fs` capability serving one read-only
-    /// file `data` under `name` (the WAD read path — see [`OnrampReactor::open_with_fs`]).
-    pub fn open_owned_with_fs(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        name: String,
-        data: Vec<u8>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        Self::open_owned_inner(m, win_log2, Some((name, data)))
-    }
-
-    fn open_owned_inner(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
-        let ptr = backing.as_mut_ptr();
-        // SAFETY: `backing` (a `Box<[u8]>` of `win_size` bytes) is owned by the returned struct and its
-        // heap allocation is pointer-stable across the struct's moves, so `[ptr, win_size)` stays valid
-        // and exclusively this reactor's window for its whole lifetime.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
-        Self::open_over(m, back, Some(backing), fs)
-    }
-
-    /// Open a shared-window reactor over a **caller-owned** window `[win_ptr, win_ptr+win_size)` of this
-    /// module's linear memory — the FFI entry (the host `temen_alloc`s the window and keeps it live for
-    /// the reactor's lifetime).
-    ///
-    /// # Safety
-    /// `[win_ptr, win_size)` must be a live region of this module's linear memory, used solely as this
-    /// reactor's window and kept valid (not freed, not reused) until the reactor is dropped.
-    pub unsafe fn open_shared(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over(m, back, None, fs)
-    }
-
-    fn open_over(
-        m: &temen_ir::Module,
-        back: std::sync::Arc<temen_interp::Region>,
-        backing: Option<Box<[u8]>>,
-        fs: Option<(String, Vec<u8>)>,
-    ) -> Result<SharedOnrampReactor, i32> {
-        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
-        let entry_sp = temen_ir::powerbox_entry_sp(m);
-        let mut host = Host::new();
-        let caps = grant_onramp_caps(&mut host, m, fs, None);
-        // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
-        // slot bindings deliver the capabilities) to run the C initializer, seeding +
-        // data-initialising the window (the once). The window then persists in the shared backing
-        // for every `tick`.
-        let host = std::sync::Mutex::new(host);
-        let reactor =
-            bytecode::VcpuReactor::open(m, back.clone(), &host, &[]).map_err(|_| STATUS_TRAP)?;
-        Ok(SharedOnrampReactor {
-            reactor,
-            host,
-            _backing: backing,
-            _back: back,
-            entry_sp,
-            tick,
-            caps,
-            last_trap: None,
-        })
-    }
-
-    /// Run one frame: call the guest's `tick` on the **live** shared window (all prior-frame state
-    /// intact), returning `(status, stdout-delta)`. `STATUS_OK` = keep going; `STATUS_EXIT` = the guest
-    /// called `Exit`; `STATUS_TRAP` = a trap. This slice interprets `tick` (no eligibility set), so the
-    /// `service` closure is never invoked. The presented frame (if any) is read via
-    /// [`take_frame`](Self::take_frame).
-    pub fn frame(&mut self) -> (i32, Vec<u8>) {
-        let stdout_before = self.host.lock().unwrap().stdout.len();
-        let args = [Value::I64(self.entry_sp as i64)];
-        // No JIT eligibility set → `service` is unreachable; propagate a trap if one ever surfaced.
-        let result = self.reactor.frame(
-            self.tick,
-            &args,
-            &self.host,
-            |_func, _argv, _mapped, _info| Err(Trap::Malformed),
-        );
-        let status = match result {
-            Ok(_) => STATUS_OK,
-            Err(Trap::Exit(_)) => STATUS_EXIT,
-            Err(t) => {
-                self.last_trap = Some(format!("{t:?}"));
-                STATUS_TRAP
-            }
-        };
-        let delta = self.host.lock().unwrap().stdout[stdout_before..].to_vec();
-        (status, delta)
-    }
-
-    /// The `Debug` string of the last frame's trap (diagnostic), or `""` if none.
-    pub fn last_trap(&self) -> &str {
-        self.last_trap.as_deref().unwrap_or("")
-    }
-
-    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
-    pub fn take_frame(&self) -> Option<Frame> {
-        self.caps.take_frame()
-    }
-
-    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
-    pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.caps.push_key(keycode, pressed);
-    }
-
-    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
-    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
-    pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.caps.push_mouse(kind, payload);
-    }
-
-    /// Capture a [`Moment`] — this reactor's whole state at the current frame boundary, so a
-    /// later [`restore`](Self::restore) puts the guest back here. Refused when the window cannot be
-    /// faithfully imaged (none, or a §13 region alias — the capture refuses rather than handing back a
-    /// fiction).
-    pub fn moment(&self) -> Result<Moment, Refusal> {
-        Moment::capture(
-            self.reactor.window_layout().ok_or(Refusal::NoWindow)?,
-            &self.host.lock().unwrap(),
-        )
-    }
-
-    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
-    /// next [`frame`](Self::frame) runs as the frame that followed the one the moment was taken at.
-    /// `false` if this reactor has no window to restore into (a memory-less module).
-    ///
-    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
-    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
-    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
-    pub fn restore(&mut self, moment: &Moment) -> bool {
-        let mut host = self.host.lock().unwrap();
-        if !self.reactor.restore_window(&moment.layout(), &host) {
-            return false;
-        }
-        moment.restore_host(&mut host);
         true
     }
 }
