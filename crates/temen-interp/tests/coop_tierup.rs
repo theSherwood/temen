@@ -26,8 +26,12 @@ mod coop;
 #[path = "support/rec.rs"]
 mod rec;
 
+use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
-use temen_interp::{bytecode, Host, Trap, Value};
+use temen_interp::{
+    bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, ParkEvent, SignalSource, Trap,
+    Value,
+};
 use temen_text::parse_module;
 
 const FUEL: u64 = 10_000_000;
@@ -1231,6 +1235,186 @@ fn fork_twin_run(
         .collect();
     out.sort_unstable();
     (result, out, events)
+}
+
+// #2273 — a fork twin of the root runs program 0, whose emitted `call.dyn` dispatches through the
+// root's dispatch table, over a table of its own. A `Jit` in the powerbox could make the two differ,
+// so then the twin and its threads interpret; without one they tier up as the root does. The root
+// forks through a personality reduced to its process doors ([`grant_proc_doors`]). The twin calls
+// the eligible leaf f1 and joins a thread (f2) that calls it too; the root waits for the twin and
+// calls f1 itself. The twin returns f1(5) + f1(9) = 56, and the root 1000 * 56 + f1(3) = 56016.
+const SRC_ROOT_FORK: &str = r#"
+memory 16
+func (i32) -> (i64) {
+block 0 (vproc: i32) {
+  vpid = call.cap 13 0 () -> (i64) vproc ()
+  vz = i64.const 0
+  vtwin = i64.eq vpid vz
+  br_if vtwin 1() 2(vpid, vproc)
+}
+block 1 () {
+  vz1 = i64.const 0
+  vt = thread.spawn 2 vz1 vz1
+  v5 = i64.const 5
+  vown = call 1 (v5)
+  vth = thread.join vt
+  vr = i64.add vown vth
+  return vr
+}
+block 2 (vp: i64, vh: i32) {
+  vst = call.cap 13 1 (i64) -> (i64) vh (vp)
+  v3 = i64.const 3
+  vown2 = call 1 (v3)
+  vk = i64.const 1000
+  vsk = i64.mul vst vk
+  vr2 = i64.add vsk vown2
+  return vr2
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v9 = i64.const 9
+  vr = call 1 (v9)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_root_fork_twin_interprets_when_the_run_holds_a_jit() {
+    let m = parse_module(SRC_ROOT_FORK).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    for jit in [false, true] {
+        let (want, none) = root_fork_run(&m, jit, false);
+        assert_eq!(want, Ok(vec![Value::I64(56_016)]), "oracle, jit {jit}");
+        assert!(none.is_empty(), "the oracle never tiers up");
+        let (got, envs) = root_fork_run(&m, jit, true);
+        assert_eq!(
+            got, want,
+            "jit {jit}: the tier-up run diverged from the oracle"
+        );
+        // `-1` is the root's env; `0`, the twin's, which its thread shares.
+        let tiered: &[i64] = if jit { &[-1] } else { &[-1, 0, 0] };
+        assert_eq!(
+            envs, tiered,
+            "jit {jit}: the envs whose leaf calls tiered up"
+        );
+    }
+}
+
+/// Run [`SRC_ROOT_FORK`] on the cooperative driver, its powerbox holding a `Jit` or not, with the
+/// leaf f1 eligible (`tierup`) or without a bitmap: its result, and the sorted envs of its tier-up
+/// events. The session constructor wires the personality's park door, as for `bash -i`, over an
+/// owned flat backing (as [`fork_twin_run`]'s).
+fn root_fork_run(
+    m: &temen_ir::Module,
+    jit: bool,
+    tierup: bool,
+) -> (Result<Vec<Value>, Trap>, Vec<i64>) {
+    let mut host = Host::new();
+    let doors = grant_proc_doors(&mut host);
+    if jit {
+        host.grant_jit_with_table(Some(16), 4);
+    }
+    let tierup = tierup.then(|| TierUpConfig {
+        root: ProgramEmit {
+            eligible: Arc::from(vec![false, true, false]),
+            page_checked: false,
+        },
+        leaf: None,
+        modules: None,
+    });
+    let back =
+        Arc::new(temen_interp::Region::owned_zeroed(1 << 16, 4096).expect("64 KiB allocates"));
+    let program = bytecode::compile_reserved(m).expect("in subset");
+    let mut run = bytecode::CoopRun::new_reserved_over_compiled(
+        m,
+        program,
+        0,
+        &[Value::I32(doors)],
+        FUEL,
+        host,
+        tierup,
+        &[],
+        16,
+        Some(back),
+    )
+    .expect("entry in range");
+    let mut envs = Vec::new();
+    let result = loop {
+        match run.run() {
+            bytecode::CoopEvent::Done(vals) => break Ok(vals),
+            bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::TierUp { func, argv, .. } => {
+                assert_eq!(func, 1, "only the leaf is eligible");
+                assert!(envs.len() < 10, "runaway tier-ups");
+                envs.push(run.pending_env());
+                run.deliver_tierup(&[argv[0] * 3 + 7]);
+            }
+            _ => panic!("unexpected pump event"),
+        }
+    };
+    envs.sort_unstable();
+    (result, envs)
+}
+
+/// A personality reduced to its process doors: op 0 `fork`s and op 1 `waitpid`s, as temen-posix's
+/// do. Each asks the core through the park door the driver installs on the domain's signal source;
+/// `waitpid` re-runs when the twin ends, and answers the status its exit hook recorded.
+fn grant_proc_doors(host: &mut Host) -> i32 {
+    const ENOSYS: i64 = -38;
+    let door = Arc::new(ParkDoor::default());
+    let exited: Arc<Mutex<Option<i64>>> = Arc::default();
+    let (ask, status) = (Arc::clone(&door), Arc::clone(&exited));
+    let doors: HostProc = Box::new(move |op, args, _, _| {
+        let (park, r) = match (op, *status.lock().unwrap()) {
+            (0, _) => (Some(ParkEvent::ForkSelf), ENOSYS),
+            (_, Some(s)) => (None, s),
+            (_, None) => (Some(ParkEvent::TaskExit(args[0] as u64)), ENOSYS),
+        };
+        if let (Some(ev), Some(req)) = (park, ask.0.lock().unwrap().clone()) {
+            req(ev);
+        }
+        Ok(vec![r])
+    });
+    // The twin's own door, as a per-process personality mints one (its park door is its own), and an
+    // exit hook that records its status.
+    let fork: HostProcFork = Arc::new(move |_pid| {
+        let exited = Arc::clone(&exited);
+        let source: Arc<dyn SignalSource + Send + Sync> = Arc::new(ParkDoor::default());
+        ForkedProc {
+            signal: Some((source, Arc::default())),
+            exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
+            ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![ENOSYS])), CapState::Stateless)
+        }
+    });
+    host.set_signal_source(door, Arc::default());
+    host.grant_host_proc_forkable(doors, fork, CapState::Stateless)
+}
+
+/// The park door the driver installs on a domain's signal source.
+type ParkRequest = Arc<dyn Fn(ParkEvent) + Send + Sync>;
+
+/// A signal source that holds only the park door the driver installs.
+#[derive(Default)]
+struct ParkDoor(Mutex<Option<ParkRequest>>);
+
+impl SignalSource for ParkDoor {
+    fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+        None
+    }
+    fn set_park_request(&self, req: ParkRequest) {
+        *self.0.lock().unwrap() = Some(req);
+    }
 }
 
 // #816 item 4 — `SharedProgram::coop_run_over_grown`, the warm session's cooperative constructor:

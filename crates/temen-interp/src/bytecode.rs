@@ -15200,9 +15200,12 @@ impl SchedCore {
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                     // keep an inherited bitmap only if its private `fork_private` window is
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
-                    // on every target); a `Paged` twin window strips it and interprets,
-                    // fail-closed.
-                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                    // on every target), and only if its calls dispatch through the table its
+                    // program's emit reads (#2273). Otherwise it interprets, fail-closed.
+                    let program = extra_envs[ck].program;
+                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                        || !child_runs_emit(program, &twin_host)
+                    {
                         twin_vt.active.jit_eligible = None;
                         twin_vt.active.jit_page_checked = false;
                     }
@@ -15211,7 +15214,6 @@ impl SchedCore {
                     // the caller's env fuel.
                     let twin_table = extra_envs[ck].table.fork();
                     let twin_eidx = extra_envs.len();
-                    let program = extra_envs[ck].program;
                     extra_envs.push(ChildEnv {
                         mem: twin_mem,
                         host: twin_host.into_cell(),
@@ -15481,18 +15483,6 @@ impl SchedCore {
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
                         wire_process(&twin_host, root);
-                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
-                        // may keep it only if its OWN private window (`fork_private`, pushed into
-                        // `extra_envs` below) is servable — the driver then answers each of the
-                        // twin's events over that window via the pending-env routing. The
-                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
-                        // on every target; a twin still on the `Paged` fallback (unbounded
-                        // reservation, allocation failure) is not: strip the bitmap so it
-                        // interprets, fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
-                        }
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let (twin_table, twin_fuel, program) = match env {
                             Some(k) => (
@@ -15502,6 +15492,21 @@ impl SchedCore {
                             ),
                             None => (dom.table.fork(), fuel.for_thread(), 0),
                         };
+                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                        // may keep it only if its OWN private window (`fork_private`, pushed into
+                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // twin's events over that window via the pending-env routing. The
+                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                        // on every target; a twin still on the `Paged` fallback (unbounded
+                        // reservation, allocation failure) is not. Nor is a twin whose calls would
+                        // not dispatch through the table its program's emit reads (#2273). Either
+                        // strips the bitmap so it interprets, fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                            || !child_runs_emit(program, &twin_host)
+                        {
+                            twin_vt.active.jit_eligible = None;
+                            twin_vt.active.jit_page_checked = false;
+                        }
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
@@ -15576,14 +15581,18 @@ impl SchedCore {
                 // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
                 // thread tiers up over its own carve. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
-                // is always right.
-                let window = match tasks[ti].env {
-                    None => mem.as_ref(),
-                    Some(k) => extra_envs[k].mem.as_ref(),
+                // is always right. So does a child domain whose calls would not dispatch through
+                // the table the emit reads (#2273, [`child_runs_emit`]).
+                let (window, dispatches) = match tasks[ti].env {
+                    None => (mem.as_ref(), true),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref(),
+                        child_runs_emit(module, &extra_envs[k].host.lock_unpoisoned()),
+                    ),
                 };
                 if let Some(e) = programs
                     .of(module)
-                    .filter(|_| tierup_servable(window, mem.as_ref()))
+                    .filter(|_| dispatches && tierup_servable(window, mem.as_ref()))
                 {
                     let durable = task_host(root, extra_envs, tasks[ti].env)
                         .lock_unpoisoned()
@@ -16629,6 +16638,18 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
         }
         _ => false,
     }
+}
+
+/// #2273 — whether a task of a child domain may run program `module`'s emit, `host` being the
+/// domain's powerbox. A granted module's emitted `call.dyn` dispatches through a table of the
+/// module's own functions, but program 0's dispatches through the root's dispatch table, which the
+/// driver mirrors. A child domain that runs program 0 (a fork twin, its threads, its own twins)
+/// dispatches through its own table, a fork of its parent's. The two stay equal until a domain
+/// installs a unit, which takes a `Jit`. A fork carries its parent's `Jit` into the twin's
+/// powerbox, so such a domain runs the emit only while its powerbox holds none. Otherwise its
+/// tasks interpret, which is always right.
+fn child_runs_emit(module: u32, host: &Host) -> bool {
+    module != 0 || !host.has_jit_table()
 }
 
 /// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid

@@ -2479,6 +2479,9 @@ live window (`compile_module_tierup_live`), with two differences. It emits again
 declared window, because every window a child of the module runs in is at least that. And it
 dispatches through a table of the module's own functions, because the driver's shared table mirrors
 only the run's own dispatch table (#2273): a `call.dyn` site emits only when the whole module does.
+A fork twin of the root runs the run's own program over a table of its own, forked from the root's,
+so it and its threads tier up only while its powerbox holds no `Jit`, without which neither table
+can change (`child_runs_emit`).
 The parallel driver's tier (`ThreadTier`, #1414 B6-3a) emits the run's own program only, so there a
 child of a granted module interprets until its tier takes the module emitter too (#1414 ED-2).
 

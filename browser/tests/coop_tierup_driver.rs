@@ -3735,6 +3735,197 @@ fn coop_tierup_serves_a_detached_child_over_its_own_window() {
     temen_coop_close();
 }
 
+/// #2398 — a detached child's emitted `call.dyn` resolves in the child's own dispatch table, as its
+/// interpreted one does, never in the root's. The root installs a unit `u(a, b) = a + 7` into its own
+/// table and calls it through its slot with 5 (12). It spawns `"worker"`, a separate program, with
+/// the slot in its args payload, and joins it. The worker's entry `call.dyn`s the slot with 5. The
+/// worker holds no `Jit`, so its table holds only its own four functions, and the slot, masked as
+/// every `call.dyn` index is, lands on one of them: f1, f2 or f3 (105, 205 or 305), or the entry,
+/// whose signature traps. The worker is wholly emittable, so its entry runs emitted (#1414 ED-1),
+/// `call.dyn` included. While a child read the pump's one mirror of the root's table, its emitted
+/// call ran the root's unit there. A child runs a granted module now (#2219), whose emit dispatches
+/// through a table of the module's own functions.
+#[test]
+fn a_childs_emitted_call_dyn_resolves_in_its_own_table() {
+    let _g = instantiator_guard();
+    let unit = temen_text::parse_module(
+        "memory 17\nfunc (i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64) {\n  vk = i64.const 7\n  \
+         vr = i64.add va vk\n  return vr\n  }\n}\n",
+    )
+    .expect("parse unit");
+    temen_verify::verify_module(&unit).expect("verify unit");
+    let blob = temen_encode::encode_module(&unit);
+    let mut install = String::new();
+    for (i, chunk) in blob.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let (addr, val) = (BLOB_BASE + i as i64 * 8, i64::from_le_bytes(word));
+        install.push_str(&format!(
+            "  vba{i} = i64.const {addr}\n  vbv{i} = i64.const {val}\n  i64.store vba{i} vbv{i}\n"
+        ));
+    }
+    let root = temen_text::parse_module(&format!(
+        r#"memory 17
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "worker"
+data ro 40992 "jit"
+func () -> (i64) {{
+block 0 () {{
+  vjp = i64.const 40992
+  vjl = i64.const 3
+  vjit = self.resolve vjp vjl
+{install}  vblp = i64.const {BLOB_BASE}
+  vbll = i64.const {blob_len}
+  vcode = call.import 0 (vblp, vbll)
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
+  vx = i64.const 5
+  vown = call 1 (vslot, vx)
+  vsa = i64.const 35840
+  i64.store vsa vslot
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vwp = i64.const 40984
+  vwl = i64.const 6
+  vw = self.resolve vwp vwl
+  vrec = i64.const 34816
+  vw0 = i64.const 1
+  i64.store vrec vw0
+  vw2 = i64.const -4294967296
+  i64.store vrec vw2 offset=16
+  i32.store vrec vw offset=24
+  i32.store vrec vb offset=28
+  i64.store vrec vsa offset=56
+  vpl = i64.const 8
+  i64.store vrec vpl offset=64
+  vw9 = i64.const 4294967295
+  i64.store vrec vw9 offset=72
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vz = i64.const 0
+  vtr = i64.ne vj_st vz
+  vtrw = i64.extend_i32_u vtr
+  vm = i64.const 1000000
+  vtrm = i64.mul vtrw vm
+  vk = i64.const 1000
+  vjk = i64.mul vj vk
+  vs1 = i64.add vjk vown
+  vsum = i64.add vs1 vtrm
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vs: i64, vx: i64) {{
+  vs32 = i32.wrap_i64 vs
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vx, vx)
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len()
+    ))
+    .expect("parse");
+    let worker_fn = |k: i64| {
+        format!(
+            "func (i64, i64) -> (i64) {{\nblock 0 (va: i64, vb: i64) {{\n  vk = i64.const {k}\n  \
+             vr = i64.add va vk\n  return vr\n  }}\n}}\n"
+        )
+    };
+    let worker = temen_text::parse_module(&format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vap = i64.const {args}
+  vs = i64.load vap
+  vs32 = i32.wrap_i64 vs
+  vx = i64.const 5
+  vr = call.dyn (i64, i64) -> (i64) vs32 (vx, vx)
+  return vr
+  }}
+}}
+{f1}{f2}{f3}"#,
+        args = temen_ir::module_args_base(),
+        f1 = worker_fn(100),
+        f2 = worker_fn(200),
+        f3 = worker_fn(300),
+    ))
+    .expect("parse");
+    temen_verify::verify_module(&root).expect("verify");
+    temen_verify::verify_module(&worker).expect("verify");
+    let bytes = temen_encode::encode_module(&root);
+
+    // Each run takes the staged program, so stage it before each.
+    stage_child_program("worker", worker.clone());
+    let want = onramp_exec_root(&root, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle status");
+    assert_eq!(
+        want.value % 1000,
+        12,
+        "oracle: the root's call runs its unit, u(5, 5) = 12"
+    );
+    let child = want.value / 1000;
+    assert!(
+        matches!(child, 105 | 205 | 305 | 1000),
+        "oracle: the worker's call runs one of its own functions, or traps (1000), never the \
+         root's unit: {child}"
+    );
+
+    stage_child_program("worker", worker);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    // The root's events run its emit over the shared table, which the driver mirrors with the
+    // unit (B2); the worker's emit dispatches through a table of its own.
+    let mut root_tier = CoopB2Driver::new();
+    let mut calls = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                if temen_coop_module() == 0 {
+                    root_tier.service_tierup(1);
+                } else {
+                    match service_coop_on_wasmi(1) {
+                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                        Err(code) => temen_coop_deliver_trap(code),
+                    }
+                }
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The worker is program 2: the root's unit, compiled before the spawn, is program 1.
+    calls.sort();
+    assert_eq!(
+        calls,
+        vec![(0, 1), (2, 0)],
+        "the root's call to its `call.dyn` helper and the worker's entry run emitted, (program, \
+         function)"
+    );
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the oracle: the worker's emitted `call.dyn` resolved in its own table"
+    );
+    temen_coop_close();
+}
+
 /// #2248 — a child that runs a module the run did not build tiers up through that module's own
 /// emit. The root spawns `"worker"`, a separate program staged as a card's `//// child:` program
 /// is, and joins it, then calls its own f1. The worker's f1 computes 5x + 1 where the root's
