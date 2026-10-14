@@ -1,5 +1,5 @@
-//! #2322 — a detached child whose code runs on a guest fiber joins and waits for a child of its own
-//! from that fiber, on the tree-walk oracle, the bytecode drivers and Cranelift alike.
+//! #2322 — a detached child whose code runs on a guest fiber joins a child of its own from that
+//! fiber, on the tree-walk oracle, the bytecode drivers and Cranelift alike.
 //!
 //! A join blocks its whole vCPU on every engine: the oracle parks the vCPU, the bytecode drivers the
 //! task, and an OS vCPU on Cranelift its thread. Inside a Cranelift child task the fiber's park is
@@ -10,8 +10,8 @@
 //! fiber runs under the child's root, and again under a fiber of its own, so the park has to pass
 //! through a guest fiber's resume too. An outcome already in is returned at once.
 //!
-//! Before #2322 Cranelift trapped `ThreadFault` at every one of these joins and waits: a task's join
-//! was refused from any stack but the task's own, before the outcome was even read.
+//! Before #2322 Cranelift trapped `ThreadFault` at every one of these joins: a task's join was refused
+//! from any stack but the task's own, before the outcome was even read.
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -91,7 +91,7 @@ block 0 (vinst: i32, vbud: i32, vmod: i32) {{
   i32.store vrb vbud
 {grants}  vrp = i64.const {CHILD_REC}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return vj
   }}
 }}
@@ -288,22 +288,22 @@ fn on_every_engine(what: &str, fiber: &str, drivers: &[Driver], lanes: i64, want
     );
 }
 
-/// The fiber joins a child that is still running, then waits for another while it runs and joins it
-/// once it has returned: `(join * 1000 + wait) * 1000 + join`. Under a run lane cap of 1 a grandchild
-/// cannot start until its parent's join gives the one lane back, so each of the first two finds its
-/// child running, on every engine: the park must block the child's whole vCPU, its root seeing no
-/// `FIBER_PARKED`, and hold no lane while it waits. No `poll`, so the `Vcpu` driver runs it too.
+/// The fiber joins a child that is still running, then another while it runs:
+/// `(value * 1000 + status) * 1000 + value`, the second join's status beside both values (#2066).
+/// Under a run lane cap of 1 a grandchild cannot start until its parent's join gives the one lane
+/// back, so each join finds its child running, on every engine: the park must block the child's
+/// whole vCPU, its root seeing no `FIBER_PARKED`, and hold no lane while it waits. No `poll`, so the
+/// `Vcpu` driver runs it too.
 #[test]
-fn a_childs_fiber_joins_and_waits_for_a_running_child_on_every_engine() {
+fn a_childs_fiber_joins_running_children_on_every_engine() {
     let fiber = format!(
         "{}  vg1 = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj1 = call.cap 6 1 (i32) -> (i64) vi (vg1)
+  vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) vi (vg1)
 {}  vg2 = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vw2 = call.cap 6 18 (i32) -> (i64) vi (vg2)
-  vj2 = call.cap 6 1 (i32) -> (i64) vi (vg2)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) vi (vg2)
   vk = i64.const 1000
   va = i64.mul vj1 vk
-  vb2 = i64.add va vw2
+  vb2 = i64.add va vj2_st
   vc = i64.mul vb2 vk
   vd = i64.add vc vj2
   return vd
@@ -312,7 +312,7 @@ fn a_childs_fiber_joins_and_waits_for_a_running_child_on_every_engine() {
         pick(4)
     );
     on_every_engine(
-        "a fiber joins a running child, then waits for and joins another",
+        "a fiber joins a running child, then another",
         &fiber,
         &drivers::ALL,
         1,
@@ -349,22 +349,21 @@ block 3 (i3: i32, g3: i32, p3: i32) {{
     )
 }
 
-/// The fiber waits for and joins a child whose outcome is already in (`poll` reports it returned):
-/// `(poll * 1000 + wait) * 1000 + join`. The `Vcpu` driver's host answers no `poll` (temen#2083).
+/// The fiber joins a child whose outcome is already in (`poll` reports it returned):
+/// `(poll * 1000 + status) * 1000 + value`. The `Vcpu` driver's host answers no `poll` (temen#2083).
 #[test]
-fn a_childs_fiber_waits_for_and_joins_a_child_that_returned_on_every_engine() {
+fn a_childs_fiber_joins_a_child_that_returned_on_every_engine() {
     let fiber = poll_then(
         5,
-        "  vw = call.cap 6 18 (i32) -> (i64) i3 (g3)
-  vj = call.cap 6 1 (i32) -> (i64) i3 (g3)
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) i3 (g3)
   va = i64.mul vp64 vk
-  vb2 = i64.add va vw
+  vb2 = i64.add va vj_st
   vc = i64.mul vb2 vk
   vd = i64.add vc vj
   return vd",
     );
     on_every_engine(
-        "a fiber waits for and joins a child that returned",
+        "a fiber joins a child that returned",
         &fiber,
         &drivers::SCHEDULING,
         -1,
@@ -372,19 +371,19 @@ fn a_childs_fiber_waits_for_and_joins_a_child_that_returned_on_every_engine() {
     );
 }
 
-/// The fiber waits for a child whose outcome is already in, a trap: the wait answers the trap's code
-/// and reaps the child, and the fiber runs on. `poll * 1000 + wait`.
+/// The fiber joins a child whose outcome is already in, a trap: the join answers the trap's code
+/// and reaps the child, and the fiber runs on (#2066). `poll * 1000 + status`.
 #[test]
-fn a_childs_fiber_waits_for_a_child_that_trapped_on_every_engine() {
+fn a_childs_fiber_joins_a_child_that_trapped_on_every_engine() {
     let fiber = poll_then(
         6,
-        "  vw = call.cap 6 18 (i32) -> (i64) i3 (g3)
+        "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) i3 (g3)
   va = i64.mul vp64 vk
-  vd = i64.add va vw
+  vd = i64.add va vj_st
   return vd",
     );
     on_every_engine(
-        "a fiber waits for a child that trapped",
+        "a fiber joins a child that trapped",
         &fiber,
         &drivers::SCHEDULING,
         -1,

@@ -48,7 +48,7 @@ block 0 (vinst: i32, vread: i32, vwrite: i32, vbud: i32, vmod: i32) {
   i32.store rrb vbud
   rra0 = i64.const 20544
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
-  vcr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vcr_st, vcr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   a16 = i64.const 16400
   vlen = i64.const 2
   vrd = call.cap 0 0 (i64, i64) -> (i64) vread (a16, vlen)

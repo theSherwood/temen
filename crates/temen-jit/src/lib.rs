@@ -1510,7 +1510,7 @@ pub fn compile_and_run_capture_reserved_with_host(
         cap_thunk,
         cap_ctx,
         None,
-        None, // no re-granted child powerbox (op 8 → CapFault)
+        None, // no child-powerbox hooks: a spawn is an inert CapFault
     )
 }
 
@@ -1522,8 +1522,9 @@ pub fn compile_and_run_capture_reserved_with_host(
 /// # Safety
 /// As [`compile_and_run_capture_reserved_with_host`]; `resolve_module` (with `cap_ctx`) must honour
 /// the [`ModuleResolver`] contract — in particular the resolved views must outlive the run.
-/// `grant_child` (PROCESS.md S2 JIT parity) supplies the `instantiate_granted` (op 8) child-powerbox
-/// builder/releaser; `None` ⇒ op 8 is an inert `CapFault`. Both hooks share `cap_ctx` as their host.
+/// `grant_child` (PROCESS.md S2 JIT parity) supplies the hooks that build and release a detached
+/// child's powerbox ([`GrantChildHooks`]); `None` ⇒ a spawn is an inert `CapFault`. Both hooks share
+/// `cap_ctx` as their host.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_and_run_capture_reserved_with_host_ex(
     m: &IrModule,
@@ -2186,7 +2187,7 @@ struct RunOpts<'a> {
     sub: Option<SubWindow>,
     /// §14 module resolver for a guest `instantiate` of a separate-module child.
     resolve_module: Option<ModuleResolver>,
-    /// op-8 `instantiate_granted` child-powerbox builder/releaser (PROCESS.md S2).
+    /// The detached-child powerbox builder/releaser ([`GrantChildHooks`], PROCESS.md S2).
     grant_child: Option<GrantChildHooks>,
     /// §5 async kill-path cell, host-written and polled at safepoints.
     interrupt: Option<*const AtomicU64>,
@@ -2262,9 +2263,9 @@ fn run_inner(
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
     )?;
-    // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
-    // §14 nursery before the guest runs (the nursery only exists when the module holds an
-    // `Instantiator`). `None` leaves op 8 an inert `CapFault`.
+    // PROCESS.md S2 (JIT parity): install the child-powerbox host callbacks into the §14 nursery
+    // before the guest runs (the nursery only exists when the module holds an `Instantiator`). `None`
+    // leaves a spawn an inert `CapFault`.
     // Through the one setter, so the nursery hooks and the domain's lane are installed together
     // (they come from the same host and must agree).
     cm.set_grant_child_hooks(grant_child);
@@ -2519,7 +2520,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 17408
   v2 = call.cap 6 17 (i64) -> (i32) v0 (v1)
-  v3 = call.cap 6 1 (i32) -> (i64) v0 (v2)
+  v3_st, v3 = call.cap 6 1 (i32) -> (i64, i64) v0 (v2)
   return v3
   }
 }
@@ -7175,8 +7176,6 @@ struct InstEnv {
     /// the code has a nursery.
     active: bool,
     join_thunk: i64,
-    // op 18 (`wait`): join's park, answering how the child ended.
-    wait_thunk: i64,
     // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
     poll_thunk: i64,
     detach_thunk: i64,
@@ -7199,7 +7198,6 @@ impl InstEnv {
         InstEnv {
             active: false,
             join_thunk: 0,
-            wait_thunk: 0,
             poll_thunk: 0,
             detach_thunk: 0,
             kill_thunk: 0,
@@ -7219,7 +7217,6 @@ impl InstEnv {
         InstEnv {
             active: true,
             join_thunk: instantiator_rt::join as *const () as i64,
-            wait_thunk: instantiator_rt::wait as *const () as i64,
             poll_thunk: instantiator_rt::poll as *const () as i64,
             detach_thunk: instantiator_rt::detach as *const () as i64,
             kill_thunk: instantiator_rt::kill as *const () as i64,
@@ -10179,55 +10176,17 @@ fn lower_instantiator(
     args: &[u32],
     vals: &mut Vec<Value>,
 ) -> Result<(), JitError> {
-    // §3c: the verifier checks a `call.cap`'s args against its *declared* `sig` only — it knows
-    // nothing about host interfaces, so a verifier-valid module can call iface 6 with any
-    // `(op, sig)` shape. The interpreter discovers a mismatch at **runtime** (handle resolution
-    // first → `CapFault` on a forged handle; then per-op arg indexing → `Malformed`), but this
-    // lowering dispatches on `op` **statically** and can neither index missing args nor pass
-    // mistyped values through the fixed thunk ABIs. So: a call whose declared shape doesn't match
-    // the op's contract (arg prefix / result types below), or whose op is unknown (the
-    // interpreter's default arm is `CapFault`), lowers to an unconditional runtime `CapFault` —
-    // never a compile-time rejection of a verified module. (Found by the libFuzzer `diff` target:
-    // ops 5/6/7 with short args made the compile fail `Malformed`, crashing the differential —
-    // nightlies Jun 19 / Jul 2 / Jul 4, ISSUES.md I16.) Extra trailing args beyond the contract
-    // prefix are tolerated exactly like the interpreter (it never indexes past the op's arity).
-    use ValType::{I32 as VI32, I64 as VI64};
-    let contract: Option<(&[ValType], &[ValType])> = match op {
-        // join(child) -> result; wait(child) -> 0 | trap code
-        1 | 18 => Some((&[VI32], &[VI64])),
-        // S3 lifecycle: poll / detach / kill (child) -> i32 status
-        9 | 10 | 12 => Some((&[VI32], &[VI32])),
-        // §3 instantiate_rec: (record_ptr) -> child handle — the config-record spawn (§3d: the
-        // scalar granted/named spawns, ops 8/11, died into it — grants are record data now)
-        17 => Some((&[VI64], &[VI32])),
-        // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL); #2220
-        // grant: (child, handle) -> the child's handle (probeable -EINVAL / -EMFILE).
-        14 | 19 => Some((&[VI32, VI64], &[VI32])),
-        // PROCESS.md §5 / #1287 instantiate_detached: (budget, module, grants_ptr, grants_n, entry,
-        // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
-        // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
-        15 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
-        // Every other op — the retired carve spawns (ops 0, 5 and 13, #1867) and the deleted ones —
-        // is the oracle's `CapFault`.
-        _ => None,
-    };
-    // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
-    // coerces each result to the *declared* sig type): a call is admitted when its arg count covers
-    // the op's contract prefix and every prefix arg + every result is a scalar int — i32 **or** i64.
-    // The exact-width `== *need` / `== res` was too strict: a chibicc guest widens all scalars to i64
-    // (`int __spawn(...)` → `… -> (i64)`), so a spawn's i32-result contract (and op 1/9/10/12's i32
-    // child arg) never matched, and every compiled-C driver of the Instantiator fell to a CapFault
-    // that the interpreter never raised. The per-arg coercions below (`slot_i64`/`slot_i32`/
-    // `result_as`) reconcile the declared widths with each thunk's fixed ABI, so relaxing the gate
-    // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
-    // unconditional runtime CapFault — never a compile-time rejection of a verified module.
-    let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
-    let shape_ok = contract.is_some_and(|(need, res)| {
-        sig.params.len() >= need.len()
-            && sig.params[..need.len()].iter().all(is_scalar_int)
-            && sig.results.len() == res.len()
-            && sig.results.iter().all(is_scalar_int)
-    });
+    // §3c: the verifier checks a `call.cap` against its *declared* `sig` only, so a verifier-valid
+    // module can call iface 6 with any `(op, sig)` shape. This lowering dispatches on `op`
+    // **statically** and can neither index missing args nor pass mistyped values through the fixed
+    // thunk ABIs, so it checks the declared shape against the one contract every engine checks
+    // (`temen_ir::instantiator_contract`, #2066). A call that doesn't match, or whose op isn't live,
+    // lowers to an unconditional runtime `CapFault`, as the interpreters trap — never a compile-time
+    // rejection of a verified module. (Found by the libFuzzer `diff` target: ops 5/6/7 with short
+    // args made the compile fail `Malformed`, crashing the differential — nightlies Jun 19 / Jul 2 /
+    // Jul 4, ISSUES.md I16.) The contract is width-tolerant: the per-arg coercions below
+    // (`slot_i64`/`slot_i32`/`result_as`) reconcile the declared widths with each thunk's fixed ABI.
+    let shape_ok = temen_ir::instantiator_shape_ok(op, sig);
     if !shape_ok {
         emit_trap_set(b, lower, TrapKind::CapFault);
         emit_trap_propagate(b, lower);
@@ -10244,30 +10203,33 @@ fn lower_instantiator(
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.vmctx_var);
     match op {
-        1 | 18 => {
-            // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
-            // The nursery owns the child table for this run; the thunk still resolves the call.cap's
-            // `Instantiator` first, as the oracle does for every op (#1729). `wait` (op 18) has
-            // join's shape and answers how the child ended.
+        1 => {
+            // join(nursery, mem_base, instantiator:i32, child_handle:i32, status_out:i64,
+            // trap_out:i64) -> value:i64, the status through `status_out` as `cont.resume`'s is
+            // (#2066). The nursery owns the child table for this run; the thunk still resolves the
+            // call.cap's `Instantiator` first, as the oracle does for every op (#1729).
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
+            let ss =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64] {
+            for t in [I64, I64, I32, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
             let tref = b.import_signature(tsig);
-            let thunk_addr = match op {
-                1 => lower.inst.join_thunk,
-                _ => lower.inst.wait_thunk,
-            };
-            let thunk = b.ins().iconst(I64, thunk_addr);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
+            let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, child, status_ptr, trap_out],
+            );
             emit_trap_propagate(b, lower);
-            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
-            vals.push(r);
+            let value = b.inst_results(call)[0];
+            let status = b.ins().stack_load(I64, ss, 0);
+            vals.push(result_as(b, status, sig.results[0]));
+            vals.push(result_as(b, value, sig.results[1]));
         }
         9 | 10 | 12 => {
             // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,

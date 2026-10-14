@@ -23,7 +23,7 @@ data 18432 "fs"
 data 18448 "stdout"
 data 24576 "\x02\x00\x00\x00\x00\x00\x00\x00\x61\x00\x62\x00"
 data 20480 "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x44\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x60\x00\x00\x00\x00\x00\x00\x0c\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-func (i32, i32, i32, i32, i32) -> (i64) {
+func (i32, i32, i32, i32, i32) -> (i64, i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   xr17408 = i64.const 8589953024
   or17408 = i64.const 17408
@@ -43,8 +43,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store rb20480 v2
   vrp = i64.const 20480
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
+  vs, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
+  return vs, vr
   }
 }
 "#
@@ -303,7 +303,11 @@ fn a_pipe_edge_carries_one_nodes_stdout_to_anothers_stdin() {
         temen_interp::bytecode::compile_and_run_with_host(&root, 0, &args, &mut fuel, &mut host)
             .expect("the bytecode engine runs the root");
 
-    assert_eq!(out, Ok(vec![Value::I64(12)]), "echo wrote its whole line");
+    assert_eq!(
+        temen_browser::plan::outcome(out),
+        Ok(vec![Value::I64(12)]),
+        "echo wrote its whole line"
+    );
     assert_eq!(&sink.lock().unwrap()[..], b"hello, pipe\n", "cat echoed it");
     // The same plan cannot run on the spawn-to-completion driver: it is refused, not half-run.
     assert_eq!(

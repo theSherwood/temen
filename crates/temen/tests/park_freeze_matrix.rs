@@ -915,7 +915,7 @@ block 1 (vi0: i32, vc1: i32, vt1: i32, vk1: i64, vi: i64) {
 }
 block 2 (vi3: i32, vc2: i32, vt2: i32) {
   vr = thread.join vt2
-  vn = call.cap 6 1 (i32) -> (i64) vi3 (vc2)
+  vn_st, vn = call.cap 6 1 (i32) -> (i64, i64) vi3 (vc2)
   vth = i64.const 1000
   vm = i64.mul vn vth
   vres = i64.add vm vr

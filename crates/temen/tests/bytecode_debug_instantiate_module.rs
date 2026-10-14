@@ -47,7 +47,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vb v2
   vr = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (vr)
-  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  v7_st, v7 = call.cap 6 1 (i32) -> (i64, i64) v0 (v6)
   return v7
   }
 }

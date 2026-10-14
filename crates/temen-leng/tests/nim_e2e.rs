@@ -3647,8 +3647,8 @@ block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {
   cl = i64.const 17
   co = i64.const 65536
   pc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) inst (b, cm, z, z, z, cl, z, z, z, region, co)
-  jn = call.cap 6 1 (i32) -> (i64) inst (pn)
-  jc = call.cap 6 1 (i32) -> (i64) inst (pc)
+  jn_st, jn = call.cap 6 1 (i32) -> (i64, i64) inst (pn)
+  jc_st, jc = call.cap 6 1 (i32) -> (i64, i64) inst (pc)
   return jn, jc
   }
 }

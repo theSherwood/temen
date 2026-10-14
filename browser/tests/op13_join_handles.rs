@@ -86,7 +86,7 @@ fn a_first_join_returns_the_childs_result() {
 fn a_rejoin_traps() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (st, _) = run(
-        &driver("  vo = call.cap 6 1 (i32) -> (i64) v0 (vh)"),
+        &driver("  vo_st, vo = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)"),
         &child(""),
     );
     assert_eq!(st, OP13JIT_TRAP, "the join retired the handle");
@@ -96,19 +96,26 @@ fn a_rejoin_traps() {
 fn a_negative_or_out_of_range_join_traps() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for bad in [-1, 1, 7] {
-        let tail = format!("  vb = i32.const {bad}\n  vo = call.cap 6 1 (i32) -> (i64) v0 (vb)");
+        let tail = format!(
+            "  vb = i32.const {bad}\n  vo_st, vo = call.cap 6 1 (i32) -> (i64, i64) v0 (vb)"
+        );
         let (st, _) = run(&driver(&tail), &child(""));
         assert_eq!(st, OP13JIT_TRAP, "join on handle {bad}");
     }
 }
 
-/// The declined child joins a handle it never spawned. Its trap reaches the driver at its join.
+/// The declined child joins a handle it never spawned. It traps `ThreadFault`, which the driver's join
+/// answers as the child's status (#2066): the driver returns `status * 1000 + value`.
 #[test]
 fn a_childs_join_on_a_handle_it_never_spawned_traps_not_panics() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tail = "  vk = i64.const 1000\n  vs = i64.mul vr_st vk\n  vo = i64.add vs vr";
     for bad in [-1, 0, 5] {
         let body = format!("  vb = i32.const {bad}\n  vj = thread.join vb");
-        let (st, _) = run(&driver("  vo = i64.add vr vr"), &child(&body));
-        assert_eq!(st, OP13JIT_TRAP, "the child's join on handle {bad}");
+        assert_eq!(
+            run(&driver(tail), &child(&body)),
+            (OP13JIT_DONE, temen_ir::trap_code::THREAD_FAULT * 1000),
+            "the child's join on handle {bad}"
+        );
     }
 }

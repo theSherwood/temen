@@ -26,7 +26,7 @@
  */
 
 long __vm_instantiate_rec(int inst, long rec);    /* Instantiator op 17 -> child handle | -errno */
-long __vm_instantiate_join(int inst, long child); /* Instantiator op 1 -> the child's entry result */
+long __vm_instantiate_join(int inst, long child, long *status); /* Instantiator op 1, below */
 int __vm_cap_count(void);
 int __vm_cap_at(int i, int *type_id_out);
 
@@ -116,7 +116,10 @@ static inline long vm_spawn(long module, long size_log2, vm_grant *grants, long 
   return __vm_instantiate_rec(vm_instantiator_(), (long)scratch);
 }
 
-/* vm_join(child) -> the child's entry result (its `main` return), or -errno. */
-static inline long vm_join(long child) {
-  return __vm_instantiate_join(vm_instantiator_(), child);
+/* vm_join(child, &status) -> the child's entry result (its `main` return), with `status` 0; or 0, with
+ * `status` the wire code of the trap the child ended in (`temen_ir::trap_code`: out of fuel, a fault,
+ * `kill`, or `exit(n)` with `n` in the high 32 bits). The child's end is never the caller's (#2066),
+ * and either way it is reaped. */
+static inline long vm_join(long child, long *status) {
+  return __vm_instantiate_join(vm_instantiator_(), child, status);
 }

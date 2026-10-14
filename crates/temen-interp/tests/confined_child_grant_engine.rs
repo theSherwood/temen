@@ -54,7 +54,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i32.store vbud v3
   vrec = i64.const 17536
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrec)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
   }
 }

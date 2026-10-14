@@ -41,13 +41,13 @@ use temen_text::parse_module;
 mod drivers;
 
 /// Spawn `child` through the [`temen_run::conductor`] on `driver`, re-granting a forkable memfs
-/// (seeded with `seed`) as `"fs"`. Returns the child's joined status and the shared `MemFsHandle`
-/// (seed it before / read it after).
+/// (seeded with `seed`) as `"fs"`. Returns the child's joined value (its join answered status 0: it
+/// returned) and the shared `MemFsHandle` (seed it before / read it after).
 fn spawn_child_over_memfs(
     driver: drivers::Driver,
     child: &Module,
     seed: &[(String, Vec<u8>)],
-) -> (Vec<Value>, MemFsHandle) {
+) -> (i64, MemFsHandle) {
     temen_verify::verify_module(child).expect("child verifies");
     let parent = temen_run::conductor(&["fs"], &[]);
     let handle = RefCell::new(None);
@@ -77,9 +77,13 @@ fn spawn_child_over_memfs(
     };
     let ran = drivers::run_on(driver, &parent, &powerbox)
         .unwrap_or_else(|| panic!("{driver:?} declined the conductor"));
-    let r = ran
-        .result
-        .unwrap_or_else(|t| panic!("{driver:?}: the parent trapped: {t:?}"));
+    let r = match ran.result {
+        Ok(r) => match r[..] {
+            [Value::I64(0), Value::I64(v)] => v,
+            _ => panic!("{driver:?}: the child did not return: {r:?}"),
+        },
+        Err(t) => panic!("{driver:?}: the parent trapped: {t:?}"),
+    };
     (r, handle.into_inner().expect("the run built its powerbox"))
 }
 
@@ -128,10 +132,7 @@ fn child_entry_writes_a_file_through_a_regranted_memfs() {
         let (r, handle) = spawn_child_over_memfs(driver, &child, &[]);
 
         // The child's `write` returned 9, joined back through op-1.
-        assert!(
-            matches!(r.as_slice(), [Value::I64(9)] | [Value::I32(9)]),
-            "{driver:?}: child wrote 9 bytes, status joined back: {r:?}"
-        );
+        assert_eq!(r, 9, "{driver:?}: child wrote 9 bytes, joined back");
         assert_eq!(
             read_back(&handle, "out.bin"),
             b"hello.nif",
@@ -186,13 +187,8 @@ fn child_entry_copies_a_parent_seeded_file_through_a_regranted_memfs() {
 
         // The child read 12 bytes and wrote all 12 back; the count joined through op-1.
         let n = input.len() as i64;
-        let got = match r.as_slice() {
-            [Value::I64(m)] => *m,
-            [Value::I32(m)] => *m as i64,
-            other => panic!("{driver:?}: unexpected join result: {other:?}"),
-        };
         assert_eq!(
-            got, n,
+            r, n,
             "{driver:?}: child copied {n} bytes, status joined back"
         );
         assert_eq!(

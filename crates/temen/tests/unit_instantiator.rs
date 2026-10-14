@@ -86,7 +86,7 @@ block 0 (vi64: i64) {{
   i32.store vmp vm
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) vi (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
   return vj
   }}
 }}

@@ -86,7 +86,7 @@ block 0 (vs: i64) {{
   i32.store ba vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  r = call.cap 6 1 (i32) -> (i64) vinst (ch)
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
   return r
   }}
 }}
@@ -96,7 +96,8 @@ block 0 (vs: i64) {{
 }
 
 /// The root (args `(instantiator, middle module, grandchild module, budget)`): spawn the middle child
-/// detached, paid from `budget` and granted the grandchild module as `mod`, and join it.
+/// detached, paid from `budget` and granted the grandchild module as `mod`, join it, and return how it
+/// ended, `(status, value)` as the join answers it (#2066).
 fn root() -> String {
     let rec = SpawnRec {
         grants_ptr: 16384,
@@ -106,7 +107,7 @@ fn root() -> String {
     format!(
         "memory 17
 data 16484 \"mod\"
-{rec}func (i32, i32, i32, i32) -> (i64) {{
+{rec}func (i32, i32, i32, i32) -> (i64, i64) {{
 block 0 (vinst: i32, vmid: i32, vgrand: i32, vbud: i32) {{
   g0 = i64.const 16384
   gv0 = i32.const 16484
@@ -122,8 +123,8 @@ block 0 (vinst: i32, vmid: i32, vgrand: i32, vbud: i32) {{
   i32.store ba vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
-  r = call.cap 6 1 (i32) -> (i64) vinst (ch)
-  return r
+  r_st, r = call.cap 6 1 (i32) -> (i64, i64) vinst (ch)
+  return r_st, r
   }}
 }}
 ",
@@ -231,10 +232,14 @@ fn run(driver: Driver, spawn: impl Fn(Unheld) -> Spawn) -> Result<Vec<Value>, Tr
     }
 }
 
-/// The oracle refuses the spawn; every other driver must give the oracle's answer.
+/// The oracle refuses the spawn, so the middle child ends in a trap, which the root's join answers;
+/// every other driver must give the oracle's answer.
 fn refused_everywhere(spawn: impl Fn(Unheld) -> Spawn + Copy) {
     let want = run(Driver::Oracle, spawn);
-    assert!(want.is_err(), "the oracle refuses the spawn, got {want:?}");
+    assert!(
+        matches!(&want, Ok(v) if v.first() != Some(&Value::I64(0))),
+        "the oracle refuses the spawn, got {want:?}"
+    );
     let wrong: Vec<_> = [Driver::Cooperative, Driver::Parallel, Driver::Debug]
         .into_iter()
         .map(|d| (d, run(d, spawn)))
@@ -254,7 +259,11 @@ fn control_a_middle_child_spawns_with_its_own_handles() {
         Driver::Parallel,
         Driver::Debug,
     ] {
-        assert_eq!(run(d, |_| Spawn::Own), Ok(vec![Value::I64(4242)]), "{d:?}");
+        assert_eq!(
+            run(d, |_| Spawn::Own),
+            Ok(vec![Value::I64(0), Value::I64(4242)]),
+            "{d:?}"
+        );
     }
 }
 

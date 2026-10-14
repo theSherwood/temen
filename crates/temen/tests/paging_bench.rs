@@ -101,7 +101,7 @@ block 2 (vh2: i32, vs2: i64, vacc2: i64, vch2: i32, vsrv: i64) {{
   br_if vcmp 2(vh2, vs2, vacc2, vch2, vsrv2) 3(vh2, vs2, vacc2, vch2, vsrv2)
 }}
 block 3 (vh3: i32, vs3: i64, vacc3: i64, vch3: i32, vsrvf: i64) {{
-  vj = call.cap 6 1 (i32) -> (i64) vh3 (vch3)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh3 (vch3)
   vmk = i64.const {mark}
   vm = i64.mul vsrvf vmk
   vacc4 = i64.add vacc3 vj

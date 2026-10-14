@@ -84,7 +84,7 @@ fn parent_waits_child_notifies_across_domains() {
         "  vexp = i32.const 0
   vinf = i64.const -1
   vw = i32.atomic.wait va vexp vinf
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vw64 = i64.extend_i32_u vw
   vh = i64.const 100
   vwh = i64.mul vw64 vh
@@ -137,7 +137,7 @@ fn child_waits_parent_notifies_across_domains() {
         "  vone = i32.const 1
   i32.atomic.store va vone
   vn = atomic.notify va vone
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vten = i64.const 10
   vj10 = i64.mul vj vten
   vn64 = i64.extend_i32_u vn

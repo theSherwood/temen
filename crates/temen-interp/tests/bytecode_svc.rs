@@ -297,7 +297,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   va = i64.const 40
   vb = i64.const 2
   vr = call.cap 268435456 0 (i64, i64) -> (i64) v7 (va, vb)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs = i64.add vm vr
@@ -416,7 +416,7 @@ func () -> (i64) {{
 block 0 () {{
   vz = i32.const 0
 {serve}
-  vj = call.cap 6 1 (i32) -> (i64) vz (vz)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vz (vz)
   vr = i64.add vn vj
   return vr
   }}
@@ -466,7 +466,7 @@ fn a_spawning_server_runs_natively_only_while_its_handlers_cannot_park() {
     )));
     for helper in [
         // a join
-        "  vz = i32.const 0\n  vj = call.cap 6 1 (i32) -> (i64) vz (vz)\n  return vj",
+        "  vz = i32.const 0\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vz (vz)\n  return vj",
         // an indirect call
         "  vf = ref.func 2\n  vr = call.dyn (i64) -> (i64) vf (vx)\n  return vr",
         // a call through a live offer
@@ -506,7 +506,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrb v1
   vrp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vj
   }
 }

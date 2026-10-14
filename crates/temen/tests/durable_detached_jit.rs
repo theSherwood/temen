@@ -28,7 +28,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }
 }
@@ -355,8 +355,8 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 /// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking
 /// 1 ms a time (a durable run on the oracle has one worker, so a waiter must give it up), then the
 /// settle time. Then one fiber resume: the run's only fiber safepoint, where
-/// `arm_freeze_after(win, 1)` freezes the settled tree. Last, it joins the child and returns what
-/// the child returns.
+/// `arm_freeze_after(win, 1)` freezes the settled tree. Last, it joins the child and returns
+/// `status * 1000 + value`: what the child returns, or its trap's wire code times 1000 (#2066).
 const NEST_ROOT: &str = "memory 18 shadow 16448 65536
 data 70000 \"freeze\"
 data 70008 \"nest\"
@@ -432,8 +432,11 @@ block 2 (vi2: i32, vch2: i32, vms2: i32) {
   vk = cont.new vf vsp
   vz2 = i64.const 0
   vs, vx = cont.resume vk vz2
-  vj = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
+  vjk = i64.const 1000
+  vjs = i64.mul vj_st vjk
+  vjt = i64.add vjs vj
+  return vjt
   }
 }
 func (i64, i64) -> (i64) {
@@ -464,7 +467,7 @@ block 0 (v0: i64, v1: i64) {
   vlog = i64.const 17
   vinst = i32.wrap_i64 v0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vz, vz, vz, vlog, vz)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
   return vr
@@ -614,7 +617,7 @@ block 0 (v0: i64, v1: i64) {
 
 /// #2041 — a child [`NEST_ROOT`] can spawn in [`NEST`]'s place that traps at once: the freeze finds
 /// it completed **trapped** and not joined, so its trap crosses as its `join` outcome, which the
-/// root's `join` re-raises.
+/// root's `join` answers as its status (#2066).
 const TRAP_NEST: &str = "memory 17 shadow 16448 65536
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
@@ -681,7 +684,7 @@ block 0 (v0: i64, v1: i64) {
   vlog = i64.const 17
   vinst = i32.wrap_i64 v0
   vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vbw, vmw, vga, vgn, vz, vlog, vz)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vhundred = i64.const 100
   vr = i64.add vj vhundred
   return vr
@@ -754,9 +757,9 @@ block 2 (vi2: i32, vbw2: i64, vsw2: i64, vq2: i32) {
   vlog2 = i64.const 17
   vs1 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
   vs2 = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi2 (vbw2, vsw2, vz2, vz2, vz2, vlog2, vz2)
-  vj1 = call.cap 6 1 (i32) -> (i64) vi2 (vs1)
-  vj2 = call.cap 6 1 (i32) -> (i64) vi2 (vs2)
-  vjq = call.cap 6 1 (i32) -> (i64) vi2 (vq2)
+  vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) vi2 (vs1)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) vi2 (vs2)
+  vjq_st, vjq = call.cap 6 1 (i32) -> (i64, i64) vi2 (vq2)
   vhundred = i64.const 100
   vr0 = i64.add vjq vhundred
   vr1 = i64.add vr0 vj1
@@ -1274,11 +1277,11 @@ fn a_completed_detached_child_rides_its_parents_freeze_on_every_engine() {
 }
 
 /// #2041 — **the same for a child that trapped**: its trap rides the artifact as its `join` outcome,
-/// not a value. Every engine's thaw re-raises it from the root's rewound `join`, as the uninterrupted
-/// run does.
+/// not a value. Every engine's thaw answers it from the root's rewound `join` as its status, as the
+/// uninterrupted run does (#2066).
 #[test]
 fn a_completed_detached_childs_trap_rides_its_parents_freeze_on_every_engine() {
-    let unreachable = (Err(temen_ir::trap_code::UNREACHABLE), "");
+    let unreachable = (Ok(temen_ir::trap_code::UNREACHABLE * 1000), "");
     rides_every_engine(TRAP_NEST, 2, completed_children, &[1], unreachable);
 }
 
@@ -1337,10 +1340,11 @@ fn a_delivered_completed_child_rides_a_second_freeze_on_every_engine() {
 }
 
 /// #2044 — **the same for a child that trapped**: its trap rides both freezes as its `join` outcome,
-/// and every engine's last thaw re-raises it from the root's rewound `join`.
+/// and every engine's last thaw answers it from the root's rewound `join` as its status (#2066).
 #[test]
 fn a_delivered_trapped_child_rides_a_second_freeze_on_every_engine() {
-    refreezes_every_engine(TRAP_NEST, (Err(temen_ir::trap_code::UNREACHABLE), ""));
+    let unreachable = (Ok(temen_ir::trap_code::UNREACHABLE * 1000), "");
+    refreezes_every_engine(TRAP_NEST, unreachable);
 }
 
 /// Freeze [`refreeze_root`] over `child` (which ends at once) on each engine at its first fiber

@@ -82,7 +82,7 @@ block 0 (vx: i64) {
   i32.store rb vb
   rp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) vi (rp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vc)
   return vr
   }
 }
@@ -162,8 +162,8 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {
   i32.store cb v1
   cp = i64.const 17760
   vC = call.cap 6 17 (i64) -> (i32) v0 (cp)
-  vjC = call.cap 6 1 (i32) -> (i64) v0 (vC)
-  vjS = call.cap 6 1 (i32) -> (i64) v0 (vS)
+  vjC_st, vjC = call.cap 6 1 (i32) -> (i64, i64) v0 (vC)
+  vjS_st, vjS = call.cap 6 1 (i32) -> (i64, i64) v0 (vS)
   vk = i64.const 1000
   vm = i64.mul vjC vk
   vr = i64.add vm vjS
@@ -209,7 +209,7 @@ block 0 (vx: i64) {
   i32.store fm vg
   fp = i64.const 18432
   vG = call.cap 6 17 (i64) -> (i32) vi (fp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vG)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vG)
   return vr
   }
 }

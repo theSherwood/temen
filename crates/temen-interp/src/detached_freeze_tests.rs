@@ -23,7 +23,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
   vlog = i64.const 17
   vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vr
   }
 }

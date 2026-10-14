@@ -177,7 +177,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vd = i64.const 2
   vr2 = call.cap 268435456 0 (i64, i64) -> (i64) v7 (vc, vd)
   vr3 = call.cap 268435456 1 () -> (i64) v7 ()
-  vj = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (v5)
   vk = i64.const 100
   vm = i64.mul vj vk
   vs1 = i64.add vr1 vr2

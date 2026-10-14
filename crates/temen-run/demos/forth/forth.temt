@@ -4258,9 +4258,11 @@ block 0 (x: i64) {
 ;
 ; Its *memory* is its own window and nothing else: no address in it names ours.
 ;
-; Returns the child's status, `-1` if the host granted no sandbox capability or the program is
-; larger than the args payload (both said out loud, not silent), or the spawn's own `-EINVAL` if it
-; was refused.
+; Returns how the child ended: 0 if its program ran (`prompt` answers 0), or the wire code of the trap
+; it ended in (`temen_ir::trap_code`: 6 a capability it doesn't hold, such as `read`; 8 a memory
+; fault; 11 out of fuel) — the child's end is never ours (#2066). Or `-1` if the host granted no
+; sandbox capability or the program is larger than the args payload (both said out loud, not silent),
+; or the spawn's own `-EINVAL` if it was refused.
 func (i64, i64) -> (i64) {
 block 0 (addr: i64, len: i64) {
   ip = i64.const 33152
@@ -4390,8 +4392,11 @@ block 5 (ch: i32) {
   return v
   }
 block 6 (hinst: i32, ch: i32) {
-  st = call.cap 6 1 (i32) -> (i64) hinst (ch)
-  return st
+  st, v = call.cap 6 1 (i32) -> (i64, i64) hinst (ch)
+  z64 = i64.const 0
+  trapped = i64.ne st z64
+  r = select trapped st v
+  return r
   }
 }
 

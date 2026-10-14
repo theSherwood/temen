@@ -60,7 +60,7 @@ block 1 (ve: i32) {{
   return vr
 }}
 block 2 (vc: i32, vi2: i32) {{
-  vj = call.cap 6 1 (i32) -> (i64) vi2 (vc)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vc)
   return vj
   }}
 }}

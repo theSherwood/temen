@@ -48,7 +48,7 @@ block 0 (v0: i64, v1: i64) {{
   vinst = i32.wrap_i64 v0
 {stores}  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   return vr
   }}
 }}
@@ -173,7 +173,7 @@ fn threaded_unit_matches_oracle() {
         .func_wrap(
             "env",
             "join",
-            |_: Caller<'_, HostState>, _i: i32, _c: i32| -> i64 {
+            |_: Caller<'_, HostState>, _i: i32, _c: i32| -> (i64, i64) {
                 unreachable!("no instantiate join in this unit")
             },
         )
@@ -285,7 +285,7 @@ block 0 (v0: i64, v1: i64) {{
   vinst = i32.wrap_i64 v0
 {stores}  vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
   vf = f64.convert_i64_s vr
   vg = call 2 (vf)
   vi = i64.trunc_sat_f64_s vg
@@ -444,7 +444,7 @@ fn compile_nested_fiber_entry_tierup_emit_runs() {
         .func_wrap(
             "env",
             "join",
-            |_: Caller<'_, HostState>, _i: i32, _c: i32| -> i64 { unreachable!() },
+            |_: Caller<'_, HostState>, _i: i32, _c: i32| -> (i64, i64) { unreachable!() },
         )
         .unwrap();
     linker

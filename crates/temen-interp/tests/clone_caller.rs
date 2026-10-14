@@ -305,7 +305,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store q2b vbud
   q2p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -585,7 +585,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store q4b vbud
   q4p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q4p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -750,7 +750,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }
@@ -907,7 +907,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }

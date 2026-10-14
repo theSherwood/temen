@@ -315,7 +315,7 @@ static int spawn_cmd(long mod, int argc, char **argv) {
   }
   long child = spawn_child(mod, rec, gn, argc, argv);
   if (child < 0) { puts_(argv[0]); puts_(": cannot execute\n"); return 126; }   /* refused, loudly */
-  return (int)__join(__inst(), child);
+  return (int)join_status(child);
 }
 #endif /* TEMEN_SHELL_SPAWN */
 
@@ -685,7 +685,7 @@ static int run_ring_pipeline(char **stages, int ns, long mod) {
     child[s - 1] = spawn_stage(mod, stages[s], rin, rout);
     if (child[s - 1] < 0) {
       /* a refused stage (an exhausted budget): nothing reads the ring, so fail loudly, not hang */
-      for (int k = 0; k < s - 1; k++) __join(__inst(), child[k]);
+      for (int k = 0; k < s - 1; k++) join_status(child[k]);
       __rg_unmap(rh[0], mapoff, g);
       return 125;
     }
@@ -696,7 +696,7 @@ static int run_ring_pipeline(char **stages, int ns, long mod) {
   ring_done(ring_out);
   ring_out = 0;
   int st = 0;
-  for (int s = 1; s < ns; s++) st = (int)__join(__inst(), child[s - 1]);
+  for (int s = 1; s < ns; s++) st = (int)join_status(child[s - 1]);
   __rg_unmap(rh[0], mapoff, g);
   return st;
 }

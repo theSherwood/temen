@@ -117,10 +117,10 @@ fn child_entry_write_binds_stdout_on_the_jit() {
         Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
+    // The conductor answers `(status, value)`, as the join did (#2066).
     let status = match jo {
-        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-        JitOutcome::Exited(c) => c as i64,
-        ref o => panic!("jit ended abnormally: {o:?}"),
+        JitOutcome::Returned(ref v) if v.len() == 2 && v[0] == 0 => v[1],
+        ref o => panic!("the child did not return on the jit: {o:?}"),
     };
     assert!(
         matches!(status, 0),
@@ -173,10 +173,10 @@ fn child_entry_malloc_binds_vm_map_on_the_jit() {
         Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
+    // The conductor answers `(status, value)`, as the join did (#2066).
     let status = match jo {
-        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-        JitOutcome::Exited(c) => c as i64,
-        ref o => panic!("jit ended abnormally: {o:?}"),
+        JitOutcome::Returned(ref v) if v.len() == 2 && v[0] == 0 => v[1],
+        ref o => panic!("the child did not return on the jit: {o:?}"),
     };
     assert_eq!(
         status, 42,

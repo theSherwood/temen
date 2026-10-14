@@ -66,7 +66,7 @@ block 0 (v0: i32, v1: i32, v2: i32, vchild: i32) {{
   i32.store vba v2
   vrp = i64.const {REC_AT}
   vch = call.cap 6 17 (i64) -> (i32) v1 (vrp)
-  vjr = call.cap 6 1 (i32) -> (i64) v1 (vch)
+  vjr_st, vjr = call.cap 6 1 (i32) -> (i64, i64) v1 (vch)
   vk = i64.const 100000
   vjs = i64.mul vjr vk
   v3 = i64.const 3
@@ -318,8 +318,9 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
         .func_wrap(
             "env",
             "join",
-            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> i64 {
-                caller.data().children[child as usize]
+            // The child ran to its return at its spawn: `(status 0, its result)` (#2066).
+            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> (i64, i64) {
+                (0, caller.data().children[child as usize])
             },
         )
         .unwrap();

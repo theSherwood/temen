@@ -1427,8 +1427,8 @@ fn differential_pass(m: &Module, args: &[Value], init: &[u8], mem_oracle: bool, 
 
 /// One differential pass with the entry run as a **detached child** (#1867 decision 3). The child
 /// is `m` behind a wrapper entry that calls `m`'s func 0 with `args` and returns a digest of its
-/// results and of its own final window ([`detached_probe::digest_func`]); the probe root spawns it,
-/// waits for it and joins it. The interpreter and the JIT must agree on how the child ended — the
+/// results and of its own final window ([`detached_probe::digest_func`]); the probe root spawns it
+/// and joins it, which answers how it ended. The interpreter and the JIT must agree on that — the
 /// same digest for a clean run, a trap under the window passes' policy — and on the root's whole
 /// final window, which must also show that the child never touched it (the canary). Skipped unless
 /// the module is a float-free `mem_oracle` candidate whose entry takes and returns only integers.

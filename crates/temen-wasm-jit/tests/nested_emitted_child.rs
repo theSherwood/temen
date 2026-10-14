@@ -153,14 +153,15 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
         .func_wrap(
             "env",
             "join",
-            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> i64 {
+            |caller: Caller<'_, HostState>, _inst: i32, child: i32| -> (i64, i64) {
                 // A `-1` (or otherwise out-of-range) handle means the gate refused the spawn — map it
                 // to a sentinel instead of indexing, so a fail-closed rejection surfaces as a value.
+                // A child that ran returned at its spawn: `(status 0, its result)` (#2066).
                 let st = caller.data();
                 if child < 0 || child as usize >= st.children.len() {
-                    return i64::MIN;
+                    return (0, i64::MIN);
                 }
-                st.children[child as usize]
+                (0, st.children[child as usize])
             },
         )
         .unwrap();
@@ -396,7 +397,7 @@ block 0 (v0: i32, v1: i32) {{
   i32.store vma v1
   vrp = i64.const {REC_AT}
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   vmine = i64.load vsa
   vs = i64.add vr vmine
   return vs

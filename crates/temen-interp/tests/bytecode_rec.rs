@@ -35,7 +35,7 @@ func (i32) -> (i64) {
 block 0 (v0: i32) {
   qa0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vch)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vch)
   return vr
   }
 }
@@ -81,7 +81,7 @@ block 1 (ve: i32) {{
   return vr
 }}
 block 2 (vi2: i32, vch2: i32) {{
-  vr = call.cap 6 1 (i32) -> (i64) vi2 (vch2)
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vi2 (vch2)
   return vr
   }}
 }}

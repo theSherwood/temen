@@ -8,8 +8,8 @@
 //! own detached window, the one placement once the carve is gone.
 //!
 //! Differential across the cooperative multiplex and the OS-thread parallel driver: a child storing at
-//! 8 traps `MemoryFault` on both; the same child storing above the guard returns the value on both. A
-//! spawned thread gets the same treatment.
+//! 8 traps `MemoryFault` on both, which its parent's join answers (#2066); the same child storing above
+//! the guard returns the value on both. A spawned thread gets the same treatment.
 
 #[path = "support/rec.rs"]
 mod rec;
@@ -20,9 +20,9 @@ use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
-/// Root `(inst, budget, child) -> child`: spawns `child` (func 1's child image, #2219) detached through
-/// the v1 record at 17408, paid from `budget`, and `join`s it. The child stores 7 at `addr` in its own
-/// window and loads it back.
+/// Root `(inst, budget, child) -> status * 1000 + value`: spawns `child` (func 1's child image, #2219)
+/// detached through the v1 record at 17408, paid from `budget`, and `join`s it. The child stores 7 at
+/// `addr` in its own window and loads it back.
 fn child_src(addr: u64) -> String {
     format!(
         r#"memory 17
@@ -34,8 +34,11 @@ block 0 (vinst: i32, vbud: i32, vmod: i32) {{
   i32.store vb vbud
   vrec = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
-  vr = call.cap 6 1 (i32) -> (i64) vinst (vh)
-  return vr
+  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vk = i64.const 1000
+  vs = i64.mul vr_st vk
+  vt = i64.add vs vr
+  return vt
   }}
 }}
 func (i64) -> (i64) {{
@@ -134,16 +137,9 @@ fn none(_: &temen_ir::Module) -> (Host, Vec<Value>) {
 #[test]
 fn child_store_at_null_traps_on_both_engines() {
     let src = child_src(8);
-    assert_eq!(
-        coop(&src, spawn_host),
-        Err(Trap::MemoryFault),
-        "cooperative"
-    );
-    assert_eq!(
-        parallel(&src, spawn_host),
-        Err(Trap::MemoryFault),
-        "parallel"
-    );
+    let faulted = Ok(vec![Value::I64(temen_ir::trap_code::MEMORY_FAULT * 1000)]);
+    assert_eq!(coop(&src, spawn_host), faulted, "cooperative");
+    assert_eq!(parallel(&src, spawn_host), faulted, "parallel");
 }
 
 #[test]

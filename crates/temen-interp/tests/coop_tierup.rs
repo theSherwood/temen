@@ -662,7 +662,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj = call.cap 6 1 (i32) -> (i64) v0 (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   v3 = i64.const 3
   vlocal = call 3 (v3)
   vr = i64.add vj vlocal
@@ -864,9 +864,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   i32.store vrm v2
   vrp = i64.const 17408
   vh1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj1 = call.cap 6 1 (i32) -> (i64) v0 (vh1)
+  vj1_st, vj1 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh1)
   vh2 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vj2 = call.cap 6 1 (i32) -> (i64) v0 (vh2)
+  vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) v0 (vh2)
   vr = i64.add vj1 vj2
   return vr
   }
@@ -921,15 +921,14 @@ block 0 (vx: i64) {
 
 // #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is
 // the proven browser fork probe (`FORK_TWIN`, FORK.md §9): a manager (f0) spawns a server (f1,
-// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as detached §14 children (the server
-// through the v1 record `fork_twin_src` lays at 17792); the guest calls
+// handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as detached §14 children, through
+// the v1 records `fork_twin_src` lays at 17792 and 17664; the guest calls
 // `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
 // copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
 // reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
-// The manager takes a `Budget`, which a detached guest's record charges, and the `Module` a granted
-// guest runs. `fork_twin_src` fills in where the manager spawns the guest (`@GUEST@`) and the
-// guest's scratch (`@S0@`, `@S8@`, `@S16@`): its names and its stdout word, which it keeps in its
-// own window.
+// The manager takes a `Budget`, which each record charges, and the `Module`s its guest and server
+// run: func 4's and func 1's child images. `fork_twin_src` fills in the guest's scratch (`@S0@`,
+// `@S8@`, `@S16@`): its names and its stdout word, which it keeps in its own window.
 const SRC_FORK_TWIN: &str = r#"
 memory 18
 type 0 func (i64) -> (i64)
@@ -969,7 +968,7 @@ block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32, vsrv: i32) {
   q2m = i64.const 17688
   i32.store q2m vmod
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
-  vjc = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
   }
 }

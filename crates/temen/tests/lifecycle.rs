@@ -137,7 +137,7 @@ block 0 (vci: i64) {{
 #[test]
 fn poll_terminal_status_converges_returning_child() {
     let src = poll_loop(
-        "vj = call.cap 6 1 (i32) -> (i64) v0c (vchc)",
+        "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0c (vchc)",
         "  v7 = i64.const 7\n  return v7",
     );
     let i = run_interp(&src);
@@ -150,8 +150,8 @@ fn poll_terminal_status_converges_returning_child() {
 }
 
 /// A child that **traps** (the crash-handling shape — a bad command must not kill the shell): it
-/// divides by zero; the parent `detach`es it once `poll` is non-zero (never `join`, which would
-/// raise the child's trap in the parent). The terminal status is `2` (trapped) on every backend.
+/// divides by zero; the parent `detach`es it once `poll` is non-zero. The terminal status is `2`
+/// (trapped) on every backend.
 #[test]
 fn poll_terminal_status_converges_trapping_child() {
     let src = poll_loop(

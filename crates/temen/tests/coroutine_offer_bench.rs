@@ -78,7 +78,7 @@ block 1 (vh1: i32, vch1: i32, voffer1: i32, vi: i64, vacc: i64) {{
   br_if vcmp 1(vh1, vch1, voffer1, vi2, vacc2) 2(vh1, vch1, vacc2)
 }}
 block 2 (vh2: i32, vch2: i32, vaccf: i64) {{
-  vj = call.cap 6 1 (i32) -> (i64) vh2 (vch2)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
   vc = i32.wrap_i64 vaccf
   call.import 0 (vc)
   unreachable

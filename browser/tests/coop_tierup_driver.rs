@@ -3570,7 +3570,7 @@ block 0 () {{
   vnl = i64.const 12
   vh = self.resolve va0 vnl
 {record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
   vma = i64.const 16384
   vpre = i32.load8_u vma
   vpree = i64.extend_i32_u vpre
@@ -3752,7 +3752,7 @@ block 0 () {{
   vw9 = i64.const 4294967295
   i64.store vrec vw9 offset=72
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   v3 = i64.const 3
   vlocal = call 1 (v3)
   vk = i64.const 1000
@@ -3914,7 +3914,7 @@ block 0 () {{
 block 1 (vh1: i32, vch1: i32) {{
   vz1 = i32.const 0
   vn = svc.wait vz1
-  vj = call.cap 6 1 (i32) -> (i64) vh1 (vch1)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh1 (vch1)
   vk = i64.const 100
   vt = i64.mul vj vk
   vs = i64.add vt vn
@@ -4077,7 +4077,8 @@ fn coop_tierup_serves_a_parents_children() {
 // ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
-/// a child at f1 (`child`) detached through a v1 record, join it, return the join value. f1 (child
+/// a child at f1 (`child`) detached through a v1 record, join it, return the join's status: how the
+/// child ended, its trap's wire code if it trapped (#2066). f1 (child
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
 /// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
@@ -4104,8 +4105,8 @@ block 0 () {{
   vnl = i64.const 12
   vh = self.resolve va0 vnl
 {record}  vch = call.cap 6 17 (i64) -> (i32) vh (vrec)
-  vj = call.cap 6 1 (i32) -> (i64) vh (vch)
-  return vj
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
+  return vj_st
   }}
 }}
 func (i64, i64) -> (i64) {{
@@ -4141,10 +4142,11 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of
-    // its window then loads it, so the run traps `MemoryFault`.
+    // its window then loads it, so it traps `MemoryFault`, which the root's join answers.
     let want = onramp_exec_root(&m, b"");
     assert_eq!(
-        want.status, STATUS_TRAP,
+        (want.status, want.value),
+        (STATUS_OK, temen_ir::trap_code::MEMORY_FAULT),
         "oracle: the child's load of its own unmapped page traps"
     );
 
@@ -4194,24 +4196,12 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
         vec![(1, 1)],
         "the child tiers up once, (program, function)"
     );
+    // #1822: the child's trap is the oracle's — the emitted leaf's `env.trap(MEMORY_FAULT)` code
+    // reaches the root's join, where it used to be delivered as `Unreachable`.
     assert_eq!(
-        temen_status(),
-        want.status,
-        "trap parity with the interpreter oracle over the child's window"
-    );
-    assert_eq!(
-        temen_coop_value(),
-        want.value,
-        "value parity with the oracle on the trapping run"
-    );
-    // #1822: and it is the oracle's trap — the emitted leaf's `env.trap(MEMORY_FAULT)` code
-    // reaches the guest, where it used to be delivered as `Unreachable`.
-    // SAFETY: the end-of-run trap-name slot, read before anything else runs.
-    let trap = unsafe { std::slice::from_raw_parts(temen_trap_ptr(), temen_trap_len()) };
-    assert_eq!(
-        std::str::from_utf8(trap).unwrap(),
-        want.trap.as_ref().map_or("", |t| t.name()),
-        "trap-kind parity with the oracle on the trapping run"
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "trap-kind parity with the interpreter oracle over the child's window"
     );
     temen_coop_close();
 }

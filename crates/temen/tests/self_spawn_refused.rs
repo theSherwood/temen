@@ -93,14 +93,14 @@ fn module_is(handle: &str) -> String {
 
 /// Spawn through the record, join the child, and return its result.
 const SPAWN_REC: &str = "  vh = call.cap 6 17 (i64) -> (i32) vi (vp)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vh)";
+  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)";
 
 /// Op 15's 7-arg form `(budget, module, grants_ptr, grants_n, entry, size_log2, quota)` with
 /// `module` and `entry`; join the child and return its result.
 fn op15(module: &str, entry: &str) -> String {
     format!(
         "  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) vi (vb64, {module}, vz, vz, {entry}, vz, vz)
-  vr = call.cap 6 1 (i32) -> (i64) vi (vh)"
+  vst, vr = call.cap 6 1 (i32) -> (i64, i64) vi (vh)"
     )
 }
 
