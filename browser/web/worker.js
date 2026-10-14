@@ -125,47 +125,119 @@ self.onmessage = async (e) => {
     for (const g of x2Tier.fuelGlobals) g.value = X2_SLICE;
     x2Tier.armEnv();
     if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
-    return x2Tier;
+    return [x2Tier, x2Win];
   };
-  // Enter the tier (`enter` returns the emitted function and its arguments), call it, and write its
-  // results at `out` (`res` makes each a slot). Whatever throws comes back as the task's trap, never
-  // out of the Worker: the emitted code's own, or MALFORMED when the tier could not be entered.
+  // A detached child's tier (#1414 ED-2): its granted module's emit over the child's own memory,
+  // which this Worker registered for the child's root task. The call's context is the first in the
+  // child's header, and the window starts past the header. The module's emit dispatches through a
+  // table of its own functions, so the tier's shared table stays empty. The engine reads a bounce's
+  // slots from its own memory, so a bounce mirrors the context through engine scratch, as the
+  // per-Worker driver's does. A paged emit's page-state table is copied into the header after the
+  // contexts, at each call and after each bounce.
+  let x2Child = null, x2ChildModule = -1, x2ChildScratch = 0;
+  const x2ChildTable = () => {
+    const off = ex.temen_detached_pagestate_off();
+    const p = Number(ex.temen_x2_pagestate_ptr()), n = ex.temen_x2_pagestate_len();
+    if (off + n > ex.temen_detached_header_bytes()) {
+      throw new Error('pagestate table does not fit the detached header');
+    }
+    new Uint8Array(x2Mem.buffer).set(new Uint8Array(memory.buffer).subarray(p, p + n), off);
+    return off;
+  };
+  const x2ChildEnter = (mem, module, mapped, over) => {
+    if (mem !== x2MemId) throw new Error(`memory ${mem} is not this Worker's`);
+    x2Mapped = mapped;
+    x2Over = over;
+    if (x2Child === null) {
+      const envBytes = ex.temen_wasmjit_env_bytes();
+      if (envBytes > ex.temen_detached_pagestate_off()) {
+        throw new Error('env cell does not fit the detached header');
+      }
+      x2ChildScratch = Number(ex.temen_alloc(envBytes));
+      x2Child = emittedTier(ex, x2Mem, {
+        envCell: 0,
+        tableLog2: () => 0,
+        nfuncs: () => 0,
+        tableGen: () => ex.temen_x2_table_gen(),
+        slotUnit: () => -1n,
+        slotUnitBytes: () => null,
+        shimBytes: () => null,
+        callInterp: (target, argsPtr, spillLen) => {
+          const s = x2ChildScratch;
+          new Uint8Array(memory.buffer).set(new Uint8Array(x2Mem.buffer).subarray(0, envBytes), s);
+          const rc = ex.temen_x2_call_interp(target, s + argsPtr, spillLen);
+          new Uint8Array(x2Mem.buffer).set(new Uint8Array(memory.buffer).subarray(s, s + envBytes), 0);
+          return rc;
+        },
+        paged: () => ex.temen_x2_paged(),
+        mapped: () => x2Mapped,
+        mappedNow: () => ex.temen_x2_mapped_now(),
+        pagestatePtr: x2ChildTable,
+        winPtr: () => ex.temen_detached_header_bytes(),
+        deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
+        spillBytes: () => 0,
+        spillPtr: () => 0,
+        fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
+      });
+    }
+    if (module !== x2ChildModule) {
+      const bytes = x2Bytes(ex.temen_x2_program_len(module));
+      if (bytes === null) throw new Error(`program ${module} has no emit`);
+      x2Child.setProgram(new WebAssembly.Instance(new WebAssembly.Module(bytes), x2Child.imports()).exports);
+      x2ChildModule = module;
+    }
+    for (const g of x2Child.mappedGlobals) g.value = mapped;
+    if (ex.temen_x2_paged()) {
+      const at = x2ChildTable();
+      for (const g of x2Child.pagestateGlobals) g.value = at;
+    }
+    for (const g of x2Child.fuelGlobals) g.value = X2_SLICE;
+    x2Child.armEnv();
+    if (tierupCell) Atomics.add(new Int32Array(memory.buffer), tierupCell >> 2, 1); // the run's count
+    return [x2Child, ex.temen_detached_header_bytes()];
+  };
+  // Enter a tier (`enter` returns it, the window's base, the emitted function and its arguments),
+  // call the function, and write its results at `out` (`res` makes each a slot). Whatever throws
+  // comes back as the task's trap, never out of the Worker: the emitted code's own, or MALFORMED when
+  // the tier could not be entered.
   const x2Call = (enter, out, res) => {
-    let f, args;
+    let tier, win, f, args;
     try {
-      [f, args] = enter();
+      [tier, win, f, args] = enter();
     } catch {
       return -1 - 12; // temen_ir::trap_code::MALFORMED: e.g. a module that does not instantiate
     }
     try {
-      const ret = f(x2Win, x2Tier.envCell, ...args);
+      const ret = f(win, tier.envCell, ...args);
       const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
       const view = new BigInt64Array(memory.buffer); // the emitted code may have grown the memory
       for (let i = 0; i < rets.length; i++) view[(out >>> 3) + i] = res(rets[i], i);
       return rets.length;
     } catch (e) {
-      return -1 - x2Tier.trapOf(e);
+      return -1 - tier.trapOf(e);
     }
   };
-  // A tier-up of the thread's task: `f{func}` of the run's tier-up module, its slots all i64.
-  const x2_tierup = (func, argv, argc, win, mapped, over, out) => x2Call(() => {
-    const tier = x2Enter(win, mapped, over);
+  // A tier-up of the thread's task: `f{func}` of program `module`'s emit, its slots all i64. Over
+  // the engine's memory (`mem` -1) it is the run's own program; over a child's own memory, the
+  // child's granted module.
+  const x2_tierup = (module, func, argv, argc, win, mapped, over, out, mem) => x2Call(() => {
+    const [tier, base] = mem < 0 ? x2Enter(win, mapped, over) : x2ChildEnter(mem, module, mapped, over);
     const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
     const args = [];
     for (let i = 0; i < argc; i++) args.push(view[at + i]);
-    return [tier.program()['f' + func], args];
+    return [tier, base, tier.program()['f' + func], args];
   }, out, (r) => BigInt(r));
   // A §22 invoke of the unit with code handle `code`: its emitted module's `f0`, instantiated once
   // per Worker, its slots marshalled by the types at `types`.
   const x2_invoke = (code, wasm, wasmLen, types, nparams, nresults, argv, win, mapped, over, out) => {
     const tc = new Uint8Array(memory.buffer).slice(types, types + nparams + nresults);
     return x2Call(() => {
-      const tier = x2Enter(win, mapped, over);
+      const [tier, base] = x2Enter(win, mapped, over);
       const unit = tier.unitForSync(code, new Uint8Array(memory.buffer).slice(wasm, wasm + wasmLen));
       const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
       const args = [];
       for (let i = 0; i < nparams; i++) args.push(tierupJitArg(view[at + i], tc[i]));
-      return [unit['f0'], args];
+      return [tier, base, unit['f0'], args];
     }, out, (r, i) => tierupJitRes(r, tc[nparams + i]));
   };
   ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
@@ -195,6 +267,7 @@ self.onmessage = async (e) => {
     if (x2Mem) registerForeign(x2Mem, ex.temen_detached_header_bytes(), x2MemId);
     ex.temen_x2_thread(start);
     if (x2Tier !== null) x2Tier.free();
+    if (x2Child !== null) ex.temen_dealloc(x2ChildScratch, ex.temen_wasmjit_env_bytes());
     self.close(); // the thread has counted itself out of its run: this Worker has nothing left to do
     return;
   }
