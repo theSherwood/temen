@@ -467,7 +467,11 @@ pub fn on_every_engine(m: &temen_ir::Module) -> [Outcome; 3] {
     let (mut h, handles) = powerbox(m);
     let args: Vec<i64> = handles.into_iter().map(i64::from).collect();
     let window = MemLayout::image(vec![0; WINDOW as usize]);
-    let jit = match temen_run::jit_cap_run(m, 0, &args, &window, 0, TABLE_LOG2, &mut h, None) {
+    // The reservation the interpreters' runs take, so a page op past the declared window reaches
+    // the same tail on every engine.
+    let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+    let jit = match temen_run::jit_cap_run(m, 0, &args, &window, reserved, TABLE_LOG2, &mut h, None)
+    {
         Ok((JitOutcome::Returned(vals), _)) => Some(Ok(vals)),
         Ok((JitOutcome::Trapped(kind), _)) => Some(Err(kind as i64)),
         Ok((JitOutcome::Exited(code), _)) => Some(Err(temen_ir::trap_code::exit(code))),
