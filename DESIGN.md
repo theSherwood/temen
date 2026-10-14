@@ -1864,7 +1864,10 @@ hang, and the mirror: a server parked in `svc.wait` whose **client** child domai
 no-progress `0` — the timed form's answer — so it can return and be joined instead of
 waiting forever for a request that can never come (#1217); a nested child's exit/trap ends
 the *child* domain only, surfacing to its owner as
-an outcome (supervision: `poll` → trapped → detach + respawn, per I37). Before this rule
+an outcome (supervision: `poll` → trapped → detach + respawn, per I37). What an owner keeps
+for a child goes when its claim ends — a `join`, a `wait` that reaps, a `detach` — once the
+child has ended (#2359), so an owner that respawns children for its whole life does not grow
+with them. Before this rule
 the engines had divergent incidental residues (interpreter: join-all + a 10 s wait clamp;
 JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regression report
 (2026-07-24) is the consumer that forced the decision.

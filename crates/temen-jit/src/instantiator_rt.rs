@@ -35,6 +35,9 @@ pub(crate) struct ChildDone {
     /// #1820 — `true` while this cell's joiner is counted in the run's `Domain::parked`
     /// (`Domain::join_park`); settled by [`Self::publish`] or by the joiner leaving.
     pub(crate) joiner_parked: AtomicBool,
+    /// #2359 — the child's task has ended and been torn down, or it never had one: nothing runs
+    /// against its powerbox any more ([`Nursery::forget`]).
+    pub(crate) torn_down: AtomicBool,
 }
 
 impl ChildDone {
@@ -44,6 +47,7 @@ impl ChildDone {
             cv: Condvar::new(),
             durable,
             joiner_parked: AtomicBool::new(false),
+            torn_down: AtomicBool::new(state.is_some()),
         }
     }
 
@@ -142,7 +146,8 @@ struct Child {
     /// (`GrantChild::retained_ctx` as usize; `0` = the builder shared nothing, op 14 answers
     /// `-EINVAL`). Lets `child_offer` mint a live-impl over the child and keeps the child `Host`
     /// reachable after its thread exits (the interp's `child_hosts` retention, JIT twin).
-    /// Released exactly once, at [`Nursery::join_children`], via the grant hooks' releaser.
+    /// Released exactly once via the grant hooks' releaser: once its claim has ended and its
+    /// subtree is torn down ([`Nursery::forget`], #2359), else at [`Nursery::join_children`].
     retained: usize,
     /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
     /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
@@ -548,12 +553,18 @@ pub(crate) struct Nursery {
     /// a child's task is gated on ([`Nursery::lane_chain_of`]), as the oracle gates every vCPU.
     ancestors: Vec<(usize, i64)>,
     /// #1956 — the nurseries of this nursery's detached children that spawn in turn, held to the
-    /// run's teardown. Their children's instances name them, and what they retain
-    /// is released only after every task has ended ([`Nursery::join_children`]): a grandchild's
-    /// teardown hands its lane and window back to its parent's host, which only that retained ref
-    /// keeps alive once the parent has ended. Each is held from its birth ([`Nursery::for_child`]),
-    /// whether or not its child is ever filed: a thaw files its children into it first (#2010).
+    /// run's teardown, or (#2359) until their child's claim ends with its subtree torn down
+    /// ([`Nursery::forget`]). Their children's instances name them, and what they retain is
+    /// released only after every task under them has ended ([`Nursery::join_children`]): a
+    /// grandchild's teardown hands its lane and window back to its parent's host, which only that
+    /// retained ref keeps alive once the parent has ended. Each is held from its birth
+    /// ([`Nursery::for_child`]), whether or not its child is ever filed: a thaw files its children
+    /// into it first (#2010).
     kids: Mutex<Vec<std::sync::Arc<Nursery>>>,
+    /// #2359 — the slots of children whose claim has ended (a join, a wait that reaps, a detach)
+    /// while what this nursery keeps for them could not go yet ([`Nursery::forget`]): each later
+    /// claim's end looks at them again.
+    unclaimed: Mutex<Vec<usize>>,
     /// #1956 — the installed [`crate::AsParent`] (0 = none: a detached child spawns nothing).
     grant_as_parent: std::sync::atomic::AtomicUsize,
     /// temen#2168 — the compiles of the run's detached children, shared by every nursery of the run
@@ -610,6 +621,7 @@ impl Nursery {
             }),
             ancestors: Vec::new(),
             kids: Mutex::new(Vec::new()),
+            unclaimed: Mutex::new(Vec::new()),
             grant_as_parent: std::sync::atomic::AtomicUsize::new(0),
             durable: AtomicBool::new(false),
             freeze: Mutex::new(None),
@@ -934,19 +946,75 @@ impl Nursery {
         for kid in self.kids.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             kid.release_retained();
         }
-        let release_addr = self.grant_release.load(Ordering::Acquire);
-        if release_addr != 0 {
-            let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
-            let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-            for c in children.iter_mut() {
-                let retained = std::mem::take(&mut c.retained);
-                if retained != 0 {
-                    // SAFETY: `retained` is a live `GrantChild::retained_ctx` this nursery owns,
-                    // released exactly once here (spawn error paths released theirs before filing).
-                    unsafe { release(retained as *mut core::ffi::c_void) };
-                }
-            }
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        for c in children.iter_mut() {
+            self.release(std::mem::take(&mut c.retained));
         }
+    }
+
+    /// Give back a child powerbox ref this nursery retained (`0`: none) through the grant hooks'
+    /// releaser.
+    fn release(&self, retained: usize) {
+        let release_addr = self.grant_release.load(Ordering::Acquire);
+        if retained != 0 && release_addr != 0 {
+            let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
+            // SAFETY: `retained` is a live `GrantChild::retained_ctx` this nursery owns, taken out
+            // of its child's entry by the caller, so released exactly once (spawn error paths
+            // released theirs before filing).
+            unsafe { release(retained as *mut core::ffi::c_void) };
+        }
+    }
+
+    /// #2359 — the claim on the child at `slot` has ended: a join, a wait that reaps it, a detach.
+    /// Let go of what this nursery keeps for it, and for any child before it whose claim ended
+    /// while that could not go yet, as soon as nothing can need it ([`Nursery::forget`]). A server
+    /// that spawns a child per request would otherwise hold every child's powerbox to the run's end.
+    fn claim_ended(&self, slot: usize) {
+        let mut unclaimed = self.unclaimed.lock().unwrap_or_else(|e| e.into_inner());
+        unclaimed.push(slot);
+        unclaimed.retain(|&s| !self.forget(s));
+    }
+
+    /// Release the child at `slot`'s retained powerbox, and its own nursery with what that retains,
+    /// once its whole subtree has ended and been torn down: a grandchild's teardown hands its lane
+    /// and window back through the powerbox retained here (see [`Nursery::kids`]), and the child's
+    /// code names its nursery. Whether it let go. The entry stays, joined, so a stale handle answers
+    /// as it did.
+    fn forget(&self, slot: usize) -> bool {
+        let (retained, kid) = {
+            let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(c) = children.get_mut(slot) else {
+                return true;
+            };
+            let ended = c.done.torn_down.load(Ordering::Acquire)
+                && c.kid.as_ref().is_none_or(|k| k.quiescent());
+            if !ended {
+                return false;
+            }
+            (std::mem::take(&mut c.retained), c.kid.take())
+        };
+        if let Some(kid) = kid {
+            kid.release_retained();
+            self.kids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|k| !std::sync::Arc::ptr_eq(k, &kid));
+        }
+        self.release(retained);
+        true
+    }
+
+    /// Whether every child this nursery filed, and every child under those, has ended and been torn
+    /// down.
+    fn quiescent(&self) -> bool {
+        self.children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|c| {
+                c.done.torn_down.load(Ordering::Acquire)
+                    && c.kid.as_ref().is_none_or(|k| k.quiescent())
+            })
     }
 
     /// #1361 step 4 — a freeze reached this domain: ring every live durable detached child's doorbell,
@@ -2119,19 +2187,23 @@ unsafe fn join_or_wait(
             crate::os_thread_rt::mark_reissue(mem_base);
             return 0;
         }
-        match (trap, wait) {
-            (0, true) => 0, // returned: it stays for its `join`
-            (0, false) => result,
+        let (r, claim_ended) = match (trap, wait) {
+            (0, true) => (0, false), // returned: it stays for its `join`
+            (0, false) => (result, true),
             // A trapped child has nothing left to join: the wait reaps it.
             (trap, true) => {
                 rt.children.lock().unwrap_or_else(|e| e.into_inner())[slot].joined = true;
-                trap
+                (trap, true)
             }
             (trap, false) => {
                 *trap_out = trap; // a child trap propagates to the parent on join
-                0
+                (0, true)
             }
+        };
+        if claim_ended {
+            rt.claim_ended(slot);
         }
+        r
     })();
     // Back from the park: re-take the lane before the parent's guest code runs again.
     if let Some(d) = dom {
@@ -2190,7 +2262,8 @@ pub(crate) unsafe extern "C" fn poll(
 
 /// PROCESS.md S3 `detach(child) -> 0` (JIT). Drop the parent's join claim; a later `join` is then inert.
 /// The child's OS thread (if still running) is joined at run teardown (`join_children`), so a detached
-/// async child never outlives the window. A forged / already-joined handle is a `CapFault`.
+/// async child never outlives the window; what the nursery keeps for it goes once it has ended
+/// (#2359, [`Nursery::claim_ended`]). A forged / already-joined handle is a `CapFault`.
 ///
 /// # Safety
 /// As [`join`].
@@ -2206,16 +2279,20 @@ pub(crate) unsafe extern "C" fn detach(
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    match children.get_mut(handle as usize) {
+    let claimed = match children.get_mut(handle as usize) {
         Some(c) if !c.joined => {
             c.joined = true;
-            0
+            true
         }
-        _ => {
-            *trap_out = TrapKind::CapFault as i64;
-            0
-        }
+        _ => false,
+    };
+    drop(children);
+    if claimed {
+        rt.claim_ended(handle as usize);
+    } else {
+        *trap_out = TrapKind::CapFault as i64;
     }
+    0
 }
 
 /// PROCESS.md S3 `kill(child) -> 0` (JIT, #2074): end the child and every child under it with

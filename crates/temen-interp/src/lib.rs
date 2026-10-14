@@ -11936,6 +11936,26 @@ pub(crate) fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T
         .expect("resolve_thread checked liveness"))
 }
 
+/// #2359 — drop what a vCPU keeps for the child at join `slot` once no handle names the child and it
+/// has ended: its carve, its powerbox, its kill flag, its freeze doorbell and spawn, and a thaw's
+/// delivery of it (PROCESS.md §3: a domain's end drops its records). Every reader of these reaches
+/// them through a live slot, so a spent slot's are dead weight, and the powerbox is a whole `Host`.
+/// The slot itself stays `None`, so a stale handle answers as it did.
+fn forget_child(
+    slot: usize,
+    nested_children: &mut Vec<NestedChildInfo>,
+    child_hosts: &mut BTreeMap<usize, Arc<Mutex<Host>>>,
+    child_kill: &mut BTreeMap<usize, Arc<AtomicBool>>,
+    child_freeze: &mut BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
+    delivered_detached: &mut Vec<(usize, TaskId)>,
+) {
+    nested_children.retain(|c| c.slot != slot);
+    child_hosts.remove(&slot);
+    child_kill.remove(&slot);
+    child_freeze.remove(&slot);
+    delivered_detached.retain(|&(s, _)| s != slot);
+}
+
 #[cfg(test)]
 mod take_child_tests {
     //! #1728 — the join rule an embedder's child table gets from [`take_child`].
@@ -12086,7 +12106,8 @@ struct VCpu {
     /// slot. Retained so the parent can mint a [`Binding::LiveImpl`] over a child's offer
     /// (`Instantiator.child_offer`, op 14) — the caller-parking linkage. Live-only (never
     /// frozen: a LiveImpl is non-durable), kept out of `NestedChildInfo` so the freeze
-    /// records stay `Copy`.
+    /// records stay `Copy`. Dropped with the slot's other records once its handle is spent
+    /// ([`forget_child`], #2359).
     child_hosts: BTreeMap<usize, Arc<Mutex<Host>>>,
     /// This vCPU **is** a §14 instantiated child (depth-1). Its freeze-unwind is self-describing —
     /// its extent lives in its carve's shadow-SP word, inside the parent's window image — so its
@@ -12225,6 +12246,10 @@ struct VCpu {
     /// so they are in no `child_hosts`; a freeze before the `join` reads them here and records each as
     /// completed again, while the slot still names that task.
     delivered_detached: Vec<(usize, TaskId)>,
+    /// #2359 — the children this vCPU detached (`Instantiator.detach`, op 10) before they ended, as
+    /// `(slot, task)`. What it keeps for each, its kill flag among it, stays until a later detach
+    /// finds the child ended and reaps it ([`forget_child`]).
+    unreaped: Vec<(usize, TaskId)>,
     /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
     /// innermost first. A worker may run it only while every bounded cap in the chain has room
     /// ([`lane_enter`]); it holds those lanes from that dispatch until it parks or finishes
@@ -12387,6 +12412,7 @@ impl VCpu {
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -12469,6 +12495,7 @@ impl VCpu {
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -12566,6 +12593,7 @@ impl VCpu {
             child_kill: BTreeMap::new(),
             child_freeze: BTreeMap::new(),
             delivered_detached: Vec::new(),
+            unreaped: Vec::new(),
             lane_chain: Vec::new(),
             holds_lanes: false,
             child_lane: BTreeMap::new(),
@@ -13316,6 +13344,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 v.frames[top].vals.push(Reg::from_i64(0));
             } else {
                 v.threads[slot] = None; // a handle is joined once
+                forget_child(
+                    slot,
+                    &mut v.nested_children,
+                    &mut v.child_hosts,
+                    &mut v.child_kill,
+                    &mut v.child_freeze,
+                    &mut v.delivered_detached,
+                );
                 credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
                                                                      // #1685 — under a freeze, a child that unwound hands back a placeholder: mark the join
                                                                      // for re-issue on thaw, against the re-spawned child. A child that finished for real is
@@ -13442,7 +13478,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         unit_ref_cache,
         window_lease: _, // settled where the vCPU ends (`Done` / `reap`), never mid-run
         live: _,         // #2001: handed back when the vCPU is dropped
-        delivered_detached: _, // #2044: read by the freeze scan, at the dispatch boundary
+        delivered_detached,
+        unreaped,
     } = v;
     let depth = *depth;
     let durable = *durable;
@@ -14699,19 +14736,33 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i32(status));
                         }
                         // detach(child) -> 0 (PROCESS.md S3): drop the parent's join claim. The child
-                        // keeps running to completion (detach is not kill); its result is reaped now if
-                        // it already finished, else discarded when the run tears down — never joinable
-                        // again. A forged / already-joined handle is a `ThreadFault`. (Auto-reap of a
-                        // still-running detached child's eventual result — vs. run-end cleanup — is a
-                        // follow-up, as is `kill`, which needs a per-child §5 interrupt.)
+                        // keeps running to completion (detach is not kill) and is never joinable again.
+                        // A forged / already-joined handle is a `ThreadFault`. #2359 — it is reaped, its
+                        // result and what this vCPU keeps for it, once it has ended: now if it has, else
+                        // at a later detach. Until then its kill flag stays, so a kill of this vCPU
+                        // still ends it.
                         10 => {
                             let ch =
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             threads[slot] = None; // no longer joinable
-                            let _ = sched.take_result(child); // reap if already finished
                             credit_child_lane(child_lane, host, slot); // D66
+                            unreaped.push((slot, child));
+                            unreaped.retain(|&(slot, child)| {
+                                let ended = sched.take_result(child).is_some();
+                                if ended {
+                                    forget_child(
+                                        slot,
+                                        nested_children,
+                                        child_hosts,
+                                        child_kill,
+                                        child_freeze,
+                                        delivered_detached,
+                                    );
+                                }
+                                !ended
+                            });
                             frames[top].vals.push(Reg::from_i32(0));
                         }
                         // kill(child) -> 0 (PROCESS.md S3, #2074): end the child and everything under
@@ -32857,6 +32908,15 @@ impl Host {
                         } else {
                             EINVAL // `dst` is not under this node (itself, a peer, an ancestor)
                         }])
+                    }
+                    // close() -> 0 (#2384): give the handle up, as a `Stream`'s or a region's is
+                    // ([`Host::close`]): a later use answers `-EBADF`. The node stays in the tree,
+                    // where charges name it by id, so a child spawned from it is capped and charged
+                    // as before. A parent that splits a node per child closes its handle once the
+                    // child holds its own, or its table fills with them.
+                    3 => {
+                        self.close(handle);
+                        Ok(vec![0])
                     }
                     _ => Ok(vec![EINVAL]),
                 }

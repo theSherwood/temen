@@ -13927,6 +13927,18 @@ fn park_task(
     tasks[ti].state = state;
 }
 
+/// The child envs (§14 children and fork twins) whose domains have finished, as [`settle_wakes`]
+/// releases them.
+#[derive(Default)]
+struct Released {
+    /// FORK.md §8.6 / #1807 — the envs whose pipe ends were released at their domain's finish.
+    /// Released once: the release decrements the shared end counts.
+    envs: std::collections::BTreeSet<usize>,
+    /// #2359 — the powerbox each is left holding: one empty `Host` for the run rather than a fresh
+    /// one apiece, whose handle table alone is kilobytes.
+    host: DomainCell,
+}
+
 /// A run's scheduling core (#1414 3e): the task set and the state the scheduling rules read and
 /// write — the run-shared §12 fiber registry (+ its durable parallel arrays), the §14 confined
 /// child environments, the fork/teardown bookkeeping, and the logical clock.
@@ -13955,9 +13967,8 @@ struct SchedCore {
     /// their completion). Fired once, in the settle scan, before a personality `waitpid` re-execution
     /// reads the retired status (the bytecode port of the tree-walker's exit-hook-at-death step).
     hooked_twins: std::collections::BTreeSet<usize>,
-    /// FORK.md §8.6 / #1807 — child envs (§14 children and fork twins) whose pipe ends were released at
-    /// their domain's finish. Released once: the release decrements the shared end counts.
-    released_envs: std::collections::BTreeSet<usize>,
+    /// The child envs whose domains have finished ([`Released`]).
+    released: Released,
     /// The scheduler's logical clock, in ns: it moves by the ops of each quantum that runs out
     /// (#2224), and jumps to the earliest `wait` deadline when no task is runnable.
     clock: u64,
@@ -14126,7 +14137,7 @@ fn settle_wakes(
     fibers: &[FiberState],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &mut std::collections::BTreeSet<usize>,
-    released_envs: &mut std::collections::BTreeSet<usize>,
+    released: &mut Released,
     root: &DomainCell,
 ) {
     // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
@@ -14190,7 +14201,7 @@ fn settle_wakes(
     }
     let mut finished: Vec<usize> = Vec::new();
     for k in 0..extra_envs.len() {
-        if seen[k] && !live[k] && released_envs.insert(k) {
+        if seen[k] && !live[k] && released.envs.insert(k) {
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
@@ -14240,11 +14251,13 @@ fn settle_wakes(
     // A finished domain gives back what it held — its window, its powerbox, its frames — now
     // that its pipe ends are released and its exit hooks have fired. What a reaper reads is its
     // tasks' `Done` results, which stay. Without this a run holds every process it ever ran: a
-    // build that forks and execs a compiler per module grew by a window per process.
+    // build that forks and execs a compiler per module grew by a window per process. The env is
+    // left holding the run's one empty powerbox (#2359): a fresh one apiece grew a run by its
+    // handle table per child.
     for k in finished {
         let env = &mut extra_envs[k];
         env.mem = None;
-        env.host = std::sync::Arc::new(std::sync::Mutex::new(Host::new()));
+        env.host = std::sync::Arc::clone(&released.host);
         env.fibers = FiberTables::default();
         for t in tasks.iter_mut().filter(|t| t.env == Some(k)) {
             t.vm.vt.release();
@@ -14478,7 +14491,6 @@ impl SchedCore {
         // `-ECHILD`, never a park that hangs); an id is retired when reaped.
         let forked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let hooked_twins: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let released_envs: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         Ok(SchedCore {
             tasks,
             extra_envs,
@@ -14488,7 +14500,7 @@ impl SchedCore {
             dead_envs,
             forked_twins,
             hooked_twins,
-            released_envs,
+            released: Released::default(),
             clock,
         })
     }
@@ -14613,7 +14625,7 @@ impl CoopSched {
                 dead_envs,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 clock,
             } = &mut *core;
             let EmitTier {
@@ -14680,7 +14692,7 @@ impl CoopSched {
                 fibers,
                 forked_twins,
                 hooked_twins,
-                released_envs,
+                released,
                 root,
             );
             // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
@@ -17803,7 +17815,7 @@ impl ThreadRun {
             &core.fibers,
             &mut core.forked_twins,
             &mut core.hooked_twins,
-            &mut core.released_envs,
+            &mut core.released,
             &self.root,
         );
         interrupt_parks(&mut core.tasks, &core.extra_envs, &self.root);
