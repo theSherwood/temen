@@ -5392,7 +5392,7 @@ impl ExecReq {
             m.exec_window(
                 back,
                 self.window,
-                &self.module.data,
+                &self.module,
                 self.null_guard,
                 self.args.as_deref(),
             )
@@ -33760,13 +33760,15 @@ impl Mem {
     }
 
     /// FORK.md §8.6 — the window an `execve` replaces this one with. An exec replaces the address
-    /// space: the new image gets this window's reservation and shadow arena, a backed prefix of
-    /// `mapped` bytes (its declared memory, [`ExecImage::child_size`], #2332) over `back`, a fresh
-    /// backing, and nothing else of this window. The caller's bytes
-    /// past the image, the pages it `vm_map`ped in the reserved tail and its page protections stay
-    /// behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance. Nor
-    /// is the caller's window zeroed or copied, which for a compiler's forked child was most of what
-    /// an exec cost.
+    /// space: the new image gets this window's reservation, a backed prefix of `mapped` bytes (its
+    /// declared memory, [`ExecImage::child_size`], #2332) over `back`, a fresh backing, and nothing
+    /// else of this window. Its shadow arena is the one `image` declares (INVARIANTS #16), never the
+    /// caller's: the arena fences the image's own page ops (#2426), and the caller's layout is gone,
+    /// so a fence it left would refuse the image's heap growth over pages it now owns. The caller's
+    /// bytes past the image, the pages it `vm_map`ped in the reserved tail and its page protections
+    /// stay behind, as they do on the Cranelift JIT, whose exec starts the image in a fresh instance.
+    /// Nor is the caller's window zeroed or copied, which for a compiler's forked child was most of
+    /// what an exec cost.
     ///
     /// The image arrives as a fresh instantiation's does ([`Mem::from_spec`], #1737): its data
     /// segments written, the `readonly` ones RO, behind the NULL guard (#1094: a null dereference in
@@ -33780,7 +33782,7 @@ impl Mem {
         &self,
         back: Region,
         mapped: u64,
-        data: &[temen_ir::Data],
+        image: &Module,
         null_guard: u64,
         args: Option<&[u8]>,
     ) -> Mem {
@@ -33803,10 +33805,10 @@ impl Mem {
         let m = Mem::from_spec(WindowSpec {
             reserved_log2: reserved.trailing_zeros() as u8,
             mapped_log2: mapped.trailing_zeros() as u8,
-            shadow: Some(self.shadow),
+            shadow: image.memory.and_then(|mc| mc.shadow),
             back: Some(Arc::new(back)),
             seed: &seed,
-            data,
+            data: &image.data,
             null_guard,
         });
         if let Some(blob) = args {

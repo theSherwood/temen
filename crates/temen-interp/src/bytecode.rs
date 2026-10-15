@@ -10341,7 +10341,7 @@ fn exec_image_build(
     let win = m.exec_window(
         back,
         img.child_size,
-        &img.module.data,
+        &img.module,
         temen_ir::module_null_guard(),
         args.as_deref(),
     );
