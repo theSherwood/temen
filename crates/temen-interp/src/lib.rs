@@ -33815,23 +33815,31 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                // A **recoverable** in-window page fault: record the confined address so a §14
-                // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
-                None if page * self.page < self.null_guard => {
-                    // #964: a NULL dereference — fatal, never a recoverable §14 page fault (a
-                    // demand parent could not legally map the reserved region anyway). #1190: record
-                    // the faulting address for the debugger (a segfault at `base`) in the dedicated
-                    // report field — *not* `last_fault`, whose recoverable-fault contract the guard
-                    // deliberately sidesteps here.
-                    self.fault_report.store(base, Ordering::Relaxed);
-                    return Err(Trap::MemoryFault);
-                }
-                None => return Err(self.page_fault(base)), // unmapped
-                Some(false) if write => return Err(self.page_fault(base)), // read-only store
-                _ => {}
+                Some(writable) if writable || !write => {}
+                _ => return Err(self.refused(base, page)),
             }
         }
         Ok(())
+    }
+
+    /// The fault for an access starting at `base` that `page` refuses: the page is unmapped, or the
+    /// access stores to it and it is read-only.
+    ///
+    /// - **Below the NULL guard**, fatal (#964): never a recoverable §14 page fault, since a demand
+    ///   parent could not legally map the reserved region anyway. #1190: the address goes to the
+    ///   debugger (a segfault at `base`) in the dedicated report field, not in `last_fault`, whose
+    ///   recoverable-fault contract the guard sidesteps.
+    /// - **Otherwise recoverable**: a §14 coroutine child suspends to its parent on it, and a demand
+    ///   child's pager supplies the page. It is recorded at the access's first byte in `page`, the
+    ///   page the access needs (#2469): an access that crosses into `page` from a mapped one starts
+    ///   in the mapped one.
+    fn refused(&self, base: u64, page: u64) -> Trap {
+        let start = page * self.page;
+        if start < self.null_guard {
+            self.fault_report.store(base, Ordering::Relaxed);
+            return Trap::MemoryFault;
+        }
+        self.page_fault(base.max(start))
     }
 
     /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
@@ -34249,9 +34257,8 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                None => return Err(self.page_fault(base)),
-                Some(false) if write => return Err(self.page_fault(base)),
-                _ => {}
+                Some(writable) if writable || !write => {}
+                _ => return Err(self.refused(base, page)),
             }
         }
         Ok(())

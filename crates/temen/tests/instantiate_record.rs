@@ -999,16 +999,80 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
 /// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
 /// no-progress answer) so its `join` answers the child's `MEMORY_FAULT` — the run ends instead of
 /// hanging.
+///
+/// #2469 — a bulk op on the guard is fatal too: a `mem.copy` from it, a `mem.fill` of it. Their span
+/// check had no guard arm, so it recorded a recoverable fault, the pager was asked for the guard
+/// page, and its supply mapped the guard read-write.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
-    let src = detached_pager_program_at(0);
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in BACKENDS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            faulted,
-            "{b:?}: a NULL fault in a paged child is fatal to it"
+    for (what, access) in [
+        ("a load", None),
+        (
+            "a copy's source",
+            Some("  vd = i64.const 32768\n  vn = i64.const 4\n  mem.copy vd va vn\n  vb = i32.load8_u vd\n"),
+        ),
+        (
+            "a fill",
+            Some("  vf = i32.const 5\n  vn = i64.const 4\n  mem.fill va vf vn\n  vb = i32.load8_u va\n"),
+        ),
+    ] {
+        let mut src = detached_pager_program_at(0);
+        if let Some(access) = access {
+            src = src.replace("  vb = i32.load8_u va\n", access);
+            assert!(src.contains(access), "the rewrite must apply");
+        }
+        for b in BACKENDS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                faulted,
+                "{b:?}: {what} of the NULL guard in a paged child is fatal to it"
+            );
+        }
+    }
+}
+
+/// #2469 — an access that crosses from a supplied page into one not yet supplied faults on the page
+/// it needs. The child touches 32765, which brings in the page below 32768 (a 16 KiB boundary, so a
+/// page boundary on any host), then reads a word across it: a scalar load, a `mem.copy` whose source
+/// crosses, a `mem.fill` whose destination does. The fault used to be recorded where the access
+/// starts, in the page already supplied: the pager supplied that page again, and the child faulted
+/// again. The root serves both faults and returns `child + 2 * 1000`. The child returns the byte it
+/// touched, 77, plus the word: the pager's 77 lands at 32768, the word's third byte.
+#[test]
+fn a_paged_access_that_crosses_into_an_unsupplied_page_faults_on_that_page() {
+    let read = "  vx = i64.const 32766\n  vw = i32.load vx\n";
+    let copy = "  vd = i64.const 32700\n  vsrc = i64.const 32760\n  vn = i64.const 16\n  \
+                mem.copy vd vsrc vn\n  vx = i64.const 32706\n  vw = i32.load vx\n";
+    let fill = "  vd = i64.const 32760\n  vf = i32.const 5\n  vn = i64.const 16\n  \
+                mem.fill vd vf vn\n  vx = i64.const 32766\n  vw = i32.load vx\n";
+    for (what, access, word) in [
+        ("a load", read, 77 << 16),
+        ("a copy's source", copy, 77 << 16),
+        ("a fill", fill, 0x0505_0505),
+    ] {
+        let src = detached_pager_program_at(32765)
+            .replace(
+                "  vs = svc.wait vz\n",
+                "  vs1 = svc.wait vz\n  vs2 = svc.wait vz\n  vs = i64.add vs1 vs2\n",
+            )
+            .replace(
+                "  return vbw\n",
+                &format!(
+                    "{access}  vw64 = i64.extend_i32_u vw\n  vr = i64.add vbw vw64\n  return vr\n"
+                ),
+            );
+        assert!(
+            src.contains("vs2 = svc.wait") && src.contains(access),
+            "the rewrites must apply"
         );
+        for b in BACKENDS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                77 + word + 2000,
+                "{what} on {b:?}"
+            );
+        }
     }
 }
 
