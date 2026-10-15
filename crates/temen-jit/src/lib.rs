@@ -112,7 +112,7 @@ mod os_thread_rt;
 #[cfg(not(loom))]
 pub use os_thread_rt::{
     park_host_call, region_canon_forget_window, region_canon_lookup, region_canon_new_owner,
-    region_canon_record, wake_host_parks, wake_host_parks_in, HostPark,
+    region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in, HostPark,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —

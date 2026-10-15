@@ -6400,7 +6400,8 @@ fn journal_state(
     let invertible = host.journal_invertible()
         && extra_envs.iter().all(|e| e.host.region_count() == 0)
         && tasks.iter().all(|t| t.vm.vt.active_invoke.is_none())
-        && !any_event_parked(fibers.iter());
+        && !any_event_parked(fibers.iter())
+        && !pool_parked(tasks, extra_envs, host);
     if !invertible {
         return;
     }
@@ -6625,21 +6626,22 @@ fn debug_advance_fiber(
                 Err(t) => FiberStep::Trapped(t),
             }
         }
-        // F2 — a punted host call in a debug advance keeps the pre-F2 inline wait (the debug
-        // drivers' whole-vCPU-park shape is sanctioned tiering, invariant 9 observability
-        // corollary; checkpointing across one is already excluded by `admits_checkpoint`'s
-        // replay-substate rules — the wait happens inside the advance, leaving no parked state).
-        Ok(Outcome::CapPending { id, dst }) => {
+        // #2047 — a punted host call parks the thread, as the oracle parks the vCPU: the call may
+        // wait on the world, or on what another thread does. The run takes the pool's answer once
+        // nothing else can run ([`dbg_take_pool_answer`]), so the schedule stays deterministic. A
+        // durable run keeps the inline wait (the freeze must never meet a park).
+        Ok(Outcome::CapPending { id, dst }) if host.is_durable() => {
             match host.completions().wait_unless_host_owned(id) {
                 Some(r) => {
                     vt.active.set(dst, Reg::from_i64(r));
                     FiberStep::Stepped
                 }
-                // #1366: a host-completed punt — the debug run parks on it (`cap_parked`) and the
-                // backend surfaces `StopReason::CapPark`; `deliver_cap` resumes.
                 None => FiberStep::CapParked { id, dst, at },
             }
         }
+        // #1366: a host-completed punt parks the same way, and the backend surfaces
+        // `StopReason::CapPark`; `deliver_cap` resumes.
+        Ok(Outcome::CapPending { id, dst }) => FiberStep::CapParked { id, dst, at },
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (`service_advance` dispatches its subset, declines the rest).
         Ok(other) => FiberStep::Other(other),
@@ -7696,10 +7698,11 @@ fn service_advance(
             *turn += 1;
             complete(tasks, ti, Err(t));
         }
-        // #1366 — a host-completed cap park: the call did not run and the turn holds (as a stdin
-        // park); `drive` reports `SchedStop::CapPark` once nothing else can run, and `deliver_cap`
-        // lands the value and re-admits the task. Until #1517 this engine failed closed here — and
-        // could not in fact reach it, since it never admitted host-completed punts at all.
+        // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park). Once
+        // nothing else can run, `drive` takes the pool's answer (#2047), or reports
+        // `SchedStop::CapPark` for the embedder's, and `deliver_cap` lands it; either re-admits the
+        // task and counts the turn. Until #1517 this engine failed closed here — and could not in
+        // fact reach it, since it never admitted host-completed punts at all.
         FiberStep::CapParked { id, dst, at } => {
             tasks[ti].state = TaskState::BlockedHostCap { id, dst, at };
         }
@@ -8263,6 +8266,58 @@ fn dbg_pick_runnable(
     }
 }
 
+/// #2047 — with nothing runnable and no timer left, the lowest-index thread parked on a punted call
+/// takes the offload pool's answer: wait for it, deliver it and re-admit the thread, counting the
+/// turn as [`ScheduledDebugRun::deliver_cap`] counts the embedder's. Taken only here, where nothing
+/// else could run meanwhile, so when it comes changes nothing a replay sees. `false` when no thread
+/// is parked, or the lowest-index park is host-completed (the embedder's to answer).
+fn dbg_take_pool_answer(
+    tasks: &mut [TaskSlot],
+    extra_envs: &[DbgEnv],
+    host: &Host,
+    turn: &mut u64,
+) -> bool {
+    let Some((p, id, dst)) = tasks.iter().enumerate().find_map(|(i, t)| match t.state {
+        TaskState::BlockedHostCap { id, dst, .. } => Some((i, id, dst)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let comps = dbg_completions(tasks[p].env, extra_envs, host);
+    if comps.is_host_owned(id) {
+        return false;
+    }
+    let r = comps.wait(id);
+    tasks[p].deliver(dst, Reg::from_i64(r));
+    tasks[p].state = TaskState::Runnable;
+    *turn += 1;
+    true
+}
+
+/// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
+/// from outside the run, which a restore cannot reach, so it keeps a checkpoint and a journal state
+/// record out, as a fiber's cap park does. A host-completed park is the replay's to serve.
+fn pool_parked(tasks: &[TaskSlot], extra_envs: &[DbgEnv], host: &Host) -> bool {
+    tasks.iter().any(|t| match t.state {
+        TaskState::BlockedHostCap { id, .. } => {
+            !dbg_completions(t.env, extra_envs, host).is_host_owned(id)
+        }
+        _ => false,
+    })
+}
+
+/// The completion store of a debug task's domain: the root's, or its child env's.
+fn dbg_completions(
+    env: Option<usize>,
+    extra_envs: &[DbgEnv],
+    host: &Host,
+) -> std::sync::Arc<super::Completions> {
+    match env {
+        None => host.completions(),
+        Some(k) => extra_envs[k].host.completions(),
+    }
+}
+
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
     /// bytecode engine's subset (`compile_module` declines it). The powerbox is empty; use
@@ -8796,6 +8851,9 @@ impl ScheduledDebugRun {
                     // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
                     // lowest-index one), else a true deadlock.
                     None => {
+                        if dbg_take_pool_answer(tasks, extra_envs, host, turn) {
+                            continue;
+                        }
                         // #1366: a thread parked on a host-completed cap is a live `CapPark`
                         // stop on that thread (lowest-index), resumable via `deliver_cap`.
                         if let Some((p, id, at)) =
@@ -9129,7 +9187,9 @@ impl ScheduledDebugRun {
                 *turn,
             )
         }) else {
-            return false; // no runnable thread and no waiter (deadlock) — can't advance
+            // The pool's answer to a parked thread is this tick, as in `drive`; else no runnable
+            // thread and no waiter (deadlock, or the embedder's to answer) — can't advance.
+            return dbg_take_pool_answer(tasks, extra_envs, host, turn);
         };
         if let Some(before) = pre_pick.as_ref() {
             let mut events = Vec::new();
@@ -9257,19 +9317,26 @@ impl ScheduledDebugRun {
 
     /// #1366 — the completion id some thread is parked on (a host-completed cap call), if any: the
     /// lowest-index parked thread's. The backend reports it as `StopReason::CapPark { id }`;
-    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it.
+    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it. A park the offload pool answers
+    /// is not one (#2047): the run takes that answer itself.
     pub fn cap_parked(&self) -> Option<u64> {
-        self.tasks.iter().find_map(|t| match t.state {
-            TaskState::BlockedHostCap { id, .. } => Some(id),
-            _ => None,
-        })
+        self.host_cap_park().map(|(id, _)| id)
     }
 
     /// #1366 — the pc of the host-completed cap call the parked thread is on (the stop location), if
     /// parked and the call had a source position.
     pub fn cap_park_pc(&self) -> Option<super::IrPc> {
+        self.host_cap_park().and_then(|(_, at)| at)
+    }
+
+    /// The lowest-index thread's park on a host-completed cap call: its id and the call's pc.
+    fn host_cap_park(&self) -> Option<(u64, Option<super::IrPc>)> {
         self.tasks.iter().find_map(|t| match t.state {
-            TaskState::BlockedHostCap { at, .. } => at,
+            TaskState::BlockedHostCap { id, at, .. }
+                if dbg_completions(t.env, &self.extra_envs, &self.host).is_host_owned(id) =>
+            {
+                Some((id, at))
+            }
             _ => None,
         })
     }
@@ -9291,7 +9358,9 @@ impl ScheduledDebugRun {
         else {
             return false;
         };
-        settle_host_cap(&mut self.host, id, value);
+        if !settle_host_cap(&mut self.host, id, value) {
+            return false; // the offload pool's to answer (#2047)
+        }
         let _ = self.host.completions().try_take(id);
         self.tasks[ti].deliver(dst, Reg::from_i64(value));
         self.tasks[ti].state = TaskState::Runnable;
@@ -9341,7 +9410,8 @@ impl ScheduledDebugRun {
                 .fibers
                 .iter()
                 .chain(self.extra_envs.iter().flat_map(|e| e.fibers.fibers.iter())),
-        ) {
+        ) || pool_parked(&self.tasks, &self.extra_envs, &self.host)
+        {
             return Err(Refusal::Fiber);
         }
         // A child's window is its own (#1866): its image rides its env's snapshot, so only a
@@ -11322,6 +11392,28 @@ fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> bo
     }
 }
 
+/// #2047 — wake each task parked on a punted call whose answer has come, once a round: no one polls
+/// a parked task, as a resumer polls a parked fiber ([`drain_cap_parked`]). A task is a vCPU of its
+/// own, so between tasks the order is whatever the world's is, as on the oracle. The store is the
+/// root's, so only its domain's tasks are looked at (a child's ids are its own host's), and only
+/// while one is parked.
+fn drain_task_completions(tasks: &mut [TaskSlot], root: &DomainCell) {
+    let parked =
+        |t: &TaskSlot| t.env.is_none() && matches!(t.state, TaskState::BlockedHostCap { .. });
+    if !tasks.iter().any(parked) {
+        return;
+    }
+    let comps = root.lock_unpoisoned().completions();
+    for t in tasks.iter_mut().filter(|t| parked(t)) {
+        if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
+            if let Some(r) = comps.try_take(id) {
+                t.deliver(dst, Reg::from_i64(r));
+                t.state = TaskState::Runnable;
+            }
+        }
+    }
+}
+
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
 const ROOT_FIBER: usize = usize::MAX;
 
@@ -13020,13 +13112,15 @@ enum TaskState {
     BlockedOnFiber {
         fiber: usize,
     },
-    /// #1953 — parked on a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the
-    /// embedder answers completion `id` ([`CoopRun::deliver_cap`]), whose value lands in `dst`.
-    /// Only a [`CoopRun`] admits such calls, and only on its root powerbox; once nothing else can
-    /// run, the pump surfaces the smallest outstanding id as [`CoopStep::CapPark`]. The task twin
-    /// of a fiber's [`FiberState::CapParked`]. A debug session parks the same way and records the
-    /// call's own pc, `at`, as the stop location (#1366); the pump keeps none. A checkpoint `restore`
-    /// re-admits it, the replay serving the call from the tape.
+    /// #2047 — parked on a **punted cap call**: completion `id`'s value lands in `dst`. The offload
+    /// pool posts it, and a round's drain delivers it ([`drain_task_completions`]). #1953 — or the
+    /// call is **host-completed** ([`crate::OffloadOutcome::Host`]), and the embedder answers it
+    /// ([`CoopRun::deliver_cap`]): only a [`CoopRun`] admits such calls, and only on its root
+    /// powerbox; once nothing else can run, the pump surfaces the smallest outstanding id as
+    /// [`CoopStep::CapPark`]. The task twin of a fiber's [`FiberState::CapParked`]. A debug session
+    /// parks the same way and records the call's own pc, `at`, as the stop location (#1366); the
+    /// pump keeps none. A checkpoint `restore` re-admits a host-completed park, the replay serving
+    /// the call from the tape; a pool park keeps a checkpoint out, as a fiber's does.
     BlockedHostCap {
         id: u64,
         dst: u32,
@@ -14288,6 +14382,7 @@ impl CoopSched {
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
                 return res.map(CoopStep::Done);
             }
+            drain_task_completions(tasks, root);
             settle_wakes(
                 tasks,
                 extra_envs,
@@ -14330,16 +14425,9 @@ impl CoopSched {
                 ) {
                     continue;
                 }
-                // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
-                // pending work on the offload pool, never a deadlock and never a reason to jump the
-                // logical clock. Block on the store for the smallest outstanding id (submission
-                // order), deliver through the ordered drain, and loop — the woken fibers'
-                // resumers observe the wake at their next poll (or their own timers fire below on
-                // a later pass).
-                //
-                // #1953 — a host-completed call (a task's `BlockedHostCap`, or a fiber's `CapParked`
-                // on a host-owned id) is the same pending work, finished by the embedder instead of
-                // the pool: when the smallest outstanding id is one, surface it rather than wait.
+                // The punted calls outstanding (F2, FIBER_PARK.md): a fiber's `CapParked`, a task's
+                // `BlockedHostCap`. #1953 — when the smallest is host-completed, it is the
+                // embedder's to finish: surface it.
                 let min_cap = fibers
                     .iter()
                     .filter_map(|f| match f {
@@ -14354,33 +14442,28 @@ impl CoopSched {
                     }))
                     .min();
                 if let Some(id) = min_cap {
-                    let comps = root.lock_unpoisoned().completions();
-                    if comps.is_host_owned(id) {
+                    if root.lock_unpoisoned().completions().is_host_owned(id) {
                         return Ok(CoopStep::CapPark { id });
                     }
-                    let r = comps.wait(id);
-                    for f in fibers.iter_mut() {
-                        if let FiberState::CapParked {
-                            id: fid,
-                            woken: w @ None,
-                            ..
-                        } = f
-                        {
-                            if *fid == id {
-                                *w = Some(r);
-                            }
-                        }
-                    }
-                    drain_cap_parked(fibers, &comps);
-                    continue;
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
-                // event-parked fiber waiters alike (§3.6 slice 5a), in every domain — else it is a
-                // deadlock.
+                // event-parked fiber waiters alike (§3.6 slice 5a), in every domain.
                 let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
                     .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
                     .collect();
                 if !fire_next_timeout(tasks, &mut regs, clock) {
+                    // #2047 — no timer is left, but a punted call is outstanding: work in flight
+                    // on the offload pool, never a deadlock. Block until the smallest outstanding
+                    // id (submission order) arrives, and deliver it: a fiber's through the ordered
+                    // drain, a task's at the next round's. Only after the timers, as a call may
+                    // wait on the world, or on what a timed waiter will do: it must not hold the
+                    // clock back.
+                    if let Some(id) = min_cap {
+                        let comps = root.lock_unpoisoned().completions();
+                        comps.wait_ready(id);
+                        drain_cap_parked(fibers, &comps);
+                        continue;
+                    }
                     // #1146 slice 2 — before blocking, interrupt the parks a deliverable signal
                     // reached ([`interrupt_parks`]).
                     if interrupt_parks(tasks, extra_envs, root) {
@@ -14828,16 +14911,18 @@ impl SchedCore {
                 };
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
-                // F2 (FIBER_PARK.md) — a punted dispatch, cooperative form. A FIBER parks
-                // (`CapParked` — the slice-5a contract; the ordered drain right after the
-                // park is the register-then-recheck closing the completion-raced-the-park
-                // window). The root keeps the inline wait (guest-invisible — the oracle
-                // parks the vCPU here instead; the cooperative driver has nothing else to
-                // run on this task anyway). Two more inline cases, both mirroring the
-                // oracle's predicate: a durable run (`freeze_drive` has no cap-park
-                // re-derivation — the freeze must never meet one) and a confined
-                // `instantiate` child (its completions live on ITS host; keeping the child
-                // inline keeps the drain single-store — recorded FIBER_PARK.md residue).
+                // F2 (FIBER_PARK.md), #2047 — a punted dispatch, cooperative form: what made the
+                // call parks, and the rest of the run goes on, as the oracle parks the vCPU. The
+                // call may wait on the world, or on what another task does. A FIBER parks
+                // (`CapParked` — the slice-5a contract; the ordered drain right after the park is
+                // the register-then-recheck closing the completion-raced-the-park window). A task's
+                // own call parks the task (`BlockedHostCap`), and a round's drain wakes it
+                // ([`drain_task_completions`]); a host-completed one waits for the embedder,
+                // which only a `CoopRun` admits (#1953). Two inline cases, both mirroring the
+                // oracle's predicate: a durable run (`freeze_drive` has no cap-park re-derivation
+                // — the freeze must never meet one) and a confined `instantiate` child (its
+                // completions live on ITS host; keeping the child inline keeps the drain
+                // single-store — recorded FIBER_PARK.md residue).
                 let durable = root.lock_unpoisoned().is_durable();
                 if tasks[ti].vm.vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
                     let comps = root.lock_unpoisoned().completions();
@@ -14867,13 +14952,7 @@ impl SchedCore {
                     ) {
                         tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                     }
-                } else if tasks[ti].env.is_none()
-                    && !durable
-                    && root.lock_unpoisoned().completions().is_host_owned(id)
-                {
-                    // #1953: a host-completed punt, which only a `CoopRun` admits (on its root
-                    // powerbox): park the task until the embedder answers it. The pump surfaces
-                    // the park once nothing else can run.
+                } else if tasks[ti].env.is_none() && !durable {
                     tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                 } else {
                     let comps = task_host(root, extra_envs, tasks[ti].env)
@@ -17568,12 +17647,13 @@ impl ThreadRun {
             .collect();
         time_out_due(&mut core.tasks, &mut regs, core.clock);
         // F2: a fiber parked on a punted call wakes once the call completes (only the root domain's
-        // fibers park on one).
+        // fibers park on one); #2047: a task too.
         let cap_parked = |f: &FiberState| matches!(f, FiberState::CapParked { woken: None, .. });
         if core.fibers.iter().any(cap_parked) {
             let comps = self.root.lock_unpoisoned().completions();
             drain_cap_parked(&mut core.fibers, &comps);
         }
+        drain_task_completions(&mut core.tasks, &self.root);
         settle_wakes(
             &mut core.tasks,
             &mut core.extra_envs,

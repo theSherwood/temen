@@ -21306,6 +21306,26 @@ impl Completions {
         }
     }
 
+    /// [`wait`](Completions::wait) for at most `d`: `None` if `id` has not arrived by then. What a
+    /// waiter that must also watch for its run's end waits with (#2047).
+    pub fn wait_timeout(&self, id: u64, d: std::time::Duration) -> Option<i64> {
+        let g = self.mx.lock_unpoisoned();
+        let (mut g, _) = self
+            .cv
+            .wait_timeout_while(g, d, |s| !s.ready.contains_key(&id))
+            .unwrap_or_else(|e| e.into_inner());
+        g.ready.remove(&id)
+    }
+
+    /// Block until completion `id` has arrived, and leave it for the drain to take: the cooperative
+    /// pump's idle wait (#2047), which then delivers it the way every round does.
+    pub fn wait_ready(&self, id: u64) {
+        let mut g = self.mx.lock_unpoisoned();
+        while !g.ready.contains_key(&id) {
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
     /// drain's probe and the park path's register-then-recheck. Exactly one taker wins; the
     /// loser's wake attempt is an idempotent no-op.
