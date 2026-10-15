@@ -325,21 +325,22 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
-**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites (its
-waiter collections, with a reply and a page fault told apart in the one they share), each a `ParkSite`
-with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
-freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
-vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites
+(its waiter collections, with a reply and a page fault told apart in the one they share), each a
+`ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the freeze; its op is
+abandoned and the thaw re-issues it), **phase** (it stays parked and another vCPU's unwind wakes
+it), or **decline** (no rule yet: the census refuses the freeze up front,
 `DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
-parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
-collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
-`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane.
-Decline: a fork-twin `wait(-1)` (#1688), a demand-paged child's page fault (#1940), a punted
-completion, which is a host call outside the cut (#1902), and an offer admission, which a durable
-caller never reaches (#1681). A fiber parked at a site follows the same rule: the freeze drive of
-whichever vCPU finishes first gives an unwoken fiber park the placeholder and re-issue word its
-site calls for, and a resumer that then claims the flattened fiber sees it still parked (#1677). A
-serve handler, parked or caught mid-run, rides the same way, with its reply linkage (#1676).
+parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a
+new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
+`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
+and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
+below). Decline: a fork-twin `wait(-1)` (#1688), a punted completion, which is a host call outside
+the cut (#1902), and an offer admission, which a durable caller never reaches (#1681). A fiber
+parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
+unwoken fiber park the placeholder and re-issue word its site calls for, and a resumer that then
+claims the flattened fiber sees it still parked (#1677). A serve handler, parked or caught mid-run,
+rides the same way, with its reply linkage (#1676).
 
 **A reply wait is a re-issue of the wait, not the call (#1901).** A caller parked on a live callee's
 reply has already issued its dispatch: it is queued on the callee, in the callee's handler, or
@@ -636,16 +637,32 @@ words are never demand-paged: the pages a durable module's page ops may not touc
 (`ShadowArena::fences`, #2426), its control words and its declared shadow arena, stay mapped,
 because the runtime reads and writes them at every safepoint, freeze and thaw, and the pager,
 which cannot see the child's window, could only supply a stale copy (the cause of #2438's
-silent wrong results). A child parked on a fault when the freeze fires declines it (the
-census, #1940). One that faults after the census, before it reaches a safepoint, cannot
-unwind, since its pager has unwound and serves nothing: the run's harvest leaves it unreached
-and the freeze is refused (`DetachedUnreached`), never written as if it had unwound (#2455).
-The harvest captures only a child whose run ended by unwinding; one that trapped, or that a
-deadlock teardown reaped, keeps a window but has nothing to resume. Paging runs on the
+silent wrong results). The harvest captures only a child whose run ended by unwinding; one
+that trapped, that ran to its end, or that a deadlock teardown reaped keeps a window but has
+nothing to resume, and the freeze is refused (`DetachedUnreached`). Paging runs on the
 tree-walker only (#2164): a routed run of a pager-capable program thaws there as it runs
 there, and the Cranelift JIT refuses to thaw a paged child rather than run it with no pager.
 Pinned by `temen`'s `durable_paged_detached.rs` and `temen-snapshot`'s
 `detached_roundtrip.rs`.
+
+**Leaves first (#2455).** A paged child's pages arrive only through its pager's serve loop, so
+a child that faults on its way to a safepoint unwinds only once the fault is served. A freeze
+therefore never takes a pager down while a child it pages still runs. Wherever it reaches a
+domain (the domain's trigger, its doorbell, the admission of its parks, or a paged spawn in a
+domain already unwinding), a domain paging live detached children is **held** instead
+(`hold_for_paged`). Its phase stays `NORMAL`, so it runs on and serves. Each such child is rung
+at once and its parks are brought through the freeze: a fault park takes the freeze's phase and
+waits for its page, as a join waits for its child (#1940). The hold waits on those children,
+and when the last has ended it releases, and the domain unwinds after them.
+
+A held domain's guest is still running, so it can meet a child that unwound before it. Such a
+child is **withheld**: its outcome is kept from the domain until the release, so to `poll`,
+`join`, `grant` and `child_offer` it reads as running, which is how the domain's own cut records
+it. A `kill` of it ends it as a kill of a running child does. The cut is consistent because a
+withheld child unwound before its spawner's cut and nothing crosses back: the spawner's later
+calls into it wait on its queue or ride the cut as a running child's. A root that returns while
+held has completed the run, and nothing froze. A domain that keeps spawning paged children keeps
+its hold only as long as its budget lasts: a withheld child keeps its window's charge.
 
 **The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
 its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,

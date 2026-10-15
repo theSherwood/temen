@@ -1,218 +1,25 @@
 //! #2438 — a durable run freezes a live **demand-paged** detached child, and the thaw gives it back
-//! with its pager.
+//! with its pager. #2455 — **leaves first**: a freeze holds a pager at `NORMAL`, serving, until the
+//! children it pages have unwound, so a child that faults after the freeze rang it is served and
+//! unwinds, rather than stranding the freeze.
 //!
-//! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a v1 record
-//! naming it as the pager (#1862, #1863). It serves the child's faults with `svc.poll` while it polls
-//! the child, then joins it and returns `status << 56 | served << 48 | value`. Its pager supplies
-//! every page from one scratch page holding the faulting page's number at the faulting byte, and
-//! refuses any address below 65536, which is the runtime's: the control words and the shadow arena.
-//! A durable window keeps those mapped, so the pager is never asked for them; were it asked, its
-//! refusal would end the child with a fault.
-//!
-//! The child touches page 24 (address 100000), runs a polled loop, then touches page 26 (address
-//! 110000) and reads `self.attest`. It returns `iters << 24 | b24 << 16 | b26 << 8 | exposure`:
-//! `exposure` is the attestation's window and freeze bits, both set for a durable paged child.
+//! The parents and children are `support/paged_detached.rs`'s.
 #![cfg(all(unix, target_arch = "x86_64"))]
 
 #[path = "support/detached_thaw.rs"]
 mod detached_thaw;
+#[path = "support/paged_detached.rs"]
+mod paged_detached;
 
-use detached_thaw::*;
-use std::sync::Arc;
-use temen_durable::{arm_freeze_after_backedges, begin_thaw, init_durable_window, write_state};
-use temen_interp::Host;
-use temen_ir::SpawnRec;
-
-const ITERS: u64 = 200_000;
-
-/// What the parent answers when the child ran to the end with its pager: no trap, two pages served,
-/// and the child's value.
-const EXPECT: i64 = (2 << 48) | ((ITERS as i64) << 24) | (24 << 16) | (26 << 8) | 3;
-
-const PARENT_SRC: &str = "memory 18 shadow 16448 65536
-type 0 func (i64) -> (i64)
-type 1 interface { page: 0 }
-export 0 interface \"pager\" 1 { page: 1 }
-func (i32, i32, i32) -> (i64) {
-block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
-  i32.store vrm v1
-  vrb = i64.const 65564
-  i32.store vrb v2
-  vrp = i64.const 65536
-  vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
-  vz = i64.const 0
-  br 1(v0, vc, vz)
-}
-block 1 (vh: i32, vch: i32, vt: i64) {
-  vzp = i32.const 0
-  vp = svc.poll vzp
-  vt2 = i64.add vt vp
-  vst = call.cap 6 9 (i32) -> (i32) vh (vch)
-  vzz = i32.const 0
-  vrun = i32.eq vst vzz
-  br_if vrun 1(vh, vch, vt2) 2(vh, vch, vt2)
-}
-block 2 (vh2: i32, vch2: i32, vt3: i64) {
-  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
-  v56 = i64.const 56
-  vsb = i64.shl vj_st v56
-  v48 = i64.const 48
-  vtm = i64.shl vt3 v48
-  vr0 = i64.or vsb vtm
-  vr = i64.or vr0 vj
-  return vr
-  }
-}
-func (i64) -> (i64) {
-block 0 (vaddr: i64) {
-  vlim = i64.const 65536
-  vlow = i64.lt_u vaddr vlim
-  br_if vlow 1() 2(vaddr)
-}
-block 1 () {
-  vneg = i64.const -1
-  return vneg
-}
-block 2 (va: i64) {
-  vmask = i64.const 4095
-  voff = i64.and va vmask
-  vdt = i64.const 135168
-  vdst = i64.add vdt voff
-  v12 = i64.const 12
-  vpg = i64.shr_u va v12
-  vb = i32.wrap_i64 vpg
-  i32.store8 vdst vb
-  return vdst
-  }
-}
-";
-
-/// The child. `touch_first` puts its first page touch before the leaf call that is its first
-/// safepoint, so a child the freeze rang before it ran faults before it can unwind.
-fn child_src(touch_first: bool) -> String {
-    let touch = "  va = i64.const 100000\n  vb1 = i32.load8_u va\n";
-    let leaf = "  vs0 = i32.wrap_i64 v1\n  vz = i64.const 0\n  vu = call.cap 5 1 (i64, i64) -> (i64) vs0 (vz, vz)\n";
-    let head = if touch_first {
-        format!("{touch}{leaf}")
-    } else {
-        format!("{leaf}{touch}")
-    };
-    format!(
-        "memory 17 shadow 16448 65536
-func (i64, i64) -> (i64) {{
-block 0 (v0: i64, v1: i64) {{
-{head}  vb164 = i64.extend_i32_u vb1
-  vz0 = i64.const 0
-  br 1(vz0, vb164)
-}}
-block 1 (vi: i64, vb: i64) {{
-  vn = i64.const {ITERS}
-  vc = i64.lt_s vi vn
-  br_if vc 2(vi, vb) 3(vi, vb)
-}}
-block 2 (vj: i64, vb2: i64) {{
-  vo = i64.const 1
-  vk = i64.add vj vo
-  br 1(vk, vb2)
-}}
-block 3 (vfin: i64, vb3: i64) {{
-  vaddr2 = i64.const 110000
-  vc2 = i32.load8_u vaddr2
-  vc264 = i64.extend_i32_u vc2
-  vat = self.attest
-  vat64 = i64.extend_i32_u vat
-  v8 = i64.const 8
-  vex = i64.shr_u vat64 v8
-  v24 = i64.const 24
-  vacc = i64.shl vfin v24
-  v16 = i64.const 16
-  vb1s = i64.shl vb3 v16
-  vc2s = i64.shl vc264 v8
-  vr0 = i64.or vacc vb1s
-  vr1 = i64.or vr0 vc2s
-  vr = i64.or vr1 vex
-  return vr
-  }}
-}}
-"
-    )
-}
-
-fn parent() -> temen_ir::Module {
-    let paged = SpawnRec {
-        size_log2: 17,
-        pager: 0,
-        ..SpawnRec::v1()
-    };
-    parent_with(PARENT_SRC, &paged)
-}
-
-/// The parent's powerbox ([`powerbox`]), knowing its own program: op 17 checks the pager export
-/// against it.
-fn host(parent: &temen_ir::Module, child: &temen_ir::Module) -> (Host, Vec<i64>) {
-    let (mut h, args) = powerbox(child);
-    h.set_self_module(&Arc::new(parent.clone()));
-    (h, args)
-}
-
-/// A run of the parent on the tree-walker from a fresh durable window, with `arm` applied to it.
-fn run_from(
-    parent: &temen_ir::Module,
-    child: &temen_ir::Module,
-    arm: impl FnOnce(&mut Vec<u8>),
-) -> (Out, Vec<u8>, Host, Vec<i64>) {
-    let (mut h, args) = host(parent, child);
-    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    arm(&mut win);
-    let (out, snap) =
-        run(Engine::Interp, parent, &args, &win, &mut h).expect("the tree-walker runs");
-    (out, snap, h, args)
-}
-
-/// Thaw `art` on `engine` over a restoring host that grants the child and knows the parent's
-/// program. `None` when the engine refuses the thaw.
-fn thaw_on(
-    engine: Engine,
-    art: &[u8],
-    parent: &temen_ir::Module,
-    child: &temen_ir::Module,
-    args: &[i64],
-) -> Option<Out> {
-    let mut th = Host::new();
-    th.set_durable(true);
-    th.grant_durable_module(child);
-    th.set_self_module(&Arc::new(parent.clone()));
-    let mut twin = temen_snapshot::restore(art, parent, &mut th).expect("restore");
-    begin_thaw(&mut twin, ARENA, 0);
-    run(engine, parent, args, &twin, &mut th).map(|(o, _)| o)
-}
-
-/// Freeze with `arm`, require the child captured live, and carry the tree through the codec.
-fn artifact(
-    parent: &temen_ir::Module,
-    child: &temen_ir::Module,
-    arm: impl FnOnce(&mut Vec<u8>),
-) -> (Vec<u8>, Vec<i64>) {
-    let (_, snap, mut fh, args) = run_from(parent, child, arm);
-    assert_eq!(
-        fh.take_freeze_declined(),
-        None,
-        "the freeze was not declined"
-    );
-    assert_eq!(
-        fh.captured_detached().len(),
-        1,
-        "the paged child was captured live"
-    );
-    let art = temen_snapshot::freeze(parent, &snap, &fh).expect("serialize");
-    (art, args)
-}
+use detached_thaw::{child_module, run, Engine, Out};
+use paged_detached::*;
+use temen_durable::{arm_freeze_after_backedges, read_state, write_state, STATE_UNWINDING};
 
 #[test]
 fn a_paged_child_runs_to_its_answer_with_only_its_own_pages_served() {
-    let (parent, child) = (parent(), child_module(&child_src(false)));
-    let (out, ..) = run_from(&parent, &child, |_| {});
+    let child = child_module(&child_src(false));
+    let parent = parent(PARENT_SRC, &[17]);
+    let (out, ..) = run_from(&parent, &[&child], |_| {});
     assert_eq!(
         out,
         Out::Ret(EXPECT),
@@ -224,26 +31,200 @@ fn a_paged_child_runs_to_its_answer_with_only_its_own_pages_served() {
 /// its image and its pager serving the next one.
 #[test]
 fn a_paged_child_cut_mid_run_thaws_with_its_pager() {
-    let (parent, child) = (parent(), child_module(&child_src(false)));
-    let (art, args) = artifact(&parent, &child, |w| arm_freeze_after_backedges(w, 2000));
+    let child = child_module(&child_src(false));
+    let parent = parent(PARENT_SRC, &[17]);
+    let (art, args) = artifact(&parent, &[&child], 1, |w| {
+        arm_freeze_after_backedges(w, 2000)
+    });
     assert_eq!(
-        thaw_on(Engine::Interp, &art, &parent, &child, &args),
+        thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(Out::Ret(EXPECT)),
         "the thawed child resumes its loop and its pager serves the page it touches next"
     );
 }
 
 /// A child the freeze rang before it ran unwinds at its first safepoint, before it touches a page,
-/// and thaws to the same answer.
+/// and thaws to the same answer. The parent was already unwinding when it spawned the child, so it
+/// held for it (#2455), as it would have at a trigger.
 #[test]
 fn a_paged_child_frozen_before_it_runs_thaws_with_its_pager() {
-    let (parent, child) = (parent(), child_module(&child_src(false)));
-    let (art, args) = artifact(&parent, &child, |w| {
-        write_state(w, temen_durable::STATE_UNWINDING)
-    });
+    let child = child_module(&child_src(false));
+    let parent = parent(PARENT_SRC, &[17]);
+    let (art, args) = artifact(&parent, &[&child], 1, |w| write_state(w, STATE_UNWINDING));
     assert_eq!(
-        thaw_on(Engine::Interp, &art, &parent, &child, &args),
+        thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(Out::Ret(EXPECT))
+    );
+}
+
+/// #2455's repro: the freeze rings a paged child before it has run, and the child faults on its
+/// first op, before its first safepoint. Its pager is held, still serving: the fault is served, the
+/// child unwinds at its safepoint, then the pager does. Before leaves first, the pager had unwound
+/// and served nothing, and the freeze was refused after the run had unwound.
+#[test]
+fn a_paged_child_that_faults_before_it_can_unwind_is_served_and_thaws() {
+    let child = child_module(&child_src(true));
+    let parent = parent(PARENT_SRC, &[17]);
+    let (art, args) = artifact(&parent, &[&child], 1, |w| write_state(w, STATE_UNWINDING));
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
+        Some(Out::Ret(EXPECT))
+    );
+}
+
+/// The same, from a countdown that fires mid-run: the parent's census passes, and the parent holds
+/// for the live child it pages rather than unwinding.
+#[test]
+fn a_paged_child_rung_at_a_trigger_is_served_before_it_unwinds() {
+    let child = child_module(&child_src(true));
+    let parent = parent(PARENT_SRC, &[17]);
+    // The countdown fires at the parent's first branch past the spawn (the transform's entry
+    // dispatch is its first), long before its quantum ends and the child first runs.
+    let (art, args) = artifact(&parent, &[&child], 1, |w| arm_freeze_after_backedges(w, 2));
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
+        Some(Out::Ret(EXPECT))
+    );
+}
+
+/// #2455, the case the issue rates likely: a child streaming through memory its pager supplies a
+/// page at a time touches a fresh page every few ops, so a freeze almost always rings it between a
+/// fault and its next safepoint. Each cut captures it, and thaws to the fresh answer.
+#[test]
+fn a_paged_child_streaming_fresh_pages_freezes_mid_stream() {
+    let child = child_module(&stream_src(28));
+    let parent = parent(PARENT_SRC, &[20]);
+    let (fresh, ..) = run_from(&parent, &[&child], |_| {});
+    assert!(
+        matches!(fresh, Out::Ret(v) if v >> 56 == 0 && (v >> 48) & 0xff == 224),
+        "every page served once: {fresh:?}"
+    );
+    for arm in [20_000, 80_000] {
+        let (art, args) = artifact(&parent, &[&child], 1, |w| {
+            arm_freeze_after_backedges(w, arm)
+        });
+        assert_eq!(
+            thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
+            Some(fresh.clone()),
+            "cut at back-edge {arm}"
+        );
+    }
+}
+
+/// #2455 — a child that unwinds while its pager is held is withheld from it: the pager runs on, and
+/// must read the child as still running, since its own cut will record it so. Child A unwinds at once;
+/// child B faults first, which keeps the pager held and running while it serves B. The parent waits
+/// for A, joins it, then waits for B: had A read as ended, the parent would have joined it under the
+/// hold and carried its placeholder past the cut.
+#[test]
+fn a_held_pager_reads_a_child_that_unwound_first_as_running() {
+    let (a, b) = (
+        child_module(&child_src(false)),
+        child_module(&child_src(true)),
+    );
+    let parent = parent(TWO_PARENT_SRC, &[17, 17]);
+    let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
+    assert_eq!(fresh, Out::Ret(EXPECT_TWO));
+    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| arm_freeze_after_backedges(w, 2));
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&a, &b], &args),
+        Some(Out::Ret(EXPECT_TWO))
+    );
+}
+
+/// #1940, #2455 — the freeze's trigger lands while the child is parked on a fault
+/// ([`fault_parked_at_the_trigger_thaws`]); the park matrix runs it as its tree-walker row.
+#[test]
+fn a_paged_child_parked_on_a_fault_at_the_trigger_unwinds_once_served() {
+    fault_parked_at_the_trigger_thaws();
+}
+
+/// #2455 — a held pager kills a child whose unwind it is withheld from. The kill ends it as a kill
+/// of a running child would: it is recorded as killed, and does not ride the artifact as running.
+#[test]
+fn a_held_pager_kills_a_child_that_unwound_first() {
+    let (a, b) = (
+        child_module(&child_src(false)),
+        child_module(&child_src(true)),
+    );
+    let parent = parent(KILL_PARENT_SRC, &[17, 17]);
+    let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
+    let Out::Ret(v) = fresh else {
+        panic!("{fresh:?}")
+    };
+    assert_ne!(v >> 56, 0, "A ended by the kill");
+    assert_eq!(
+        v & ((1 << 52) - 1),
+        EXPECT & ((1 << 48) - 1),
+        "B ran to its end"
+    );
+    let (art, args) = artifact(&parent, &[&a, &b], 1, |w| arm_freeze_after_backedges(w, 2));
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&a, &b], &args),
+        Some(fresh)
+    );
+}
+
+/// #2455 — a held pager kills the one child it is held for. The hold is over, and the release
+/// reaches the pager while it runs: it unwinds at its next safepoint, the child recorded as killed.
+#[test]
+fn a_kill_of_the_last_child_a_pager_is_held_for_lets_it_unwind() {
+    let child = child_module(&child_src(true));
+    let parent = parent(KILL_AT_ONCE_PARENT_SRC, &[17]);
+    let (fresh, ..) = run_from(&parent, &[&child], |_| {});
+    assert!(matches!(fresh, Out::Ret(v) if v >> 56 != 0), "{fresh:?}");
+    let (art, args) = artifact(&parent, &[&child], 0, |w| arm_freeze_after_backedges(w, 2));
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
+        Some(fresh)
+    );
+}
+
+/// #2455 — a root that returns while it is held has completed the run: it answers as uninterrupted,
+/// and nothing froze, though a child had unwound for the freeze.
+#[test]
+fn a_root_that_returns_while_held_completes_the_run() {
+    let (a, b) = (
+        child_module(&child_src(false)),
+        child_module(&child_src(true)),
+    );
+    let parent = parent(RETURNS_PARENT_SRC, &[17, 17]);
+    let (out, snap, mut fh, _) = run_from(&parent, &[&a, &b], |w| arm_freeze_after_backedges(w, 2));
+    assert_eq!(out, Out::Ret(42));
+    assert_eq!(fh.take_freeze_declined(), None);
+    assert_ne!(
+        read_state(&snap),
+        STATE_UNWINDING,
+        "the root did not freeze"
+    );
+    assert!(fh.frozen_root_sp().is_none() && fh.frozen_fibers().is_empty());
+    assert!(fh.captured_detached().is_empty() && fh.unreached_detached().is_empty());
+}
+
+/// #2455 — a thawed run frozen again holds as a fresh one: the thaw's re-launched children are
+/// withheld from their held pager too. The first cut has both children at their first safepoint. In
+/// the thaw, A unwinds at its next one, while B, which streams through pages, faults again before
+/// it reaches its own: the parent, held while it serves B, must read A as running.
+#[test]
+fn a_thawed_pager_holds_its_relaunched_children_again() {
+    let (a, b) = (
+        child_module(&child_src(false)),
+        child_module(&stream_src(28)),
+    );
+    let parent = parent(TWO_PARENT_SRC, &[17, 20]);
+    let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
+    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| arm_freeze_after_backedges(w, 2));
+    let (mut h, mut win) = restored(&art, &parent, &[&a, &b]);
+    // Past the parent's rewind, before its first quantum ends.
+    arm_freeze_after_backedges(&mut win, 10);
+    let (_, snap) = run(Engine::Interp, &parent, &args, &win, &mut h).expect("runs");
+    assert_eq!(h.take_freeze_declined(), None);
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "the thaw froze again");
+    assert_eq!(h.captured_detached().len(), 2);
+    let art = temen_snapshot::freeze(&parent, &snap, &h).expect("serialize");
+    assert_eq!(
+        thaw_on(Engine::Interp, &art, &parent, &[&a, &b], &args),
+        Some(fresh)
     );
 }
 
@@ -251,24 +232,10 @@ fn a_paged_child_frozen_before_it_runs_thaws_with_its_pager() {
 /// run it with no pager. A routed run folds a pager-capable program to the interpreter instead.
 #[test]
 fn the_jit_refuses_to_thaw_a_paged_child() {
-    let (parent, child) = (parent(), child_module(&child_src(false)));
-    let (art, args) = artifact(&parent, &child, |w| arm_freeze_after_backedges(w, 2000));
-    assert_eq!(thaw_on(Engine::Jit, &art, &parent, &child, &args), None);
-}
-
-/// A child that faults after the freeze rang it, before its first safepoint, can never unwind: its
-/// pager has unwound and serves nothing. It is unreached, and the freeze is refused whole, never
-/// written as if the child had unwound.
-#[test]
-fn a_paged_child_that_faults_before_it_can_unwind_refuses_the_freeze() {
-    let (parent, child) = (parent(), child_module(&child_src(true)));
-    let (_, snap, fh, _) = run_from(&parent, &child, |w| {
-        write_state(w, temen_durable::STATE_UNWINDING)
+    let child = child_module(&child_src(false));
+    let parent = parent(PARENT_SRC, &[17]);
+    let (art, args) = artifact(&parent, &[&child], 1, |w| {
+        arm_freeze_after_backedges(w, 2000)
     });
-    assert!(fh.captured_detached().is_empty(), "nothing was captured");
-    assert_eq!(fh.unreached_detached().len(), 1, "the child is unreached");
-    assert!(matches!(
-        temen_snapshot::freeze(&parent, &snap, &fh),
-        Err(temen_snapshot::FreezeError::DetachedUnreached { .. })
-    ));
+    assert_eq!(thaw_on(Engine::Jit, &art, &parent, &[&child], &args), None);
 }

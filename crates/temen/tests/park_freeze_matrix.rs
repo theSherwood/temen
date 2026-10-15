@@ -14,8 +14,12 @@
 //! ([`arm_freeze_after`]), which the rows that fire the freeze in a sibling use; the oracle and the
 //! bytecode engine keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]), which the one-vCPU rows use.
 
-#[path = "../../temen-interp/tests/support/rec.rs"]
-mod rec;
+#[path = "support/detached_thaw.rs"]
+mod detached_thaw;
+#[path = "support/paged_detached.rs"]
+mod paged_detached;
+
+use detached_thaw::rec;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,7 +82,7 @@ fn interp_row(site: ParkSite) -> Row {
                   when it parks, so no lane is ever full",
         },
         ParkSite::Reply => Row::Case(reply),
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Case(page_fault),
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::ReapAny => Row::Unreachable {
             why: "`wait(-1)` needs a live fork twin, which declines the freeze first (#1688)",
@@ -127,8 +131,8 @@ fn jit_row(site: ParkSite) -> Row {
 }
 
 const PAGE_FAULT_PENDING: Row = Row::Pending {
-    issue: 1940,
-    why: "a faulting access is no call to re-issue, and cannot unwind until its page arrives",
+    issue: 2164,
+    why: "the engine has no demand paging: a pager-capable program folds to the tree-walker",
 };
 
 const COMPLETION_PENDING: Row = Row::Pending {
@@ -510,6 +514,19 @@ block 2 (va2: i64) {{
         |_| {},
         Ok(1007),
     );
+}
+
+/// #1940 — a page fault. Only a demand-paged child faults, so this row is not the shared shape: the
+/// child parks on its page while its pager computes, the trigger fires in the pager, and the freeze
+/// holds the pager to serve the fault (#2455). The scenario is `support/paged_detached.rs`'s.
+fn page_fault(site: ParkSite, engine: Engine) {
+    assert_eq!(site.freeze_rule(), FreezeRule::Phase);
+    assert_eq!(
+        engine,
+        Engine::Interp,
+        "only the tree-walker demand-pages (#2164)"
+    );
+    paged_detached::fault_parked_at_the_trigger_thaws();
 }
 
 /// A pipe read — the root reads one byte from an empty pipe whose write end the sibling holds and

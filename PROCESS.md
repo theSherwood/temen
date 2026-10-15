@@ -645,7 +645,8 @@ held past it (#2332). A root's processes pay from the run's own node.
 > **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
 > a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
 > pages only: a durable window's control words and declared shadow arena are the runtime's, and stay
-> mapped.
+> mapped. A freeze holds a pager at `NORMAL`, serving, until the children it pages have unwound,
+> so a child that faults during the freeze is served (leaves first, #2455).
 
 Two different things surface as "SIGSEGV" and the design splits them:
 

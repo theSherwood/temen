@@ -182,13 +182,13 @@ fn a_vcpu_parked_at_a_decline_site_declines() {
         unreachable!()
     };
     rs.lock()
-        .ticket_waiters
-        .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
+        .completion_waiters
+        .insert(2, Waiter::VCpu(parked_vcpu(&f, 5)));
     assert_eq!(
         f.census(&f.root_seat()),
-        Some(DeclineCause::Parked(ParkSite::PageFault))
+        Some(DeclineCause::Parked(ParkSite::Completion))
     );
-    let v = rs.lock().take(ParkSite::PageFault, false);
+    let v = rs.lock().take(ParkSite::Completion, false, &|_| true);
     assert_eq!(v.len(), 1);
 
     rs.lock()
@@ -204,6 +204,63 @@ fn page_faulted(f: &Fixture, id: TaskId) -> Box<VCpu> {
     let mut v = parked_vcpu(f, id);
     v.page_fault = Some(0);
     v
+}
+
+/// #1940, #2455 — a vCPU parked on its page does not decline: a freeze holds its pager to serve the
+/// fault ([`hold_for_paged`]), so the park takes the freeze's phase and waits for its page, as a join
+/// waits for its child, then unwinds at its next safepoint.
+#[test]
+fn a_page_fault_park_takes_the_freeze_phase_and_waits() {
+    let f = Fixture::new();
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    rs.lock()
+        .ticket_waiters
+        .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
+    assert_eq!(f.census(&f.root_seat()), None);
+    let mut s = rs.lock();
+    admit_parks_for_freeze(&mut s);
+    assert!(s.runnable.is_empty(), "nothing re-admitted");
+    let parked = s.parked(ParkSite::PageFault);
+    assert_eq!(parked.len(), 1, "still waiting for its page");
+    assert_eq!(parked[0].dstate, STATE_UNWINDING);
+}
+
+/// #2455 — a freeze that reaches a domain paging a live detached child holds it: the child is rung,
+/// the domain's parks stay where they are while the hold waits on the child, and once the child has
+/// ended the domain is released and its parks are brought through the freeze.
+#[test]
+fn a_domain_paging_a_live_child_is_held_until_the_child_ends() {
+    let mut f = Fixture::new().with_detached_child(true);
+    f.child_freeze.get_mut(&0).expect("slot 0").1.pager = Some(0);
+    let SchedRef::Real(rs) = &f.sched else {
+        unreachable!()
+    };
+    let root = f.root.lock_unpoisoned().domain_id() as usize;
+    let mut s = rs.lock();
+    park_on_futex(&mut s, &f, 4);
+    assert!(hold_for_paged(&mut s, root, Some(&f.root_seat())));
+    assert!(
+        f.child_freeze[&0].0.load(Ordering::Relaxed),
+        "the child is rung"
+    );
+    assert_eq!(s.held[&root], BTreeSet::from([7]));
+
+    admit_parks_for_freeze(&mut s);
+    assert!(s.runnable.is_empty(), "a held domain's parks stay");
+    assert!(
+        !freeze_can_admit(&s),
+        "so the worker loop does not spin on them"
+    );
+
+    end_hold_member(&mut s, 7);
+    assert!(s.held.is_empty(), "released once the child has ended");
+    let v = s
+        .runnable
+        .pop_front()
+        .expect("its futex waiter is re-admitted");
+    assert_eq!(v.dstate, STATE_UNWINDING);
 }
 
 /// #1901 — a caller parked on a live callee's reply does not decline: a freeze re-admits it to
@@ -241,9 +298,9 @@ fn park_on_futex(s: &mut Sched, f: &Fixture, id: TaskId) {
         .push((0, Waiter::VCpu(v)));
 }
 
-/// #1918 — freeze-on-quiesce asks the census before it fires. With a page-fault park beside the futex
-/// park, it declines: the decline lands on the run root's powerbox, the arm is spent, and nothing is
-/// re-admitted or phased, so the run carries on as if it was never armed.
+/// #1918 — freeze-on-quiesce asks the census before it fires. With a completion park beside the
+/// futex park, it declines: the decline lands on the run root's powerbox, the arm is spent, and
+/// nothing is re-admitted or phased, so the run carries on as if it was never armed.
 #[test]
 fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
     let f = Fixture::new();
@@ -253,8 +310,8 @@ fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
     {
         let mut s = rs.lock();
         park_on_futex(&mut s, &f, 4);
-        s.ticket_waiters
-            .insert((1, 2), Waiter::VCpu(page_faulted(&f, 5)));
+        s.completion_waiters
+            .insert(2, Waiter::VCpu(parked_vcpu(&f, 5)));
         s.freeze_on_quiesce = Some(Arc::clone(&f.root));
     }
     let (s, acted) = freeze_step(rs, rs.lock());
@@ -271,7 +328,7 @@ fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
     assert_eq!(
         f.root.lock_unpoisoned().take_freeze_declined(),
         Some(FreezeDeclined {
-            cause: DeclineCause::Parked(ParkSite::PageFault),
+            cause: DeclineCause::Parked(ParkSite::Completion),
             task: 5,
             slot: None
         })
