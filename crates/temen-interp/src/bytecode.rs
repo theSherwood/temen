@@ -13423,6 +13423,7 @@ fn drive(
             &mut root.lock_unpoisoned(),
             None,
         )?;
+        sched.wall = cfg!(not(target_family = "wasm"));
         match sched.pump(&dom, mem, &root, &mut root_fuel, budget)? {
             CoopStep::Done(vals) => Ok(vals),
             CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
@@ -13768,6 +13769,10 @@ struct CoopSched {
     /// At zero the pump returns [`CoopStep::Paused`], every task's cursor persisted — the next pump
     /// resumes exactly where this one stopped, as after a #1157 preemption.
     slice_left: Option<u64>,
+    /// #1979 — an idle pump lets the time to its next deadline pass in real time ([`wait_out`])
+    /// instead of jumping its clock there. Set by the native `drive`; a [`CoopRun`]'s embedder
+    /// keeps the jump (a browser has no clock to wait on, #2439).
+    wall: bool,
     /// DURABILITY.md §13.4 slice 4c-bis — **freeze-on-quiesce**, one-shot: a durable run armed to
     /// freeze the moment it quiesces ([`freeze_step`]). Read once at run setup from the window's
     /// arm-quiesce flag, as the oracle's `Sched::freeze_on_quiesce`.
@@ -14238,6 +14243,7 @@ impl CoopSched {
             },
             suspend_on_idle: false,
             slice_left: None,
+            wall: false,
             freeze_on_quiesce: host.is_durable()
                 && mem.as_ref().is_some_and(|m| m.durable_freeze_on_quiesce()),
         })
@@ -14288,6 +14294,7 @@ impl CoopSched {
             emit,
             suspend_on_idle,
             slice_left,
+            wall,
             freeze_on_quiesce,
         } = self;
         // #1954 — a root the host emitted whole tiers up at its entry, once, before anything runs
@@ -14439,6 +14446,10 @@ impl CoopSched {
                         return Ok(CoopStep::CapPark { id });
                     }
                 }
+                // #1979 — on the native driver the time to the earliest deadline passes first.
+                if *wall && wait_out(tasks, fibers, extra_envs, clock, root, min_cap, bell_gen) {
+                    continue;
+                }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
                 // event-parked fiber waiters alike (§3.6 slice 5a), in every domain.
                 let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
@@ -14453,7 +14464,7 @@ impl CoopSched {
                     // clock back.
                     if let Some(id) = min_cap {
                         let comps = root.lock_unpoisoned().completions();
-                        comps.wait_ready(id);
+                        comps.wait_ready(id, None);
                         drain_cap_parked(fibers, &comps);
                         continue;
                     }
@@ -14490,13 +14501,7 @@ impl CoopSched {
                     }
                     let bell = root.lock_unpoisoned().external_wake();
                     match bell.filter(|_| external) {
-                        Some(bell) => {
-                            let (gen, cv) = &*bell;
-                            let mut g = gen.lock().unwrap_or_else(|e| e.into_inner());
-                            while *g == bell_gen {
-                                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
-                            }
-                        }
+                        Some(bell) => _ = wait_for_ring(&bell, bell_gen, None),
                         None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
                     }
                 }
@@ -18140,6 +18145,20 @@ fn fire_next_timeout(
     fibers: &mut [&mut Vec<FiberState>],
     clock: &mut u64,
 ) -> bool {
+    let Some(next) = next_timeout(tasks, fibers.iter().flat_map(|reg| reg.iter())) else {
+        return false;
+    };
+    *clock = (*clock).max(next);
+    time_out_due(tasks, fibers, *clock);
+    true
+}
+
+/// The earliest deadline on the logical clock: a task's futex wait's, or an event-parked fiber's
+/// among `fibers`. `None` when no wait has one.
+fn next_timeout<'a>(
+    tasks: &[TaskSlot],
+    fibers: impl Iterator<Item = &'a FiberState>,
+) -> Option<u64> {
     let fiber_deadline = |f: &FiberState| match f {
         FiberState::WaitParked {
             deadline,
@@ -18148,17 +18167,80 @@ fn fire_next_timeout(
         } => *deadline,
         _ => None,
     };
-    let next = fibers
-        .iter()
-        .flat_map(|reg| reg.iter().filter_map(fiber_deadline))
+    fibers
+        .filter_map(fiber_deadline)
         .chain(next_wait_deadline(tasks))
-        .min();
-    let Some(next) = next else {
+        .min()
+}
+
+/// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
+/// other engines' waits do, instead of jumping its `clock` there. The answer to outstanding call
+/// `call` ends the wait early, or with none a ring of the embedder's bell past generation `seen`.
+/// The clock moves by the time that passed, so the schedule is still the clock's (#2224). Whether
+/// something came first: the pump then runs a round, the fibers' answers drained.
+#[cold]
+fn wait_out(
+    tasks: &[TaskSlot],
+    fibers: &mut [FiberState],
+    extra_envs: &[ChildEnv],
+    clock: &mut u64,
+    root: &DomainCell,
+    call: Option<u64>,
+    seen: u64,
+) -> bool {
+    let regs = std::iter::once(&*fibers).chain(extra_envs.iter().map(|e| &e.fibers.fibers[..]));
+    let next = next_timeout(tasks, regs.flat_map(|reg| reg.iter()));
+    let Some(left) = next
+        .and_then(|next| next.checked_sub(*clock))
+        .filter(|&l| l > 0)
+    else {
         return false;
     };
-    *clock = (*clock).max(next);
-    time_out_due(tasks, fibers, *clock);
-    true
+    let began = sched_wall_now();
+    let woke = idle_wait(root, call, seen, left);
+    *clock += sched_wall_now().saturating_sub(began).min(left);
+    if woke {
+        drain_cap_parked(fibers, &root.lock_unpoisoned().completions());
+    }
+    woke
+}
+
+/// [`wait_out`]'s wait: `ns` of real time, on the answer to `call` when one is outstanding, else on
+/// the embedder's bell when one is armed, else asleep. Whether something came before the time was
+/// up. No lock is held while it waits.
+fn idle_wait(root: &DomainCell, call: Option<u64>, seen: u64, ns: u64) -> bool {
+    let d = std::time::Duration::from_nanos(ns);
+    if let Some(id) = call {
+        let comps = root.lock_unpoisoned().completions();
+        return comps.wait_ready(id, Some(d));
+    }
+    let bell = root.lock_unpoisoned().external_wake();
+    match bell {
+        Some(bell) => wait_for_ring(&bell, seen, Some(d)),
+        None => {
+            std::thread::sleep(d);
+            false
+        }
+    }
+}
+
+/// Wait on `bell` until it rings past generation `seen`, or for at most `within`: whether it rang.
+fn wait_for_ring(
+    bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    seen: u64,
+    within: Option<std::time::Duration>,
+) -> bool {
+    let (gen, cv) = &**bell;
+    let g = gen.lock().unwrap_or_else(|e| e.into_inner());
+    let not_yet = |g: &mut u64| *g == seen;
+    let g = match within {
+        None => cv.wait_while(g, not_yet).unwrap_or_else(|e| e.into_inner()),
+        Some(d) => {
+            let waited = cv.wait_timeout_while(g, d, not_yet);
+            waited.unwrap_or_else(|e| e.into_inner()).0
+        }
+    };
+    *g != seen
 }
 
 /// #1146 slice 2 — interrupt an all-parked run's interruptible parks before it blocks, when a

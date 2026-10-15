@@ -1919,8 +1919,19 @@ the pool's answer only once nothing else can run, so its schedule stays determin
 vCPU, under either thunk, waits outside the run with its D66 lane given back and the §5 kill
 re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
 context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
-on an outstanding call, so a call waiting on the world never holds back a timed waiter (the clock
-stays logical, #1979). Pinned on every engine in `temen-run/tests/root_cap_park.rs`.
+on an outstanding call, so a call waiting on the world never holds back a timed waiter. Pinned on
+every engine in `temen-run/tests/root_cap_park.rs`.
+
+**An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
+logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
+run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call ends the
+wait early, or with none outstanding a ring of the embedder's bell, and the clock moves by the time
+that passed, so the schedule is the clock's as before. A run with no outside input keeps its
+schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
+after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
+debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
+too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'

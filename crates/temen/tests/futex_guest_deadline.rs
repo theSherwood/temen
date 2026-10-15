@@ -10,7 +10,7 @@
 //! the wrong one, and no test asked.
 //!
 //! The kernel waits **longer than `MAX_WAIT`** — that is the whole point, so the gate costs real
-//! wall time on the two engines with a real clock. Shorter and it proves nothing.
+//! wall time: one wait, as the engines run at once. Shorter and it proves nothing.
 
 use temen_run::{instantiate, Backend, Outcome, RunConfig, Value};
 
@@ -57,28 +57,19 @@ fn run(backend: Backend) -> (i64, std::time::Duration) {
     }
 }
 
-/// Every engine must report the guest's own timeout expiring — never the backstop's.
+/// Every engine must report the guest's own timeout expiring, after the guest's deadline — never
+/// the backstop's. Since #1979 the bytecode engine's cooperative driver lets the time pass too,
+/// rather than jumping its logical clock to the deadline the moment nothing else can run.
 #[test]
 fn a_guest_timeout_longer_than_the_backstop_is_honoured_on_every_backend() {
-    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let (status, dt) = run(backend);
+    let runs = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit]
+        .map(|backend| (backend, std::thread::spawn(move || run(backend))));
+    for (backend, ran) in runs {
+        let (status, dt) = ran.join().expect("the run");
         assert_eq!(
             status, TIMED_OUT,
             "{backend:?}: a wait with no notifier must end in WAIT_TIMED_OUT, got {status} in {dt:?}"
         );
-    }
-}
-
-/// The engines that sleep on a real clock must actually sleep the guest's deadline. Bytecode is
-/// excluded **by construction, not by omission**: its cooperative driver advances a *logical* clock
-/// to the deadline the moment nothing else can run, so it reports the right status in under a
-/// millisecond. Asserting wall time there would pin the clock model, not the semantics — the status
-/// assertion above is what binds it, and it is the assertion that was missing.
-#[test]
-fn the_real_clock_engines_sleep_the_guest_deadline_not_the_backstop() {
-    for backend in [Backend::TreeWalk, Backend::Jit] {
-        let (status, dt) = run(backend);
-        assert_eq!(status, TIMED_OUT, "{backend:?}: expected WAIT_TIMED_OUT");
         assert!(
             dt >= FLOOR,
             "{backend:?}: returned after {dt:?}, under the {FLOOR:?} floor — the 10 s MAX_WAIT \
