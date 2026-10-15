@@ -4931,6 +4931,11 @@ impl<'p> Vcpu<'p> {
                     mapped,
                     ..
                 }) => {
+                    // A vCPU arms no entry (`with_jit_eligible` sets the bitmap alone), so each of
+                    // its tier-ups is a call.
+                    let TierUpDst::Frame(dst) = dst else {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    };
                     self.pending_tierup = Some((dst, results));
                     return VcpuEvent::TierUp { func, argv, mapped };
                 }
@@ -10369,9 +10374,10 @@ enum Outcome {
     Done(Vec<Value>),
     Suspended,
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
-    /// function of program `module` ([`Vm::jit_module`]). The host runs the emitted `f{func}`
-    /// region and delivers its `n_results` results to the absolute register slot `dst`. `argv` is
-    /// the marshalled arguments (raw i64 slots). `mapped` is the window's scalar committed extent
+    /// function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
+    /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
+    /// results to `dst`: the caller frame's slots, or the task's end. `argv` is the marshalled
+    /// arguments (raw i64 slots). `mapped` is the window's scalar committed extent
     /// at call entry ([`Mem::scalar_extent`]) — the host MUST write it to the emitted module's
     /// `"mapped"` global before invoking `f{func}`, so the emitted bounds check admits exactly what
     /// the interpreter would (#717). Surfaced only when the extent is scalar-representable;
@@ -10380,7 +10386,7 @@ enum Outcome {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -12232,14 +12238,14 @@ enum VcpuStop {
     Preempted,
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region of
-    /// program `module` on the host, delivering its `n_results` results to absolute slot `dst` via
+    /// program `module` on the host, delivering its `n_results` results to `dst` via
     /// `deliver_tierup`. `mapped` is the entry-snapshot scalar committed extent the host must write
     /// to the emitted `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
     TierUp {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -12787,8 +12793,10 @@ fn coop_start_child(
             .lock_unpoisoned()
             .release_detached(lease)
     })?;
+    // It tiers up at its entry too (#1414 ED-1), unless its domain is durable: a thaw replays the
+    // entry interpreted.
     if let Some(e) = &tierup {
-        vt.active.tier_up(module, e);
+        vt.active.tier_up(module, e, !child_host.is_durable());
     }
     let eidx = extra_envs.len();
     extra_envs.push(ChildEnv {
@@ -13397,13 +13405,14 @@ enum CoopStep {
     },
 }
 
-/// Where a surfaced tier-up's results land ([`EmitTier::pending_tierup`]).
+/// Where a tier-up's results land ([`Outcome::TierUp`], [`EmitTier::pending_tierup`]).
 #[derive(Clone, Copy)]
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
     Frame(usize),
-    /// No frame: the task tiered up at its entry (#1896), so its results end it. `parks`: its host
-    /// suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
+    /// No frame: the task tiered up at its entry, a leaf image's (#1896) or one the run started
+    /// (#1414 ED-1), so its results end it. `parks`: its host suspends its emitted frames where a
+    /// call parks ([`LeafOffer::parks`]).
     Entry { parks: bool },
 }
 
@@ -13973,9 +13982,11 @@ fn settle_wakes(
 impl SchedCore {
     /// #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
     /// call to an eligible function surfaces (`Vm::resume`'s `jit_module` gate). `thread.spawn`
-    /// children and child domains take their own program's emit in the stop rules (#2248).
+    /// children and child domains take their own program's emit in the stop rules (#2248), and
+    /// tier up at their entry; the root's entry has a rule of its own, the root leaf ([`root_leaf`]),
+    /// which runs it whole with the slicing and suspension a region call has not.
     fn arm_tierup(&mut self, emit: &ProgramEmit) {
-        self.tasks[0].vm.vt.active.tier_up(0, emit);
+        self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
@@ -14755,7 +14766,7 @@ impl SchedCore {
                     pending_tierup.is_none(),
                     "a tier-up is already outstanding — deliver_tierup was skipped"
                 );
-                *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
+                *pending_tierup = Some((ti, dst, results));
                 return Some(CoopStep::TierUp {
                     module,
                     func,
@@ -15008,9 +15019,12 @@ impl SchedCore {
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                     // keep an inherited bitmap only if its private `fork_private` window is
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
-                    // on every target); a `Paged` twin window strips it and interprets,
-                    // fail-closed.
-                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                    // on every target), and only if its calls dispatch through the table its
+                    // program's emit reads (#2273). Otherwise it interprets, fail-closed.
+                    let program = extra_envs[ck].program;
+                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                        || !child_runs_emit(program, &twin_host)
+                    {
                         twin_vt.active.jit_eligible = None;
                         twin_vt.active.jit_page_checked = false;
                     }
@@ -15019,7 +15033,6 @@ impl SchedCore {
                     // the caller's env fuel.
                     let twin_table = extra_envs[ck].table.fork();
                     let twin_eidx = extra_envs.len();
-                    let program = extra_envs[ck].program;
                     extra_envs.push(ChildEnv {
                         mem: twin_mem,
                         host: twin_host.into_cell(),
@@ -15289,18 +15302,6 @@ impl SchedCore {
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
                         wire_process(&twin_host, root);
-                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
-                        // may keep it only if its OWN private window (`fork_private`, pushed into
-                        // `extra_envs` below) is servable — the driver then answers each of the
-                        // twin's events over that window via the pending-env routing. The
-                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
-                        // on every target; a twin still on the `Paged` fallback (unbounded
-                        // reservation, allocation failure) is not: strip the bitmap so it
-                        // interprets, fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
-                        }
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let (twin_table, twin_fuel, program) = match env {
                             Some(k) => (
@@ -15310,6 +15311,21 @@ impl SchedCore {
                             ),
                             None => (dom.table.fork(), fuel.for_thread(), 0),
                         };
+                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                        // may keep it only if its OWN private window (`fork_private`, pushed into
+                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // twin's events over that window via the pending-env routing. The
+                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                        // on every target; a twin still on the `Paged` fallback (unbounded
+                        // reservation, allocation failure) is not. Nor is a twin whose calls would
+                        // not dispatch through the table its program's emit reads (#2273). Either
+                        // strips the bitmap so it interprets, fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                            || !child_runs_emit(program, &twin_host)
+                        {
+                            twin_vt.active.jit_eligible = None;
+                            twin_vt.active.jit_page_checked = false;
+                        }
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
@@ -15375,7 +15391,8 @@ impl SchedCore {
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
                 // the program it runs has an emit: the run's own, or a granted module's that a
                 // child domain runs. A thread in another program (a §22 unit spawning its own
-                // function) has none, and interprets.
+                // function) has none, and interprets. It tiers up at its entry too (#1414 ED-1),
+                // except in a durable run, whose thaw replays the entry interpreted.
                 //
                 // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
                 // tier up exactly when that env's window is tier-up-servable — the driver answers
@@ -15383,16 +15400,23 @@ impl SchedCore {
                 // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
                 // thread tiers up over its own carve. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
-                // is always right.
-                let window = match tasks[ti].env {
-                    None => mem.as_ref(),
-                    Some(k) => extra_envs[k].mem.as_ref(),
+                // is always right. So does a child domain whose calls would not dispatch through
+                // the table the emit reads (#2273, [`child_runs_emit`]).
+                let (window, dispatches) = match tasks[ti].env {
+                    None => (mem.as_ref(), true),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref(),
+                        child_runs_emit(module, &extra_envs[k].host.lock_unpoisoned()),
+                    ),
                 };
                 if let Some(e) = programs
                     .of(module)
-                    .filter(|_| tierup_servable(window, mem.as_ref()))
+                    .filter(|_| dispatches && tierup_servable(window, mem.as_ref()))
                 {
-                    child.active.tier_up(module, e);
+                    let durable = task_host(root, extra_envs, tasks[ti].env)
+                        .lock_unpoisoned()
+                        .is_durable();
+                    child.active.tier_up(module, e, !durable);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
@@ -16433,6 +16457,18 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
     }
 }
 
+/// #2273 — whether a task of a child domain may run program `module`'s emit, `host` being the
+/// domain's powerbox. A granted module's emitted `call.dyn` dispatches through a table of the
+/// module's own functions, but program 0's dispatches through the root's dispatch table, which the
+/// driver mirrors. A child domain that runs program 0 (a fork twin, its threads, its own twins)
+/// dispatches through its own table, a fork of its parent's. The two stay equal until a domain
+/// installs a unit, which takes a `Jit`. A fork carries its parent's `Jit` into the twin's
+/// powerbox, so such a domain runs the emit only while its powerbox holds none. Otherwise its
+/// tasks interpret, which is always right.
+fn child_runs_emit(module: u32, host: &Host) -> bool {
+    module != 0 || !host.has_jit_table()
+}
+
 /// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid
 /// run, calls back to an interp-resident leaf `target`. Resolves `target` through the caller's dispatch
 /// `table` (masked, exactly as `Op::CallIndirect`), marshals the i64 scratch `io` per the callee's
@@ -16801,7 +16837,8 @@ pub struct ThreadTier {
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
 pub enum EmittedTarget<'a> {
-    /// Function `func` of the run's tier-up module: a direct call to it tiered up.
+    /// Function `func` of the run's tier-up module: a direct call to it, or the entry of a thread
+    /// the run started, tiered up.
     Region(u32),
     /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
     /// and the types the argument and result slots carry.
@@ -17250,7 +17287,16 @@ impl ThreadRun {
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
                     }
-                    set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                    match dst {
+                        TierUpDst::Frame(dst) => {
+                            set_slot_results(&mut vm.vt.active, dst as u32, &results, vals)
+                        }
+                        // A task that tiered up at its entry ran whole: its results end it.
+                        TierUpDst::Entry { .. } => {
+                            let vals = results.iter().zip(vals).map(|(t, v)| slot_to_val(*t, v));
+                            return Ok(VcpuStop::Done(vals.collect()));
+                        }
+                    }
                 }
                 stop => return stop,
             }
@@ -18292,6 +18338,10 @@ struct Vm {
     /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
     /// runs.
     jit_module: usize,
+    /// #1414 ED-1 — the task tiers up at its entry, which `jit_eligible` makes eligible: its first
+    /// resume surfaces the entry as [`Outcome::TierUp`], as a call to it would, and the results end
+    /// the task. Set by [`Vm::tier_up`] for a task the run starts, and spent by that first resume.
+    jit_entry: bool,
     /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
@@ -18438,11 +18488,40 @@ fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
 }
 
 impl Vm {
-    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248).
-    fn tier_up(&mut self, module: u32, emit: &ProgramEmit) {
+    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248). With
+    /// `entry`, this task's own entry tiers up too when `emit` makes it eligible: the run started
+    /// the task at it, as a call to it ([`Vm::jit_entry`], #1414 ED-1).
+    fn tier_up(&mut self, module: u32, emit: &ProgramEmit, entry: bool) {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
         self.jit_module = module as usize;
+        self.jit_entry = entry
+            && self.module == self.jit_module
+            && emit.eligible.get(self.cur).copied().unwrap_or(false);
+    }
+
+    /// The `"mapped"` extent a tier-up surfaces with over `mem` (#717 host sync), or `None` where
+    /// it declines and the callee interprets.
+    ///
+    /// The window's scalar committed extent is what the host writes into the emitted `"mapped"`
+    /// global. A window whose page state is not representable by one bound (sparse grow,
+    /// `Ro`/`Unmapped`/aliased pages) declines tier-up: the interpreted call honors the full
+    /// per-page map (fail-closed; the interpreter is always right). A memory-less module has
+    /// nothing to bound (no emitted access): `0`.
+    ///
+    /// #750 paged tier: the emitted code carries a per-access page check, so an unrepresentable
+    /// window must NOT decline: it surfaces with the reserved size (the bound must never
+    /// under-admit a page the driver's table admits).
+    ///
+    /// #1414 B6-3: the emitted code addresses the window as one flat span (`win + addr`), so a
+    /// window backed without one (`Sparse`, `Paged`, `Foreign`) declines whatever its page state.
+    fn tierup_extent(&self, mem: Option<&Mem>) -> Option<u64> {
+        match mem {
+            None => Some(0),
+            Some(m) if m.flat_win_base().is_none() => None,
+            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+            Some(m) => m.scalar_extent(),
+        }
     }
 
     /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
@@ -18509,6 +18588,7 @@ impl Vm {
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             jit_module: 0,
+            jit_entry: false,
             jit_page_checked: false,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
@@ -18540,15 +18620,6 @@ impl Vm {
         })
     }
 
-    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
-    /// op boundary with the cursor persisted into `self` (resume by calling again); return
-    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
-    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
-    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
-    ///
-    /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
-    /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
-    /// is also what a future blocking-op / debug-stop seam will do before yielding.
     /// Write a host op's result slots into the registers from `at`.
     fn set_results(&mut self, at: usize, res: &[i64], results: &[ValType]) {
         for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
@@ -18570,7 +18641,52 @@ impl Vm {
         freezing
     }
 
+    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
+    /// op boundary with the cursor persisted into `self` (resume by calling again); return
+    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
+    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
+    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
+    ///
+    /// #1414 ED-1: a task the run started at an eligible entry runs the entry emitted instead,
+    /// surfaced as a call to it would be, and the results end the task ([`Vm::jit_entry`]). A window
+    /// the emitted code cannot bound interprets it. The check sits here, outside the op loop's
+    /// function ([`Vm::run_ops`]): at the loop's head it slowed the interpreter's calls by a tenth.
     fn resume(
+        &mut self,
+        source: &ModuleSource,
+        table: &SharedSlots,
+        fuel: &mut Fuel,
+        mem: &mut Option<Mem>,
+        host: &mut HostCell,
+        budget: u64,
+    ) -> Result<Outcome, Trap> {
+        if self.jit_entry {
+            self.jit_entry = false;
+            if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                let c = source.get(self.module).ok_or(Trap::Malformed)?;
+                let (cur, base) = (self.cur, self.base);
+                let params = c.sigs[cur].0.len();
+                return Ok(Outcome::TierUp {
+                    module: self.module as u32,
+                    func: cur as u32,
+                    argv: self.regs[base..base + params]
+                        .iter()
+                        .map(|r| r.i64())
+                        .collect(),
+                    dst: TierUpDst::Entry { parks: false },
+                    results: c.result_types[cur].clone().into(),
+                    mapped,
+                });
+            }
+        }
+        self.run_ops(source, table, fuel, mem, host, budget)
+    }
+
+    /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
+    /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
+    /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
+    /// before yielding.
+    fn run_ops(
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
@@ -19094,27 +19210,9 @@ impl Vm {
                     if self.jit_eligible.as_ref().is_some_and(|e| {
                         module == self.jit_module && e.get(callee).copied().unwrap_or(false)
                     }) {
-                        // #717 host sync: snapshot the window's scalar committed extent for the host
-                        // to write into the emitted `"mapped"` global. A window whose page state is
-                        // not representable by one bound (sparse grow, `Ro`/`Unmapped`/aliased pages)
-                        // declines tier-up — fall through to the interpreted call below, which honors
-                        // the full per-page map (fail-closed; the interpreter is always right). A
-                        // memory-less module has nothing to bound (no emitted access): sync `0`.
-                        //
-                        // #750 paged tier: the emitted code carries a per-access page check, so an
-                        // unrepresentable window must NOT decline — surface with the reserved size
-                        // (the bound must never under-admit a page the driver's table admits).
-                        //
-                        // #1414 B6-3: the emitted code addresses the window as one flat span
-                        // (`win + addr`), so a window backed without one (`Sparse`, `Paged`,
-                        // `Foreign`) declines whatever its page state.
-                        let extent = match mem.as_ref() {
-                            None => Some(0),
-                            Some(m) if m.flat_win_base().is_none() => None,
-                            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
-                            Some(m) => m.scalar_extent(),
-                        };
-                        if let Some(mapped) = extent {
+                        // A window the emitted code cannot bound declines: the call below
+                        // interprets ([`Vm::tierup_extent`]).
+                        if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
                             let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
                             let results: Box<[ValType]> = c.result_types[callee].clone().into();
                             // Spill past the call with the caller's window intact (no callee frame
@@ -19128,7 +19226,7 @@ impl Vm {
                                 module: module as u32,
                                 func: callee as u32,
                                 argv,
-                                dst: *dst as usize,
+                                dst: TierUpDst::Frame(*dst as usize),
                                 results,
                                 mapped,
                             });
