@@ -108,16 +108,21 @@ fn launch(child: &Module) -> DetachedLaunch {
         digest: module_digest(child),
         lane: 2,
         names: vec![("fs".to_string(), 0x0103)],
+        pager: None,
     }
 }
 
 /// The parent's frozen window and a powerbox that granted `child` durable and captured it live.
 fn parent_with_child(c: &Module) -> (Vec<u8>, Host) {
-    parent_with(c, frozen_root(c))
+    parent_with(c, frozen_root(c), launch(c))
 }
 
-/// [`parent_with_child`] over a given frozen child.
-fn parent_with(c: &Module, (window, chost): (MemLayout, Host)) -> (Vec<u8>, Host) {
+/// [`parent_with_child`] over a given frozen child and launch record.
+fn parent_with(
+    c: &Module,
+    (window, chost): (MemLayout, Host),
+    launch: DetachedLaunch,
+) -> (Vec<u8>, Host) {
     let mut host = Host::new();
     host.set_durable(true);
     host.grant_durable_module(c);
@@ -128,7 +133,7 @@ fn parent_with(c: &Module, (window, chost): (MemLayout, Host)) -> (Vec<u8>, Host
         reserved_log2: 17,
         host: Arc::new(Mutex::new(chost)),
         module: Arc::new(c.clone()),
-        launch: launch(c),
+        launch,
     }]);
     let mut win = init_durable_window(1 << 17, ARENA);
     write_state(&mut win, STATE_UNWINDING);
@@ -223,7 +228,7 @@ fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
     };
     assert!(holds(&chost), "the child's stdout is its spawner's");
     let (window, _) = frozen_root(&c);
-    let (win, host) = parent_with(&c, (window, chost));
+    let (win, host) = parent_with(&c, (window, chost), launch(&c));
     let art = freeze(&p, &win, &host).expect("freeze the tree");
 
     let mut rhost = Host::new();
@@ -258,6 +263,60 @@ fn a_child_whose_module_is_not_re_granted_refuses_the_restore() {
     );
 }
 
+/// A parent declaring a `{ page: (i64) -> (i64) }` export, the one shape a pager takes (#744).
+fn pager_parent() -> Module {
+    instrument(
+        "memory 17 shadow 16448 65536
+type 0 func (i64) -> (i64)
+type 1 interface { page: 0 }
+export 0 interface \"pager\" 1 { page: 1 }
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 7
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  return v0
+  }
+}
+",
+    )
+}
+
+/// #2438 — a demand-paged child's pager rides its launch record (v46), so the thaw re-links its faults
+/// to it; and it must name a pager export of the spawner's program, as op 17 requires, or the restore
+/// is refused.
+#[test]
+fn a_paged_childs_pager_rides_its_launch_record() {
+    let (p, c) = (pager_parent(), child());
+    let paged = |pager| {
+        let (win, host) = parent_with(
+            &c,
+            frozen_root(&c),
+            DetachedLaunch {
+                pager: Some(pager),
+                ..launch(&c)
+            },
+        );
+        freeze(&p, &win, &host).expect("freeze the tree")
+    };
+    let restore = |art: &[u8]| {
+        let mut rhost = Host::new();
+        rhost.set_durable(true);
+        rhost.grant_durable_module(&c);
+        restore_with_prots(art, &p, &mut rhost).map(|_| rhost.take_thawed_detached())
+    };
+    let thawed = restore(&paged(0)).expect("restore");
+    assert_eq!(thawed[0].launch.pager, Some(0), "the pager survives");
+    assert_eq!(
+        restore(&paged(1)).map(|_| ()),
+        Err(RestoreError::Malformed),
+        "export 1 is no pager"
+    );
+}
+
 /// A child's own restore failing fails the parent's (#1698): never swallowed into a child that thaws
 /// short of what it froze with. Here the child holds a named `vm_fs`, so its restore needs the
 /// registrar the restoring host lends it.
@@ -266,7 +325,7 @@ fn a_child_whose_restore_fails_refuses_the_parents() {
     let (p, c) = (parent(), child());
     let (window, mut chost) = frozen_root(&c);
     temen_fs::grant_vm_fs(&mut chost, None);
-    let (win, host) = parent_with(&c, (window, chost));
+    let (win, host) = parent_with(&c, (window, chost), launch(&c));
     let art = freeze(&p, &win, &host).expect("freeze the tree");
 
     let restoring = || {

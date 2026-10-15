@@ -274,7 +274,9 @@ use temen_ir::Module;
 /// carries it and `B_FREEZE_AUTHORITY` (12), the carve range, is retired.
 /// v45 (#2433): `B_INSTANTIATOR` (6) carries no payload. The `Instantiator` named the window range a
 /// carve child was confined to, which nothing reads now that every child has a window of its own.
-const FORMAT_VERSION: u16 = 45;
+/// v46 (#2438): a Section 8 launch record carries the spawner's pager export (plus one; `0` = an
+/// unpaged child), so a demand-paged child thaws with its pager.
+const FORMAT_VERSION: u16 = 46;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1195,6 +1197,8 @@ fn write_detached(
             b.extend_from_slice(name.as_bytes());
             write_uleb(&mut b, *h as u32 as u64);
         }
+        // v46 (#2438): the spawner's pager export plus one, `0` for an unpaged child.
+        write_uleb(&mut b, l.pager.map_or(0, |e| u64::from(e) + 1));
         write_uleb(&mut b, art.len() as u64);
         b.extend_from_slice(&art);
     }
@@ -1798,7 +1802,7 @@ fn restore_at(
     // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
     // child failing fails this restore. ----
     if let Some(body) = detached_body {
-        let children = decode_detached(body, host, depth, cut)?;
+        let children = decode_detached(body, module, host, depth, cut)?;
         host.set_thawed_detached(children);
     }
     // #1944: every carried budget node is one some domain of the cut named, or an ancestor of one
@@ -1819,9 +1823,11 @@ fn restore_at(
 
 /// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
 /// holds the restoring host's thaw seams ([`Host::detached_thaw_host`]). A child whose module the
-/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle.
+/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle. `spawner`
+/// is the program whose Section 8 this is: a paged child's pager must be one of its pager exports.
 fn decode_detached(
     body: &[u8],
+    spawner: &Module,
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
@@ -1860,6 +1866,17 @@ fn decode_detached(
             let h = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
             names.push((name, h));
         }
+        // #2438 — op 17 admits only a `{ page: (i64) -> (i64) }` export of the spawner's program as a
+        // pager (`Module::is_pager_export`), so an artifact naming anything else is malformed.
+        let pager = match r.uleb()? {
+            0 => None,
+            e => Some(
+                u32::try_from(e - 1)
+                    .ok()
+                    .filter(|&e| spawner.is_pager_export(e))
+                    .ok_or(RestoreError::Malformed)?,
+            ),
+        };
         let art_len = r.uleb()? as usize;
         let art = r.take(art_len)?;
         let module = host
@@ -1880,6 +1897,7 @@ fn decode_detached(
                 digest,
                 lane,
                 names,
+                pager,
             },
         });
     }

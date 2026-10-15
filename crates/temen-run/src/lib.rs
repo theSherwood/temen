@@ -1690,6 +1690,9 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
 /// #2041 — and no two of a domain's detached children claim one join slot. The interpreter keeps a
 /// join table per spawning vCPU, so two children of different spawners can share a slot number; the
 /// JIT keeps one per domain, where both handles would name one child.
+///
+/// #2438 — and none is demand-paged: the JIT has no fault seam to serve its pager (#2164). A routed
+/// run of a pager-capable program thaws on the interpreter ([`folds_to_oracle`]), as it runs there.
 fn jit_relaunches(host: &Host) -> bool {
     let mut slots: Vec<usize> = host
         .thawed_detached()
@@ -1703,6 +1706,7 @@ fn jit_relaunches(host: &Host) -> bool {
         && host.thawed_detached().iter().all(|td| {
             let c = &td.host;
             host.durable_module_by_digest(&td.launch.digest).is_some()
+                && td.launch.pager.is_none()
                 && (c.frozen_vcpus().is_empty() || c.frozen_root_sp().is_some())
                 && jit_relaunches(c)
         })
@@ -1773,9 +1777,11 @@ fn detached_left(
         let Some(module) = module else {
             continue;
         };
+        // A JIT child is never demand-paged: its op-17 thunk refuses a pager record (#2164).
         let spawn = temen_interp::DetachedSpawn {
             digest: temen_interp::module_digest(&module),
             module: std::sync::Arc::clone(&module),
+            pager: None,
         };
         let (grand_captured, grand_completed) = detached_left(h.children, unreached);
         let outcome = join_outcome(h.outcome);
@@ -1823,6 +1829,7 @@ fn detached_left(
                 digest: spawn.digest,
                 lane,
                 names,
+                pager: None,
             },
         });
     }
@@ -1839,6 +1846,7 @@ fn pending_detached(c: temen_interp::CapturedDetached) -> temen_interp::PendingD
         spawn: temen_interp::DetachedSpawn {
             digest: c.launch.digest,
             module: c.module,
+            pager: c.launch.pager,
         },
     }
 }

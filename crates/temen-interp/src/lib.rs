@@ -2618,7 +2618,7 @@ fn seed_domain(
     root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
         root.mem
             .as_ref()
-            .map(|m| m.durable_get_sp(root_word))
+            .and_then(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| arena.frame_base(root.vcpu_ctx))
     });
     // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
@@ -2976,6 +2976,16 @@ fn relaunch_detached(
     child.kill = Some(Arc::clone(&kflag));
     child.freeze_bell = Some(Arc::clone(&bell));
     child.window_lease = lease;
+    // #2438 — a demand-paged child's faults go to its spawner's pager again, as op 17 wired them: its
+    // unsupplied pages are still unmapped in its image. The codec checked the export against the
+    // spawner's program.
+    if let Some(export) = launch.pager {
+        child.pager = Some(PagerRef {
+            cell: Arc::clone(&spawner.host),
+            export,
+        });
+        child.fault_pager = true;
+    }
     child.lane_chain = std::iter::once((dom, launch.lane))
         .chain(spawner.lane_chain.iter().copied())
         .collect();
@@ -3002,6 +3012,7 @@ fn relaunch_detached(
             DetachedSpawn {
                 module: Arc::clone(&module),
                 digest: launch.digest,
+                pager: launch.pager,
             },
         ),
     );
@@ -3269,8 +3280,11 @@ fn drive_over_cell(
                 // `layout_snapshot` is root-window-only, and a detached child's window *is* a root
                 // window. A §13 page rides as its alias; the codec decides whether the cut holds the
                 // region (R4, #2025).
+                // #2438 — only a child that unwound. One that trapped, or that a deadlock teardown
+                // reaped before it reached its poll, keeps its window but has nothing to resume: it is
+                // unreached, never written as if it had unwound.
                 let out = sched.lock().results.remove(&p.child_task);
-                let Some(m) = out.and_then(|o| o.mem) else {
+                let Some(m) = out.filter(|o| o.result.is_ok()).and_then(|o| o.mem) else {
                     unreached.push(p);
                     continue;
                 };
@@ -3290,6 +3304,7 @@ fn drive_over_cell(
                         digest: p.spawn.digest,
                         lane,
                         names,
+                        pager: p.spawn.pager,
                     },
                     module: p.spawn.module,
                 });
@@ -8555,7 +8570,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
                 // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
                 v.dstate = m.durable_load_dstate(v.vcpu_ctx);
-                v.root_shadow_sp = m.durable_get_sp(root_word);
+                // The vCPU's own copy stands when the word cannot be read: it is what was written.
+                if let Some(sp) = m.durable_get_sp(root_word) {
+                    v.root_shadow_sp = sp;
+                }
             }
         }
         match step {
@@ -8573,7 +8591,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         m.durable_state() == STATE_UNWINDING
                             && (v.spawn_residue.is_none()
                                 || m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx))
-                                    > v.arena().frame_base(v.vcpu_ctx))
+                                    .is_some_and(|sp| sp > v.arena().frame_base(v.vcpu_ctx)))
                     });
                 // Freeze driver (DURABILITY.md §12.8 slice 3.1.4 / 3.4): a durable run left in `UNWINDING`
                 // has drained THIS vCPU's native stack into its shadow region; now flatten the fibers it
@@ -8663,7 +8681,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let self_sp = v
                         .mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
+                        .and_then(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
                         .unwrap_or_else(|| v.arena().frame_base(v.vcpu_ctx));
                     if let Some((func, args, slot)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
@@ -10461,12 +10479,14 @@ fn shadow_switch(
             shadow_context_index(ctx)
         })
     };
-    // Save the outgoing context's live SP to its host-side slot.
-    let sp = m.durable_get_sp(region_of(out_ctx));
-    if out_ctx == ROOT_FIBER {
-        *root_shadow_sp = sp;
-    } else {
-        registry.set_saved_sp(out_ctx, sp);
+    // Save the outgoing context's live SP to its host-side slot (which stands when the word cannot be
+    // read: it is what was written).
+    if let Some(sp) = m.durable_get_sp(region_of(out_ctx)) {
+        if out_ctx == ROOT_FIBER {
+            *root_shadow_sp = sp;
+        } else {
+            registry.set_saved_sp(out_ctx, sp);
+        }
     }
     // Load the incoming context's SP into its (own) region word.
     let in_sp = if in_ctx == ROOT_FIBER {
@@ -10672,6 +10692,9 @@ pub struct DetachedSpawn {
     pub module: Arc<Module>,
     /// The grant's digest ([`module_digest`] of `module`).
     pub digest: [u8; 32],
+    /// #2438 — the spawner's pager export, when the record named one: the child's window is
+    /// demand-paged and its faults are served there (§2.2), across a freeze as before it.
+    pub pager: Option<u32>,
 }
 
 /// #1361 step 4 — the spawner-held half of a detached child's freeze record: how to launch it again.
@@ -10690,6 +10713,9 @@ pub struct DetachedLaunch {
     /// The names the spawner registered the child's grants under, `(name, handle)` — what its imports
     /// resolve by. The handles are the child's own, restored verbatim by its artifact.
     pub names: Vec<(String, i32)>,
+    /// #2438 — the spawner's pager export, if the child is demand-paged (v46). Its unsupplied pages
+    /// stay unmapped in its image, so after a thaw they fault again and this pager serves them.
+    pub pager: Option<u32>,
 }
 
 /// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
@@ -12148,7 +12174,7 @@ impl VCpu {
         let root_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(root_word))
+            .and_then(|m| m.durable_get_sp(root_word))
             .unwrap_or_else(|| arena.frame_base(self.vcpu_ctx));
         while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
             // Placeholder resume value (inert; not spilled by `Yield`).
@@ -12241,7 +12267,7 @@ impl VCpu {
         let shadow_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(arena.region_base(fctx)))
+            .and_then(|m| m.durable_get_sp(arena.region_base(fctx)))
             .unwrap_or_else(|| arena.frame_base(fctx));
         self.registry.set_saved_sp(slot, shadow_sp);
         self.frozen.push(FrozenFiber {
@@ -14285,7 +14311,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // demand-paged and every page arrives through the pager's reply.
                                 let pager_for_child = pager_ref;
                                 if pager_for_child.is_some() {
-                                    fm.demand_page();
+                                    fm.demand_page(durable);
                                 }
                                 let mut ch = host.lock_unpoisoned().child_host();
                                 // §4: *a durable domain may only spawn durable children* — the
@@ -14364,6 +14390,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Fuel::drawn(child_host.lock_unpoisoned().own_node());
                                     let (cfuncs, ctypes) = cm.tables(); // with its type section (#922)
                                     let csched = sched.clone();
+                                    let pager_export = pager_for_child.as_ref().map(|&(_, e)| e);
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
                                     // #1361 step 3 — the freeze doorbell, minted beside the kill flag
@@ -14432,6 +14459,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                     DetachedSpawn {
                                                         module: Arc::clone(&cm.module),
                                                         digest: cm.digest,
+                                                        pager: pager_export,
                                                     },
                                                 ),
                                             );
@@ -16738,7 +16766,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let region_base = arena.region_base(lctx);
                     let shadow_sp = mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp(region_base))
+                        .and_then(|m| m.durable_get_sp(region_base))
                         .unwrap_or_else(|| arena.frame_base(lctx));
                     // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
                     // the region's first 8 bytes); an empty stack sits exactly at the frame base.
@@ -33591,17 +33619,33 @@ impl Mem {
         }
     }
 
-    /// Mark **every** page of this window's declared extent unmapped — demand-paging it (§14 lazy
+    /// Mark the pages of this window's declared extent unmapped — demand-paging it (§14 lazy
     /// paging): a child started this way faults on first access of each page, and its pager supplies
     /// the page (#1862/#1863).
-    fn demand_page(&self) {
+    ///
+    /// #2438 — except, in a **durable** window, the pages holding the runtime's own words: the
+    /// control words and the module's declared shadow arena (INVARIANTS #16). The runtime reads and
+    /// writes them at every safepoint, freeze and thaw; they are never the pager's to supply, and it
+    /// could only supply a stale copy, since it cannot see this window (#1862).
+    fn demand_page(&self, durable: bool) {
         // `div_ceil` so a window smaller than one host page (e.g. 4 KiB on a 16 KiB-page host) still
         // gets its single covering page marked — confinement keeps its accesses in-window. The
         // **declared** window, not the reservation: a detached window reserves 2^37 bytes (#1863) —
         // its tail is growth (`vm_map`), never pager-supplied.
         let pages = self.window.mapped().div_ceil(self.page).max(1);
+        let runtime = [
+            (temen_ir::POWERBOX_NULL_GUARD, DURABLE_CONTROL_END),
+            (self.shadow.base, self.shadow.end),
+        ];
+        let page = self.page;
+        let runtime_page = |p: u64| {
+            durable
+                && runtime
+                    .iter()
+                    .any(|&(lo, hi)| lo < hi && lo < (p + 1) * page && p * page < hi)
+        };
         let mut space = self.space_write();
-        for p in 0..pages {
+        for p in (0..pages).filter(|&p| !runtime_page(p)) {
             space.prot.insert(p, PageProt::Unmapped);
         }
     }
@@ -34351,11 +34395,13 @@ impl Mem {
     /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
     /// the current context's region (D-fiber-cont option A). Falls back to the root region base (`ShadowArena::region_base(0)`) if the
     /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
-    fn durable_get_sp(&self, sp_word: u64) -> u64 {
+    /// A context's shadow-SP word at `sp_word`, or `None` when its page cannot be read. Never a
+    /// stand-in: an SP the caller did not read is one it must not use (#2438, where a demand-paged
+    /// control page read as the region base and the next freeze spilled over the region's header).
+    fn durable_get_sp(&self, sp_word: u64) -> Option<u64> {
         self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
-            .unwrap_or(self.shadow.region_base(0))
     }
 
     fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
