@@ -6,14 +6,19 @@
 //! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a v1 record
 //! naming it as the pager (#1862, #1863). It serves the child's faults with `svc.poll` while it polls
 //! the child, then joins it and returns `status << 56 | served << 48 | value`. Its pager supplies
-//! every page from one scratch page holding the faulting page's number at the faulting byte, and
-//! refuses any address below 65536, which is the runtime's: the control words and the shadow arena.
+//! every page from one scratch region holding the faulting address's 4 KiB page number at the
+//! faulting byte, and refuses any address below 65536, which is the runtime's: the control words and
+//! the shadow arena.
 //! A durable window keeps those mapped, so the pager is never asked for them; were it asked, its
 //! refusal would end the child with a fault.
 //!
-//! The child touches page 24 (address 100000), runs a polled loop, then touches page 26 (address
-//! 110000) and reads `self.attest`. It returns `iters << 24 | b24 << 16 | b26 << 8 | exposure`:
+//! The child touches page 24 (address 100000), runs a polled loop, then touches page 29 (address
+//! 120000) and reads `self.attest`. It returns `iters << 24 | b24 << 16 | b29 << 8 | exposure`:
 //! `exposure` is the attestation's window and freeze bits, both set for a durable paged child.
+//!
+//! A page is the host's, 4 KiB or 16 KiB (DESIGN.md, "Page size"), so the fixtures lay out their
+//! pages at 16 KiB, the largest common host page: every page a child touches is a fresh host page on
+//! either, and so faults.
 #![allow(dead_code)] // each including binary uses a different subset
 
 use super::detached_thaw::*;
@@ -28,7 +33,7 @@ pub const ITERS: u64 = 200_000;
 
 /// What the parent answers when the child ran to the end with its pager: no trap, two pages served,
 /// and the child's value.
-pub const EXPECT: i64 = (2 << 48) | ((ITERS as i64) << 24) | (24 << 16) | (26 << 8) | 3;
+pub const EXPECT: i64 = (2 << 48) | ((ITERS as i64) << 24) | (24 << 16) | (29 << 8) | 3;
 
 pub const PARENT_SRC: &str = "memory 18 shadow 16448 65536
 type 0 func (i64) -> (i64)
@@ -68,7 +73,9 @@ block 2 (vh2: i32, vch2: i32, vt3: i64) {
 ";
 
 /// The parents' pager (#1862): any address below 65536 is refused, being the runtime's; any other
-/// is supplied from one scratch page, holding the faulting page's number at the faulting byte.
+/// is supplied from a 16 KiB scratch region at 128 KiB, holding the faulting address's 4 KiB page
+/// number at the faulting byte. The runtime copies the host page around that byte, so the region
+/// is the largest host page and aligned to it: the page it copies lies inside on any host.
 pub const PAGER_SRC: &str = "func (i64) -> (i64) {
 block 0 (vaddr: i64) {
   vlim = i64.const 65536
@@ -80,9 +87,9 @@ block 1 () {
   return vneg
 }
 block 2 (va: i64) {
-  vmask = i64.const 4095
+  vmask = i64.const 16383
   voff = i64.and va vmask
-  vdt = i64.const 135168
+  vdt = i64.const 131072
   vdst = i64.add vdt voff
   v12 = i64.const 12
   vpg = i64.shr_u va v12
@@ -345,7 +352,7 @@ block 2 (vj: i64, vb2: i64) {{
   br 1(vk, vb2)
 }}
 block 3 (vfin: i64, vb3: i64) {{
-  vaddr2 = i64.const 110000
+  vaddr2 = i64.const 120000
   vc2 = i32.load8_u vaddr2
   vc264 = i64.extend_i32_u vc2
   vat = self.attest
@@ -367,22 +374,23 @@ block 3 (vfin: i64, vb3: i64) {{
     )
 }
 
-/// #2455 — a child (1 MiB) that streams through memory its pager supplies: `iters` iterations, each
-/// reading the first byte of 8 fresh pages from 64 KiB up. Its only safepoints are its loop's
-/// back-edges, so between two of them it faults 8 times. It returns the sum of the bytes it read.
+/// #2455 — a child (4 MiB) that streams through memory its pager supplies: `iters` iterations, at
+/// most 31, each reading the first byte of 8 fresh 16 KiB pages from 64 KiB up. Its only safepoints
+/// are its loop's back-edges, so between two of them it faults 8 times. It returns the sum of the
+/// bytes it read.
 pub fn stream_src(iters: u64) -> String {
     let mut body = String::new();
     for k in 0..8u64 {
         body.push_str(&format!(
             "  vo{k} = i64.const {off}\n  va{k} = i64.add vbase vo{k}\n  vb{k} = i32.load8_u va{k}\n  vx{k} = i64.extend_i32_u vb{k}\n",
-            off = k * 4096
+            off = k * 16384
         ));
     }
     body.push_str(
         "  vs1 = i64.add vx0 vx1\n  vs2 = i64.add vs1 vx2\n  vs3 = i64.add vs2 vx3\n  vs4 = i64.add vs3 vx4\n  vs5 = i64.add vs4 vx5\n  vs6 = i64.add vs5 vx6\n  vs7 = i64.add vs6 vx7\n",
     );
     format!(
-        "memory 20 shadow 16448 65536
+        "memory 22 shadow 16448 65536
 func (i64, i64) -> (i64) {{
 block 0 (v0: i64, v1: i64) {{
   vs0 = i32.wrap_i64 v1
@@ -396,7 +404,7 @@ block 1 (vi: i64, vacc: i64) {{
   br_if vc 2(vi, vacc) 3(vacc)
 }}
 block 2 (vj: i64, vacc2: i64) {{
-  vps = i64.const 32768
+  vps = i64.const 131072
   vsh = i64.mul vj vps
   vlo = i64.const 65536
   vbase = i64.add vlo vsh
@@ -428,7 +436,7 @@ pub fn parent(src: &str, sizes: &[i64]) -> temen_ir::Module {
 }
 
 /// The parent's powerbox: its `Instantiator`, each of `children` as a durable `Module`, a `Budget` of
-/// 4 MiB, and freeze authority; it knows its own program, against which op 17 checks the pager
+/// 8 MiB, and freeze authority; it knows its own program, against which op 17 checks the pager
 /// export. The args are `(instantiator, modules.., budget)`.
 pub fn host(parent: &temen_ir::Module, children: &[&temen_ir::Module]) -> (Host, Vec<i64>) {
     let mut h = Host::new();
@@ -437,7 +445,7 @@ pub fn host(parent: &temen_ir::Module, children: &[&temen_ir::Module]) -> (Host,
     for c in children {
         args.push(h.grant_durable_module(c) as i64);
     }
-    args.push(h.grant_budget(-1, 1 << 22, 4) as i64);
+    args.push(h.grant_budget(-1, 1 << 23, 4) as i64);
     h.grant_freeze_authority();
     h.set_self_module(&Arc::new(parent.clone()));
     (h, args)

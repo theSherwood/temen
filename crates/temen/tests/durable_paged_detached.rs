@@ -4,7 +4,11 @@
 //! unwinds, rather than stranding the freeze.
 //!
 //! The parents and children are `support/paged_detached.rs`'s.
-#![cfg(all(unix, target_arch = "x86_64"))]
+#![cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
 
 #[path = "support/detached_thaw.rs"]
 mod detached_thaw;
@@ -93,7 +97,7 @@ fn a_paged_child_rung_at_a_trigger_is_served_before_it_unwinds() {
 #[test]
 fn a_paged_child_streaming_fresh_pages_freezes_mid_stream() {
     let child = child_module(&stream_src(28));
-    let parent = parent(PARENT_SRC, &[20]);
+    let parent = parent(PARENT_SRC, &[22]);
     let (fresh, ..) = run_from(&parent, &[&child], |_| {});
     assert!(
         matches!(fresh, Out::Ret(v) if v >> 56 == 0 && (v >> 48) & 0xff == 224),
@@ -211,7 +215,7 @@ fn a_thawed_pager_holds_its_relaunched_children_again() {
         child_module(&child_src(false)),
         child_module(&stream_src(28)),
     );
-    let parent = parent(TWO_PARENT_SRC, &[17, 20]);
+    let parent = parent(TWO_PARENT_SRC, &[17, 22]);
     let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
     let (art, args) = artifact(&parent, &[&a, &b], 2, |w| arm_freeze_after_backedges(w, 2));
     let (mut h, mut win) = restored(&art, &parent, &[&a, &b]);
