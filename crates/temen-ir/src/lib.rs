@@ -3932,14 +3932,25 @@ impl Func {
             }
         }
         let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
-        // The edges into each block from a reachable one: the source block, where its params
-        // start in `src`, how many it has, and the arguments.
-        let mut into: Vec<Vec<(u64, usize, usize, &[ValIdx])>> = vec![Vec::new(); n];
+        // An edge into a block from a reachable one: its source block (a value's high half), where
+        // that block's params start in `src`, how many it has, and the arguments.
+        #[derive(Clone, Copy)]
+        struct In<'a> {
+            from: u64,
+            at: usize,
+            np: usize,
+            args: &'a [ValIdx],
+        }
+        let mut into: Vec<Vec<In>> = vec![Vec::new(); n];
         for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
-            let (at, np) = (first[u] as usize, self.blocks[u].params.len());
             for &(t, args) in es {
                 if let Some(e) = into.get_mut(t as usize) {
-                    e.push(((u as u64) << 32, at, np, args));
+                    e.push(In {
+                        from: (u as u64) << 32,
+                        at: first[u] as usize,
+                        np: self.blocks[u].params.len(),
+                        args,
+                    });
                 }
             }
         }
@@ -3961,14 +3972,14 @@ impl Func {
                     }
                     let me = (t as u64) << 32 | i as u64;
                     let mut val = Forwards::UNKNOWN;
-                    for &(u, at, np, args) in &into[t] {
-                        let Some(&a) = args.get(i) else {
+                    for e in &into[t] {
+                        let Some(&a) = e.args.get(i) else {
                             val = Forwards::OWN;
                             break;
                         };
-                        let mut v = u | a as u64;
-                        if (a as usize) < np {
-                            v = match src[at + a as usize] {
+                        let mut v = e.from | a as u64;
+                        if (a as usize) < e.np {
+                            v = match src[e.at + a as usize] {
                                 Forwards::OWN => v,
                                 Forwards::UNKNOWN => continue,
                                 w => w,
