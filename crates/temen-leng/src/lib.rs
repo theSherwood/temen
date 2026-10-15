@@ -800,14 +800,13 @@ const SHADOW_CONTEXTS: u64 = 16;
 /// ([`temen_ir::POWERBOX_STACK_RESERVE`]) — and below the heap, which [`seed_powerbox_heap`] starts at
 /// the arena's end, so neither the allocator nor a data segment can alias it (the verifier checks the
 /// latter). Its base is the stack reserve's end, [`temen_ir::POWERBOX_STACK_ALIGN`]-aligned, so it
-/// never shares a host page with a read-only segment. The window grows if the arena would eat into
-/// the heap floor [`temen_ir::link`] sized it for ([`temen_ir::POWERBOX_HEAP_RESERVE`]).
+/// never shares a host page with a read-only segment. The window grows if it does not reach the
+/// arena's end.
 fn place_shadow_arena(m: &mut Module) {
     let base = temen_ir::powerbox_entry_sp(m) + temen_ir::POWERBOX_STACK_RESERVE;
     let end = base + SHADOW_CONTEXTS * temen_ir::durable_abi::DEFAULT_SHADOW_STRIDE;
     let Some(mem) = m.memory.as_mut() else { return };
-    let need = end + temen_ir::POWERBOX_HEAP_RESERVE;
-    mem.size_log2 = mem.size_log2.max((64 - (need - 1).leading_zeros()) as u8);
+    mem.size_log2 = mem.size_log2.max((64 - (end - 1).leading_zeros()) as u8);
     mem.shadow = Some(temen_ir::durable_abi::ShadowArena::new(base, end));
 }
 
@@ -826,9 +825,9 @@ fn place_shadow_arena(m: &mut Module) {
 /// ([`HEAP_GROW`], committing the reserved tail under a host), and fails closed where it cannot
 /// (#1060) — the confinement mask already prevents an out-of-window access from escaping, so a bump
 /// past the committed top is never a self-corrupting wrap, only a growth or a clean allocation
-/// failure. The window itself is sized to hold `data + stack + heap` reserves by
-/// [`temen_ir::link`] ([`temen_ir::POWERBOX_HEAP_RESERVE`]), independent of any runtime unit's
-/// `memory N` declaration.
+/// failure. The window itself holds the data and the data stack ([`temen_ir::link`]) and no heap
+/// floor: the heap starts in what its power-of-two size leaves above them and grows from there
+/// (#2346).
 ///
 /// Baked as a 16-byte writable data segment (not `_start` stores) because it must run **before**
 /// `main`, and because [`synth_start_unit`] is built before the window size is known. The two words
@@ -989,6 +988,14 @@ const HEAP_GROW_HOOK: &str = "__temen_heap_grow";
 /// It serves a **self-contained** link ([`nim_compute_shim_unit`]), a module run with no host to
 /// grow it — so it imports nothing.
 const SHIM_HEAP_FIXED: u32 = 88;
+
+/// The window a link on [`SHIM_HEAP_FIXED`] declares. With no host to grow it, its heap is what the
+/// window holds above the data stack: 16 MiB, the window every nim link had before the linker
+/// stopped reserving heap (#2346). The shim itself declares only the page its words need.
+const FIXED_HEAP_WINDOW: temen_ir::Memory = temen_ir::Memory {
+    size_log2: 24,
+    shadow: None,
+};
 
 /// [`HEAP_GROW_HOOK`] under a host: commit the window's reserved tail from `top` up to `new`
 /// rounded to the host's page (`vm_page_size`), with the core's `vm_map`, exactly as the C on-ramp's
@@ -2052,13 +2059,15 @@ fn caps_runtime(
 }
 
 /// The **compute-shim link unit alone**, exporting exactly the pure-compute leaves `units` reference,
-/// on the shim's own fixed heap ([`SHIM_HEAP_FIXED`]) and with no edge: the system calls stay
-/// **retained imports**, for a caller to bind by name. Same discovery, same table as [`nim_runtime`]:
-/// one route through the compute bottom edge.
+/// on the shim's own fixed heap ([`SHIM_HEAP_FIXED`], in [`FIXED_HEAP_WINDOW`]) and with no edge: the
+/// system calls stay **retained imports**, for a caller to bind by name. Same discovery, same table
+/// as [`nim_runtime`]: one route through the compute bottom edge.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
     let mut exports = nim_compute_exports(units, &lower_program(units)?)?.0;
     exports.push((HEAP_GROW_HOOK.to_string(), SHIM_HEAP_FIXED));
-    compute_shim_unit(exports)
+    let mut unit = compute_shim_unit(exports)?;
+    unit.module.memory = Some(FIXED_HEAP_WINDOW);
+    Ok(unit)
 }
 
 /// Bottom-edge leaves the **personality** serves for real, so [`Edge::Posix`] takes them from
@@ -2888,7 +2897,8 @@ mod tests {
             })
             .collect();
         exports.push((HEAP_GROW_HOOK.into(), SHIM_HEAP_FIXED));
-        let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM).expect("parses");
+        let mut shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM).expect("parses");
+        shim.memory = Some(FIXED_HEAP_WINDOW);
         let mut m = temen_ir::link(&[
             temen_ir::LinkUnit {
                 module: driver,
