@@ -77,7 +77,6 @@ fn run_temen(wasm: &[u8], reps: usize) -> (i64, Duration) {
         None,
         None,
         None,
-        None,
         None, // fast_resolver
         None,
         0,

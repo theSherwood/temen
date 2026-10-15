@@ -44,7 +44,6 @@ fn compile(src: &str) -> CompiledModule {
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,

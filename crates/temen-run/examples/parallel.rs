@@ -66,7 +66,6 @@ fn jit_compile(m: &Module) -> temen_jit::CompiledModule {
         28,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,

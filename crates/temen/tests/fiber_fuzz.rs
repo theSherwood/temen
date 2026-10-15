@@ -378,7 +378,6 @@ fn generated_fiber_programs_agree_on_interp_and_jit() {
             temen_ir::DEFAULT_RESERVED_LOG2,
             None,
             None,
-            None,
             None, // fuel
             None,
             temen_run::run_node(&jhost),

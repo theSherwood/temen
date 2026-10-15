@@ -2001,7 +2001,6 @@ fn jit_compile(m: &Module) -> CompiledModule {
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,

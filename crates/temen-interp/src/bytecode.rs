@@ -4931,6 +4931,11 @@ impl<'p> Vcpu<'p> {
                     mapped,
                     ..
                 }) => {
+                    // A vCPU arms no entry (`with_jit_eligible` sets the bitmap alone), so each of
+                    // its tier-ups is a call.
+                    let TierUpDst::Frame(dst) = dst else {
+                        return VcpuEvent::Trapped(Trap::Malformed);
+                    };
                     self.pending_tierup = Some((dst, results));
                     return VcpuEvent::TierUp { func, argv, mapped };
                 }
@@ -5949,27 +5954,8 @@ impl LineBreakpoints {
     }
 }
 
-/// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
-/// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
-/// lies within the parent's snapshotted prefix ([`Mem::nested_within_prefix`], so its bytes ride in the
-/// parent reseed rather than a separate copy). A memoryless child is trivially fine. Shared by the
-/// scheduled checkpointable gate's carve arm.
-fn child_checkpointable(child: Option<&Mem>, parent: Option<&Mem>) -> Result<(), Refusal> {
-    let Some(m) = child else {
-        return Ok(());
-    };
-    if !m.layout_snapshot_safe() {
-        return Err(Refusal::Region);
-    }
-    if !parent.is_some_and(|p| m.nested_within_prefix(p)) {
-        return Err(Refusal::WindowLayout);
-    }
-    Ok(())
-}
-
-/// Whether a child env's host is one a restore rebuilds: a checkpoint rebuilds a child's host with
-/// only its `Instantiator` and `AddressSpace` (`rebuild_env`), so on top of the root host's rule it
-/// must hold no `Jit` table and no §13 region.
+/// Whether a child env's host is one a restore rebuilds ([`rebuild_detached_env`]): on top of the
+/// root host's rule it must hold no `Jit` table and no §13 region.
 fn child_host_admits(host: &Host) -> Result<(), Refusal> {
     host.admits_checkpoint()?;
     if host.has_jit_table() {
@@ -5994,75 +5980,30 @@ fn any_event_parked<'a>(mut fibers: impl Iterator<Item = &'a FiberState>) -> boo
     })
 }
 
-/// Capture a live `instantiate`-child [`DbgEnv`] into an [`EnvSnapshot`]: its window geometry
-/// (`nested_view` base + size) + host replay substate + fuel + its own page-protection map. Its bytes ride
-/// in the shared window snapshot (the view shares the root backing region).
-///
-/// #1866 — a detached child's env carries its own window image and powerbox instead, or nothing of
-/// either once it is `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that
-/// is not a plain value ([`Host::child_powerbox`]), or it has no window.
+/// Capture a child [`DbgEnv`] into an [`EnvSnapshot`] (#1866): host replay substate, fuel, fibers,
+/// the env that spawned it, and its own window image and powerbox, or nothing of either once it is
+/// `spent` ([`env_spent`]). Refused when a live one's powerbox holds a binding that is not a plain
+/// value ([`Host::child_powerbox`]), or it has no window.
 fn env_snapshot(e: &DbgEnv, spent: bool) -> Result<EnvSnapshot, Refusal> {
-    let detached = match e.place {
-        EnvPlace::Carve => None,
-        EnvPlace::Detached { spawner } => Some(DetachedEnv {
-            spawner,
-            live: match (&e.mem, spent) {
-                (_, true) => None,
-                (Some(m), false) => Some(DetachedLive {
-                    image: m.layout_snapshot(),
-                    reserved_log2: m.window.reserved().trailing_zeros() as u8,
-                    mapped_log2: m.window.mapped().trailing_zeros() as u8,
-                    shadow: m.shadow,
-                    powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
-                }),
-                (None, false) => return Err(Refusal::NoWindow),
-            },
+    let live = match (&e.mem, spent) {
+        (_, true) => None,
+        (Some(m), false) => Some(DetachedLive {
+            image: m.layout_snapshot(),
+            reserved_log2: m.window.reserved().trailing_zeros() as u8,
+            mapped_log2: m.window.mapped().trailing_zeros() as u8,
+            shadow: m.shadow,
+            powerbox: e.host.child_powerbox().ok_or(Refusal::ChildPowerbox)?,
         }),
+        (None, false) => return Err(Refusal::NoWindow),
     };
     Ok(EnvSnapshot {
-        win_base: e.mem.as_ref().map_or(0, |m| m.window.base()),
-        size_log2: e
-            .mem
-            .as_ref()
-            .map_or(0, |m| m.window.reserved().trailing_zeros() as u8),
         module: e.program as usize,
         host: e.host.replay_substate(),
         fuel: e.fuel.can_burn(),
-        prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
         fibers: e.fibers.fibers.clone(),
-        detached,
+        spawner: e.spawner,
+        live,
     })
-}
-
-/// Rebuild a §14 `instantiate`-child [`DbgEnv`] from an [`EnvSnapshot`] on restore — the inverse of
-/// [`env_snapshot`]: recreate its `nested_view` over the (reseeded) `shared_mem` window, its attenuated
-/// `Instantiator` + `AddressSpace` powerbox over `[0, child_size)` (deterministic in `child_size`), the
-/// captured host replay substate, its natural module-0 table, and its fuel quota.
-fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource) -> DbgEnv {
-    let child_size = 1u64 << es.size_log2;
-    let child_shadow = source
-        .get(es.module)
-        .and_then(|c| c.shadow)
-        .unwrap_or(super::ShadowArena::EMPTY);
-    let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2, child_shadow));
-    if let Some(m) = &mem {
-        m.install_prot(&es.prot); // its `map`/`unmap`/`protect`ed pages (bytes rode in the shared reseed)
-    }
-    let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
-    let mut host = Host::new();
-    host.grant_instantiator(0, child_size);
-    host.grant_address_space(0, child_size);
-    host.restore_replay_substate(&es.host);
-    let table_log2 = host.jit_table_log2(); // #1296: the child's reserved install slots
-    DbgEnv {
-        mem,
-        table: build_table_for(progs_len, table_log2, es.module as u32),
-        program: es.module as u32,
-        fuel: Fuel::fixed(es.fuel),
-        fibers: FiberTables::restored(es.fibers.clone(), &host),
-        host,
-        place: EnvPlace::Carve,
-    }
 }
 
 /// #1866 — rebuild a detached child's [`DbgEnv`] under `spawner`, the powerbox of the env that spawned
@@ -6070,15 +6011,9 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
 /// its own image laid over it, as a thaw's relaunch does; its powerbox is rebuilt from its
 /// [`ChildPowerbox`](super::ChildPowerbox), its inherited stdio aliased to `spawner`'s. A spent env comes
 /// back empty: nothing runs in it again.
-fn rebuild_detached_env(
-    es: &EnvSnapshot,
-    d: &DetachedEnv,
-    spawner: &mut Host,
-    source: &ModuleSource,
-) -> DbgEnv {
+fn rebuild_detached_env(es: &EnvSnapshot, spawner: &mut Host, source: &ModuleSource) -> DbgEnv {
     let progs_len = source.get(es.module).map_or(0, |u| u.progs.len());
-    let place = EnvPlace::Detached { spawner: d.spawner };
-    let Some(live) = &d.live else {
+    let Some(live) = &es.live else {
         let host = Host::new();
         let table = build_table_for(progs_len, host.jit_table_log2(), es.module as u32);
         return DbgEnv {
@@ -6088,7 +6023,7 @@ fn rebuild_detached_env(
             program: es.module as u32,
             fuel: Fuel::fixed(es.fuel),
             fibers: FiberTables::default(),
-            place,
+            spawner: es.spawner,
         };
     };
     let mut mem = Mem::from_spec(WindowSpec {
@@ -6109,7 +6044,7 @@ fn rebuild_detached_env(
         fuel: Fuel::fixed(es.fuel),
         fibers: FiberTables::restored(es.fibers.clone(), &host),
         host,
-        place,
+        spawner: es.spawner,
     }
 }
 
@@ -6522,7 +6457,7 @@ fn journal_state(
         + cont
             .extra_envs
             .iter()
-            .filter_map(|e| e.detached.as_ref()?.live.as_ref())
+            .filter_map(|e| e.live.as_ref())
             .map(|l| (l.image.bytes.len() / std::mem::size_of::<super::Reg>()) as u64)
             .sum::<u64>();
     journal.record_state(
@@ -7152,13 +7087,6 @@ pub enum SchedBreak {
     Pause,
 }
 
-/// A §14 `instantiate` **confined executor child**'s runtime under the multi-vCPU debug scheduler — the
-/// debug-engine counterpart of the production [`ChildEnv`]. Its `mem` is a `nested_view` sub-window
-/// sharing the parent's backing (the confinement masking is the production primitive, unchanged — the
-/// debugger only drives an already-confined child op-by-op), `host` an attenuated powerbox (an
-/// `Instantiator` + `AddressSpace`, each over `[0, child_size)`), `table` a fresh natural dispatch table
-/// over module 0 (no installed §22 units), and `fuel` a sub-allocated quota. Plain `Host` (the debug
-/// scheduler is single-threaded and the §3.6 live-call/serve machinery is not yet driven here).
 /// [`refund_ended_windows`] on the debugger's scheduler: a finished detached child's window goes back
 /// to the budget that paid for it, in the spawner's own powerbox, and what the window grew with it
 /// (#1909), from the child's own. The debugger's child envs see no other end (it declines fork, spawn
@@ -7207,29 +7135,9 @@ struct DbgEnv {
     /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
     /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
     fibers: FiberTables,
-    /// Where its window lives, which decides what a checkpoint carries of it (#1866).
-    place: EnvPlace,
-}
-
-/// Where a [`DbgEnv`]'s window lives (#1866).
-#[derive(Clone, Copy)]
-enum EnvPlace {
-    /// A carve: a view of the root window, whose bytes ride the root's image.
-    Carve,
-    /// A §5 detached child's window of its own. `spawner` is the env whose powerbox spawned it
-    /// (`None`: the root's), whose stdio its inherited streams alias on a rebuild.
-    Detached { spawner: Option<usize> },
-}
-
-impl DbgEnv {
-    /// The env whose powerbox spawned this one — a detached child's spawner — for a `kill` to end
-    /// the subtree ([`kill_env`]). A carve child records none.
-    fn spawner(&self) -> Option<usize> {
-        match self.place {
-            EnvPlace::Detached { spawner } => spawner,
-            EnvPlace::Carve => None,
-        }
-    }
+    /// The env whose powerbox spawned this one (`None`: the root's): whose stdio its inherited
+    /// streams alias on a rebuild (#1866), and whose `kill` ends it with its subtree ([`kill_env`]).
+    spawner: Option<usize>,
 }
 
 /// #1866 — whether nothing runs in env `k` again and nothing still leans on it: every task in it has
@@ -7242,17 +7150,15 @@ fn env_spent(tasks: &[TaskSlot], envs: &[DbgEnv], k: usize) -> bool {
         .filter(live)
         .any(|t| t.env == Some(k) || matches!(t.lease, Some((Some(e), _)) if e == k))
         && !envs.iter().enumerate().any(|(i, e)| {
-            matches!(e.place, EnvPlace::Detached { spawner: Some(sp) } if sp == k)
-                && tasks.iter().filter(live).any(|t| t.env == Some(i))
+            e.spawner == Some(k) && tasks.iter().filter(live).any(|t| t.env == Some(i))
         })
 }
 
 /// One scheduled vCPU's captured state inside a [`ScheduledContinuation`] — its full `VTask` continuation
-/// (active `Vm`, active fiber id, resume `chain`, same-module coroutine children, active-coroutine
-/// cursor, durable shadow-SP), the join-handle table, the env index (`Some(k)` for a §14 `instantiate`
-/// child — see [`ScheduledContinuation::extra_envs`]), the run state, and the breakpoint-skip flag. The
-/// fiber `Vm`s share the run's window(s), and each coroutine's window is a `nested_view` sharing the
-/// parent backing, so their bytes ride in the snapshot's window bytes; `restore` rebuilds the `VTask`.
+/// (active `Vm`, active fiber id, resume `chain`, durable shadow-SP), the join-handle table, the env
+/// index (`Some(k)` for a §14 child — see [`ScheduledContinuation::extra_envs`]), the run state, and
+/// the breakpoint-skip flag. The fiber `Vm`s share their domain's window, so their bytes ride in its
+/// image; `restore` rebuilds the `VTask`.
 #[derive(Clone)]
 struct DbgTaskSnapshot {
     active: Vm,
@@ -7315,40 +7221,23 @@ impl ScheduledContinuation {
     }
 }
 
-/// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`Moment`]. Like a coroutine
-/// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
-/// snapshot's window bytes and only the view geometry (`win_base`/`size_log2`) is stored; `restore`
-/// rebuilds the view over the reseeded shared window. Its attenuated powerbox (an `Instantiator` +
-/// `AddressSpace`, each over `[0, child_size)`) is deterministic in `child_size = 1 << size_log2`, so
-/// only the host replay substate is carried; a natural dispatch table over the child's [`module`] (a
-/// **separate-module** `instantiate_module` child's pushed unit rides in `extra_units`) and the
-/// sub-allocated `fuel` complete it. The child's own page-protection map (`prot`) is captured alongside,
-/// admitting a child that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the shared
-/// snapshot. A §13 region-aliased child stays outside the checkpointable subset.
+/// A §14 child environment ([`DbgEnv`]) inside a [`Moment`] (#1866): its own window and powerbox
+/// ([`DetachedLive`]) unless it is spent, its host replay substate, a natural dispatch table over the
+/// child's [`module`] (whose pushed unit rides in `extra_units`) and its fixed `fuel`. A §13
+/// region-aliased child stays outside the checkpointable subset.
 #[derive(Clone)]
 struct EnvSnapshot {
-    win_base: u64,
-    size_log2: u8,
     /// The unit the child's domain runs ([`DbgEnv::program`]): the granted module's, whose pushed unit
     /// is captured in the run snapshot's `extra_units`. Its natural dispatch table is rebuilt over this
     /// index.
     module: usize,
     host: super::HostReplaySubstate,
     fuel: u64,
-    /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
-    /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
-    prot: Vec<(u64, super::PageProt)>,
-    /// The child's fiber registry (its `Vm`s' bytes ride in the shared snapshot, like the root's).
+    /// The child's fiber registry (its `Vm`s' bytes ride in its window image).
     fibers: Vec<FiberState>,
-    /// #1866 — a detached child's own window and powerbox, which a carve's need not carry.
-    detached: Option<DetachedEnv>,
-}
-
-/// #1866 — what a checkpoint carries of a detached child's env beyond a carve's: the env that spawned
-/// it, and, unless it is spent ([`env_spent`]), its own window and powerbox.
-#[derive(Clone)]
-struct DetachedEnv {
+    /// The env that spawned it ([`DbgEnv::spawner`]).
     spawner: Option<usize>,
+    /// Its own window and powerbox, unless it is spent ([`env_spent`]).
     live: Option<DetachedLive>,
 }
 
@@ -7842,7 +7731,7 @@ fn service_advance(
             }
             Outcome::ChildCtl { child, dst, ctl } => {
                 *turn += 1;
-                let spawners: Vec<_> = extra_envs.iter().map(DbgEnv::spawner).collect();
+                let spawners: Vec<_> = extra_envs.iter().map(|e| e.spawner).collect();
                 child_ctl(tasks, &spawners, ti, child, dst, ctl);
             }
             Outcome::ChildOffer {
@@ -8019,7 +7908,6 @@ fn dbg_start_child(
     host: &mut Host,
     child: AdmittedChild,
     dst: u32,
-    place: EnvPlace,
 ) -> Result<(), Trap> {
     let spawner = tasks[ti].env;
     let room = live_tasks(tasks) < super::MAX_VCPUS;
@@ -8046,7 +7934,7 @@ fn dbg_start_child(
         // (#1944 slice 3).
         fuel: Fuel::fixed(fuel.can_burn()),
         fibers: FiberTables::default(),
-        place,
+        spawner,
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
@@ -8086,10 +7974,7 @@ fn dbg_instantiate_detached(
         tasks[ti].deliver(dst, Reg::from_i32(super::EINVAL as i32));
         return Ok(());
     };
-    let place = EnvPlace::Detached {
-        spawner: tasks[ti].env,
-    };
-    dbg_start_child(tasks, ti, extra_envs, host, child, dst, place)
+    dbg_start_child(tasks, ti, extra_envs, host, child, dst)
 }
 
 /// #2220 — `Instantiator.grant` (op 19) from task `ti` into the child handle `child` names
@@ -9439,18 +9324,13 @@ impl ScheduledDebugRun {
     /// multi-vCPU time-travel **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
-    /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
-    /// same-module *or* separate-module (a separate module's pushed unit rides in `extra_units`); and
-    /// **§14 `instantiate` / `instantiate_module` children** are admitted (each [`DbgEnv`] a `nested_view`
-    /// over the shared backing + a deterministic `Instantiator`/`AddressSpace` powerbox + a natural table
-    /// over the child's module, rebuilt on restore) — this is what admits scheduled coroutines, which only
-    /// ever arise alongside an `instantiate` sibling (the bytecode engine rejects `coroutine + thread`).
-    /// Both coroutines and children may be **demand**/self-page-mapping: each child's own page map is
-    /// captured (`child_checkpointable`: `layout_snapshot_safe`, no §13 regions, within the parent's
-    /// prefix) and its bytes ride in the shared snapshot. The root's §13 regions ride the moment
-    /// ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its window's aliases in its
-    /// page map. Still excluded (→ replay-from-turn-0): a child holding or aliasing a region, or one
-    /// carved beyond the parent's captured prefix.
+    /// wall-clock deadline); **§14 children** are admitted, each [`DbgEnv`] carrying its own window
+    /// image and powerbox ([`DetachedLive`]) and rebuilt under its spawner's on restore
+    /// ([`rebuild_detached_env`]), or nothing of either once spent (#1866). The root's §13 regions
+    /// ride the moment ([`Moment::checkpoint`](super::moment::Moment::checkpoint), #2026), its
+    /// window's aliases in its page map. Still excluded (→ replay-from-turn-0): a task
+    /// mid-§22-invoke, and a live child with no window, a `Jit` table, a §13 region, or a powerbox
+    /// binding that is not a plain value.
     fn checkpointable(&self) -> Result<(), Refusal> {
         // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
         if self.tasks.iter().any(|t| t.vm.vt.active_invoke.is_some()) {
@@ -9464,24 +9344,18 @@ impl ScheduledDebugRun {
         ) {
             return Err(Refusal::Fiber);
         }
-        // A detached child's window is its own (#1866): its image rides its env's snapshot, so only a
+        // A child's window is its own (#1866): its image rides its env's snapshot, so only a
         // §13 region keeps it out; and once spent, nothing of it does. Its powerbox must be plain
         // values, which the capture itself checks (`env_snapshot`).
         for (k, e) in self.extra_envs.iter().enumerate() {
-            match e.place {
-                EnvPlace::Carve => {
-                    child_host_admits(&e.host)?;
-                    child_checkpointable(e.mem.as_ref(), self.mem.as_ref())?;
-                }
-                EnvPlace::Detached { .. } if env_spent(&self.tasks, &self.extra_envs, k) => {}
-                EnvPlace::Detached { .. } => {
-                    child_host_admits(&e.host)?;
-                    match &e.mem {
-                        None => return Err(Refusal::NoWindow),
-                        Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
-                        Some(_) => {}
-                    }
-                }
+            if env_spent(&self.tasks, &self.extra_envs, k) {
+                continue;
+            }
+            child_host_admits(&e.host)?;
+            match &e.mem {
+                None => return Err(Refusal::NoWindow),
+                Some(m) if !m.layout_snapshot_safe() => return Err(Refusal::Region),
+                Some(_) => {}
             }
         }
         Ok(())
@@ -9585,22 +9459,15 @@ impl ScheduledDebugRun {
         self.source.reset_extra(&c.extra_units);
         // The units past the restored ones are gone, and a later spawn adds its module afresh.
         self.line_bps.unbind();
-        // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and carve
-        // windows are `nested_view`s over the shared window (their bytes — shared via the backing
-        // region — are already correct); each table is rebuilt over the child's own module. A
-        // detached child's env is rebuilt under its spawner's, which comes back first (#1866).
+        // Rebuild each task's full `VTask` and each §14 child env, each table over the child's own
+        // module. A child's env is rebuilt under its spawner's, which comes back first (#1866).
         let mut envs: Vec<DbgEnv> = Vec::with_capacity(c.extra_envs.len());
         for es in &c.extra_envs {
-            let env = match &es.detached {
-                None => rebuild_env(es, self.mem.as_ref(), &self.source),
-                Some(d) => {
-                    let spawner = match d.spawner {
-                        None => &mut self.host,
-                        Some(k) => &mut envs[k].host,
-                    };
-                    rebuild_detached_env(es, d, spawner, &self.source)
-                }
+            let spawner = match es.spawner {
+                None => &mut self.host,
+                Some(k) => &mut envs[k].host,
             };
+            let env = rebuild_detached_env(es, spawner, &self.source);
             envs.push(env);
         }
         self.extra_envs = envs;
@@ -9720,7 +9587,7 @@ impl ScheduledDebugRun {
     }
 
     /// A [`FrameReader`] over the **focused** thread's currently-stepping `Vm` (what `select_task` chose):
-    /// the thread's own vCPU over its window (a confined `instantiate` child reads its `nested_view`).
+    /// the thread's own vCPU over its window (a §14 child's own, for a task in a child env).
     fn reader(&self) -> FrameReader<'_> {
         let vm = self.tasks[self.focus].vm.vt.debug_active();
         FrameReader {
@@ -10507,9 +10374,10 @@ enum Outcome {
     Done(Vec<Value>),
     Suspended,
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
-    /// function of program `module` ([`Vm::jit_module`]). The host runs the emitted `f{func}`
-    /// region and delivers its `n_results` results to the absolute register slot `dst`. `argv` is
-    /// the marshalled arguments (raw i64 slots). `mapped` is the window's scalar committed extent
+    /// function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
+    /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
+    /// results to `dst`: the caller frame's slots, or the task's end. `argv` is the marshalled
+    /// arguments (raw i64 slots). `mapped` is the window's scalar committed extent
     /// at call entry ([`Mem::scalar_extent`]) — the host MUST write it to the emitted module's
     /// `"mapped"` global before invoking `f{func}`, so the emitted bounds check admits exactly what
     /// the interpreter would (#717). Surfaced only when the extent is scalar-representable;
@@ -10518,7 +10386,7 @@ enum Outcome {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -12370,14 +12238,14 @@ enum VcpuStop {
     Preempted,
     Done(Vec<Value>),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): run the emitted `f{func}` region of
-    /// program `module` on the host, delivering its `n_results` results to absolute slot `dst` via
+    /// program `module` on the host, delivering its `n_results` results to `dst` via
     /// `deliver_tierup`. `mapped` is the entry-snapshot scalar committed extent the host must write
     /// to the emitted `"mapped"` global first (#717 — see [`Outcome::TierUp`]).
     TierUp {
         module: u32,
         func: u32,
         argv: Box<[i64]>,
-        dst: usize,
+        dst: TierUpDst,
         results: Box<[ValType]>,
         mapped: u64,
     },
@@ -12818,12 +12686,11 @@ fn resolve_fiber_entry(
     }
 }
 
-/// A §14 `instantiate` child's confined runtime, owned by [`drive`] alongside the task set. Its `mem`
-/// is a `nested_view` sub-window sharing the parent's backing (the §14 shared data plane), its `host`
-/// an attenuated powerbox (an `Instantiator` + an `AddressSpace`, each over `[0, child_size)`), its
-/// `table` a fresh **natural** dispatch table over module 0 (no access to installed §22 units — like
-/// the tree-walker's fresh `DomainTable::new(&cfuncs, 0)`), and `fuel` its own (#1944 slice 3: drawn
-/// from its budget node when detached, a fixed allowance when carved).
+/// A child domain's runtime (a §14 child, a fork twin or an exec image), owned by [`drive`] alongside
+/// the task set. Its `mem` is the domain's own window, its `host` its powerbox, its `table` a fresh
+/// **natural** dispatch table over its unit (no access to installed §22 units — like the
+/// tree-walker's fresh `DomainTable`), and `fuel` its own (#1944 slice 3: a §14 child's is drawn
+/// from its budget node).
 struct ChildEnv {
     mem: Option<Mem>,
     /// The child's live powerbox, in its cell ([`DomainCell`]): a §3.6 live-callee offer holds the
@@ -12926,8 +12793,10 @@ fn coop_start_child(
             .lock_unpoisoned()
             .release_detached(lease)
     })?;
+    // It tiers up at its entry too (#1414 ED-1), unless its domain is durable: a thaw replays the
+    // entry interpreted.
     if let Some(e) = &tierup {
-        vt.active.tier_up(module, e);
+        vt.active.tier_up(module, e, !child_host.is_durable());
     }
     let eidx = extra_envs.len();
     extra_envs.push(ChildEnv {
@@ -13536,13 +13405,14 @@ enum CoopStep {
     },
 }
 
-/// Where a surfaced tier-up's results land ([`EmitTier::pending_tierup`]).
+/// Where a tier-up's results land ([`Outcome::TierUp`], [`EmitTier::pending_tierup`]).
 #[derive(Clone, Copy)]
 enum TierUpDst {
     /// The paused caller frame's result slots, from this one on.
     Frame(usize),
-    /// No frame: the task tiered up at its entry (#1896), so its results end it. `parks`: its host
-    /// suspends its emitted frames where a call parks ([`LeafOffer::parks`]).
+    /// No frame: the task tiered up at its entry, a leaf image's (#1896) or one the run started
+    /// (#1414 ED-1), so its results end it. `parks`: its host suspends its emitted frames where a
+    /// call parks ([`LeafOffer::parks`]).
     Entry { parks: bool },
 }
 
@@ -14112,9 +13982,11 @@ fn settle_wakes(
 impl SchedCore {
     /// #926 slice 2: arm the root task's `Vm` for tier-up. The entry runs in module 0, so a direct
     /// call to an eligible function surfaces (`Vm::resume`'s `jit_module` gate). `thread.spawn`
-    /// children and child domains take their own program's emit in the stop rules (#2248).
+    /// children and child domains take their own program's emit in the stop rules (#2248), and
+    /// tier up at their entry; the root's entry has a rule of its own, the root leaf ([`root_leaf`]),
+    /// which runs it whole with the slicing and suspension a region call has not.
     fn arm_tierup(&mut self, emit: &ProgramEmit) {
-        self.tasks[0].vm.vt.active.tier_up(0, emit);
+        self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
@@ -14894,7 +14766,7 @@ impl SchedCore {
                     pending_tierup.is_none(),
                     "a tier-up is already outstanding — deliver_tierup was skipped"
                 );
-                *pending_tierup = Some((ti, TierUpDst::Frame(dst), results));
+                *pending_tierup = Some((ti, dst, results));
                 return Some(CoopStep::TierUp {
                     module,
                     func,
@@ -15147,9 +15019,12 @@ impl SchedCore {
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
                     // keep an inherited bitmap only if its private `fork_private` window is
                     // servable (flat; the owned-flat twin backing makes the tier-up shapes so
-                    // on every target); a `Paged` twin window strips it and interprets,
-                    // fail-closed.
-                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
+                    // on every target), and only if its calls dispatch through the table its
+                    // program's emit reads (#2273). Otherwise it interprets, fail-closed.
+                    let program = extra_envs[ck].program;
+                    if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                        || !child_runs_emit(program, &twin_host)
+                    {
                         twin_vt.active.jit_eligible = None;
                         twin_vt.active.jit_page_checked = false;
                     }
@@ -15158,7 +15033,6 @@ impl SchedCore {
                     // the caller's env fuel.
                     let twin_table = extra_envs[ck].table.fork();
                     let twin_eidx = extra_envs.len();
-                    let program = extra_envs[ck].program;
                     extra_envs.push(ChildEnv {
                         mem: twin_mem,
                         host: twin_host.into_cell(),
@@ -15428,18 +15302,6 @@ impl SchedCore {
                         // park (a bash pipeline subshell is a twin that forks and waits its
                         // command), and its signal doors on the run's bell.
                         wire_process(&twin_host, root);
-                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
-                        // may keep it only if its OWN private window (`fork_private`, pushed into
-                        // `extra_envs` below) is servable — the driver then answers each of the
-                        // twin's events over that window via the pending-env routing. The
-                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
-                        // on every target; a twin still on the `Paged` fallback (unbounded
-                        // reservation, allocation failure) is not: strip the bitmap so it
-                        // interprets, fail-closed.
-                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref()) {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
-                        }
                         // #1297: the twin's own dispatch table, seeded with the caller's installs.
                         let (twin_table, twin_fuel, program) = match env {
                             Some(k) => (
@@ -15449,6 +15311,21 @@ impl SchedCore {
                             ),
                             None => (dom.table.fork(), fuel.for_thread(), 0),
                         };
+                        // #816 env-routed tier-up: the clone carries the parent's bitmap; the twin
+                        // may keep it only if its OWN private window (`fork_private`, pushed into
+                        // `extra_envs` below) is servable — the driver then answers each of the
+                        // twin's events over that window via the pending-env routing. The
+                        // owned-flat twin backing (#816 item 3) makes the tier-up shapes servable
+                        // on every target; a twin still on the `Paged` fallback (unbounded
+                        // reservation, allocation failure) is not. Nor is a twin whose calls would
+                        // not dispatch through the table its program's emit reads (#2273). Either
+                        // strips the bitmap so it interprets, fail-closed.
+                        if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
+                            || !child_runs_emit(program, &twin_host)
+                        {
+                            twin_vt.active.jit_eligible = None;
+                            twin_vt.active.jit_page_checked = false;
+                        }
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
@@ -15514,7 +15391,8 @@ impl SchedCore {
                 // #926 slice 2, #2248: a `thread.spawn` child tiers up its own eligible calls when
                 // the program it runs has an emit: the run's own, or a granted module's that a
                 // child domain runs. A thread in another program (a §22 unit spawning its own
-                // function) has none, and interprets.
+                // function) has none, and interprets. It tiers up at its entry too (#1414 ED-1),
+                // except in a durable run, whose thaw replays the entry interpreted.
                 //
                 // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
                 // tier up exactly when that env's window is tier-up-servable — the driver answers
@@ -15522,16 +15400,23 @@ impl SchedCore {
                 // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
                 // thread tiers up over its own carve. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
-                // is always right.
-                let window = match tasks[ti].env {
-                    None => mem.as_ref(),
-                    Some(k) => extra_envs[k].mem.as_ref(),
+                // is always right. So does a child domain whose calls would not dispatch through
+                // the table the emit reads (#2273, [`child_runs_emit`]).
+                let (window, dispatches) = match tasks[ti].env {
+                    None => (mem.as_ref(), true),
+                    Some(k) => (
+                        extra_envs[k].mem.as_ref(),
+                        child_runs_emit(module, &extra_envs[k].host.lock_unpoisoned()),
+                    ),
                 };
                 if let Some(e) = programs
                     .of(module)
-                    .filter(|_| tierup_servable(window, mem.as_ref()))
+                    .filter(|_| dispatches && tierup_servable(window, mem.as_ref()))
                 {
-                    child.active.tier_up(module, e);
+                    let durable = task_host(root, extra_envs, tasks[ti].env)
+                        .lock_unpoisoned()
+                        .is_durable();
+                    child.active.tier_up(module, e, !durable);
                 }
                 let cidx = tasks.len();
                 // §12: its `vcpu.tls` starts at its id in its domain (#1775).
@@ -16181,7 +16066,7 @@ impl CoopRun {
 
     /// #816: the pending round-trip task's env identity — `-1` for the root env, the `extra_envs`
     /// index for a confined child. Part of the driver's page-state cache key: env windows have their
-    /// **own** `map_version` counters (a fresh Arc per `nested_view`), so a version compare is only
+    /// **own** `map_version` counters (each env's window is its own `Mem`), so a version compare is only
     /// meaningful within one env — the driver rebuilds whenever (env, version) changes.
     pub fn pending_env(&self) -> i64 {
         self.pending_ti()
@@ -16190,9 +16075,8 @@ impl CoopRun {
     }
 
     /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, addressable
-    /// len)`. For the root this is the run backing itself; for a §14 child it is the backing plus
-    /// the carve offset, so the emitted `win + addr` accesses land exactly where the interpreter's
-    /// confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
+    /// len)`: the pending window's own backing, so the emitted `win + addr` accesses land exactly where
+    /// the interpreter's confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
     /// window, e.g. a fork twin's private copy on wasm) — such tasks never carry the tier-up bitmap
     /// (the eligibility gates check [`Mem::flat_win_base`] at task creation), so a pending tier-up
     /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
@@ -16554,9 +16438,8 @@ impl CoopRun {
 /// #816 env-routed tier-up: may a task running over `cand` carry the tier-up bitmap? Either arm
 /// keeps the driver contract satisfiable — [`CoopRun::pending_win`] must resolve a flat view of the
 /// pending window:
-/// - a window sharing the **root backing** (a root-env thread, a §14 child carve via `nested_view`)
-///   is servable wherever the root is (the per-event `win` is the backing base plus the window's
-///   carve offset);
+/// - a window sharing the **root backing** (a root-env thread) is servable wherever the root is (the
+///   per-event `win` is the backing base);
 /// - any other window (a detached child's own, a fork twin's private `fork_private` copy) qualifies
 ///   only if its own region is flat-addressable ([`Mem::flat_win_base`]). A detached child that
 ///   inherits the run's bitmap gets a growable flat window on every target (#2102), and a twin
@@ -16572,6 +16455,18 @@ fn tierup_servable(cand: Option<&Mem>, root: Option<&Mem>) -> bool {
         }
         _ => false,
     }
+}
+
+/// #2273 — whether a task of a child domain may run program `module`'s emit, `host` being the
+/// domain's powerbox. A granted module's emitted `call.dyn` dispatches through a table of the
+/// module's own functions, but program 0's dispatches through the root's dispatch table, which the
+/// driver mirrors. A child domain that runs program 0 (a fork twin, its threads, its own twins)
+/// dispatches through its own table, a fork of its parent's. The two stay equal until a domain
+/// installs a unit, which takes a `Jit`. A fork carries its parent's `Jit` into the twin's
+/// powerbox, so such a domain runs the emit only while its powerbox holds none. Otherwise its
+/// tasks interpret, which is always right.
+fn child_runs_emit(module: u32, host: &Host) -> bool {
+    module != 0 || !host.has_jit_table()
 }
 
 /// #926 slice 2 — the cooperative driver's cross-tier **bounce** body: an emitted tier-up region, mid
@@ -16700,7 +16595,7 @@ mod dbg_domain_end_tests {
             program: 0,
             fuel: Fuel::fixed(0),
             fibers,
-            place: EnvPlace::Detached { spawner: None },
+            spawner: None,
         }];
         let held = |h: &Host| h.capture_durable_budgets()[0].used.mem;
         let done = || TaskState::Done(Ok(Vec::new()));
@@ -16803,8 +16698,7 @@ mod live_cap_tests {
         let mut tasks: Vec<TaskSlot> = (0..crate::MAX_VCPUS)
             .map(|_| TaskSlot::new(vtask(), None, LiveVcpu::none()))
             .collect();
-        let place = EnvPlace::Detached { spawner: None };
-        let r = dbg_start_child(&mut tasks, 0, &mut Vec::new(), &mut host, child, 0, place);
+        let r = dbg_start_child(&mut tasks, 0, &mut Vec::new(), &mut host, child, 0);
         assert_eq!(r, Err(Trap::ThreadFault));
         assert_eq!(tasks.len(), crate::MAX_VCPUS, "nothing was scheduled");
         assert_eq!(held(&host), (0, 0), "nothing stays charged");
@@ -16943,7 +16837,8 @@ pub struct ThreadTier {
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
 pub enum EmittedTarget<'a> {
-    /// Function `func` of the run's tier-up module: a direct call to it tiered up.
+    /// Function `func` of the run's tier-up module: a direct call to it, or the entry of a thread
+    /// the run started, tiered up.
     Region(u32),
     /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
     /// and the types the argument and result slots carry.
@@ -17392,7 +17287,16 @@ impl ThreadRun {
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
                     }
-                    set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                    match dst {
+                        TierUpDst::Frame(dst) => {
+                            set_slot_results(&mut vm.vt.active, dst as u32, &results, vals)
+                        }
+                        // A task that tiered up at its entry ran whole: its results end it.
+                        TierUpDst::Entry { .. } => {
+                            let vals = results.iter().zip(vals).map(|(t, v)| slot_to_val(*t, v));
+                            return Ok(VcpuStop::Done(vals.collect()));
+                        }
+                    }
                 }
                 stop => return stop,
             }
@@ -18434,6 +18338,10 @@ struct Vm {
     /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
     /// runs.
     jit_module: usize,
+    /// #1414 ED-1 — the task tiers up at its entry, which `jit_eligible` makes eligible: its first
+    /// resume surfaces the entry as [`Outcome::TierUp`], as a call to it would, and the results end
+    /// the task. Set by [`Vm::tier_up`] for a task the run starts, and spent by that first resume.
+    jit_entry: bool,
     /// #750 **paged tier-up**: the eligible functions were emitted with the software page-check
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
@@ -18580,11 +18488,40 @@ fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
 }
 
 impl Vm {
-    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248).
-    fn tier_up(&mut self, module: u32, emit: &ProgramEmit) {
+    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248). With
+    /// `entry`, this task's own entry tiers up too when `emit` makes it eligible: the run started
+    /// the task at it, as a call to it ([`Vm::jit_entry`], #1414 ED-1).
+    fn tier_up(&mut self, module: u32, emit: &ProgramEmit, entry: bool) {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
         self.jit_module = module as usize;
+        self.jit_entry = entry
+            && self.module == self.jit_module
+            && emit.eligible.get(self.cur).copied().unwrap_or(false);
+    }
+
+    /// The `"mapped"` extent a tier-up surfaces with over `mem` (#717 host sync), or `None` where
+    /// it declines and the callee interprets.
+    ///
+    /// The window's scalar committed extent is what the host writes into the emitted `"mapped"`
+    /// global. A window whose page state is not representable by one bound (sparse grow,
+    /// `Ro`/`Unmapped`/aliased pages) declines tier-up: the interpreted call honors the full
+    /// per-page map (fail-closed; the interpreter is always right). A memory-less module has
+    /// nothing to bound (no emitted access): `0`.
+    ///
+    /// #750 paged tier: the emitted code carries a per-access page check, so an unrepresentable
+    /// window must NOT decline: it surfaces with the reserved size (the bound must never
+    /// under-admit a page the driver's table admits).
+    ///
+    /// #1414 B6-3: the emitted code addresses the window as one flat span (`win + addr`), so a
+    /// window backed without one (`Sparse`, `Paged`, `Foreign`) declines whatever its page state.
+    fn tierup_extent(&self, mem: Option<&Mem>) -> Option<u64> {
+        match mem {
+            None => Some(0),
+            Some(m) if m.flat_win_base().is_none() => None,
+            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+            Some(m) => m.scalar_extent(),
+        }
     }
 
     /// Open a callee window ending at slot `need` for a call that pushes a return entry, bounded by
@@ -18651,6 +18588,7 @@ impl Vm {
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             jit_module: 0,
+            jit_entry: false,
             jit_page_checked: false,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
@@ -18682,15 +18620,6 @@ impl Vm {
         })
     }
 
-    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
-    /// op boundary with the cursor persisted into `self` (resume by calling again); return
-    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
-    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
-    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
-    ///
-    /// The cursor (`cur`/`base`/`pc`) lives in locals for the duration of the loop so the optimizer
-    /// keeps it in registers; it is written back to `self` only when the loop exits (suspend), which
-    /// is also what a future blocking-op / debug-stop seam will do before yielding.
     /// Write a host op's result slots into the registers from `at`.
     fn set_results(&mut self, at: usize, res: &[i64], results: &[ValType]) {
         for (i, (s, ty)) in res.iter().zip(results.iter()).enumerate() {
@@ -18712,7 +18641,52 @@ impl Vm {
         freezing
     }
 
+    /// Run the continuation for at most `budget` ops, then return [`Outcome::Suspended`] at the next
+    /// op boundary with the cursor persisted into `self` (resume by calling again); return
+    /// [`Outcome::Done`] when the entry activation returns, or `Err` on a trap. Per-op fuel is
+    /// charged here, one charge per op, exactly as the run-to-completion form did — slicing only
+    /// chooses *where* to pause, never *what* runs, so the result is independent of `budget`.
+    ///
+    /// #1414 ED-1: a task the run started at an eligible entry runs the entry emitted instead,
+    /// surfaced as a call to it would be, and the results end the task ([`Vm::jit_entry`]). A window
+    /// the emitted code cannot bound interprets it. The check sits here, outside the op loop's
+    /// function ([`Vm::run_ops`]): at the loop's head it slowed the interpreter's calls by a tenth.
     fn resume(
+        &mut self,
+        source: &ModuleSource,
+        table: &SharedSlots,
+        fuel: &mut Fuel,
+        mem: &mut Option<Mem>,
+        host: &mut HostCell,
+        budget: u64,
+    ) -> Result<Outcome, Trap> {
+        if self.jit_entry {
+            self.jit_entry = false;
+            if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                let c = source.get(self.module).ok_or(Trap::Malformed)?;
+                let (cur, base) = (self.cur, self.base);
+                let params = c.sigs[cur].0.len();
+                return Ok(Outcome::TierUp {
+                    module: self.module as u32,
+                    func: cur as u32,
+                    argv: self.regs[base..base + params]
+                        .iter()
+                        .map(|r| r.i64())
+                        .collect(),
+                    dst: TierUpDst::Entry { parks: false },
+                    results: c.result_types[cur].clone().into(),
+                    mapped,
+                });
+            }
+        }
+        self.run_ops(source, table, fuel, mem, host, budget)
+    }
+
+    /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
+    /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
+    /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
+    /// before yielding.
+    fn run_ops(
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
@@ -19236,27 +19210,9 @@ impl Vm {
                     if self.jit_eligible.as_ref().is_some_and(|e| {
                         module == self.jit_module && e.get(callee).copied().unwrap_or(false)
                     }) {
-                        // #717 host sync: snapshot the window's scalar committed extent for the host
-                        // to write into the emitted `"mapped"` global. A window whose page state is
-                        // not representable by one bound (sparse grow, `Ro`/`Unmapped`/aliased pages)
-                        // declines tier-up — fall through to the interpreted call below, which honors
-                        // the full per-page map (fail-closed; the interpreter is always right). A
-                        // memory-less module has nothing to bound (no emitted access): sync `0`.
-                        //
-                        // #750 paged tier: the emitted code carries a per-access page check, so an
-                        // unrepresentable window must NOT decline — surface with the reserved size
-                        // (the bound must never under-admit a page the driver's table admits).
-                        //
-                        // #1414 B6-3: the emitted code addresses the window as one flat span
-                        // (`win + addr`), so a window backed without one (`Sparse`, `Paged`,
-                        // `Foreign`) declines whatever its page state.
-                        let extent = match mem.as_ref() {
-                            None => Some(0),
-                            Some(m) if m.flat_win_base().is_none() => None,
-                            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
-                            Some(m) => m.scalar_extent(),
-                        };
-                        if let Some(mapped) = extent {
+                        // A window the emitted code cannot bound declines: the call below
+                        // interprets ([`Vm::tierup_extent`]).
+                        if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
                             let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
                             let results: Box<[ValType]> = c.result_types[callee].clone().into();
                             // Spill past the call with the caller's window intact (no callee frame
@@ -19270,7 +19226,7 @@ impl Vm {
                                 module: module as u32,
                                 func: callee as u32,
                                 argv,
-                                dst: *dst as usize,
+                                dst: TierUpDst::Frame(*dst as usize),
                                 results,
                                 mapped,
                             });

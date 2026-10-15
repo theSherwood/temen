@@ -195,10 +195,13 @@ fn bounce_whole_call(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     Ok(())
 }
 
-fn tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatform {
+fn tier(
+    eligible: Arc<[bool]>,
+    run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>,
+) -> ThreadPlatform {
     ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: count_eligible(),
+            eligible,
             page_checked: false,
             spill: 0,
             run,
@@ -220,13 +223,40 @@ fn each_thread_runs_its_own_tasks_tier_ups() {
     let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
     assert_eq!(interpreted, Ok(vec![Value::I64(2000)]));
     assert_eq!(
-        run_over(&m, tier(counting_bounce), flat_window()),
+        run_over(&m, tier(count_eligible(), counting_bounce), flat_window()),
         interpreted
     );
     assert_eq!(
         BOUNCED.load(Ordering::SeqCst),
         4,
         "each thread's call to the eligible function tiered up"
+    );
+}
+
+static ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Emitted code for the counters' entry, function 1, counted.
+fn counting_entries(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    assert!(
+        matches!(call.target, EmittedTarget::Region(1)),
+        "the threads' entry alone tiers up"
+    );
+    ENTRIES.fetch_add(1, Ordering::SeqCst);
+    bounce_whole_call(call)
+}
+
+/// #1414 ED-1 — a thread whose entry is eligible runs it on its own emitted tier, and the entry's
+/// results end the thread.
+#[test]
+fn each_thread_runs_its_entry_on_its_emitted_tier() {
+    let m = module(FOUR_COUNTERS);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    let entries = tier(Arc::from([false, true, false]), counting_entries);
+    assert_eq!(run_over(&m, entries, flat_window()), interpreted);
+    assert_eq!(
+        ENTRIES.load(Ordering::SeqCst),
+        4,
+        "each thread's entry tiered up"
     );
 }
 
@@ -242,7 +272,7 @@ fn a_window_with_no_flat_span_runs_interpreted() {
     let sparse = Region::sparse(1 << 16).expect("a sparse window");
     let ran = run_over(
         &module(FOUR_COUNTERS),
-        tier(sparse_bounce),
+        tier(count_eligible(), sparse_bounce),
         Some(Arc::new(sparse)),
     );
     assert_eq!(ran, Ok(vec![Value::I64(2000)]));
@@ -257,7 +287,7 @@ fn a_window_with_no_flat_span_runs_interpreted() {
 fn a_trap_in_emitted_code_traps_its_task() {
     let ran = run_over(
         &module(FOUR_COUNTERS),
-        tier(|_| Err(Trap::DivByZero)),
+        tier(count_eligible(), |_| Err(Trap::DivByZero)),
         flat_window(),
     );
     assert_eq!(ran, Err(Trap::DivByZero));
@@ -269,7 +299,7 @@ fn a_trap_in_emitted_code_traps_its_task() {
 fn a_memory_fault_in_emitted_code_reports_its_address() {
     let ran = run_over(
         &module(FOUR_COUNTERS),
-        tier(|call| {
+        tier(count_eligible(), |call| {
             call.fault = Some(0x1234);
             Err(Trap::MemoryFault)
         }),
@@ -344,7 +374,7 @@ fn signal_and_answer(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
 fn a_thread_that_only_tiers_up_still_sees_the_run_end() {
     let ran = run_over(
         &module(ROOT_LEAVES_A_CALLER),
-        tier(signal_and_answer),
+        tier(count_eligible(), signal_and_answer),
         flat_window(),
     );
     assert_eq!(ran, Ok(vec![Value::I64(42)]));
@@ -378,7 +408,7 @@ fn spin_until_stopped(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
 fn the_runs_end_stops_emitted_code_still_running() {
     let ran = run_over(
         &module(ROOT_LEAVES_A_SPINNER),
-        tier(spin_until_stopped),
+        tier(count_eligible(), spin_until_stopped),
         flat_window(),
     );
     assert_eq!(ran, Ok(vec![Value::I64(42)]));

@@ -42,7 +42,6 @@ fn compile_reserved(m: &Module, table_log2: u8) -> CompiledModule {
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,
@@ -316,7 +315,6 @@ fn run_repl(table_log2: u8, n: usize, compact_every: Option<usize>) -> (Vec<i64>
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,
@@ -413,7 +411,6 @@ fn recompaction_carries_live_invoke_only_unit() {
         INERT_CAP_THUNK,
         core::ptr::null_mut(),
         DEFAULT_RESERVED_LOG2,
-        None,
         None,
         None,
         None, // fuel

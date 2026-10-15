@@ -191,7 +191,6 @@ fn jit_compile(m: &Module) -> CompiledModule {
         None,
         None,
         None,
-        None,
         0,
     )
     .expect("jit compile")

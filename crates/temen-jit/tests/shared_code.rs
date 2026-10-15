@@ -68,7 +68,6 @@ fn compile(
         None,
         None,
         None,
-        None,
         table_log2,
     )
     .expect("compile")
@@ -94,7 +93,6 @@ fn compile_metered(src: &str, cell: *mut FuelCell) -> CompiledModule {
         INERT_CAP_THUNK,
         core::ptr::null_mut(),
         temen_ir::DEFAULT_RESERVED_LOG2,
-        None,
         None,
         None,
         Some(cell),
