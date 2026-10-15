@@ -6776,6 +6776,18 @@ type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
 /// consumer→native op remap, and the requirement set (names + sigs) retained for `import.attach`.
 type GroupedSlot = (usize, Arc<[u32]>, Vec<String>, Vec<FuncType>);
 
+/// #2428 — what a [`HostCap::host_proc`]'s `make` mints a handler for, which decides how the state it
+/// makes is charged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mint {
+    /// The embedder's grant: state it chose to hand over, the grantee's from now on past any ceiling.
+    Grant,
+    /// A process the guest makes (a `fork()` twin, a spawned child re-granted the capability): its
+    /// copy of the state is the guest's own act, charged within every limit and refused when there
+    /// is no room, which fails that fork or re-grant.
+    Inherit,
+}
+
 #[derive(Clone)]
 pub struct HostCap {
     type_id: u32,
@@ -7008,10 +7020,14 @@ impl HostCap {
     /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
     /// where the handler is made. `make` is handed the node of the domain the capability is granted
     /// to (#2306), which pays for the host memory a guest grows that state by
-    /// ([`temen_interp::HostCharge`]).
+    /// ([`temen_interp::HostCharge`]), and what it mints for ([`Mint`]): `None` refuses an
+    /// [`Mint::Inherit`] with no room for its state, and is never returned for a [`Mint::Grant`].
     pub fn host_proc(
         op: u32,
-        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef, Mint) -> Option<(HostProc, temen_interp::CapState)>
+            + Send
+            + Sync
+            + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
@@ -7023,16 +7039,17 @@ impl HostCap {
                 // state (`ForkedProc::shared`), the right default for an arbitrary host cap whose
                 // state the runtime cannot split. A personality with real per-process state supplies
                 // its own factory via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`). What a twin
-                // mints is paid for by the grantee, as a child's re-grant is (#2306).
+                // mints is paid for by the grantee, as a child's re-grant is (#2306), within its
+                // limits (#2428).
                 let payer = h.own_node();
                 let fork: temen_interp::HostProcFork = Arc::new({
                     let (make, payer) = (Arc::clone(&make), payer.clone());
                     move |_pid| {
-                        let (h, state) = make(&payer);
-                        temen_interp::ForkedProc::shared(h, state)
+                        let (h, state) = make(&payer, Mint::Inherit)?;
+                        Some(temen_interp::ForkedProc::shared(h, state))
                     }
                 });
-                let (f, state) = make(&payer);
+                let (f, state) = make(&payer, Mint::Grant).expect("a grant always mints");
                 h.grant_host_proc_forkable(f, fork, state)
             }),
             unbound: false,

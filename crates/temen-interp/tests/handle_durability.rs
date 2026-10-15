@@ -369,7 +369,10 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
     }
     fn factory() -> temen_interp::HostProcFork {
         std::sync::Arc::new(|_pid| {
-            temen_interp::ForkedProc::shared(answer(), temen_interp::CapState::Stateless)
+            Some(temen_interp::ForkedProc::shared(
+                answer(),
+                temen_interp::CapState::Stateless,
+            ))
         })
     }
     let mut a = Host::new();

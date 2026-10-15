@@ -52,20 +52,20 @@ fn arbitrary_named_host_capabilities_bind_and_run() {
     let imports = Imports::new()
         .provide(
             "add_seven",
-            HostCap::host_proc(0, |_| {
-                (
+            HostCap::host_proc(0, |_, _| {
+                Some((
                     Box::new(|_op, args, _mem, _| Ok(vec![args[0] + 7])),
                     temen_interp::CapState::Stateless,
-                )
+                ))
             }),
         )
         .provide(
             "triple",
-            HostCap::host_proc(0, |_| {
-                (
+            HostCap::host_proc(0, |_, _| {
+                Some((
                     Box::new(|_op, args, _mem, _| Ok(vec![args[0] * 3])),
                     temen_interp::CapState::Stateless,
-                )
+                ))
             }),
         );
 
@@ -111,7 +111,7 @@ fn module_bindings_share_one_instance() {
         // One provider, two fields: `set` is op 0, `get` is op 1 — one closure, one cell.
         let imports = Imports::new().provide_module(
             "kv",
-            HostCap::host_proc(0, |_| {
+            HostCap::host_proc(0, |_, _| {
                 let mut cell = 0i64;
                 let h: temen_interp::HostProc = Box::new(move |op, args, _mem, _| {
                     Ok(vec![match op {
@@ -123,7 +123,7 @@ fn module_bindings_share_one_instance() {
                     }])
                 });
                 // The cell is guest-observable and nothing serializes it.
-                (h, temen_interp::CapState::Uncaptured)
+                Some((h, temen_interp::CapState::Uncaptured))
             }),
             &[("set", 0), ("get", 1)],
         );
@@ -147,11 +147,11 @@ fn unbound_name_fails_closed() {
     // Provide only one of the two imports.
     let imports = Imports::new().provide(
         "add_seven",
-        HostCap::host_proc(0, |_| {
-            (
+        HostCap::host_proc(0, |_, _| {
+            Some((
                 Box::new(|_op, args, _mem, _| Ok(vec![args[0]])),
                 temen_interp::CapState::Stateless,
-            )
+            ))
         }),
     );
     let err = match instantiate_with_imports(module, imports) {

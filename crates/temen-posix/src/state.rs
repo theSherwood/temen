@@ -364,7 +364,8 @@ pub(crate) fn restore(w: &mut World, p: &mut Proc, bytes: &[u8]) -> Result<(), S
     p.pending_exec_image = pending_exec_image;
     p.core_task = core_task;
     p.term_in = term_in;
-    // A pending caught signal is deliverable again at the next poll.
+    p.recharge_tables(); // #2373 — what the restored tables cost, past any ceiling
+                         // A pending caught signal is deliverable again at the next poll.
     p.arm_signals();
     if p.stopped_sig.is_some() != was_stopped {
         p.fire_stop_apply(!was_stopped);

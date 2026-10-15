@@ -1391,11 +1391,11 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
     let fork: HostProcFork = Arc::new(move |_pid| {
         let exited = Arc::clone(&exited);
         let source: Arc<dyn SignalSource + Send + Sync> = Arc::new(ParkDoor::default());
-        ForkedProc {
+        Some(ForkedProc {
             signal: Some((source, Arc::default())),
             exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
             ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![ENOSYS])), CapState::Stateless)
-        }
+        })
     });
     host.set_signal_source(door, Arc::default());
     host.grant_host_proc_forkable(doors, fork, CapState::Stateless)

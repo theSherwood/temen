@@ -3995,11 +3995,11 @@ impl OnrampCaps {
             // `grant` and `registrar` build a factory only for a name `handler` served, over cells
             // that never change which names they serve — so the fallback is never reached. It traps
             // rather than answers if it ever is.
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 caps.handler(&name)
                     .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
                 caps.cap_state(&name),
-            )
+            ))
         })
     }
 
@@ -10394,14 +10394,14 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
     let c2 = std::sync::Arc::clone(&counter);
     let fork: temen_interp::HostProcFork = std::sync::Arc::new(move |_pid| {
         let c = std::sync::Arc::clone(&c2);
-        temen_interp::ForkedProc::shared(
+        Some(temen_interp::ForkedProc::shared(
             Box::new(move |_op, _a, _m, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Uncaptured,
-        )
+        ))
     });
 
     let mut host = Host::new();
@@ -14263,14 +14263,14 @@ block 0 () {
         let c2 = Arc::clone(&counter);
         let fork = Arc::new(move |_pid: u64| {
             let c = Arc::clone(&c2);
-            ForkedProc::shared(
+            Some(ForkedProc::shared(
                 Box::new(move |_op, _a, _m, _| {
                     let mut c = c.lock().unwrap();
                     *c += 1;
                     Ok(vec![*c])
                 }),
                 temen_interp::CapState::Uncaptured,
-            )
+            ))
         });
         // A counter the guest reads back, which nothing serializes (#1699).
         let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);

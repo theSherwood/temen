@@ -374,44 +374,49 @@ pub unsafe extern "C" fn temen_imports_provide_host_proc(
     // `make` is called once per backend host; each builds a fresh `HostProc` that trampolines into `f`.
     // #1699 — `ctx` is C state nothing here can serialize: `Uncaptured`, so a freeze refuses the
     // capability rather than thaw it with its state lost.
-    let cap = HostCap::host_proc(op, move |_| -> (HostProc, temen_interp::CapState) {
-        let ctx = ctx;
-        let h: HostProc = Box::new(
-            move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
-                // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
-                let ctx = ctx;
-                let mut buf = [0i64; TEMEN_MAX_RESULTS];
-                // Wrap the guest window (if any) so the C callback can read/write it bounds-checked, via
-                // `temen_guest_read`/`temen_guest_write`. The shim lives on this stack frame for the call only;
-                // the pointer it hands C is dangling the instant `f` returns (documented contract).
-                let mut shim = mem.map(|m| TemenGuestMem {
-                    // SAFETY: erase the borrow's lifetime to carry it through the opaque C handle. The
-                    // pointer is dereferenced (by `temen_guest_read`/`write`) only during this in-flight
-                    // callback, while `m`'s borrow is live and otherwise untouched — no aliasing.
-                    mem: unsafe { std::mem::transmute::<&mut dyn GuestMem, *mut dyn GuestMem>(m) },
-                });
-                let mem_ptr = shim
-                    .as_mut()
-                    .map_or(ptr::null_mut(), |s| s as *mut TemenGuestMem);
-                let n = f(
-                    ctx.0,
-                    op,
-                    args.as_ptr(),
-                    args.len(),
-                    buf.as_mut_ptr(),
-                    buf.len(),
-                    mem_ptr,
-                );
-                if n < 0 {
-                    return Err(Trap::CapFault);
-                }
-                let n = (n as usize).min(buf.len());
-                Ok(buf[..n].to_vec())
-            },
-        );
-        (h, temen_interp::CapState::Uncaptured)
-    });
+    let cap = HostCap::host_proc(
+        op,
+        move |_, _| -> Option<(HostProc, temen_interp::CapState)> {
+            let ctx = ctx;
+            let h: HostProc = Box::new(
+                move |op, args, mem, _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                    // Force whole-`ctx` capture (the `Send`/`Sync` wrapper), not the disjoint `ctx.0` field
+                    // (a bare `*mut c_void`, which isn't `Send`) — Rust 2021 edition capture.
+                    let ctx = ctx;
+                    let mut buf = [0i64; TEMEN_MAX_RESULTS];
+                    // Wrap the guest window (if any) so the C callback can read/write it bounds-checked, via
+                    // `temen_guest_read`/`temen_guest_write`. The shim lives on this stack frame for the call only;
+                    // the pointer it hands C is dangling the instant `f` returns (documented contract).
+                    let mut shim = mem.map(|m| TemenGuestMem {
+                        // SAFETY: erase the borrow's lifetime to carry it through the opaque C handle. The
+                        // pointer is dereferenced (by `temen_guest_read`/`write`) only during this in-flight
+                        // callback, while `m`'s borrow is live and otherwise untouched — no aliasing.
+                        mem: unsafe {
+                            std::mem::transmute::<&mut dyn GuestMem, *mut dyn GuestMem>(m)
+                        },
+                    });
+                    let mem_ptr = shim
+                        .as_mut()
+                        .map_or(ptr::null_mut(), |s| s as *mut TemenGuestMem);
+                    let n = f(
+                        ctx.0,
+                        op,
+                        args.as_ptr(),
+                        args.len(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        mem_ptr,
+                    );
+                    if n < 0 {
+                        return Err(Trap::CapFault);
+                    }
+                    let n = (n as usize).min(buf.len());
+                    Ok(buf[..n].to_vec())
+                },
+            );
+            Some((h, temen_interp::CapState::Uncaptured))
+        },
+    );
     provide(i, name, cap)
 }
 

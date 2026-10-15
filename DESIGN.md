@@ -2551,7 +2551,10 @@ child's grants is exactly the party positioned to observe their use.
   mappings) is `channel` of the node of the domain the capability's state was
   granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
   the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
-  re-granted the capability spends its grantor's. It is charged before it is
+  re-granted the capability spends its grantor's. A POSIX process's heap records,
+  descriptor slots, arguments and working directory count too (#2373). What a
+  fork twin or a spawned child copies of it is charged with the fork, within every
+  limit, so a guest cannot fork past its grant (#2428). It is charged before it is
   allocated, refused past a ceiling with the errno a full device gives
   (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed
   back as it shrinks or goes. File descriptors are the process's to share, as its

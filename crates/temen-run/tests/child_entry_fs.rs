@@ -67,7 +67,7 @@ fn spawn_child_over_memfs(
             let factory = Arc::clone(&factory);
             Arc::new(move |_pid| {
                 let (h, s) = (*factory)();
-                ForkedProc::shared(h, s)
+                Some(ForkedProc::shared(h, s))
             })
         };
         let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
