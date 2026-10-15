@@ -148,7 +148,7 @@ fn run_chain_with_watchdog() -> Result<Vec<Value>, Trap> {
     std::thread::spawn(move || {
         let m = module(&chain());
         let mut host = Host::new();
-        let ih = host.grant_instantiator(0, 1u64 << 19);
+        let ih = host.grant_instantiator();
         let hb = host.grant_budget(-1, 4 << 20, -1);
         let c1 = host.grant_module(&temen_ir::child_image_at(&m, 2).expect("C1's image"));
         let c2 = host.grant_module(&temen_ir::child_image_at(&m, 4).expect("C2's image"));

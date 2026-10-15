@@ -272,13 +272,15 @@ use temen_ir::Module;
 /// each record's host state. The completed detached-child block follows the vCPU residue directly,
 /// present iff non-empty. Freeze authority has one scope, detached progeny, so `B_FREEZE_DETACHED`
 /// carries it and `B_FREEZE_AUTHORITY` (12), the carve range, is retired.
-/// v45 (#2427): Section 1 carries a window sparsely. The header's `mapped` is its head, the bytes
+/// v45 (#2433): `B_INSTANTIATOR` (6) carries no payload. The `Instantiator` named the window range a
+/// carve child was confined to, which nothing reads now that every child has a window of its own.
+/// v46 (#2427): Section 1 carries a window sparsely. The header's `mapped` is its head, the bytes
 /// `[0, mapped)` read whole, where an unlisted page is a zero read-write one; past it each page the
 /// window holds is listed, however far apart, and an unlisted page is one it does not hold. A page's
 /// protection byte gains [`PAGE_BYTES`] when its bytes follow, which they do for each page with
 /// contents of its own that are not all zero, an inaccessible one included (its contents are kept,
 /// #1909), so a zero page stores none, whatever its protection.
-const FORMAT_VERSION: u16 = 45;
+const FORMAT_VERSION: u16 = 46;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -330,6 +332,7 @@ const B_CLOCK: u8 = 2;
 // authority now rides B_ADDRESS_SPACE `{0, u64::MAX}`; the tag stays reserved.
 // B_YIELDER (4) retired with the §2.3 coroutine deletion; the tag stays reserved.
 const B_ADDRESS_SPACE: u8 = 5;
+/// No payload since v45 (#2433).
 const B_INSTANTIATOR: u8 = 6;
 const B_LIVE_IMPL: u8 = 7;
 /// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
@@ -363,7 +366,7 @@ const PROT_RO: u8 = 1;
 const PROT_UNMAPPED: u8 = 2;
 /// v39 (#2025): a page aliasing a region inside the cut — no bytes; the region's carry them.
 const PROT_BACKED: u8 = 3;
-/// v45 (#2427): set on a page's protection byte when its bytes follow — never on a `PROT_BACKED`
+/// v46 (#2427): set on a page's protection byte when its bytes follow — never on a `PROT_BACKED`
 /// page, and only for bytes that are not all zero.
 const PAGE_BYTES: u8 = 0x80;
 
@@ -539,7 +542,7 @@ fn tail_ok(off: u64, floor: u64, reserved_log2: u8) -> bool {
             .is_some_and(|end| end <= 1u64 << reserved_log2)
 }
 
-/// Whether a page's bytes are not all zero: the pages whose bytes Section 1 stores (v45).
+/// Whether a page's bytes are not all zero: the pages whose bytes Section 1 stores (v46).
 fn nonzero(page: &[u8]) -> bool {
     page.iter().any(|&x| x != 0)
 }
@@ -563,8 +566,7 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
             base: 0,
             size: u64::MAX,
         } => return true,
-        DurableBinding::AddressSpace { base, size }
-        | DurableBinding::Instantiator { base, size } => (base, size),
+        DurableBinding::AddressSpace { base, size } => (base, size),
         _ => return true,
     };
     size != 0
@@ -748,7 +750,7 @@ fn freeze_at(
 
     // Section 0 — Header (§12.2). `reserved_log2` is the caller's mask domain (v18: no longer derived
     // from the image's length, so a head < reservation is representable); `mapped` is the head's
-    // length (v45: the pages held past it are listed apart).
+    // length (v46: the pages held past it are listed apart).
     section(&mut out, TAG_HEADER, |b| {
         b.extend_from_slice(&digest);
         b.push(reserved_log2);
@@ -2288,11 +2290,7 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
-        DurableBinding::Instantiator { base, size } => {
-            b.push(B_INSTANTIATOR);
-            write_uleb(b, base);
-            write_uleb(b, size);
-        }
+        DurableBinding::Instantiator => b.push(B_INSTANTIATOR),
         DurableBinding::FreezeAuthority => b.push(B_FREEZE_DETACHED),
         DurableBinding::LiveImpl { slot, export } => {
             b.push(B_LIVE_IMPL);
@@ -2354,10 +2352,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         },
         // B_FREEZE_AUTHORITY (12): the carve range, retired with the carve (#1867) — fails closed.
         B_FREEZE_DETACHED => DurableBinding::FreezeAuthority,
-        B_INSTANTIATOR => DurableBinding::Instantiator {
-            base: r.uleb()?,
-            size: r.uleb()?,
-        },
+        B_INSTANTIATOR => DurableBinding::Instantiator,
         B_LIVE_IMPL => DurableBinding::LiveImpl {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
@@ -2473,11 +2468,9 @@ mod binding_window_tests {
     #[test]
     fn rejects_only_out_of_window_or_malformed_address_bindings() {
         let mapped = 1u64 << 18; // 256 KiB window
-        let ok = |base, size| {
-            binding_in_window(&DurableBinding::Instantiator { base, size }, mapped)
-                && binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped)
-        };
-        // Legitimate sub-ranges: the whole window, an aligned interior carve, the top slot.
+        let ok =
+            |base, size| binding_in_window(&DurableBinding::AddressSpace { base, size }, mapped);
+        // Legitimate sub-ranges: the whole window, an aligned interior range, the top slot.
         assert!(ok(0, mapped));
         assert!(ok(1 << 12, 1 << 12));
         assert!(ok(mapped - (1 << 12), 1 << 12));
@@ -2507,13 +2500,7 @@ mod binding_window_tests {
             },
             mapped
         ));
-        assert!(!binding_in_window(
-            &DurableBinding::Instantiator {
-                base: 0,
-                size: u64::MAX
-            },
-            mapped
-        ));
+        assert!(binding_in_window(&DurableBinding::Instantiator, mapped));
     }
 }
 
@@ -2595,7 +2582,7 @@ mod pipe_numbering_tests {
 
 #[cfg(test)]
 mod window_section_tests {
-    //! #2427 — Section 1 (v45) carries a window's head, dense, and each page it holds past the head,
+    //! #2427 — Section 1 (v46) carries a window's head, dense, and each page it holds past the head,
     //! apart. An artifact has one encoding, so a restore refuses every other.
     use super::*;
 

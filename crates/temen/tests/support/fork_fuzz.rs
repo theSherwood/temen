@@ -198,7 +198,7 @@ fn observe(
     run: impl FnOnce(&Arc<temen_ir::Module>, &[Value], &mut Host) -> RunOut,
 ) -> Observed {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 64 << 20, -1);

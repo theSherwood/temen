@@ -301,7 +301,7 @@ block 3 (vnok: i64) {{
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     // fuel/mem/spawn unbounded — only `channel` constrains the child.
     let bh = host.grant_budget_channel(-1, -1, -1, channel);
     let mh = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
@@ -765,10 +765,7 @@ fn run_detached_on(
     std::thread::spawn(move || {
         let inst = instantiate_with_imports(m, Imports::new()).expect("instantiate");
         let mut caps = vec![
-            (
-                "vm",
-                HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-            ),
+            ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
             ("budget", HostCap::detached_budget(mem)),
             (
                 "as",

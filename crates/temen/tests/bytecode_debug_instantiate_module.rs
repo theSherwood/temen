@@ -59,7 +59,7 @@ const WANT: i64 = 1086;
 fn powerbox() -> (Host, i32, i32) {
     let child = parse_module(CHILD_SRC).expect("parse child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let mh = host.grant_module(&child);
     (host, inst, mh)
 }
@@ -191,7 +191,7 @@ fn a_line_of_a_childs_own_source_binds_when_the_run_admits_it() {
     let src = format!("{DETACHED_PARENT}{}", rec::segment(17408, &SpawnRec::v1()));
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let mh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let args = [inst, mh, budget].map(Value::I32);

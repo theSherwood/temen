@@ -70,7 +70,7 @@ fn host() -> (Host, [i32; 4]) {
     let child = parse_module(CHILD).expect("parse child");
     verify_module(&child).expect("verify child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 19);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(&child);
     let out = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);

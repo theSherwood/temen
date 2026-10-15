@@ -127,8 +127,8 @@ fn module(text: &str) -> temen_ir::Module {
 }
 
 /// Grant the three caps a detached spawn needs and hand back the argument vector.
-fn powerbox(host: &mut Host, child: &temen_ir::Module, window: u64) -> Vec<Value> {
-    let inst = host.grant_instantiator(0, window);
+fn powerbox(host: &mut Host, child: &temen_ir::Module) -> Vec<Value> {
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)]
@@ -151,7 +151,7 @@ fn shared_window(size: u64) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 fn the_tree_walk_oracle_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut fuel = u64::MAX;
         let result = run_with_host(parent, 0, &args, &mut fuel, &mut host);
         assert_eq!(result, want, "{shape}");
@@ -162,7 +162,7 @@ fn the_tree_walk_oracle_spawns_and_joins_a_detached_child() {
 fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut fuel = u64::MAX;
         let result = bytecode::compile_and_run_with_host(parent, 0, &args, &mut fuel, &mut host)
             .expect("the cooperative executor runs this module");
@@ -177,7 +177,7 @@ fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
 fn the_parallel_driver_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let (back, base, layout) = shared_window(1 << 16);
         let mut fuel = u64::MAX;
 
@@ -208,7 +208,7 @@ fn the_parallel_driver_spawns_and_joins_a_detached_child() {
 fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
     for_each_child(|shape, parent, child, want| {
         let mut host = Host::new();
-        let args = powerbox(&mut host, child, 1 << 16);
+        let args = powerbox(&mut host, child);
         let mut run = ScheduledDebugRun::new_with_host(parent, 0, &args, host).expect("in subset");
         let mut fuel = u64::MAX;
 
@@ -301,7 +301,7 @@ block 0 () {
 fn stdio_host(child: &temen_ir::Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.stdin = b"abc".to_vec();
-    let mut args = powerbox(&mut host, child, 1 << 16);
+    let mut args = powerbox(&mut host, child);
     args.push(Value::I32(host.grant_stream(StreamRole::In)));
     args.push(Value::I32(host.grant_stream(StreamRole::Out)));
     (host, args)
@@ -494,7 +494,7 @@ fn a_pipe_between_two_detached_children_reaches_eof_on_every_runner() {
     );
     let host = || {
         let mut h = Host::new();
-        let inst = h.grant_instantiator(0, 1 << 16);
+        let inst = h.grant_instantiator();
         let mw = h.grant_module(&writer);
         let mr = h.grant_module(&reader);
         let budget = h.grant_budget(-1, 1 << 20, -1);

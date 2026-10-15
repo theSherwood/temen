@@ -773,12 +773,12 @@ holder is the domain that implements them:
   harvests it: a parent holding a child's `Instantiator` cannot
   enumerate-and-wire the child's *live* offers. A hostile parent can always
   run your code; it can never reach into your service.
-- **Honest limit:** this controls who can *call through* your offers. In
-  window-exposed tiers a §14 parent already reads and writes the child's
-  entire carve — export protection cannot create confidentiality the memory
-  model doesn't provide. (Retiring with the carve placement, INVARIANTS #13
-  ruling 2026-09-29: a detached child is window-exposed only over a region it
-  was granted, so this limit narrows to pre-mapped `SharedRegion`s.) That is `attest`'s job: a child that finds itself
+- **Honest limit:** this controls who can *call through* your offers. Where a
+  child's memory is exposed to its parent — a pre-mapped `SharedRegion` it
+  was granted, or every page of a paged child (#2095) — export protection
+  cannot create confidentiality the memory model doesn't provide. (A carve
+  child's whole window was exposed this way until the carve went, #1867.)
+  That is `attest`'s job: a child that finds itself
   window-exposed to an untrusted parent should refuse to hold secrets at
   all; distrust means separate processes (§1a). The two compose: attest
   tells you which world you are in; `export.handle` keeps offer wiring

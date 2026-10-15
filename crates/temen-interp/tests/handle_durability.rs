@@ -29,7 +29,7 @@ fn durable_handles_round_trip_through_capture_restore() {
     a.grant_memory();
     a.grant_exit();
     a.grant_address_space(0x2000, 0x1000);
-    a.grant_instantiator(0x0, 0x4000);
+    a.grant_instantiator();
 
     let captured = a
         .capture_durable_handles()
@@ -539,6 +539,9 @@ fn a_budget_node_round_trips_with_its_ceilings_charge_and_parent() {
 
     let mut t = Host::new();
     t.grant_clock();
+    // An unbounded run, so a read reports the restored nodes alone: a guest sees the run's own
+    // node's `channel` too (#2337).
+    t.set_grant(-1, -1, -1, -1);
     restore_budgets(&mut t, &nodes, &captured);
     assert_eq!(read(&mut t, root, 1), (1 << 20) - 4096, "the root's room");
     assert_eq!(read(&mut t, b, 1), (1 << 19) - 4096, "b's room");

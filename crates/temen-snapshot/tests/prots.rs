@@ -82,7 +82,7 @@ fn page_protections_round_trip_through_the_window_image() {
         "a zero Unmapped page is still preserved"
     );
 
-    // Bytes recovered for every page that has them (v45, #2427): an `Unmapped` page keeps its
+    // Bytes recovered for every page that has them (v46, #2427): an `Unmapped` page keeps its
     // content, which a guest that protects it readable again reads (#1909).
     assert_eq!(rwin[0], 0xAB);
     assert_eq!(rwin[PAGE - 1], 0xCD);

@@ -97,7 +97,7 @@ fn setup() -> (Module, Host, [i32; 5]) {
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let (w, r) = host.grant_pipe();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));

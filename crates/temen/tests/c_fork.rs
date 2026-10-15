@@ -59,7 +59,7 @@ fn fork_host(manager: &temen_ir::Module) -> (Host, [i32; 4]) {
     let mut host = Host::new();
     host.shared_stdout();
     let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, 1 << 19);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 64 << 20, -1);
     let server = host.grant_module(&temen_ir::child_image_at(manager, 1).expect("server image"));
     (host, [stream, inst, budget, server])
@@ -1979,9 +1979,8 @@ fn a_nested_compiled_c_guest_execs_a_separate_command() {
 
     let mut host = Host::new();
     let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
     let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 64 << 20, -1);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);
@@ -2127,9 +2126,8 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
 
     let mut host = Host::new();
     let _sink = host.shared_stdout();
-    let win = 1u64 << 19;
     let stream = host.grant_stream(StreamRole::Out);
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 64 << 20, -1);
     let gmod = host.grant_module(&guest);
     let cmod = host.grant_module(&cmd);

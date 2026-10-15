@@ -1,5 +1,5 @@
-//! **Child-domain executor** (DESIGN.md §23, D66) — every non-durable §14 child (the carve children
-//! of Instantiator ops 0/5/8/11/13 and the detached children of op 17) runs as a **task on a bounded
+//! **Child-domain executor** (DESIGN.md §23, D66) — every non-durable §14 child (a detached child of
+//! Instantiator op 17) runs as a **task on a bounded
 //! pool of platform workers**, not one OS thread each. A task is a platform-owned fiber ([`FiberSlot::platform`]) carrying the child's own window,
 //! trap cell and fiber execution context; any worker may resume it (migration under the same
 //! single-owner claim guest fibers use), and a task that parks — a futex `wait` inside the child —
@@ -1091,7 +1091,7 @@ impl ChildExec {
     /// sweep. A task that parks after this began is poisoned too (`worker_loop`).
     ///
     /// `end_domain` — the run is ending (not freezing): every task ends with it, running or not yet
-    /// started, carve or detached, as the oracle ends a child domain with the run (DESIGN §23, D66).
+    /// started, as the oracle ends a child domain with the run (DESIGN §23, D66).
     /// Its stop word gets the completion sentinel, which its entry and back-edge polls observe
     /// (`emit_domain_poll`). A freeze skips this, so a child the freeze reaches still unwinds under
     /// its own freeze word.

@@ -97,8 +97,7 @@ pub mod cap_id {
     /// 1 `unmap(off,len)`, 2 `protect(off,len,prot)`, 3 `page_size() -> i64`, and 4
     /// **`sub(off, size_log2) -> handle`** — the **attenuation** primitive: mint a child `AddressSpace`
     /// over the power-of-two-aligned sub-range `[base+off, base+off + 2^size_log2)`, which must lie
-    /// within the holder's range (a parent can only sub-allocate what it holds, §14). This is the
-    /// memory half of the `Instantiator`: a guest carves a child's window from its own.
+    /// within the holder's range (a parent can only sub-allocate what it holds, §14).
     pub const ADDRESS_SPACE: u32 = 5;
     /// `Instantiator` — the §14 nesting primitive: spawn a **child domain**, a module running in a
     /// window of its own (VM-in-VM), and manage it. The live ops ([`super::served_contract`]
@@ -118,8 +117,8 @@ pub mod cap_id {
     /// module ops. Fail-closed: a malformed or unverifiable module is `-EINVAL`, nothing is minted. It
     /// is the missing input side of the nesting primitive — a guest that *produces* a module (a linker,
     /// a JIT-driver) can now run it, without the host pre-granting every module it might build. Emitting
-    /// bytes confers no new authority over the host: the minted module can only be *spawned* into a carve
-    /// of the holder's own window (which it already controls), and the verifier gates it unconditionally.
+    /// bytes confers no new authority over the host: the minted module can only be *spawned* into a window
+    /// of its own, paid from the holder's budget, and the verifier gates it unconditionally.
     /// Host-granted (non-ambient), like `exec`/`fs`.
     pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle

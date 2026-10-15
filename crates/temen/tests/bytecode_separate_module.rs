@@ -42,7 +42,7 @@ fn host(child: &Module) -> (Host, i32, i32) {
     let mut h = Host::new();
     let budget = h.grant_budget(-1, 1 << 20, -1);
     h.register_cap_name("budget", budget);
-    let ih = h.grant_instantiator(0, 128 << 10);
+    let ih = h.grant_instantiator();
     let mh = h.grant_module(child);
     (h, ih, mh)
 }

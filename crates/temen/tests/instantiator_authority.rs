@@ -60,7 +60,7 @@ block 0 (v0: i64) {{
 /// The entry's arguments: the `Instantiator`, the `Budget` that pays for the child, and the child.
 fn host(m: &temen_ir::Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     (host, [inst, budget, child])

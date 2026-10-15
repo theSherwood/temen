@@ -408,7 +408,7 @@ fn child_oracle(m: &temen_ir::Module) -> (Result<i64, ()>, i64) {
     let (mut host, counter) = fs_host();
     const LOG2: u8 = 15;
     let size = 1u64 << LOG2;
-    let cinst = host.grant_instantiator(0, size);
+    let cinst = host.grant_instantiator();
     let cas = host.grant_address_space(0, size);
     let prog = bytecode::SharedProgram::compile(m).expect("compile");
     let mut backing = vec![0u8; size as usize].into_boxed_slice();
@@ -441,7 +441,7 @@ fn child_case(store_to_ro: bool) {
     let (mut host, counter) = fs_host();
     const LOG2: u8 = 15;
     let size = 1u64 << LOG2;
-    let cinst = host.grant_instantiator(0, size);
+    let cinst = host.grant_instantiator();
     let cas = host.grant_address_space(0, size);
     let engine = Engine::default();
     let mut store: Store<Drv> = Store::new(

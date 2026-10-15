@@ -931,7 +931,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
 fn premap_host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let mut host = Host::new();
     host.set_region_factory(temen_run::new_shared_region);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1i64 << 17, -1);

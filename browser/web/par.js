@@ -185,7 +185,7 @@ export function makeRunner({ module, memory, ex }) {
         u8().set(unit, uptr);
         ulen = unit.length;
       }
-      if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen, BigInt(minter)) !== 1) {
+      if (ex.temen_par_powerbox_inst(uptr, ulen, BigInt(minter)) !== 1) {
         throw new Error('temen_par_powerbox_inst failed');
       }
     }
@@ -222,9 +222,8 @@ export function makeRunner({ module, memory, ex }) {
               if (m.x2Mem) childMems++;
               startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'spawn') {
-              // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
-              // child's message carries its own win/winSize — the carve; a detached child's carries its
-              // own `childMem`, a shared Memory that transfers by reference — overriding the run defaults).
+              // A §5-detached child: relay the message's cfg verbatim (its message carries its own
+              // `childMem`, a shared Memory that transfers by reference, overriding the run defaults).
               const { kind, ...cfg2 } = m;
               startVcpu({ role: 'child', ...cfg2 });
             } else if (m.kind === 'done') {

@@ -5656,14 +5656,14 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     for (name, handle) in POWERBOX_CAP_NAMES[5..].iter().zip(&v[5..]) {
         h.register_cap_name(name, *handle);
     }
-    // #1234: a §14 `Instantiator` over the guest's own window, resolvable by name only — it is *not*
-    // part of the fixed §3e positional prefix (that arity is an ABI: `_start` reads its caps by
-    // index), so a translated guest is unperturbed and only a guest that asks for `"instantiator"`
-    // by name finds one. Spawn authority is a strict subset of the guest's own reach: a child is a
-    // sub-carve of this window, funded from this guest's own fuel, with a powerbox attenuated to
-    // what the parent re-grants by name. The browser on-ramp grants the same cap under the same
+    // #1234: a §14 `Instantiator`, resolvable by name only — it is *not* part of the fixed §3e
+    // positional prefix (that arity is an ABI: `_start` reads its caps by index), so a translated
+    // guest is unperturbed and only a guest that asks for `"instantiator"` by name finds one. Spawn
+    // authority is a strict subset of the guest's own reach: a child runs in a window of its own
+    // that the guest's `"budget"` pays for, with a powerbox attenuated to what the parent re-grants
+    // by name. The browser on-ramp grants the same cap under the same
     // name (`grant_onramp_caps`) so both reference hosts present one frontier (INVARIANTS #14).
-    let inst = h.grant_instantiator(0, win);
+    let inst = h.grant_instantiator();
     h.register_cap_name("instantiator", inst);
     // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only for
     // a guest that spawns detached (`temen_ir::spawns_detached`): least authority.
@@ -6093,7 +6093,7 @@ pub fn conductor(caps: &[&str], argv: &[&str]) -> temen_ir::Module {
 /// `Budget` unbounded on its own level, which pays for `child`'s window and for what `child` grows
 /// past it (#1909): a phase grows as freely as it would at the root.
 pub fn grant_conductor(host: &mut Host, child: &temen_ir::Module) -> (i32, i32, i32) {
-    let inst = host.grant_instantiator(0, 1u64 << CONDUCTOR_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (inst, modh, budget)

@@ -105,7 +105,7 @@ fn detached_depth_two() -> (temen_ir::Module, Host, [Value; 4]) {
     );
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let [c1, c2] =
         [1, 2].map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));

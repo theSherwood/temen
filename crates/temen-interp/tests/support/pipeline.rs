@@ -212,7 +212,7 @@ pub fn modules() -> (Module, Module) {
 /// image of func 1, the consumer.
 pub fn host(stages: &Module) -> (Host, [i32; 5]) {
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(stages);
     let hw = host.grant_budget(-1, (2 << 17) as i64, -1);

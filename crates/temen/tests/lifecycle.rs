@@ -32,7 +32,7 @@ fn setup(src: &str) -> (Module, Host, [i32; 3]) {
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();
-    let ih = h.grant_instantiator(0, 128 << 10);
+    let ih = h.grant_instantiator();
     let bh = h.grant_budget(-1, 1 << 20, -1);
     let region =
         h.grant_shared_region_backed(temen_run::new_shared_region(64 << 10).expect("a region"));

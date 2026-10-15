@@ -261,7 +261,7 @@ fn two_svc_wait_consumers_serve_a_live_caller_across_every_interleaving() {
     // complete with the same packed result.
     for i in 0..10 {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hm = host.grant_module(&b);
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = u64::MAX;

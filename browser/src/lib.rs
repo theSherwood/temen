@@ -376,7 +376,7 @@ pub extern "C" fn run_fork() -> i64 {
         return i64::MIN;
     };
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     // The server's and the guest's windows, and the twin's copy of the guest's (#2106).
@@ -1381,10 +1381,9 @@ fn par_pb() -> Option<&'static ParPowerbox> {
 // build its powerbox deterministically. Children never touch it: the engine admits each one and
 // builds its powerbox, and the JS host relays it as an opaque ticket, so no authority crosses JS.
 
-/// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant +
-/// an optional `WindowMinter` (#1286: `minter_quota > 0` bytes of detached-window admission).
+/// The §14 run recipe: `Instantiator` authority + an optional `Module` grant + an optional `Budget`
+/// (#1286: `minter_quota > 0` bytes of detached-window admission).
 struct ParInstCfg {
-    win_size: u64,
     module: Option<temen_ir::Module>,
     minter_quota: u64,
 }
@@ -1392,14 +1391,13 @@ struct ParInstCfg {
 /// The leaked [`ParInstCfg`] pointer (or `0`), shared across Workers via shared linear memory.
 static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Publish the §14 run recipe: the root's `Instantiator` will span `[0, win_size)`; a non-empty
-/// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
-/// grant); a non-zero `minter_quota` grants the root a `WindowMinter` of that many bytes (#1286 — the
-/// admission for a detached spawn; its handle follows the module's in the root's args). Returns
-/// `1`, or `0` on a bad module. Call once (on the main thread) before the run.
+/// Publish the §14 run recipe: the root gets an `Instantiator`; a non-empty `[mod_ptr, mod_len)` is
+/// decoded as the **granted module** it spawns (`0` len ⇒ no grant); a non-zero `minter_quota` grants
+/// the root a `Budget` of that many bytes of `mem` (#1286 — the admission for a detached spawn; its
+/// handle follows the module's in the root's args). Returns `1`, or `0` on a bad module. Call once
+/// (on the main thread) before the run.
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_inst(
-    win_size: u64,
     mod_ptr: *const u8,
     mod_len: usize,
     minter_quota: u64,
@@ -1416,7 +1414,6 @@ pub extern "C" fn temen_par_powerbox_inst(
         }
     };
     let cfg = Box::into_raw(Box::new(ParInstCfg {
-        win_size,
         module,
         minter_quota,
     }));
@@ -1436,8 +1433,8 @@ fn par_inst() -> Option<&'static ParInstCfg> {
     unsafe { p.as_ref() }
 }
 
-/// The §14 recipe's root powerbox for a run of `module`: an `Instantiator` over `[0, win_size)`,
-/// the granted module and a `WindowMinter` budget when the recipe has them, and the root's args
+/// The §14 recipe's root powerbox for a run of `module`: an `Instantiator`, the granted module and a
+/// `Budget` when the recipe has them, and the root's args
 /// (their handles, in that order).
 fn par_inst_powerbox(
     cfg: &ParInstCfg,
@@ -1445,7 +1442,7 @@ fn par_inst_powerbox(
 ) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_self_module(module);
-    let inst = host.grant_instantiator(0, cfg.win_size);
+    let inst = host.grant_instantiator();
     let mut args = vec![Value::I32(inst)];
     if let Some(m) = &cfg.module {
         args.push(Value::I32(host.grant_module(m)));
@@ -4257,7 +4254,7 @@ fn grant_onramp_caps(
     // (#1117) toggles it); granted last so every other handle keeps its value.
     if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let handle = host.grant_instantiator(0, win);
+        let handle = host.grant_instantiator();
         host.register_cap_name("instantiator", handle);
         // The by-name spawn set (`"budget"`, and `"child"` for a program exporting `_child`), only
         // for a guest that spawns detached: least authority.
@@ -4999,7 +4996,7 @@ pub fn posix_shell_exec_with(
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let (in_h, in_fifo) = host.grant_input_pipe();
-    let _inst = host.grant_instantiator(0, win);
+    let _inst = host.grant_instantiator();
     let _as = host.grant_address_space(0, win);
     // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
@@ -6779,7 +6776,7 @@ pub fn capture_exec(m: &temen_ir::Module, init: &[u8], arg: i64) -> CapOutcome {
 /// by the wasm [`temen_run_nested`] export and the native `gencorpus` ground truth.
 pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
     for e in &m.exports {
@@ -10409,7 +10406,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module) -> i32
 
     let mut host = Host::new();
     let win = 1u64 << driver.memory.map_or(16, |mc| mc.size_log2); // the built-in driver: `memory 16`
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     // A counter the guest reads back, which nothing serializes (#1699).
     let fs_h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);

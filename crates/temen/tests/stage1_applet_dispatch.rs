@@ -106,7 +106,7 @@ fn setup(applet: &str, token: &[u8; 3]) -> (Module, Host, [i32; 3]) {
     let m = parse_module(&src(applet, token)).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, WIN as u64);
+    let ih = host.grant_instantiator();
     let oh = host.grant_stream(StreamRole::Out);
     let bh = host.grant_budget(-1, 1 << 20, -1);
     for e in &m.exports {

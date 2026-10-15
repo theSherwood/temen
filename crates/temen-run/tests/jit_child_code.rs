@@ -106,7 +106,7 @@ fn run(backend: Backend, cfg: RunConfig) -> Outcome {
     within_a_minute(&format!("{backend:?}"), move || {
         let nest = module(&nester(false));
         let mut setup = |h: &mut Host| {
-            let inst = h.grant_instantiator(0, 1 << 17);
+            let inst = h.grant_instantiator();
             h.register_cap_name("spawner", inst);
             let m = h.grant_module(&nest);
             h.register_cap_name("nester", m);

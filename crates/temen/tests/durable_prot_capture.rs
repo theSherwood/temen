@@ -118,7 +118,7 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
 /// its declared size, captured through the real interpreter and round-tripped through the §12 codec.
 /// Pre-v18 the captured window (larger than `1 << size_log2`) hit `GeometryMismatch`; v18 carries the
 /// grown extent + reservation, so the grown page's content and protection survive serialize/restore —
-/// the durable-artifact analogue of the in-process warm-snapshot restore (#828/#1127). v45 (#2427)
+/// the durable-artifact analogue of the in-process warm-snapshot restore (#828/#1127). v46 (#2427)
 /// carries them as pages held past the declared window.
 #[test]
 fn a_vm_map_grown_window_survives_the_codec() {

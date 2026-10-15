@@ -139,7 +139,7 @@ fn inst_card_sums_eight_copies_of_itself() {
     );
     let mut host = temen_interp::Host::new();
     host.set_self_module(&m);
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1); // the page's `minter`
     host.grant_child_image();
     let mut fuel = 50_000_000u64;

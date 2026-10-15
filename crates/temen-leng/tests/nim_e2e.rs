@@ -3747,7 +3747,7 @@ fn a_nim_domain_and_a_c_domain_share_a_ring() {
     let parent = ring_parent();
     let host = || {
         let mut host = temen_interp::Host::new();
-        let inst = host.grant_instantiator(0, 1 << 17);
+        let inst = host.grant_instantiator();
         let aspace = host.grant_address_space(0, 1 << 17);
         let nim = host.grant_module(&producer);
         let c = host.grant_module(&c);

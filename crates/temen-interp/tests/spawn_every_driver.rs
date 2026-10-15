@@ -164,7 +164,7 @@ fn a_grant_carrying_record_spawn() {
     let m = module(&op17_granted());
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let o = h.grant_stream(StreamRole::Out);
         let e = h.grant_stream(StreamRole::Err);
         let b = h.grant_budget(-1, 1 << 20, -1);
@@ -185,7 +185,7 @@ fn a_budget_funded_module_record_spawn() {
     let child = module(CHILD_42);
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(&child);
         let b = h.grant_budget(5_000_000, -1, -1);
         (h, vec![Value::I32(i), Value::I32(c), Value::I64(b as i64)])
@@ -267,7 +267,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
 fn detached_setup(child: &Module, mem: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(child);
         let b = h.grant_budget(-1, mem, -1);
         let o = h.grant_stream(StreamRole::Out);
@@ -665,7 +665,7 @@ fn handles_agree(drivers: &[Driver], what: &str, ops: &str, want: &Ran) {
     let m = module(&three_children_then(ops));
     let child = module(CHILD_RETURNS_PAYLOAD);
     let setup = |h: &mut Host| {
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(&child);
         let b = h.grant_budget(-1, 1 << 20, -1);
         let o = h.grant_stream(StreamRole::Out);
@@ -911,7 +911,7 @@ fn generations_setup<'a>(
 ) -> impl Fn() -> (Host, Vec<Value>) + 'a {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", b);
         let mut args = vec![Value::I32(i)];
@@ -1028,7 +1028,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
 fn spawn_setup(child: &Module, spawn: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(child);
         let b = h.grant_budget(-1, 1 << 20, spawn);
         (h, vec![Value::I32(i), Value::I32(c), Value::I32(b)])
@@ -1768,7 +1768,7 @@ fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     let m = module(LIVE_CALLER);
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, 1 << 20, -1);
         let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         (h, [i, c, b].map(Value::I32).to_vec())

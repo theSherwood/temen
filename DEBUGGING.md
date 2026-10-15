@@ -663,8 +663,8 @@ different things depending on which pair you compare:
   *and* separate-module) on **both** engines, plus **§14 `instantiate` / `instantiate_module` children**
   on the scheduled engine (which is what admits scheduled coroutines) and **page-mapping windows**
   (`map`/`unmap`/`protect`/grow) — root *and* child, plus **demand** (`fault_yields`) coroutines — the
-  page-protection map is captured alongside the bytes. (A carve child's bytes ride the parent's image,
-  and the carve is being retired — INVARIANTS #13, 2026-09-29. A **detached** child's env carries its
+  page-protection map is captured alongside the bytes. (A carve child's bytes rode the parent's image,
+  and the carve is retired — INVARIANTS #13, 2026-09-29, deleted in #1867. A **detached** child's env carries its
   own window image and its powerbox, the handle table by the freeze's own durable capture with
   inherited stdio re-aliased to the spawner's on restore, and the checkpoint carries the run's budget
   tree, which the child's spawn charged (#1866). A child whose powerbox holds anything but plain values
@@ -1831,8 +1831,8 @@ exposing the read-only/control verbs W1–W3/W7 need (breakpoints, watchpoints, 
 read window/locals, record/replay control, model-check/replay). It is **not** a guest-callable
 capability by default — it is a *host* capability (the embedder/debugger holds it), consistent
 with "debugger observes from outside." Nesting (§14) makes a parent a natural debugger of a
-child. (That rests on the carve child's parent-readable window, which is being retired —
-INVARIANTS #13, 2026-09-29. A detached child's window is ancestor-readable only by grant, and the
+child. (That rested on the carve child's parent-readable window, which is retired —
+INVARIANTS #13, 2026-09-29, deleted in #1867. A detached child's window is ancestor-readable only by grant, and the
 owner decided on 2026-10-01 (#1866) which grant: **inspecting a detached child is the freeze
 grant**, since a snapshot is a read. An ancestor may inspect a child it holds freeze authority
 over and that attests `freeze_exposed`; a child nobody may freeze is

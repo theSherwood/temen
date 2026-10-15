@@ -84,7 +84,7 @@ block 0 (vsp: i64, varg: i64) {{
 /// The spawning root's powerbox: an instantiator, a budget, and the child image of its func 1.
 fn spawn_host(m: &temen_ir::Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     (host, [inst, budget, child].map(Value::I32).to_vec())
