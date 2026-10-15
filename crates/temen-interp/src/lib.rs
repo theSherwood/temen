@@ -21317,13 +21317,23 @@ impl Completions {
         g.ready.remove(&id)
     }
 
-    /// Block until completion `id` has arrived, and leave it for the drain to take: the cooperative
-    /// pump's idle wait (#2047), which then delivers it the way every round does.
-    pub fn wait_ready(&self, id: u64) {
-        let mut g = self.mx.lock_unpoisoned();
-        while !g.ready.contains_key(&id) {
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-        }
+    /// Block until completion `id` has arrived, or for at most `within`, and leave it for the drain
+    /// to take: the cooperative pump's idle wait (#2047), which then delivers it the way every
+    /// round does, and its wait for its next deadline (#1979). Whether it has arrived.
+    pub fn wait_ready(&self, id: u64, within: Option<std::time::Duration>) -> bool {
+        let g = self.mx.lock_unpoisoned();
+        let not_yet = |s: &mut CompletionState| !s.ready.contains_key(&id);
+        let g = match within {
+            None => self
+                .cv
+                .wait_while(g, not_yet)
+                .unwrap_or_else(|e| e.into_inner()),
+            Some(d) => {
+                let waited = self.cv.wait_timeout_while(g, d, not_yet);
+                waited.unwrap_or_else(|e| e.into_inner()).0
+            }
+        };
+        g.ready.contains_key(&id)
     }
 
     /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
