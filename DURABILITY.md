@@ -639,9 +639,10 @@ because the runtime reads and writes them at every safepoint, freeze and thaw, a
 which cannot see the child's window, could only supply a stale copy (the cause of #2438's
 silent wrong results). The harvest captures only a child whose run ended by unwinding; one
 that trapped, that ran to its end, or that a deadlock teardown reaped keeps a window but has
-nothing to resume, and the freeze is refused (`DetachedUnreached`). Paging runs on the
-tree-walker only (#2164): a routed run of a pager-capable program thaws there as it runs
-there, and the Cranelift JIT refuses to thaw a paged child rather than run it with no pager.
+nothing to resume, and the freeze is refused (`DetachedUnreached`). A durable run pages on the
+tree-walker only: the bytecode engine's durable entry declines a module that spawns (§4), so a
+routed run of a pager-capable program freezes and thaws there, and the Cranelift JIT, which has
+no paging (#2164), refuses to thaw a paged child rather than run it with no pager.
 Pinned by `temen`'s `durable_paged_detached.rs` and `temen-snapshot`'s
 `detached_roundtrip.rs`.
 

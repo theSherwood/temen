@@ -5458,7 +5458,9 @@ struct PagerRef {
 
 /// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
 /// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
-/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see.
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see. Both
+/// interpreters file and settle it through the pager's host ([`Host::request_page`],
+/// [`Host::settle_page`], #2164).
 struct PageSink {
     child: Mem,
     /// The page's child-relative base.
@@ -5470,36 +5472,38 @@ struct PageSink {
     off: u64,
 }
 
-/// §2.2 / #1862 — settle a `page(addr)` request: copy the page the pager's reply `value` names
-/// out of the **pager's own window** (`pager_mem`, the serving vCPU's) into the faulting child's,
-/// then mark it mapped. `value` is the pager-window address of the faulting byte's source; the
-/// page around it is `[value - off, value - off + len)`. Runs on the pager's vCPU at the settle,
-/// before the reply is delivered, so the pager cannot reuse its buffer before the copy. Returns
-/// the value to deliver: unchanged, or `EFAULT` when the pager's window cannot supply that range
-/// (the child's fault is then fatal, as a pagerless one is). A ticket with no sink (not a page
-/// request) passes through.
-fn supply_page_at_settle(
-    sched: &SchedRef,
-    pager: &Arc<Mutex<Host>>,
-    ticket: u64,
-    value: i64,
-    pager_mem: Option<&Mem>,
-) -> i64 {
-    let Some(sink) = sched.take_page_sink(pager, ticket) else {
-        return value;
-    };
-    if value < 0 {
-        return value;
-    }
-    let bytes = (value as u64)
-        .checked_sub(sink.off)
-        .and_then(|src| pager_mem?.read_bytes_impl(src, sink.len));
-    match bytes {
-        Some(b) => {
-            sink.child.supply_page(sink.page, &b);
-            value
+impl PageSink {
+    /// The sink for a recoverable fault at `addr` in `child`'s window: the host page around it.
+    fn at(child: &Mem, addr: u64) -> PageSink {
+        let page = addr / child.page * child.page;
+        PageSink {
+            child: child.fork_for_thread(),
+            page,
+            len: child.page.min(child.window.mapped() - page),
+            off: addr - page,
         }
-        None => EFAULT,
+    }
+
+    /// Settle the request: copy the page the pager's reply `value` names out of the **pager's own
+    /// window** (`pager_mem`, the serving vCPU's) into the faulting child's, then mark it mapped.
+    /// `value` is the pager-window address of the faulting byte's source; the page around it is
+    /// `[value - off, value - off + len)`. Returns the value to deliver: unchanged, or `EFAULT`
+    /// when the pager's window cannot supply that range (the child's fault is then fatal, as a
+    /// pagerless one is).
+    fn supply(self, value: i64, pager_mem: Option<&Mem>) -> i64 {
+        if value < 0 {
+            return value;
+        }
+        let bytes = (value as u64)
+            .checked_sub(self.off)
+            .and_then(|src| pager_mem?.read_bytes_impl(src, self.len));
+        match bytes {
+            Some(b) => {
+                self.child.supply_page(self.page, &b);
+                value
+            }
+            None => EFAULT,
+        }
     }
 }
 
@@ -6059,17 +6063,18 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 }
 
 /// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
-/// releases: its §2.2 pager, and — for a §14 child's entry vCPU (the one vCPU with a `freeze_bell`):
-/// the child domain's end, not a thread of it finishing — the
-/// provider of every live offer its powerbox still holds ([`Binding::LiveImpl`], the re-granted
-/// `child_offer` shape). Instanced offers (CALLS.md 4x, animated on the caller's own vCPU) never
-/// park a provider on this client, so they are not listed. Locks the host cells briefly, never
-/// nested; call it before taking the scheduler lock.
+/// releases. Only a §14 child's entry vCPU (the one vCPU with a `freeze_bell`) has any: its end is
+/// the child domain's, where a thread of it finishing is not. They are its §2.2 pager, which its
+/// threads share (#2164), and the provider of every live offer its powerbox still holds
+/// ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers (CALLS.md 4x,
+/// animated on the caller's own vCPU) never park a provider on this client, so they are not
+/// listed. Locks the host cells briefly, never nested; call it before taking the scheduler lock.
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
-    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    if v.freeze_bell.is_some() {
-        cells.extend(v.host.lock_unpoisoned().live_offer_providers());
+    if v.freeze_bell.is_none() {
+        return Vec::new();
     }
+    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
+    cells.extend(v.host.lock_unpoisoned().live_offer_providers());
     let mut ids: Vec<usize> = cells
         .iter()
         .map(|c| c.lock_unpoisoned().domain_id() as usize)
@@ -6238,11 +6243,6 @@ struct Sched {
     /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
     /// call volume.
     orphan_tickets: BTreeSet<(usize, u64)>,
-    /// §2.2 / #1862 — the page each in-flight `page(addr)` request supplies, keyed like
-    /// [`Sched::ticket_waiters`] by `(pager domain id, ticket)`. Filed by the faulting child in
-    /// the same scheduler critical section as its enqueue, so the pager can never settle the
-    /// request before its sink exists; taken at the settle ([`supply_page_at_settle`]).
-    page_sinks: BTreeMap<(usize, u64), PageSink>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -6798,9 +6798,12 @@ impl Scheduler {
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
-        let callee_id = callee.lock_unpoisoned().domain_id() as usize;
-        // #1862 — a page request settled without a copy (an error reply) drops its sink here.
-        s.page_sinks.remove(&(callee_id, ticket));
+        let callee_id = {
+            let mut c = callee.lock_unpoisoned();
+            // #1862 — a page request answered without a settle (an error reply) drops its sink.
+            c.page_sinks.remove(&ticket);
+            c.domain_id() as usize
+        };
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -9403,26 +9406,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // #1862: the pager gets the fault address in the child's own coordinates, and its
-                // reply is copied into the child through the sink filed here. Enqueue and sink are
-                // one scheduler critical section (lock order sched → host), so the pager cannot
-                // settle the request before its sink exists.
+                // reply is copied into the child through the sink filed with the request.
                 let (ticket, pager_id) = {
                     let m = v.mem.as_ref().expect("a demand child has a window");
-                    let page = addr / m.page * m.page;
-                    let sink = PageSink {
-                        child: m.fork_for_thread(),
-                        page,
-                        len: m.page.min(m.window.mapped() - page),
-                        off: addr - page,
-                    };
-                    let mut s = sched.lock();
+                    let sink = PageSink::at(m, addr);
                     let mut cg = pb.cell.lock_unpoisoned();
-                    let id = cg.domain_id();
-                    let t = cg.svc_enqueue(pb.export, 0, vec![addr as i64]);
-                    if let Some(t) = t {
-                        s.page_sinks.insert((id as usize, t), sink);
-                    }
-                    (t, id)
+                    (cg.request_page(pb.export, sink), cg.domain_id())
                 };
                 let Some(t) = ticket else {
                     // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
@@ -9641,17 +9630,6 @@ enum SchedRef {
 }
 
 impl SchedRef {
-    /// §2.2 / #1862 — take the page sink filed for `pager`'s dispatch `ticket`, if that dispatch is
-    /// a page request. The explorer runs no demand children, so it never has one.
-    fn take_page_sink(&self, pager: &Arc<Mutex<Host>>, ticket: u64) -> Option<PageSink> {
-        match self {
-            SchedRef::Real(s) => {
-                let id = pager.lock_unpoisoned().domain_id() as usize;
-                s.lock().page_sinks.remove(&(id, ticket))
-            }
-            SchedRef::Det(_) => None,
-        }
-    }
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         match self {
             SchedRef::Real(s) => s.spawn(make),
@@ -13056,7 +13034,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         chain,
         cur,
         fault_pager,
-        pager: _,
+        pager,
         page_fault: _,
         reply_ticket: _,
         frames,
@@ -14889,9 +14867,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
                                     // vCPU's window, before the reply can wake the child.
-                                    let value = supply_page_at_settle(
-                                        sched,
-                                        host,
+                                    let value = host.lock_unpoisoned().settle_page(
                                         run.ticket,
                                         value,
                                         mem.as_ref(),
@@ -16600,6 +16576,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
                     // / top-level thread) stays unkillable.
                     let kill_inherit = kill.clone();
+                    // §2.2 / #2164 — and its pager: the thread runs over the same demand-paged window,
+                    // whose pages the pager supplies whichever vCPU touches one first.
+                    let pager_inherit = pager.clone();
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
                     let mut h = host.lock_unpoisoned();
@@ -16638,6 +16617,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
+                        child.fault_pager = pager_inherit.is_some();
+                        child.pager = pager_inherit;
                         child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         child.live = live;
                         Box::new(child)
@@ -23248,6 +23229,17 @@ pub struct Host {
     frozen_handlers: BTreeMap<u32, u64>,
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
+    /// §2.2 / #1862 — where each in-flight `page(addr)` request on this domain lands, by ticket:
+    /// filed with the request ([`Host::request_page`]), taken at its settle
+    /// ([`Host::settle_page`]) or dropped by an error reply that settles nothing. Never cut data:
+    /// a freeze holds a pager until its paged children have unwound, so no request is in flight
+    /// at the cut (#2455).
+    page_sinks: BTreeMap<u64, PageSink>,
+    /// §2.2 / #2164 — the bytecode engine's pager edge, on a demand-paged detached child's
+    /// powerbox: the export, on its spawner's program, whose `page` op supplies this domain's
+    /// window, served by its spawner's domain. A recoverable fault in the window is a request to it.
+    /// (The tree-walker keeps its edge on the vCPU, [`VCpu::pager`].)
+    pager: Option<u32>,
     svc_next_ticket: u64,
     /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
     /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
@@ -24110,6 +24102,8 @@ impl Host {
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
+            page_sinks: BTreeMap::new(),
+            pager: None,
             reply_waits: BTreeMap::new(),
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
@@ -28370,6 +28364,29 @@ impl Host {
             ticket,
         });
         Some(ticket)
+    }
+
+    /// §2.2 / #1862 — enqueue a demand child's `page(addr)` request on pager export `export`, the
+    /// fault address `sink`'s, and file `sink`, where its reply lands. One lock of this host covers
+    /// both, so the pager cannot settle the request before its sink exists. `None` when the queue
+    /// is full: backpressure, and the child re-faults.
+    fn request_page(&mut self, export: u32, sink: PageSink) -> Option<u64> {
+        let addr = sink.page + sink.off;
+        let ticket = self.svc_enqueue(export, 0, vec![addr as i64])?;
+        self.page_sinks.insert(ticket, sink);
+        Some(ticket)
+    }
+
+    /// §2.2 / #1862 — settle served dispatch `ticket`, whose handler returned `value`: a page
+    /// request's page moves from the pager's window `pager_mem`, the serving vCPU's, into its
+    /// child's ([`PageSink::supply`]). The settle runs before the reply is delivered, so the pager
+    /// cannot reuse its buffer before the copy, and the child cannot run before its page is in
+    /// place. Returns the value to deliver; any other dispatch's passes through.
+    fn settle_page(&mut self, ticket: u64, value: i64, pager_mem: Option<&Mem>) -> i64 {
+        match self.page_sinks.remove(&ticket) {
+            Some(sink) => sink.supply(value, pager_mem),
+            None => value,
+        }
     }
 
     /// Take a served dispatch's result (first result slot; `0` for a no-result handler).

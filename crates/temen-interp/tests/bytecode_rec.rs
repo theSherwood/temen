@@ -3,14 +3,14 @@
 //! bytecode engine (`compile_and_run_with_host`), asserting identical results — and the
 //! `.expect(...)` on the engine's `Option` is the non-vacuity gate: if the engine *declined* the
 //! module (fell back), the test fails. That is what distinguishes these pins from the
-//! `temen`-crate record differentials, which run through temen-run's `Backend::Bytecode` — a path
-//! that folds every `Instantiator` module to the tree-walker and so never exercises the native
-//! `Op::InstantiateRec`.
+//! `temen`-crate record differentials, which run through temen-run's `Backend::Bytecode`, where a
+//! module the engine declines runs on the tree-walker without a word.
 //!
 //! Tier boundaries pinned here:
-//! - a **pager-capable** module (op 17 + impl exports) must *decline* to the oracle, which owns
-//!   demand paging (`compile_module_for`'s veto — the bytecode twin of temen-run's
-//!   `module_demand_spawns` fold on the Cranelift tier);
+//! - a **pager-capable** module (op 17 + a pager-shaped export) runs on a driver that serves its
+//!   children, which pages them (#2164), and declines to the oracle on one that does not
+//!   (`compile_module_for`'s veto; temen-run's `module_demand_spawns` folds it off the Cranelift
+//!   tier, which has no paging);
 //! - a **budget** funds the child natively, and a dangling one refuses the spawn probeably. What a
 //!   budget bounds is pinned on every driver by `spawn_every_driver.rs`.
 
@@ -23,10 +23,9 @@ use temen_text::parse_module;
 
 use temen_ir::errno::EINVAL;
 
-/// A record spawn (the v1 record [`rec_with_impl_export`] appends at 17536) plus an **impl export**
-/// (a pager-capable module): op 17 present + impl exports ⇒ the whole module must decline to the
-/// tree-walk oracle (the record's pager field is runtime data, so admission is by module shape —
-/// `compile_module_for`).
+/// A record spawn (the v1 record [`rec_with_impl_export`] appends at 17536) plus a **pager-shaped
+/// export** (a pager-capable module). The record's pager field is runtime data, so admission is by
+/// the module's shape (`compile_module_for`).
 const REC_WITH_IMPL_EXPORT: &str = r#"memory 17
 type 0 func (i64) -> (i64)
 type 1 interface { page: 0 }
@@ -47,8 +46,8 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// [`REC_WITH_IMPL_EXPORT`] with its record. The module declines by its shape, before the record
-/// is read.
+/// [`REC_WITH_IMPL_EXPORT`] with its record. Admission is by the module's shape; the record is
+/// never read here.
 fn rec_with_impl_export() -> String {
     format!(
         "{REC_WITH_IMPL_EXPORT}{}",
@@ -138,22 +137,20 @@ fn record_spawn_is_native_and_matches_the_oracle() {
     assert_eq!(r_bc, r_tw, "record spawn: bytecode != tree-walker");
 }
 
-/// The pager admission veto: an op-17 module WITH impl exports declines whole (the oracle owns
-/// demand paging), on both the orchestration entry and the cooperative runner.
+/// #2164 — the pager admission: a driver that serves its children pages them, so it admits a
+/// pager-capable module; a `Vcpu` serves none, so it declines the module whole to the oracle. What
+/// the paging does is pinned on every driver by `temen`'s `instantiate_record.rs`.
 #[test]
-fn pager_capable_record_module_declines_to_the_oracle() {
+fn a_pager_capable_record_module_runs_where_children_are_served() {
     let m = parse_module(&rec_with_impl_export()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     assert!(
-        bytecode::VcpuProgram::compile(&m).is_none(),
-        "op 17 + impl exports must decline (pager records are runtime data)"
+        bytecode::admits(&m),
+        "the cooperative driver pages its children itself"
     );
-    let mut h = Host::new();
-    let i = h.grant_instantiator();
-    let mut fuel = 10_000_000u64;
     assert!(
-        bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(i)], &mut fuel, &mut h).is_none(),
-        "cooperative entry must decline the pager-capable module too"
+        bytecode::VcpuProgram::compile(&m).is_none(),
+        "a `Vcpu` serves no children, so it declines a module that could page one"
     );
 }
 
@@ -181,4 +178,120 @@ fn dangling_budget_handle_refuses_the_detached_spawn_on_both_engines() {
         &mut h_bc,
     );
     assert_eq!(r_bc, r_tw, "dangling budget: bytecode != tree-walker");
+}
+
+/// #2164 — a paged child's thread pages too: it runs over the child's window, whose pages the pager
+/// supplies whichever vCPU touches one first. The parent spawns the child through a record naming its
+/// `pager` export, serves in `svc.wait` until that answers 0 (its client has ended, #1217), joins,
+/// and returns `child + serves * 1000`. Its pager stores 77 at `addr + 40000` and replies with that
+/// address. The child (a module of its own, so the parent's serve escape admits the parent) joins a
+/// thread that reads 32768, a page nothing has touched, then reads 49152 itself, and returns the
+/// sum. The tree-walker paged only a child's first vCPU, so the thread's fault ended the child; and
+/// only the child's end, not its thread's, may tell the pager its client is gone.
+#[test]
+fn a_paged_childs_thread_is_served_on_every_engine() {
+    let parent = format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ page: 0 }}
+export 0 interface "pager" 1 {{ page: 1 }}
+func (i32, i64, i32) -> (i64) {{
+block 0 (v0: i32, v1: i64, v2: i32) {{
+  qma = i64.const 17560
+  i32.store qma v2
+  qb = i32.wrap_i64 v1
+  qba = i64.const 17564
+  i32.store qba qb
+  qa0 = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
+  vz = i64.const 0
+  br 1(v0, vch, vz)
+}}
+block 1 (vh: i32, vch1: i32, vt: i64) {{
+  vzw = i32.const 0
+  vs = svc.wait vzw
+  vt2 = i64.add vt vs
+  vz1 = i64.const 0
+  vgone = i64.eq vs vz1
+  br_if vgone 2(vh, vch1, vt2) 1(vh, vch1, vt2)
+}}
+block 2 (vh2: i32, vch2: i32, vt3: i64) {{
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
+  vk = i64.const 1000
+  vsk = i64.mul vt3 vk
+  vr = i64.add vj vsk
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vaddr: i64) {{
+  voff = i64.const 40000
+  vsrc = i64.add vaddr voff
+  vb = i32.const 77
+  i32.store8 vsrc vb
+  return vsrc
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17536,
+            &SpawnRec {
+                pager: 0,
+                ..SpawnRec::v1()
+            }
+        )
+    );
+    let child = parse_module(
+        "memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vsp = i64.const 0
+  va = i64.const 32768
+  vh = thread.spawn 1 vsp va
+  vj = thread.join vh
+  vb2 = i64.const 49152
+  vc = i32.load8_u vb2
+  vcw = i64.extend_i32_u vc
+  vr = i64.add vj vcw
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vaddr: i64) {
+  vb = i32.load8_u vaddr
+  vbw = i64.extend_i32_u vb
+  return vbw
+  }
+}
+",
+    )
+    .expect("parse");
+    temen_verify::verify_module(&child).expect("verify");
+    let m = std::sync::Arc::new(parse_module(&parent).expect("parse"));
+    let powerbox = || {
+        let mut h = Host::new();
+        h.set_self_module(&m);
+        let i = h.grant_instantiator();
+        let c = h.grant_module(&child);
+        let b = h.grant_budget(5_000_000, -1, -1);
+        (h, [Value::I32(i), Value::I64(b as i64), Value::I32(c)])
+    };
+    let served = Ok(vec![Value::I64(2154)]);
+    let (mut h, args) = powerbox();
+    assert_eq!(tw(&parent, &args, &mut h), served, "oracle");
+    let (mut h, args) = powerbox();
+    assert_eq!(bc(&parent, &args, &mut h), served, "cooperative driver");
+    let (mut h, args) = powerbox();
+    let mut fuel = 10_000_000u64;
+    let (r, _) = bytecode::compile_and_run_capture_over_parallel_with_host(
+        &m,
+        0,
+        &args,
+        &mut fuel,
+        &[],
+        None,
+        &mut h,
+    )
+    .expect("the parallel driver runs it natively");
+    assert_eq!(r, served, "parallel driver");
 }

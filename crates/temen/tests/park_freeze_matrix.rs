@@ -124,16 +124,14 @@ fn jit_row(site: ParkSite) -> Row {
                 "the JIT's `live_impl_call` reply park: its re-park on thaw, and the re-link of a \
                   `LiveImpl` onto a re-launched detached child",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 2164,
+            why: "the engine has no demand paging: a pager-capable program runs on an interpreter",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
-
-const PAGE_FAULT_PENDING: Row = Row::Pending {
-    issue: 2164,
-    why: "the engine has no demand paging: a pager-capable program folds to the tree-walker",
-};
 
 const COMPLETION_PENDING: Row = Row::Pending {
     issue: 1902,
@@ -170,7 +168,11 @@ fn bytecode_row(site: ParkSite) -> Row {
             issue: 1904,
             why: "a live call's reply park: its re-park on thaw (#1901)",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 1893,
+            why: "only a detached child pages (#2164), and a durable run on this engine refuses a \
+                  detached spawn: its freeze cannot capture one",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -524,7 +526,7 @@ fn page_fault(site: ParkSite, engine: Engine) {
     assert_eq!(
         engine,
         Engine::Interp,
-        "only the tree-walker demand-pages (#2164)"
+        "only the tree-walker freezes a paged child (#1893, #2164)"
     );
     paged_detached::fault_parked_at_the_trigger_thaws();
 }

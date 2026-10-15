@@ -1733,24 +1733,27 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// driver declines such a module to the tree-walk oracle.
 ///
 /// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
-/// pager-shaped export ([`Module::declares_pager`]) could build a pager record, which only the
-/// oracle serves (native paging is #2164), so it declines. A module with no such export builds no
-/// valid pager record — spawn validation refuses one identically on every tier — so the record
-/// spawn runs natively. The same key as temen-run's `module_demand_spawns` fold for the JIT.
+/// pager-shaped export ([`Module::declares_pager`]) could build a pager record. A driver that serves
+/// its children pages them (#2164): a paged child's fault is a call into its spawner's domain. Every
+/// other driver declines such a module to the oracle. A module with no such export builds no valid
+/// pager record — spawn validation refuses one identically on every tier — so the record spawn runs
+/// natively. The same key as temen-run's `module_demand_spawns` fold for the JIT.
 fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
-    let uses_rec = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::CapCall {
-                    type_id: super::cap_id::INSTANTIATOR,
-                    op: 17,
-                    ..
-                }
-            )
+    let uses_rec = || {
+        m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 17,
+                        ..
+                    }
+                )
+            })
         })
-    });
-    if uses_rec && m.declares_pager() {
+    };
+    if !serves_children && m.declares_pager() && uses_rec() {
         return None;
     }
     let escape = serves_children && bytecode_serves_children(m);
@@ -1803,6 +1806,9 @@ struct DetachedSpawn {
     /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
     /// before it starts.
     premap: Option<(i32, u64)>,
+    /// §2.2 — the pager: an export of the spawner's program, checked at the op, whose `page` op
+    /// supplies the child's demand-paged window (#2164).
+    pager: Option<u32>,
 }
 
 impl DetachedSpawn {
@@ -1815,6 +1821,7 @@ impl DetachedSpawn {
             grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
             args: (sr.args.1 > 0).then_some(sr.args),
             premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+            pager: (sr.pager != u32::MAX).then_some(sr.pager),
         }
     }
 }
@@ -1983,6 +1990,8 @@ struct FreshWindow {
     /// The module the child runs: its data segments seed the window.
     module: std::sync::Arc<Module>,
     payload: Vec<u8>,
+    /// §2.2 — the window starts demand-paged: every page arrives through its pager's reply.
+    paged: bool,
 }
 
 impl FreshWindow {
@@ -2005,6 +2014,10 @@ impl FreshWindow {
         });
         if !self.payload.is_empty() {
             let _ = mem.write_bytes(temen_ir::module_args_base(), &self.payload);
+        }
+        // As the tree-walker builds a paged window: seeded, then demand-paged, then pre-mapped.
+        if self.paged {
+            mem.demand_page();
         }
         if host.apply_premap(&mut mem) < 0 {
             return Err(Trap::Malformed);
@@ -2047,6 +2060,12 @@ fn admit_detached_child(
     freezes_detached: bool,
     source: &ModuleSource,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+    // §2.2 — a paged child's faults are calls into its spawner's serve loop, through the spawner's
+    // own cell, as a live self-serve grant's are (#744): a spawner in no cell cannot page one. The
+    // record named the pager before anything else was checked, so it fails first (#2164).
+    if s.pager.is_some() && host.own_cell().is_none() {
+        return Err(Trap::CapFault);
+    }
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         let program = granted_program(host, source, g)?;
@@ -2117,7 +2136,8 @@ fn admit_detached_child(
     let mut child_host = host.child_host();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
-    child_host.set_attestation(host.detached_child_attestation(false));
+    child_host.set_attestation(host.detached_child_attestation(s.pager.is_some()));
+    child_host.pager = s.pager;
     // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
     // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
     child_host.set_lane_cap(lane);
@@ -2163,6 +2183,7 @@ fn admit_detached_child(
         shadow: cshadow,
         module: cmodule,
         payload,
+        paged: s.pager.is_some(),
     };
     Ok(Some((child, window)))
 }
@@ -4898,6 +4919,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::ChildOffer { grant: true, .. }) => {
                     return VcpuEvent::Trapped(Trap::ThreadFault)
                 }
+                // #2164 — no child of this driver pages (`admit_record` refuses a pager), so a fault
+                // here is a pagerless one.
+                Ok(VcpuStop::PageFault(_)) => return VcpuEvent::Trapped(Trap::MemoryFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -7472,6 +7496,7 @@ fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
             TaskState::BlockedHostCap { id, .. } => (5, id),
             TaskState::BlockedSvc
             | TaskState::BlockedTicket { .. }
+            | TaskState::BlockedPage { .. }
             | TaskState::BlockedReap { .. }
             | TaskState::BlockedReapPersonality { .. }
             | TaskState::BlockedPipeRead { .. }
@@ -7837,6 +7862,10 @@ fn service_advance(
             | Outcome::SvcWait
             | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
+
+            // Paging: a page comes from its pager's serve loop. This engine's domains sit in no
+            // cell, so it refuses a paged spawn (`admit_detached_child`), and no fault reaches here.
+            Outcome::PageFault(_) => return Serviced::Declined,
 
             // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
             // run harness rather than the debug scheduler.
@@ -10436,6 +10465,10 @@ impl DispatchParks {
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
+    /// §2.2 / #2164 — a demand-paged child's recoverable fault at this window address: its pager
+    /// must supply the page. The cursor sits AT the faulting op, which re-executes once the page is
+    /// in place. Only a child the driver pages raises it ([`Host::pager`]).
+    PageFault(u64),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
     /// function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
     /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
@@ -12221,6 +12254,8 @@ fn drive_nested(
             {
                 return Err(Trap::CapFault)
             }
+            // An unserviced seam. Among them a fault on a paged child's unsupplied page: a nested
+            // drive cannot park on its pager yet, where the oracle's invoke pages (#2472).
             _ => return Err(Trap::CapFault),
         }
     }
@@ -12230,6 +12265,9 @@ fn drive_nested(
 /// (`thread.*` / `memory.*`) event the scheduler must service. Fiber switches never reach here —
 /// `step_vcpu` handles them against the run's fiber registry ([`FiberCell`]).
 enum VcpuStop {
+    /// §2.2 / #2164 — a demand-paged child's fault at this window address ([`Outcome::PageFault`]):
+    /// park the task on its `page` request to its pager.
+    PageFault(u64),
     /// I48 — a `cont.resume.block` whose target fiber is still event-parked: idle this task on the
     /// fiber (`TaskState::BlockedOnFiber`). `step_vcpu` already rewound the resumer's cursor to the
     /// resume op, so the wake re-executes it.
@@ -12620,6 +12658,7 @@ fn step_vcpu(
                 })
             }
             Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
+            Outcome::PageFault(addr) => return Ok(VcpuStop::PageFault(addr)),
             Outcome::ChildCtl { child, dst, ctl } => {
                 return Ok(VcpuStop::ChildCtl { child, dst, ctl })
             }
@@ -13057,6 +13096,14 @@ enum TaskState {
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
     },
+    /// §2.2 / #2164 — parked on a page fault: `ticket` is its `page(addr)` request on `pager`, its
+    /// spawner's domain. The settle-wake scan claims the reply as it claims a live call's: the page
+    /// is in place, so the task runs again and its faulting op re-executes; or the pager refused
+    /// it (`< 0`), and the task ends with `MemoryFault`, as a pagerless fault does.
+    BlockedPage {
+        ticket: u64,
+        pager: std::sync::Arc<std::sync::Mutex<Host>>,
+    },
     /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes;
     /// the settle scan delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A
     /// trapped twin reaps as a nonzero crash status, never a propagated trap (reap ≠ join).
@@ -13271,6 +13318,7 @@ impl TaskState {
             // A `cont.resume.block` resumer idles beside the serve loop, as on the oracle.
             TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => Some(ParkSite::Svc),
             TaskState::BlockedTicket { .. } => Some(ParkSite::Reply),
+            TaskState::BlockedPage { .. } => Some(ParkSite::PageFault),
             TaskState::BlockedReapPersonality { .. } => Some(ParkSite::Reap),
             TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
             TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
@@ -13332,12 +13380,15 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
-/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
-/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
-/// re-admitted call would be issued twice, and it declines instead (#1904).
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait and a page fault. The
+/// oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901); this engine has no
+/// re-park yet, so a re-admitted call would be issued twice, and it declines instead (#1904). The
+/// oracle holds a pager until its paged children have unwound (#2455), so a fault waits for its page;
+/// this engine has no hold, so it declines. No fault parks in a freeze yet: a durable run on this
+/// engine refuses a detached spawn (#1893), and only a detached child pages.
 fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
     match site {
-        super::ParkSite::Reply => super::FreezeRule::Decline,
+        super::ParkSite::Reply | super::ParkSite::PageFault => super::FreezeRule::Decline,
         s => s.freeze_rule(),
     }
 }
@@ -13834,24 +13885,34 @@ fn settle_wakes(
 ) {
     // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
     // callee's serve loop completed its dispatch; claiming the completion cell delivers the
-    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
-    for t in tasks.iter_mut() {
-        let hit = match &t.state {
-            TaskState::BlockedTicket {
-                ticket,
-                callee,
-                dst,
-            } => callee
-                .lock_unpoisoned()
-                .svc_results
-                .remove(ticket)
-                .map(|v| (v, *dst)),
-            _ => None,
+    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell). A task
+    // parked on a page request claims its reply the same way (#2164): the page is in place and
+    // the faulting op re-executes, or the pager refused it and the fault is fatal.
+    let mut refused = Vec::new();
+    for (i, t) in tasks.iter_mut().enumerate() {
+        let (TaskState::BlockedTicket { ticket, callee, .. }
+        | TaskState::BlockedPage {
+            ticket,
+            pager: callee,
+        }) = &t.state
+        else {
+            continue;
         };
-        if let Some((v, dst)) = hit {
-            t.deliver(dst, Reg::from_i64(v));
-            t.state = TaskState::Runnable;
+        let Some(v) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
+            continue;
+        };
+        match t.state {
+            TaskState::BlockedTicket { dst, .. } => t.deliver(dst, Reg::from_i64(v)),
+            _ if v < 0 => {
+                refused.push(i);
+                continue;
+            }
+            _ => {}
         }
+        t.state = TaskState::Runnable;
+    }
+    for i in refused {
+        complete(tasks, i, Err(Trap::MemoryFault));
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
@@ -13897,14 +13958,19 @@ fn settle_wakes(
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
-            // #1217 — a §14 child's end releases every service it held a live offer to: it
-            // can no longer call one, so a `svc.wait` there answers `0` instead of waiting
-            // for it (a token, when no serve loop is parked yet), as on the oracle.
-            let services = if extra_envs[k].nested {
+            // #1217 — a §14 child's end releases every service it held a live offer to, and the
+            // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there
+            // answers `0` instead of waiting for it (a token, when no serve loop is parked yet),
+            // as on the oracle (`client_gone_targets`).
+            let mut services = if extra_envs[k].nested {
                 h.live_offer_providers()
             } else {
                 Vec::new()
             };
+            if h.pager.is_some() {
+                let pager = task_host(root, extra_envs, extra_envs[k].spawner);
+                services.push(std::sync::Arc::clone(pager));
+            }
             drop(h);
             for service in services {
                 service.lock_unpoisoned().set_client_gone();
@@ -14909,6 +14975,36 @@ impl SchedCore {
                     callee,
                     dst,
                 };
+            }
+            // §2.2 / #2164 — a demand-paged child's fault, the oracle's `Step::PageFault` in
+            // cooperative form: a `page(addr)` request to the pager export on its spawner's domain,
+            // with the sink its reply lands in, and the task parks on the reply as a live caller
+            // parks on its ticket. A full queue is backpressure: the task stays runnable, and its
+            // re-executed op faults and asks again.
+            Ok(VcpuStop::PageFault(addr)) => {
+                let paged = tasks[ti].env.and_then(|k| {
+                    let e = &extra_envs[k];
+                    let export = e.host.lock_unpoisoned().pager?;
+                    Some((
+                        e.spawner,
+                        export,
+                        super::PageSink::at(e.mem.as_ref()?, addr),
+                    ))
+                });
+                // Only a paged child's window raises a fault, and a pager that is gone can never
+                // reply: either way it is a pagerless fault.
+                let Some((pager_env, export, sink)) =
+                    paged.filter(|&(p, ..)| !p.is_some_and(|p| dead_envs.contains(&p)))
+                else {
+                    complete(tasks, ti, Err(Trap::MemoryFault));
+                    return None;
+                };
+                let pager = std::sync::Arc::clone(task_host(root, extra_envs, pager_env));
+                let ticket = pager.lock_unpoisoned().request_page(export, sink);
+                wake_serve_loops(tasks, pager_env);
+                if let Some(ticket) = ticket {
+                    tasks[ti].state = TaskState::BlockedPage { ticket, pager };
+                }
             }
             Ok(VcpuStop::CapPending { id, dst }) => {
                 // F2 (FIBER_PARK.md), #2047 — a punted dispatch, cooperative form: what made the
@@ -18431,18 +18527,33 @@ fn teardown_domains(
         // The dying child's undelivered dispatches: wake every caller parked on a ticket
         // against its host with the probeable errno (queued or admitted — no reply will ever
         // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_envs`).
+        // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
         if let Some(k) = env {
             let dying = &extra_envs[k].host;
-            for t in tasks.iter_mut() {
-                if let TaskState::BlockedTicket { callee, dst, .. } = &t.state {
-                    if std::sync::Arc::ptr_eq(callee, dying) {
+            let mut stranded = Vec::new();
+            for (i, t) in tasks.iter_mut().enumerate() {
+                match &t.state {
+                    TaskState::BlockedTicket { callee, dst, .. }
+                        if std::sync::Arc::ptr_eq(callee, dying) =>
+                    {
                         let dst = *dst;
                         t.deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                         t.state = TaskState::Runnable;
                     }
+                    TaskState::BlockedPage { pager, .. }
+                        if std::sync::Arc::ptr_eq(pager, dying) =>
+                    {
+                        stranded.push(i)
+                    }
+                    _ => {}
                 }
             }
-            dying.lock_unpoisoned().svc_queue.clear();
+            for i in stranded {
+                complete(tasks, i, Err(Trap::MemoryFault));
+            }
+            let mut h = dying.lock_unpoisoned();
+            h.svc_queue.clear();
+            h.page_sinks.clear();
         }
     }
 }
@@ -18926,6 +19037,29 @@ impl Vm {
                 self.regs[base + $i as usize]
             };
         }
+        // §2.2 / #2164 — a memory op's result. In a demand-paged child (its powerbox holds a pager,
+        // [`Host::pager`]), a recoverable fault is a page to fetch, not a trap: the cursor is left AT
+        // the op, which re-executes once the page is in place, and the fault goes to the driver.
+        // The oracle's `handle_mem`. Consulted only on a fault, so an access that succeeds pays
+        // nothing.
+        macro_rules! paged {
+            ($access:expr) => {
+                match $access {
+                    Ok(v) => v,
+                    Err(Trap::MemoryFault) if host.with(|p| p.pager.is_some()) => {
+                        let Some(addr) = mem.as_ref().and_then(Mem::take_fault) else {
+                            return Err(Trap::MemoryFault);
+                        };
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc;
+                        return Ok(Outcome::PageFault(addr));
+                    }
+                    Err(t) => return Err(t),
+                }
+            };
+        }
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
         macro_rules! edge {
             ($copies:expr) => {{
@@ -19145,7 +19279,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = m.load_scalar(a, *offset, *op)?;
+                    r!(*dst) = paged!(m.load_scalar(a, *offset, *op));
                     pc += 1;
                 }
                 Op::Store {
@@ -19156,9 +19290,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let lo = r!(*value).i64() as u64;
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .store_scalar(a, *offset, *op, lo)?;
+                        .store_scalar(a, *offset, *op, lo));
                     pc += 1;
                 }
                 // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe fast path
@@ -19168,18 +19303,14 @@ impl Vm {
                     let d = r!(*dst).i64() as u64;
                     let s = r!(*src).i64() as u64;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_copy_fast(d, s, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_copy_fast(d, s, n));
                     pc += 1;
                 }
                 Op::MemFill { dst, val, len } => {
                     let d = r!(*dst).i64() as u64;
                     let v = r!(*val).i32() as u8;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_fill_fast(d, v, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_fill_fast(d, v, n));
                     pc += 1;
                 }
                 Op::AtomicLoad {
@@ -19190,7 +19321,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = Reg::from_value(m.atomic_load(a, *offset, *ty)?);
+                    r!(*dst) = Reg::from_value(paged!(m.atomic_load(a, *offset, *ty)));
                     pc += 1;
                 }
                 Op::AtomicStore {
@@ -19201,9 +19332,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_store(a, *offset, *ty, v)?;
+                        .atomic_store(a, *offset, *ty, v));
                     pc += 1;
                 }
                 Op::AtomicRmw {
@@ -19216,10 +19348,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_rmw(a, *offset, *ty, *op, v)?;
+                        .atomic_rmw(a, *offset, *ty, *op, v));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19234,10 +19366,10 @@ impl Vm {
                     let a = r!(*addr).i64() as u64;
                     let exp = Value::I64(r!(*expected).i64());
                     let rep = Value::I64(r!(*replacement).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_cmpxchg(a, *offset, *ty, exp, rep)?;
+                        .atomic_cmpxchg(a, *offset, *ty, exp, rep));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19966,7 +20098,12 @@ impl Vm {
                     }
                     if let Some((t, _)) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
                         let v = self.regs[base + *dst as usize].i64();
-                        host.with(|p| p.svc_results.insert(t, v));
+                        // #1862, #2164: a page request's bytes move now, from this serving vCPU's
+                        // window, before its child can claim the reply.
+                        host.with(|p| {
+                            let v = p.settle_page(t, v, mem.as_ref());
+                            p.svc_results.insert(t, v)
+                        });
                         self.rare().serve_count += 1;
                     }
                     // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
@@ -20000,7 +20137,10 @@ impl Vm {
                         }
                         let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
                         if d.args.len() != params.len() {
-                            host.with(|p| p.svc_results.insert(d.ticket, super::EINVAL));
+                            host.with(|p| {
+                                let v = p.settle_page(d.ticket, super::EINVAL, None);
+                                p.svc_results.insert(d.ticket, v)
+                            });
                             continue;
                         }
                         let nb = base + c.progs[cur].nslots as usize;
@@ -20257,24 +20397,30 @@ impl Vm {
                 // confined window and fail closed exactly as the tree-walker's arm does (bad version
                 // or reserved field → `CapFault`). The outcome is served by every driver's detached
                 // arm, where the budget's take and the module resolve happen at the driver's commit
-                // site (`admit_detached_child`). This tier never natively
-                // demand-pages: the module-level entries decline any op-17 module with a pager-shaped
-                // export ([`compile_module_for`]), so a surviving pager field can only come from a
-                // module without one — which `CapFault`s identically on the tree-walker.
+                // site (`admit_detached_child`). A record's pager must be a `{ page: (i64) -> (i64) }`
+                // export of this domain's own program, as on the tree-walker (#744, #1862), or the
+                // spawn fails closed here (#2164).
                 Op::InstantiateRec { handle, rec, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
                     let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
-                    if sr.pager != u32::MAX {
-                        return Err(Trap::CapFault);
+                    let spawn = DetachedSpawn::of(&sr);
+                    if let Some(export) = spawn.pager {
+                        let pages = host.with(|p| {
+                            p.self_module
+                                .as_ref()
+                                .is_some_and(|sm| sm.is_pager_export(export))
+                        });
+                        if !pages {
+                            return Err(Trap::CapFault);
+                        }
                     }
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    let spawn = DetachedSpawn::of(&sr);
                     return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery

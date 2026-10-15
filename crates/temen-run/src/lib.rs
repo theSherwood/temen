@@ -5744,10 +5744,11 @@ fn module_nests(m: &temen_ir::Module) -> bool {
 /// CONSOLIDATION.md §2.2/§3, #744: the module could build a **pager** record — it uses the §3
 /// config-record spawn (op 17) and declares a pager-shaped export ([`Module::declares_pager`], the
 /// one predicate spawn validation checks too). The record's `pager` field is runtime data, so such a
-/// module folds: the JIT has no native arm for the fault seam (native paging is #2164), and its
-/// op-17 thunk `CapFault`s any pager. A module with no pager-shaped export cannot build a valid pager
-/// record — every engine refuses one identically — so it runs natively through the
-/// `instantiate_rec` thunk, serving its own children if it serves (#744).
+/// module folds: the JIT has no native arm for the fault seam (#2164), and its op-17 thunk
+/// `CapFault`s any pager. It folds to the bytecode engine, which pages a child itself. A module with
+/// no pager-shaped export cannot build a valid pager record — every engine refuses one identically —
+/// so it runs natively through the `instantiate_rec` thunk, serving its own children if it serves
+/// (#744).
 fn module_demand_spawns(m: &temen_ir::Module) -> bool {
     m.declares_pager()
         && m.funcs.iter().any(|f| {
