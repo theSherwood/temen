@@ -250,15 +250,6 @@ fn run_nested_paged(m0: &temen_ir::Module, tail: &[i64]) -> (Outcome, Vec<u8>, u
     linker
         .func_wrap(
             "env",
-            "instantiate",
-            |_: Caller<'_, Driver>, _w: i32, _i: i32, _e: i64, _o: i64, _s: i64, _q: i64| -> i32 {
-                unreachable!("no instantiate in this unit")
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
             "join",
             |_: Caller<'_, Driver>, _i: i32, _c: i32| -> (i64, i64) { unreachable!("no join") },
         )

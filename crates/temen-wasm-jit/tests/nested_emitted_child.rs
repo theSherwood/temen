@@ -110,21 +110,6 @@ fn wire_nested_imports(linker: &mut Linker<HostState>, memory: Memory) {
             },
         )
         .unwrap();
-    // env.instantiate: the fixed carve-spawn slot (#1867). No emitted code calls it.
-    linker
-        .func_wrap(
-            "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _win: i32,
-             _inst: i32,
-             _entry: i64,
-             _off: i64,
-             _slog: i64,
-             _quota: i64|
-             -> i32 { unreachable!("no carve spawn is emitted") },
-        )
-        .unwrap();
     // §3c.3 env.instantiate_rec (op 17): a detached spawn. Read the record out of the parent's
     // window, decode it as every tier does, and run the child in a memory of its own.
     linker

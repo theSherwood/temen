@@ -1128,7 +1128,7 @@ impl Nursery {
                 }
                 // Its protections as captured (the guard follows, as on every child window).
                 let mapped = rw.len() as u64;
-                w.apply_prots(0, &prots, mapped, &image)
+                w.apply_prots(&prots, mapped, &image)
             },
             // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {
@@ -1291,15 +1291,15 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
 /// already-joined handle is inert (a `CapFault`), matching the interpreter's once-only join.
 ///
 /// # Safety
-/// As [`instantiate`]: `rt`/`trap_out` are the instance's nursery + run trap cell, valid for the call.
-/// #1287 — the detached twin of [`spawn_granted_child`]: the child runs on its own OS thread in a window
-/// that is its own (`run_detached_child_then` — `mapped_log2` committed inside a `reserved_log2`
-/// reservation, seeded from `seeds`), no carve, no copy-in/copy-back. Registered as a pending join-table
-/// entry like every async child; the powerbox is released by the teardown hook while the window lives.
+/// As [`instantiate_rec`]: `rt`/`trap_out` are the instance's nursery + run trap cell, valid for the call.
+/// #1287 — spawn a detached child: a task ([`file_task`]) in a window that is its own (`mapped_log2`
+/// committed inside a `reserved_log2` reservation, seeded from `seeds`), with no copy-in or copy-back.
+/// Registered as a pending join-table entry like every async child; the powerbox is released by the
+/// teardown hook while the window lives.
 ///
 /// # Safety
-/// As [`spawn_granted_child`] minus the carve: `code` was compiled against `gc_ctx` for exactly
-/// `(mapped_log2, reserved_log2)`; `args` matches the entry arity.
+/// As [`instantiate_rec`]: `rt`/`trap_out` are valid for the call. `code` was compiled against
+/// `gc_ctx` for exactly `(mapped_log2, reserved_log2)`; `args` matches the entry arity.
 #[allow(clippy::too_many_arguments)]
 unsafe fn spawn_detached_child(
     rt: &Nursery,

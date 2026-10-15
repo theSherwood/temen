@@ -1134,7 +1134,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    exactly as the interpreter surfaced `VcpuStop::Instantiate` to its driver; the emitted parent does
    no confinement itself (the child's window carve + attenuated powerbox stay the host's job, unchanged
    from the interpreter path). Opt-in, so the production paths are byte-identical. The spawn is now
-   op 17's `env.instantiate_rec` bounce (the op-0 carve is retired and no longer lowered, #1867), pinned by
+   op 17's `env.instantiate_rec` bounce (the op-0 carve is retired and no longer lowered, and its
+   `env.instantiate` import is gone, #1867), pinned by
    `crates/temen-wasm-jit/tests/instantiate_rec.rs`: an emitted entry that spawns + `join`s a child
    returns exactly the child's **interpreter** result (with a non-vacuity guard that the host imports
    actually fired).

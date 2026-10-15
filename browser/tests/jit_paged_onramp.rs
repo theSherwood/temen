@@ -9,10 +9,10 @@
 //!   its helper `protect`s the page holding "K" = 75 read-only and `unmap`s another; `_start` reads K
 //!   through the `Ro` page and stores a marker on an `Rw` page → 7509. The twins store on the
 //!   `Ro` page / the unmapped page: the emitted access traps, as the interpreter's does.
-//! - a **§14 op-13 child** (`open_shared_run_over_host`, the `[I64,I64]->[I64]` child-entry over a
-//!   marshaled `fs` + its real starter `AddressSpace` handle — #1201 passes it instead of `0`): its
-//!   leaf resolves `fs` (counter → 1) and `protect`s its "K" page; `f0` reads K back → 116, the
-//!   store twin traps after the leaf ran.
+//! - a **§14 child** (`open_detached_run` over a granted powerbox, as the op-13 servicer opens one:
+//!   the `[I64,I64]->[I64]` child-entry over a marshaled `fs` + its real starter `AddressSpace`
+//!   handle — #1201 passes it instead of `0`): its leaf resolves `fs` (counter → 1) and `protect`s its
+//!   "K" page; `f0` reads K back → 116, the store twin traps after the leaf ran.
 //!
 //! Each case is differential against the interpreter (`onramp_exec` for the root guest; the value /
 //! trap the child's interpreter run gives), and the page-state table the emitted accesses consulted is
@@ -20,7 +20,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use temen_browser::{onramp_exec, JitOnrampRun, STATUS_TRAP};
+use temen_browser::{onramp_exec, JitOnrampRun, RunInput, STATUS_TRAP};
 use temen_interp::{bytecode, host_page_size, ForkedProc, Host, HostProc, Region, Value};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -455,28 +455,29 @@ fn child_case(store_to_ro: bool) {
     );
     let (memory, table_base) = new_memory(&mut store, size);
     store.data_mut().table_base = table_base;
-    // SAFETY: as above — the child's window (its carve) lives inside the fixed wasmi memory.
-    let win_ptr = unsafe {
-        memory
-            .data_mut(&mut store)
-            .as_mut_ptr()
-            .add(WIN_BASE as usize)
-    };
-    let run = unsafe {
-        JitOnrampRun::open_shared_run_over_host(
-            &m,
-            win_ptr,
+    // SAFETY: as above — the child's window lives inside the fixed wasmi memory.
+    let back = Arc::new(unsafe {
+        Region::shared(
+            memory
+                .data_mut(&mut store)
+                .as_mut_ptr()
+                .add(WIN_BASE as usize),
             size,
-            LOG2,
-            false,
-            host,
-            Vec::new(),
-            cinst as u64,
-            cas as u64,
-            None,
         )
-    }
-    .expect("a page-op op-13 child opens as a single-shot JIT run (paged)");
+    });
+    let run = JitOnrampRun::open_detached_run(
+        &m,
+        back,
+        false,
+        RunInput::PreGranted {
+            host: Box::new(host),
+            init_mem: Vec::new(),
+            entry_inst: cinst as u64,
+            entry_as: cas as u64,
+        },
+        None,
+    )
+    .expect("a page-op child opens as a single-shot JIT run (paged)");
     let slots: Vec<Val> = run
         .slots()
         .iter()

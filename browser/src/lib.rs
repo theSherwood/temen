@@ -4201,11 +4201,11 @@ fn grant_onramp_caps(
     }
     // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
     // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
-    // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
+    // spawns a sandboxed child (the Forth kernel's `sandbox` word) behaves identically on both
     // reference hosts — one frontier, INVARIANTS #14. Spawn authority is a strict subset of the
-    // guest's own reach: a child is a sub-carve of *this* window with fuel sub-allocated from this
-    // guest's own quota, its powerbox attenuated to what the parent re-grants by name, and it can
-    // reach nothing the parent could not already reach directly. The knob stays for an embedder that
+    // guest's own reach: a child's window is paid from a `Budget` the guest holds, its powerbox
+    // attenuated to what the parent re-grants by name, and it can reach nothing the parent could not
+    // already reach directly. The knob stays for an embedder that
     // wants the narrower set (and for the differential harness, whose env-routed child tier-up
     // (#1117) toggles it); granted last so every other handle keeps its value.
     if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
@@ -6119,7 +6119,6 @@ pub struct JitOnrampRun {
     /// The compiled interpreter program for cross-tier bounces.
     program: std::sync::Arc<bytecode::SharedProgram>,
     host: Host,
-    _backing: Option<Box<[u8]>>,
     back: std::sync::Arc<temen_interp::Region>,
     win_base: usize,
     /// The emitted `_start` wasm.
@@ -6185,7 +6184,7 @@ pub struct JitOnrampRun {
 /// [`onramp_fs_exec`] (a seeded memfs + argv). `Stdin` grants the plain on-ramp powerbox
 /// ([`grant_onramp_caps`]); `Fs` grants the headless powerbox with a mounted `fs` image and seeds
 /// `argv` at `POWERBOX_ARGS_BASE` (the chibicc-in-the-browser card: `/in.c` + `/include/*.h`).
-enum RunInput {
+pub enum RunInput {
     Stdin(Vec<u8>),
     Fs {
         image: Vec<u8>,
@@ -6193,30 +6192,26 @@ enum RunInput {
         stdin: Vec<u8>,
     },
     /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
-    /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
-    /// the op-13 convention (a parent data segment landing inside the child's carve) has no analogue
-    /// across memories. The window is the child's own foreign memory (`open_detached_run`). Constructed
-    /// only by the wasm32 threads-build FFI (`temen_detached_jit_run_open`); dead on native.
-    #[allow(dead_code)]
+    /// `argv` seeded at `module_args_base()`, the spawn-time args payload. The window is the child's
+    /// own foreign memory (`open_detached_run`). Constructed only by the wasm32 threads-build FFI
+    /// (`temen_detached_jit_run_open`).
     Detached {
         stdin: Vec<u8>,
         argv: Vec<Vec<u8>>,
     },
-    /// A **caller-provided granted powerbox** (#1025 Path 1) — the run executes its emitted `_start` over
-    /// `host` verbatim instead of building the on-ramp powerbox from stdin/an fs image. This is what an
-    /// op-13 nested phase child uses: its `host` is the powerbox the parent marshaled across the
-    /// `env.instantiate_module` bounce ([`Host::spawn_named_child_from_window`]), so the child's `call.cap`
-    /// leaves (an `fs`/`stdout`) resolve over that granted host on the reactor-path cross-tier bounce
-    /// ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), exactly as a top-level phase's `fs`
-    /// resolves today. `init_mem` is the window prefix to seed (argv at `POWERBOX_ARGS_BASE`, or empty).
+    /// A **caller-provided granted powerbox** (#1025 Path 1): the run executes its emitted entry over
+    /// `host` verbatim instead of building the on-ramp powerbox from stdin or an fs image. A detached
+    /// child's is the powerbox its spawn's admission built ([`bytecode::PendingChild::into_powerbox`]),
+    /// so its `call.cap` leaves resolve over the caps it was granted, on the reactor-path cross-tier
+    /// bounce ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`). `init_mem` is the window
+    /// prefix to seed (the spawn's args payload, or empty).
     PreGranted {
         host: Box<Host>,
         init_mem: Vec<u8>,
-        /// The child entry's data-stack pointer, passed as its first `i64` param for a §14 child-entry
-        /// module (`child_entry_ok`: `[I64]->[I64]`). `0` for a paramless `_start` child (the param is
-        /// then not emitted, so the value is unused). The emitted `f{entry}` is called with the module's
-        /// declared params filled from this (`sp`, then `entry_as` for a second).
-        entry_sp: u64,
+        /// The child entry's first `i64` param, its starter `Instantiator` handle (`[I64]->[I64]`). The
+        /// emitted `f{entry}` is called with the module's declared params filled from this, then
+        /// `entry_as`; a paramless entry takes neither.
+        entry_inst: u64,
         /// #1201 — the child entry's second `i64` param, its starter `AddressSpace` handle for the
         /// `[I64,I64]->[I64]` shape (a page-op child's outlined leaf `call.cap`s on it). `0` otherwise.
         entry_as: u64,
@@ -6243,7 +6238,6 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             win_size,
             win_base,
             win_log2,
@@ -6253,42 +6247,15 @@ impl JitOnrampRun {
         )
     }
 
-    /// Open a single-shot JIT run over an **owned** (heap-backed) window with a **caller-provided granted
-    /// `Host`** (#1025 Path 1 — the owned-window twin of [`open_shared_run_over_host`]). The run executes
-    /// its emitted `_start` over `host` verbatim (an op-13 phase child's marshaled powerbox); `init_mem`
-    /// seeds the window prefix (argv).
-    /// The child's `call.cap` leaves resolve over `host` on the reactor cross-tier bounce, exactly as a
-    /// top-level phase's `fs` resolves. Used by the browser op-13-child-on-JIT servicer.
-    pub fn open_owned_run_over_host(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        host: Host,
-        init_mem: Vec<u8>,
-    ) -> Result<JitOnrampRun, i32> {
-        Self::open_owned_run_with(
-            m,
-            win_log2,
-            shared_memory,
-            RunInput::PreGranted {
-                host: Box::new(host),
-                init_mem,
-                entry_sp: 0,
-                entry_as: 0,
-            },
-            None,
-        )
-    }
-
     /// Open a single-shot JIT run over a **detached child's own window** (#1285, DETACHED_JIT.md §3.1):
-    /// `back`, from [`mint_detached_backing`] — in the browser the page-registered foreign memory
+    /// `back`, from `mint_detached_backing` — in the browser the page-registered foreign memory
     /// (`web/foreign-mem.js`), addressed through `Region::Foreign`. The child's window starts one host
     /// header page into that memory (`win` = [`DETACHED_HEADER_BYTES`]; the header holds the emitted
     /// tier's `env` cell and `pagestate`, unreachable by the guest since every span is checked against
     /// `"mapped"` before `win` is added). The backing is grown here to the module's declared window and
-    /// later by each `vm_map` bounce ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no
-    /// carve: the parent cannot address a byte of it.
-    pub(crate) fn open_detached_run(
+    /// later by each `vm_map` bounce ([`run_cross_tier`](Self::run_cross_tier)). The parent cannot
+    /// address a byte of it.
+    pub fn open_detached_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
         shared_memory: bool,
@@ -6303,55 +6270,11 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             declared,
             DETACHED_HEADER_BYTES as usize,
             size_log2,
             shared_memory,
             input,
-            cached,
-        )
-    }
-
-    /// Open a single-shot JIT run over a **caller-owned** window with a **caller-provided granted
-    /// `Host`** (#1025 Path 1 — the emitted nested phase child). The run executes its emitted `_start`
-    /// over `host` verbatim: the parent already marshaled exactly the caps the child holds (a shared
-    /// `fs`/`stdout`) across the op-13 bounce, so the child's `call.cap` leaves resolve over this granted
-    /// powerbox on the reactor cross-tier bounce — no on-ramp caps are added. `init_mem` seeds the window
-    /// prefix (argv at `POWERBOX_ARGS_BASE`, or empty).
-    ///
-    /// # Safety
-    /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
-    /// module's linear memory (the carve), used solely as this run's window, valid until the run is dropped.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn open_shared_run_over_host(
-        m: &temen_ir::Module,
-        win_ptr: *mut u8,
-        win_size: u64,
-        win_log2: u8,
-        shared_memory: bool,
-        host: Host,
-        init_mem: Vec<u8>,
-        entry_sp: u64,
-        entry_as: u64,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        let win_base = win_ptr as usize;
-        let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
-        Self::open_over_run(
-            m,
-            back,
-            None,
-            win_size,
-            win_base,
-            win_log2,
-            shared_memory,
-            RunInput::PreGranted {
-                host: Box::new(host),
-                init_mem,
-                entry_sp,
-                entry_as,
-            },
             cached,
         )
     }
@@ -6378,7 +6301,6 @@ impl JitOnrampRun {
         Self::open_over_run(
             m,
             back,
-            None,
             win_size,
             win_base,
             win_log2,
@@ -6389,36 +6311,6 @@ impl JitOnrampRun {
                 stdin,
             },
             None,
-        )
-    }
-
-    fn open_owned_run_with(
-        m: &temen_ir::Module,
-        win_log2: u8,
-        shared_memory: bool,
-        input: RunInput,
-        cached: Option<CachedEmit>,
-    ) -> Result<JitOnrampRun, i32> {
-        // The owned backing must equal the size the emitter masks: the module's declared window is the
-        // floor.
-        let win_log2 = win_log2.max(m.memory.map_or(0, |mc| mc.size_log2));
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize].into_boxed_slice();
-        let ptr = backing.as_mut_ptr();
-        let win_base = ptr as usize;
-        // SAFETY: `backing` is owned by the returned struct and pointer-stable across its moves, so
-        // `[ptr, win_size)` stays valid + exclusive for the run.
-        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(ptr, win_size) });
-        Self::open_over_run(
-            m,
-            back,
-            Some(backing),
-            win_size,
-            win_base,
-            win_log2,
-            shared_memory,
-            input,
-            cached,
         )
     }
 
@@ -6489,7 +6381,6 @@ impl JitOnrampRun {
     fn open_over_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
-        backing: Option<Box<[u8]>>,
         win_size: u64,
         win_base: usize,
         win_log2: u8,
@@ -6514,7 +6405,7 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (mut host, init_mem, frame, entry_sp, entry_as) = match input {
+        let (mut host, init_mem, frame, entry_inst, entry_as) = match input {
             RunInput::Stdin(stdin) => {
                 let mut host = Host::new();
                 host.stdin = stdin;
@@ -6545,24 +6436,24 @@ impl JitOnrampRun {
             RunInput::PreGranted {
                 host,
                 init_mem,
-                entry_sp,
+                entry_inst,
                 entry_as,
             } => {
                 // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
                 // here; the parent granted exactly what the child holds (the confinement default).
                 let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                (*host, init_mem, frame, entry_sp, entry_as)
+                (*host, init_mem, frame, entry_inst, entry_as)
             }
         };
         // The emitted `f{entry}` is called `f{entry}(win, env, ...declared params)`. A paramless `_start`
         // adds no trailing slots; a §14 child-entry (`[I64]->[I64]` / `[I64,I64]->[I64]`) takes its
-        // starter `Instantiator` as the first param (`entry_sp`) and its `AddressSpace` as the second
+        // starter `Instantiator` as the first param (`entry_inst`) and its `AddressSpace` as the second
         // (`entry_as`) — the handles the interpreter passes (#1025 Path 1; #1201 for the second).
         let n_params = module.funcs.first().map_or(0, |f| f.params.len());
         let entry_slots: Vec<Value> = (0..n_params)
             .map(|i| {
                 Value::I64(match i {
-                    0 => entry_sp as i64,
+                    0 => entry_inst as i64,
                     1 => entry_as as i64,
                     _ => 0,
                 })
@@ -6609,7 +6500,6 @@ impl JitOnrampRun {
             module,
             program,
             host,
-            _backing: backing,
             back,
             win_base,
             emitted_wasm,
@@ -10623,7 +10513,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     RunInput::PreGranted {
                         host: Box::new(host),
                         init_mem,
-                        entry_sp: cinst,
+                        entry_inst: cinst,
                         entry_as: cas,
                     },
                     Some(emit),
@@ -12898,7 +12788,7 @@ impl CoopTierupRun {
     /// #1009 paged tier-up: refresh the page-state table iff the pending window's page map changed
     /// — the [`TierupRun::sync_pagestate`] twin over the cooperative run — then stage its coverage
     /// for `"mapped"`. #816: the engine routes `mem_map_info`/`mem_map_version` to the pending
-    /// round-trip's task env (a §14 confined child serves over its own carve), so the cache is
+    /// round-trip's task env (a §14 child serves over its own window), so the cache is
     /// keyed (env, version) and the staged coverage is the pending window's own bound.
     fn sync_pagestate(&mut self) {
         let env = self.run.pending_env();
@@ -13894,8 +13784,8 @@ pub extern "C" fn temen_coop_win_len() -> usize {
 
 /// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
 /// for the tier-up / JIT_INVOKE currently being serviced. For a root-env task this equals
-/// [`temen_coop_win_ptr`]; for a §14 confined child it is the backing plus the child's carve
-/// offset, so the emitted accesses land exactly where the interpreter's confined accesses do.
+/// [`temen_coop_win_ptr`]; for a §14 child it is the base of the child's own window, so the emitted
+/// accesses land exactly where the interpreter's do.
 /// Read it **per event** (the JS driver's per-call `win`), never cached across events. Falls back
 /// to the root window if no round-trip is pending (defensive; the driver only reads it inside one).
 #[no_mangle]
@@ -13908,7 +13798,7 @@ pub extern "C" fn temen_coop_tierup_win_ptr() -> *const u8 {
 }
 
 /// #816: the pending event's window byte length (the span [`temen_coop_tierup_win_ptr`] addresses —
-/// the child carve size for a confined child's event, the run window otherwise).
+/// a child's own window for a child's event, the run window otherwise).
 #[no_mangle]
 pub extern "C" fn temen_coop_tierup_win_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| {
@@ -14270,41 +14160,14 @@ pub extern "C" fn temen_coop_close() {
 
 #[cfg(test)]
 mod path1_jit_over_host_tests {
-    //! #1025 Path 1 — the engine primitive for an **emitted nested child**:
-    //! [`JitOnrampRun::open_shared_run_over_host`] runs a guest's emitted `_start` over a
-    //! **caller-provided granted powerbox** (the host an op-13 parent marshals across the
-    //! `env.instantiate_module` bounce). This proves the caller's host is wired into the reactor
-    //! cross-tier bounce ([`JitOnrampRun::run_cross_tier`] → `run_over(&mut self.host)`), so a child's
-    //! `call.cap` leaf (an `fs`) resolves over the granted host — without needing the JS emitted driver
-    //! (the bounce seam is exercised directly, exactly what an emitted `f0` reaching a cross-tier leaf does).
+    //! #1025 Path 1 — a detached child's run over the powerbox its spawn built: the op-13 servicer
+    //! opens the child's run with [`RunInput::PreGranted`], and the child's `call.cap` leaves resolve
+    //! over that host on the reactor cross-tier bounce ([`JitOnrampRun::run_cross_tier`] →
+    //! `run_over(&mut self.host)`). The bounce seam is driven directly, without the JS emitted
+    //! driver: exactly what an emitted `f0` reaching a cross-tier leaf does.
     use super::*;
     use std::sync::{Arc, Mutex};
-    use temen_interp::{ForkedProc, HostProc};
-
-    // f0 (emitted) = 40 + f1(); f1 (cross-tier leaf) seeds "fs" (0x7366 LE), resolves it, calls the
-    // granted HOST_PROC counter, returns its post-increment result.
-    const CHILD: &str = r#"memory 12
-func () -> (i64) {
-block 0 () {
-  v40 = i64.const 40
-  vcap = call 1 ()
-  vr = i64.add v40 vcap
-  return vr
-  }
-}
-func () -> (i64) {
-block 0 () {
-  vname = i64.const 29542
-  vzero = i64.const 0
-  i64.store vzero vname
-  vp0 = i64.const 0
-  vl2 = i64.const 2
-  vh = self.resolve vp0 vl2
-  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
-  return vr
-  }
-}
-"#;
+    use temen_interp::{ForkedProc, HostProc, Lease, WINDOW_RUNS};
 
     // Two distinct caps marshaled together (two forkable counters "fs" + "ax"). f0 = f1() + f2(); f1
     // resolves "fs" (0x7366), f2 resolves "ax" (0x7861), each calls its granted HOST_PROC — proving
@@ -14371,146 +14234,12 @@ block 0 () {
         counter
     }
 
-    fn granted_fs_host() -> (Host, Arc<Mutex<i64>>) {
-        let counter = Arc::new(Mutex::new(0i64));
-        let mut host = Host::new();
-        let c1 = Arc::clone(&counter);
-        let handler: HostProc = Box::new(move |_op, _a, _m, _| {
-            let mut c = c1.lock().unwrap();
-            *c += 1;
-            Ok(vec![*c])
-        });
-        let c2 = Arc::clone(&counter);
-        let fork = Arc::new(move |_pid: u64| {
-            let c = Arc::clone(&c2);
-            ForkedProc::shared(
-                Box::new(move |_op, _a, _m, _| {
-                    let mut c = c.lock().unwrap();
-                    *c += 1;
-                    Ok(vec![*c])
-                }),
-                temen_interp::CapState::Uncaptured,
-            )
-        });
-        // A counter the guest reads back, which nothing serializes (#1699).
-        let h = host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Uncaptured);
-        host.register_cap_name("fs", h);
-        (host, counter)
-    }
-
     #[test]
-    fn jit_run_over_a_marshaled_granted_host_resolves_the_cap() {
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let (host, counter) = granted_fs_host();
-
-        let win_log2 = 12u8;
-        let win_size = 1u64 << win_log2;
-        let mut backing = vec![0u8; win_size as usize];
-        let win_ptr = backing.as_mut_ptr();
-        // SAFETY: `backing` outlives `run` (dropped first, reverse declaration order); it is this run's
-        // sole window and never moves.
-        let mut run = unsafe {
-            JitOnrampRun::open_shared_run_over_host(
-                &m,
-                win_ptr,
-                win_size,
-                win_log2,
-                false,
-                host,
-                Vec::new(),
-                0,
-                0,
-                None,
-            )
-        }
-        .expect("open a JIT run over the caller-provided granted host");
-        // The emitted `f0` reaches its `call.cap` leaf `f1` via `run_cross_tier` — drive that seam
-        // directly (no JS emitted driver needed to prove the host is carried into the bounce).
-        let r = run
-            .run_cross_tier(1, &[])
-            .expect("the cross-tier leaf runs over the granted host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(1)),
-            "the granted `fs` returned its post-increment count (1)"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the marshaled `fs` cap resolved + ran inside the JIT run's cross-tier bounce"
-        );
-        drop(run);
-    }
-
-    #[test]
-    fn owned_window_jit_run_over_a_granted_host_runs_the_whole_child() {
-        // The owned-window twin (`open_owned_run_over_host`, the browser op-13 servicer's constructor).
-        // Drive the whole child `f0` (not just the leaf) as the interpreter oracle over the granted host —
-        // `40 + fs()` = 41, the exact value the JS-driven emitted `f0` returns (tier parity, INVARIANTS §9).
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let (host, counter) = granted_fs_host();
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new())
-            .expect("open an owned JIT run over the granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the granted host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(41)),
-            "child f0 = 40 + granted fs() = 41 over the caller-provided powerbox"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the granted fs ran exactly once"
-        );
-    }
-
-    #[test]
-    fn primitive_consumes_a_host_from_the_op13_marshal() {
-        // The composition the browser op-13 servicer performs: the child's powerbox is **marshaled** from a
-        // parent's grant records (`spawn_named_child_from_window`, #1025 slice 3a), then handed to the JIT
-        // run primitive — not a hand-built host. The child resolves the marshaled `fs` and computes 41.
-        let m = temen_text::parse_module(CHILD).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-
-        // A parent powerbox holding the grantable `fs`, and a window with one grant record naming it.
-        let (mut parent, counter) = granted_fs_host();
-        let fs_handle = parent.resolve_cap_name("fs").expect("parent holds fs");
-        let mut window = vec![0u8; 256];
-        // record at 32: {name_off=64, name_len=2, handle=fs_handle, flags=0}; name "fs" at 64.
-        window[32..36].copy_from_slice(&64u32.to_le_bytes());
-        window[36..40].copy_from_slice(&2u32.to_le_bytes());
-        window[40..44].copy_from_slice(&fs_handle.to_le_bytes());
-        window[64..66].copy_from_slice(b"fs");
-        let (child_host, _inst, _as) = parent
-            .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
-            .expect("marshal the grant list into a child powerbox");
-
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
-            .expect("open a JIT run over the *marshaled* granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the marshaled host");
-        assert_eq!(
-            r.first(),
-            Some(&Value::I64(41)),
-            "child resolved the *marshaled* fs (marshal -> primitive -> resolve, the op-13 servicer flow)"
-        );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the marshaled fs shares the parent's provider state (ticked once)"
-        );
-    }
-
-    #[test]
-    fn primitive_resolves_multiple_marshaled_caps() {
-        // A child can hold several caps; prove the primitive resolves **multiple distinct**
-        // marshaled caps. A parent grants two ("fs", "ax"); a two-record grant list marshals both into the
-        // child powerbox; the child resolves each and calls it — f0 = fs() + ax() = 2, both counters tick.
+    fn a_detached_childs_run_resolves_each_marshaled_cap() {
+        // The composition the op-13 servicer performs: the child's powerbox is marshaled from the
+        // parent's grant records (`read_grant_records`, every spawn's reader) by the detached builder
+        // (`Host::spawn_detached_child`), then handed to the child's run over its own window. The child
+        // resolves each cap and calls it: f0 = fs() + ax() = 2, and both counters tick.
         let m = temen_text::parse_module(CHILD_TWO_CAPS).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
 
@@ -14532,11 +14261,31 @@ block 0 () {
         rec(0, 96, b"fs", h_fs);
         rec(1, 100, b"ax", h_ax);
 
+        let grants =
+            temen_interp::read_grant_records(32, 2, |o, l| temen_interp::read_slice(&window, o, l))
+                .expect("both records are in the window");
+        let lease = Lease {
+            budget: parent.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 12,
+            runs: WINDOW_RUNS,
+        };
         let (child_host, _i, _a) = parent
-            .spawn_named_child_from_window(&window, 32, 2, 1 << 12)
+            .spawn_detached_child(&grants, 1 << 12, lease, -1)
             .expect("marshal a two-cap grant list");
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new())
-            .expect("open over the two-cap marshaled host");
+        let (back, _) = mint_detached_backing(1 << 12).expect("a native child window");
+        let mut run = JitOnrampRun::open_detached_run(
+            &m,
+            Arc::new(back),
+            false,
+            RunInput::PreGranted {
+                host: Box::new(child_host),
+                init_mem: Vec::new(),
+                entry_inst: 0,
+                entry_as: 0,
+            },
+            None,
+        )
+        .expect("open the child's run over its marshaled host");
         let r = run
             .run_cross_tier(0, &[])
             .expect("child f0 runs over the marshaled host");

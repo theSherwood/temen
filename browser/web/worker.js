@@ -480,8 +480,6 @@ self.onmessage = async (e) => {
           }
           syncMapped();
         },
-        // A carve spawn (op 0/5/13): a detached window has no carve to give a grandchild.
-        instantiate: () => { throw new Error('carve spawn from a detached child'); },
         // An op-17 spawn from emitted code: the engine admits the record against THIS child's vCPU as
         // the interpreted op does, a v1 record as a DETACHED grandchild, started here exactly as the
         // interpreter's INSTANTIATE_DETACHED event is and filed in the vCPU's own child table. A
