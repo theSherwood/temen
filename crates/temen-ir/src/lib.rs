@@ -3874,9 +3874,14 @@ impl Forwards {
     const PASSES: usize = 32;
 
     /// The value block `b`'s param `i` forwards, as its block and its index there (a param of
-    /// that block that is its own, or a result in it), or `None` for a param that is its own.
+    /// that block that is its own, or a result in it), or `None` for a param that is its own or
+    /// that the block does not have (an edge's extra argument stays an argument).
     pub fn source(&self, b: usize, i: usize) -> Option<(BlockIdx, ValIdx)> {
-        match self.src[self.first[b] as usize + i] {
+        let (lo, hi) = (
+            *self.first.get(b)? as usize,
+            *self.first.get(b + 1)? as usize,
+        );
+        match *self.src[lo..hi].get(i)? {
             Self::OWN => None,
             v => Some(((v >> 32) as BlockIdx, v as ValIdx)),
         }
@@ -8389,6 +8394,8 @@ mod forwards_tests {
         assert_eq!(w.source(1, 1), Some((0, 0)));
         assert_eq!(w.source(2, 0), Some((0, 1)));
         assert_eq!(w.source(2, 1), Some((0, 0)));
+        assert_eq!(w.source(1, 2), None, "a param the block does not have");
+        assert_eq!(w.source(3, 0), None, "a block the function does not have");
     }
 
     #[test]
