@@ -67,22 +67,18 @@ fn exports_md_is_up_to_date() {
     );
 }
 
-/// The parser's two non-obvious cases, pinned so a refactor of either cannot quietly drop exports:
-/// an attribute between `#[no_mangle]` and the `fn`, and the one export-minting macro.
+/// The parser's non-obvious case, pinned so a refactor of it cannot quietly drop exports: an
+/// attribute between `#[no_mangle]` and the `fn`.
 #[test]
-fn the_parser_sees_attribute_runs_and_the_macro() {
+fn the_parser_sees_attribute_runs() {
     let exports = rust_exports(&root().join("src"));
-    assert!(
-        exports.contains_key("temen_par_ev_b"),
-        "`par_ev_getter!` expansions must count as exports"
-    );
     let gated = exports.values().filter(|e| e.cfg.is_some()).count();
     assert!(
         gated > 0,
         "some exports are cfg-gated; the parser must record that"
     );
     assert!(
-        exports.len() >= 340,
+        exports.len() >= 280,
         "export count fell to {}",
         exports.len()
     );

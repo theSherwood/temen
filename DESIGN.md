@@ -2342,8 +2342,8 @@ IR, so a verified unit always yields a runnable artifact:
   instantiate/join/thread functions — still tiers up with its bounces intact. Fibers are **never**
   emitted; a fiber reachable from the entry by call edges drops it from the emitted set, and a
   `thread.spawn`ed fiber runs in its own spawned interpreter vCPU. Either way the emitted-function
-  bitmap is a sound "safe to call `f{i}` directly" signal (the browser's per-instance
-  `temen_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
+  bitmap is a sound "safe to call `f{i}` directly" signal, and no new emitted-code or window-access
+  surface is added
   (INVARIANTS.md #2 untouched). This is the wasm-tier counterpart of the §22 "fibers in a submitted
   unit" allowance.
 
@@ -2428,15 +2428,17 @@ a leaf may store and `call.cap` (the op-13 grant seeder, a `map`-calling allocat
 must never service these leaves on a throwaway window (the browser's `temen_wasmjit_call_interp`,
 which is faithful only for the tier-up analysis's pure leaves) — an impure helper run on the empty
 powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
-The browser's §14 codegen entry
-(`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
-`compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
-own detached `Memory`** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
-the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
-after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
-wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
-still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
-refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned in real Chromium by `browser-test`'s `instpaged` item. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+Until #1414 B6-4a deleted the browser's per-Worker driver, its §14 codegen entry
+(`temen_par_enable_inst_codegen`) routed a unit that reaches any ADDRESS_SPACE page op through
+`compile_nested_paged` and serviced its `env.call_interp` leaves on the **child's own vCPU over its
+own detached `Memory`** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated
+powerbox — the shape the `nested_paged` fuzz harness uses), re-syncing the page-state table +
+`"mapped"` from that vCPU after each bounce; the helper that `map`s/`unmap`s/`protect`s was bounced
+whole (no outlining — a wrapper would index a function the child's domain doesn't hold). `map` (grow)
+is admitted on the nested paged path by the same refresh (`is_nested_leaf_cap` admits ops 0–4). The
+browser now runs a paged child on executor 2, its root task on its granted module's region emit with
+the page-state table in the child memory's header (#1414 ED-2); `browser-test`'s `instpaged` item
+pins it in real Chromium. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 

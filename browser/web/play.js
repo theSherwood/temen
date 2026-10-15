@@ -4912,7 +4912,7 @@ async function runText(c) {
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
-      // Workers were torn down mid-run; shared state (locks, the live-vCPU counter) may be wedged.
+      // Workers were torn down mid-run; shared state (locks) may be wedged.
       broken = true;
       setState(c, 'stopped', 'stopped — reload the page to run again');
       logTo(c, 'stopped by user');

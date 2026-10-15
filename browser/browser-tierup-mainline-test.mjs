@@ -87,6 +87,9 @@ const res = await page.evaluate(async ({ src }) => {
   if (ok !== 1) return { parseError: new TextDecoder().decode(out) };
   const guest = out;
 
+  // The leaf is small: the tier-up size floor (#1026) is lowered, as coop's own tests do, so the
+  // test exercises the mechanism rather than the floor's policy.
+  eng.ex.temen_coop_set_tierup_floor(0);
   const plain = await run(guest, {});                 // all-interpreter
   const tiered = await run(guest, { tierup: true });  // mainline tier-up over the live window
   return {

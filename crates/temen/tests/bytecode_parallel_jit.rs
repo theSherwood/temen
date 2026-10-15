@@ -362,9 +362,8 @@ fn invoked_spawning_unit_stays_capfault() {
 
 // ---- concurrent **runtime** compile (the browser's cross-Worker slice) ---------------------------
 // The parallel driver shares one `Mutex<Host>` across every vCPU thread and takes the lock per
-// `call.cap` — byte-for-byte the browser's `Vcpu::with_shared_host(&Mutex<Host>)`.
-// The browser's cross-Worker runtime JIT (`temen_par_child` now shares the `ParJitCfg` host) therefore
-// rests on exactly this: worker vCPUs on real threads each `compile` a unit **at runtime** into the
+// `call.cap`. The browser's cross-Worker runtime JIT (the same driver over the `ParJitCfg` host)
+// therefore rests on exactly this: worker vCPUs on real threads each `compile` a unit **at runtime** into the
 // shared host — the `Mutex` serialising the mutating `jit_compile`s — then `invoke` it. Above, the
 // unit is host-pre-compiled; here every worker compiles its own, so the new concurrency is the
 // concurrent `compile` itself.
