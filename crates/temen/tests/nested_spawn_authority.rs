@@ -155,7 +155,7 @@ struct Unheld {
 fn powerbox(spawn: impl Fn(Unheld) -> Spawn) -> (Host, [Value; 4]) {
     let grand = parse(GRAND);
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, WIN as u64);
+    let inst = host.grant_instantiator();
     host.grant_stream(StreamRole::Err);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let grand_h = host.grant_module(&grand);

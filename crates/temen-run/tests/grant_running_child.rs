@@ -62,7 +62,7 @@ fn setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
         h.set_region_factory(temen_run::new_shared_region);
-        let i = h.grant_instantiator(0, 1 << 18);
+        let i = h.grant_instantiator();
         let a = h.grant_address_space(0, 1 << 18);
         let b = h.grant_budget(-1, 1 << 21, -1);
         for e in &m.exports {

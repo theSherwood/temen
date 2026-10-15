@@ -309,6 +309,39 @@ fn an_activation_sets_its_nodes_fuel_room_and_an_unbounded_chain_is_unmetered() 
     );
 }
 
+/// #2337 — every dimension of the run's own node but its fuel is a guest's to see, as any level's
+/// is: the embedder's grant bounds what a `read` of an unbounded budget reports, and clamps a `split`.
+#[test]
+fn a_guest_sees_the_runs_own_grant_except_its_fuel() {
+    let mut h = Host::new();
+    h.set_grant(2 * MIB, 64 * KIB, 8, 100);
+    let _ = h.begin_activation(10, RootWindow::default());
+    let b = h.grant_budget(-1, -1, -1);
+    let read = |h: &mut Host, field: i64| {
+        h.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[field], None)
+            .expect("read")[0]
+    };
+    assert_eq!(
+        read(&mut h, 0),
+        -1,
+        "fuel: the activation's limit stays hidden"
+    );
+    assert_eq!(read(&mut h, 1), 2 * MIB, "mem: the run's grant");
+    assert_eq!(read(&mut h, 3), 64 * KIB, "channel: the run's grant");
+    let sub = split(&mut h, b, -1);
+    assert_eq!(
+        room(&mut h, sub),
+        2 * MIB,
+        "a split is clamped by the run's grant too"
+    );
+    let spawn = read(&mut h, 2);
+    let maps = read(&mut h, 5);
+    assert!(
+        (0..=8).contains(&spawn) && (0..=100).contains(&maps),
+        "spawn and maps: bounded by the run's grant (less what the activation holds): {spawn}, {maps}"
+    );
+}
+
 /// #1944 slice 3 — a guest's `read` and `split` see the budgets it holds, not the activation's limit
 /// above them (what is left of that moves with when each engine draws); a draw is bounded by it.
 #[test]

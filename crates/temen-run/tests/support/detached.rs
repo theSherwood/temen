@@ -30,7 +30,7 @@ pub fn module(text: &str) -> temen_ir::Module {
 /// bytes of `mem`.
 pub fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     (host, [inst, modh, budget])

@@ -106,7 +106,7 @@ fn spawn(t: temen_llvm::Translated) -> i64 {
     let plog2 = p.module.memory.expect("a window").size_log2;
     let sp = temen_ir::powerbox_entry_sp(&p.module);
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << plog2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(&image);
     // The child's fuel is capped by the budget it is spawned with (#1944 slice 3).
     let budget = host.grant_budget(1_000_000, -1, -1);

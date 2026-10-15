@@ -101,7 +101,7 @@ fn module() -> Module {
 /// `Stream` (happy path) or the non-copyable `Instantiator` (negative path), to prove it is refused.
 fn host(m: &Module, stream_grant: bool) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let sh = host.grant_stream(StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));

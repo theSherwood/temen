@@ -97,7 +97,7 @@ fn by_record(ptr: u64, len: u64, forged: bool) -> Module {
 /// The parent's powerbox: an `Instantiator`, the child module, and a `Budget` its window spends.
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, child, budget])

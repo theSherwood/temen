@@ -219,7 +219,7 @@ fn a_parents_granted_lanes_may_not_exceed_its_cap_and_a_reaped_child_returns_its
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_lane_cap(2);
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 3 << 12, -1);
     let args = vec![Value::I32(inst), Value::I32(modh), Value::I32(budget)];
@@ -279,6 +279,9 @@ fn split_bounds_a_childs_lane_by_the_holders_cap_and_never_draws_the_cap_down() 
 #[test]
 fn budget_mem_give_is_the_exact_undo_of_a_take() {
     let mut host = Host::new();
+    // An unbounded run, so a read of an unbounded budget is unbounded along its whole chain: a guest
+    // sees the run's own node's `mem` too (#2337).
+    host.set_grant(-1, -1, -1, -1);
     let b = host.grant_budget(-1, 8192, -1);
     let read_mem = |host: &mut Host| -> i64 {
         host.cap_dispatch_slots(cap_id::BUDGET, 1, b, &[1], None)

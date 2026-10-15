@@ -120,7 +120,7 @@ pub fn child_module(src: &str) -> temen_ir::Module {
 pub fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, 4);
     host.grant_freeze_authority();

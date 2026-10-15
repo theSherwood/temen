@@ -236,7 +236,7 @@ fn phase_scale_child_grows_to_its_whole_reservation_matching_the_interpreter() {
     let reserved = 1u64 << RESERVED;
     // A detached child's starter caps span its reservation (authorizing the grow), while the run below
     // commits only its declared window.
-    let cinst = host.grant_instantiator(0, reserved);
+    let cinst = host.grant_instantiator();
     let cas = host.grant_address_space(0, reserved);
     let engine = Engine::default();
     let mut store: Store<Drv> = Store::new(

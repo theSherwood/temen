@@ -238,9 +238,9 @@ property, so in practice:
     asserts the same in **real Chromium** (the `#jit` work item). Validates std `Mutex<Vec<Arc<…>>>`
     (the `Domain`'s `ModuleSource`) working cross-Worker on wasm atomics. (Invoked units still run over
     the vCPU's deny-all powerbox — a `call.cap`ing unit is out of scope, the C1 limitation.)
-  - **§14 `instantiate` in parallel** *(Retiring: this design runs each child over a carve of the
-    shared backing — `nested_view`, `carve_region` — and the carve path is being deleted (INVARIANTS
-    #13, 2026-09-29; #1289). The detached equivalent is the op-17 record: `drive_threads` and the resumable
+  - **§14 `instantiate` in parallel** *(Retired: this design ran each child over a carve of the
+    shared backing — `nested_view`, `carve_region` — and the carve path is deleted (INVARIANTS
+    #13, 2026-09-29; #1289; #1867). The detached equivalent is the op-17 record: `drive_threads` and the resumable
     `Vcpu` (`VcpuEvent::InstantiateDetached`) run the child over its own `Mem`, and the browser runs
     it on its own Worker over a per-child `WebAssembly.Memory` through `Region::Foreign`
     (`temen_par_child_detached`; DETACHED_JIT.md §3.1, §3.3).)* — a confined executor child runs as

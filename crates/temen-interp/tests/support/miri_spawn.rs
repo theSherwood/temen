@@ -93,7 +93,7 @@ block 0 (vinst: i32, vas: i32, vmod: i32, vbud: i32) {{
 /// child module, and a `Budget` that pays for both children's windows.
 pub fn host() -> (Host, Vec<Value>) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 18);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1 << 18);
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 18, -1);

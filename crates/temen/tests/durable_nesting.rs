@@ -162,7 +162,7 @@ block 0 (v0: i64, v1: i64) {
 fn detached_powerbox() -> (Host, [Value; 3]) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, WINDOW as u64);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(&child());
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.grant_freeze_authority();
@@ -298,7 +298,7 @@ fn a_durable_freeze_is_never_killed_by_a_detached_child() {
 
     let mut host = Host::new();
     host.set_durable(true);
-    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let ih = host.grant_instantiator();
     let mh = host.grant_module(&child_mod);
     let bh = host.grant_budget(-1, (1u64 << 17) as i64, -1); // one detached window
     let mut win = init_durable_window(WINDOW, TEST_ARENA);

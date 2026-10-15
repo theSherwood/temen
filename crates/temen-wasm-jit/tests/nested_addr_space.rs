@@ -105,7 +105,7 @@ fn granted_host(m: &temen_ir::Module, with_inst: bool) -> (Host, Vec<Value>) {
     let a = h.grant_address_space(0, WIN);
     let mut args = vec![Value::I32(a)];
     if with_inst {
-        let i = h.grant_instantiator(0, WIN);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, -1, -1);
         let c = h.grant_module(&child_image(m));
         args.extend([Value::I32(i), Value::I32(b), Value::I32(c)]);

@@ -153,7 +153,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
 
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&image());
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, modh, budget])

@@ -65,7 +65,7 @@ child in its own address space.** In temen that structure already has a name.
 | `WindowMinter` cap (`cap_id` 15), embedder-granted, byte quota, `window_minter_take` at each mint | `lib.rs` 16256, 20950–20975 | **Built** |
 | Detached child = **fresh reservation + guard exactly like a root run's**: `Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)` — so it `vm_map`-grows into a 2^37 reservation, natively | `lib.rs` ~11900 | **Built** |
 | Detached window size must equal the module's declared (`mod_ok = memory_log2 == size_log2`, §14 transparency) | `lib.rs` ~11889 | **Built** |
-| Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
+| Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape; since #2433 only the `AddressSpace` has a span), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
 | op 15 optional trailing `(args_ptr, args_len)` — the spawn-time args payload copied to the child's `module_args_base()` (#1286) | `lib.rs` op-15 arm; `bytecode.rs` `Op::InstantiateDetached` | **Built** (both engines) |
 | Resumable-engine op 15: `VcpuEvent::InstantiateDetached { size_log2 }` — the host mints the window and starts the admitted child over it (#1286, #1414) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Built** |
 | `self.attest` → `tier \| window_exposed<<8 \| freeze_exposed<<9`; detached attests `window_exposed = false` | `lib.rs` 16358–16385, 19496 | **Built** (PROCESS.md §6) |
@@ -285,8 +285,8 @@ mapping on native. So:
 Nothing here removes zero-copy sharing. Two mechanisms exist, both **explicit grants**:
 
 - **§14 nested spawn (op 13)**: the child is a sub-window; the parent aliases it for free.
-  ~~Stays exactly as built, as the *opt-in* placement for tightly-coupled children.~~ **Retiring**
-  (2026-09-29): the carve path is being deleted; tightly-coupled children use the `SharedRegion`
+  ~~Stays exactly as built, as the *opt-in* placement for tightly-coupled children.~~ **Retired**
+  (INVARIANTS #13, 2026-09-29; deleted in #1867): tightly-coupled children use the `SharedRegion`
   below.
 - **§13 `SharedRegion`**: lend a region *into* a detached child at some offset; pointers are
   region-relative. This is the designed way for a detached parent and child to share bulk
@@ -367,8 +367,8 @@ for the whole direction: an isolated child *removes* window-access surface rathe
 
 ## 5. Platform consistency (R5)
 
-> **Retiring:** the `nested (op 13)` row describes the carve path being deleted (INVARIANTS #13,
-> 2026-09-29); the detached row is the surviving placement.
+> **Retired (#1867):** the `nested (op 13)` row describes the carve path, deleted in #1867
+> (INVARIANTS #13, 2026-09-29); the detached row is the surviving placement.
 
 Both spawns exist on every tier with **platform-independent semantics**:
 

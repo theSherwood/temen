@@ -1451,7 +1451,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     h.set_durable(true);
     h.set_self_module(&inst);
     let args = [
-        h.grant_instantiator(0, WINDOW as u64),
+        h.grant_instantiator(),
         h.grant_durable_module(&server),
         h.grant_budget(-1, 1 << 20, -1),
     ]
@@ -1717,7 +1717,10 @@ fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("a Budget no longer refuses the freeze");
 
-    let mut thost = Host::new(); // no hook: the carried state verbatim
+    // No hook: the carried state verbatim. An unbounded run, so a read reports the carried node
+    // alone: a guest sees the run's own node's `channel` too (#2337).
+    let mut thost = Host::new();
+    thost.set_grant(-1, -1, -1, -1);
     restore(&artifact, &inst, &mut thost).expect("restore");
     assert_eq!(
         read_mem(&mut thost, h),

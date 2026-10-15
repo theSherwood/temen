@@ -77,7 +77,7 @@ fn parent() -> Module {
 /// The parent's powerbox: `(instantiator, child module, budget)`.
 fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, modh, budget])

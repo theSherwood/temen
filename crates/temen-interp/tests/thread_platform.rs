@@ -889,7 +889,7 @@ fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<V
     let m = module(&spawn_and_join());
     let mut host = Host::new();
     host.set_thread_platform(platform);
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let child = host.grant_module(&module(child));
     let budget = host.grant_budget(-1, mem, -1);
     let args = [

@@ -439,7 +439,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const u8 = () => new Uint8Array(memory.buffer);
   const i64 = () => new BigInt64Array(memory.buffer);
   // #816 env-routed tier-up: `win` is PER EVENT — the pending task's window base (root backing for
-  // a root-env task, backing + carve offset for a §14 confined child). Read inside each event arm
+  // a root-env task, the base of its own window for a §14 child). Read inside each event arm
   // via temen_coop_tierup_win_ptr(); never cache it across events.
   const eventWin = () => Number(ex.temen_coop_tierup_win_ptr());
 

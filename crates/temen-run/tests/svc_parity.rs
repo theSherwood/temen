@@ -97,10 +97,7 @@ fn a_serving_domain_behaves_identically_on_all_three_backends() {
                 backend,
                 &RunConfig::default(),
                 &[
-                    (
-                        "vm",
-                        HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                    ),
+                    ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                     ("budget", HostCap::detached_budget(1 << 20)),
                     (
                         "child",
@@ -288,7 +285,7 @@ fn verified(src: &str) -> Module {
 fn separate_setup(kid: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let vm = h.grant_instantiator(0, 128 << 10);
+        let vm = h.grant_instantiator();
         h.register_cap_name("vm", vm);
         let budget = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", budget);

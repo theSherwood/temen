@@ -91,7 +91,7 @@ fn grant_io_powerbox(
     // Granted **last**, so every handle above keeps its value (a reverse-`seek` rebuild replays the
     // recorded cap tape against the same numbering) — the browser on-ramp orders it the same way.
     host.set_self_module(&std::sync::Arc::new(m.clone()));
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     host.register_cap_name("instantiator", inst);
     if temen_ir::spawns_detached(m) {
         host.grant_detached_spawn_caps(win);

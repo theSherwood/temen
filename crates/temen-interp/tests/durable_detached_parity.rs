@@ -107,7 +107,7 @@ fn powerbox_with(
     if authority {
         host.grant_freeze_authority();
     }
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     // `marked`: the host attests the grant as freeze-instrumented (`grant_durable_module`) — the
     // DURABILITY.md §4 bit a durable domain's admission checks. Unmarked is the default everywhere
     // above; the #1501 tests below flip it.
@@ -400,7 +400,7 @@ fn probe(durable: bool) -> i64 {
     let leaf = module(LEAF);
     let mut host = Host::new();
     host.set_durable(durable);
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let ch = host.grant_module(&child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let lh = host.grant_module(&leaf); // un-instrumented on purpose: the thing §4 refuses

@@ -8321,7 +8321,7 @@ impl ScheduledDebugRun {
     }
 
     /// [`new`](ScheduledDebugRun::new) carrying a live powerbox `host`, so a granted `Instantiator`
-    /// (`host.grant_instantiator(..)`) reaches the guest as an argument and makes an `instantiate`-using
+    /// (`host.grant_instantiator()`) reaches the guest as an argument and makes an `instantiate`-using
     /// multithreaded guest debuggable.
     pub fn new_with_host(
         m: &Module,

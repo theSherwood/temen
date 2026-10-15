@@ -142,7 +142,7 @@ fn a_grant_list_regrants_through_the_resumable_engine() {
 
     let counter = Arc::new(Mutex::new(0i64));
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let fsh = grant_fs(&mut host, &counter);
     let budget = host.grant_budget(-1, 1 << 20, -1);

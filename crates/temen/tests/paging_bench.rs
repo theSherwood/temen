@@ -192,10 +192,7 @@ fn run(backend: Backend, src: &str) -> i32 {
             backend,
             &RunConfig::default(),
             &[
-                (
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                ),
+                ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                 // One live child at a time, each a 2^24 window.
                 ("budget", HostCap::detached_budget(1 << 25)),
                 (

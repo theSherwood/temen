@@ -355,7 +355,7 @@ fn a_native_caller_parks_on_a_native_serving_child_and_wakes_with_the_reply() {
     );
     let run = |entry: Entry| {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hm = host.grant_module(&b);
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let mut fuel = 5_000_000u64;
@@ -544,7 +544,7 @@ fn a_live_offer_over_a_thread_is_refused() {
     ));
     let run = |entry: Entry| {
         let mut host = Host::new();
-        let hi = host.grant_instantiator(0, 1u64 << 17);
+        let hi = host.grant_instantiator();
         let hb = host.grant_budget(-1, 1 << 20, -1);
         let hm = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 5_000_000u64;

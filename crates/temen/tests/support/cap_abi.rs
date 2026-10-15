@@ -406,7 +406,7 @@ fn powerbox(m: &temen_ir::Module) -> (Host, Vec<i32>) {
         h.grant_stream(temen_interp::StreamRole::Out),
         h.grant_stream(temen_interp::StreamRole::Err),
         h.grant_stream(temen_interp::StreamRole::In),
-        h.grant_instantiator(0, WINDOW as u64),
+        h.grant_instantiator(),
         h.grant_address_space(0, WINDOW as u64),
         h.grant_budget(FUEL as i64, 4 << 20, 4),
         // #2219: a spawn starts at its module's function 0, so the program is granted as the child

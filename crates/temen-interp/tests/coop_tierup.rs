@@ -798,7 +798,7 @@ fn run_spawner(
 ) -> (Result<Vec<Value>, Trap>, Vec<u32>) {
     let mut host = Host::new();
     host.set_self_module(&std::sync::Arc::new(m.clone()));
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let module = host.grant_module(image);
     let args = [inst, budget, module].map(Value::I32);
@@ -1175,7 +1175,7 @@ fn fork_twin_run(
     const FORK_FUEL: u64 = 40_000_000;
     let mut host = Host::new();
     host.set_self_module(m);
-    let inst = host.grant_instantiator(0, 1u64 << 18);
+    let inst = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(temen_interp::StreamRole::Out);
     let budget = host.grant_budget(-1, 1 << 20, -1);

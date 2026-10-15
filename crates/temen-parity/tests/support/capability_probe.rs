@@ -175,7 +175,7 @@ pub fn rows() -> Vec<Row> {
             // zero it never gets past reading its record, so admission would go untested.
             mint: Box::new(|| {
                 let mut h = Host::new();
-                let x = h.grant_instantiator(0, 1 << 16);
+                let x = h.grant_instantiator();
                 let modh = h.grant_module(&a_module());
                 (h, x, vec![(17, 0, modh as i64)])
             }),

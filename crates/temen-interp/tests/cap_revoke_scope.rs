@@ -101,7 +101,7 @@ fn a_close_in_one_domain_does_not_revoke_another_domains_parked_read() {
     let m = temen_text::parse_module(&src()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hout = host.grant_stream(StreamRole::Out);
     // Granted before stdin: the child's table holds its `"budget"` there too, so `"o"` lands on
     // stdin's number.

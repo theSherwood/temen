@@ -90,7 +90,7 @@ fn module(src: &str) -> temen_ir::Module {
 /// and the child, func 1's child image (all three unused by the thread guests).
 fn host(m: &temen_ir::Module) -> (Host, [i64; 3]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1 << 19);
+    let ih = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     (host, [ih, budget, child].map(i64::from))

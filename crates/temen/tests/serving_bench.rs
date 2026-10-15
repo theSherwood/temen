@@ -149,10 +149,7 @@ fn run(backend: Backend, src: &str) -> i32 {
             backend,
             &RunConfig::default(),
             &[
-                (
-                    "vm",
-                    HostCap::custom(6, 0, |h, win| h.grant_instantiator(0, win)),
-                ),
+                ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
                 ("budget", HostCap::detached_budget(1 << 20)),
                 (
                     "child",

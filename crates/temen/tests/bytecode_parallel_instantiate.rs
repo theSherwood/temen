@@ -65,7 +65,7 @@ fn module() -> Module {
 /// The root's powerbox and args: its `Instantiator`, the child image, and a `Budget` for its window.
 fn host(m: &Module) -> (Host, [Value; 3]) {
     let mut h = Host::new();
-    let inst = h.grant_instantiator(0, 128 << 10);
+    let inst = h.grant_instantiator();
     let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     let budget = h.grant_budget(-1, 1 << 20, -1);
     (h, [inst, child, budget].map(Value::I32))

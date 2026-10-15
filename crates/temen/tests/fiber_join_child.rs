@@ -215,7 +215,7 @@ block 2 () {{
 fn setup(m: &Module, lanes: i64) -> (Host, Vec<Value>) {
     let mut h = Host::new();
     h.set_lane_cap(lanes);
-    let inst = h.grant_instantiator(0, 128 << 10);
+    let inst = h.grant_instantiator();
     let budget = h.grant_budget(-1, -1, -1);
     let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     for f in 3..=6 {

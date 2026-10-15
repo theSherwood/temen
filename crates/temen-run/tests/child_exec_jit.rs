@@ -191,7 +191,7 @@ fn host(a: &temen_ir::Module, b: &temen_ir::Module, lane_cap: i64) -> (Host, [i3
     let mut host = Host::new();
     host.set_region_factory(temen_run::new_shared_region);
     host.set_lane_cap(lane_cap);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let ma = host.grant_module(a);
     let mb = host.grant_module(b);

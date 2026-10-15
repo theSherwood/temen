@@ -125,7 +125,7 @@ fn record_spawn_is_native_and_matches_the_oracle() {
     let image = temen_ir::child_image_at(&m, 1).expect("image");
     let powerbox = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let c = h.grant_module(&image);
         let b = h.grant_budget(5_000_000, -1, -1);
         (h, [Value::I32(i), Value::I64(b as i64), Value::I32(c)])
@@ -149,7 +149,7 @@ fn pager_capable_record_module_declines_to_the_oracle() {
         "op 17 + impl exports must decline (pager records are runtime data)"
     );
     let mut h = Host::new();
-    let i = h.grant_instantiator(0, 1 << 17);
+    let i = h.grant_instantiator();
     let mut fuel = 10_000_000u64;
     assert!(
         bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(i)], &mut fuel, &mut h).is_none(),
@@ -166,14 +166,14 @@ fn dangling_budget_handle_refuses_the_detached_spawn_on_both_engines() {
     let src = budget_rec_v1_src();
     let image = temen_ir::child_image_at(&parse_module(&src).expect("parse"), 1).expect("image");
     let mut h_tw = Host::new();
-    let i_tw = h_tw.grant_instantiator(0, 1 << 17);
+    let i_tw = h_tw.grant_instantiator();
     let c_tw = h_tw.grant_module(&image);
     let args_tw = [Value::I32(i_tw), Value::I64(99), Value::I32(c_tw)];
     let r_tw = tw(&src, &args_tw, &mut h_tw);
     assert_eq!(r_tw, Ok(vec![Value::I64(EINVAL)]), "oracle");
 
     let mut h_bc = Host::new();
-    let i_bc = h_bc.grant_instantiator(0, 1 << 17);
+    let i_bc = h_bc.grant_instantiator();
     let c_bc = h_bc.grant_module(&image);
     let r_bc = bc(
         &src,

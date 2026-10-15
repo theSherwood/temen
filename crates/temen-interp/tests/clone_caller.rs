@@ -216,7 +216,7 @@ fn clone_caller_outside_a_handler_is_probeable_einval() {
 fn clone_caller_injects_the_callers_reply_out_of_band() {
     let m = module(&format!("{SRC}{}", server()));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let [sm] = images(&mut host, &m, [1]);
     let mut fuel = 20_000_000u64;
@@ -378,7 +378,7 @@ block 4 (vr: i64, vho: i32) {
 fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout(); // promote stdout to a shared sink the twin inherits
     let out_h = host.grant_stream(StreamRole::Out);
@@ -425,7 +425,7 @@ fn clone_caller_forks_the_caller_into_a_twin_that_returns_the_second_reply() {
 fn run_src_twin_oracle() -> (Vec<Value>, Vec<u8>) {
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -450,7 +450,7 @@ fn bytecode_forks_the_twin_identically_to_the_oracle() {
     // The bytecode engine must run the fork module NATIVELY (`Some`) — a fold would return `None`.
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -498,7 +498,7 @@ fn the_parallel_driver_forks_the_twin_identically_to_the_oracle() {
     let (oracle_r, oracle_bytes) = run_src_twin_oracle();
     let m = module(&forking(SRC_TWIN));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -659,7 +659,7 @@ block 5 (vpid: i64) {
 fn pid_mode_replies_the_twins_task_id_to_the_parent_and_zero_to_the_child() {
     let m = module(&forking(SRC_FORK_PID));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -828,7 +828,7 @@ block 5 () {
 fn fork_then_wait_reaps_the_twins_exit_status_through_the_shared_offer() {
     let m = module(&forking(SRC_FORK_WAIT));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -992,7 +992,7 @@ block 5 () {
 fn waitpid_wnohang_returns_zero_for_a_still_running_twin_without_blocking() {
     let m = module(&forking(SRC_FORK_WAITPID));
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let hb = host.grant_budget(-1, 8 << 20, -1);
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
@@ -1085,7 +1085,7 @@ block 2 (vs: i64) {
     std::thread::spawn(move || {
         let m = module(&forking(&src));
         let mut host = Host::new();
-        let ih = host.grant_instantiator(0, 1u64 << 18);
+        let ih = host.grant_instantiator();
         let hb = host.grant_budget(-1, 8 << 20, -1);
         let out_h = host.grant_stream(StreamRole::Out);
         let [sm, cm] = images(&mut host, &m, [1, 4]);
