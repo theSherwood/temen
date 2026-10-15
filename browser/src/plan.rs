@@ -410,8 +410,7 @@ pub(crate) fn drive_op13<'p>(
             // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
             // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
             bytecode::VcpuEvent::JitInstall { handle, code } => {
-                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
-                    .map(|(f, t, _wasm, id)| (f, t, id));
+                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
                 vcpu.deliver_jit_install(unit);
             }
             bytecode::VcpuEvent::JitUninstall { handle, .. } => {
@@ -419,8 +418,7 @@ pub(crate) fn drive_op13<'p>(
                 vcpu.deliver_jit_uninstall(authorized);
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
-                let unit = crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
-                    .map(|(f, t, _wasm, id)| (f, t, id));
+                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
                 vcpu.deliver_jit_invoke(unit);
             }
             // The children this loop drives are single-threaded and non-interactive: no threads, no

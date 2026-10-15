@@ -11,7 +11,7 @@
 import { foreignImports } from './foreign-mem.js';
 import { engineMemory } from './engine-mem.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
-const STACK = 1 << 20, SLOT = 16;
+const STACK = 1 << 20;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 export async function fetchBytes(url) {
@@ -81,77 +81,59 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
   return { module, bytes, memory, ex, maxPages };
 }
 
-// Build the runner over a loaded engine. The returned `runAcrossWorkers(guest, opts)` runs one
-// guest's `thread.spawn`ed / `instantiate`d vCPUs across real Web Workers and resolves
-// `{ value, started }`. `guest` is the **encoded module bytes** (a fetched `.temenc` or an in-browser
+// Build the runner over a loaded engine. The returned `runAcrossWorkers(guest, opts)` runs one guest
+// on the parallel driver (executor 2, #1414 B6): the whole run is one in-Rust call on the root's
+// Worker, and each of its threads runs on a Worker of its own. It resolves `{ value, exit, started,
+// tierups, childMems }`. `guest` is the **encoded module bytes** (a fetched `.temenc` or an in-browser
 // `temen_parse` product). Options:
-//   `jit`     ⇒ build the Rust-side §22 powerbox + reserve the JIT dispatch table;
+//   `jit`     ⇒ build the Rust-side §22 powerbox: a host-compiled unit the root is handed;
+//   `jitCodegen` ⇒ the same, with a guest's `Jit.invoke` running the unit on emitted wasm on its
+//               thread's Worker; `jitService` selects the unit (0 = i32 `service`, 1 = f64 `fservice`);
+//   `jitRuntime` ⇒ publish the runtime-`Jit.compile` powerbox (the guest compiles its own units, in
+//               one shared host); `jitRuntimeCodegen` runs their invokes on emitted wasm, and
+//               `jitBlobs` stages the unit blobs into the window, where the guest's `compile (ptr,
+//               len)` reads them;
 //   `inst`    ⇒ publish the §14 recipe (root `Instantiator` over the window + the optional granted
-//               `unit` module bytes + a `WindowMinter` of `minter` bytes when > 0, #1286) — the root
-//               vCPU builds its powerbox from it; a root's `instantiate_detached` then spawns each
-//               child into its OWN `WebAssembly.Memory` on its own Worker (concurrently);
-//   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every vCPU
+//               `unit` module bytes + a `WindowMinter` of `minter` bytes when > 0, #1286) — a root's
+//               detached spawn starts each child on its own `WebAssembly.Memory`, each of its threads
+//               on a Worker of its own;
+//   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every thread
 //               dispatches `call.cap` through; read stdout back via `temen_par_stdout_*` after);
 //   `onramp`  ⇒ publish the **on-ramp** powerbox the same way (#152): the grants a single-threaded
-//               on-ramp run gets, manifest imports included, shared by every vCPU — so an on-ramp
+//               on-ramp run gets, manifest imports included, shared by every thread — so an on-ramp
 //               `.temen` whose runtime spawns threads runs them on real Workers. `stdin` (bytes)
 //               seeds its stdin, and `env` (an array of `KEY=VALUE` strings, #1777) its §3e
 //               environment — how a runtime learns per-run settings such as JACL's worker count;
-//               an `exit(code)` from any vCPU ends the run with `exit` = code;
+//               an `exit(code)` from any thread ends the run with `exit` = code;
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
-//   `x2`      ⇒ run on the **parallel driver** (executor 2, #1414 B6) instead of a `Vcpu` per Worker:
-//               the whole run is one in-Rust call on the root's Worker, each of its threads a Worker
-//               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, `jitRuntime`,
-//               none). Of the emitted-tier options it takes `tierup` and the §22 ones (`jitCodegen`,
-//               `jitRuntimeCodegen`, `jitB2`): each thread runs its task's tier-ups and emitted
-//               invokes on its own Worker, over a window of `winSize` that cannot grow. Under
-//               `tierup` a detached child's root task runs its granted module's emit over the
-//               child's own memory (#1414 ED-2), so it refuses `instCodegen`, the per-Worker
-//               driver's switch for that. A run it ends with a trap rejects with an Error whose
-//               `faultAddr` is where a memory fault faulted, window-relative (`-1n` for none, #2275);
-//   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
+//   `tierup`  ⇒ each thread runs its task's tier-ups on its own Worker, over a window of `winSize`
+//               that cannot grow; a detached child's root task runs its granted module's emit over
+//               the child's own memory (#1414 ED-2). `tierups` counts the emitted calls.
+//   `winSize` sizes the window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
-//   I/O powerbox lock, the live-vCPU counter) may be left unusable; reload the page after a stop.
-// Either way the page services no authority: JIT/IO are in-Rust, and a §14 `instantiate` event's
-// operands are inert integers relayed into a new Worker.
+//   engine's locks) may be left unusable; reload the page after a stop.
+// A run that ends in a trap rejects with an Error whose `faultAddr` is where a memory fault faulted,
+// window-relative (`-1n` for none, #2275). The page services no authority: the powerboxes are
+// in-Rust, and a Worker only hosts a thread the engine started.
 export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], x2 = false } = {}) {
-    if (x2 && instCodegen) {
-      throw new Error('the parallel driver runs a detached child emitted under `tierup`, not `instCodegen` (#1414 ED-2)');
-    }
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
-    // #2251: every vCPU gets its own Worker, so a guest's `self.parallelism` is the page's core count.
+    // #2251: every thread gets its own Worker, so a guest's `self.parallelism` is the page's core count.
     ex.temen_par_set_workers(globalThis.navigator?.hardwareConcurrency || 1);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
-    // §22 real-codegen run: like `jit`, but the host-compiled unit's wasm is emitted + stashed, and a
-    // guest `Jit.invoke` runs it on emitted wasm (each Worker instantiates the unit — see worker.js).
-    // `jitService` selects the codegen unit (0 = i32 `service`, 1 = f64 `fservice`).
-    if (jitCodegen) ex.temen_par_jit_codegen_service(jitService);
-    // §22 Model B2 cross-Worker: emit runtime-compiled units importing the shared reserved funcref
-    // table (a shared static, so setting it on this instance sets it for every Worker); each Worker
-    // provides its own `WebAssembly.Table` mirror (`jitB2` in the cfg → worker.js). Verified by the
-    // CI-gated `jitb2` work item — see BROWSER.md § "wasm-JIT tier".
-    if (jitB2) ex.temen_par_jit_set_b2(1);
-    // §22 runtime-`Jit.compile` across Workers: publish the shared Mutex<Host> powerbox every vCPU
-    // dispatches its call.caps through (the guest compiles its OWN units at runtime); with
-    // `jitRuntimeCodegen` each compiled unit's emitted wasm services `Jit.invoke` per-Worker
-    // (worker.js instantiates per code handle). `jitBlobs` stages the unit blobs into the window
-    // where the guest's `compile (ptr, len)` reads them.
+    if (jitCodegen) {
+      ex.temen_par_jit_codegen_service(jitService);
+      if (ex.temen_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_codegen failed');
+    }
     if (jitRuntime) {
-      // Self-clean: clear any prior run's recipe (temen_par_root checks the §14/§22-fixed recipes
-      // first, so a stale one would hijack this run), and set the B2 flag explicitly both ways —
-      // it is a sticky static that powerbox_none does not reset.
-      ex.temen_par_powerbox_none();
-      ex.temen_par_jit_set_b2(jitB2 ? 1 : 0);
       if (ex.temen_par_powerbox_jit_runtime(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_runtime failed');
       ex.temen_par_jit_set_codegen(jitRuntimeCodegen ? 1 : 0);
     }
-    if (jitCodegen && ex.temen_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_codegen failed');
     if (io && ex.temen_par_powerbox_io() !== 1) throw new Error('temen_par_powerbox_io failed');
     if (onramp) {
       const sin = stdin || new Uint8Array(0);
@@ -164,21 +146,7 @@ export function makeRunner({ module, memory, ex }) {
       if (ex.temen_set_run_env(eptr, envb.length) !== 0) throw new Error('temen_set_run_env refused the environment (an entry without `=`, or too large)');
       if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length) !== 1) throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module)');
     }
-    if (!jit && !jitCodegen && !io && !onramp && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
-    // The parallel driver compiles the guest itself, on the root's Worker.
-    const prog = x2 ? 0 : (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
-    if (!x2 && prog === 0) throw new Error('module unsupported on the per-Worker driver (temen_par_compile null)');
-    // #2414: never a window smaller than the module declares. Emitted code checks its accesses
-    // against the declaration, so the engine refuses a smaller one. The parallel driver floors its own.
-    if (!x2) winSize = Math.max(winSize, 2 ** Math.max(ex.temen_par_declared_log2(prog), 0));
-    const win = ex.temen_par_alloc(winSize);
-    if (win === 0) throw new Error(`could not allocate a ${winSize}-byte window`);
-    for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
-    // The parallel driver's window is its own: it copies the staged blobs in from `win`.
-    const seedLen = jitBlobs.reduce((n, b) => Math.max(n, b.off + b.bytes.length), 0);
-    // §14 real-codegen (`instCodegen`) publishes the same recipe as `inst`; each confined child whose
-    // granted-unit entry is emitted runs it on wasm instead of interpreting (see worker.js).
-    if (inst || instCodegen) {
+    if (inst) {
       let uptr = 0, ulen = 0;
       if (unit) {
         uptr = ex.temen_par_alloc(unit.length);
@@ -189,20 +157,28 @@ export function makeRunner({ module, memory, ex }) {
         throw new Error('temen_par_powerbox_inst failed');
       }
     }
+    if (!jit && !jitCodegen && !io && !onramp && !inst && !jitRuntime) ex.temen_par_powerbox_none();
+    // A runtime-compile guest reads its unit blobs from the window: they are staged here, and the run
+    // copies them into its own window (`seedLen` bytes from `win`).
+    const seedLen = jitBlobs.reduce((n, b) => Math.max(n, b.off + b.bytes.length), 0);
+    const win = seedLen ? ex.temen_par_alloc(seedLen) : 0;
+    if (seedLen && win === 0) throw new Error(`could not allocate ${seedLen} bytes to stage the unit blobs`);
+    for (const b of jitBlobs) u8().set(b.bytes, win + b.off);
 
-    // A shared i32 cell every Worker atomically bumps each time it runs an emitted region (a tier-up
-    // or a §22 JIT-codegen invoke), so the caller can prove the seam actually fired (a result match
-    // alone can't tell "ran emitted wasm" from "silently interpreted"). Read back after the run.
-    const tierupCell = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? ex.temen_par_alloc(4) : 0;
+    // A shared i32 cell every Worker atomically bumps each time it runs an emitted call (a tier-up or
+    // a §22 invoke), so the caller can prove the seam actually fired (a result match alone can't tell
+    // "ran emitted wasm" from "silently interpreted"). Read back after the run.
+    const counted = tierup || jitCodegen || jitRuntimeCodegen;
+    const tierupCell = counted ? ex.temen_par_alloc(4) : 0;
 
-    const workers = new Set();
-    // A parallel-driver thread's Worker closes itself once its thread is out of the engine, and the
-    // page leaves it be: the thread counts itself out of the run before it is done in the engine (it
-    // still drops what it held). Chromium stops a terminated Worker that is still running about two
-    // seconds later, wherever it is, and one stopped inside the engine's allocator holds its lock for
-    // good. Only a stop tears these down too, as the note on `signal` above says.
-    const x2threads = new Set();
-    // `childMems`: how many parallel-driver threads ran over a detached child's own memory.
+    // A thread's Worker closes itself once its thread is out of the engine, and the page leaves it
+    // be: the thread counts itself out of the run before it is done in the engine (it still drops
+    // what it held). Chromium stops a terminated Worker that is still running about two seconds
+    // later, wherever it is, and one stopped inside the engine's allocator holds its lock for good.
+    // Only a stop tears these down too, as the note on `signal` above says.
+    let root = null;
+    const threads = new Set();
+    // `childMems`: how many threads ran over a detached child's own memory.
     let started = 0, childMems = 0;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
@@ -210,23 +186,18 @@ export function makeRunner({ module, memory, ex }) {
           if (signal.aborted) return reject(new Error('stopped'));
           signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
         }
-        const startVcpu = (cfg) => {
+        const startWorker = (cfg) => {
           started++;
           const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-          (cfg.role === 'x2thread' ? x2threads : workers).add(w);
+          if (cfg.role === 'x2thread') threads.add(w);
+          else root = w;
           w.onmessage = (e) => {
             const m = e.data;
             if (m.kind === 'x2spawn') {
-              // A thread of a parallel-driver run: the boxed closure at `start`, on a Worker of its own,
-              // with the detached child's memory its window lives in, if any (B6-3c).
+              // A thread of the run: the boxed closure at `start`, on a Worker of its own, with the
+              // detached child's memory its window lives in, if any (B6-3c).
               if (m.x2Mem) childMems++;
-              startVcpu({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
-            } else if (m.kind === 'spawn') {
-              // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
-              // child's message carries its own win/winSize — the carve; a detached child's carries its
-              // own `childMem`, a shared Memory that transfers by reference — overriding the run defaults).
-              const { kind, ...cfg2 } = m;
-              startVcpu({ role: 'child', ...cfg2 });
+              startWorker({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
             } else if (m.kind === 'done') {
               resolve({ value: BigInt(m.value) });
             } else if (m.kind === 'exit') {
@@ -236,21 +207,18 @@ export function makeRunner({ module, memory, ex }) {
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
-          // `tierup` + the guest bytes (kept live at `gptr` for the run) let each Worker JIT-compile
-          // the guest locally and run eligible compute regions on the emitted wasm (threads slice).
-          w.postMessage({ module, memory, prog, win, winSize, tierup, jitCodegen, jitService, instCodegen, jitB2, jitRuntime, gptr, glen: guest.length, tierupCell, seedLen, ...cfg });
+          w.postMessage({ module, memory, win, winSize, tierup, gptr, glen: guest.length, tierupCell, seedLen, ...cfg });
         };
-        // The root vCPU runs on its own Worker (the page can't Atomics.wait).
-        const rootSlot = ex.temen_par_alloc(SLOT);
-        const rootStackTop = ex.temen_par_alloc(STACK) + STACK;
-        const rootTlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-        startVcpu({ role: x2 ? 'x2root' : 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
+        // The run starts on a Worker of its own (the page can't Atomics.wait).
+        const stackTop = ex.temen_par_alloc(STACK) + STACK;
+        const tlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+        startWorker({ role: 'x2root', stackTop, tlsBase });
       });
-      const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
+      const tierups = counted ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, exit, started, tierups, childMems };
     } finally {
-      for (const w of workers) w.terminate();
-      if (signal && signal.aborted) for (const w of x2threads) w.terminate();
+      if (root) root.terminate();
+      if (signal && signal.aborted) for (const w of threads) w.terminate();
     }
   };
 }

@@ -379,7 +379,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `WebAssembly.Memory` are exposed, and `browser-test.mjs` drives the preinstalled Chromium against a
   page (`web/index.html` + `main.js` + `worker.js`) that (1) runs the **powerbox** (`temen_run_pb` →
   `"hello, powerbox!"`, single-threaded on the page) and (2) runs **one guest's `thread.spawn`ed vCPUs
-  across real Web Workers** over the shared memory — the browser twin of `threads-spawn.mjs`: the page
+  across real Web Workers** over the shared memory (since #1414 B6-4a on executor 2): the page
   creates every Worker and never blocks (a browser bans main-thread `Atomics.wait`); each Worker sets
   its own stack/TLS and services `thread.join` via `Atomics.wait` and the futex via
   `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
@@ -803,7 +803,7 @@ schedule/IO-shaped; the real-language playground tab is what makes this the high
 
 v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation, lazy hot-block
 discovery. Temen has none of that. Code arrives as **complete, verified, immutable IR units at exactly
-three explicit points** — module load (`temen_par_compile`), §22 `jit_compile`/`install` (already
+three explicit points** — module load, §22 `jit_compile`/`install` (already
 literally the API for "compile this unit"), and a §14 spawn's granted module — and uninstall is drop, never
 patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `v128`, typed
 SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
@@ -907,6 +907,14 @@ alongside the existing escape-TCB targets. The §22 guest-JIT path already has t
 subset" concept this tier generalizes: a unit outside the emitter's subset invokes on the interpreter.
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
+
+> **Since #1414 B6-4a** the browser's parallel mode is executor 2 (THREADS.md §4c-wasm): one
+> in-Rust run on the root's Worker, each thread on a Worker of its own, its tier-ups, §22 units and
+> §14 children on emitted wasm through the shared emitted-tier host (`emittedTier`). The per-Worker
+> `Vcpu` driver the slices below built on (`temen_par_run`, the `instCodegen`/`jitB2` options, and
+> the Node harnesses `threads-spawn.mjs`, `tierup.mjs` and `jitcodegen*.mjs`) is deleted; the
+> slices record it as history. The Chromium `#x2` item and the `#inst*` items cover what its page
+> items did.
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any

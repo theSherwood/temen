@@ -20,7 +20,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - **durability** — does it survive a freeze? (`capture_durable_handles`) *(conformance-tested)*
 - **backend** — same on every engine? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
 - **target** — same on native / wasm32 / Windows?
-- **concurrency** — carried by both the coop and per-Worker drivers? *(conformance-tested)*
+- **concurrency** — carried by both the coop and parallel drivers? *(conformance-tested)*
 - **code origin** — usable from a §22 guest-JIT unit as from the base module? *(conformance-tested)*
 - **debugger** — observable under the debug tier? *(conformance-tested)*
 

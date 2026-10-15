@@ -127,7 +127,7 @@ fn detached_card_spawns_over_a_premapped_region() {
     assert_eq!(run.value, 42082);
 }
 
-/// The `inst` card under the grants of the parallel §14 recipe it runs on (`temen_par_root`): an
+/// The `inst` card under the grants of the parallel §14 recipe it runs on (`temen_x2_start`): an
 /// `Instantiator` over its window, the `budget` its children's windows spend, and its child image as
 /// `"child"` (#2219). The page runs each child on a Worker of its own; here they share the bytecode
 /// engine's cooperative driver, which admits them the same way. Eight copies return 5 each.

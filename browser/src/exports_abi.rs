@@ -30,9 +30,8 @@ pub struct Export {
     pub cfg: Option<String>,
 }
 
-/// Every `#[no_mangle] pub extern "C" fn` under `src_dir`, plus the `par_ev_getter!` macro's
-/// expansions (the one macro that mints exports). Attribute lines between `#[no_mangle]` and the
-/// `fn` (`#[allow(...)]`, `#[cfg(...)]`) are tolerated and, for `cfg`, recorded.
+/// Every `#[no_mangle] pub extern "C" fn` under `src_dir`. Attribute lines between `#[no_mangle]`
+/// and the `fn` (`#[allow(...)]`, `#[cfg(...)]`) are tolerated and, for `cfg`, recorded.
 pub fn rust_exports(src_dir: &Path) -> BTreeMap<String, Export> {
     let mut out = BTreeMap::new();
     for file in rs_files(src_dir) {
@@ -57,13 +56,6 @@ pub fn rust_exports(src_dir: &Path) -> BTreeMap<String, Export> {
                         },
                     );
                 }
-            }
-            if let Some(rest) = t.strip_prefix("par_ev_getter!(") {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                out.insert(name.clone(), Export { name, cfg: None });
             }
             // Doc comments sit above the attribute run; anything else ends it.
             if !t.starts_with("///") {

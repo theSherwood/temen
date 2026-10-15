@@ -617,7 +617,9 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    child are the natural follow-up (a `temen_par_child` over the same foreign id). *(Since #1414's
    E2 the admitted child crosses to its Worker whole, as a ticket: the engine seeds the window, the
    event carries no segment blob, and a spawn with re-grants or a pre-mapped region runs rather than
-   trapping, on both arms.)*
+   trapping, on both arms. Since #1414 B6-4a the parallel Worker driver is executor 2, which mints a
+   detached child's `Memory` through its thread platform and hands it to each of the child's
+   threads' Workers (B6-3c-1, ED-2); the per-Worker `temen_par_*` driver is deleted.)*
 4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
    decoupled-window child compile, the copy-free detached runner, the `build_detached` /
    `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.

@@ -5,7 +5,7 @@
     { "short": "durability", "question": "does it survive a freeze? (`capture_durable_handles`)", "conformed": true },
     { "short": "backend", "question": "same on every engine? (see OPS_PARITY.md for op-level detail)", "conformed": true },
     { "short": "target", "question": "same on native / wasm32 / Windows?", "conformed": false },
-    { "short": "concurrency", "question": "carried by both the coop and per-Worker drivers?", "conformed": true },
+    { "short": "concurrency", "question": "carried by both the coop and parallel drivers?", "conformed": true },
     { "short": "code origin", "question": "usable from a §22 guest-JIT unit as from the base module?", "conformed": true },
     { "short": "debugger", "question": "observable under the debug tier?", "conformed": true }
   ],
