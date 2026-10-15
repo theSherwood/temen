@@ -33422,7 +33422,12 @@ struct Mem {
     /// after a `MemoryFault` to distinguish a recoverable page fault (suspend to the parent, which
     /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
     /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
+    /// It holds the access's first byte, which a report names (#2126).
     last_fault: AtomicU64,
+    /// #2469 — the first byte of that access in the page that refused it: the page a pager must
+    /// supply ([`Mem::take_fault`]). It differs from [`last_fault`] only for an access that crosses
+    /// into the refused page from one it may touch. Valid while `last_fault` is set.
+    refused_at: AtomicU64,
     /// #1190 debugger side-channel: the confined address of the most recent **fatal** memory fault
     /// (a NULL-guard access, an unmapped/read-only page), recorded by `check_prot` for the DAP layer
     /// to report a segfault's address (a NULL deref → `0`). Distinct from [`last_fault`], which is the
@@ -33542,6 +33547,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -33615,6 +33621,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -33672,6 +33679,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: self.null_guard,
@@ -33846,17 +33854,17 @@ impl Mem {
     ///   parent could not legally map the reserved region anyway. #1190: the address goes to the
     ///   debugger (a segfault at `base`) in the dedicated report field, not in `last_fault`, whose
     ///   recoverable-fault contract the guard sidesteps.
-    /// - **Otherwise recoverable**: a §14 coroutine child suspends to its parent on it, and a demand
-    ///   child's pager supplies the page. It is recorded at the access's first byte in `page`, the
-    ///   page the access needs (#2469): an access that crosses into `page` from a mapped one starts
-    ///   in the mapped one.
+    /// - **Otherwise recoverable**: a demand child's pager supplies the page. A report names the
+    ///   access's first byte, `base`, on every engine (#2126). The page to supply is `page`, the one
+    ///   that refused it, which holds the access's first byte only when the access starts there: one
+    ///   that crosses into `page` starts in a page it may touch (#2469).
     fn refused(&self, base: u64, page: u64) -> Trap {
         let start = page * self.page;
         if start < self.null_guard {
             self.fault_report.store(base, Ordering::Relaxed);
             return Trap::MemoryFault;
         }
-        self.page_fault(base.max(start))
+        self.page_fault(base, base.max(start))
     }
 
     /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
@@ -34022,21 +34030,23 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
-    /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
-    /// child reads the recorded address and suspends to its parent instead.
-    fn page_fault(&self, base: u64) -> Trap {
+    /// Record a pending recoverable page fault of the access starting at `base`, refused at `at`, and
+    /// return the `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a
+    /// demand child's pager supplies the page instead.
+    fn page_fault(&self, base: u64, at: u64) -> Trap {
         self.last_fault.store(base, Ordering::Relaxed);
+        self.refused_at.store(at, Ordering::Relaxed);
         Trap::MemoryFault
     }
 
-    /// Take the pending recoverable page-fault address (set by [`check_prot`], cleared by
-    /// [`confine_checked`]), clearing it. `None` if the last `MemoryFault` was an out-of-window fault
-    /// (a real trap), not a recoverable page fault.
+    /// Take the pending recoverable page fault (set by [`check_prot`], cleared by
+    /// [`confine_checked`]), clearing it: the access's first byte in the page that refused it, the
+    /// page to supply (#2469). `None` if the last `MemoryFault` was an out-of-window fault (a real
+    /// trap), not a recoverable page fault.
     fn take_fault(&self) -> Option<u64> {
         match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
             NO_FAULT => None,
-            addr => Some(addr),
+            _ => Some(self.refused_at.load(Ordering::Relaxed)),
         }
     }
 
