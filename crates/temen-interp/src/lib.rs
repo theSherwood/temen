@@ -33074,6 +33074,15 @@ impl MemLayout {
         &self.bytes
     }
 
+    /// #2427 — whether the pages this layout holds past its head with contents cover `[off, off + len)`
+    /// whole, so a restore that writes them leaves nothing of what was there.
+    fn rewrites(&self, off: u64, len: u64) -> bool {
+        let unit = self.map.page;
+        (off / unit * unit..off + len)
+            .step_by(unit as usize)
+            .all(|at| self.tail.contains_key(&at))
+    }
+
     /// What holding this layout costs: its head's bytes and those of each page it holds past it (the
     /// protection map is a handful of entries beside them).
     pub fn byte_len(&self) -> usize {
@@ -35063,16 +35072,17 @@ impl Mem {
         // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
         // installs its entry with the region it names.
         if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
-            let mut space = self.space_write(); // marks prot_dirty, matching the captured window
-                                                // #2427 — what a live window holds past the image is zeroed first, in runs: the layout
-                                                // writes only the pages it holds with contents, so a page it holds zero, or not at all,
-                                                // must not keep what the guest wrote there since the moment was taken. A fresh window
-                                                // holds nothing there.
+            // Marks prot_dirty, matching the captured window.
+            let mut space = self.space_write();
+            // #2427 — a page a live window holds past the image that the layout does not rewrite whole
+            // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
+            // page it holds zero, or not at all, must not keep what the guest wrote there since the
+            // moment was taken. A fresh window holds nothing there.
             let mut stale: Vec<(u64, u64)> = Vec::new();
             for (&page, _) in self
                 .held_map(&space)
                 .range(first..)
-                .filter(|(_, p)| held_tail(p))
+                .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
             {
                 match stale.last_mut() {
                     Some((_, end)) if *end == page => *end += 1,
