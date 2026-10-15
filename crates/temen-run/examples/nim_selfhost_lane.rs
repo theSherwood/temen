@@ -1,8 +1,9 @@
 //! **The self-hosted nimony lane** (#1609, #763): nimony's own toolchain, compiled to Temen with
 //! **no C compiler anywhere**, builds a nim program on Temen, and the program runs.
 //!
-//! Every tool is a `.temen` module built by `build_nim_temen --posix` (nimony → Leng →
-//! `temen-leng`), bound to one shared `temen_posix` personality, so they all see one memfs.
+//! Every tool is a `.temen` module that `scripts/nim-toolchain.sh` builds with nimony's Temen
+//! backend (`nimony t` → Leng → `temen-link`), bound to one shared `temen_posix` personality, so
+//! they all see one memfs.
 //!
 //! ```text
 //! nim_selfhost_lane --sh <sh.ir> --nimony <nimony.temen> --nifmake <nifmake.temen>
@@ -283,7 +284,7 @@ fn run_program(
 /// directory, `lib/` in it — so both record the same paths, relative and absolute alike (nimony
 /// writes a compile-time evaluation program's imports and output file absolute). And native's
 /// phases are the ones **nimony** built natively from the same sources as these Temen builds
-/// (`build_nim_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
+/// (`scripts/nim-toolchain.sh`, step 1): the same compiler, only the target differs. `nimony/bin`'s
 /// own phases are built by classic Nim, a different compiler whose hash tables iterate in a
 /// different order, and hexer's output shows it (#1753).
 fn expect_native(posix: &temen_posix::Posix, cache: &str) {
@@ -372,7 +373,8 @@ fn main() {
     let shoggoth_p = need(flag("--shoggoth"), "--shoggoth");
     let link_p = need(flag("--temen-link"), "--temen-link");
     // The prebuilt guest libc (`snprintf`, `strtod`, libm): what `temen-link` links a program
-    // against, found where `build_nim_temen` finds it.
+    // against. `--libc`, else `$TEMEN_PG_LIBC`, as the toolchain's host `temen-link` reads it, else
+    // the committed one.
     let libc_p = flag("--libc")
         .or_else(|| std::env::var("TEMEN_PG_LIBC").ok())
         .unwrap_or_else(|| "browser/web/assets/pg_libc.temeno".to_string());
