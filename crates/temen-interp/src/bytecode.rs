@@ -10989,7 +10989,8 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 
 /// #1538 — whether a durable freeze is in progress (the global freeze word reads `UNWINDING`): a park
 /// under it is **fresh** (the resumer's trailing poll unwinds before it observes the value), one under
-/// `NORMAL` is consumed by the resumer that runs on.
+/// `NORMAL` is consumed by the resumer that runs on. Callers ask only for a durable run: any other
+/// keeps its own data at the guard base (#2101).
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
 }
@@ -11255,7 +11256,7 @@ fn suspend_fiber(
     // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
     resumer.tls = vt.active.tls;
     let suspended = std::mem::replace(&mut vt.active, resumer);
-    let consumed = !is_unwinding(mem);
+    let consumed = !(durable && is_unwinding(mem));
     fibers.with(|f, _, _| {
         f[id] = FiberState::Parked {
             vm: suspended,

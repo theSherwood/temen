@@ -2604,11 +2604,12 @@ fn seed_domain(
         detached: thaw_detached,
         live_detached: thaw_live_detached,
     } = residue;
-    root.dstate = root
-        .mem
-        .as_ref()
-        .map(|m| m.durable_load_dstate(root.vcpu_ctx))
-        .unwrap_or(STATE_NORMAL);
+    // Only a durable window has control words at the guard base; any other run keeps its own data
+    // there, and starts in no freeze phase whatever it holds (#2101).
+    root.dstate = match root.mem.as_ref() {
+        Some(m) if root.durable => m.durable_load_dstate(root.vcpu_ctx),
+        _ => STATE_NORMAL,
+    };
     // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
     // the window's active-SP word otherwise (a fresh/freeze run leaves it at the root region base; a
     // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
@@ -16225,11 +16226,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
                     // safepoint. (A child existing *before* the freeze point is reconstructed by the
                     // runtime at thaw, not re-spawned here — the root's rewind skips the prologue
-                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.)
-                    let child_state = mem
-                        .as_ref()
-                        .map(|m| m.durable_state())
-                        .unwrap_or(STATE_NORMAL);
+                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.) Any
+                    // other run's word there is its own data, and its child starts `NORMAL` (#2101).
+                    let child_state = match mem.as_ref() {
+                        Some(m) if durable => m.durable_state(),
+                        _ => STATE_NORMAL,
+                    };
                     // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
                     // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
                     // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
