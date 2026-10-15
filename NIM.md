@@ -985,7 +985,7 @@ condition variable over `syscall(SYS_futex, …)`. The shim's `syscall` (row 58)
 **The CPU count.** `sysconf(_SC_NPROCESSORS_ONLN)` (and `_CONF`) answers `self.parallelism`: how
 many vCPUs the driver running the domain can run at once, bounded by its lane cap (D66). That is the
 host's worker count on the tree-walker and the JIT, 1 on the bytecode engine, whose driver runs every
-vCPU on one thread, and the page's core count under the browser's per-Worker driver (#2254).
+vCPU on one thread, and the page's core count under the browser's parallel driver (#2254).
 `std/cpuinfo` asks `sched_getaffinity` first, which reports nothing here, and falls back to it, so
 `initPool()` starts `max(1, n - 1)` workers.
 

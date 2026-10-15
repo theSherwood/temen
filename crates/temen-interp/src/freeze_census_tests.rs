@@ -58,6 +58,7 @@ impl Fixture {
                     DetachedSpawn {
                         digest: module_digest(&m),
                         module: m,
+                        pager: None,
                     },
                 ),
             );

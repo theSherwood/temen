@@ -395,7 +395,8 @@ every axis it can reach —
 - **Host target** — native (x86/arm), wasm32, Windows: a guest never behaves differently by platform;
   a capability landing native-first is not done until it reaches the others.
 - **Concurrency model** — the cooperative multiplex driver (`CoopRun`) and the genuinely-parallel
-  per-Worker driver (`temen_par_*`) both carry it.
+  driver (executor 2: a thread per task, an OS thread natively and a Worker in the browser) both
+  carry it.
 - **Code origin** — the host-translated base module and a §22 guest-JIT unit (`vm_jit_*`,
   runtime-compiled by the guest) both support it.
 - **Nesting** — it holds for a confined §14 child, a fork/clone twin, and a spawned thread, not just

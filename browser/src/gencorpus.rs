@@ -2375,13 +2375,13 @@ fn main() {
     // 4d host I/O across Workers — ground truth (result 8, stdout "tick\n"×8) asserted in JS.
     emit("threads_io", THREADS_IO);
     // #152 the on-ramp recipe across Workers — ground truth (exit 7, letters, total 8060) asserted in
-    // JS; the native twin is `tests/par_onramp.rs` over the same fixture.
+    // JS.
     emit(
         "threads_onramp",
         include_str!("../tests/fixtures/threads_onramp.temt"),
     );
-    // #1761 a fiber migrating between Workers under one run-shared registry, reading `vcpu.tls` —
-    // ground truth (13) asserted in JS; the native twin is `tests/par_onramp.rs` over the fixture.
+    // #1761 a fiber migrating between Workers, reading `vcpu.tls` — ground truth (13) asserted in
+    // JS.
     emit(
         "threads_fibers",
         include_str!("../tests/fixtures/threads_fibers.temt"),

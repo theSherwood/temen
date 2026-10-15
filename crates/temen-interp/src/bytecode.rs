@@ -10346,7 +10346,7 @@ fn exec_image_build(
     let win = m.exec_window(
         back,
         img.child_size,
-        &img.module.data,
+        &img.module,
         temen_ir::module_null_guard(),
         args.as_deref(),
     );
@@ -11549,11 +11549,13 @@ fn shadow_switch(
     // cannot keep it refuse durable hosts (#1694).
     let arena = m.shadow_arena();
     let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
-    let sp = m.durable_get_sp(region_of(out_ctx));
-    if out_ctx == ROOT_FIBER {
-        *root_shadow_sp = sp;
-    } else {
-        fiber_sp[out_ctx] = sp;
+    // The host-side slot stands when the word cannot be read: it is what was written.
+    if let Some(sp) = m.durable_get_sp(region_of(out_ctx)) {
+        if out_ctx == ROOT_FIBER {
+            *root_shadow_sp = sp;
+        } else {
+            fiber_sp[out_ctx] = sp;
+        }
     }
     let in_sp = if in_ctx == ROOT_FIBER {
         *root_shadow_sp
@@ -11611,7 +11613,7 @@ fn freeze_drive(
     let root_sp = ctx
         .mem
         .as_ref()
-        .map(|m| m.durable_get_sp(root_word))
+        .and_then(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
@@ -11706,7 +11708,7 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(arena.region_base(slot + 1)))
+            .and_then(|m| m.durable_get_sp(arena.region_base(slot + 1)))
             .unwrap_or(arena.frame_base(slot + 1));
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
