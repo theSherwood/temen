@@ -541,3 +541,277 @@ block 0 (v0: i32) {{
         "the next run starts with nothing installed"
     );
 }
+
+// ---- #2414: a thread's emitted code never runs over a window smaller than the module declares ------
+//
+// The per-Worker driver builds a `thread.spawn`ed vCPU over its spawner's window, and the tier-up
+// module's emitted code elides the bound check of any access it proves below the module's DECLARED
+// memory. A window smaller than the declaration (the page used to cap every window at 16 MiB) let
+// such an access land past the window, in the engine's own linear memory. The driver now refuses to
+// build a vCPU over a window smaller than its module declares; at the declared size the same access
+// is in the window.
+
+/// Where the harness's window starts inside the wasmi memory, the browser's shared-linear-memory
+/// shape (the window is a span of the engine's memory, with engine data on both sides of it).
+const EDGE_WIN_BASE: u32 = 0x10_0000;
+const EDGE_ENV_PTR: u32 = 1024;
+/// The module declares 32 MiB.
+const EDGE_DECLARED_LOG2: u8 = 25;
+/// A constant address past 16 MiB and inside the declared 32 MiB: the emit proves the store below
+/// the declared size, so it elides its check.
+const EDGE_ADDR: i64 = (1 << 24) + 256;
+const EDGE_SENTINEL: i64 = 0x5EED_2414;
+const CANARY: u8 = 0xA5;
+
+/// f0 (the root) spawns f1 and joins it. f1 calls f2, the tier-up target: a leaf that stores
+/// `EDGE_SENTINEL` at `EDGE_ADDR` and loads it back.
+fn edge_guest() -> temen_ir::Module {
+    let src = format!(
+        r#"memory {EDGE_DECLARED_LOG2}
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vj = thread.join vt
+  return vj
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vr = call 2 ()
+  return vr
+  }}
+}}
+func () -> (i64) {{
+block 0 () {{
+  va = i64.const {EDGE_ADDR}
+  vs = i64.const {EDGE_SENTINEL}
+  i64.store va vs
+  vr = i64.load va
+  return vr
+  }}
+}}
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("guest parse");
+    temen_verify::verify_module(&m).expect("guest verify");
+    m
+}
+
+/// How one edge run ended.
+#[derive(Debug, PartialEq)]
+enum EdgeRun {
+    /// `temen_par_root` refused the window.
+    RootRefused,
+    /// `temen_par_child` refused the window for the root's thread.
+    ThreadRefused,
+    /// The root returned `value`; `tierups` regions ran emitted; `canary` is whether the bytes just
+    /// past the window are as the harness left them.
+    Ran {
+        value: i64,
+        tierups: u32,
+        canary: bool,
+    },
+}
+
+/// Drive one vCPU the way `worker.js` does, running each `PAR_TIERUP` region on the emitted module.
+/// The root's thread runs to its end at its `PAR_SPAWN` (it depends on nothing the root does after).
+fn edge_drive(
+    store: &mut Store<LkDrv>,
+    emitted: wasmi::Instance,
+    edge: (*mut temen_interp::bytecode::VcpuProgram, *mut u8, usize),
+    v: *mut temen_browser::ParVcpu,
+    tierups: &mut u32,
+) -> Result<Result<i64, i64>, EdgeRun> {
+    // `edge`'s size is the window the harness hands a thread, which may differ from the root's.
+    use temen_browser::{
+        temen_par_child, temen_par_deliver_child, temen_par_deliver_join, temen_par_deliver_tierup,
+        temen_par_deliver_tierup_trap, temen_par_ev_c, temen_par_ev_d, temen_par_tierup_argv_len,
+        temen_par_tierup_argv_ptr, PAR_JOIN, PAR_SPAWN, PAR_TIERUP, PAR_TRAP,
+    };
+    let (prog, win_ptr, win_size) = edge;
+    let mut joined: Option<Result<i64, i64>> = None;
+    loop {
+        match temen_par_run(v) {
+            PAR_DONE => return Ok(Ok(temen_par_ev_a(v))),
+            PAR_TRAP => return Ok(Err(temen_par_ev_a(v))),
+            PAR_SPAWN => {
+                let am = temen_par_ev_a(v);
+                let (module, func) = ((am >> 32) as u32, am as u32);
+                let (sp, arg, vcpu) = (temen_par_ev_b(v), temen_par_ev_c(v), temen_par_ev_d(v));
+                let c = temen_par_child(prog, win_ptr, win_size, module, func, sp, arg, vcpu);
+                if c.is_null() {
+                    return Err(EdgeRun::ThreadRefused);
+                }
+                let end = edge_drive(store, emitted, edge, c, tierups)?;
+                temen_par_free(c);
+                joined = Some(end);
+                temen_par_deliver_child(v, 0);
+            }
+            PAR_JOIN => match joined.take().expect("a join after its spawn") {
+                Ok(r) => temen_par_deliver_join(v, r, 0),
+                Err(code) => temen_par_deliver_join(v, code, 1),
+            },
+            PAR_TIERUP => {
+                *tierups += 1;
+                let func = temen_par_ev_a(v);
+                for g in store.data().mapped_globals.clone() {
+                    g.set(&mut *store, Val::I64(temen_par_ev_b(v))).unwrap();
+                }
+                let n = temen_par_tierup_argv_len(v);
+                // SAFETY: the pending event's argument stash, stable until the deliver.
+                let argv = unsafe { std::slice::from_raw_parts(temen_par_tierup_argv_ptr(v), n) };
+                let mut params = vec![
+                    Val::I32(EDGE_WIN_BASE as i32),
+                    Val::I32(EDGE_ENV_PTR as i32),
+                ];
+                params.extend(argv.iter().map(|a| Val::I64(*a)));
+                let mut results = [Val::I64(0)];
+                let f = emitted
+                    .get_func(&*store, &format!("f{func}"))
+                    .expect("an eligible function is exported");
+                match f.call(&mut *store, &params, &mut results) {
+                    Ok(()) => {
+                        let Val::I64(r) = results[0] else {
+                            unreachable!()
+                        };
+                        temen_par_deliver_tierup(v, [r].as_ptr(), 1);
+                    }
+                    Err(_) => temen_par_deliver_tierup_trap(v, 0),
+                }
+            }
+            ev => panic!("unexpected par event {ev}"),
+        }
+    }
+}
+
+/// Run [`edge_guest`] on the per-Worker driver with the tier-up module enabled, the root over a window
+/// of `1 << win_log2` bytes and its thread over the first `1 << thread_log2` of them, and look at
+/// the bytes just past the thread's window afterwards.
+fn edge_run(win_log2: u8, thread_log2: u8) -> EdgeRun {
+    use temen_browser::{temen_par_compile, temen_par_declared_log2, temen_par_powerbox_none};
+    let guest = edge_guest();
+    let guest_bytes = temen_encode::encode_module(&guest);
+    temen_par_powerbox_none(); // a plain run (and a new run generation for the tier-up stash)
+    let prog = temen_par_compile(guest_bytes.as_ptr(), guest_bytes.len());
+    assert!(!prog.is_null(), "guest compiles");
+    assert_eq!(
+        temen_par_declared_log2(prog),
+        i32::from(EDGE_DECLARED_LOG2),
+        "the declared size the page floors its window at"
+    );
+    assert_eq!(
+        temen_par_enable_jit(guest_bytes.as_ptr(), guest_bytes.len()),
+        1,
+        "the leaf tiers up"
+    );
+
+    let engine = Engine::default();
+    let mut store: Store<LkDrv> = Store::new(
+        &engine,
+        LkDrv {
+            v: 0,
+            bounces: 0,
+            mapped_globals: Vec::new(),
+            fuel_globals: Vec::new(),
+        },
+    );
+    let pages = (EDGE_WIN_BASE as usize + (1 << EDGE_DECLARED_LOG2) + (1 << 16)) >> 16;
+    let pages = pages as u32;
+    let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages))).unwrap();
+    memory
+        .write(
+            &mut store,
+            EDGE_ENV_PTR as usize,
+            &(1i64 << 61).to_le_bytes(),
+        )
+        .unwrap();
+    let win_size = 1usize << win_log2;
+    let canary_at = EDGE_WIN_BASE as usize + (1usize << thread_log2);
+    memory
+        .write(&mut store, canary_at, &[CANARY; 4096])
+        .unwrap();
+    // SAFETY: a fixed-size memory has a stable data pointer, and the window is used only as this
+    // run's window.
+    let win_ptr = unsafe {
+        memory
+            .data_mut(&mut store)
+            .as_mut_ptr()
+            .add(EDGE_WIN_BASE as usize)
+    };
+    let table = wasmi::Table::new(
+        &mut store,
+        wasmi::TableType::new(wasmi::core::ValType::FuncRef, 1 << 10, Some(1 << 10)),
+        Val::FuncRef(wasmi::FuncRef::null()),
+    )
+    .unwrap();
+    // wasmi validates no threads proposal: the non-shared twin of the FFI's emit.
+    let art = temen_wasm_jit::compile_jit(&guest, temen_wasm_jit::Shape::Threaded, false)
+        .expect("tier-up emit");
+    assert!(art.emitted[2], "the edge leaf emits");
+    let emitted = lk_instantiate(&mut store, &engine, memory, table, &art.wasm);
+
+    let v = temen_par_root(prog, win_ptr, win_size, 0);
+    if v.is_null() {
+        return EdgeRun::RootRefused;
+    }
+    store.data_mut().v = v as usize;
+    let mut tierups = 0;
+    let end = edge_drive(
+        &mut store,
+        emitted,
+        (prog, win_ptr, 1 << thread_log2),
+        v,
+        &mut tierups,
+    );
+    temen_par_free(v);
+    let mut after = [0u8; 4096];
+    memory.read(&store, canary_at, &mut after).unwrap();
+    let canary = after.iter().all(|b| *b == CANARY);
+    match end {
+        Err(refused) => refused,
+        Ok(Ok(value)) => EdgeRun::Ran {
+            value,
+            tierups,
+            canary,
+        },
+        Ok(Err(code)) => EdgeRun::Ran {
+            value: -code,
+            tierups,
+            canary,
+        },
+    }
+}
+
+/// #2414 — a window smaller than the module's declared memory is refused, for the root and for a
+/// thread, so an emitted access the emit proved below the declaration can't land past the window.
+/// Before the fix the 16 MiB run went ahead, and its thread's emitted store wrote the sentinel past
+/// the window (`Ran { value: SENTINEL, tierups: 1, canary: false }`). At the declared size the same
+/// access is in the window.
+#[test]
+fn par_refuses_a_window_smaller_than_the_module_declares() {
+    let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // #1182 — serial single-run
+    let (declared, short) = (EDGE_DECLARED_LOG2, EDGE_DECLARED_LOG2 - 1);
+    assert_eq!(
+        edge_run(short, short),
+        EdgeRun::RootRefused,
+        "a 16 MiB window for a module that declares 32 MiB"
+    );
+    assert_eq!(
+        edge_run(declared, short),
+        EdgeRun::ThreadRefused,
+        "a thread handed less window than the module declares"
+    );
+    match edge_run(declared, declared) {
+        EdgeRun::Ran {
+            value,
+            tierups,
+            canary,
+        } => {
+            assert_eq!(value, EDGE_SENTINEL, "the thread's store reads back");
+            assert!(tierups >= 1, "the store ran emitted");
+            assert!(canary, "nothing past the window changed");
+        }
+        other => panic!("the declared-size window runs: {other:?}"),
+    }
+}

@@ -166,7 +166,11 @@ export function makeRunner({ module, memory, ex }) {
     // The parallel driver compiles the guest itself, on the root's Worker.
     const prog = x2 ? 0 : (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
     if (!x2 && prog === 0) throw new Error('module unsupported on the per-Worker driver (temen_par_compile null)');
+    // #2414: never a window smaller than the module declares. Emitted code checks its accesses
+    // against the declaration, so the engine refuses a smaller one. The parallel driver floors its own.
+    if (!x2) winSize = Math.max(winSize, 2 ** Math.max(ex.temen_par_declared_log2(prog), 0));
     const win = ex.temen_par_alloc(winSize);
+    if (win === 0) throw new Error(`could not allocate a ${winSize}-byte window`);
     for (const b of jitBlobs) u8().set(b.bytes, win + b.off); // stage runtime-compile unit blobs
     // The parallel driver's window is its own: it copies the staged blobs in from `win`.
     const seedLen = jitBlobs.reduce((n, b) => Math.max(n, b.off + b.bytes.length), 0);

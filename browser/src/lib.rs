@@ -1115,6 +1115,19 @@ unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuP
     &*prog
 }
 
+/// #2414 — whether a window of `win_size` bytes holds the memory `prog`'s module declares. The
+/// tier-up emit drops the bound check of an access it proves below the declared size, so a vCPU over
+/// a smaller window would make that access past the window, in the engine's own memory. The other
+/// drivers never run a module over less than it declares, and this one refuses to.
+fn holds_declared(prog: *mut bytecode::VcpuProgram, win_size: usize) -> bool {
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    let m = unsafe { prog_ref(prog) }.module();
+    m.memory.is_none_or(|mc| {
+        1u64.checked_shl(mc.size_log2.into())
+            .is_some_and(|declared| win_size as u64 >= declared)
+    })
+}
+
 /// The run's shared fiber registry (#1761), owned by its program: attached to the root and every
 /// `thread.spawn` child of a run — never to a §14 confined or detached child, each its own process.
 fn par_fibers(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::SharedFibers {
@@ -2050,8 +2063,19 @@ pub extern "C" fn temen_par_compile_jit(
     }
 }
 
+/// #2414 — the memory `prog`'s module declares, as `log2` of its bytes (`-1`: none): the least
+/// window the driver builds a vCPU over ([`holds_declared`]). `par.js` floors its window at it, as
+/// the parallel driver (`temen_x2_start`) floors its own.
+#[no_mangle]
+pub extern "C" fn temen_par_declared_log2(prog: *mut bytecode::VcpuProgram) -> i32 {
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    let m = unsafe { prog_ref(prog) }.module();
+    m.memory.map_or(-1, |mc| i32::from(mc.size_log2))
+}
+
 /// Build the **root** vCPU (function `func`) over the shared window `[win_ptr, win_size)`; it seeds +
-/// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func.
+/// data-initialises the window (the once). Returns a boxed [`ParVcpu`] pointer, null on a bad func or
+/// a window smaller than the module declares ([`holds_declared`]).
 #[no_mangle]
 pub extern "C" fn temen_par_root(
     prog: *mut bytecode::VcpuProgram,
@@ -2059,7 +2083,7 @@ pub extern "C" fn temen_par_root(
     win_size: usize,
     func: u32,
 ) -> *mut ParVcpu {
-    if !par_vcpu_admit() {
+    if !holds_declared(prog, win_size) || !par_vcpu_admit() {
         return core::ptr::null_mut();
     }
     // SAFETY: the host guarantees `[win_ptr, win_size)` is a live shared window for the run.
@@ -2161,7 +2185,8 @@ pub extern "C" fn temen_par_root(
 }
 
 /// Build a `thread.spawn`ed **child** vCPU (`func(sp, arg)`) over the **same** shared window — it does
-/// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func.
+/// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func, or a
+/// window smaller than the module declares ([`holds_declared`]), as for the root.
 /// `module` is the spawning frame's module from the `PAR_SPAWN` event (`ev_a >> 32`) — `func`
 /// resolves there and the child's root frame starts there (module-0 for plain guests). `vcpu` is
 /// the event's `ev_d`: the child's dense vCPU id, which seeds its `vcpu.tls` (a language runtime's
@@ -2177,7 +2202,7 @@ pub extern "C" fn temen_par_child(
     arg: i64,
     vcpu: i64,
 ) -> *mut ParVcpu {
-    if !win_size.is_power_of_two() {
+    if !win_size.is_power_of_two() || !holds_declared(prog, win_size) {
         return core::ptr::null_mut();
     }
     // SAFETY: the host guarantees `[win_ptr, win_size)` is the same live shared window.
