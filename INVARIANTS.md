@@ -121,7 +121,8 @@ region when it closes its handle (`SharedRegion.close`, #2358), and a domain a b
 of the rest when it ends, while a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
 stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
-listings or mappings; a POSIX process's heap records, arguments and working directory, #2373) is
+listings or mappings; a POSIX process's heap records, arguments, working directory and `getenv`
+copies, #2373) is
 `channel` of
 the node of the domain the capability's state was granted to, and every ancestor, plus one `maps` for
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling

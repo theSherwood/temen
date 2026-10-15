@@ -1455,10 +1455,11 @@ struct Proc {
     free_list: Vec<(u64, u64)>,
     /// #2373 — what this process's host-side tables cost ([`Proc::tables_cost`]): a [`TABLE_ENTRY`]
     /// for each heap block `allocated` and `free_list` record and each descriptor slot, its
-    /// arguments (a [`TABLE_ENTRY`] and the bytes of each), its working directory, and an exec staged
-    /// on it. Charged to the personality's payer and refused past a ceiling: a `malloc` with no room
-    /// answers `NULL`, a new descriptor slot `-EMFILE`, a `chdir` or an `execve` `-ENOMEM`, and a
-    /// fork `-EAGAIN`.
+    /// arguments (a [`TABLE_ENTRY`] and the bytes of each), its working directory, the `getenv`
+    /// copies it caches (a [`TABLE_ENTRY`] and the name of each), and an exec staged on it. Charged to
+    /// the personality's payer and refused past a ceiling: a `malloc` or a `getenv` with no room
+    /// answers `NULL`, a new descriptor slot `-EMFILE`, a `chdir` or an `execve` `-ENOMEM`, and a fork
+    /// `-EAGAIN`.
     tables: HostCharge,
     /// The host-side fd **table** (indexed by fd) — per-process, POSIX: a fork copies the table, a
     /// child's `close`/`dup2` never disturbs its parent's numbering. Entries point at **shared**
@@ -1887,7 +1888,7 @@ impl Posix {
     pub fn set_env(&self, name: &str, value: &str) {
         let payer = self.world.lock().unwrap_or_else(|e| e.into_inner()).payer();
         let mut st = self.root.lock().unwrap_or_else(|e| e.into_inner());
-        st.env_ptrs.remove(name);
+        st.uncache_env(name);
         // The embedder's, charged past any ceiling (#2345).
         Env::set(
             &mut st.env,
@@ -2877,9 +2878,9 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
             p.heap_end = end;
             p.free_list.clear();
             p.allocated.clear();
-            p.recharge_tables();
             // The copies `getenv` handed out lived in that heap.
             p.env_ptrs.clear();
+            p.recharge_tables();
         }
         // #2345 — the old image's handler frames are gone with it, so none can return to restore
         // the mask it saved: an exec from inside a handler left its entry behind for good. The mask
@@ -3676,6 +3677,7 @@ impl Proc {
             + args_cost(&self.args)
             + staged_cost(self.pending_exec.as_ref())
             + self.cwd.len() as u64
+            + names_cost(self.env_ptrs.keys())
     }
 
     /// #2373 — charge `n` more to [`Proc::tables`]: `false`, charging nothing, when the payer has no
@@ -3693,6 +3695,13 @@ impl Proc {
         }
         self.cwd = cwd;
         true
+    }
+
+    /// #2373 — drop the `getenv` copy of `name` cached here, handing its entry back.
+    fn uncache_env(&mut self, name: &str) {
+        if self.env_ptrs.remove(name).is_some() {
+            self.shrink_tables(TABLE_ENTRY + name.len() as u64);
+        }
     }
 
     /// #2373 — hand `n` of [`Proc::tables`] back.
@@ -6120,10 +6129,20 @@ impl Ctx<'_> {
         };
         let mut vb = value.into_bytes();
         vb.push(0); // NUL terminator
+                    // #2373 — the cache's entry is charged first: with no room for it the copy is not made, as
+                    // with no room in the arena.
+        let entry = TABLE_ENTRY + name.len() as u64;
+        if !self.p.grow_tables(entry) {
+            return Ok(vec![0]);
+        }
         let Some(dst) = self.arena_bump(vb.len() as u64) else {
+            self.p.shrink_tables(entry);
             return Ok(vec![0]); // no room → behave as if unset (best effort)
         };
-        mem.write_bytes(dst, &vb).ok_or(Trap::Malformed)?;
+        if mem.write_bytes(dst, &vb).is_none() {
+            self.p.shrink_tables(entry);
+            return Err(Trap::Malformed);
+        }
         self.p.env_ptrs.insert(name, dst);
         Ok(vec![dst as i64])
     }
@@ -6151,7 +6170,7 @@ impl Ctx<'_> {
         if !Env::set(&mut self.p.env, self.w.payer(), false, name.clone(), value) {
             return Ok(vec![ENOMEM]); // #2345: no room for it
         }
-        self.p.env_ptrs.remove(&name); // stale cached pointer no longer reflects the value
+        self.p.uncache_env(&name); // stale cached pointer no longer reflects the value
         Ok(vec![0])
     }
 
@@ -6191,7 +6210,7 @@ impl Ctx<'_> {
         if !Env::remove(&mut self.p.env, self.w.payer(), &name) {
             return Ok(vec![ENOMEM]); // #2345: a shared environment's copy has no room
         }
-        self.p.env_ptrs.remove(&name);
+        self.p.uncache_env(&name);
         Ok(vec![0])
     }
 
@@ -9338,15 +9357,17 @@ block 0 () {\n\
 
     /// #2373 — what a process keeps for its guest outside its window is charged to the personality's
     /// payer as it changes: a record for each heap block, a slot for each descriptor, its working
-    /// directory and an exec staged on it. Past the ceiling each is refused, having changed nothing:
-    /// `malloc` answers `NULL`, a new descriptor `-EMFILE`, `chdir` `-ENOMEM`. A merge of freed
-    /// blocks hands a record back.
+    /// directory, the `getenv` copies it caches and an exec staged on it. Past the ceiling each is
+    /// refused, having changed nothing: `malloc` and `getenv` answer `NULL`, a new descriptor
+    /// `-EMFILE` (before an `open` makes its file), `chdir` `-ENOMEM`. A merge of freed blocks hands
+    /// a record back.
     #[test]
     fn a_processes_host_tables_are_charged() {
         let (posix, host) = bound(8 << 10);
-        let mut win = vec![b'd'; 256];
-        win[0] = b'/';
-        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        posix.set_env("V", "x");
+        let mut win = vec![b'd'; WIN];
+        (win[0], win[255]) = (b'/', b'V');
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
         {
             ctx!(posix, w_g, p_g, st);
             let blocks: Vec<i64> = std::iter::repeat_with(|| st.malloc(&[16]))
@@ -9365,6 +9386,10 @@ block 0 () {\n\
             let chdir = st.chdir(&[0, 200], Some(&mut mem)).unwrap()[0];
             assert_eq!(chdir, ENOMEM, "nor for a longer directory");
             assert_eq!(st.p.cwd, "/");
+            let getenv = |st: &mut Ctx, mem: &mut temen_interp::WindowMem| {
+                st.getenv(&[255, 1], Some(mem)).unwrap()[0]
+            };
+            assert_eq!(getenv(&mut st, &mut mem), 0, "nor for a getenv's copy");
             assert_eq!(host.channel_used(), full, "a refusal charges nothing");
             st.free(&[blocks[0]]);
             assert_eq!(host.channel_used(), full, "a freed block keeps its record");
@@ -9374,7 +9399,10 @@ block 0 () {\n\
                 full - TABLE_ENTRY as i64,
                 "two neighbours merge into one record"
             );
-            assert!(st.dup(&[1]) >= 0, "a descriptor's slot takes it");
+            st.free(&[blocks[2]]);
+            st.free(&[blocks[3]]);
+            assert!(st.dup(&[1]) >= 0, "the records handed back hold a slot");
+            assert_ne!(getenv(&mut st, &mut mem), 0, "and a getenv's copy");
             assert_eq!(st.p.tables.bytes(), st.p.tables_cost(), "charged as held");
         }
         drop(posix);
@@ -9531,7 +9559,11 @@ block 0 () {\n\
     /// a name it has no room for.
     #[test]
     fn names_are_charged_as_they_change() {
-        let (posix, host) = bound(5 * TABLE_ENTRY as i64);
+        let (posix, mut host) = bound(-1);
+        // Room for five entries of names past the process's own tables and the two descriptor
+        // slots its opens take (#2373).
+        let own = host.channel_used() + 2 * TABLE_ENTRY as i64;
+        host.set_grant(-1, own + 5 * TABLE_ENTRY as i64, -1, -1);
         let mut win = vec![0u8; 256];
         win[..24].copy_from_slice(b"/d/d/a/d/bb/e/d/zzzzzzzz");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
