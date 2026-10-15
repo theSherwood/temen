@@ -59,8 +59,9 @@ fn page_protections_round_trip_through_the_window_image() {
     window[5 * PAGE + 10] = 0x11; // page 5: Ro, non-zero
     prots[5] = PageProt::Ro;
     prots[6] = PageProt::Ro; // page 6: Ro, all-zero → must still come back Ro
-    window[9 * PAGE + 2] = 0x99; // page 9: Unmapped — content is NOT stored
+    window[9 * PAGE + 2] = 0x99; // page 9: Unmapped — protected to nothing, its content kept
     prots[9] = PageProt::Unmapped;
+    prots[10] = PageProt::Unmapped; // page 10: Unmapped, all-zero → stores no bytes
 
     let art = freeze_with_prots(&m, &window, &prots, SIZE_LOG2, &host).expect("freeze");
 
@@ -75,8 +76,14 @@ fn page_protections_round_trip_through_the_window_image() {
     assert_eq!(rprots[5], PageProt::Ro);
     assert_eq!(rprots[6], PageProt::Ro, "a zero Ro page is still preserved");
     assert_eq!(rprots[9], PageProt::Unmapped);
+    assert_eq!(
+        rprots[10],
+        PageProt::Unmapped,
+        "a zero Unmapped page is still preserved"
+    );
 
-    // Bytes recovered for Rw/Ro; an Unmapped page restores zero (its content is never stored).
+    // Bytes recovered for every page that has them (v45, #2427): an `Unmapped` page keeps its
+    // content, which a guest that protects it readable again reads (#1909).
     assert_eq!(rwin[0], 0xAB);
     assert_eq!(rwin[PAGE - 1], 0xCD);
     assert_eq!(rwin[5 * PAGE + 10], 0x11);
@@ -84,9 +91,10 @@ fn page_protections_round_trip_through_the_window_image() {
         rwin[6 * PAGE..7 * PAGE].iter().all(|&b| b == 0),
         "zero Ro page restores zero"
     );
-    assert!(
-        rwin[9 * PAGE..10 * PAGE].iter().all(|&b| b == 0),
-        "Unmapped page drops its pre-freeze content"
+    assert_eq!(
+        rwin[9 * PAGE + 2],
+        0x99,
+        "an Unmapped page keeps its content"
     );
 
     // §12.6 canonical: re-serializing the restored image at the same safepoint is byte-identical.

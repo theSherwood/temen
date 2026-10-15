@@ -2922,7 +2922,7 @@ fn relaunch_detached(
     mem.restore_layout(&window);
     // #2025 — and its §13 pages aliased back onto the regions its restored powerbox holds. #2268 —
     // then the window has started, with the runs its artifact gave it, which its lease paid for.
-    let started = host.realias_regions(&mut mem, &window.dense_prots()) && {
+    let started = host.realias_regions(&mut mem, window.page_map()) && {
         host.start_window(mem.window_runs());
         mem.durable_set_state(STATE_NORMAL);
         let thaw_off = mem.thaw_state_off(0);
@@ -3577,43 +3577,35 @@ pub enum CapturedProt {
     },
 }
 
-/// [`run_capture_reserved_with_host`] that **seeds** an initial per-page protection map (the
-/// durable-restore step — re-establishing `Ro`/`Unmapped` pages so a thawed guest faults exactly
-/// as the frozen one would) and **returns** the post-run protection map (the durable-freeze step),
-/// both one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). Pass
-/// `init_prots = None` to capture only (every page starts at its default). A `Backed` entry in
-/// `init_prots` re-aliases the region it names, which must already be in `host` (the codec's restore
-/// rebuilt it, #2025); one that does not map traps the run `Malformed` before it starts.
-#[allow(clippy::too_many_arguments)]
-pub fn run_capture_reserved_with_host_prots(
+/// [`run_capture_reserved_with_host`] over a whole window [`MemLayout`]: the run **starts** from
+/// `init` — its bytes, then its page map and the pages it holds past them re-established, so a thawed
+/// guest faults exactly as the frozen one would (the durable-restore step) — and **returns** its
+/// window's layout ([`Mem::layout_snapshot`], the durable-freeze step), `None` for a memoryless
+/// module. #2427 — a layout carries the prefix and each page held past it, so neither step costs
+/// more than the window holds. A `Backed` page of `init` re-aliases the region it names, which must
+/// already be in `host` (the codec's restore rebuilt it, #2025); one that does not map traps the run
+/// `Malformed` before it starts.
+pub fn run_capture_reserved_with_host_layout(
     m: &Module,
     func: FuncIdx,
     args: &[Value],
     fuel: &mut u64,
-    init_mem: &[u8],
-    init_prots: Option<&[CapturedProt]>,
+    init: &MemLayout,
     reserved_log2: u8,
     host: &mut Host,
-) -> (Result<Vec<Value>, Trap>, Vec<u8>, Vec<CapturedProt>) {
+) -> (Result<Vec<Value>, Trap>, Option<MemLayout>) {
     if m.funcs.get(func as usize).is_none() {
-        return (Err(Trap::Malformed), Vec::new(), Vec::new());
+        return (Err(Trap::Malformed), None);
     }
-    let mut mem = Mem::root(m, reserved_log2, None, init_mem);
-    if let (Some(mm), Some(prots)) = (mem.as_mut(), init_prots) {
-        mm.apply_prots(prots, init_mem);
-        if !host.realias_regions(mm, prots) {
-            return (Err(Trap::Malformed), Vec::new(), Vec::new());
+    let mut mem = Mem::root(m, reserved_log2, None, init.bytes());
+    if let Some(mm) = mem.as_mut() {
+        mm.apply_layout(init);
+        if !host.realias_regions(mm, init.page_map()) {
+            return (Err(Trap::Malformed), None);
         }
     }
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
-    let (snap, prots) = mem
-        .as_ref()
-        .map(|mm| {
-            let span = mm.capture_extent(SNAP_CAP) as usize;
-            (mm.snapshot_window(span), mm.snapshot_prots(span))
-        })
-        .unwrap_or_default();
-    (r, snap, prots)
+    (r, mem.as_ref().map(Mem::layout_snapshot))
 }
 
 /// Run a module under the **deterministic explorer** (§18) with scheduling decisions driven by
@@ -25563,120 +25555,96 @@ impl Host {
             })
             .collect();
         self.cap_pages = (!pages.is_empty()).then(|| (UNCLAIMED_BASE, Arc::new(Mutex::new(pages))));
-        self.realias = region_aliases(
-            map.page,
-            map.prot.iter().filter_map(|(&p, prot)| match *prot {
-                PageProt::Backed {
-                    region,
-                    region_off,
-                    writable,
-                } => Some((p, region, region_off, writable)),
-                _ => None,
-            }),
-        );
+        self.realias = map.aliases();
     }
 
-    /// #1810 — how far the guest grew JIT window `base` through the Memory capability: one past the
-    /// highest page in its `cap_pages` (whatever that page's state, as the interpreter's own map
-    /// counts it), or `0` when it grew none.
-    pub fn cap_high_water(&self, base: usize) -> u64 {
+    /// #2427 — the pages past `mapped` (the declared window) that JIT window `base` holds with contents
+    /// of its own through the Memory capability — committed, or protected to nothing with its contents
+    /// kept (#1909) — the byte offset of each, ascending, in host pages. What a durable capture reads
+    /// of the window past its prefix ([`Host::capture_window_layout`]), however far apart the pages
+    /// lie.
+    pub fn cap_held_tail(&self, base: usize, mapped: u64) -> Vec<u64> {
+        use temen_ir::PageState as ps;
+        let page = host_page_size();
         match &self.cap_pages {
             Some((b, m)) if *b == base || *b == UNCLAIMED_BASE => m
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .keys()
-                .next_back()
-                .map_or(0, |&p| (p + 1) * host_page_size()),
-            _ => 0,
+                .range(mapped.div_ceil(page)..)
+                .filter(|(_, s)| matches!(s, ps::Rw | ps::Ro | ps::Unmapped))
+                .map(|(&p, _)| p * page)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
-    /// Capture the window's per-page protections for a durable freeze of a **JIT** run
-    /// (DURABILITY.md §12.3). The JIT keeps protections in the OS page tables, so — unlike the
-    /// interpreter, where [`run_capture_reserved_with_host_prots`] reads its software map — a
-    /// freeze reconstructs them here from the two host-side sources, mirroring the interpreter's
-    /// `snapshot_prots` so the backends agree page-for-page:
+    /// Capture a **JIT** window for a durable freeze (DURABILITY.md §12.3): `bytes`, its prefix, and
+    /// `tail`, each page past it the window holds ([`Host::cap_held_tail`]), under the page map the
+    /// host rebuilds for it. The JIT keeps protections in the OS page tables, so — unlike the
+    /// interpreter, whose `Mem` reads its own map — the map comes from two host-side sources,
+    /// mirroring the interpreter's `init_data`/`seed_null_guard`/page ops so the backends agree page
+    /// for page:
     ///
-    /// * the module's `readonly` data segments → `Ro` (applied to the window at instantiation but
-    ///   not recorded in `cap_pages`), and
-    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`)
-    ///   — which **overrides** the segment/default for any page the guest changed.
+    /// * the NULL guard and the module's `readonly` data segments (`Unmapped`, `Ro`), which the window
+    ///   applied at instantiation but `cap_pages` does not record, and
+    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`, and
+    ///   §13 aliases, #2025) — which **overrides** them for any page the guest changed.
     ///
-    /// One [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`]-byte page over `npages`; `mapped` is the
-    /// backed-prefix byte length (pages beyond it default `Unmapped`). A `Backed` (§13) page can't
-    /// arise here — a domain holding a shared region isn't freezable (its handle is non-durable).
-    pub fn capture_window_prots(
+    /// `mapped` is the declared window's length; past it, a page in neither is one the window does not
+    /// hold (#2427).
+    pub fn capture_window_layout(
         &self,
         data: &[Data],
         mapped: u64,
-        npages: usize,
         null_guard: u64,
-    ) -> Vec<CapturedProt> {
-        // Default: Rw in the backed prefix, Unmapped in the reserved tail.
-        let mut out: Vec<CapturedProt> = (0..npages as u64)
-            .map(|p| {
-                if p * DURABLE_SNAPSHOT_PAGE < mapped {
-                    CapturedProt::Rw
-                } else {
-                    CapturedProt::Unmapped
-                }
-            })
-            .collect();
-        let host = host_page_size();
+        bytes: Vec<u8>,
+        tail: Vec<(u64, Vec<u8>)>,
+    ) -> MemLayout {
+        let page = host_page_size();
+        let mut prot = BTreeMap::new();
         // #1094: the NULL guard seeds `[0, null_guard)` `Unmapped` at window construction
-        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (mirroring the same
+        // (`seed_null_guard`) — outside `cap_pages`, so reconstruct it here (with the same
         // host-page-alignment / `guard <= mapped` gate) or this capture would report the guard pages
-        // `Rw` and diverge from the interpreter's `snapshot_prots` (and un-seed the guard on thaw).
-        // Runtime `map`/`protect` below still overrides, matching the live seed→init→runtime order.
-        if null_guard > 0 && null_guard.is_multiple_of(host) && null_guard <= mapped {
-            let guard_pages = (null_guard / DURABLE_SNAPSHOT_PAGE).min(npages as u64);
-            for p in 0..guard_pages {
-                out[p as usize] = CapturedProt::Unmapped;
-            }
+        // `Rw` and diverge from the interpreter's capture (and un-seed the guard on thaw).
+        if null_guard > 0 && null_guard.is_multiple_of(page) && null_guard <= mapped {
+            prot.extend((0..null_guard / page).map(|p| (p, PageProt::Unmapped)));
         }
         // `readonly` data segments → Ro. Protection is **host-page** granular (the JIT's
-        // `GuestWindow::protect` and the interpreter's `init_data` protect the whole host page), so
-        // a segment marks every codec page of the host page(s) it touches — this is what makes the
-        // result match `snapshot_prots` on a host whose page is larger than a codec page.
-        for d in data {
-            if !d.readonly || d.bytes.is_empty() {
-                continue;
-            }
-            let lo = (d.offset / host) * host / DURABLE_SNAPSHOT_PAGE;
-            let hi =
-                (d.offset + d.bytes.len() as u64).div_ceil(host) * host / DURABLE_SNAPSHOT_PAGE;
-            for p in lo..hi.min(npages as u64) {
-                out[p as usize] = CapturedProt::Ro;
-            }
+        // `GuestWindow::protect` and the interpreter's `init_data` protect the whole host page).
+        for d in data.iter().filter(|d| d.readonly && !d.bytes.is_empty()) {
+            let last = d.offset + d.bytes.len() as u64 - 1;
+            prot.extend((d.offset / page..=last / page).map(|p| (p, PageProt::Ro)));
         }
         // Runtime map/unmap/protect (host-page-indexed) override the defaults.
         if let Some((_, map)) = &self.cap_pages {
-            let m = map.lock().unwrap();
-            for (p, slot) in out.iter_mut().enumerate() {
-                let hp = (p as u64 * DURABLE_SNAPSHOT_PAGE) / host;
-                use temen_ir::PageState as ps;
-                match m.get(&hp).copied() {
-                    Some(ps::Rw) => *slot = CapturedProt::Rw,
-                    Some(ps::Ro) => *slot = CapturedProt::Ro,
-                    Some(ps::Unmapped) => *slot = CapturedProt::Unmapped,
-                    // A §13 alias names its region (#2025): this codec page's bytes are the
-                    // region's at the host page's offset plus this page's place in it.
-                    Some(ps::Backed {
+            use temen_ir::PageState as ps;
+            let m = map.lock().unwrap_or_else(|e| e.into_inner());
+            prot.extend(m.iter().map(|(&p, &st)| {
+                let st = match st {
+                    ps::Rw => PageProt::Rw,
+                    ps::Ro => PageProt::Ro,
+                    ps::Unmapped => PageProt::Unmapped,
+                    ps::Backed {
                         region,
                         off,
                         writable,
-                    }) => {
-                        *slot = CapturedProt::Backed {
-                            region,
-                            off: off + (p as u64 * DURABLE_SNAPSHOT_PAGE - hp * host),
-                            writable,
-                        }
-                    }
-                    None => {}
-                }
-            }
+                    } => PageProt::Backed {
+                        region,
+                        region_off: off,
+                        writable,
+                    },
+                };
+                (p, st)
+            }));
         }
-        out
+        MemLayout {
+            bytes,
+            tail: tail
+                .into_iter()
+                .filter(|(_, b)| b.iter().any(|&x| x != 0))
+                .collect(),
+            map: PageMap { prot, page, mapped },
+        }
     }
 
     /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing (or
@@ -26266,21 +26234,10 @@ impl Host {
         self.region(id).map(region_key)
     }
 
-    /// #2025 — alias back into `mem` every region `prots` names: the thaw half of a captured
-    /// `Backed` page. `false` if one names no region of this host or does not map.
-    fn realias_regions(&self, mem: &mut dyn GuestMem, prots: &[CapturedProt]) -> bool {
-        let backed = prots
-            .iter()
-            .enumerate()
-            .filter_map(|(p, prot)| match *prot {
-                CapturedProt::Backed {
-                    region,
-                    off,
-                    writable,
-                } => Some((p as u64, region, off, writable)),
-                _ => None,
-            });
-        self.map_aliases(mem, &region_aliases(DURABLE_SNAPSHOT_PAGE, backed))
+    /// #2025 — alias back into `mem` every region `map` names: the thaw half of a captured `Backed`
+    /// page. `false` if one names no region of this host or does not map.
+    fn realias_regions(&self, mem: &mut dyn GuestMem, map: &PageMap) -> bool {
+        self.map_aliases(mem, &map.aliases())
     }
 
     /// #2025 — map each of `aliases` into `mem` through [`Self::region_map`], the path a guest's own
@@ -32886,6 +32843,21 @@ impl PageMap {
         self.prot.is_empty()
     }
 
+    /// #2025 — its §13 pages as maximal aliases, each run re-mapped in one `map`.
+    fn aliases(&self) -> Vec<RegionAlias> {
+        region_aliases(
+            self.page,
+            self.prot.iter().filter_map(|(&p, prot)| match *prot {
+                PageProt::Backed {
+                    region,
+                    region_off,
+                    writable,
+                } => Some((p, region, region_off, writable)),
+                _ => None,
+            }),
+        )
+    }
+
     /// #2268 — the runs of page state ([`PageClass`]) a window of `reserved` bytes with a `guard`-byte
     /// NULL guard starts with when restored from this map, in this host's pages: what its activation
     /// reserves of `maps` before the window exists.
@@ -32911,7 +32883,7 @@ impl PageMap {
 
     /// This map re-expressed in `page`-byte pages. Identity when the units already agree; otherwise
     /// every page of the target unit an entry covers takes that entry, last one winning — a finer
-    /// entry into a coarser page marks the whole page, the same rounding [`Mem::apply_prots`] does.
+    /// entry into a coarser page marks the whole page.
     ///
     /// The conversion lives here rather than at the restore site because it is a property of the map,
     /// not of who is installing it — and because the §12 codec's fixed 4 KiB, a 16 KiB native capture
@@ -32932,9 +32904,14 @@ impl PageMap {
 
 #[derive(Clone)]
 pub struct MemLayout {
-    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
-    /// uncommitted pages read zero).
+    /// The window's bytes `[0, len)`: a capture's committed prefix, its declared window, or the whole
+    /// image a holder handed in (uncommitted pages read zero).
     bytes: Vec<u8>,
+    /// #2427 — the pages past `bytes` the window holds with contents of its own that are not all zero:
+    /// each `map.page` bytes long, by byte offset. Past `bytes` the page map names every page the
+    /// window holds (these, the zero ones, and those it aliased), and a page it does not hold is in
+    /// neither: a capture spends nothing on the span between two pages it holds.
+    tail: BTreeMap<u64, Vec<u8>>,
     /// Which pages deviate, in what unit, over what committed prefix.
     map: PageMap,
 }
@@ -32956,6 +32933,7 @@ impl MemLayout {
     ) -> Option<MemLayout> {
         Some(MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap::from_entries(page, mapped, prot)?,
         })
     }
@@ -32978,27 +32956,19 @@ impl MemLayout {
     /// Build a layout from the §12 codec's **dense** form — one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over `bytes` — for a window whose committed prefix is `mapped` (the
     /// module's declared memory). The inverse of [`dense_prots`](Self::dense_prots), and the same
-    /// rule [`Mem::apply_prots`] installs by: `Ro`/`Unmapped` always, `Rw` only where it is not the
-    /// default (a grown reserved-tail page).
+    /// rule the window installs it by: `Ro`/`Unmapped` always, `Rw` only where it is not the default
+    /// (a grown reserved-tail page). Its page unit is the codec's, so [`hold`](Self::hold) adds the
+    /// codec's tail pages to it.
     pub fn from_dense(bytes: Vec<u8>, prots: &[CapturedProt], mapped: u64) -> MemLayout {
         // A `Backed` page keeps its alias (#2025): the thaw maps it back onto its region.
-        let backed = prots.iter().enumerate().filter_map(|(i, &p)| match p {
-            CapturedProt::Backed {
-                region,
-                off,
-                writable,
-            } => Some((
-                i as u64,
-                PageProt::Backed {
-                    region,
-                    region_off: off,
-                    writable,
-                },
-            )),
-            _ => None,
-        });
+        let backed = prots
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p, CapturedProt::Backed { .. }))
+            .map(|(i, &p)| (i as u64, p.into()));
         MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap {
                 prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped)
                     .chain(backed)
@@ -33009,11 +32979,23 @@ impl MemLayout {
         }
     }
 
+    /// #2427 — hold one more page past the head in state `prot`, with `bytes` (`DURABLE_SNAPSHOT_PAGE`
+    /// of them) when it has contents: the codec's restore of a page a capture carried past the window's
+    /// head ([`tail_pages`](Self::tail_pages)). A layout from [`from_dense`](Self::from_dense), whose
+    /// page unit is the codec's.
+    pub fn hold(&mut self, off: u64, prot: CapturedProt, bytes: Option<Vec<u8>>) {
+        let page = off / self.map.page;
+        self.map.prot.insert(page, prot.into());
+        if let Some(bytes) = bytes {
+            self.tail.insert(page * self.map.page, bytes);
+        }
+    }
+
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
-    /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
-    /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole
-    /// under a grown high-water stays a hole), and an entry in a coarser page unit covers every codec
-    /// page it spans.
+    /// [`DURABLE_SNAPSHOT_PAGE`] over the head ([`bytes`](Self::bytes)) — an absent page is `Rw`
+    /// below `mapped` and `Unmapped` above, the window's own default, and an entry in a coarser page
+    /// unit covers every codec page it spans. The pages held past the head are
+    /// [`tail_pages`](Self::tail_pages).
     pub fn dense_prots(&self) -> Vec<CapturedProt> {
         dense_prots(
             &self.map.prot,
@@ -33021,6 +33003,53 @@ impl MemLayout {
             self.map.mapped,
             self.bytes.len() as u64,
         )
+    }
+
+    /// The layout in the §12 codec's **dense** form, the inverse of [`from_dense`](Self::from_dense):
+    /// one image through the last page it holds, and one [`CapturedProt`] per
+    /// [`DURABLE_SNAPSHOT_PAGE`] of it. A page between two it holds past the head reads as an
+    /// `Unmapped` zero one — the image of a flat window, which holds its whole buffer (#2427).
+    pub fn to_dense(&self) -> (Vec<u8>, Vec<CapturedProt>) {
+        let unit = DURABLE_SNAPSHOT_PAGE as usize;
+        let (mut bytes, mut prots) = (self.bytes.clone(), self.dense_prots());
+        for (off, prot, page) in self.tail_pages() {
+            let at = off as usize;
+            bytes.resize(bytes.len().max(at + unit), 0);
+            prots.resize(bytes.len() / unit, CapturedProt::Unmapped);
+            prots[at / unit] = prot;
+            if let Some(page) = page {
+                bytes[at..at + page.len()].copy_from_slice(page);
+            }
+        }
+        (bytes, prots)
+    }
+
+    /// #2427 — each [`DURABLE_SNAPSHOT_PAGE`] past the head that the window holds or aliases,
+    /// ascending: its byte offset, its protection, and its bytes when it has contents of its own that
+    /// are not all zero (`None` reads zero; a §13 alias's bytes are its region's). A page the window
+    /// does not hold is not listed, however far the next one is.
+    pub fn tail_pages(&self) -> Vec<(u64, CapturedProt, Option<&[u8]>)> {
+        let head = self.bytes.len() as u64;
+        let unit = DURABLE_SNAPSHOT_PAGE;
+        let page = self.map.page;
+        self.map
+            .prot
+            .range(head / page..)
+            .flat_map(|(&pg, &p)| {
+                let base = pg * page;
+                let bytes = self.tail.get(&base);
+                (0..page.div_ceil(unit))
+                    .map(move |k| base + k * unit)
+                    .filter(move |&off| off >= head)
+                    .map(move |off| {
+                        let within = (off - base) as usize;
+                        let bytes = bytes
+                            .and_then(|b| b.get(within..(within + unit as usize).min(b.len())))
+                            .filter(|b| b.iter().any(|&x| x != 0));
+                        (off, p.captured(off - base), bytes)
+                    })
+            })
+            .collect()
     }
 
     /// Whether a page of this layout aliases a §13 region (#2025): its bytes are the region's, which
@@ -33037,19 +33066,21 @@ impl MemLayout {
     pub fn image(bytes: Vec<u8>) -> MemLayout {
         MemLayout {
             bytes,
+            tail: BTreeMap::new(),
             map: PageMap::empty(),
         }
     }
 
-    /// The captured window bytes `[0, len)`.
+    /// The captured window bytes `[0, len)`: the head. The pages held past it are
+    /// [`tail_pages`](Self::tail_pages).
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// The captured image's byte length — what holding this layout costs (the protection map is a
-    /// handful of entries beside it), and the window extent a restore will overwrite.
+    /// What holding this layout costs: its head's bytes and those of each page it holds past it (the
+    /// protection map is a handful of entries beside them).
     pub fn byte_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() + self.tail.values().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -33073,6 +33104,46 @@ enum PageProt {
         region_off: u64,
         writable: bool,
     },
+}
+
+impl PageProt {
+    /// This page's state as a capture reports the codec page `within` bytes into it: a §13 alias
+    /// names its region from that page on.
+    fn captured(self, within: u64) -> CapturedProt {
+        match self {
+            PageProt::Rw => CapturedProt::Rw,
+            PageProt::Ro => CapturedProt::Ro,
+            PageProt::Unmapped => CapturedProt::Unmapped,
+            PageProt::Backed {
+                region,
+                region_off,
+                writable,
+            } => CapturedProt::Backed {
+                region,
+                off: region_off + within,
+                writable,
+            },
+        }
+    }
+}
+
+impl From<CapturedProt> for PageProt {
+    fn from(p: CapturedProt) -> PageProt {
+        match p {
+            CapturedProt::Rw => PageProt::Rw,
+            CapturedProt::Ro => PageProt::Ro,
+            CapturedProt::Unmapped => PageProt::Unmapped,
+            CapturedProt::Backed {
+                region,
+                off,
+                writable,
+            } => PageProt::Backed {
+                region,
+                region_off: off,
+                writable,
+            },
+        }
+    }
 }
 
 /// A guest linear-memory window. Confinement itself lives in [`temen_mask::Window`]
@@ -34906,70 +34977,84 @@ impl Mem {
         self.window.reserved().min(self.back.len())
     }
 
-    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map,
-    /// and (#2407) over a growable backing's whole length, which the window holds and pays for, so a
-    /// capture carries what its thaw is charged for.
-    fn high_water(&self, space: &AddrSpace) -> u64 {
-        let mut high = self.window.mapped();
-        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
-            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
-        }
-        if self.back.can_grow() {
-            high = high.max(self.back.len());
-        }
-        high.min(self.window.reserved())
-    }
-
-    /// A durable capture's span: at least `snap_cap` (the escape-oracle span the JIT captures too),
-    /// and always through the high-water mark, so a page grown past `snap_cap` rides a freeze
-    /// (#1700). Only the freeze capture wants it — a run that reads just its low window must not
-    /// copy a grown heap (a compiler guest's is hundreds of MiB).
-    fn capture_extent(&self, snap_cap: usize) -> u64 {
-        let high = self.high_water(&self.space_read());
-        self.window.reserved().min(high.max(snap_cap as u64))
-    }
-
-    /// Capture the window's full guest-visible memory state — the committed byte range plus the
-    /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
-    /// [`restore_layout`](Mem::restore_layout). A page aliasing a §13 region is captured as the
-    /// region it names, its bytes the region's to carry. The byte range runs to the high-water mark —
-    /// the mapped prefix, extended to cover any grown reserved-tail page present in the map — so a
-    /// `map`-grown heap is captured;
-    /// uncommitted/unmapped pages inside it read zero (the demand-zeroed backing, and `map`/`unmap`
-    /// zero on commit), matching a fresh window. Any domain's window: the root's, or a §14 child's
-    /// own (#1866).
+    /// Capture the window's full guest-visible memory state — its bytes and its page-protection map —
+    /// for a time-travel checkpoint, a moment or a §12 freeze, restored with
+    /// [`restore_layout`](Mem::restore_layout). Any domain's window: the root's, or a §14 child's own
+    /// (#1866).
+    ///
+    /// #2427 — the image is the committed prefix, then each page past it the window holds, apart: a
+    /// page the window does not hold costs the capture nothing, so a guest that maps one page at the
+    /// top of its reservation is captured as one page, not as the span below it, and the layout's map
+    /// holds what the window's budget pays for ([`PageMap::grown_bytes`]). A held page keeps its bytes
+    /// unless they are all zero, a page protected to nothing included (its contents are kept, #1909);
+    /// a page aliasing a §13 region is captured as the region it names, its bytes the region's to
+    /// carry ([`Mem::held_map`]).
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
-        let high = self.high_water(&space);
+        let mapped = self.window.mapped();
         // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
-        // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
-        // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
-        // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
-        // rather than millions of calls; the per-byte arm is a window that aliased a region, which a
+        // region mapped no page is `Backed`, so the prefix reads straight out of `back` in one pass —
+        // a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch PER
+        // BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy rather
+        // than millions of calls; the per-byte arm is a window that aliased a region, which a
         // reactor's §12 save-state (#2051) and a debugger checkpoint (#2026) capture, reading through
-        // it. Offset `0`, exactly as the per-byte arm's `self.byte(i)` indexes.
+        // it.
         let bytes = if !self.has_regions.load(Ordering::Relaxed) {
-            let mut out = vec![0u8; high as usize];
+            let mut out = vec![0u8; mapped as usize];
             self.back.read_into(0, &mut out);
             out
         } else {
-            (0..high).map(|i| self.byte(i)).collect()
+            (0..mapped).map(|i| self.byte(i)).collect()
         };
+        let first = mapped.div_ceil(self.page);
+        let prot = self.held_map(&space);
+        let tail = prot
+            .range(first..)
+            .filter(|(_, p)| held_tail(p))
+            .map(|(&page, _)| {
+                let off = page * self.page;
+                let mut out = vec![0u8; self.page as usize];
+                self.back.read_into(off, &mut out);
+                (off, out)
+            })
+            .filter(|(_, out)| out.iter().any(|&x| x != 0))
+            .collect();
         MemLayout {
             bytes,
+            tail,
             map: PageMap {
-                prot: space.prot.clone(),
+                prot,
                 page: self.page,
-                mapped: self.window.mapped(),
+                mapped,
             },
         }
     }
 
-    /// Reinstate a [`layout_snapshot`](Mem::layout_snapshot) into this freshly built window: reseed the
-    /// captured bytes (committing any grown-tail page), then install the page-protection map verbatim.
-    /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
-    /// window has no regions, so this reproduces the guest-visible state exactly.
+    /// #2427 — this window's page map as a capture records it: its entries, and on a flat window, which
+    /// holds its whole buffer (#2407), each page of the buffer past the declared window that has none,
+    /// as an inaccessible one it holds.
+    fn held_map(&self, space: &AddrSpace) -> BTreeMap<u64, PageProt> {
+        let mut prot = space.prot.clone();
+        if self.back.can_grow() {
+            let first = self.window.mapped().div_ceil(self.page);
+            let end = self
+                .back
+                .len()
+                .min(self.window.reserved())
+                .div_ceil(self.page);
+            for page in first..end {
+                prot.entry(page).or_insert(PageProt::Unmapped);
+            }
+        }
+        prot
+    }
+
+    /// Reinstate a [`layout_snapshot`](Mem::layout_snapshot) into this window: install the
+    /// page-protection map, then write the captured prefix and each page held past it. A thaw's
+    /// fresh window, or a live one a reactor rewinds; either way its regions are the host's to re-alias
+    /// ([`Host::realias_regions`]).
     fn restore_layout(&mut self, layout: &MemLayout) {
+        let first = (layout.bytes.len() as u64).div_ceil(self.page);
         // Install the captured map first, *replacing* whatever this window carries. The guard is only
         // the fast-path one: a window with no explicit protections restoring an image that has none
         // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
@@ -34982,17 +35067,38 @@ impl Mem {
         // installs its entry with the region it names.
         if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
+                                                // #2427 — what a live window holds past the image is zeroed first, in runs: the layout
+                                                // writes only the pages it holds with contents, so a page it holds zero, or not at all,
+                                                // must not keep what the guest wrote there since the moment was taken. A fresh window
+                                                // holds nothing there.
+            let mut stale: Vec<(u64, u64)> = Vec::new();
+            for (&page, _) in self
+                .held_map(&space)
+                .range(first..)
+                .filter(|(_, p)| held_tail(p))
+            {
+                match stale.last_mut() {
+                    Some((_, end)) if *end == page => *end += 1,
+                    _ => stale.push((page, page + 1)),
+                }
+            }
             space.prot = layout.map.rebased_to(self.page);
             space
                 .prot
                 .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+            drop(space);
+            for (lo, hi) in stale {
+                self.back.zero(lo * self.page, (hi - lo) * self.page);
+            }
         }
-        // Then the image, straight into `back` in one pass (the mirror of the capture above and of
-        // `seed`). No page is `Backed` now (an alias dirties the map, so the map above replaced it),
-        // so every byte is the window's own: a region the live window aliased since the moment was
-        // taken keeps its bytes out of the restore (#2059). Same root-only offset convention as
-        // `layout_snapshot`.
+        // Then the image, straight into `back` (the mirror of the capture above and of `seed`). No page
+        // is `Backed` now (an alias dirties the map, so the map above replaced it), so every byte is
+        // the window's own: a region the live window aliased since the moment was taken keeps its
+        // bytes out of the restore (#2059). The prefix last overwrites what a fresh window seeded.
         self.back.write_from(0, &layout.bytes);
+        for (&off, bytes) in &layout.tail {
+            self.back.write_from(off, bytes);
+        }
     }
 
     /// Snapshot the low `min(reserved, max(mapped, snap_cap))` bytes for the escape-oracle —
@@ -35029,48 +35135,35 @@ impl Mem {
         out
     }
 
-    /// Per-page protections over the same span as [`snapshot_window`], one [`CapturedProt`] per
-    /// [`DURABLE_SNAPSHOT_PAGE`]-byte page (DURABILITY.md §12.3). A page absent from the map is
-    /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
-    /// access path and the JIT's page tables use.
-    fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
-        let snap = self
-            .window
-            .reserved()
-            .min(self.window.mapped().max(snap_cap as u64));
-        let space = self.space_read();
-        dense_prots(&space.prot, self.page, self.window.mapped(), snap)
-    }
-
-    /// Re-establish a captured protection map on this window (the durable-restore step, the
-    /// inverse of [`snapshot_prots`]): mark each `Ro`/`Unmapped` page so a thawed guest faults
-    /// exactly as the frozen one would. `Rw` is the prefix default (left absent) but is set
-    /// explicitly for a reserved-tail page (a grown commit); `Backed` is skipped — a §13
-    /// shared-region alias isn't restorable here (D-region), the embedder re-grants the region.
-    /// A committed reserved-tail page takes its bytes from `init`, the image the map was captured
-    /// with (#1834) — [`seed`](Mem::seed) stops at the prefix. The JIT's `GuestWindow::apply_prots`
-    /// is this rule on its page tables.
-    fn apply_prots(&mut self, prots: &[CapturedProt], init: &[u8]) {
-        let mapped = self.window.mapped();
-        for (i, p) in prots.iter().enumerate() {
-            let off = i as u64 * DURABLE_SNAPSHOT_PAGE;
-            if off >= mapped && matches!(p, CapturedProt::Rw | CapturedProt::Ro) {
-                let src = init.get(off as usize..).unwrap_or(&[]);
-                let n = src.len().min(DURABLE_SNAPSHOT_PAGE as usize);
-                // A fresh window has no §13 region, so the bytes go straight to the backing.
-                self.back.write_from(off, &src[..n]);
-            }
+    /// Re-establish a captured layout on this freshly seeded window (the durable-restore step, the
+    /// inverse of [`layout_snapshot`](Mem::layout_snapshot) once [`seed`](Mem::seed) laid its prefix
+    /// down): its page map's entries over the seeded ones, so a thawed guest faults on an `Ro` or
+    /// `Unmapped` page exactly as the frozen one would, and each page held past the prefix with its
+    /// bytes (#1834, #2427). A `Backed` page is the host's to re-alias ([`Host::realias_regions`]). The
+    /// JIT's `GuestWindow::apply_prots` is this rule on its page tables.
+    fn apply_layout(&mut self, layout: &MemLayout) {
+        for (&off, bytes) in &layout.tail {
+            // A fresh window has no §13 region, so the bytes go straight to the backing.
+            self.back.write_from(off, bytes);
+        }
+        if layout.map.is_empty() {
+            return;
         }
         let mut space = self.space_write();
-        space.prot.extend(sparse_prots(prots, self.page, mapped));
+        space.prot.extend(
+            layout
+                .map
+                .rebased_to(self.page)
+                .into_iter()
+                .filter(|(_, p)| !matches!(p, PageProt::Backed { .. })),
+        );
     }
 }
 
 /// The one sparse ⇒ dense protection conversion: a window's page map (in `page`-byte pages, committed
 /// prefix `mapped`) as one [`CapturedProt`] per [`DURABLE_SNAPSHOT_PAGE`] over `[0, len)`. A page
 /// absent from the map is `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same
-/// default the access path and the JIT's page tables use. Shared by [`Mem::snapshot_prots`] and
-/// [`MemLayout::dense_prots`], so the live window and its captured image agree page for page.
+/// default the access path and the JIT's page tables use. [`MemLayout::dense_prots`]'s.
 fn dense_prots(
     prot: &BTreeMap<u64, PageProt>,
     page: u64,
@@ -35081,18 +35174,7 @@ fn dense_prots(
         .map(|i| {
             let byte_off = i * DURABLE_SNAPSHOT_PAGE;
             match prot.get(&(byte_off / page)) {
-                Some(PageProt::Rw) => CapturedProt::Rw,
-                Some(PageProt::Ro) => CapturedProt::Ro,
-                Some(PageProt::Unmapped) => CapturedProt::Unmapped,
-                Some(&PageProt::Backed {
-                    region,
-                    region_off,
-                    writable,
-                }) => CapturedProt::Backed {
-                    region,
-                    off: region_off + byte_off % page,
-                    writable,
-                },
+                Some(p) => p.captured(byte_off % page),
                 None if byte_off < mapped => CapturedProt::Rw,
                 None => CapturedProt::Unmapped,
             }
@@ -35103,7 +35185,7 @@ fn dense_prots(
 /// The one dense ⇒ sparse protection conversion, the inverse of [`dense_prots`]: the entries a window
 /// with `page`-byte pages and committed prefix `mapped` carries for a codec map. `Ro`/`Unmapped`
 /// always; `Rw` only in the reserved tail (a grown commit — in the prefix it is the default and stays
-/// absent); `Backed` never (D-region). Shared by [`Mem::apply_prots`] and [`MemLayout::from_dense`].
+/// absent); `Backed` never (D-region). [`MemLayout::from_dense`]'s.
 fn sparse_prots(
     prots: &[CapturedProt],
     page: u64,
@@ -36276,8 +36358,9 @@ mod growth_tests {
         assert_eq!(used(&root, run), 0);
     }
 
-    /// #2407 — a capture of a growable window reaches its backing's end, though no page up there is
-    /// mapped any more, so the window a thaw rebuilds from it holds what the frozen one was charged.
+    /// #2407 — a capture of a growable window holds each page up to its backing's end, though no
+    /// page up there is mapped any more, so the window a thaw rebuilds from it holds what the frozen
+    /// one was charged. #2427 — as pages held past the declared window, which the codec rebuilds.
     #[test]
     fn a_flat_windows_capture_carries_what_it_holds() {
         let page = host_page_size();
@@ -36288,8 +36371,65 @@ mod growth_tests {
         let held = mem.tail_bytes(0, 1 << 20).held;
         assert_eq!(held, 8 * page);
         let image = mem.layout_snapshot();
-        let thawed = MemLayout::from_dense(image.bytes().to_vec(), &image.dense_prots(), WINDOW);
+        assert_eq!(image.page_map().grown_bytes(), held);
+        let mut thawed =
+            MemLayout::from_dense(image.bytes().to_vec(), &image.dense_prots(), WINDOW);
+        for (off, prot, bytes) in image.tail_pages() {
+            thawed.hold(off, prot, bytes.map(<[u8]>::to_vec));
+        }
         assert_eq!(thawed.page_map().grown_bytes(), held);
+    }
+
+    /// #2427 — a capture holds the pages a window holds past its declared size, apart, and nothing
+    /// between them: a page mapped at the top of the reservation is one page of the capture, which a
+    /// window rebuilt from it holds, contents and all.
+    #[test]
+    fn a_capture_holds_a_far_page_alone() {
+        let page = host_page_size();
+        let top = (1 << 20) - page;
+        let mut mem = Mem::with_reservation(20, 16, None);
+        assert_eq!(mem.map(top, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.write_bytes(top + 7, &[0x5a]), Some(()));
+        let image = mem.layout_snapshot();
+        assert_eq!(
+            image.bytes().len() as u64,
+            WINDOW,
+            "the head is the declared window"
+        );
+        assert_eq!(
+            image.byte_len() as u64,
+            WINDOW + page,
+            "nothing of the span below"
+        );
+        assert_eq!(image.page_map().grown_bytes(), page);
+        let mut thawed = Mem::with_reservation(20, 16, None);
+        thawed.apply_layout(&image);
+        assert_eq!(thawed.read_bytes(top + 7, 1), Some(vec![0x5a]));
+        assert_eq!(thawed.tail_bytes(0, 1 << 20).held, page);
+    }
+
+    /// #2427 — a window rewound to a capture holds what the capture held, though the guest wrote and
+    /// mapped past its declared size since: a page it held zero reads zero again, and one it did not
+    /// hold is gone.
+    #[test]
+    fn a_rewound_window_forgets_what_was_written_past_its_capture() {
+        let page = host_page_size();
+        let (held_zero, later) = (WINDOW + 2 * page, WINDOW + 5 * page);
+        let mut mem = Mem::with_reservation(20, 16, None);
+        assert_eq!(mem.map(held_zero, page, PROT_READ | PROT_WRITE), 0);
+        let moment = mem.layout_snapshot();
+        assert_eq!(mem.write_bytes(held_zero, &[7; 8]), Some(()));
+        assert_eq!(mem.map(later, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.write_bytes(later, &[9; 8]), Some(()));
+        mem.restore_layout(&moment);
+        assert_eq!(mem.read_bytes(held_zero, 8), Some(vec![0; 8]));
+        assert_eq!(
+            mem.tail_bytes(0, 1 << 20).held,
+            page,
+            "the later page is gone"
+        );
+        assert_eq!(mem.map(later, page, PROT_READ | PROT_WRITE), 0);
+        assert_eq!(mem.read_bytes(later, 8), Some(vec![0; 8]));
     }
 
     /// #2407 — a fork twin of a growable window holds what its parent's holds, which is what the twin

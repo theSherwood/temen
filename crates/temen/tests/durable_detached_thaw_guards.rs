@@ -215,6 +215,54 @@ fn a_thawed_detached_childs_grown_page_is_seen_by_its_memory_capability() {
     check_child(GROWN_CHILD, Out::Ret(EINVAL));
 }
 
+/// #2427: [`GROWN_CHILD`]'s page 64 GiB into its 128 GiB reservation, its byte read back after the
+/// cut.
+fn far_child() -> String {
+    let src = GROWN_CHILD
+        .replace("vt = i64.const 131072", &format!("vt = i64.const {FAR}"))
+        .replace(
+            "  vl = i64.const 1\n  vr = self.resolve vp vl\n  pr = i64.extend_i32_s vr\n",
+            "  vr = i32.load8_u vp\n  pr = i64.extend_i32_u vr\n",
+        );
+    assert!(
+        src.contains(&FAR.to_string()) && src.contains("load8_u"),
+        "{src}"
+    );
+    src
+}
+const FAR: u64 = 1 << 36;
+
+/// #2427 — a freeze captures the pages a child holds past its declared window, apart: a page it
+/// mapped 64 GiB up is one page of its artifact, not the span below it (which the capture used to
+/// allocate whole), and the thawed child holds that page alone, so the growth its end hands back is
+/// the page its budget paid for.
+#[test]
+fn a_far_page_rides_a_detached_childs_artifact_alone() {
+    let (parent, src) = (parent(), far_child());
+    let child = child_module(&src);
+    for engine in [Engine::Interp, Engine::Jit] {
+        let Some((art, _)) = artifact(engine, &parent, &child) else {
+            continue;
+        };
+        assert!(
+            art.len() < 1 << 20,
+            "frozen on {engine:?}: {} bytes",
+            art.len()
+        );
+        let mut thost = Host::new();
+        thost.set_durable(true);
+        thost.grant_durable_module(&child);
+        temen_snapshot::restore(&art, &parent, &mut thost).expect("restore");
+        let grown: Vec<u64> = thost
+            .thawed_detached()
+            .iter()
+            .map(|t| t.window.page_map().grown_bytes())
+            .collect();
+        assert_eq!(grown, [16384], "frozen on {engine:?}");
+    }
+    check_child(&src, Out::Ret(122));
+}
+
 /// #1904 — the root spawns the detached child, spawns a thread that resumes a fiber (the safepoints
 /// the freeze trigger counts), joins the child, then the thread, and returns their sum.
 const JOINING_PARENT: &str = "memory 18 shadow 16448 65536

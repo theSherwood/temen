@@ -1,7 +1,7 @@
 //! **The experimental NULL-page guard** (`compile_module_tierup_nullguard`) — the differential for
 //! the trap-on-NULL measurement mode: every confined access traps when its first byte lands below
 //! the guard, exactly where an interpreter whose page map seeds `[0, guard)` `Unmapped` traps
-//! (`run_capture_reserved_with_host_prots` is the seeding seam). A *bottom* guard needs no
+//! (`run_capture_reserved_with_host_layout` is the seeding seam). A *bottom* guard needs no
 //! last-byte consultation — an access starting at or above the guard cannot reach down — but an
 //! access *starting* below it traps even when its span crosses into mapped pages (the straddle
 //! probe). Like the paged check, the guard is **never elided**: a constant-address access the
@@ -11,7 +11,7 @@
 //! trap-parity divergence, never an escape — the same INVARIANTS #2 argument as the #750 page
 //! check this mode's lowering is weighed against.
 
-use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Value};
+use temen_interp::{run_capture_reserved_with_host_layout, CapturedProt, Host, MemLayout, Value};
 use temen_wasm_jit::{compile_module_tierup_nullguard, ENV_FAULT_OFF, TRAP_MEMORY_FAULT};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -165,16 +165,9 @@ fn run_oracle(m: &temen_ir::Module, func: u32, argv: &[i64]) -> Result<i64, Opti
     let args: Vec<Value> = argv.iter().map(|&a| Value::I64(a)).collect();
     let mut fuel = FUEL;
     let mut host = Host::new();
-    let init_mem = vec![0u8; WIN_SIZE as usize];
-    let (res, _, _) = run_capture_reserved_with_host_prots(
-        m,
-        func,
-        &args,
-        &mut fuel,
-        &init_mem,
-        Some(&prots),
-        WIN_LOG2,
-        &mut host,
+    let init = MemLayout::from_dense(vec![0u8; WIN_SIZE as usize], &prots, WIN_SIZE);
+    let (res, _) = run_capture_reserved_with_host_layout(
+        m, func, &args, &mut fuel, &init, WIN_LOG2, &mut host,
     );
     match res {
         Ok(vals) => match vals.first() {

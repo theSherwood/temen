@@ -8,8 +8,8 @@
 //!   the page comes back `Rw`) — on **both** the interpreter and the JIT (real `mprotect` /
 //!   `VirtualProtect`), so the two backends agree on a thawed protected window.
 
-use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, MemLayout, Value};
-use temen_ir::Memory;
+use temen_interp::{run_capture_reserved_with_host_layout, CapturedProt, Host, MemLayout, Value};
+use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
@@ -25,6 +25,34 @@ const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
                                 // (macOS) page 4 shares host page 1 with the page-5 RO segment and captures Ro; page 8 is a
                                 // clean host page above it.
 const RW_OFF: usize = 8 * PAGE;
+
+/// `m`'s `func` on the interpreter over `init`, in a reservation of `1 << reserved_log2`: how it
+/// ended, and the window it left.
+fn interp_run(
+    m: &Module,
+    func: u32,
+    args: &[Value],
+    init: &MemLayout,
+    reserved_log2: u8,
+    host: &mut Host,
+) -> (Result<Vec<Value>, temen_interp::Trap>, MemLayout) {
+    let mut fuel = 1_000_000u64;
+    let (r, left) =
+        run_capture_reserved_with_host_layout(m, func, args, &mut fuel, init, reserved_log2, host);
+    (r, left.expect("the guest has a window"))
+}
+
+/// What a window layout holds, page for page: its head, the head's protections, and each page it
+/// holds past the head (#2427).
+type Held<'a> = (
+    &'a [u8],
+    Vec<CapturedProt>,
+    Vec<(u64, CapturedProt, Option<&'a [u8]>)>,
+);
+
+fn held(l: &MemLayout) -> Held<'_> {
+    (l.bytes(), l.dense_prots(), l.tail_pages())
+}
 
 // A read-only data segment + a trivial entry (it doesn't touch memory; the segment alone marks
 // its page `Ro` at instantiation, D40).
@@ -50,19 +78,10 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     let mut host = Host::new();
     let _ = host.grant_clock(); // a durable handle so the freeze has a non-empty table
 
-    let init = vec![0u8; WINDOW];
-    let mut fuel = 100_000u64;
-    let (r, window, caps) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(0)],
-        &mut fuel,
-        &init,
-        None, // capture only
-        SIZE_LOG2,
-        &mut host,
-    );
+    let init = MemLayout::image(vec![0u8; WINDOW]);
+    let (r, left) = interp_run(&m, 0, &[Value::I32(0)], &init, SIZE_LOG2, &mut host);
     assert_eq!(r, Ok(vec![Value::I64(7)]));
+    let (window, caps) = (left.bytes(), left.dense_prots());
 
     // Capture: the readonly segment's page is `Ro`; an ordinary committed page is `Rw`.
     let ro_page = RO_OFF / PAGE;
@@ -83,7 +102,7 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     );
 
     // Through the §12 codec: the protection is recorded and recovered (Phase-1 would have lost it).
-    let art = freeze_with_prots(&m, &window, &caps, SIZE_LOG2, &host).expect("freeze");
+    let art = freeze_with_prots(&m, window, &caps, SIZE_LOG2, &host).expect("freeze");
     let mut rhost = Host::new();
     let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
     assert_eq!(
@@ -99,7 +118,8 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
 /// its declared size, captured through the real interpreter and round-tripped through the §12 codec.
 /// Pre-v18 the captured window (larger than `1 << size_log2`) hit `GeometryMismatch`; v18 carries the
 /// grown extent + reservation, so the grown page's content and protection survive serialize/restore —
-/// the durable-artifact analogue of the in-process warm-snapshot restore (#828/#1127).
+/// the durable-artifact analogue of the in-process warm-snapshot restore (#828/#1127). v45 (#2427)
+/// carries them as pages held past the declared window.
 #[test]
 fn a_vm_map_grown_window_survives_the_codec() {
     // Declares 128 KiB; `_start` `vm_map`s [128 KiB, 192 KiB) Rw and writes a marker into the grown
@@ -130,49 +150,50 @@ block 0 (v0: i32) {
 
     let mut host = Host::new();
     let mem_h = host.grant_memory(); // the AddressSpace cap the guest `vm_map`s through (durable)
-    let init = vec![0u8; 1 << GROW_SIZE_LOG2];
-    let mut fuel = 100_000u64;
-    let (r, window, caps) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(mem_h)],
-        &mut fuel,
-        &init,
-        None,
-        GROW_RESERVED_LOG2,
-        &mut host,
-    );
+    let init = MemLayout::image(vec![0u8; 1 << GROW_SIZE_LOG2]);
+    let args = [Value::I32(mem_h)];
+    let (r, left) = interp_run(&m, 0, &args, &init, GROW_RESERVED_LOG2, &mut host);
     assert_eq!(r, Ok(vec![Value::I64(0)]), "the vm_map grow succeeds");
-    // The capture spans the grown region: the marker's page is committed Rw above the declared window.
-    let mark_page = GROWN_MARK_OFF / PAGE;
-    assert!(
-        mark_page >= (1 << GROW_SIZE_LOG2) / PAGE,
-        "the marker is in the grown tail, not the declared window"
+    // The capture holds the grown region past its declared window: the marker's page is Rw.
+    let mark_page = (GROWN_MARK_OFF / PAGE * PAGE) as u64;
+    assert_eq!(
+        left.bytes().len(),
+        1 << GROW_SIZE_LOG2,
+        "the head is the declared window"
     );
-    assert_eq!(window[GROWN_MARK_OFF], 424242i64.to_le_bytes()[0]);
-    assert_eq!(caps[mark_page], CapturedProt::Rw, "grown page captured Rw");
+    let marked = |l: &MemLayout| {
+        l.tail_pages()
+            .into_iter()
+            .find(|&(off, ..)| off == mark_page)
+            .map(|(_, prot, bytes)| (prot, bytes.map(|b| b[GROWN_MARK_OFF % PAGE])))
+    };
+    let mark = Some((CapturedProt::Rw, Some(424242i64.to_le_bytes()[0])));
+    assert_eq!(
+        marked(&left),
+        mark,
+        "grown page captured Rw, its marker with it"
+    );
 
     // Through the codec at the guest's real reservation: pre-v18 this was GeometryMismatch.
     let art =
-        freeze_with_prots(&m, &window, &caps, GROW_RESERVED_LOG2, &host).expect("freeze grown");
+        temen_snapshot::freeze_layout(&m, &left, GROW_RESERVED_LOG2, &host).expect("freeze grown");
     let mut rhost = Host::new();
-    let (rwin, rprots, rreserved) =
-        restore_with_prots(&art, &m, &mut rhost).expect("restore grown");
+    let (restored, rreserved) =
+        temen_snapshot::restore_layout(&art, &m, &mut rhost).expect("restore grown");
     assert_eq!(
         rreserved, GROW_RESERVED_LOG2,
         "the mask domain survives the codec"
     );
     assert_eq!(
-        rwin.len(),
-        window.len(),
-        "the grown committed extent survives"
+        held(&restored),
+        held(&left),
+        "the grown window survives the codec"
     );
     assert_eq!(
-        &rwin[GROWN_MARK_OFF..GROWN_MARK_OFF + 8],
-        &424242i64.to_le_bytes(),
+        marked(&restored),
+        mark,
         "the grown-region marker survives serialize/restore"
     );
-    assert_eq!(rprots[mark_page], PageProt::Rw);
 }
 
 // Stores to page 5 (`RO_OFF`), then returns 0. With that page restored `Ro` the store faults;
@@ -208,32 +229,14 @@ fn restore_re_establishes_ro_so_a_thawed_write_faults() {
     let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut rhost).expect("restore");
 
     // Thaw with the restored protections: the store into the Ro page faults.
-    let mut fuel = 100_000u64;
-    let (faulted, _, _) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(0)],
-        &mut fuel,
-        &rwin,
-        Some(&rprots.clone()),
-        SIZE_LOG2,
-        &mut rhost,
-    );
+    let thawed = MemLayout::from_dense(rwin.clone(), &rprots, WINDOW as u64);
+    let (faulted, _) = interp_run(&m, 0, &[Value::I32(0)], &thawed, SIZE_LOG2, &mut rhost);
     assert!(faulted.is_err(), "a store to a restored Ro page must fault");
 
     // Control: the same window/guest with no protections re-established — the store succeeds.
-    let mut fuel = 100_000u64;
     let mut host2 = Host::new();
-    let (ok, _, _) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(0)],
-        &mut fuel,
-        &rwin,
-        None,
-        SIZE_LOG2,
-        &mut host2,
-    );
+    let bare = MemLayout::image(rwin);
+    let (ok, _) = interp_run(&m, 0, &[Value::I32(0)], &bare, SIZE_LOG2, &mut host2);
     assert_eq!(
         ok,
         Ok(vec![Value::I64(0)]),
@@ -320,23 +323,15 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
         size_log2: SIZE_LOG2,
         shadow: Some(TEST_ARENA),
     });
-    let npages = WINDOW / PAGE;
     let init = vec![0u8; WINDOW];
 
     // Interpreter capture (reads its software page map).
     let mut hi = Host::new();
     let _ = hi.grant_clock();
-    let mut fuel = 100_000u64;
-    let (_, _, caps_i) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(0)],
-        &mut fuel,
-        &init,
-        None,
-        SIZE_LOG2,
-        &mut hi,
-    );
+    let image = MemLayout::image(init.clone());
+    let caps_i = interp_run(&m, 0, &[Value::I32(0)], &image, SIZE_LOG2, &mut hi)
+        .1
+        .dense_prots();
 
     // JIT capture: run, then reconstruct the protections from the host (data segments + cap map).
     let mut hj = Host::new();
@@ -352,12 +347,15 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
         &mut hj as *mut Host as *mut c_void,
     )
     .expect("jit compiles");
-    let caps_j = hj.capture_window_prots(
-        &m.data,
-        WINDOW as u64,
-        npages,
-        temen_ir::module_null_guard(),
-    );
+    let caps_j = hj
+        .capture_window_layout(
+            &m.data,
+            WINDOW as u64,
+            temen_ir::module_null_guard(),
+            init,
+            Vec::new(),
+        )
+        .dense_prots();
 
     assert_eq!(caps_i[RO_OFF / PAGE], CapturedProt::Ro);
     assert_eq!(
@@ -379,7 +377,9 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
     let mut h = Host::new();
     let map = h.cap_window_pages(0);
     map.lock().unwrap().insert(0, temen_ir::PageState::Unmapped);
-    let caps = h.capture_window_prots(&[], WINDOW as u64, WINDOW / PAGE, 0);
+    let caps = h
+        .capture_window_layout(&[], WINDOW as u64, 0, vec![0; WINDOW], Vec::new())
+        .dense_prots();
     assert_eq!(
         caps[0],
         CapturedProt::Unmapped,
@@ -394,7 +394,8 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
 
 /// #1700: a page grown past the 256 KiB escape-oracle span still rides the capture. The capture ran
 /// to `max(mapped, 256 KiB)`, so a guest that `vm_map`ped at 512 KiB lost the page (bytes and
-/// protection) and a freeze of it silently dropped live memory.
+/// protection) and a freeze of it silently dropped live memory. #2427: and the capture holds that
+/// page alone past the declared window, not the span below it.
 #[test]
 fn a_page_grown_past_the_oracle_span_is_captured() {
     const RESERVED_LOG2: u8 = 20; // 1 MiB reservation
@@ -419,28 +420,125 @@ block 0 (v0: i32) {{
     let m = temen_text::parse_module(&src).expect("parse");
     let mut host = Host::new();
     let mem_h = host.grant_memory();
-    let mut fuel = 100_000u64;
-    let (r, window, caps) = run_capture_reserved_with_host_prots(
-        &m,
-        0,
-        &[Value::I32(mem_h)],
-        &mut fuel,
-        &vec![0u8; 1 << 17],
-        None,
-        RESERVED_LOG2,
-        &mut host,
-    );
+    let init = MemLayout::image(vec![0u8; 1 << 17]);
+    let (r, left) = interp_run(&m, 0, &[Value::I32(mem_h)], &init, RESERVED_LOG2, &mut host);
     assert_eq!(r, Ok(vec![Value::I64(0)]), "the vm_map grow succeeds");
-    assert!(
-        window.len() >= GROWN + PAGE,
-        "the capture reaches the grown page: {} bytes",
-        window.len()
-    );
-    assert_eq!(&window[MARK_OFF..MARK_OFF + 8], &424242i64.to_le_bytes());
+    let (head, _, tail) = held(&left);
+    assert_eq!(head.len(), 1 << 17, "the head is the declared window");
+    // The host page the grow committed, in codec pages: the grown one first.
+    let host_page = temen_interp::host_page_size();
+    assert_eq!(tail.len() as u64, host_page / PAGE as u64, "{tail:?}");
+    let (off, prot, bytes) = tail[0];
     assert_eq!(
-        caps[GROWN / PAGE],
-        CapturedProt::Rw,
+        (off, prot),
+        (GROWN as u64, CapturedProt::Rw),
         "grown page captured Rw"
+    );
+    let bytes = bytes.expect("the marker's page has contents");
+    assert_eq!(&bytes[MARK_OFF - GROWN..][..8], &424242i64.to_le_bytes());
+    assert_eq!(
+        left.byte_len() as u64,
+        (1 << 17) + host_page,
+        "nothing of the gap"
+    );
+}
+
+/// #2427: a guest that maps one page 64 GiB into its 128 GiB reservation and writes a marker there
+/// (entry 0), and one that loads the marker back (entry 1).
+const FAR_SRC: &str = "memory 17 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 68719476736
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) v0 (va, vlen, vrw)
+  vm = i64.const 424242
+  i64.store va vm
+  return vr
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  va = i64.const 68719476736
+  vl = i64.load va
+  return vl
+  }
+}
+";
+
+/// #2427 — a capture holds the pages a window holds past its declared size, apart, on both engines:
+/// a page mapped 64 GiB up is one page of the capture and of the artifact, not the span below it
+/// (which the capture used to allocate whole), and a window thawed from it on either engine holds
+/// that page alone, its marker and all.
+#[test]
+fn a_far_page_rides_the_artifact_alone_on_both_engines() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let m = temen_text::parse_module(FAR_SRC).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+    let image = MemLayout::image(vec![0u8; WINDOW]);
+
+    let mut hi = Host::new();
+    let ih = hi.grant_memory();
+    let (ir, ilayout) = interp_run(&m, 0, &[Value::I32(ih)], &image, reserved, &mut hi);
+    assert_eq!(ir, Ok(vec![Value::I64(0)]), "the far map succeeds");
+    assert_eq!(
+        ilayout.page_map().grown_bytes(),
+        16384,
+        "the capture holds the page alone"
+    );
+    assert!(
+        ilayout.byte_len() <= WINDOW + 16384,
+        "{} bytes",
+        ilayout.byte_len()
+    );
+
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_memory();
+    let (jo, jlayout) =
+        temen_run::jit_cap_run(&m, 0, &[jh as i64], &image, reserved, 0, &mut hj, None)
+            .expect("jit");
+    assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![0]));
+    assert!(
+        held(&jlayout) == held(&ilayout),
+        "the JIT captures what the interpreter does"
+    );
+
+    let art = temen_snapshot::freeze_layout(&m, &jlayout, reserved, &Host::new()).expect("freeze");
+    assert!(
+        art.len() < 1 << 20,
+        "the artifact holds the page alone: {} bytes",
+        art.len()
+    );
+    let (restored, _) =
+        temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
+    assert_eq!(
+        restored.page_map().grown_bytes(),
+        16384,
+        "the thaw holds what the guest did"
+    );
+
+    let mut hi = Host::new();
+    let ih = hi.grant_memory();
+    let (ir, _) = interp_run(&m, 1, &[Value::I32(ih)], &restored, reserved, &mut hi);
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(424242)]),
+        "the interpreter's thaw reads the marker"
+    );
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let jh = hj.grant_memory();
+    let (jo, _) =
+        temen_run::jit_cap_run(&m, 1, &[jh as i64], &restored, reserved, 0, &mut hj, None)
+            .expect("jit");
+    assert_eq!(
+        jo,
+        temen_jit::JitOutcome::Returned(vec![424242]),
+        "the JIT's thaw reads it"
     );
 }
 
@@ -532,9 +630,10 @@ block 0 (v0: i32) {
 const PROBES: [u32; 6] = [1, 2, 3, 4, 5, 6];
 const PAGE_OPS_RESERVED_LOG2: u8 = 20; // 1 MiB
 
-/// #1810: the JIT's durable capture is the interpreter's — bytes through the high-water, and the page
-/// map. It stopped at 256 KiB, so the page at 512 KiB never reached a JIT freeze; and it was bytes
-/// alone, so a JIT freeze recorded every page `Rw`, losing the guest's `protect` and `unmap`.
+/// #1810: the JIT's durable capture is the interpreter's — its declared window, each page held past
+/// it (#2427), and the page map. It stopped at 256 KiB, so the page at 512 KiB never reached a JIT
+/// freeze; and it was bytes alone, so a JIT freeze recorded every page `Rw`, losing the guest's
+/// `protect` and `unmap`.
 #[test]
 fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     if !temen_jit::fiber_supported() {
@@ -546,14 +645,12 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
 
     let mut hi = Host::new();
     let ih = hi.grant_memory();
-    let mut fuel = 1_000_000u64;
-    let (ir, ibytes, iprots) = run_capture_reserved_with_host_prots(
+    let image = MemLayout::image(init.clone());
+    let (ir, ilayout) = interp_run(
         &m,
         0,
         &[Value::I32(ih)],
-        &mut fuel,
-        &init,
-        None,
+        &image,
         PAGE_OPS_RESERVED_LOG2,
         &mut hi,
     );
@@ -574,26 +671,31 @@ fn jit_durable_capture_matches_interp_past_the_oracle_span() {
     )
     .expect("jit");
     assert_eq!(jo, temen_jit::JitOutcome::Returned(vec![0]));
-    assert_eq!(jlayout.bytes().len(), ibytes.len(), "capture extent");
-    assert!(jlayout.bytes() == ibytes, "capture bytes");
-    assert_eq!(jlayout.dense_prots(), iprots, "page map");
-    // The cases the page map must carry, spelled out.
+    assert!(held(&jlayout) == held(&ilayout), "capture");
+    // The cases the page map must carry, spelled out: in the declared window, and past it, where an
+    // `unmap`ped page is one the window no longer holds.
+    let (_, iprots, itail) = held(&ilayout);
     for (off, want) in [
-        (81920, CapturedProt::Ro),        // the readonly segment
-        (98304, CapturedProt::Ro),        // `protect`ed read-only in the declared memory
-        (196608, CapturedProt::Ro),       // `protect`ed read-only
-        (229376, CapturedProt::Unmapped), // `unmap`ped
-        (524288, CapturedProt::Rw),       // grown past 256 KiB
+        (81920, CapturedProt::Ro), // the readonly segment
+        (98304, CapturedProt::Ro), // `protect`ed read-only in the declared memory
     ] {
         assert_eq!(iprots[off / PAGE], want, "interp page at {off}");
     }
+    let tail = |off: u64| itail.iter().find(|t| t.0 == off).map(|t| t.1);
+    assert_eq!(
+        tail(196608),
+        Some(CapturedProt::Ro),
+        "`protect`ed read-only"
+    );
+    assert_eq!(tail(229376), None, "`unmap`ped");
+    assert_eq!(tail(524288), Some(CapturedProt::Rw), "grown past 256 KiB");
 
     // Through the codec and back: the JIT's artifact keeps what the interpreter's does.
     let art = temen_snapshot::freeze_layout(&m, &jlayout, PAGE_OPS_RESERVED_LOG2, &Host::new())
         .expect("freeze");
-    let (rwin, rprots, _) = restore_with_prots(&art, &m, &mut Host::new()).expect("restore");
-    assert!(rwin == ibytes, "restored bytes");
-    assert_eq!(rprots, iprots, "restored page map");
+    let (restored, _) =
+        temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
+    assert!(held(&restored) == held(&ilayout), "restored window");
 }
 
 /// #1834: a thaw on the JIT re-applies the page map the artifact carries, as the interpreter's does.
@@ -630,21 +732,12 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
 
     let mut wrong = Vec::new();
     for entry in PROBES {
-        // The interpreter's thaw: the restored bytes under the restored page map.
+        // The interpreter's thaw: the restored window, page map and all.
         let mut hi = Host::new();
-        let (rwin, rprots, reserved) = restore_with_prots(&art, &m, &mut hi).expect("restore");
+        let (rlayout, reserved) =
+            temen_snapshot::restore_layout(&art, &m, &mut hi).expect("restore");
         let ih = hi.grant_memory();
-        let mut fuel = 1_000_000u64;
-        let (ir, ibytes, iprots) = run_capture_reserved_with_host_prots(
-            &m,
-            entry,
-            &[Value::I32(ih)],
-            &mut fuel,
-            &rwin,
-            Some(&rprots.clone()),
-            reserved,
-            &mut hi,
-        );
+        let (ir, ilayout) = interp_run(&m, entry, &[Value::I32(ih)], &rlayout, reserved, &mut hi);
         let iout = match &ir {
             Ok(v) => format!("{v:?}"),
             Err(t) => format!("{t:?}"),
@@ -668,13 +761,8 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
             wrong.push(format!("entry {entry}: interp {iout}, JIT {jout}"));
         }
         // What the run leaves, as the next freeze would record it.
-        if ir.is_ok() && jlayout.dense_prots() != iprots {
-            wrong.push(format!(
-                "entry {entry}: the page map the run leaves differs"
-            ));
-        }
-        if ir.is_ok() && jlayout.bytes() != &ibytes[..] {
-            wrong.push(format!("entry {entry}: the bytes the run leaves differ"));
+        if ir.is_ok() && held(&jlayout) != held(&ilayout) {
+            wrong.push(format!("entry {entry}: the window the run leaves differs"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

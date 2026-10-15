@@ -20,7 +20,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_UNWINDING,
 };
 use temen_interp::{
-    run_capture_reserved_with_host_prots, CapturedProt, DurableBinding, Host, MemLayout,
+    run_capture_reserved_with_host_layout, CapturedProt, DurableBinding, Host, MemLayout,
     RegionNotCaptured, RegionRefusal, SharedBacking, Value,
 };
 use temen_ir::{Module, SpawnRec};
@@ -123,7 +123,14 @@ fn run(
     Vec<CapturedProt>,
 ) {
     let mut fuel = 50_000_000u64;
-    run_capture_reserved_with_host_prots(m, func, args, &mut fuel, win, prots, SIZE_LOG2, host)
+    let init = match prots {
+        Some(prots) => MemLayout::from_dense(win.to_vec(), prots, WINDOW as u64),
+        None => MemLayout::image(win.to_vec()),
+    };
+    let (res, left) =
+        run_capture_reserved_with_host_layout(m, func, args, &mut fuel, &init, SIZE_LOG2, host);
+    let left = left.expect("the guest has a window");
+    (res, left.bytes().to_vec(), left.dense_prots())
 }
 
 /// [`run`] on the native JIT: `m`'s `func` over `layout`, its result (`None` for a run the freeze

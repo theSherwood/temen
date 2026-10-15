@@ -24,6 +24,7 @@
 //! serialization ([`temen-snapshot`] writes a `ShadowStack` moment as a §12 artifact).
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::{Host, HostReplaySubstate, MemLayout, PageMap, RegionTable};
@@ -171,8 +172,10 @@ const SHARED_PAGE: usize = crate::DURABLE_SNAPSHOT_PAGE as usize;
 enum Image {
     Flat(MemLayout),
     Paged {
-        /// The image in [`SHARED_PAGE`] pages; the last one holds the remainder.
+        /// The image's head in [`SHARED_PAGE`] pages; the last one holds the remainder.
         pages: Vec<Arc<[u8]>>,
+        /// The pages it holds past the head (#2427), kept as captured: a grown heap's own pages.
+        tail: BTreeMap<u64, Vec<u8>>,
         map: PageMap,
     },
 }
@@ -182,8 +185,9 @@ impl Image {
     fn layout(&self) -> Cow<'_, MemLayout> {
         match self {
             Image::Flat(l) => Cow::Borrowed(l),
-            Image::Paged { pages, map } => Cow::Owned(MemLayout {
+            Image::Paged { pages, tail, map } => Cow::Owned(MemLayout {
                 bytes: pages.concat(),
+                tail: tail.clone(),
                 map: map.clone(),
             }),
         }
@@ -192,14 +196,17 @@ impl Image {
     fn byte_len(&self) -> usize {
         match self {
             Image::Flat(l) => l.byte_len(),
-            Image::Paged { pages, .. } => pages.iter().map(|p| p.len()).sum(),
+            Image::Paged { pages, tail, .. } => {
+                pages.iter().map(|p| p.len()).sum::<usize>()
+                    + tail.values().map(Vec::len).sum::<usize>()
+            }
         }
     }
 
     /// This image in pages, each one shared with `below`'s page at the same index when the bytes
     /// agree. An image already paged is left as it is.
     fn paged(self, below: Option<&Image>) -> Image {
-        let Image::Flat(MemLayout { bytes, map }) = self else {
+        let Image::Flat(MemLayout { bytes, tail, map }) = self else {
             return self;
         };
         let below: &[Arc<[u8]>] = match below {
@@ -214,24 +221,25 @@ impl Image {
                 _ => Arc::from(page),
             })
             .collect();
-        Image::Paged { pages, map }
+        Image::Paged { pages, tail, map }
     }
 
     /// The pages this image holds that `below` does not share — what holding it adds to a ladder.
     fn bytes_beyond(&self, below: Option<&Image>) -> usize {
-        let Image::Paged { pages, .. } = self else {
+        let Image::Paged { pages, tail, .. } = self else {
             return self.byte_len();
         };
         let below: &[Arc<[u8]>] = match below {
             Some(Image::Paged { pages, .. }) => pages,
             _ => &[],
         };
-        pages
+        let shared: usize = pages
             .iter()
             .enumerate()
             .filter(|(i, p)| !below.get(*i).is_some_and(|b| Arc::ptr_eq(b, p)))
             .map(|(_, p)| p.len())
-            .sum()
+            .sum();
+        shared + tail.values().map(Vec::len).sum::<usize>()
     }
 }
 

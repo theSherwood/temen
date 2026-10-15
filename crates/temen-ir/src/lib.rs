@@ -355,7 +355,7 @@ pub mod errno {
 /// state, absent ⇒ the region default (read-write in the backed prefix, unmapped in the reserved
 /// tail). One definition for the readers: the flat-window backend that writes them
 /// (`temen_run::MprotectWindow`), the durable capture that turns them into a snapshot's page map
-/// (`temen_interp::Host::capture_window_prots`), and the JIT's fork copy (`temen_jit`).
+/// (`temen_interp::Host::capture_window_layout`), and the JIT's fork copy (`temen_jit`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PageState {
     /// Committed read-write.

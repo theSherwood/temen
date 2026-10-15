@@ -24,10 +24,10 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined,
 };
 use temen_interp::{
-    bytecode, run_capture_reserved_with_host_prots, CapturedProt, Host, Region, Value,
+    bytecode, run_capture_reserved_with_host_layout, CapturedProt, Host, MemLayout, Region, Value,
 };
 use temen_ir::{Memory, Module};
-use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
+use temen_snapshot::{freeze_layout, restore_with_prots, PageProt, PAGE};
 
 /// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
 const TEST_ARENA: temen_ir::durable_abi::ShadowArena =
@@ -96,50 +96,27 @@ fn instrument(flip: bool) -> Module {
 }
 
 // Grant a fresh AddressSpace + Clock (the two entry caps) and run the instrumented guest over
-// `window`/`prots` at the grown reservation. Returns (result, captured window, captured prots).
+// `window` at the grown reservation. Returns (result, the window it left).
 fn run_fresh(
     inst: &Module,
     clock_v: i64,
     window: &[u8],
-    prots: Option<&[CapturedProt]>,
     host: &mut Host,
-) -> (
-    Result<Vec<Value>, temen_interp::Trap>,
-    Vec<u8>,
-    Vec<CapturedProt>,
-) {
+) -> (Result<Vec<Value>, temen_interp::Trap>, MemLayout) {
     let space = host.grant_memory();
     let clk = host.grant_clock();
-    run_at(inst, clock_v, window, prots, host, space, clk)
-}
-
-// Run the instrumented guest with explicit cap handles (for the thaw phase, where the handles come
-// from the restored table rather than fresh grants).
-fn run_at(
-    inst: &Module,
-    clock_v: i64,
-    window: &[u8],
-    prots: Option<&[CapturedProt]>,
-    host: &mut Host,
-    space: i32,
-    clk: i32,
-) -> (
-    Result<Vec<Value>, temen_interp::Trap>,
-    Vec<u8>,
-    Vec<CapturedProt>,
-) {
     host.clock_ns = clock_v;
     let mut fuel = 5_000_000u64;
-    run_capture_reserved_with_host_prots(
+    let (r, left) = run_capture_reserved_with_host_layout(
         inst,
         0,
         &[Value::I32(space), Value::I32(clk)],
         &mut fuel,
-        window,
-        prots,
+        &MemLayout::image(window.to_vec()),
         RESERVED_LOG2,
         host,
-    )
+    );
+    (r, left.expect("the guest has a window"))
 }
 
 #[test]
@@ -150,11 +127,10 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     // Baseline: the uninterrupted oracle run (no self-flip). 42 + grown-page marker 77 = 119.
     let mut base_host = Host::new();
     base_host.set_durable(true);
-    let (baseline, _, _) = run_fresh(
+    let (baseline, _) = run_fresh(
         &oracle,
         FREEZE_CLOCK,
         &init_durable_window(WINDOW, TEST_ARENA),
-        None,
         &mut base_host,
     );
     let baseline = baseline.expect("baseline runs to completion");
@@ -163,41 +139,38 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     // Phase 1 — freeze mid-run: grow + store run NORMAL, then the self-flip unwinds at the clock.
     let mut fhost = Host::new();
     fhost.set_durable(true);
-    let (froze, fsnap, fprots) = run_fresh(
+    let (froze, frozen) = run_fresh(
         &freezable,
         FREEZE_CLOCK,
         &init_durable_window(WINDOW, TEST_ARENA),
-        None,
         &mut fhost,
     );
     froze.expect("freeze run does not trap");
     assert_eq!(
-        read_state(&fsnap),
+        read_state(frozen.bytes()),
         STATE_UNWINDING,
         "froze, did not complete"
     );
     let mark_page = MARK_ADDR as usize / PAGE;
     assert!(mark_page >= WINDOW / PAGE, "marker is in the grown tail");
-    assert!(
-        fsnap.len() > WINDOW,
-        "the grown extent was captured (len {} > declared {})",
-        fsnap.len(),
-        WINDOW
-    );
+    // The grown extent was captured past the declared window, as the pages the guest holds there.
+    let (prot, bytes) = frozen
+        .tail_pages()
+        .into_iter()
+        .find(|&(off, ..)| off as usize == mark_page * PAGE)
+        .map(|(_, prot, bytes)| (prot, bytes.map(<[u8]>::to_vec)))
+        .expect("the grown page was captured");
+    assert_eq!(prot, CapturedProt::Rw, "grown page captured Rw");
     assert_eq!(
-        fsnap[MARK_ADDR as usize],
+        bytes.expect("the grown page has contents")[MARK_ADDR as usize % PAGE],
         MARK_VAL.to_le_bytes()[0],
         "marker captured in the grown page at freeze"
     );
-    assert_eq!(
-        fprots[mark_page],
-        CapturedProt::Rw,
-        "grown page captured Rw"
-    );
 
     // Serialize the frozen (grown) domain through the §12 snapshot codec at its real reservation, then
-    // restore it on a FRESH host — the cross-host boundary the browser crosses via IndexedDB.
-    let art = freeze_with_prots(&freezable, &fsnap, &fprots, RESERVED_LOG2, &fhost)
+    // restore it on a FRESH host — the cross-host boundary the browser crosses via IndexedDB — in the
+    // dense form the browser's flat backing thaws from.
+    let art = freeze_layout(&freezable, &frozen, RESERVED_LOG2, &fhost)
         .expect("freeze grown durable domain to snapshot");
     let mut thost = Host::new();
     thost.set_durable(true);
