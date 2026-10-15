@@ -60,9 +60,13 @@ if [ -x "$REPO/nimony/bin/nimony" ]; then
 fi
 
 # --- shared build products --------------------------------------------------------------------------
-echo "=== building temen-llvm-translate + prep_temen (shared by every step) ==="
-( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
-cargo build --release -p temen-run --example prep_temen || true
+# Every step but nim_card uses the translator or prep_temen. The builders build the translator only
+# when it is missing, so it is built fresh here, unless nim_card is all this run rebuilds (#2442).
+if [ "$ONLY" != nim_card ]; then
+  echo "=== building temen-llvm-translate + prep_temen (shared by every step but nim_card) ==="
+  ( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
+  cargo build --release -p temen-run --example prep_temen || true
+fi
 PREP="$REPO/target/release/examples/prep_temen"
 
 # Validate that a produced .temen decodes+verifies (prep_temen exits non-zero / panics otherwise).
