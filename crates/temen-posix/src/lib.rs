@@ -3953,7 +3953,7 @@ impl Ctx<'_> {
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
-        if self.free_fd(0).is_none() {
+        if !self.fd_room() {
             return Ok(vec![EMFILE]); // before the open creates or truncates anything
         }
         // Creating a file and truncating one are both writes, and only those two: opening an
@@ -5243,7 +5243,7 @@ impl Ctx<'_> {
             Some(_) => return Ok(vec![ENOTSOCK]),
             None => return Ok(vec![EBADF]),
         };
-        if self.free_fd(0).is_none() {
+        if !self.fd_room() {
             return Ok(vec![EMFILE]); // the connection stays queued, as Linux leaves it
         }
         let Some(sock) = q.lock().unwrap_or_else(|e| e.into_inner()).pop_front() else {
@@ -5953,6 +5953,12 @@ impl Ctx<'_> {
             self.p.fds.resize_with(i + 1, || None);
         }
         true
+    }
+
+    /// Whether a descriptor is free for an op that makes something before it takes one: #2373 — its
+    /// slot charged first, so a refusal comes before the op has made anything.
+    fn fd_room(&mut self) -> bool {
+        self.free_fd(0).is_some_and(|i| self.fd_slots(i))
     }
 
     /// The lowest free fd `>= min` below [`FD_MAX`], if there is one (#2306).
@@ -9353,6 +9359,9 @@ block 0 () {\n\
             );
             let full = host.channel_used();
             assert_eq!(st.dup(&[1]), EMFILE, "no room for a descriptor's slot");
+            let open = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
+            assert_eq!(open, EMFILE, "an open refused for one");
+            assert!(!st.w.files.contains_key("/d"), "makes no file");
             let chdir = st.chdir(&[0, 200], Some(&mut mem)).unwrap()[0];
             assert_eq!(chdir, ENOMEM, "nor for a longer directory");
             assert_eq!(st.p.cwd, "/");
