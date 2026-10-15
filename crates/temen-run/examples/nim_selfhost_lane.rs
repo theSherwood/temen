@@ -184,6 +184,7 @@ fn relower(
             &temen_run::ExecGrants::default(),
             engine,
             Some(jit_code),
+            None,
         )
         .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
         assert!(
@@ -261,6 +262,7 @@ fn run_program(
         &temen_run::ExecGrants::default(),
         engine,
         Some(jit_code),
+        None,
     )
     .unwrap_or_else(|e| panic!("the program failed on {engine:?}: {e}"));
     run.stdout()
@@ -505,6 +507,7 @@ fn main() {
         },
         engine,
         Some(&jit_code),
+        None,
     );
     // The driver quits with `FAILURE: <cmd>` on any failed step; that is an ordinary exit, so ask
     // the memfs what was built: `nimcache/t/<main>/<prog>.temen`, `<main>` named by the path

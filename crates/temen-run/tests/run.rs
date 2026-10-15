@@ -963,6 +963,7 @@ fn a_threaded_program_given_an_argv_runs_on_the_bytecode_engine() {
         &temen_run::ExecGrants::default(),
         temen_run::Backend::Bytecode,
         None,
+        None,
     );
     assert_eq!(run, Ok(Outcome::Returned(vec![])));
 }

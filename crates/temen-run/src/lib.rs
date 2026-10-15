@@ -5946,6 +5946,11 @@ pub struct ExecGrants<'a> {
 /// across runs ([`RunConfig::jit_code`], #2145) — a toolchain run once per phase or per build then
 /// compiles each program once.
 ///
+/// `cpus`: how many CPUs the guest sees (`sysconf`, the `self.parallelism` it answers), when not the
+/// driver's workers ([`temen_interp::Host::set_workers`]); every process the run starts inherits it.
+/// A build whose output is committed runs with one: nifmake then runs one job at a time, so the build
+/// writes its files in the same order every time (#2442).
+///
 /// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
@@ -5958,6 +5963,7 @@ pub struct ExecGrants<'a> {
 ///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
+#[allow(clippy::too_many_arguments)]
 pub fn nim_noc_run(
     module: Module,
     posix: &temen_posix::Posix,
@@ -5968,6 +5974,7 @@ pub fn nim_noc_run(
     exec: &ExecGrants,
     backend: Backend,
     jit_code: Option<&JitCodeCache>,
+    cpus: Option<usize>,
 ) -> Result<Outcome, String> {
     if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits(&module) {
         return Err(
@@ -6015,6 +6022,9 @@ pub fn nim_noc_run(
         }
         if exec.built {
             grant_module_loader(host);
+        }
+        if let Some(n) = cpus {
+            host.set_workers(n);
         }
     };
     inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))
