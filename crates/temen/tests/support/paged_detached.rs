@@ -3,14 +3,13 @@
 //! tree-walker. Included by `durable_paged_detached.rs` and `park_freeze_matrix.rs`, each beside
 //! [`super::detached_thaw`].
 //!
-//! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a v1 record
-//! naming it as the pager (#1862, #1863). It serves the child's faults with `svc.poll` while it polls
-//! the child, then joins it and returns `status << 56 | served << 48 | value`. Its pager supplies
-//! every page from one scratch region holding the faulting address's 4 KiB page number at the
-//! faulting byte, and refuses any address below 65536, which is the runtime's: the control words and
-//! the shadow arena.
-//! A durable window keeps those mapped, so the pager is never asked for them; were it asked, its
-//! refusal would end the child with a fault.
+//! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a spawn
+//! record naming it as the pager (#1862, #1863). It serves the child's faults with `svc.poll` while
+//! it polls the child, then joins it and returns `status << 56 | served << 48 | value`. Its pager
+//! supplies every page from one scratch region holding the faulting address's 4 KiB page number at
+//! the faulting byte, and refuses any address below 65536, which is the runtime's: the control words
+//! and the shadow arena. A durable window keeps those mapped, so the pager is never asked for them;
+//! were it asked, its refusal would end the child with a fault.
 //!
 //! The child touches page 24 (address 100000), runs a polled loop, then touches page 29 (address
 //! 120000) and reads `self.attest`. It returns `iters << 24 | b24 << 16 | b29 << 8 | exposure`:
@@ -41,9 +40,9 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -108,9 +107,9 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -161,13 +160,13 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vam = i64.const 65560
+  vam = i64.const 65544
   i32.store vam v1
-  vab = i64.const 65564
+  vab = i64.const 65548
   i32.store vab v3
-  vbm = i64.const 65688
+  vbm = i64.const 65672
   i32.store vbm v2
-  vbb = i64.const 65692
+  vbb = i64.const 65676
   i32.store vbb v3
   vpa = i64.const 65536
   vca = call.cap 6 17 (i64) -> (i32) v0 (vpa)
@@ -218,13 +217,13 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vam = i64.const 65560
+  vam = i64.const 65544
   i32.store vam v1
-  vab = i64.const 65564
+  vab = i64.const 65548
   i32.store vab v3
-  vbm = i64.const 65688
+  vbm = i64.const 65672
   i32.store vbm v2
-  vbb = i64.const 65692
+  vbb = i64.const 65676
   i32.store vbb v3
   vpa = i64.const 65536
   vca = call.cap 6 17 (i64) -> (i32) v0 (vpa)
@@ -272,13 +271,13 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vam = i64.const 65560
+  vam = i64.const 65544
   i32.store vam v1
-  vab = i64.const 65564
+  vab = i64.const 65548
   i32.store vab v3
-  vbm = i64.const 65688
+  vbm = i64.const 65672
   i32.store vbm v2
-  vbb = i64.const 65692
+  vbb = i64.const 65676
   i32.store vbb v3
   vpa = i64.const 65536
   vca = call.cap 6 17 (i64) -> (i32) v0 (vpa)
@@ -307,9 +306,9 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -421,13 +420,13 @@ block 3 (vfin: i64) {{
     )
 }
 
-/// The parent over one paged child per entry of `sizes`, each `size_log2`, through v1 records naming
+/// The parent over one paged child per entry of `sizes`, each `size_log2`, through spawn records naming
 /// the parent's `pager` export: the first at 65536 ([`parent_with`]), the next 128 bytes on.
 pub fn parent(src: &str, sizes: &[i64]) -> temen_ir::Module {
     let paged = |size_log2| SpawnRec {
         size_log2,
         pager: 0,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let more: String = (1..sizes.len())
         .map(|i| rec::segment(65536 + 128 * i as u64, &paged(sizes[i])))

@@ -37,7 +37,7 @@ long __px_closedir(int cap, long dir);
 long __px_argc(int cap);
 long __px_argv(int cap, long i, long buf, long cap2);
 /* Personality `exec` surface (STAGE1.md §5): PATH lookup + the forwardable stdout handle. The spawn
-   itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a v1 detached record) /
+   itself is the shell's own `Instantiator` call.cap — `__spawn_rec` (op 17, a detached spawn record) /
    `join_status` (op 1, below) — dispatched on the reflection-discovered `Instantiator` handle
    (`__inst()`), like every import here; each child's window is paid from the reflection-discovered
    `Budget`. */

@@ -5,7 +5,7 @@
 //! the child execute on emitted wasm, exactly as the native Cranelift path runs a nimony phase child
 //! on emitted code.
 //!
-//! The spawn is op 17 with a v1 record (#1865): the servicer decodes the record, mints the child a
+//! The spawn is op 17 with a spawn record (#1865): the servicer decodes the record, mints the child a
 //! memory of its own and emits the child over its declared window there. The carve spawns (ops 0
 //! and 13) are retired (#1867) and no longer lowered. Also pinned: an emitted child's own
 //! confinement — an out-of-window access faults, run directly or through the bounce — and its NULL
@@ -364,13 +364,13 @@ const CHILD_MODULE_HANDLE: i32 = 99;
 const REC_AT: u64 = 18432;
 
 /// The op-17 parent (#1865): `v0` is its `Instantiator`, `v1` the child `Module`. It stores `7` at its
-/// own window's byte 16392, builds a v1 record for the child's func 0 (its declared window, no budget,
+/// own window's byte 16392, builds a spawn record for the child's func 0 (its declared window, no budget,
 /// no grants) with the module handle filled in at run time, spawns it detached, joins it, and returns
 /// the child's result plus its own byte 16392. [`CHILD_ABOVE_GUARD`] stores `55` at *its* 16392 and
 /// returns it, so a child that ran in the parent's window would make this `110`, not `62`.
 fn parent_op17() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
-    let modh_at = REC_AT + 24;
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::default());
+    let modh_at = REC_AT + temen_ir::SpawnRec::MODULE_AT;
     format!(
         r#"memory 16
 func (i32, i32) -> (i64) {{

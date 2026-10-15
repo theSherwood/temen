@@ -365,7 +365,7 @@ block 0 (v0: i64) {
   }
 
   // --- 4) §14 detached children **on emitted wasm** across real Web Workers (#1865, #1414 ED-2) ----
-  // The root spawns a granted unit 8× as DETACHED children (op-17 v1 records paid from its budget), each
+  // The root spawns a granted unit 8× as DETACHED children (op-17 records paid from its budget), each
   // in its own `WebAssembly.Memory`, each child's thread on a Worker of its own. Under `tierup` a
   // child's root task runs its entry on its granted module's emit over that memory, reading the "K"=75
   // its window was seeded with → 8 × 75 = 600. Run it BOTH ways, interpreted and emitted: both 600, and
@@ -402,7 +402,7 @@ block 0 (v0: i64) {
   // --- 5) §14 **VM-in-VM** (a detached child's spawn, #1865) ---------------------------------------
   // The detached root, granting each child the unit itself as `"unit"`, and the granted unit's entry
   // SPAWNS: it reads its "K"=75, spawns `"unit"` DETACHED with a payload that makes it a pure grandchild
-  // (→ 9) — an op-17 v1 record paid from its own `budget`, the node that paid for its window (#1944) —
+  // (→ 9) — an op-17 record paid from its own `budget`, the node that paid for its window (#1944) —
   // joins it, returns 84 → 8 × 84 = 672, each grandchild in its own `Memory` (17 Workers). The entry
   // spawns and joins, which a region tier-up cannot serve, so under `tierup` it interprets in every
   // child and grandchild (#2443 runs it emitted). Both runs must agree.

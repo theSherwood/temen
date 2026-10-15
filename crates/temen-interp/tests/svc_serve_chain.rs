@@ -42,7 +42,7 @@ data 17408 "budget"
 data 17416 "c2"
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm v2
   vga = i64.const 17760
   vgn = i32.const 17416
@@ -52,7 +52,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i32.store vgb vgl
   vgc = i64.const 17768
   i32.store vgc v3
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb v1
   vrp = i64.const 17536
   vc1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -76,12 +76,12 @@ block 0 (v0: i64) {
   vnp = i64.const 17408
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  vrb = i64.const 17692
+  vrb = i64.const 17676
   i32.store vrb vb
   vmp = i64.const 17416
   vml = i64.const 2
   vm2 = self.resolve vmp vml
-  vrm = i64.const 17688
+  vrm = i64.const 17672
   i32.store vrm vm2
   vrp = i64.const 17664
   vc2 = call.cap 6 17 (i64) -> (i32) vh (vrp)
@@ -118,12 +118,12 @@ fn chain() -> String {
     let c1 = SpawnRec {
         grants_ptr: 17760,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "{CHAIN}{}{}",
         rec::segment(17536, &c1),
-        rec::segment(17664, &SpawnRec::v1())
+        rec::segment(17664, &SpawnRec::default())
     )
 }
 

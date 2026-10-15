@@ -29,7 +29,7 @@ fn drive_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value
 }
 
 // The root `(instantiator, budget, c1, c2) -> i64` spawns the child `c1`, func 1's child image
-// (#2219), through a v1 record at 17408, paid from its budget and granted `c2`, func 2's image, as
+// (#2219), through a spawn record at 17408, paid from its budget and granted `c2`, func 2's image, as
 // `"g2"` by the list at 16768. The child resolves its own `"budget"` and `"g2"` and spawns the
 // grandchild through the record at 17536, paid from it. Each window is its own, so the grandchild
 // writes its marker 200 above its NULL guard, at 16640. Each joins the next; the grandchild returns
@@ -39,9 +39,9 @@ data 16700 "budget"
 data 16720 "g2"
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vb: i32, vc1: i32, vc2: i32) {
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vb
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vc1
   ga = i64.const 16768
   gn = i32.const 16720
@@ -66,12 +66,12 @@ block 0 (v0: i64) {
   np = i64.const 16700
   nl = i64.const 6
   hb = self.resolve np nl
-  cb = i64.const 17564
+  cb = i64.const 17548
   i32.store cb hb
   gp = i64.const 16720
   gl = i64.const 2
   hg = self.resolve gp gl
-  cm = i64.const 17560
+  cm = i64.const 17544
   i32.store cm hg
   cp = i64.const 17536
   v8 = call.cap 6 17 (i64) -> (i32) v1 (cp)
@@ -96,12 +96,12 @@ fn detached_depth_two() -> (temen_ir::Module, Host, [Value; 4]) {
     let r1 = SpawnRec {
         grants_ptr: 16768,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let src = format!(
         "{DETACHED_DEPTH_TWO}{}{}",
         rec::segment(17408, &r1),
-        rec::segment(17536, &SpawnRec::v1())
+        rec::segment(17536, &SpawnRec::default())
     );
     let m = parse_module(&src).expect("parse");
     let mut host = Host::new();

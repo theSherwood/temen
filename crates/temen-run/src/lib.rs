@@ -6077,7 +6077,7 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     Some(temen_ir::Resolved::Cap(cap))
 }
 
-/// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 v1 record,
+/// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 spawn record,
 /// so the child runs in a window of its own (its declared memory: `size_log2 = 0`), paid from a `Budget`
 /// and returned to it when the child ends — with `caps` re-granted to it by name and `argv` as the
 /// spawn's args payload (`{argc, envc = 0}` + packed NUL-terminated strings, landing at the child's
@@ -6126,7 +6126,18 @@ fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
     let n = 3 + caps.len();
     let sig = vec!["i32"; n].join(", ");
     let params: Vec<String> = (0..n).map(|i| format!("v{i}: i32")).collect();
-    let mut data = format!("data {args} \"{}\"\n", esc(&payload));
+    // Every field but the module and budget handles, which only the entry knows, is data.
+    let record = temen_ir::SpawnRec {
+        grants_ptr: grants,
+        grants_n: caps.len() as u64,
+        args: (args, payload.len() as u64),
+        ..temen_ir::SpawnRec::default()
+    };
+    let mut data = format!(
+        "data {args} \"{}\"\ndata {rec} \"{}\"\n",
+        esc(&payload),
+        esc(&record.encode())
+    );
     let mut body = String::new();
     for (i, name) in caps.iter().enumerate() {
         let (noff, goff) = (names + 16 * i as u64, grants + 16 * i as u64);
@@ -6144,22 +6155,8 @@ fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
 {data}func ({sig}) -> (i64, i64) {{
 block 0 ({params}) {{
 {body}  r = i64.const {rec}
-  w0 = i64.const 1
-  i64.store r w0
-  w2 = i64.const {w2}
-  i64.store r w2 offset=16
-  i32.store r v1 offset=24
-  i32.store r v2 offset=28
-  gp = i64.const {grants}
-  i64.store r gp offset=40
-  gn = i64.const {gn}
-  i64.store r gn offset=48
-  ap = i64.const {args}
-  i64.store r ap offset=56
-  al = i64.const {al}
-  i64.store r al offset=64
-  none = i32.const -1
-  i32.store r none offset=72
+  i32.store r v1 offset={module_at}
+  i32.store r v2 offset={budget_at}
   h = call.cap 6 17 (i64) -> (i32) v0 (r)
   z = i32.const 0
   refused = i32.lt_s h z
@@ -6177,10 +6174,8 @@ block 2 (inst: i32, c: i32) {{
 }}
 "#,
         params = params.join(", "),
-        // size_log2 0 (the module's declared window) | pager u32::MAX (none)
-        w2 = (0xFFFF_FFFFu64 << 32) as i64,
-        gn = caps.len(),
-        al = payload.len(),
+        module_at = temen_ir::SpawnRec::MODULE_AT,
+        budget_at = temen_ir::SpawnRec::BUDGET_AT,
     )
 }
 

@@ -184,9 +184,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm v2
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb v1
   vrp = i64.const 17536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -221,7 +221,10 @@ block 0 (va: i64, vb: i64) {
 
 /// [`CALLER_PARKING`] with its spawn record.
 fn caller_parking() -> String {
-    format!("{CALLER_PARKING}{}", rec::segment(17536, &SpawnRec::v1()))
+    format!(
+        "{CALLER_PARKING}{}",
+        rec::segment(17536, &SpawnRec::default())
+    )
 }
 
 /// §3.6 slice 4 — the **slot route**: the same round-trip as the direct form, but the caller
@@ -238,9 +241,9 @@ import 0 "svc.add" (i64, i64) -> (i64) rebindable
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17624
+  vrm = i64.const 17608
   i32.store vrm v2
-  vrb = i64.const 17628
+  vrb = i64.const 17612
   i32.store vrb v1
   vrp = i64.const 17600
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -276,7 +279,7 @@ block 0 (va: i64, vb: i64) {
 
 /// [`SLOT_CALLER`] with its spawn record.
 fn slot_caller() -> String {
-    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::v1()))
+    format!("{SLOT_CALLER}{}", rec::segment(17600, &SpawnRec::default()))
 }
 
 #[test]
@@ -337,9 +340,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v1
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v2
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -381,7 +384,7 @@ block 0 (va: i64, vb: i64) {
 fn separate_module_bad_export() -> String {
     format!(
         "{SEPARATE_MODULE_BAD_EXPORT}{}",
-        rec::segment(17408, &SpawnRec::v1())
+        rec::segment(17408, &SpawnRec::default())
     )
 }
 
@@ -430,9 +433,9 @@ data 16584 "adder"
 
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
-  vrma = i64.const 17688
+  vrma = i64.const 17672
   i32.store vrma v2
-  vrba = i64.const 17692
+  vrba = i64.const 17676
   i32.store vrba v1
   vrpa = i64.const 17664
   vA = call.cap 6 17 (i64) -> (i32) v0 (vrpa)
@@ -446,9 +449,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   i32.store va2 vv2
   va3 = i64.const 16648
   i32.store va3 vcap
-  vrmb = i64.const 17784
+  vrmb = i64.const 17768
   i32.store vrmb v3
-  vrbb = i64.const 17788
+  vrbb = i64.const 17772
   i32.store vrbb v1
   vrpb = i64.const 17760
   vB = call.cap 6 17 (i64) -> (i32) v0 (vrpb)
@@ -494,11 +497,11 @@ fn sibling_as_service() -> String {
     let b = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "{SIBLING_AS_SERVICE}{}{}",
-        rec::segment(17664, &SpawnRec::v1()),
+        rec::segment(17664, &SpawnRec::default()),
         rec::segment(17760, &b)
     )
 }

@@ -1,6 +1,6 @@
 //! #1234 — **the Forth `sandbox` word**: `s" …" sandbox` runs a program in a confined §14 child.
 //!
-//! The child is this same kernel in a detached window of its own — an op-17 v1 record over the
+//! The child is this same kernel in a detached window of its own — an op-17 record over the
 //! kernel's child image, which the powerbox grants as `child` (#2219), entered at its function 0, a
 //! bootstrap that runs `child_start` (75). Its program is the spawn's args payload and its window is
 //! paid from the powerbox's `budget` (#1864). It is born with what the spawn record's grant list

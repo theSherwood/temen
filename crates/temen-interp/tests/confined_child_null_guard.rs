@@ -21,16 +21,16 @@ use temen_ir::SpawnRec;
 use temen_text::parse_module;
 
 /// Root `(inst, budget, child) -> status * 1000 + value`: spawns `child` (func 1's child image, #2219)
-/// detached through the v1 record at 17408, paid from `budget`, and `join`s it. The child stores 7 at
+/// detached through the spawn record at 17408, paid from `budget`, and `join`s it. The child stores 7 at
 /// `addr` in its own window and loads it back.
 fn child_src(addr: u64) -> String {
     format!(
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  vm = i64.const 17432
+  vm = i64.const 17416
   i32.store vm vmod
-  vb = i64.const 17436
+  vb = i64.const 17420
   i32.store vb vbud
   vrec = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
@@ -51,7 +51,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {}"#,
-        rec::segment(17408, &SpawnRec::v1())
+        rec::segment(17408, &SpawnRec::default())
     )
 }
 

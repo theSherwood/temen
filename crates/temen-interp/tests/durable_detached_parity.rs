@@ -29,7 +29,7 @@ use temen_ir::SpawnRec;
 
 /// `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`.
 ///
-/// Spawns a detached child from its v1 record at 17408 (no grants, no payload) and returns the
+/// Spawns a detached child from its spawn record at 17408 (no grants, no payload) and returns the
 /// result sign-extended. A refusal is a negative errno; an admission is a non-negative child slot.
 /// The guest does nothing else but store the module and budget into the record, so the return value
 /// *is* the engine's answer.
@@ -38,9 +38,9 @@ fn spawn() -> String {
         r#"memory 16
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -53,7 +53,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
             17408,
             &SpawnRec {
                 size_log2: 15,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
     )
@@ -293,7 +293,7 @@ block 0 (v0: i64) {
 
 /// The detached child for the inheritance probe. Entry `(i64) -> (i64)`: `v0` is its own starter
 /// `Instantiator` handle, as a detached spawn passes it. It resolves the named grant `"m"` (LEAF)
-/// and its own `"budget"`, writes both into its v1 record at 24576 (entry 0), tries to spawn LEAF
+/// and its own `"budget"`, writes both into its spawn record at 24576 (entry 0), tries to spawn LEAF
 /// as a detached grandchild (op 17), and returns the grandchild's joined result (≥ 0) — or the
 /// spawn's `-EINVAL` if the child's **own** durability refused the un-instrumented module (§4, the
 /// detached admission's durability check). So the value that comes back through the parent's join
@@ -310,9 +310,9 @@ block 0 (v0: i64) {{
   vbp = i64.const 20488
   vbl = i64.const 6
   vbh = self.resolve vbp vbl
-  vrm = i64.const 24600
+  vrm = i64.const 24584
   i32.store vrm vmh
-  vrb = i64.const 24604
+  vrb = i64.const 24588
   i32.store vrb vbh
   vrec = i64.const 24576
   vs = call.cap 6 17 (i64) -> (i32) vinst (vrec)
@@ -332,13 +332,13 @@ block 2 (vi2: i32, vs2: i32) {{
 data 20480 "m"
 data 20488 "budget"
 {}"#,
-        rec::segment(24576, &SpawnRec::v1())
+        rec::segment(24576, &SpawnRec::default())
     )
 }
 
 /// The parent for the inheritance probe: lays one op-11-format grant record at 16384 —
 /// `{name_off=16400, name_len=1, handle=v3, flags=0}` with `"m"` at 16400 — spawns [`probe_child`]
-/// detached (its v1 record at 17408: module `v1`, budget `v2`, grants `(16384, 1)`, `memory 16`),
+/// detached (its spawn record at 17408: module `v1`, budget `v2`, grants `(16384, 1)`, `memory 16`),
 /// and returns the child's joined answer, or the spawn's own `-EINVAL` if the spawn was refused.
 /// Args: `(instantiator, child module, budget, leaf module)`.
 fn probe_parent() -> String {
@@ -360,9 +360,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   q = i64.const 16400
   cm = i32.const 109
   i32.store8 q cm
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -385,7 +385,7 @@ block 2 (vi2: i32, vs2: i32) {{
                 size_log2: 16,
                 grants_ptr: 16384,
                 grants_n: 1,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
     )

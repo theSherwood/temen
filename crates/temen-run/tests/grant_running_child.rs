@@ -34,8 +34,6 @@ const REC_B: u64 = 17504;
 const MAILBOX: u64 = 65536;
 /// Where the parent maps the region it grants, and where a child maps it once granted.
 const GRANTED: u64 = 131072;
-/// Where a record's pre-mapped region handle sits, from the record's start.
-const REGION_AT: u64 = 72;
 /// The mailbox word a child posts once it runs, which its parent waits for before it grants.
 const READY: u64 = 24;
 /// Where a parent keeps its `Instantiator`, child and region handles across its own wait: a block
@@ -152,15 +150,15 @@ fn spawn(p: &str, rec_at: u64, module: &str, mailbox: Option<&str>, dst: &str) -
     let region = mailbox.map_or(String::new(), |r| {
         format!(
             "  {p}ra = i64.const {}\n  i32.store {p}ra {r}\n",
-            rec_at + REGION_AT
+            rec_at + SpawnRec::REGION_AT
         )
     });
     format!(
         "  {p}ma = i64.const {}\n  i32.store {p}ma {module}\n\
          \x20 {p}ba = i64.const {}\n  i32.store {p}ba vbud\n{region}  {p}rp = i64.const {rec_at}\n\
          \x20 {dst} = call.cap 6 17 (i64) -> (i32) vinst ({p}rp)\n",
-        rec_at + rec::MODULE_AT,
-        rec_at + rec::BUDGET_AT
+        rec_at + SpawnRec::MODULE_AT,
+        rec_at + SpawnRec::BUDGET_AT
     )
 }
 
@@ -317,7 +315,7 @@ block 0 (vinst: i32, vas: i32, vbud: i32) {{
 fn mailbox_rec() -> SpawnRec {
     SpawnRec {
         child_off: MAILBOX,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     }
 }
 
@@ -398,7 +396,7 @@ block 0 (v0: i64, v1: i64) {{
     let with_grandchild = SpawnRec {
         grants_ptr: GRANTS,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let m = module(&parent(
         &[(REC_A, with_grandchild), (REC_B, mailbox_rec())],
@@ -521,7 +519,7 @@ block 2 (vinst: i32, vch: i32, vreg: i32) {
 #[test]
 fn a_grant_to_an_ended_child_fails() {
     let returned = module(&parent(
-        &[(REC_A, SpawnRec::v1())],
+        &[(REC_A, SpawnRec::default())],
         &grant_between(
             POLL_UNTIL_IT_ENDS,
             "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
@@ -534,7 +532,7 @@ fn a_grant_to_an_ended_child_fails() {
         &ok(-22 * 1000 + 7),
     );
     let killed = module(&parent(
-        &[(REC_A, SpawnRec::v1())],
+        &[(REC_A, SpawnRec::default())],
         &grant_between(
             "  vk1 = call.cap 6 12 (i32) -> (i32) vinst (vch)\n\
              \x20 vj, vj_v = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
@@ -574,7 +572,7 @@ fn a_handle_no_spawn_could_grant_faults() {
             grant("q", "vch", "vforged", "vgot"),
         );
         let m = module(&parent(
-            &[(REC_A, SpawnRec::v1())],
+            &[(REC_A, SpawnRec::default())],
             &body,
             &[("child", CHILD_RETURNS_7)],
         ));

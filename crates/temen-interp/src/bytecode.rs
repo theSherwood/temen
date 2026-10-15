@@ -1812,7 +1812,7 @@ struct DetachedSpawn {
 }
 
 impl DetachedSpawn {
-    /// A v1 (detached) op-17 record's spawn (#1863).
+    /// An op-17 record's spawn, always detached (#1863).
     fn of(sr: &SpawnRec) -> DetachedSpawn {
         DetachedSpawn {
             budget: sr.budget,
@@ -5215,7 +5215,7 @@ impl<'p> Vcpu<'p> {
 
     /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
     /// bounce, #1865), admitted as the interpreted op is: the `Instantiator` resolved in this vCPU's
-    /// powerbox, the record read from its window, and a v1 record through [`admit_detached_child`],
+    /// powerbox, the record read from its window, and a spawn record through [`admit_detached_child`],
     /// the one detached admission. A v0 (carve) record traps, as the interpreted op does on every
     /// host that runs this vCPU over a window of its own. `Ok(Some((child, size_log2)))`: admitted —
     /// the host starts it, then [`file_child`](Self::file_child)s its token; `Ok(None)`: refused

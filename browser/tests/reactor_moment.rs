@@ -484,21 +484,19 @@ block 0 (vsp: i64) {{
   i32.store vg0 vcap offset=8
   vgz = i32.const 0
   i32.store vg0 vgz offset=12
-  ; the v1 spawn record at 17408 (temen_ir::SpawnRec): the child image, at its bootstrap (entry 0,
+  ; the spawn record at 17408 (temen_ir::SpawnRec): the child image, at its bootstrap (function 0,
   ; which calls func 2), its declared window, no pager or pre-mapped region, paid from `budget`,
   ; one grant
   vr0 = i64.const 17408
-  vf0 = i64.const 1
+  vf0 = i64.const -4294967296
   i64.store vr0 vf0
-  vf2 = i64.const -4294967296
-  i64.store vr0 vf2 offset=16
-  i32.store vr0 vchild offset=24
-  i32.store vr0 vbud offset=28
-  i64.store vr0 vg0 offset=40
+  i32.store vr0 vchild offset=8
+  i32.store vr0 vbud offset=12
+  i64.store vr0 vg0 offset=16
   vn = i64.const 1
-  i64.store vr0 vn offset=48
-  vf9 = i64.const 4294967295
-  i64.store vr0 vf9 offset=72
+  i64.store vr0 vn offset=24
+  vf6 = i64.const 4294967295
+  i64.store vr0 vf6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
   vgot_st, vgot = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vbp = i64.const 16432

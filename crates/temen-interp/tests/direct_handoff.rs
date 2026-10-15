@@ -28,9 +28,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm v2
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb v1
   vrp = i64.const 17536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -79,9 +79,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17624
+  vrm = i64.const 17608
   i32.store vrm v2
-  vrb = i64.const 17628
+  vrb = i64.const 17612
   i32.store vrb v1
   vrp = i64.const 17600
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -140,10 +140,10 @@ fn run_handoff(
     )
 }
 
-/// `src` with the v1 record at `at` that spawns its serve loop: func 1's child image (#2219), whose
+/// `src` with the spawn record at `at` that spawns its serve loop: func 1's child image (#2219), whose
 /// handle the root stores in it.
 fn with_record(src: &str, at: u64) -> String {
-    format!("{src}{}", rec::segment(at, &SpawnRec::v1()))
+    format!("{src}{}", rec::segment(at, &SpawnRec::default()))
 }
 
 /// **4d.1 — run-to-completion handoff ≡ enqueue+park.** The same program serves its second live

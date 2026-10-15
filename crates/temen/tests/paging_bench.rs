@@ -3,7 +3,7 @@
 //!   cargo test -p temen --release --test paging_bench -- --ignored --nocapture
 //!
 //! **What it measures and why.** The fault-service round-trip on the unified offer transport —
-//! a detached demand child (a v1 record naming the parent's pager export) touches an unsupplied
+//! a detached demand child (a spawn record naming the parent's pager export) touches an unsupplied
 //! page, the fault becomes a `page(addr)` call on the parent's pager export (direct handoff runs the
 //! handler inline on the child's thread), the handler stores the page's bytes, the substrate supplies
 //! the page, and the rewound access re-executes — timed per-fault across the backends. Until §2.3
@@ -47,7 +47,7 @@ const FAULT_MARK: i64 = 1000;
 
 /// CONSOLIDATION.md §2.2 — the **offer-transport twin**: the same S x P shape, driven the
 /// collapsed way. The parent spawns its `"child"`, func 1's child image (#2219), as a **detached
-/// demand child**, through a v1 record paid from its `"budget"` that names its own impl export 0 as
+/// demand child**, through a spawn record paid from its `"budget"` that names its own impl export 0 as
 /// the pager and leaves the child's `exit` import empty; the child walks
 /// the strides of its own window concurrently, each first touch faulting into a `page(addr)` call
 /// the parent serves from `svc.wait` (direct handoff runs the handler inline on the child's thread);
@@ -75,12 +75,12 @@ block 0 () {{
   vbp = i64.const 16400
   vbl = i64.const 6
   vb = self.resolve vbp vbl
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vb
   vcp = i64.const 16416
   vcl = i64.const 5
   vcm = self.resolve vcp vcl
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vcm
   vs0 = i64.const 0
   vacc0 = i64.const 0
@@ -160,7 +160,7 @@ block 0 (vaddr: i64) {{
                 pager: 0,
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),

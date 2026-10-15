@@ -131,10 +131,10 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}",
-        module_at = 17536 + rec::MODULE_AT,
-        budget_at = 17536 + rec::BUDGET_AT,
+        module_at = 17536 + SpawnRec::MODULE_AT,
+        budget_at = 17536 + SpawnRec::BUDGET_AT,
         ns = WAIT.as_nanos(),
-        rec = rec::segment(17536, &SpawnRec::v1())
+        rec = rec::segment(17536, &SpawnRec::default())
     )
 }
 

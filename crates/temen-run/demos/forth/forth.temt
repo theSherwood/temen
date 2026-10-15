@@ -43,8 +43,8 @@
 ;
 ;   --- per-unit scratch (rebuilt every prompt, may be clobbered between them) ---
 ;   0x40000 closed-block arena   0x50000 assembled unit blob   0x60000 input buffer (64 KiB)
-;   0x70000 `sandbox` spawn scratch (three 16-byte grant records at +0x00/+0x10/+0x20, the 88-byte
-;           op-17 v1 spawn record at +0x40)   0x80000 `sandbox` args staging ({len, text}, ≤ 16 KiB)
+;   0x70000 `sandbox` spawn scratch (four 16-byte grant records at +0x00…+0x30, the 64-byte
+;           op-17 spawn record at +0x40)   0x80000 `sandbox` args staging ({len, text}, ≤ 16 KiB)
 ;
 ; The powerbox args area (0x4080..0x8000) is where a `sandbox` child finds its program: the spawn's
 ; args payload lands there before `child_start` (75) runs. Nothing else in the map touches it.
@@ -4241,7 +4241,7 @@ block 0 (x: i64) {
 ; 76 sandbox(addr, len) -> status: run `[addr, len)` as a Forth program in a **confined child domain**
 ; that can compute and print and nothing else (#1234). `s" 2 3 + . cr" sandbox`.
 ;
-; The child is this same kernel in a **detached window of its own**: op 17 v1 over the kernel's child
+; The child is this same kernel in a **detached window of its own**: op 17 over the kernel's child
 ; image, which the powerbox grants us as `child` (#2219), entered at its function 0, a bootstrap that
 ; runs `child_start` (75). The window is the kernel's declared 2^20, paid from the `budget` the
 ; powerbox grants us and returned to it when the child ends; the engine materializes our data
@@ -4359,29 +4359,24 @@ block 4 (addr: i64, len: i64, hinst: i32, hout: i32, hjit: i32, hbud: i32, hmod:
   i64.store32 g3 five offset=4
   i32.store g3 hmod offset=8
   i64.store32 g3 zero offset=12
-  ; The op-17 v1 spawn record at 0x70040: version 1 (detached), entry 0 (the image's bootstrap, which
-  ; runs `child_start`), offset 0, 2^20 (our declared window), no pager (u32::MAX), our child image,
-  ; our budget, no quota, the four grants, the args payload, no pre-mapped region.
+  ; The op-17 spawn record at 0x70040: 2^20 (our declared window), no pager (u32::MAX), our child
+  ; image (its bootstrap runs `child_start`), our budget, the four grants, the args payload, no
+  ; pre-mapped region.
   r = i64.const 458816
-  one = i64.const 1
-  i64.store32 r one
-  i64.store32 r zero offset=4
-  i64.store r zero offset=8
   s20 = i64.const 20
-  i64.store32 r s20 offset=16
+  i64.store32 r s20
   mx = i64.const 4294967295
-  i64.store32 r mx offset=20
-  i32.store r hmod offset=24
-  i32.store r hbud offset=28
-  i64.store r zero offset=32
-  i64.store r g0 offset=40
-  i64.store r four offset=48
-  i64.store r lp offset=56
-  i64.store r alen offset=64
+  i64.store32 r mx offset=4
+  i32.store r hmod offset=8
+  i32.store r hbud offset=12
+  i64.store r g0 offset=16
+  i64.store r four offset=24
+  i64.store r lp offset=32
+  i64.store r alen offset=40
   neg1 = i64.const -1
-  i64.store32 r neg1 offset=72
-  i64.store32 r zero offset=76
-  i64.store r zero offset=80
+  i64.store32 r neg1 offset=48
+  i64.store32 r zero offset=52
+  i64.store r zero offset=56
   ch = call.cap 6 17 (i64) -> (i32) hinst (r)
   z32b = i32.const 0
   refused = i32.lt_s ch z32b

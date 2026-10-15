@@ -215,7 +215,7 @@ pub extern "C" fn run_threads() -> i64 {
 /// tier-up is orthogonal (a compute accelerator; cap/serve/fork ops leaf-fold to the interp). Returns `100` (the original's reply) **iff** both replies (`100` + `200`) reached the
 /// shared stdout — i.e. the twin genuinely ran; `i64::MIN` on any failure. The three are three
 /// programs (#2219): the manager spawns the server and the guest — modules the host grants it — through
-/// op-17 v1 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
+/// op-17 records (#1864), each at its function 0 in a **detached 2^18 window of its own** paid from
 /// the `Budget` arg, so each starts with its own data segments — the guest reads its "svc"/"o" names
 /// there, and every scratch cell sits above the #1094 NULL guard.
 const FORK_MANAGER: &str = r#"
@@ -226,21 +226,18 @@ data 16694 "o"
 ; our stdout as "o", and return the guest's status
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
-  ; the op-17 v1 record for the server at 17600: version 1 | entry 0, size_log2 18 | no pager,
-  ; the server module | budget, no grants, no args, region -1 (none); the rest is zero
+  ; the op-17 record for the server at 17600: size_log2 18 | no pager, the server module | budget,
+  ; no grants, no args, region -1 (none); the rest is zero
   q1a0 = i64.const 17600
-  q1v0 = i64.const 1
+  q1v0 = i64.const -4294967278
   i64.store q1a0 q1v0
-  q1a2 = i64.const 17616
-  q1v2 = i64.const -4294967278
-  i64.store q1a2 q1v2
-  q1a3 = i64.const 17624
-  i32.store q1a3 vsrv
-  q1a3b = i64.const 17628
-  i32.store q1a3b vbud
-  q1a9 = i64.const 17672
+  q1a1 = i64.const 17608
+  i32.store q1a1 vsrv
+  q1a1b = i64.const 17612
+  i32.store q1a1b vbud
+  q1a6 = i64.const 17648
   vnone = i32.const -1
-  i32.store q1a9 vnone
+  i32.store q1a6 vnone
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
   vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
@@ -260,24 +257,21 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsrv: i32, vgst: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  ; the guest's record at 17696: version 1 | entry 0, the guest module, the two grants above,
-  ; otherwise as the server's
+  ; the guest's record at 17696: the guest module, the two grants above, otherwise as the server's
   q2a0 = i64.const 17696
   i64.store q2a0 q1v0
+  q2a1 = i64.const 17704
+  i32.store q2a1 vgst
+  q2a1b = i64.const 17708
+  i32.store q2a1b vbud
   q2a2 = i64.const 17712
-  i64.store q2a2 q1v2
+  q2v2 = i64.const 16640
+  i64.store q2a2 q2v2
   q2a3 = i64.const 17720
-  i32.store q2a3 vgst
-  q2a3b = i64.const 17724
-  i32.store q2a3b vbud
-  q2a5 = i64.const 17736
-  q2v5 = i64.const 16640
-  i64.store q2a5 q2v5
+  q2v3 = i64.const 2
+  i64.store q2a3 q2v3
   q2a6 = i64.const 17744
-  q2v6 = i64.const 2
-  i64.store q2a6 q2v6
-  q2a9 = i64.const 17768
-  i32.store q2a9 vnone
+  i32.store q2a6 vnone
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   return vjc
@@ -3360,7 +3354,7 @@ pub fn posix_shell_exec_with(
     let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst = host.grant_instantiator();
     let _as = host.grant_address_space(0, win);
-    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
     let _budget_h = host.grant_budget(-1, 4 << 20, -1);
     let cmd_handles: Vec<(&str, i32, u8)> = cmds
@@ -8595,7 +8589,7 @@ static mut OP13_JIT: Option<Op13JitDriver> = None;
 
 /// A minimal op-13 driver (`memory 16`, entry `(Instantiator, Module, Budget)`): it resolves its
 /// `"fs"` by name, writes one grant record re-granting it as `"fs"` (at 17536, the name at 18432 — both
-/// above the NULL guard), spawns the child module detached through an op-17 v1 record at 17408 (its
+/// above the NULL guard), spawns the child module detached through an op-17 record at 17408 (its
 /// declared window, paid from the budget) and returns the value its join answers — or traps if the
 /// child ended in a trap, which its join answers as a status (#2066), so the driver still reports
 /// `OP13JIT_TRAP` for a child that trapped.
@@ -8603,7 +8597,7 @@ fn op13_mini_driver() -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     format!(
@@ -8863,7 +8857,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 return OP13JIT_DONE;
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
-            // #1286 — a DETACHED child (an op-17 v1 record): its window is its own backing
+            // #1286 — a DETACHED child (an op-17 record): its window is its own backing
             // ([`mint_detached_backing`] — in the browser a fresh `WebAssembly.Memory`, reached only
             // through `Region::Foreign`), and the emitted `_start` runs bound to it (`driveDetachedRun`).
             // No carve, no alias — the driver cannot address a byte of it. The engine admitted the child through the one admission every driver uses: its
