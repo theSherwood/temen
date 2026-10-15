@@ -1,5 +1,5 @@
 //! The JIT host side of the §14 **`Instantiator`** capability — VM-in-VM nesting. A guest holding an
-//! `Instantiator` spawns a child (op 17, the v1 spawn record) that runs a module its spawner holds in
+//! `Instantiator` spawns a child (op 17, the spawn record) that runs a module its spawner holds in
 //! a window of its own, and `join`s it. Unlike the interpreter (which spawns a child vCPU on its M:N
 //! executor), the JIT bakes confinement into machine code, so a child needs its own compilation —
 //! "**nesting cost is paid at setup, not at runtime**" (§14) — which every spawn of the same module

@@ -61,7 +61,7 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let spawn = SpawnRec {
         grants_ptr: 16384,
         grants_n: u64::from(grants_n),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let child_pre = format!(
         "  n0 = i64.const 16484\n  len3 = i64.const 3\n  hj = self.resolve n0 len3\n  vb = i64.const {}\n  vl = i64.const {}\n  vc = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n",
@@ -102,9 +102,9 @@ block 0 (vinst: i32, vjit: i32, vbud: i32, vmod: i32) {{
   a12 = i64.const 16396
   z0 = i32.const 0
   i32.store a12 z0
-  qm = i64.const 17560
+  qm = i64.const 17544
   i32.store qm vmod
-  qb = i64.const 17564
+  qb = i64.const 17548
   i32.store qb vbud
   q0a0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (q0a0)

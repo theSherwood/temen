@@ -59,19 +59,17 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vw2 = i64.const 110386705817972
   i64.store vb2 vw2
   vra = i64.const 17408
-  vrv = i32.const 1
-  i32.store vra vrv
   vrl = i32.const 16
-  i32.store vra vrl offset=16
+  i32.store vra vrl
   vrn = i32.const -1
-  i32.store vra vrn offset=20
-  i32.store vra v1 offset=24
-  i32.store vra v2 offset=28
-  i32.store vra vrn offset=72
+  i32.store vra vrn offset=4
+  i32.store vra v1 offset=8
+  i32.store vra v2 offset=12
+  i32.store vra vrn offset=48
   vap = i64.const 18432
-  i64.store vra vap offset=56
+  i64.store vra vap offset=32
   val = i64.const 24
-  i64.store vra val offset=64
+  i64.store vra val offset=40
   vh = call.cap 6 17 (i64) -> (i32) v0 (vra)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr
@@ -118,16 +116,14 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vin = i64.const 41
   i64.store vwo vin
   vra = i64.const 17408
-  vrv = i32.const 1
-  i32.store vra vrv
   vrl = i32.const 17
-  i32.store vra vrl offset=16
+  i32.store vra vrl
   vrn = i32.const -1
-  i32.store vra vrn offset=20
-  i32.store vra v1 offset=24
-  i32.store vra v2 offset=28
-  i32.store vra vrh offset=72
-  i64.store vra vwo offset=80
+  i32.store vra vrn offset=4
+  i32.store vra v1 offset=8
+  i32.store vra v2 offset=12
+  i32.store vra vrh offset=48
+  i64.store vra vwo offset=56
   vc = call.cap 6 17 (i64) -> (i32) v0 (vra)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
   vk = i64.const 1000

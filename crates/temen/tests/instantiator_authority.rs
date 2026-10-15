@@ -21,7 +21,7 @@ use temen_verify::verify_module;
 const FORGED: i32 = 9999;
 
 /// Spawn the child (func 1's child image, #2219) detached through the real `Instantiator`, paid from
-/// the root's `Budget` (a v1 record at 17408), then apply `op` to the live child through `FORGED`.
+/// the root's `Budget` (a spawn record at 17408), then apply `op` to the live child through `FORGED`.
 fn guest(op: u32) -> temen_ir::Module {
     let call = match op {
         1 => "  vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) vf (vh)".to_string(),
@@ -32,9 +32,9 @@ fn guest(op: u32) -> temen_ir::Module {
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (vi: i32, vb: i32, vm: i32) {{
-  vam = i64.const 17432
+  vam = i64.const 17416
   i32.store vam vm
-  vab = i64.const 17436
+  vab = i64.const 17420
   i32.store vab vb
   vp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vi (vp)
@@ -50,7 +50,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}"#,
-        rec = rec::segment(17408, &SpawnRec::v1())
+        rec = rec::segment(17408, &SpawnRec::default())
     );
     let m = parse_module(&src).expect("parse guest");
     verify_module(&m).expect("verify guest");

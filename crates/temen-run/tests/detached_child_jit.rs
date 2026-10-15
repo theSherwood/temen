@@ -75,7 +75,7 @@ fn parent_then(tail: &str) -> String {
     let child = SpawnRec {
         size_log2: 16,
         args: (18432, 24),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -102,8 +102,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 {rec}"#,
         w1 = ARGV_WORD,
         w2 = i64::from_le_bytes(*b"tached\0\0"),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -270,7 +270,7 @@ fn a_join_reaps_a_child_that_ran_out_of_fuel_on_the_jit() {
 fn spawn_join_spawn() -> String {
     let child = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -290,8 +290,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -338,7 +338,7 @@ fn a_detached_child_is_one_spawn_of_its_budget_on_the_jit() {
 fn spawn_join() -> String {
     let child = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -358,8 +358,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -371,7 +371,7 @@ fn parent_granting_by_name(name: &str) -> String {
         size_log2: 16,
         grants_ptr: 17664,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -394,8 +394,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 {rec}"#,
         len = name.len(),
         grant = rec::grant("g", 17664, 17920, name.len(), "vg"),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -654,13 +654,13 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-            module_at = 17408 + rec::MODULE_AT,
-            budget_at = 17408 + rec::BUDGET_AT,
+            module_at = 17408 + SpawnRec::MODULE_AT,
+            budget_at = 17408 + SpawnRec::BUDGET_AT,
             rec = rec::segment(
                 17408,
                 &SpawnRec {
                     size_log2: 16,
-                    ..SpawnRec::v1()
+                    ..SpawnRec::default()
                 }
             ),
         ))
@@ -722,13 +722,13 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-            module_at = 17408 + rec::MODULE_AT,
-            budget_at = 17408 + rec::BUDGET_AT,
+            module_at = 17408 + SpawnRec::MODULE_AT,
+            budget_at = 17408 + SpawnRec::BUDGET_AT,
             rec = rec::segment(
                 17408,
                 &SpawnRec {
                     size_log2: 18,
-                    ..SpawnRec::v1()
+                    ..SpawnRec::default()
                 }
             ),
         ))
@@ -748,7 +748,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 fn spawn_only_parent() -> String {
     let child = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -765,8 +765,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -891,7 +891,7 @@ fn premap_parent(off: u64, join: bool, hand_off: bool) -> String {
     let child = SpawnRec {
         size_log2: 17,
         child_off: off,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -919,9 +919,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
-        region_at = 17408 + rec::REGION_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        region_at = 17408 + SpawnRec::REGION_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -1030,7 +1030,7 @@ fn nest_root(d: i64) -> String {
         grants_ptr: 20032,
         grants_n: 1,
         args: (18432, 8),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -1052,8 +1052,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
 }}
 {rec}"#,
         grant = rec::grant("g", 20032, 20016, 6, "v1"),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -1131,7 +1131,7 @@ fn a_child_joining_its_child_under_a_lane_cap_of_one_steps_aside_on_the_jit() {
 fn child_thread_spawns() -> String {
     let grandchild = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 16
@@ -1174,8 +1174,8 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &grandchild),
     )
 }
@@ -1412,7 +1412,7 @@ block 2 (verr: i64) {
 fn minting_parent() -> String {
     let child = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -1429,8 +1429,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -1476,7 +1476,7 @@ fn parent_granting(grants: &[(&str, u32)]) -> String {
     let rec = temen_ir::SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     let mut segments = seg(REC, &rec.encode());
     for (i, (name, handle)) in grants.iter().enumerate() {
@@ -1515,8 +1515,8 @@ block 2 (vi: i32, vc: i32) {{
   }}
 }}
 {segments}"#,
-        ma = REC + 24,
-        ba = REC + 28,
+        ma = REC + temen_ir::SpawnRec::MODULE_AT,
+        ba = REC + temen_ir::SpawnRec::BUDGET_AT,
     )
 }
 

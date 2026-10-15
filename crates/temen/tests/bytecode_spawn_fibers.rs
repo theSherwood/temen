@@ -1,6 +1,6 @@
 //! A module that both spawns §14 children and uses §12 fibers runs on the bytecode engine, and each
 //! domain has its **own** fiber registry, as on the tree-walk oracle. The parent parks a fiber of its
-//! own, spawns a child (detached, through a v1 record) that creates and drives fibers of its own,
+//! own, spawns a child (detached, through a spawn record) that creates and drives fibers of its own,
 //! joins it, and then resumes its parked fiber. The child reports its first fiber's handle, so a
 //! registry shared across domains (the child's handles numbered after the parent's, or the parent's
 //! fiber reachable from the child) shows up as a different result. Checked on the cooperative
@@ -61,12 +61,12 @@ block 0 (vs: i64) {{
 }
 
 /// The parent (args `(instantiator, child module, budget)`): parks a fiber at its suspend, spawns the
-/// child through the v1 record at 17408 and joins it, resumes the fiber to its return. Result: child
+/// child through the spawn record at 17408 and joins it, resumes the fiber to its return. Result: child
 /// status × 1000 + 11 + 25.
 fn parent_src() -> String {
     let spawn = SpawnRec {
         size_log2: CHILD_LOG2.into(),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory {PARENT_LOG2}
@@ -77,9 +77,9 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   pf = cont.new f0 z
   a = i64.const 10
   s1, r1 = cont.resume pf a
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -173,7 +173,7 @@ fn a_detached_child_has_its_own_fiber_registry() {
 }
 
 /// The parent (args `(instantiator, child module, budget, address space)`): creates a 64 KiB region,
-/// maps it at window offset 1 MiB, spawns the child detached through the v1 record at 17408
+/// maps it at window offset 1 MiB, spawns the child detached through the spawn record at 17408
 /// ([`notifier`] lays it) with the region pre-mapped at the child's 64 KiB, then spin-`notify`s
 /// region byte 0 until a waiter is woken, and joins.
 const NOTIFIER: &str = "memory 23
@@ -187,11 +187,11 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vas: i32) {
   vz = i64.const 0
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwin, vz, vps, vprot)
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
-  rr = i64.const 17480
+  rr = i64.const 17456
   i32.store rr vrh
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -218,7 +218,7 @@ fn notifier() -> String {
     let spawn = SpawnRec {
         size_log2: 17,
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{NOTIFIER}{}", rec::segment(17408, &spawn))
 }

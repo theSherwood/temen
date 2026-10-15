@@ -823,7 +823,7 @@ block 0 (vx: i64) {
 }
 
 /// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one
-/// dispatch (a v1 record spawning func 2's child image (#2219), then `child_offer`), while the root
+/// dispatch (a spawn record spawning func 2's child image (#2219), then `child_offer`), while the root
 /// resumes a fiber, where the countdown fires. The root unwinds and rings `C`, which unwinds in its
 /// `svc.wait` without serving; `T` then enqueues its call and parks on the reply, and the freeze
 /// re-admits it: its wait is abandoned, its dispatch stays queued on `C`, and the ticket rides the
@@ -895,9 +895,9 @@ export 0 interface "counter" 1 { bump: 3 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -948,7 +948,7 @@ block 0 (vx: i64) {
     // stored there.
     let spawn = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let src = format!(
         "{src}{t}{server}{FIBER}{CALLING_FIBER}{}",

@@ -1,5 +1,5 @@
 //! PROCESS.md §5 — **detached windows**: a child spawned through a detached-spawn `Budget`
-//! capability (a v1 spawn record, `Instantiator.instantiate_rec`, op 17) runs in a fresh platform
+//! capability (a spawn record, `Instantiator.instantiate_rec`, op 17) runs in a fresh platform
 //! window *outside* its spawner's — no ancestor below the platform holds read authority, and the
 //! child attests `window_exposed = false` (the jacl distrust-spawner trust anchor). Detachment
 //! severs READ, not lifecycle (the spawner keeps kill/join) and not coordination (live offers work
@@ -19,13 +19,13 @@ fn module(text: &str) -> Arc<temen_ir::Module> {
     Arc::new(m)
 }
 
-/// The v1 spawn record each parent below lays at 17408 (above the durable control words): a child
+/// The spawn record each parent below lays at 17408 (above the durable control words): a child
 /// window of `1 << size_log2` bytes. The parent stores the child's module and `Budget` handles into
 /// it at run time, at 17432 and 17436.
 fn record(size_log2: i64) -> SpawnRec {
     SpawnRec {
         size_log2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     }
 }
 
@@ -53,7 +53,7 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// The parent: spawns the server DETACHED (its v1 record at 17408 — module, budget, no grants),
+/// The parent: spawns the server DETACHED (its spawn record at 17408 — module, budget, no grants),
 /// wires its live offer (`child_offer` — the linkage is the powerbox Arc, not the window), calls
 /// `add(40, 2)` through it (park, serve, reply), joins. Composite: join(1)*100 + 42 = 142.
 fn detached_caller() -> String {
@@ -63,9 +63,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vB = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -123,7 +123,7 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The trust anchor: [`ATTEST_MOD`] spawned **detached** (the v1 record at 17408) attests `tier 1`
+/// The trust anchor: [`ATTEST_MOD`] spawned **detached** (the spawn record at 17408) attests `tier 1`
 /// alone — no `window_exposed`, the distrust-spawner report, platform-vouched.
 fn attest_detached() -> String {
     format!(
@@ -132,9 +132,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -172,7 +172,7 @@ fn a_detached_child_attests_its_window_unexposed() {
 /// charged) — a numeric quota, host-enforced at mint. The first child is [`DETACHED_SERVER`],
 /// parked in `svc.wait` until the parent calls it after the second mint, so it holds its window
 /// across that mint: a child that returned at once could end on another worker and hand its window
-/// back first (#2077). Both spawns read the one v1 record at 17408. Composite:
+/// back first (#2077). Both spawns read the one spawn record at 17408. Composite:
 /// first_failed*10 + second_failed = 0*10 + 1 = 1.
 fn quota_exhausts() -> String {
     format!(
@@ -181,9 +181,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vfst = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -242,9 +242,9 @@ memory 17
 
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v0
   vrp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -293,7 +293,7 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The parent spawns the waiter DETACHED (the v1 record at 17408), then hammers `atomic.notify` on
+/// The parent spawns the waiter DETACHED (the spawn record at 17408), then hammers `atomic.notify` on
 /// the same offset 32768 of **its own** window, OR-ing the woken counts, and joins. Composite:
 /// `join + 10 * woke_any`.
 fn notifying_parent() -> String {
@@ -303,9 +303,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -385,7 +385,7 @@ block 0 (v0: i64) {
 "#;
 
 /// The parent stores the args blob (`argc 1`, `"hello-detached\0"`) at 18432 in ITS window and
-/// names `(18432, 24)` as its v1 record's args payload (#1286): the host copies it to the child's
+/// names `(18432, 24)` as its spawn record's args payload (#1286): the host copies it to the child's
 /// `module_args_base()` before start.
 fn argv_parent() -> String {
     let child = SpawnRec {
@@ -407,9 +407,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vb2 = i64.const 18448
   vw2 = i64.const 28265164885364
   i64.store vb2 vw2
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vD = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -500,7 +500,7 @@ fn a_detached_child_grows_past_its_declared_window() {
     );
 }
 
-/// A parent that only spawns from its v1 record at 17408 and returns the result. Its only window
+/// A parent that only spawns from its spawn record at 17408 and returns the result. Its only window
 /// writes are the record's two handles, above the durable control words, so it runs unchanged under
 /// a **durable** host.
 fn spawn_only_parent() -> String {
@@ -508,9 +508,9 @@ fn spawn_only_parent() -> String {
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -583,9 +583,9 @@ fn spawn_then_read_parent() -> String {
         r#"memory 17
 func (i32, i32, i32) -> (i64, i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)

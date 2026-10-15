@@ -33,9 +33,9 @@ fn src() -> String {
 data 20000 \"budget\"
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -90,7 +90,7 @@ block 0 (vsp: i64, varg: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1()),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 

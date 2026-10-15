@@ -38,7 +38,7 @@ fn parent(tail: &str) -> String {
     let child = SpawnRec {
         size_log2: 17,
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -71,12 +71,12 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   }}
 }}
 {rec_a}{rec_b}"#,
-        a_module = 17408 + rec::MODULE_AT,
-        a_budget = 17408 + rec::BUDGET_AT,
-        a_region = 17408 + rec::REGION_AT,
-        b_module = 17536 + rec::MODULE_AT,
-        b_budget = 17536 + rec::BUDGET_AT,
-        b_region = 17536 + rec::REGION_AT,
+        a_module = 17408 + SpawnRec::MODULE_AT,
+        a_budget = 17408 + SpawnRec::BUDGET_AT,
+        a_region = 17408 + SpawnRec::REGION_AT,
+        b_module = 17536 + SpawnRec::MODULE_AT,
+        b_budget = 17536 + SpawnRec::BUDGET_AT,
+        b_region = 17536 + SpawnRec::REGION_AT,
         rec_a = rec::segment(17408, &child),
         rec_b = rec::segment(17536, &child),
     )
@@ -589,7 +589,7 @@ fn root_spins_beside_grandchild() -> String {
         size_log2: 17,
         grants_ptr: 18432,
         grants_n: 2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -659,8 +659,8 @@ block 4 (vj4: i64) {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -674,7 +674,7 @@ fn grandchild_spins() -> String {
     let grandchild = SpawnRec {
         size_log2: 17,
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -742,9 +742,9 @@ block 4 () {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
-        region_at = 17408 + rec::REGION_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        region_at = 17408 + SpawnRec::REGION_AT,
         rec = rec::segment(17408, &grandchild),
     )
 }

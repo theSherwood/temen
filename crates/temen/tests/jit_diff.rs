@@ -2555,7 +2555,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
 
     const REC: u64 = 80 * 1024; // 5 * 16 KiB — in the reserved tail (prefix 64 KiB), page-aligned
                                 // The record's words as stores: the page is grown at run time, so no data segment can hold it.
-    let words: String = temen_ir::SpawnRec::v1()
+    let words: String = temen_ir::SpawnRec::default()
         .encode()
         .chunks(8)
         .enumerate()
@@ -2590,8 +2590,8 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
          \x20 return v5\n\
            }}\n\
          }}\n",
-        module_at = rec::MODULE_AT,
-        budget_at = rec::BUDGET_AT,
+        module_at = temen_ir::SpawnRec::MODULE_AT,
+        budget_at = temen_ir::SpawnRec::BUDGET_AT,
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");

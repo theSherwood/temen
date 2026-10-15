@@ -44,13 +44,13 @@ block 0 (v0: i32) {
 "#;
 
 /// Entry `(address_space, instantiator, budget, child) -> i64`: the §14 story in one function —
-/// `sub`-carve the window (outlined bounce), then spawn `child`, func 1's image, through a v1 record
+/// `sub`-carve the window (outlined bounce), then spawn `child`, func 1's image, through a spawn record
 /// paid from `budget` + `join` it (the dedicated import bounce), folding both results. The child
 /// mirrors the driver contract (`(i64) -> (i64)`, ignores its starter arg) and returns 9.
 fn composed() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
-    let module_at = REC_AT + 24;
-    let budget_at = REC_AT + 28;
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::default());
+    let module_at = REC_AT + temen_ir::SpawnRec::MODULE_AT;
+    let budget_at = REC_AT + temen_ir::SpawnRec::BUDGET_AT;
     format!(
         r#"memory 17
 func (i32, i32, i32, i32) -> (i64) {{

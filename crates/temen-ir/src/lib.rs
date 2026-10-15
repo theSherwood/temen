@@ -644,86 +644,103 @@ pub mod durable_abi {
 /// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
 /// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
 ///
-/// The record is the one spawn form (INVARIANTS #13): op 15, which took the same fields as
-/// positional operands, is retired (#2067). The version word is a fixed tag (#1867 decision 2): it
-/// must be 1, so a record written for the retired carve placement (version 0) fails closed; #2091
-/// retires the tag. A child runs a module the spawner holds, from its function 0, the module's child
-/// bootstrap (#2219): the word at 4, once the entry function, must be 0 until the record is next
-/// revised, as must the word at 32, once a fuel quota (#1944 slice 3: the budget caps the child's
-/// fuel).
+/// The record is the one spawn form (INVARIANTS #13). It carries no version word: the layout
+/// changes only with every producer, in one change (#2091). A child runs a module the spawner holds,
+/// from its function 0, the module's child bootstrap (#2219).
 ///
 /// | off | field | |
 /// |---|---|---|
-/// | 0 | `u32` version | 1 |
-/// | 4 | `u32` | reserved, must be 0 (was the entry function) |
-/// | 8 | `u64` | reserved, must be 0 |
-/// | 16 | `u32` size_log2 | the child's own window |
-/// | 20 | `u32` pager | impl export / `u32::MAX` |
-/// | 24 | `i32` module | the `Module` handle the child runs |
-/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends |
-/// | 32 | `u64` | reserved, must be 0 (was the fuel quota) |
-/// | 40, 48 | `u64` grants ptr, count | named-grant list |
-/// | 56, 64 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
-/// | 72 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
-/// | 76 | `u32` | reserved, must be 0 |
-/// | 80 | `u64` child_off | where the region maps in the child |
+/// | 0 | `u32` size_log2 | the child's own window |
+/// | 4 | `u32` pager | impl export / `u32::MAX` |
+/// | 8 | `i32` module | the `Module` handle the child runs |
+/// | 12 | `i32` budget | `Budget` handle whose `mem` the window spends |
+/// | 16, 24 | `u64` grants ptr, count | named-grant list |
+/// | 32, 40 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
+/// | 48 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
+/// | 52 | `u32` | padding, must be 0 |
+/// | 56 | `u64` child_off | where the region maps in the child |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
-    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
+    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 0).
     pub size_log2: i64,
-    /// Pager impl-export index, or `u32::MAX` for none (offset 20).
+    /// Pager impl-export index, or `u32::MAX` for none (offset 4).
     pub pager: u32,
-    /// The `Module` handle the child runs (offset 24).
+    /// The `Module` handle the child runs ([`Self::MODULE_AT`]).
     pub modh: i32,
-    /// `Budget` handle, or `0` for none (offset 28).
+    /// `Budget` handle, or `0` for none ([`Self::BUDGET_AT`]).
     pub budget: i32,
-    /// Named-grant list pointer (offset 40).
+    /// Named-grant list pointer (offset 16).
     pub grants_ptr: u64,
-    /// Named-grant list count (offset 48).
+    /// Named-grant list count (offset 24).
     pub grants_n: u64,
-    /// The spawn-time args payload `(ptr, len)` (offsets 56, 64).
+    /// The spawn-time args payload `(ptr, len)` (offsets 32, 40).
     pub args: (u64, u64),
-    /// The pre-mapped region handle (offset 72), `-1` for none.
+    /// The pre-mapped region handle ([`Self::REGION_AT`]), `-1` for none.
     pub region: i32,
-    /// The region's offset in the child's window (offset 80).
+    /// The region's offset in the child's window (offset 56).
     pub child_off: u64,
 }
 
 /// The byte length of a [`SpawnRec`].
-pub const SPAWN_REC_LEN: usize = 88;
+pub const SPAWN_REC_LEN: usize = 64;
 
 impl SpawnRec {
-    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
-    /// word other than 1, or a nonzero reserved field (offsets 4, 8, 32, 76) — every driver fails
-    /// that closed. Pure layout decode: no handle/window/geometry validation, all of which stays
-    /// tier-local.
+    /// Where the `module` handle sits in the record. A spawner learns its handles at run time, so
+    /// it lays the rest of the record as data and stores these three fields before the spawn.
+    pub const MODULE_AT: u64 = 8;
+    /// Where the `budget` handle sits in the record.
+    pub const BUDGET_AT: u64 = 12;
+    /// Where the pre-mapped `region` handle sits in the record.
+    pub const REGION_AT: u64 = 48;
+
+    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length or a nonzero
+    /// padding word (offset 52) — every driver fails that closed. Pure layout decode: no
+    /// handle/window/geometry validation, all of which stays tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
         if rec.len() != SPAWN_REC_LEN {
             return None;
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 1 || u32_at(4) != 0 || u64_at(8) != 0 || u64_at(32) != 0 || u32_at(76) != 0
-        {
+        if u32_at(52) != 0 {
             return None;
         }
         Some(SpawnRec {
-            size_log2: u32_at(16) as i64,
-            pager: u32_at(20),
-            modh: u32_at(24) as i32,
-            budget: u32_at(28) as i32,
-            grants_ptr: u64_at(40),
-            grants_n: u64_at(48),
-            args: (u64_at(56), u64_at(64)),
-            region: u32_at(72) as i32,
-            child_off: u64_at(80),
+            size_log2: u32_at(0) as i64,
+            pager: u32_at(4),
+            modh: u32_at(8) as i32,
+            budget: u32_at(12) as i32,
+            grants_ptr: u64_at(16),
+            grants_n: u64_at(24),
+            args: (u64_at(32), u64_at(40)),
+            region: u32_at(48) as i32,
+            child_off: u64_at(56),
         })
     }
 
-    /// A record with every field at its "none" value: the module's declared window (`size_log2`
-    /// 0), no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no
-    /// args, no region. Producers set the fields they use.
-    pub fn v1() -> SpawnRec {
+    /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(SPAWN_REC_LEN);
+        b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
+        b.extend_from_slice(&self.pager.to_le_bytes());
+        b.extend_from_slice(&self.modh.to_le_bytes());
+        b.extend_from_slice(&self.budget.to_le_bytes());
+        b.extend_from_slice(&self.grants_ptr.to_le_bytes());
+        b.extend_from_slice(&self.grants_n.to_le_bytes());
+        b.extend_from_slice(&self.args.0.to_le_bytes());
+        b.extend_from_slice(&self.args.1.to_le_bytes());
+        b.extend_from_slice(&self.region.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&self.child_off.to_le_bytes());
+        b
+    }
+}
+
+/// A record with every field at its "none" value: the module's declared window (`size_log2` 0),
+/// no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no args,
+/// no region. Producers set the fields they use.
+impl Default for SpawnRec {
+    fn default() -> SpawnRec {
         SpawnRec {
             size_log2: 0,
             pager: u32::MAX,
@@ -735,27 +752,6 @@ impl SpawnRec {
             region: -1,
             child_off: 0,
         }
-    }
-
-    /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(SPAWN_REC_LEN);
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
-        b.extend_from_slice(&self.pager.to_le_bytes());
-        b.extend_from_slice(&self.modh.to_le_bytes());
-        b.extend_from_slice(&self.budget.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&self.grants_ptr.to_le_bytes());
-        b.extend_from_slice(&self.grants_n.to_le_bytes());
-        b.extend_from_slice(&self.args.0.to_le_bytes());
-        b.extend_from_slice(&self.args.1.to_le_bytes());
-        b.extend_from_slice(&self.region.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&self.child_off.to_le_bytes());
-        b
     }
 }
 
@@ -8124,51 +8120,56 @@ mod effects_tests {
 mod spawn_rec_tests {
     use super::*;
 
-    #[test]
-    fn encode_is_the_inverse_of_parse() {
-        let mut v1 = SpawnRec::v1();
-        v1.modh = 5;
-        v1.budget = 9;
-        v1.grants_ptr = 17536;
-        v1.grants_n = 2;
-        v1.args = (18432, 24);
-        v1.region = 7;
-        v1.child_off = 65536;
-        let b = v1.encode();
-        assert_eq!(b.len(), SPAWN_REC_LEN);
-        assert_eq!(SpawnRec::parse(&b), Some(v1));
+    fn every_field() -> SpawnRec {
+        SpawnRec {
+            size_log2: 17,
+            pager: 3,
+            modh: 5,
+            budget: 9,
+            grants_ptr: 17536,
+            grants_n: 2,
+            args: (18432, 24),
+            region: 7,
+            child_off: 65536,
+        }
     }
 
-    /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
-    /// placement — and any other version fail closed, as do the reserved words (the word at 4 is
-    /// the retired entry, #2219, and the word at 32 the retired fuel quota), a short record (a v0
-    /// record was 56 bytes) and a long one.
     #[test]
-    fn only_a_version_1_record_parses() {
-        let b = SpawnRec::v1().encode();
-        let with = |o: usize, v: u32| {
-            let mut r = b.clone();
-            r[o..o + 4].copy_from_slice(&v.to_le_bytes());
-            r
-        };
-        for v in [0, 2, u32::MAX] {
-            assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
-        }
-        assert_eq!(SpawnRec::parse(&with(4, 1)), None, "the word at 4");
-        assert_eq!(SpawnRec::parse(&with(32, 1)), None, "the word at 32");
+    fn encode_is_the_inverse_of_parse() {
+        let rec = every_field();
+        let b = rec.encode();
+        assert_eq!(b.len(), SPAWN_REC_LEN);
+        assert_eq!(SpawnRec::parse(&b), Some(rec));
         assert_eq!(
-            SpawnRec::parse(&with(36, 1)),
-            None,
-            "the word at 32, high half"
+            SpawnRec::parse(&SpawnRec::default().encode()),
+            Some(SpawnRec::default())
         );
-        assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
+    }
+
+    /// The handles a spawner stores at run time sit where the constants say.
+    #[test]
+    fn the_run_time_handles_sit_at_their_offsets() {
+        let b = every_field().encode();
+        let at = |o: u64| i32::from_le_bytes(b[o as usize..o as usize + 4].try_into().unwrap());
+        assert_eq!(at(SpawnRec::MODULE_AT), 5);
+        assert_eq!(at(SpawnRec::BUDGET_AT), 9);
+        assert_eq!(at(SpawnRec::REGION_AT), 7);
+    }
+
+    /// The padding word fails closed, as does a record of any other length: a short one (a
+    /// retired 56-byte carve record) or a long one (a retired 88-byte versioned record).
+    #[test]
+    fn only_a_whole_record_with_zero_padding_parses() {
+        let b = SpawnRec::default().encode();
+        let mut padded = b.clone();
+        padded[52] = 1;
+        assert_eq!(SpawnRec::parse(&padded), None, "the padding word");
+        assert_eq!(SpawnRec::parse(&b[..56]), None, "a 56-byte record");
         assert_eq!(
-            SpawnRec::parse(&with(12, 1)),
+            SpawnRec::parse(&[b.as_slice(), &[0; 24]].concat()),
             None,
-            "the word at 8, high half"
+            "an 88-byte record"
         );
-        assert_eq!(SpawnRec::parse(&with(76, 1)), None, "the word at 76");
-        assert_eq!(SpawnRec::parse(&b[..56]), None, "a v0-length record");
         assert_eq!(
             SpawnRec::parse(&[b.as_slice(), &[0]].concat()),
             None,

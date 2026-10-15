@@ -5,7 +5,7 @@
 #define O_APPEND 02000
 
 /* Three builds of one shell, differing in exactly one thing — how a non-builtin command runs:
-     default                  as a §14 detached child (op 17 v1) with an explicit grant list: the
+     default                  as a §14 detached child (op 17) with an explicit grant list: the
                               capability shell (STAGE1.md), whose stages get a ring and a stdout and
                               nothing else;
      -D TEMEN_SHELL_SEQUENTIAL it doesn't — `<cmd>: not found` (the browser playground);
@@ -246,7 +246,7 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    command's exit status (0 = success). */
 #ifdef TEMEN_SHELL_SPAWN
 /* Spawn a command `mod` (STAGE1.md §5): the one spawn every external command and ring stage takes —
-   an op-17 v1 record, so the child runs in a **detached window of its own** (its declared memory:
+   an op-17 record, so the child runs in a **detached window of its own** (its declared memory:
    size 0 asks for exactly that), paid from our `Budget` and returned to it when the child ends. `rec` holds `gn` 16-byte grant records `{name_off, name_len, handle, flags}`;
    argv travels as the spawn's args payload `{argc, envc=0}` + packed argv, which lands at the child's
    `module_args_base`. Returns the child handle, or -errno (an over-long argv, an exhausted budget). */

@@ -27,12 +27,12 @@ const REC_AT: u64 = 18432;
 /// The `Module` handle the parent is handed for its child, which its record must name.
 const CHILD_MODULE_HANDLE: i32 = 99;
 
-/// Parent (func 0, `(i64 inst, i64 child) -> (i64)`): build a v1 record at [`REC_AT`] for `child`,
+/// Parent (func 0, `(i64 inst, i64 child) -> (i64)`): build a spawn record at [`REC_AT`] for `child`,
 /// func 1's image — the module's declared window, no pager, no budget, no fuel cap, no grants —
 /// `instantiate_rec`, `join`, return. Child (func 1): pure compute, returns 9.
 fn rec_parent() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
-    let module_at = REC_AT + 24;
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::default());
+    let module_at = REC_AT + temen_ir::SpawnRec::MODULE_AT;
     format!(
         r#"memory 16
 func (i64, i64) -> (i64) {{
@@ -192,7 +192,7 @@ fn record_spawn_bounces_and_matches_interp() {
                     rec,
                     temen_ir::SpawnRec {
                         modh: CHILD_MODULE_HANDLE,
-                        ..temen_ir::SpawnRec::v1()
+                        ..temen_ir::SpawnRec::default()
                     },
                     "the record the parent built, detached"
                 );

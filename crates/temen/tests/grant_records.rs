@@ -19,14 +19,14 @@ use temen_run::jit_cap_run;
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-/// Spawns [`CHILD`] detached over `grants_n` records at `grants_ptr`, through a v1 record at 17408
+/// Spawns [`CHILD`] detached over `grants_n` records at `grants_ptr`, through a spawn record at 17408
 /// paid from the root's `Budget`. Records 0 and 1 at 16640 (clear of the guarded low pages) are
 /// written to grant the stream under an empty name, so a list there is well formed.
 fn guest(grants_ptr: i64, grants_n: i64) -> temen_ir::Module {
     let spawn = SpawnRec {
         grants_ptr: grants_ptr as u64,
         grants_n: grants_n as u64,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let src = format!(
         r#"memory 19
@@ -36,9 +36,9 @@ block 0 (vi: i32, vm: i32, vs: i32, vb: i32) {{
   i32.store h0 vs
   h1 = i64.const 16664
   i32.store h1 vs
-  am = i64.const 17432
+  am = i64.const 17416
   i32.store am vm
-  ab = i64.const 17436
+  ab = i64.const 17420
   i32.store ab vb
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vi (rp)

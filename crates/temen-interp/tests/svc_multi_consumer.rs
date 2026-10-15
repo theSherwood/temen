@@ -162,9 +162,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v1
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v2
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -190,7 +190,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// [`SEP_CALLER`] with its spawn record: the module's entry 0 in its declared window.
 fn sep_caller() -> String {
-    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::v1()))
+    format!("{SEP_CALLER}{}", rec::segment(17408, &SpawnRec::default()))
 }
 
 const SEP_SERVER_TWO_WORKERS: &str = r#"
