@@ -2479,6 +2479,16 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // frames, read by `(block, value)`) keeps every param in a slot of its own.
     let forwards = fuse.then(|| f.forwards());
     let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
+    // The slots a forwarding param reads: read outside their block with no edge copy, so their
+    // values must be written (the `IntCmp` fusion below checks this).
+    let mut read_forwarded = vec![false; nslots as usize];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for i in 0..blk.params.len() {
+            if let Some((sb, si)) = forwarded(b, i) {
+                read_forwarded[(base[sb as usize] + si) as usize] = true;
+            }
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
         let params = b.params.len() as u32;
@@ -2532,9 +2542,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let cond_slot = g(*cond);
                 // Slice 5a: fuse a block-final `IntCmp` whose result is this branch's condition and
                 // is used nowhere else into a single `BrIfCmp`. Valid because the compare is pure and
-                // single-use *here*: it is the last instruction (so no later in-block reader) and the
-                // cond slot is not carried to any successor (not an edge-copy source). Fused compile
-                // only — `fuse == false` (debug/trace) keeps the compare as its own steppable op.
+                // single-use *here*: it is the last instruction (so no later in-block reader), the
+                // cond slot is not carried to any successor (not an edge-copy source), and no
+                // forwarding param reads it (#2448). Fused compile only — `fuse == false`
+                // (debug/trace) keeps the compare as its own steppable op.
                 let fused = if fuse && !b.insts.is_empty() {
                     match ops.last() {
                         Some(Op::IntCmp {
@@ -2544,6 +2555,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                             ty,
                             op,
                         }) if *dst == cond_slot
+                            && !read_forwarded[cond_slot as usize]
                             && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
                             && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
                         {

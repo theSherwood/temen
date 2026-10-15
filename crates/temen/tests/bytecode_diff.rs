@@ -368,6 +368,44 @@ fn bytecode_matches_interp_on_kernels() {
 }
 
 #[test]
+fn bytecode_keeps_a_fused_compare_that_a_forwarding_param_reads() {
+    // #2448: block 1's and block 2's params only forward `c`, so they read its slot and no edge
+    // copies into them. `c` is also the block-final compare a `br_if` on it fuses with, which writes
+    // no slot: the fusion must not happen while a forwarding param reads `c`, through one block or
+    // two, or the param reads whatever the slot held.
+    let src = "\
+func (i32) -> (i32) {
+block 0 (n: i32) {
+  zero = i32.const 0
+  c = i32.eq n zero
+  br_if c 1(c) 2(c)
+}
+block 1 (p: i32) {
+  br 3(p)
+}
+block 2 (q: i32) {
+  return q
+}
+block 3 (r: i32) {
+  return r
+}
+}";
+    let m = temen::text::parse_module(src).expect("parse");
+    temen::verify::verify_module(&m).expect("verify");
+    for n in [0i32, 1, -1, 7] {
+        let mut fi = u64::MAX;
+        let interp = run(&m, 0, &[Value::I32(n)], &mut fi);
+        let mut fb = u64::MAX;
+        let bc = bytecode::compile_and_run(&m, 0, &[Value::I32(n)], &mut fb)
+            .expect("bytecode supports this pure-compute module");
+        assert!(
+            results_eq(&bc, &interp),
+            "a forwarded compare disagrees at n={n}: interp={interp:?} bc={bc:?}"
+        );
+    }
+}
+
+#[test]
 fn bytecode_matches_interp_on_aliasing_edge_swap() {
     // Exercises the edge-copy **aliasing/scratch** path: a back-edge that *permutes* params (a swap of
     // `x`/`y`). A one-pass direct copy would clobber a source before it is read, so the gather-then-
