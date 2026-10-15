@@ -1423,10 +1423,10 @@ int main(void) {
     // The dropdown (`nim-programs.js`): picking one loads it into the editor (#2374).
     programs: NIM_PROGRAMS,
     desc: "**Compile a whole Nim program in your browser, with nimony's own driver** (#958, #763). Pick " +
-      "a program, or write your own, and click Run: `nimony t -r --isMain prog.nim` builds it the way it " +
+      "a program, or write your own, and click Run: `nimony t -r --novalidate --isMain prog.nim` builds it the way it " +
       "does on a host, then runs it. nimony plans the build and nifmake runs every step through " +
       "`/bin/sh`: `nifler2` parses each module, `nimsem` checks it (and builds and runs a program of its " +
-      "own for a macro, or for anything evaluated at compile time), `hexer` lowers it, and `temen-link` " +
+      "own for a macro, or for anything evaluated at compile time), `shoggoth` lowers it, and `temen-link` " +
       "links the whole program into one Temen module. Every tool is a verified Temen module that " +
       "**nimony built from its own source, with no C compiler**; they fork, exec and wait on each other " +
       "in one sandboxed process tree over an in-memory filesystem. The tree runs on the interpreter, " +
@@ -3213,8 +3213,8 @@ async function runSelfhost(c) {
 
 // Compile a **whole Nim program** in the browser with nimony's own driver, and run it (#958, #763). The
 // card's one asset is nimony's toolchain (`nimony.blob.gz`, `nimToolchain`); `nimCompileRun` runs
-// `nimony t -r --isMain prog.nim` over it, one POSIX process tree: the tree on the interpreter, each
-// leaf process (nifler2, hexer, the program) on emitted wasm, and temen-link natively. It runs on the
+// `nimony t -r --novalidate --isMain prog.nim` over it, one POSIX process tree: the tree on the
+// interpreter, each leaf process (nifler2, shoggoth, the program) on emitted wasm, and temen-link natively. It runs on the
 // nim worker, so a build (or a program that never returns) stalls only that worker; a page without one
 // runs it on the main thread.
 let nimMainToolchain = null; // the main thread's `nimToolchain`, when there is no nim worker
