@@ -3927,12 +3927,14 @@ impl Func {
             }
         }
         let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
-        // The edges into each block from a reachable one.
-        let mut into: Vec<Vec<(usize, &[ValIdx])>> = vec![Vec::new(); n];
+        // The edges into each block from a reachable one: the source block, where its params
+        // start in `src`, how many it has, and the arguments.
+        let mut into: Vec<Vec<(u64, usize, usize, &[ValIdx])>> = vec![Vec::new(); n];
         for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
+            let (at, np) = (first[u] as usize, self.blocks[u].params.len());
             for &(t, args) in es {
                 if let Some(e) = into.get_mut(t as usize) {
-                    e.push((u, args));
+                    e.push(((u as u64) << 32, at, np, args));
                 }
             }
         }
@@ -3954,14 +3956,14 @@ impl Func {
                     }
                     let me = (t as u64) << 32 | i as u64;
                     let mut val = Forwards::UNKNOWN;
-                    for &(u, args) in &into[t] {
+                    for &(u, at, np, args) in &into[t] {
                         let Some(&a) = args.get(i) else {
                             val = Forwards::OWN;
                             break;
                         };
-                        let mut v = (u as u64) << 32 | a as u64;
-                        if (a as usize) < self.blocks[u].params.len() {
-                            v = match src[first[u] as usize + a as usize] {
+                        let mut v = u | a as u64;
+                        if (a as usize) < np {
+                            v = match src[at + a as usize] {
                                 Forwards::OWN => v,
                                 Forwards::UNKNOWN => continue,
                                 w => w,
