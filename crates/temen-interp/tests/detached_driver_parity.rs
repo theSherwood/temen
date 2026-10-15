@@ -1,4 +1,4 @@
-//! **#1528 — every run loop services a detached spawn (a v1 `instantiate_rec` record, op 17), and
+//! **#1528 — every run loop services a detached spawn (an `instantiate_rec` record, op 17), and
 //! they agree.**
 //!
 //! The tree-walker hosts detached windows itself (`detached_windows.rs`); the resumable engine
@@ -26,28 +26,28 @@ use temen_interp::bytecode::{self, SchedStop, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, Region, StreamRole, Trap, Value};
 use temen_ir::SpawnRec;
 
-/// A v1 spawn record for a `memory 15` child, granted the `grants_n` records at `grants_ptr`. Each
+/// A spawn record for a `memory 15` child, granted the `grants_n` records at `grants_ptr`. Each
 /// parent below stores the child's module and `Budget` handles into it at run time.
 fn record(grants_ptr: u64, grants_n: u64) -> SpawnRec {
     SpawnRec {
         size_log2: 15,
         grants_ptr,
         grants_n,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     }
 }
 
 /// The parent: `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`. Spawns
-/// from its v1 record at 17408 (no grants, no payload) and `join`s the child, returning what the
+/// from its spawn record at 17408 (no grants, no payload) and `join`s the child, returning what the
 /// child returned.
 fn parent() -> String {
     format!(
         r#"memory 16
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -231,7 +231,7 @@ fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
 // stream from one position. With stdin `abc`: the parent reads `a`, the child reads `b` and writes it
 // to its re-granted stdout, then the parent reads `c` — on every runner.
 
-/// Params `(inst, module, budget, stdin, stdout)`. Reads one byte, spawns the child (its v1 record
+/// Params `(inst, module, budget, stdin, stdout)`. Reads one byte, spawns the child (its spawn record
 /// at 17536) with `{"stdin", "stdout"}` re-granted by name, joins it, reads one more byte and
 /// returns it.
 fn stdio_parent() -> String {
@@ -256,9 +256,9 @@ block 0 (v0: i32, v1: i32, v2: i32, vin: i32, vout: i32) {{
   vg1h = i64.const 17432
   vout64 = i64.extend_i32_u vout
   i64.store vg1h vout64
-  vma = i64.const 17560
+  vma = i64.const 17544
   i32.store vma v1
-  vba = i64.const 17564
+  vba = i64.const 17548
   i32.store vba v2
   vrp = i64.const 17536
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -382,7 +382,7 @@ fn a_child_reads_its_parents_stdin_from_where_the_parent_left_it_on_every_runner
 // write end is gone — the parent's, closed explicitly, and the writer's, released when the writer's
 // domain finishes. A runner that skipped that release would park the reader forever.
 
-/// Params `(inst, writer, reader, budget)`. Spawns the writer from its v1 record at 17536 and the
+/// Params `(inst, writer, reader, budget)`. Spawns the writer from its spawn record at 17536 and the
 /// reader from its own at 17664. Returns `reader * 1000 + writer`.
 fn pipe_parent() -> String {
     format!(
@@ -409,15 +409,15 @@ block 0 (v0: i32, vmw: i32, vmr: i32, vbud: i32) {{
   vg1h = i64.const 17432
   vrd64 = i64.extend_i32_u vrd
   i64.store vg1h vrd64
-  vwma = i64.const 17560
+  vwma = i64.const 17544
   i32.store vwma vmw
-  vwba = i64.const 17564
+  vwba = i64.const 17548
   i32.store vwba vbud
   vwrp = i64.const 17536
   vhw = call.cap 6 17 (i64) -> (i32) v0 (vwrp)
-  vrma = i64.const 17688
+  vrma = i64.const 17672
   i32.store vrma vmr
-  vrba = i64.const 17692
+  vrba = i64.const 17676
   i32.store vrba vbud
   vrrp = i64.const 17664
   vhr = call.cap 6 17 (i64) -> (i32) v0 (vrrp)

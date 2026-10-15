@@ -10,7 +10,7 @@
 //!
 //! The freeze of a live child subtree and the admission of an unmarked grant are pinned on detached
 //! children, the only kind left (#1867): `durable_detached_jit.rs` and temen-interp's
-//! `durable_detached_parity.rs`. These parents spawn through a v1 record above their shadow arena,
+//! `durable_detached_parity.rs`. These parents spawn through a spawn record above their shadow arena,
 //! storing the module and budget in it, so they take the confined transform
 //! ([`instrument_parent`]): the strict one refuses any guest memory op (R9, `GuestUsesMemory`).
 
@@ -41,13 +41,13 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
-/// A durable parent from its source, with the v1 spawn record it spawns through at 65536, above its
+/// A durable parent from its source, with the spawn record it spawns through at 65536, above its
 /// shadow arena: the child's 128 KiB window. The parent stores the module and budget in the record,
 /// a guest memory op, so it takes the confined transform.
 fn instrument_parent(src: &str) -> Module {
     let spawn = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let m = parse_module(&format!("{src}{}", rec::segment(65536, &spawn))).expect("parse");
     let inst = transform_module_assume_confined(&m).expect("transform");
@@ -120,7 +120,7 @@ block 0 () {
 
 // ---- Freeze × §14 children ----
 
-/// Durable parent that spawns its granted child **detached** (through the v1 record at 65536 that
+/// Durable parent that spawns its granted child **detached** (through the spawn record at 65536 that
 /// [`instrument_parent`] lays: no grants, `size_log2` 17; the module and budget stored there) and
 /// joins it, then drives a fiber that suspends once (the armed freeze trigger ticks on
 /// `cont.resume`, so `arm = 2` lands the freeze at the second resume — after the join, with the
@@ -128,9 +128,9 @@ block 0 () {
 const PARENT_DETACHED_JOIN_THEN_FIBER: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -279,9 +279,9 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
 const PARENT_DETACHED: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)

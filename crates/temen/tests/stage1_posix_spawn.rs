@@ -4,7 +4,7 @@
 //! the shell reads its own `argv` through the personality (`argc`/`argv`), writes its own output through
 //! the personality (`write`), looks a command up in the personality's **PATH registry** (`exec_lookup`),
 //! and re-grants the personality's forwardable stdout (`exec_stdout`) to the child — but the spawn
-//! itself is the shell's own `Instantiator.instantiate_rec` (op 17, a v1 detached record) + `join`, driven through
+//! itself is the shell's own `Instantiator.instantiate_rec` (op 17, a detached spawn record) + `join`, driven through
 //! capability imports (`Resolved::Cap`, link-time symbol resolution; the guest discovers the
 //! `Instantiator`/personality handles itself via `cap.self` reflection).
 //!
@@ -107,7 +107,7 @@ static int __budget(void) { if (__h_budget < 0) __h_budget = __capof(14); return
 static int  seq(char *a, char *b){ long i=0; for(;;){ if(a[i]!=b[i]) return 0; if(!a[i]) return 1; i++; } }
 static int rec[4];
 static char nm[8];
-static struct vm_spawn_rec spawn; /* the op-17 v1 record */
+static struct vm_spawn_rec spawn; /* the op-17 record */
 static char args[4096];
 int main(void){
   int n = __px_argc(__px());

@@ -1,11 +1,10 @@
 //! #2219 — **a child runs a module the spawner holds, from its function 0, on every engine.** A spawn
 //! that names `-1`, which once named the spawner's own program, faults: `-1` is a forged `Module`
-//! handle like any other. So does an entry other than 0 in a record's word at 4: a child starts at
-//! its module's child bootstrap. And `Module` op 0, which looked an export up by name to pick an
-//! entry, is gone: a `Module` handle has no callable op. #2067 — so is op 15, the positional spawn:
-//! the v1 record (op 17) is the one spawn form. Each traps `CapFault` on the tree-walker, each
-//! bytecode driver and the Cranelift JIT alike, so no engine runs a spawn another refuses
-//! (INVARIANTS #9).
+//! handle like any other. A child starts at its module's child bootstrap, so the record names no
+//! entry (#2091). And `Module` op 0, which looked an export up by name to pick an entry, is gone: a
+//! `Module` handle has no callable op. #2067 — so is op 15, the positional spawn: the op-17 record
+//! is the one spawn form. Each traps `CapFault` on the tree-walker, each bytecode driver and the
+//! Cranelift JIT alike, so no engine runs a spawn another refuses (INVARIANTS #9).
 //!
 //! Each form is otherwise well-formed — a budget that pays, a child module whose function 0 is a
 //! child entry, an export the lookup would find — so only the retired part is refused, and the same
@@ -43,12 +42,12 @@ const REC: u64 = 17408;
 /// Where the parent keeps the export name `"go"`.
 const NAME: u64 = 17536;
 
-/// A v1 record at [`REC`] whose word at 4, the retired entry, is `entry`.
-fn record(entry: u32) -> String {
-    let mut b = SpawnRec::v1().encode();
-    b[4..8].copy_from_slice(&entry.to_le_bytes());
-    let bytes: String = b.iter().map(|x| format!("\\x{x:02x}")).collect();
-    format!("data {REC} \"{bytes}\"\ndata {NAME} \"go\"\n")
+/// A record at [`REC`], and the export name at [`NAME`].
+fn record() -> String {
+    format!(
+        "{}data {NAME} \"go\"\n",
+        rec::segment(REC, &SpawnRec::default())
+    )
 }
 
 /// A parent `(inst, module, budget) -> i64` that runs `body` and returns its `vr`, then func 1, an
@@ -77,7 +76,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {data}",
-        budget_at = REC + rec::BUDGET_AT,
+        budget_at = REC + SpawnRec::BUDGET_AT,
     ))
 }
 
@@ -85,7 +84,7 @@ block 0 (v0: i64) {{
 fn module_is(handle: &str) -> String {
     format!(
         "  vma = i64.const {}\n  i32.store vma {handle}\n",
-        REC + rec::MODULE_AT
+        REC + SpawnRec::MODULE_AT
     )
 }
 
@@ -105,21 +104,17 @@ fn forms() -> Vec<(&'static str, Module)> {
             "a record naming module -1",
             parent(
                 &format!("  vself = i32.const -1\n{}{SPAWN_REC}", module_is("vself")),
-                &record(0),
+                &record(),
             ),
         ),
-        (
-            "a record with entry 1",
-            parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record(1)),
-        ),
-        ("op 15, the retired positional spawn", parent(OP15, &record(0))),
+        ("op 15, the retired positional spawn", parent(OP15, &record())),
         (
             "Module op 0",
             parent(
                 &format!(
                     "  vn = i64.const {NAME}\n  vl = i64.const 2\n  vr = call.cap 8 0 (i64, i64) -> (i64) vmod (vn, vl)"
                 ),
-                &record(0),
+                &record(),
             ),
         ),
     ]
@@ -159,7 +154,7 @@ fn cranelift(m: &Module) -> JitOutcome {
 }
 
 #[test]
-fn every_engine_traps_a_self_spawn_or_an_entry_with_capfault() {
+fn every_engine_traps_each_retired_spawn_form_with_capfault() {
     for (form, m) in forms() {
         for driver in drivers::ALL {
             let ran = drivers::run_on(driver, &m, &setup)
@@ -180,7 +175,7 @@ fn every_engine_traps_a_self_spawn_or_an_entry_with_capfault() {
 fn the_same_harness_runs_a_granted_module_from_function_0() {
     for (form, m) in [(
         "the record",
-        parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record(0)),
+        parent(&format!("{}{SPAWN_REC}", module_is("vmod")), &record()),
     )] {
         for driver in drivers::ALL {
             let ran = drivers::run_on(driver, &m, &setup)

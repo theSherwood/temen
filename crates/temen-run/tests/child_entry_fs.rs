@@ -25,7 +25,7 @@
 //! The memfs cap is relative-only (it refuses absolute paths, `EACCES`), so the guests name `in.bin` /
 //! `out.bin` — the same keys the parent seeds and reads back.
 //!
-//! The parent is [`temen_run::conductor`], which spawns the child detached through a v1 record. Each
+//! The parent is [`temen_run::conductor`], which spawns the child detached through a spawn record. Each
 //! test runs on the tree-walk oracle and every bytecode driver ([`drivers::ALL`]), the resumable
 //! `Vcpu` among them: a real nim phase JITs, and that is the engine that tiers up.
 

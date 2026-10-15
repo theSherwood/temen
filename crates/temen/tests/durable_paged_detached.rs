@@ -1,7 +1,7 @@
 //! #2438 — a durable run freezes a live **demand-paged** detached child, and the thaw gives it back
 //! with its pager.
 //!
-//! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a v1 record
+//! The parent declares a `{ page: (i64) -> (i64) }` export and spawns the child through a record
 //! naming it as the pager (#1862, #1863). It serves the child's faults with `svc.poll` while it polls
 //! the child, then joins it and returns `status << 56 | served << 48 | value`. Its pager supplies
 //! every page from one scratch page holding the faulting page's number at the faulting byte, and
@@ -35,9 +35,9 @@ type 1 interface { page: 0 }
 export 0 interface \"pager\" 1 { page: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -143,7 +143,7 @@ fn parent() -> temen_ir::Module {
     let paged = SpawnRec {
         size_log2: 17,
         pager: 0,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     parent_with(PARENT_SRC, &paged)
 }

@@ -72,15 +72,15 @@ block 3 (vs: i64) {
 const SIBLINGS: &str = "memory 18
 func (i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vwait: i32, vnote: i32, vbud: i32) {
-  rwm = i64.const 17432
+  rwm = i64.const 17416
   i32.store rwm vwait
-  rwb = i64.const 17436
+  rwb = i64.const 17420
   i32.store rwb vbud
   rw = i64.const 17408
   hw = call.cap 6 17 (i64) -> (i32) vinst (rw)
-  rnm = i64.const 17560
+  rnm = i64.const 17544
   i32.store rnm vnote
-  rnb = i64.const 17564
+  rnb = i64.const 17548
   i32.store rnb vbud
   rn = i64.const 17536
   hn = call.cap 6 17 (i64) -> (i32) vinst (rn)
@@ -102,9 +102,9 @@ block 0 (vinst: i32, vwait: i32, vnote: i32, vbud: i32) {
   va = i64.const 32768
   vseven = i32.const 7
   i32.store va vseven
-  rwm = i64.const 17432
+  rwm = i64.const 17416
   i32.store rwm vwait
-  rwb = i64.const 17436
+  rwb = i64.const 17420
   i32.store rwb vbud
   rw = i64.const 17408
   hw = call.cap 6 17 (i64) -> (i32) vinst (rw)
@@ -114,12 +114,12 @@ block 0 (vinst: i32, vwait: i32, vnote: i32, vbud: i32) {
 }
 ";
 
-/// A v1 spawn record at `at` for a 64 KiB child, as a `data` line. The root stores the module and the
+/// A spawn record at `at` for a 64 KiB child, as a `data` line. The root stores the module and the
 /// budget in it before the spawn.
 fn spawn_rec(at: u64) -> String {
     let spawn = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     rec::segment(at, &spawn)
 }

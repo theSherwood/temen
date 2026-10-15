@@ -51,7 +51,7 @@ const CHILD_OFF: u64 = 65536;
 
 /// The parent: `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the
 /// detached-spawn `Budget`. Mints a 64 KiB region, maps it at 65536 in its own window, stores the
-/// input word 41 at region byte 0, spawns the child detached from its v1 record at 17408 with the
+/// input word 41 at region byte 0, spawns the child detached from its spawn record at 17408 with the
 /// region pre-mapped at `off` (`reg` names the handle the parent stores into the record — the
 /// region, or a wrong-kind handle for the forgery probe). `join` then also joins the child and
 /// returns `1000 × result + the word the child wrote at region byte 8`; otherwise it returns the
@@ -60,7 +60,7 @@ fn parent(off: u64, reg: &str, join: bool) -> String {
     let child = SpawnRec {
         size_log2: 17,
         child_off: off,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let tail = if join {
         "vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
@@ -80,11 +80,11 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v2
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v3
-  vra = i64.const 17480
+  vra = i64.const 17456
   i32.store vra {reg}
   vrp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)

@@ -14299,7 +14299,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
-                                // #1862/#1863: a v1 record's pager — the whole window starts
+                                // #1862/#1863: a spawn record's pager — the whole window starts
                                 // demand-paged and every page arrives through the pager's reply.
                                 let pager_for_child = pager_ref;
                                 if pager_for_child.is_some() {
@@ -39056,14 +39056,14 @@ block 0 (vsp: i64, v0: i64) {
     /// dies; the run continues and the owner observes the death as a value: `poll` (iface 6 op 9)
     /// reports status 2 (trapped, non-propagating — the I37 supervision idiom), which the root
     /// returns. The owner's world must NOT be torn down. The root spawns the child (func 1's child
-    /// image, #2219) detached (op 17) through the v1 record the test lays at 17536, paying for it
+    /// image, #2219) detached (op 17) through the spawn record the test lays at 17536, paying for it
     /// from its budget.
     const CHILD_TRAP_POLLED: &str = r#"memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32, vmod: i32) {
-  vm = i64.const 17560
+  vm = i64.const 17544
   i32.store vm vmod
-  vb = i64.const 17564
+  vb = i64.const 17548
   i32.store vb vbud
   vrec = i64.const 17536
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrec)
@@ -39100,7 +39100,7 @@ block 0 (v0: i64) {
         m.data.push(temen_ir::Data {
             offset: 17536,
             readonly: false,
-            bytes: temen_ir::SpawnRec::v1().encode(),
+            bytes: temen_ir::SpawnRec::default().encode(),
         });
         let mut host = Host::new();
         let inst = host.grant_instantiator();

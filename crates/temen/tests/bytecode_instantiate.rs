@@ -59,12 +59,12 @@ block 0 (v0: i32) {
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  q3b = i64.const 17756
+  q3b = i64.const 17740
   i32.store q3b vb
   vcp = i64.const 16656
   vcl = i64.const 5
   vc = self.resolve vcp vcl
-  q3m = i64.const 17752
+  q3m = i64.const 17736
   i32.store q3m vc
   q3a0 = i64.const 17728
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
@@ -85,13 +85,16 @@ block 0 (v0: i64, v1: i64) {
 
 #[test]
 fn two_arg_child_manages_its_own_pages() {
-    let src = format!("{ADDRESS_SPACE}{}", rec::segment(17728, &SpawnRec::v1()));
+    let src = format!(
+        "{ADDRESS_SPACE}{}",
+        rec::segment(17728, &SpawnRec::default())
+    );
     check(&src, vec![Value::I64(0)]);
 }
 
 /// A child trap (`unreachable`) is its parent's `join` status, never the parent's trap (#2066) —
 /// identically on both engines. The parent spawns its `"child"` as [`ADDRESS_SPACE`]'s does, by the
-/// v1 record at 17728, and returns the status.
+/// spawn record at 17728, and returns the status.
 const CHILD_TRAP: &str = r#"memory 17
 data 16640 "budget"
 data 16656 "child"
@@ -100,12 +103,12 @@ block 0 (v0: i32) {
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  q3b = i64.const 17756
+  q3b = i64.const 17740
   i32.store q3b vb
   vcp = i64.const 16656
   vcl = i64.const 5
   vc = self.resolve vcp vcl
-  q3m = i64.const 17752
+  q3m = i64.const 17736
   i32.store q3m vc
   q3a0 = i64.const 17728
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q3a0)
@@ -122,6 +125,6 @@ block 0 (v0: i64) {
 
 #[test]
 fn a_child_trap_is_its_joins_status() {
-    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::v1()));
+    let src = format!("{CHILD_TRAP}{}", rec::segment(17728, &SpawnRec::default()));
     check(&src, vec![Value::I64(temen_ir::trap_code::UNREACHABLE)]);
 }

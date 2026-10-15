@@ -14,7 +14,7 @@
 > **The carve placement is retired (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289;
 > deleted in #1867).** Every §14 child gets a **detached** window (§5). The nested carve — a child in
 > a sub-range of its parent's window, and with it the "parent sees the child's memory" superset — is
-> gone from every engine: ops 0, 5 and 13 and the version-0 record trap `CapFault`. Where this doc
+> gone from every engine: ops 0, 5 and 13 trap `CapFault`. Where this doc
 > builds on the nested superset (argv seeding, parent-as-pager, parent↔child futex through carve
 > addresses, nested subtree freeze), it is history, and the detached replacement is: the spawn
 > record's args payload, a pager that supplies bytes, a pre-mapped `SharedRegion` + canonical-key
@@ -32,7 +32,7 @@ never learns about.
 ## 0. Orientation — what already exists (verified against the tree)
 
 - **Domains-as-processes.** §14 `Instantiator` (iface 6). Its live ops on every engine (#2065):
-  spawn (17, a v1 record), `join` (1), `poll` (9), `detach` (10), `kill` (12), `child_offer` (14)
+  spawn (17, a spawn record), `join` (1), `poll` (9), `detach` (10), `kill` (12), `child_offer` (14)
   and `grant` (19). Every other op number is retired and traps `CapFault`: the carve spawns (0/5/13,
   #1867), the coroutines (2/3/4/6/7), the positional and named grants (8/11), the positional
   detached spawn (15, #2067) and the demand pager (16), all four folded into op 17's record, and
@@ -407,7 +407,7 @@ per-child nursery made the code un-shareable; deleted with the nested freeze, #1
 This also *helps* async children: cached code is read-only executable, so the same blob
 can back N concurrent OS-thread children.
 
-**Detached children, one compile per run (temen#2168).** A detached spawn (the op-17 v1 record)
+**Detached children, one compile per run (temen#2168).** A detached spawn (the op-17 record)
 recompiled its child's whole module every time, the spawner's own program included.
 The child's code now loads its nursery from its vmctx, as it loads its powerbox, cells and
 thread domain, so it bakes nothing of one spawn: a run compiles each child once per shape

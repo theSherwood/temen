@@ -816,7 +816,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
 
 // ----- a detached child's window in the platform's memory (#1414 B6-3c) -----------------------
 
-/// The root spawns the granted module's entry 0, detached in its declared window, by the v1 record
+/// The root spawns the granted module's entry 0, detached in its declared window, by the spawn record
 /// at 17536, paid from `budget`. A refused spawn is tried once more. The root returns what the
 /// child returned, or the second refusal's errno.
 fn spawn_and_join() -> String {
@@ -824,10 +824,10 @@ fn spawn_and_join() -> String {
         "memory 17
 func (i32, i32, i64) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i64) {{
-  vma = i64.const 17560
+  vma = i64.const 17544
   i32.store vma vmod
   vb = i32.wrap_i64 vbud
-  vba = i64.const 17564
+  vba = i64.const 17548
   i32.store vba vb
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -852,7 +852,7 @@ block 3 (ve: i32) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17536, &SpawnRec::v1()),
+        rec = rec::segment(17536, &SpawnRec::default()),
     )
 }
 

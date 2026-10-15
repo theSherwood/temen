@@ -131,6 +131,8 @@ not from micro-optimizing hot code. Default to:
 
 Act on what you find. A better design that fits the PR goes into the PR. A larger one, or one that changes a decision the owner made, goes to the owner as options with your recommendation before you ask for merge. Record the outcome in the PR description under **Step back**: what you weighed, what you changed, what you filed. That keeps a workaround from landing silently. "Nothing found" needs its reasons.
 
+**Temen never waits on its consumers.** unir and jacl_impl, and anything else built on temen, are strictly consumers, never dependencies. No temen issue or PR waits for a consumer to move first: make the change temen needs, land it, and say in the PR what a consumer has to change. The consumer's own sessions take it from there.
+
 **Put decisions in chat, never in the `AskUserQuestion` tool.** When the owner has to decide, write the options and your recommendation in your reply, and wait for theirs.
 
 **Don't subscribe to PR activity / auto-watch a PR unless explicitly asked.** Open the PR and report it; leave CI-watching, autofix-on-red, and merge-conflict babysitting to the owner. Only call `subscribe_pr_activity` (or set up scheduled CI check-ins) when the owner specifically requests it for that PR.

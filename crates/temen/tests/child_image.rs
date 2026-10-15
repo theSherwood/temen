@@ -117,7 +117,7 @@ fn an_unfit_child_entry_is_refused() {
 }
 
 /// A parent `(inst, module, budget) -> i64` that spawns `module` detached `n` times, each through the
-/// v1 record at 17408 (a child starts at its module's function 0), joins each child, and returns the
+/// spawn record at 17408 (a child starts at its module's function 0), joins each child, and returns the
 /// sum of their statuses.
 fn parent(n: usize) -> Module {
     let mut body = String::new();
@@ -131,15 +131,15 @@ fn parent(n: usize) -> Module {
     }
     let spawn = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     parse(&format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   s0 = i64.const 0

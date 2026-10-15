@@ -48,9 +48,9 @@ data 16684 "fork"
 data 16694 "libc"
 func (i32, i32, i64, i32, i32) -> (i64) {
 block 0 (v0: i32, vlibc: i32, vgmod: i64, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -72,9 +72,9 @@ block 0 (v0: i32, vlibc: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   va5 = i64.const 16664
   i32.store va5 vlibc
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -110,11 +110,11 @@ fn manager() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "{MANAGER}{}{}",
-        rec::segment(17536, &SpawnRec::v1()),
+        rec::segment(17536, &SpawnRec::default()),
         rec::segment(17664, &guest)
     )
 }

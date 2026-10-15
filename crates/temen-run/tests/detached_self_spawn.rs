@@ -47,18 +47,16 @@ block 0 () {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  ; the spawn record (op 17), 88 bytes at 20544; a field left 0 is none
+  ; the spawn record (op 17), 64 bytes at 20544; a field left 0 is none
   vrec = i64.const 20544
-  vver = i32.const 1
-  i32.store vrec vver ; @0 version 1
   vlog = i32.const 17
-  i32.store vrec vlog offset=16 ; @16 a 128 KiB window
+  i32.store vrec vlog ; @0 a 128 KiB window
   vnone = i32.const -1
-  i32.store vrec vnone offset=20 ; @20 no pager
-  i32.store vrec vchild offset=24 ; @24 the module: this program's child image
-  i32.store vrec vbud offset=28 ; @28 the Budget its window spends
-  i32.store vrec vrh offset=72 ; @72 the region, pre-mapped ...
-  i64.store vrec vwo offset=80 ; @80 ... at 65536 of the child's window
+  i32.store vrec vnone offset=4 ; @4 no pager
+  i32.store vrec vchild offset=8 ; @8 the module: this program's child image
+  i32.store vrec vbud offset=12 ; @12 the Budget its window spends
+  i32.store vrec vrh offset=48 ; @48 the region, pre-mapped ...
+  i64.store vrec vwo offset=56 ; @56 ... at 65536 of the child's window
   vc = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000

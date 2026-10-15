@@ -44,7 +44,7 @@ pub fn parent_room_after_refusal(gp: u64, gn: u64) -> String {
         size_log2: 16,
         grants_ptr: gp,
         grants_n: gn,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -71,8 +71,8 @@ block 2 () {{
   }}
 }}
 {rec}"#,
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }
@@ -136,7 +136,7 @@ pub fn nester(orphan: bool) -> String {
         grants_ptr: 20032,
         grants_n: 1,
         args: (24576, 8),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 16
@@ -187,8 +187,8 @@ block 4 () {{
 {rec}"#,
         args = temen_ir::module_args_base(),
         grant = rec::grant("g", 20032, 20016, 6, "vnest"),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }

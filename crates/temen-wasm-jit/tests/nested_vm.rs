@@ -27,18 +27,18 @@ const ENV_PTR: i32 = 1024;
 /// Where a unit builds its spawn record: above the #1094 NULL guard.
 const REC_AT: u64 = 18432;
 
-/// The stores that build a v1 record spawning the `Module` in `v1` (func 1's image) detached — the
+/// The stores that build a spawn record spawning the `Module` in `v1` (func 1's image) detached — the
 /// module's own declared window, no budget, no grants.
 fn spawn_child() -> String {
     format!(
         "{}  vma = i64.const {}\n  vmh = i32.wrap_i64 v1\n  i32.store vma vmh\n",
-        support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1()),
-        REC_AT + 24
+        support::rec_stores(REC_AT, &temen_ir::SpawnRec::default()),
+        REC_AT + temen_ir::SpawnRec::MODULE_AT
     )
 }
 
 /// A §14 guest: func 0's entry takes its `Instantiator` handle and its child's `Module` (func 1's
-/// image), spawns the child through a v1 record, `join`s it, and returns its result. Func 1 (the
+/// image), spawns the child through a spawn record, `join`s it, and returns its result. Func 1 (the
 /// child) is pure compute — `9`.
 fn nested() -> String {
     format!(

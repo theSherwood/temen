@@ -33,7 +33,7 @@ const CHILD: i64 = 42;
 /// own size).
 const WIN_LOG2: u8 = 16;
 
-/// Where the unit writes its v1 spawn record, in the guest's window.
+/// Where the unit writes its spawn record, in the guest's window.
 const REC_AT: u64 = 17408;
 
 /// Pack `bytes` as the little-endian `i64` words a guest stores (a unit keeps no data segments —
@@ -67,7 +67,7 @@ fn resolve_by_name(dst: &str, addr: u64, name: &str) -> String {
 }
 
 /// The **unit** the guest submits at runtime: it resolves `instantiator` / `child` / `budget` by
-/// name, writes a v1 spawn record at [`REC_AT`] (no grants, no payload) with the module and budget
+/// name, writes a spawn record at [`REC_AT`] (no grants, no payload) with the module and budget
 /// it resolved, and spawns the guest's child image, whose bootstrap runs func 1, as a detached child
 /// from it, returning the spawn's own result. A name it cannot resolve is `-1`, and a spawn through
 /// a `-1` handle is a `CapFault` — so reaching a non-negative child handle at all is the proof the
@@ -77,7 +77,7 @@ fn resolve_by_name(dst: &str, addr: u64, name: &str) -> String {
 fn unit_src() -> String {
     let child = SpawnRec {
         size_log2: WIN_LOG2.into(),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory {WIN_LOG2}
@@ -98,8 +98,8 @@ block 0 (v0: i64) {{
         module = resolve_by_name("vmod", 20512, "child"),
         budget = resolve_by_name("vbud", 20544, "budget"),
         rec = store_bytes("rec", REC_AT, &child.encode()),
-        module_at = REC_AT + rec::MODULE_AT,
-        budget_at = REC_AT + rec::BUDGET_AT,
+        module_at = REC_AT + SpawnRec::MODULE_AT,
+        budget_at = REC_AT + SpawnRec::BUDGET_AT,
     )
 }
 

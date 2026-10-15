@@ -1,4 +1,4 @@
-//! #1286 — **a detached spawn (a v1 `instantiate_rec` record, op 17) on the resumable `Vcpu`
+//! #1286 — **a detached spawn (an `instantiate_rec` record, op 17) on the resumable `Vcpu`
 //! engine.** The tree-walker hosts detached windows itself (`detached_windows.rs`); the resumable
 //! engine instead **surfaces** the spawn as [`bytecode::VcpuEvent::InstantiateDetached`] — no
 //! carve, the host mints the window — after doing the authority-bearing work in-engine, in the one
@@ -43,13 +43,13 @@ const ARGV_WORD: i64 = i64::from_le_bytes(*b"hello-de");
 
 /// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores
 /// the args blob (`argc = 1`, `"hello-detached\0"`) as three words at 18432, stores the module and
-/// budget into its v1 record at 17408, which names that payload `(18432, 24)` or none, and spawns
+/// budget into its spawn record at 17408, which names that payload `(18432, 24)` or none, and spawns
 /// from it, then `join`s the child (or, in the refusal probe, returns the spawn's own result).
 fn parent(payload: bool, join: bool) -> String {
     let child = SpawnRec {
         size_log2: 16,
         args: if payload { (18432, 24) } else { (0, 0) },
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let tail = if join {
         "vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)\n  return vr"
@@ -69,9 +69,9 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vb2 = i64.const 18448
   vw2 = i64.const {w2}
   i64.store vb2 vw2
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -186,7 +186,7 @@ fn an_exhausted_minter_refuses_probeably_without_surfacing() {
     assert!(seen.is_empty(), "a refused spawn never reaches the host");
 }
 
-/// A parent that only spawns from its v1 record at 17408 (no payload) and returns the result. Its
+/// A parent that only spawns from its spawn record at 17408 (no payload) and returns the result. Its
 /// only window writes are the record's two handles, above the durable control words, so it runs
 /// unchanged under a **durable** host.
 fn spawn_only_parent() -> String {
@@ -194,9 +194,9 @@ fn spawn_only_parent() -> String {
         r#"memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32) {{
-  vma = i64.const 17432
+  vma = i64.const 17416
   i32.store vma v1
-  vba = i64.const 17436
+  vba = i64.const 17420
   i32.store vba v2
   vrp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -209,7 +209,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
             17408,
             &SpawnRec {
                 size_log2: 16,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
     )

@@ -1,7 +1,7 @@
 //! `synth_manifest_child_start`: a module a frontend linked itself (a runtime plus a program, no
 //! translator-made `_start`) runs as a §14 child. Its synthesized `_start` takes the starter
 //! capability, ignores it, calls the entry with the powerbox `sp`, and returns the entry's result
-//! widened to the `i64` status `join` reads — spawned detached through a v1 record, on the tree-walk
+//! widened to the `i64` status `join` reads — spawned detached through a spawn record, on the tree-walk
 //! oracle, the cooperative bytecode driver, and Cranelift.
 //!
 //! And `vm_region_create` in `CHILD_BINDABLE`: a child whose manifest imports it (a separately
@@ -56,15 +56,15 @@ block 0 (sp: i64) {
 fn parent(child_log2: u8) -> String {
     let spawn = SpawnRec {
         size_log2: child_log2.into(),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory {PARENT_LOG2}
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)

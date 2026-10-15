@@ -23,7 +23,7 @@ use temen_text::parse_module;
 
 use temen_ir::errno::EINVAL;
 
-/// A record spawn (the v1 record [`rec_with_impl_export`] appends at 17536) plus an **impl export**
+/// A record spawn (the spawn record [`rec_with_impl_export`] appends at 17536) plus an **impl export**
 /// (a pager-capable module): op 17 present + impl exports ⇒ the whole module must decline to the
 /// tree-walk oracle (the record's pager field is runtime data, so admission is by module shape —
 /// `compile_module_for`).
@@ -52,23 +52,23 @@ block 0 (v0: i64) {
 fn rec_with_impl_export() -> String {
     format!(
         "{REC_WITH_IMPL_EXPORT}{}",
-        rec::segment(17536, &SpawnRec::v1())
+        rec::segment(17536, &SpawnRec::default())
     )
 }
 
 /// A detached-record parent (`(i32 inst, i64 budget, i32 child) -> (i64)`): the budget and module
-/// handles arrive at run time and are stored into the v1 record appended at 17536 (`child`, func 1's
+/// handles arrive at run time and are stored into the spawn record appended at 17536 (`child`, func 1's
 /// child image, #2219, in its declared window). Spawn, join, return the child's 42 — or the spawn's
 /// refusal.
-fn budget_rec_v1_src() -> String {
+fn budget_rec_src() -> String {
     format!(
         "memory 17
 func (i32, i64, i32) -> (i64) {{
 block 0 (v0: i32, v1: i64, v2: i32) {{
-  qma = i64.const 17560
+  qma = i64.const 17544
   i32.store qma v2
   qb = i32.wrap_i64 v1
-  qba = i64.const 17564
+  qba = i64.const 17548
   i32.store qba qb
   qa0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) v0 (qa0)
@@ -92,7 +92,7 @@ block 0 (v0: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17536, &SpawnRec::v1())
+        rec = rec::segment(17536, &SpawnRec::default())
     )
 }
 
@@ -111,11 +111,11 @@ fn bc(src: &str, args: &[Value], host: &mut Host) -> Result<Vec<Value>, Trap> {
         .expect("bytecode engine must drive the record spawn natively (§3d)")
 }
 
-/// The vertical: a v1 record spawn + join is engine-native (compile succeeds — no oracle fallback)
+/// The vertical: a spawn record spawn + join is engine-native (compile succeeds — no oracle fallback)
 /// and result-identical to the tree-walker, the child funded by the budget.
 #[test]
 fn record_spawn_is_native_and_matches_the_oracle() {
-    let src = budget_rec_v1_src();
+    let src = budget_rec_src();
     let m = parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     assert!(
@@ -158,12 +158,12 @@ fn pager_capable_record_module_declines_to_the_oracle() {
 }
 
 /// A dangling budget handle refuses the detached spawn probeably (`-EINVAL`) on both engines,
-/// natively: a v1 record's `budget` must name a `Budget` (anything else refuses). This test pinned
+/// natively: a spawn record's `budget` must name a `Budget` (anything else refuses). This test pinned
 /// `CapFault` while its record spawned `module = -1` from a host that registered no program: the
 /// module failed to resolve before the budget was looked at (#2219).
 #[test]
 fn dangling_budget_handle_refuses_the_detached_spawn_on_both_engines() {
-    let src = budget_rec_v1_src();
+    let src = budget_rec_src();
     let image = temen_ir::child_image_at(&parse_module(&src).expect("parse"), 1).expect("image");
     let mut h_tw = Host::new();
     let i_tw = h_tw.grant_instantiator();

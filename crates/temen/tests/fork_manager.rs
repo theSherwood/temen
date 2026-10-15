@@ -44,9 +44,9 @@ data 16684 "fork"
 data 16694 "libc"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -67,9 +67,9 @@ block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
   i32.store va4 vfour
   va5 = i64.const 16664
   i32.store va5 vlibc
-  q1m = i64.const 17688
+  q1m = i64.const 17672
   i32.store q1m vgst
-  q1b = i64.const 17692
+  q1b = i64.const 17676
   i32.store q1b vbud
   q1p = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -130,11 +130,11 @@ fn src() -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "{SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1()),
+        rec::segment(17536, &SpawnRec::default()),
         rec::segment(17664, &guest)
     )
 }
@@ -222,9 +222,9 @@ data 16820 "wait"
 data 16830 "budget"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -254,9 +254,9 @@ block 0 (v0: i32, vlibc: i32, vbud: i32, vsrv: i32, vgst: i32) {
   i32.store va7 vfour
   va8 = i64.const 16680
   i32.store va8 vwaitoff
-  q1m = i64.const 17688
+  q1m = i64.const 17672
   i32.store q1m vgst
-  q1b = i64.const 17692
+  q1b = i64.const 17676
   i32.store q1b vbud
   q1p = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -374,11 +374,11 @@ fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>, i64) {
     let guest = SpawnRec {
         grants_ptr: 16640,
         grants_n: 3,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let src = format!(
         "{BUDGET_SRC}{}{}",
-        rec::segment(17536, &SpawnRec::v1()),
+        rec::segment(17536, &SpawnRec::default()),
         rec::segment(17664, &guest)
     );
     let m = Arc::new(parse_module(&src).expect("parse"));

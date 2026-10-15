@@ -131,7 +131,7 @@ only to mark the boundary.
 | 16 | `closedir(dir)` | `-> 0 \| -errno` | dir stream | **done** — `-EBADF` on a stale handle |
 | 17 | `argc()` | `-> n` | host arg vector | **done** — personality ext. (the `sh -c` path; `argv[0]` = program name) |
 | 18 | `argv(i, buf, cap)` | `-> len \| -errno` | host arg vector | **done** — NUL-terminated arg `i`; `-EINVAL`/`-ERANGE` |
-| 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 17 (a v1 record, `vm_spawn`) + `join` |
+| 19 | `exec_lookup(name, len)` | `-> module \| -1` | host PATH registry (`register_command`) | **done** — Stage 1 exec (STAGE1.md §5); the spawn itself is the shell's `Instantiator` op 17 (a spawn record, `vm_spawn`) + `join` |
 | 20 | `exec_stdout()` | `-> stream` | host stdout `Stream` | **done** — the handle the shell re-grants to a child under the name `"stdout"` |
 | 21 | `exec_stdin(ptr, len)` | `-> stream` | host input-pipe `Stream` + FIFO | **done** — a filter command's `"stdin"`: pushes `[ptr,len)` into the FIFO, returns the read end |
 | 22 | `exec_win(module)` | `-> size_log2 \| -1` | host PATH registry | **done** — the granted command's declared window, so the shell sizes each spawn's detached window to match |

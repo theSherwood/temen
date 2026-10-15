@@ -48,23 +48,21 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 // 18432/18440/18448 (above the 16 KiB NULL guard), three spawns with a payload `(addr, 8)`, one without
 // that the minter refuses, three joins.
 //
-// `spawn(dst, at, payload)`: a v1 spawn record (op 17) laid at `at` by stores, then the spawn into
-// `dst`: version 1, a 64 KiB window, no pager, the child Module (v1) paid from the minter (v2), no
-// region, and the 8-byte payload at `payload` if there is one. Every field left 0 is none.
+// `spawn(dst, at, payload)`: a spawn record (op 17) laid at `at` by stores, then the spawn into
+// `dst`: a 64 KiB window, no pager, the child Module (v1) paid from the minter (v2), no region, and
+// the 8-byte payload at `payload` if there is one. Every field left 0 is none.
 const spawn = (dst, at, payload) => `  ${dst}a = i64.const ${at}
-  ${dst}v = i32.const 1
-  i32.store ${dst}a ${dst}v
   ${dst}l = i32.const 16
-  i32.store ${dst}a ${dst}l offset=16
+  i32.store ${dst}a ${dst}l
   ${dst}n = i32.const -1
-  i32.store ${dst}a ${dst}n offset=20
-  i32.store ${dst}a v1 offset=24
-  i32.store ${dst}a v2 offset=28
-  i32.store ${dst}a ${dst}n offset=72
+  i32.store ${dst}a ${dst}n offset=4
+  i32.store ${dst}a v1 offset=8
+  i32.store ${dst}a v2 offset=12
+  i32.store ${dst}a ${dst}n offset=48
 ${payload === undefined ? '' : `  ${dst}p = i64.const ${payload}
-  i64.store ${dst}a ${dst}p offset=56
+  i64.store ${dst}a ${dst}p offset=32
   ${dst}s = i64.const 8
-  i64.store ${dst}a ${dst}s offset=64
+  i64.store ${dst}a ${dst}s offset=40
 `}  ${dst} = call.cap 6 17 (i64) -> (i32) v0 (${dst}a)
 `;
 const ROOT_SRC = `memory 16
@@ -124,7 +122,7 @@ block 0 () {
 const CHILD_LOG2 = 16, CHILD_GROWTH = 16384;
 const MINTER_QUOTA = 3 * ((1 << CHILD_LOG2) + CHILD_GROWTH);
 // #1865: the root spawns a copy of itself — its child image, which starts at its `_child` export
-// (func 1, → 7), granted as `"child"` (#2219) — through an op-17 v1 record and joins it, with a
+// (func 1, → 7), granted as `"child"` (#2219) — through an op-17 record and joins it, with a
 // granted unit whose func 1 (→ 9) is emitted. Only a child that runs the granted unit may run its
 // emit, so under `tierup` this child runs its own image's emit and answers 7.
 const SELF_ROOT_SRC = `memory 16
@@ -136,18 +134,15 @@ block 0 (v0: i32, vm: i32, vbud: i32) {
   vcl = i64.const 5
   vchild = self.resolve vcp vcl
   vr0 = i64.const 17408
-  vf0 = i64.const 1
+  vf0 = i64.const -4294967296
   i64.store vr0 vf0
-  vr2 = i64.const 17424
-  vf2 = i64.const -4294967296
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild
-  vr3b = i64.const 17436
-  i32.store vr3b vbud
-  vr9 = i64.const 17480
+  vr1 = i64.const 17416
+  i32.store vr1 vchild
+  vr1b = i64.const 17420
+  i32.store vr1b vbud
+  vr6 = i64.const 17456
   vnone = i32.const -1
-  i32.store vr9 vnone
+  i32.store vr6 vnone
   vh = call.cap 6 17 (i64) -> (i32) v0 (vr0)
   vr_st, vr = call.cap 6 1 (i32) -> (i64, i64) v0 (vh)
   return vr

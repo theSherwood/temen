@@ -19,14 +19,14 @@ use temen_verify::verify_module;
 const PARENT_LOG2: u8 = 18;
 
 /// The parent (256 KiB, args `(instantiator, child module, budget)`): spawn the child detached through
-/// the v1 record at 17408 ([`parent`] lays it: a 64 KiB window), join it, and return
+/// the spawn record at 17408 ([`parent`] lays it: a 64 KiB window), join it, and return
 /// `status * 1000 + value`: what the child returns, or its trap's wire code times 1000 (#2066).
 const PARENT: &str = "memory 18
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32) {
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -69,7 +69,7 @@ fn parse(src: &str) -> Module {
 fn parent() -> Module {
     let spawn = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     parse(&format!("{PARENT}{}", rec::segment(17408, &spawn)))
 }

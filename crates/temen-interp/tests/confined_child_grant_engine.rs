@@ -1,5 +1,5 @@
 //! **#1011 slice 3a — production wiring: a spawn's grant list runs on the resumable engine.** A
-//! guest spawns a separate module through a v1 record (op 17) carrying a grant list, and the
+//! guest spawns a separate module through a spawn record (op 17) carrying a grant list, and the
 //! **resumable `Vcpu` engine** admits it through the one admission every driver uses
 //! (`admit_detached_child`), re-granting the named cap out of the *parent's own powerbox* into the
 //! child's. The driver only starts the admitted child over a fresh window (`take_child` +
@@ -33,7 +33,7 @@ data 17408 "fs"
 // `v2` = the `"fs"` cap handle in the parent's powerbox, `v3` = the `Budget` the child's window is
 // paid from. It seeds the name `"fs"` at window offset 18432, builds one 16-byte grant record at
 // offset 17408 (`{name_off:u32=18432, name_len:u32=2, handle:i32=v2, flags:u32=0}`), writes the
-// module and budget into its v1 record at 17536 (grant list `(17408, 1)`, entry 0), spawns the
+// module and budget into its spawn record at 17536 (grant list `(17408, 1)`, entry 0), spawns the
 // child (op 17) and joins it (op 1), returning its result. A correct run returns the granted
 // counter's `1`.
 const PARENT: &str = r#"memory 17
@@ -48,9 +48,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
   vfsh = i64.extend_i32_u v2
   vrec1off = i64.const 17416
   i64.store vrec1off vfsh
-  vmod = i64.const 17560
+  vmod = i64.const 17544
   i32.store vmod v1
-  vbud = i64.const 17564
+  vbud = i64.const 17548
   i32.store vbud v3
   vrec = i64.const 17536
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrec)
@@ -64,7 +64,7 @@ fn parent() -> String {
     let spawn = SpawnRec {
         grants_ptr: 17408,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{PARENT}{}", rec::segment(17536, &spawn))
 }

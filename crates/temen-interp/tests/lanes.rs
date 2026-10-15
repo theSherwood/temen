@@ -147,13 +147,13 @@ block 0 (v0: i64) {
 
 /// `v0` Instantiator, `v1` Module, `v2` Budget. Three sub-budgets split off `v2` — lanes 2, 1, 1 —
 /// then: spawn with lane 2 (fits a cap of 2), spawn with lane 1 (Σ 3 > 2: refused, charges nothing),
-/// join the first (its lane returns), spawn with lane 1 (fits). Each spawn reads its own v1 record,
+/// join the first (its lane returns), spawn with lane 1 (fits). Each spawn reads its own spawn record,
 /// at 17408, 17536 and 17664, paid from its sub-budget. Returns
 /// `100·(c1 ≥ 0) + 10·(c2 == -EINVAL) + (c3 ≥ 0)`, so the expected answer is `111`.
 fn sigma() -> String {
     let child = SpawnRec {
         size_log2: 12,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 16
@@ -168,22 +168,22 @@ block 0 (v0: i32, v1: i32, v2: i32) {{
   vb1 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl2)
   vb2 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl1)
   vb3 = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) v2 (vf, vm, vs, vc, vl1)
-  vma1 = i64.const 17432
+  vma1 = i64.const 17416
   i32.store vma1 v1
-  vba1 = i64.const 17436
+  vba1 = i64.const 17420
   i32.store vba1 vb1
   vrp1 = i64.const 17408
   vc1 = call.cap 6 17 (i64) -> (i32) v0 (vrp1)
-  vma2 = i64.const 17560
+  vma2 = i64.const 17544
   i32.store vma2 v1
-  vba2 = i64.const 17564
+  vba2 = i64.const 17548
   i32.store vba2 vb2
   vrp2 = i64.const 17536
   vc2 = call.cap 6 17 (i64) -> (i32) v0 (vrp2)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) v0 (vc1)
-  vma3 = i64.const 17688
+  vma3 = i64.const 17672
   i32.store vma3 v1
-  vba3 = i64.const 17692
+  vba3 = i64.const 17676
   i32.store vba3 vb3
   vrp3 = i64.const 17664
   vc3 = call.cap 6 17 (i64) -> (i32) v0 (vrp3)

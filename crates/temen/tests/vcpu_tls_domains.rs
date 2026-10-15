@@ -32,9 +32,9 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   z = i64.const 0
   ha = thread.spawn 1 z z
   ta = thread.join ha
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vbud
   rp = i64.const 17408
   hc = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -92,7 +92,7 @@ fn module(src: &str) -> Module {
 fn root() -> Module {
     let spawn = SpawnRec {
         size_log2: 16,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     module(&format!("{ROOT}{}", rec::segment(17408, &spawn)))
 }

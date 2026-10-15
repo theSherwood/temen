@@ -1,6 +1,6 @@
 //! **§14 detached spawn end-to-end on the emitted tier** (issue #1123, slice B) — the wasmi twin of the
 //! native `rust_guest_op13`: an **emitted parent** spawns a **separate-module child that does real
-//! granted work** (a `call.cap` on a re-granted `"fs"`) through an op-17 v1 record, and the whole thing
+//! granted work** (a `call.cap` on a re-granted `"fs"`) through an op-17 record, and the whole thing
 //! runs on emitted wasm, byte-identical to the interpreter.
 //!
 //! This composes the two halves proven separately elsewhere:
@@ -59,11 +59,11 @@ block 0 () {
 "#;
 
 /// The parent driver: `v0` = `Instantiator` handle, `v1` = child `Module` handle. Spawns func 0 of the
-/// module detached through a v1 record (its declared window; an empty grant list — the host binds
+/// module detached through a spawn record (its declared window; an empty grant list — the host binds
 /// `"fs"`), `join`s it, and returns the child's result. Emittable via the `env.instantiate_rec` bounce.
 fn parent() -> String {
-    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::v1());
-    let modh_at = REC_AT + 24;
+    let stores = support::rec_stores(REC_AT, &temen_ir::SpawnRec::default());
+    let modh_at = REC_AT + temen_ir::SpawnRec::MODULE_AT;
     format!(
         r#"memory 16
 func (i32, i32) -> (i64) {{
@@ -340,7 +340,7 @@ fn emitted_parent_spawns_granted_child_detached_e2e() {
                     rec,
                     temen_ir::SpawnRec {
                         modh: MODULE_HANDLE,
-                        ..temen_ir::SpawnRec::v1()
+                        ..temen_ir::SpawnRec::default()
                     },
                     "the record the parent built: detached, func 0 of the child module"
                 );

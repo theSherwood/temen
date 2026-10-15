@@ -19,7 +19,7 @@ use temen_ir::SpawnRec;
 /// The server's spawn record at 17536: S, func 1's child image (#2219), in the window the module
 /// declares.
 fn server() -> String {
-    rec::segment(17536, &SpawnRec::v1())
+    rec::segment(17536, &SpawnRec::default())
 }
 
 /// `src` with its spawn records: the server S at 17536, and the caller C at 17664, granted `"svc"`
@@ -29,7 +29,7 @@ fn forking(src: &str) -> String {
     let c = SpawnRec {
         grants_ptr: 16640,
         grants_n: 2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{src}{}{}", server(), rec::segment(17664, &c))
 }
@@ -126,9 +126,9 @@ type 1 interface { op: 0 }
 export 0 interface "svc" 1 { op: 2 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vbud: i32, vsm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vc = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -275,9 +275,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q1b = i64.const 17564
+  q1b = i64.const 17548
   i32.store q1b vbud
   q1p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1p)
@@ -299,9 +299,9 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q2b = i64.const 17692
+  q2b = i64.const 17676
   i32.store q2b vbud
   q2p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2p)
@@ -555,9 +555,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q3b = i64.const 17564
+  q3b = i64.const 17548
   i32.store q3b vbud
   q3p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q3p)
@@ -579,9 +579,9 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q4b = i64.const 17692
+  q4b = i64.const 17676
   i32.store q4b vbud
   q4p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q4p)
@@ -720,9 +720,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q5b = i64.const 17564
+  q5b = i64.const 17548
   i32.store q5b vbud
   q5p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
@@ -744,9 +744,9 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q6b = i64.const 17692
+  q6b = i64.const 17676
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)
@@ -877,9 +877,9 @@ data 16684 "svc"
 data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
-  qsm = i64.const 17560
+  qsm = i64.const 17544
   i32.store qsm vsm
-  q5b = i64.const 17564
+  q5b = i64.const 17548
   i32.store q5b vbud
   q5p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q5p)
@@ -901,9 +901,9 @@ block 0 (v0: i32, vout: i32, vbud: i32, vsm: i32, vcm: i32) {
   i32.store va4 vnl2
   va5 = i64.const 16664
   i32.store va5 vout
-  qcm = i64.const 17688
+  qcm = i64.const 17672
   i32.store qcm vcm
-  q6b = i64.const 17692
+  q6b = i64.const 17676
   i32.store q6b vbud
   q6p = i64.const 17664
   vc = call.cap 6 17 (i64) -> (i32) v0 (q6p)

@@ -1,7 +1,7 @@
 //! #1727 — a confined child's spawn handles resolve in **its own** powerbox, on every driver.
 //!
 //! Shape: the root spawns a *middle* child detached, and the middle child spawns a *grandchild* and
-//! joins it, each through a v1 record. In the refusal cases the middle child names one handle it was
+//! joins it, each through a spawn record. In the refusal cases the middle child names one handle it was
 //! never granted but the root holds: another module, a cap it re-grants by name, or a `Budget`.
 //! Invariant #3 (authority moves only down the grant graph) says each such spawn fails closed, and #9
 //! says every driver fails it exactly as the tree-walk oracle does. The control passes only handles
@@ -67,10 +67,10 @@ fn middle(spawn: Spawn) -> String {
             SpawnRec {
                 grants_ptr: 16384,
                 grants_n: 1,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             },
         ),
-        _ => (String::new(), SpawnRec::v1()),
+        _ => (String::new(), SpawnRec::default()),
     };
     format!(
         "memory 17
@@ -80,9 +80,9 @@ data 16500 \"stdout\"
 {rec}func (i64) -> (i64) {{
 block 0 (vs: i64) {{
   vinst = i32.wrap_i64 vs
-{module}{budget}{grants}  ma = i64.const 17432
+{module}{budget}{grants}  ma = i64.const 17416
   i32.store ma vmod
-  ba = i64.const 17436
+  ba = i64.const 17420
   i32.store ba vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -102,7 +102,7 @@ fn root() -> String {
     let rec = SpawnRec {
         grants_ptr: 16384,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -117,9 +117,9 @@ block 0 (vinst: i32, vmid: i32, vgrand: i32, vbud: i32) {{
   i32.store g4 gv4
   g8 = i64.const 16392
   i32.store g8 vgrand
-  ma = i64.const 17432
+  ma = i64.const 17416
   i32.store ma vmid
-  ba = i64.const 17436
+  ba = i64.const 17420
   i32.store ba vbud
   rp = i64.const 17408
   ch = call.cap 6 17 (i64) -> (i32) vinst (rp)
