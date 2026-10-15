@@ -1242,8 +1242,8 @@ block 0 (vas: i64) {{
 }
 
 // #1201 — the **page-op op-13 child** for the real-Chromium `browser-op13jit-e2e-test.mjs` (the twin of
-// `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15` — the mini driver's
-// buddy-half carve) whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
+// `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15`, its own window)
+// whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
 // read-only; `f0` reads K back through the `Ro` page → 40 + 1 + 75 = 116. On the op-13 JIT loop it emits
 // PAGED and runs on `driveDetachedRun` with the page-state table re-synced after the bounce. "K" sits
 // at 16 KiB, above the NULL guard the single-shot bounce seeds; the browser's software page is 4 KiB.

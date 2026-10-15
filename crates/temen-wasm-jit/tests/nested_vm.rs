@@ -70,7 +70,7 @@ fn parse(src: &str) -> temen_ir::Module {
 }
 
 /// Host state threaded through the wasmi `Store`: the module (to run children on the interpreter),
-/// each spawned child's result (indexed by the handle `env.instantiate` returns), and the non-vacuity
+/// each spawned child's result (indexed by the handle `env.instantiate_rec` returns), and the non-vacuity
 /// flag.
 struct HostState {
     module: temen_ir::Module,
@@ -153,20 +153,6 @@ fn threaded_unit_matches_oracle() {
             "env",
             "call_interp",
             |_: Caller<'_, HostState>, _f: i32, _a: i32| unreachable!("no interp leaf"),
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _w: i32,
-             _i: i32,
-             _e: i64,
-             _o: i64,
-             _s: i64,
-             _q: i64|
-             -> i32 { unreachable!("no instantiate in this unit") },
         )
         .unwrap();
     linker
@@ -424,20 +410,6 @@ fn compile_nested_fiber_entry_tierup_emit_runs() {
             |_: Caller<'_, HostState>, _f: i32, _a: i32| {
                 unreachable!("pure emit — no cross-tier call")
             },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _w: i32,
-             _i: i32,
-             _e: i64,
-             _o: i64,
-             _s: i64,
-             _q: i64|
-             -> i32 { unreachable!() },
         )
         .unwrap();
     linker

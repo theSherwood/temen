@@ -224,6 +224,16 @@ try {
   console.log(`  play/parse-reject: state=${bad.state} msg=${JSON.stringify(bad.status)} ` +
     `${badOk ? 'PASS' : 'FAIL'}`);
 
+  // #2414: a card that declares more memory than the threaded runner allocates (16 MiB) is refused,
+  // not run over a smaller window. Run on the `threads` card, whose recipe is the per-Worker driver.
+  await play.evaluate((s) => document.querySelector(`${s} .CodeMirror`).CodeMirror.setValue(
+    'memory 25\nfunc () -> (i64) {\nblock 0 () {\n  v = i64.const 7\n  return v\n  }\n}\n'), card('threads'));
+  const big = await runPlay('threads');
+  const bigOk = big.state === 'error' && big.status.includes('run refused');
+  checks.push(bigOk);
+  console.log(`  play/declared-past-window: state=${big.state} msg=${JSON.stringify(big.status)} ` +
+    `${bigOk ? 'PASS' : 'FAIL'}`);
+
   // An on-ramp module: a real C guest (`hello.c`) compiled through the LLVM on-ramp and run via
   // `temen_run_onramp` (not the text/`temen_parse` path). Uses the committed `web/assets/hello_c.temen`.
   const helloC = await runPlay('hello (C → Temen)');

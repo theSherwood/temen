@@ -1,6 +1,6 @@
 //! **CONSOLIDATION.md §3c.3 — the config-record spawn on the wasm-JIT tier**: `Instantiator`
 //! op 17 (`instantiate_rec(record_ptr)`) lowers to an `env.instantiate_rec` host bounce
-//! `(win, inst, record_ptr) -> child`, emitted as a **conditional** import — func import 8,
+//! `(win, inst, record_ptr) -> child`, emitted as a **conditional** import — func import 7,
 //! present only when the module actually uses op 17 — so every existing nested-mode module
 //! keeps its exact import set and no driver changes until it loads an op-17 module.
 //!
@@ -98,20 +98,6 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
             "env",
             "call_interp",
             |_: Caller<'_, HostState>, _f: i32, _a: i32| unreachable!("no interp leaf"),
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _win: i32,
-             _inst: i32,
-             _entry: i64,
-             _off: i64,
-             _slog: i64,
-             _quota: i64|
-             -> i32 { unreachable!("no op-0 spawn in these units") },
         )
         .unwrap();
     linker

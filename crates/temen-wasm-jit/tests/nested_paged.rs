@@ -230,20 +230,6 @@ fn run_paged_nested(src: &str) -> (Outcome, u32) {
     linker
         .func_wrap(
             "env",
-            "instantiate",
-            |_: Caller<'_, DriverData>,
-             _w: i32,
-             _i: i32,
-             _e: i64,
-             _o: i64,
-             _s: i64,
-             _q: i64|
-             -> i32 { unreachable!("no instantiate in this unit") },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
             "join",
             |_: Caller<'_, DriverData>, _i: i32, _c: i32| -> (i64, i64) { unreachable!("no join") },
         )

@@ -208,16 +208,11 @@ fn fuzz_grant_marshal_authority_oracle() {
     }
 }
 
-/// The window marshal's error surface ([`Host::spawn_named_child_from_window`]): a record past an
-/// empty window is `OutOfWindow`, and zero grants over it build an empty child.
+/// The marshal's error surface: a record past an empty window is a `MemoryFault`, and zero grants
+/// over it build an empty child.
 #[test]
-fn the_window_marshal_maps_its_errors_stably() {
+fn the_marshal_maps_its_errors_stably() {
     let mut host = Host::new();
-    assert!(matches!(
-        host.spawn_named_child_from_window(&[], 0, 1, 1 << 12),
-        Err(temen_interp::GrantMarshalError::OutOfWindow)
-    ));
-    assert!(host
-        .spawn_named_child_from_window(&[], 0, 0, 1 << 12)
-        .is_ok());
+    assert_eq!(marshal(&mut host, &[], 0, 1), Err(Trap::MemoryFault));
+    assert_eq!(marshal(&mut host, &[], 0, 0), Ok(true));
 }

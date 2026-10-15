@@ -167,7 +167,7 @@ impl ChildTask {
         // interpreter's `seed_null_guard` does. `finish` re-asserts RW before the host reads it back.
         let guard = temen_ir::module_null_guard();
         let seeded =
-            init(&mut window) && (guard > 1u64 << mapped_log2 || window.seed_null_guard(0, guard));
+            init(&mut window) && (guard > 1u64 << mapped_log2 || window.seed_null_guard(guard));
         if !seeded || !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
             return Err(teardown);
         }

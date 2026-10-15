@@ -14,7 +14,7 @@
 //!
 //! | axis | predicate |
 //! |---|---|
-//! | nesting | `Host::can_regrant` (via `Host::regrant_into_child`, its only public route) |
+//! | nesting | `Host::can_regrant` (via `Host::spawn_detached_child`, its public route) |
 //! | durability | the `NonDurableKind` match in `Host::capture_durable_handles` |
 //!
 //! Four more axes — `debugger`, `concurrency`, `backend`, `code origin` — have no single predicate
@@ -25,7 +25,7 @@
 //! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
 //! moves in one direction.
 
-use temen_interp::{DurableBinding, Host, NonDurableKind, StreamRole};
+use temen_interp::{DurableBinding, Host, Lease, NonDurableKind, StreamRole, WINDOW_RUNS};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
 
@@ -75,7 +75,7 @@ fn a_module() -> temen_ir::Module {
 /// **Nesting.** For every mintable capability, the manifest's `nesting` cell must match what the
 /// engine actually lets a §14 child be granted.
 ///
-/// Driven through `Host::spawn_granted_child` — the public route, and the one the JIT backend uses
+/// Driven through `Host::spawn_detached_child` — the public route, and the one the native JIT uses
 /// to build the same child powerbox host-side. It gates on `can_regrant` before building anything,
 /// so `None` *is* "a child cannot hold this".
 #[test]
@@ -86,7 +86,14 @@ fn the_nesting_column_matches_what_a_child_can_actually_be_granted() {
     let pairs = mintable(&mut host, &m);
 
     for (cap, h) in pairs {
-        let crossed = host.spawn_granted_child(h, 1 << 12).is_some();
+        let lease = Lease {
+            budget: host.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 16,
+            runs: WINDOW_RUNS,
+        };
+        let crossed = host
+            .spawn_detached_child(&[("g".into(), h)], 1 << 16, lease, -1)
+            .is_some();
         let claimed = capability_axes(cap)[n].status;
         let expected = match claimed {
             Status::Full => true,
