@@ -3753,11 +3753,11 @@ infinite wait see quiescence and call a queue a deadlock. A lane of `0` is unsat
 slow, and answers `ThreadFault` on both engines (INVARIANTS #5 — never a hang). Cross-engine pins in
 `temen-run/tests/vcpu_lanes_jit.rs`.
 
-*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`,
-`spawn_granted_child` and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
-file-join-slot / release-on-failure — collapse into one `file_task`, parameterised by what actually
-differs: how the window is seeded (a carve image, or data segments plus payload), whether a
-`copy_back` writes it back at finish (a carve child: the parent is the superset), and the lane chain.
+*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`, the carve child's
+spawn and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
+file-join-slot / release-on-failure — collapsed into one `file_task`, parameterised by what actually
+differed: how the window is seeded, whether a `copy_back` wrote it back at finish (the carve child,
+gone with #1867), and the lane chain.
 `run_child_code`, `run_child_code_then` and `run_detached_child_then` are gone with the OS threads
 they drove, and so is `Nursery::child_threads` — run teardown is the executor's quiescence alone.
 A carve child has no lane of its own to be granted, so it runs in its parent's: the hook family

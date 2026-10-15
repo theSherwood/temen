@@ -930,6 +930,21 @@ fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
     }
 }
 
+/// #2095: a paged child attests `window_exposed`. Its spawner is its pager, which chooses each page's
+/// contents at first touch and sees every fault address in the child's coordinates. The child returns
+/// `self.attest` after its first touch: tier 1 with the exposed bit (256), plus 1 serve * 1000.
+#[test]
+fn a_paged_child_attests_its_window_exposed() {
+    let src = detached_pager_program_at(20000).replace(
+        "  return vbw\n",
+        "  vz = i32.const 0\n  vat = call.cap 4294967295 4 () -> (i64) vz ()\n  return vat\n",
+    );
+    assert!(src.contains("return vat\n"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1257, "{b:?}");
+    }
+}
+
 /// #744, the typed pager: a record's pager must be an export of exactly `{ page: (i64) -> (i64) }`,
 /// the one shape a page fault's dispatch serves. Naming any other export — here one whose op has
 /// another name, and one with a second op — fails the spawn closed on every backend.

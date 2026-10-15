@@ -5069,8 +5069,8 @@ impl Outcome {
 struct TrapOrigin {
     bt: Vec<IrPc>,
     fiber: Option<i64>,
-    /// The window-relative faulting address (#1591). For a nested (op-13) child this is relative to
-    /// the child's own carve, which is the frame its own backtrace is in.
+    /// The faulting address in the faulting domain's own window (#1591), the frame its own backtrace
+    /// is in.
     fault: Option<u64>,
 }
 
@@ -11571,11 +11571,9 @@ struct VCpu {
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
     /// #1361 step 3 — the **freeze doorbell**: `Some` on a *detached* §14 child, whose window its
-    /// parent cannot reach. A nested child is told to unwind by one word written into the parent's
-    /// own image (`carve_off + STATE_OFF`); a detached child owns its window elsewhere and the
-    /// parent deliberately holds no pointer into it (`window_exposed = false` is structural), so the
-    /// broadcast is rung out-of-band instead — the same shape as [`kill`](Self::kill), which already
-    /// crosses this boundary.
+    /// parent cannot reach. The child owns its window elsewhere and the parent holds no pointer into
+    /// it, so the broadcast is rung out-of-band — the same shape as [`kill`](Self::kill), which
+    /// already crosses this boundary.
     ///
     /// It is a **doorbell, not a second unwinding path** (INVARIANTS #15): all it does is write
     /// `UNWINDING` into this domain's *own* global freeze word, which is the one thing that makes any
@@ -11589,8 +11587,8 @@ struct VCpu {
     window_lease: Option<(Arc<Mutex<Host>>, Lease)>,
     /// #2001 — this vCPU's `spawn` charge on its domain's node, handed back when the vCPU is
     /// dropped. Taken by what makes the vCPU: `thread.spawn`, a fork, a `posix_spawn`, or a thaw
-    /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), on a
-    /// detached child's root (its [`Self::window_lease`] holds the charge) and on a carve child.
+    /// re-creating a thread. None on a run's root, which its embedder makes ([`LiveVcpu`]), and on a
+    /// detached child's root (its [`Self::window_lease`] holds the charge).
     live: LiveVcpu,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
@@ -11606,8 +11604,8 @@ struct VCpu {
     child_kill: BTreeMap<usize, Arc<AtomicBool>>,
     /// #1361 step 3 — a parent's map from a **detached** child's join slot to that child's freeze
     /// doorbell ([`VCpu::freeze_bell`]), so a subtree freeze can ring it. The detached twin of
-    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only op-17 children have one
-    /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
+    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only §14 children have one
+    /// (a `thread.spawn` sibling shares our window).
     /// Beside the bell, what the spawn knew that a thaw needs to mint the child again (#1361 step 4).
     child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
     /// #2044 — the completed detached children a thaw delivered at this vCPU's join slots, as `(slot,
@@ -13475,8 +13473,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
-            // #1361 step 3 — the freeze doorbell. A **detached** child owns a window its parent
-            // cannot write, so a subtree freeze rings this instead of broadcasting into a carve. All
+            // #1361 step 3 — the freeze doorbell. A §14 child owns a window its parent cannot
+            // write, so a subtree freeze rings this instead of writing the child's freeze word. All
             // it does is set our OWN global freeze word: from here the instrumented code unwinds
             // exactly as it would for a root freeze, so there is still one unwinding path and this is
             // a doorbell for it (#15). Idempotent, and placed here rather than at a safepoint for the
@@ -14137,10 +14135,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // the `Budget` whose `mem` mints its **fresh platform window** (#1289 R2), the
                         // window's size, the named grants, a spawn-time args payload, a pre-mapped
                         // region and a pager export (`u32::MAX` = none). The window is outside this
-                        // domain's, so no ancestor below the platform holds read authority and the
-                        // child attests `window_exposed = false` (the distrust-spawner trust model):
-                        // data flows through the module's own segments, the named grants, the payload
-                        // and the region, the separate-process discipline. The spawner keeps
+                        // domain's, so no ancestor below the platform holds read authority and an
+                        // unpaged child attests `window_exposed = false` (the distrust-spawner trust
+                        // model): data flows through the module's own segments, the named grants, the
+                        // payload and the region, the separate-process discipline. A paged child
+                        // attests it exposed: its pager chooses each page and sees each fault (#2095). The spawner keeps
                         // kill/join/fuel authority — detachment severs *read*, not lifecycle. A
                         // malformed record (a bad version, a nonzero reserved word) fails the spawn
                         // closed before any child state exists; a non-`Budget`, bad size, budget miss
@@ -14298,7 +14297,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_durable(durable);
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
-                                    hg.detached_child_attestation()
+                                    hg.detached_child_attestation(pager_for_child.is_some())
                                 });
                                 // #1286: the starter caps span the child's whole **reservation**, as a
                                 // root run's `grant_memory` does — a detached window has no carve to be
@@ -19798,18 +19797,6 @@ impl BudgetTree {
         }
     }
 
-    /// A carve record's consume (§3b, until #1867 retires the carve): the room left, then `n`'s
-    /// ceilings zeroed, so a budget funds exactly one carve child.
-    fn take(&self, n: u32) -> Option<[i64; BUDGET_DIMS]> {
-        let mut nodes = self.0.lock_unpoisoned();
-        if (n as usize) >= nodes.len() {
-            return None;
-        }
-        let room = Self::bound(&nodes, n, true);
-        nodes[n as usize].ceiling = [0; BUDGET_DIMS];
-        Some(room)
-    }
-
     /// A child of `holder`: each requested ceiling clamped to the tightest one along the holder's
     /// chain (`-1` in a field stays unbounded, bounded by the chain), and the lane as given. Deducts
     /// nothing. `None` for an unknown holder.
@@ -20041,8 +20028,7 @@ impl<C: Cost> Drop for Held<C> {
 /// What makes a vCPU inside the budget tree charges it: `thread.spawn`, a fork, a `posix_spawn`, a
 /// detached spawn's admission. A run's root is its embedder's and holds none: its domain's node is
 /// either the run's own, which no guest reads, or a detached child's, whose admission charged the
-/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]). A carve
-/// child's holds none either, until #1867 deletes the carve path.
+/// first vCPU with the window. That window's lease hands it back ([`Host::release_detached`]).
 pub type LiveVcpu = Held<VcpuCost>;
 
 /// #2112 — a live fiber's charge on its domain's node: [`temen_ir::FIBER_STACK`] of `mem`, taken when
@@ -20339,9 +20325,8 @@ impl core::ops::DerefMut for HostBuffer {
 /// #1944 slice 3 — a vCPU's fuel: what is `left` of its last draw, and the node it draws the next one
 /// from. A safepoint burns one unit; when `left` is spent a draw refills it, and a spent chain traps
 /// [`Trap::OutOfFuel`]. With no `src` it is a fixed allowance, never refilled: an unmetered vCPU's
-/// (its chain unbounded, `left = u64::MAX`) or a carve child's (the carve path keeps its per-spawn
-/// fuel until #1867 deletes it). Dropping it hands `left` back to the chain, so a vCPU that ends, or
-/// unwinds for a freeze, returns what it drew and did not burn.
+/// (its chain unbounded, `left = u64::MAX`) or a debug tier's. Dropping it hands `left` back to the
+/// chain, so a vCPU that ends, or unwinds for a freeze, returns what it drew and did not burn.
 pub(crate) struct Fuel {
     left: u64,
     src: Option<NodeRef>,
@@ -20460,8 +20445,8 @@ pub struct Attestation {
     /// from a distrusted host must see `3` or refuse.
     pub tier: u8,
     /// `true` iff an **ancestor** (beyond the platform) holds map/read/pager rights over the domain's
-    /// backing — a §14 nested carve is exposed (the parent sees the superset); a platform-minted or
-    /// root window is not.
+    /// backing — a paged §14 child is exposed (its spawner is its pager, #2095); an unpaged child's
+    /// platform-minted window or a root window is not.
     pub window_exposed: bool,
     /// `true` iff an ancestor may **snapshot** the domain (a snapshot is a complete read). A domain is
     /// *confidential* (freezable by nobody below the platform) or *ancestor-durable*, never both.
@@ -20470,8 +20455,8 @@ pub struct Attestation {
 
 impl Default for Attestation {
     /// A **root** domain: in-process (tier 1), platform-only window (no ancestor read), not
-    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; the §14 spawn path
-    /// stamps a nested child's (exposed) report.
+    /// ancestor-freezable. The embedder overrides via [`Host::set_attestation`]; a §14 spawn stamps
+    /// its child's report.
     fn default() -> Attestation {
         Attestation {
             tier: 1,
@@ -21851,7 +21836,7 @@ pub const CAP_SELF_REAP: u32 = 12;
 /// `exec_module(module_handle, grants_ptr, grants_n)` replaces the **calling vCPU's own image** with a
 /// granted command `Module`, in place, keeping the vCPU's `TaskId` and fuel — so a parent's `wait(pid)`
 /// reaps the *command's* exit, exactly as POSIX `execve` keeps the pid. The command runs in the caller's
-/// existing window (its declared memory must equal the carve); its data segments are materialized, its
+/// existing window (its declared memory must fit it); its data segments are materialized, its
 /// import manifest is bound against a fresh powerbox carrying the inherited caps named in the grant list
 /// (POSIX fd inheritance), and it starts at its entry. On success `exec_module` **never returns** — the
 /// caller's continuation is gone (the whole point of image-replace) — so the eval loop hands the driver a
@@ -22663,19 +22648,6 @@ pub enum OpParks {
 /// are half the key, so `self.schema` names are canonical). The `Host::iface_intern` element.
 type IfaceKey = (Arc<[String]>, Arc<[FuncType]>);
 
-/// Why [`Host::spawn_named_child_from_window`] refused a §14 op-13 grant list — each maps to the
-/// fail-closed trap the wasm-JIT `env.instantiate_module` servicer raises (matching the native
-/// `grant_named_child_build`: `OutOfWindow` → `MemoryFault`, `BadName`/`NotRegrantable` → `CapFault`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantMarshalError {
-    /// A record (`grants_ptr + i*16`) or a name (`name_off..name_off+name_len`) fell outside the window.
-    OutOfWindow,
-    /// A grant name was not valid UTF-8.
-    BadName,
-    /// A record named a forged / non-re-grantable handle (`spawn_named_child` fail-closed).
-    NotRegrantable,
-}
-
 /// The host: the **host-owned handle table** (the powerbox) plus deterministic mock
 /// capability state (captured stdio, a monotonic clock). Construct with [`Host::new`],
 /// `grant_*` the initial capabilities, then pass to [`run_with_host`]; afterwards read
@@ -23480,11 +23452,11 @@ pub fn jit_validate(
 /// run-in-guest). Unlike [`jit_blob_validator`] (which compiles a unit into the caller's own domain,
 /// so the unit's data can only go where the guest's symbol table places it, and its memory is the
 /// parent window), this promotes a **whole, self-contained module** — its own memory declaration,
-/// data segments, and `_start` are exactly what the `Instantiator`'s module ops want (the child
-/// runs it confined to a carve, data materialized into that carve). So the gate is just
-/// `decode_module` (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom
-/// floor — the same trusted verifier a host-granted module passed); the carve/memory sizing is
-/// enforced later, at the op-13 spawn (`cm.memory_log2 <= size_log2`). All failures are `-EINVAL`
+/// data segments, and `_start` are exactly what a spawn wants (the child runs it in a fresh window
+/// of its own, its data materialized there). So the gate is just `decode_module`
+/// (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom floor — the same
+/// trusted verifier a host-granted module passed); the window sizing is enforced later, at the
+/// spawn. All failures are `-EINVAL`
 /// (guest-visible, non-fatal; nothing minted).
 pub fn module_blob_validator(bytes: &[u8]) -> Result<Module, i64> {
     let m = temen_encode::decode_module(bytes).map_err(|_| EINVAL)?;
@@ -26831,15 +26803,6 @@ impl Host {
         self.budgets.set_ceiling(self.own_budget, BUDGET_MAPS, maps);
     }
 
-    /// #989 — set this domain's own node's channel-memory ceiling (bytes); `-1` = unbounded. The carve
-    /// spawn paths call it on a carve child's `Host`, whose node heads a tree of its own, with the
-    /// funding record's `Budget.channel` (until #1867 deletes the carve). A detached child needs none:
-    /// its own node is the budget that paid for it, whose chain bounds its pipes (#1944 slice 3).
-    pub fn set_channel_cap(&mut self, cap: i64) {
-        self.budgets
-            .set_ceiling(self.own_budget, BUDGET_CHANNEL, cap);
-    }
-
     /// D66 — set this domain's lane cap (see [`Host::lane_cap`]); `-1` = unbounded. The embedder sets
     /// the root's before the run; a §14 spawn sets a child's from its funding budget.
     pub fn set_lane_cap(&mut self, cap: i64) {
@@ -28780,8 +28743,8 @@ impl Host {
     }
 
     /// Grant a §14 `AddressSpace` capability over the window sub-range `[base, base+size)` (§14). The
-    /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest then
-    /// `sub`-attenuates it to carve children. `size` must be a power of two and `base` a multiple of
+    /// root grant is normally the whole window (`base = 0`, `size` the window size); the guest may
+    /// `sub`-attenuate it. `size` must be a power of two and `base` a multiple of
     /// it (so the range and every sub-range are power-of-two aligned, §4/D19) — the caller's
     /// contract, mirroring how the host lays out windows.
     pub fn grant_address_space(&mut self, base: u64, size: u64) -> i32 {
@@ -29172,39 +29135,6 @@ impl Host {
         }
     }
 
-    /// §3b — **consume** a Budget at a carve spawn's commit: the room left is returned and the node's
-    /// ceilings are zeroed (the handle stays granted; `read` reports 0s), so one budget funds exactly
-    /// one carve child — split first to fund several. `None` for a dangling/mistyped handle.
-    pub(crate) fn take_budget(&mut self, h: i32) -> Option<BudgetState> {
-        match self.resolve(h, cap_id::BUDGET).ok()? {
-            Binding::Budget(node) => self.budgets.take(node).map(BudgetState::from_dims),
-            _ => None,
-        }
-    }
-
-    /// §3c.2 — the one Budget read/consume a record spawn performs, exposed for the JIT tier's
-    /// `BudgetTaker` callback (the interpreter's op-17 arm does the same peek-then-drain
-    /// inline). `drain = false` peeks (validates the handle and gates `child_size` against the
-    /// mem quota; budget untouched); `drain = true` consumes to zero at spawn commit. Returns
-    /// `None` for a dangling/mistyped handle (CapFault), `Some(Err(()))` when a bounded mem
-    /// quota refuses the carve (probeable `-EINVAL`, budget intact), else `Some(Ok((fuel,
-    /// spawn)))` with the Budget's `-1` = unbounded convention.
-    pub fn budget_for_spawn(
-        &mut self,
-        handle: i32,
-        child_size: u64,
-        drain: bool,
-    ) -> Option<Result<(i64, i64), ()>> {
-        let b = self.peek_budget(handle)?;
-        if b.mem >= 0 && child_size > b.mem as u64 {
-            return Some(Err(()));
-        }
-        if drain {
-            self.take_budget(handle)?;
-        }
-        Some(Ok((b.fuel, b.spawn)))
-    }
-
     /// Grant a §15 / PROCESS.md §5 `Budget`, a node under this domain's own node with these
     /// ceilings, returning its handle. The embedder mints it with what it lends a domain;
     /// the guest `split`s child nodes under it and `read`s the room left. A field of `-1` means
@@ -29243,29 +29173,19 @@ impl Host {
         self.attestation
     }
 
-    /// PROCESS.md §5 — a **detached** child's attestation: same in-process tier (never a
-    /// Spectre boundary — real distrust is a separate process), but `window_exposed = false`
-    /// (no ancestor below the platform holds read authority over its platform-minted window)
-    /// and never ancestor-freezable. The jacl distrust-spawner report.
-    fn detached_child_attestation(&self) -> Attestation {
+    /// PROCESS.md §5 — a **detached** child's attestation: the spawner's in-process tier (never a
+    /// Spectre boundary — real distrust is a separate process), and `window_exposed` only for a
+    /// `paged` child (#2095): its spawner is its pager, which chooses each page's contents at first
+    /// touch and sees every fault address in the child's coordinates. Otherwise no ancestor below the
+    /// platform holds rights over its platform-minted window: the jacl distrust-spawner report.
+    fn detached_child_attestation(&self, paged: bool) -> Attestation {
         Attestation {
             tier: self.attestation.tier,
-            window_exposed: false,
+            window_exposed: paged,
             // Derived (#1440): an ancestor may snapshot this child iff the spawner holds freeze
             // authority *and* the subtree is durable. Both conjuncts matter — authority is *who
             // may*, durability is *whether a snapshot is possible at all*.
             freeze_exposed: self.durable && self.holds_freeze_authority(),
-        }
-    }
-
-    /// The §6 [`Attestation`] to stamp on a non-detached child this host builds: the parent's
-    /// isolation tier, `window_exposed` (its parent reads its window), and never ancestor-freezable
-    /// (it is not durable).
-    fn child_attestation(&self) -> Attestation {
-        Attestation {
-            tier: self.attestation.tier,
-            window_exposed: true,
-            freeze_exposed: false,
         }
     }
 
@@ -30059,41 +29979,6 @@ impl Host {
         }
     }
 
-    /// PROCESS.md S2 (JIT parity) — build a §14 **granted child** powerbox: a fresh `Host` holding an
-    /// `Instantiator` + `AddressSpace` over its own window `[0, child_size)` and the parent's
-    /// re-granted coordinate-free capability `grant_handle` (`Stream`/`Exit`/`Clock`). Returns the
-    /// child `Host` and its three entry-arg handles `(instantiator, address_space, grant)`, or `None`
-    /// for a forged / non-copyable handle ([`Self::resolve_copyable`]). A stdout/stderr `Stream` grant
-    /// points the child's sink at the parent's shared buffer (stdio inheritance), so the child's output
-    /// reaches the granting embedder rather than the child's discarded host buffer.
-    ///
-    /// This is the child-host construction the retired `instantiate_granted` (op 8) inlined, factored
-    /// out so the **JIT** backend could build the *same* child powerbox host-side (via
-    /// `temen_run::grant_child_build`) and keep both backends in differential lockstep — the child sees an
-    /// identical set of handles and the same shared sink.
-    ///
-    /// The grant may be a coordinate-free cap (`Stream`/`Exit`/`Clock`) **or a pipe end** — the latter
-    /// aliases its shared FIFO into the child (the cross-domain `cmd1 | cmd2` grant), see
-    /// [`Self::regrant_into_child`].
-    pub fn spawn_granted_child(
-        &mut self,
-        grant_handle: i32,
-        child_size: u64,
-    ) -> Option<(Host, i32, i32, i32)> {
-        // Reject a non-grantable handle before building anything (fail closed, no state mutated).
-        if !self.can_regrant(grant_handle) {
-            return None;
-        }
-        let mut ch = self.child_host();
-        // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
-        ch.set_self_module_opt(self.self_module.clone());
-        // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation());
-        let (cinst, cas) = ch.grant_starter_caps(child_size);
-        let cg = self.regrant_into_child(grant_handle, &mut ch)?;
-        Some((ch, cinst, cas, cg))
-    }
-
     /// The spawn's authority check for one entry of a grant list: a re-grantable table handle
     /// ([`Self::can_regrant`]), or — #744 — a live self-serve grant ([`GRANT_SERVE_LIVE_TAG`]) naming
     /// one of this domain's own impl-exports, honored only when its child can call back into it
@@ -30170,8 +30055,8 @@ impl Host {
     ///
     /// - `CapFault`: `handle` is one no spawn could grant ([`Self::can_grant`]). Checked first, so a
     ///   forgery traps whatever became of the child.
-    /// - `-EINVAL`: no live child: it has ended, or it is a carve child — a carve charges no node, so
-    ///   its own is the run node — whose path is retired (INVARIANTS #13, #1867).
+    /// - `-EINVAL`: no live child: it has ended, or it holds no budget node of its own (its node is
+    ///   the run's).
     /// - `-EINVAL`: a `Jit` table, whose install slots size the child's dispatch table, or a forkable
     ///   host proc, which wires the child's signal doors. Both are fixed when the child starts, so
     ///   only a spawn grants them.
@@ -30559,32 +30444,14 @@ impl Host {
         *tree = nodes.to_vec();
     }
 
-    /// PROCESS.md S2 (JIT parity) — build a §14 **named-grant child** powerbox: a fresh `Host` holding
-    /// an `Instantiator` + `AddressSpace` over `[0, child_size)` and each of `grants` (a list of
-    /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`.
-    /// Returns the child `Host` and its `(instantiator, address_space)` handles, or `None` if **any**
-    /// grant's handle is forged / non-copyable (the whole spawn fails closed, `CapFault`, matching the
-    /// interpreter's op-11 path). stdout/stderr grants share the parent's sinks (stdio inheritance).
-    ///
-    /// The multi-cap, by-name analog of [`Self::spawn_granted_child`]; the JIT reads the guest's grant
-    /// records from the window (host-side, `temen_run::grant_named_child_build`) and calls this, so both
-    /// backends register the same names against the same shared sinks.
-    pub fn spawn_named_child(
-        &mut self,
-        grants: &[(String, i32)],
-        child_size: u64,
-    ) -> Option<(Host, i32, i32)> {
-        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        let attestation = self.child_attestation();
-        self.spawn_child_powerbox(grants, child_size, attestation, None, None)
-    }
-
-    /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
-    /// re-grants, but the child attests `window_exposed = false` (no ancestor below the platform holds
-    /// read authority over its minted window) and its starter caps span `reservation` — the whole
-    /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-17
-    /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
-    /// both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
+    /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: each of `grants` (a list of
+    /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`
+    /// (stdout/stderr grants share the spawner's sinks), or `None` if any handle is forged or not
+    /// re-grantable — the whole spawn fails closed. The child is never paged, so it attests
+    /// `window_exposed = false` (no ancestor below the platform holds rights over its minted window),
+    /// and its starter caps span `reservation` — the whole window reservation, a root's shape, so the
+    /// child's `vm_map` grows it. The native JIT's op-17 thunk builds the child powerbox through this
+    /// (`temen_run::grant_detached_child_build`), so both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
     /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.
     pub fn spawn_detached_child(
         &mut self,
@@ -30593,7 +30460,8 @@ impl Host {
         lease: Lease,
         lane: i64,
     ) -> Option<(Host, i32, i32)> {
-        let attestation = self.detached_child_attestation();
+        // A pager record reaches only the tree-walker's arm, so this child is never paged.
+        let attestation = self.detached_child_attestation(false);
         // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
         // op-17 arm sets it (this builder is the native path's twin of that arm).
         // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
@@ -30660,38 +30528,9 @@ impl Host {
         Some((ch, cinst, cas))
     }
 
-    /// **Marshal a §14 op-13 grant list from a confined window and build the child powerbox** (#1025
-    /// slice 3a) — the safe, wasmi-friendly counterpart of the native `temen_run::grant_named_child_build`.
-    /// Reads `grants_n` × 16-byte records `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
-    /// window-relative `grants_ptr` from `window` (the parent's confined, readable window), then re-grants
-    /// each `(name, handle)` from `self` via [`Self::spawn_named_child`]. `flags` (bytes 12..16) is
-    /// reserved and ignored, exactly as on the native and interpreter (`read_grant_records`) paths.
-    ///
-    /// Fail-closed ([`GrantMarshalError`]): an out-of-window record/name (`OutOfWindow`), a non-UTF-8 name
-    /// (`BadName`), or any non-re-grantable handle (`NotRegrantable`, surfaced by `spawn_named_child`)
-    /// refuses the whole spawn — no partial child is built. This is the mechanism the wasm-JIT
-    /// `env.instantiate_module` servicer calls to carry a shared `fs` (or `stdout`) across the emitted
-    /// bounce; the `can_regrant` re-grant policy stays in `spawn_named_child` (INVARIANTS §4 — the
-    /// constructor is mechanism, the authority decision is one place).
-    pub fn spawn_named_child_from_window(
-        &mut self,
-        window: &[u8],
-        grants_ptr: u64,
-        grants_n: u64,
-        child_size: u64,
-    ) -> Result<(Host, i32, i32), GrantMarshalError> {
-        let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))
-            .map_err(|t| match t {
-                Trap::CapFault => GrantMarshalError::BadName,
-                _ => GrantMarshalError::OutOfWindow,
-            })?;
-        self.spawn_named_child(&grants, child_size)
-            .ok_or(GrantMarshalError::NotRegrantable)
-    }
-
     /// FORK.md §8.6 (#1080) — carry an `execve` **image-replace**'s process-surviving state from `self`
     /// (the old powerbox, about to be dropped) into `child` (the command's fresh powerbox from
-    /// [`Self::spawn_named_child`]). Same-process semantics: the personality (`host_procs`) moves
+    /// [`Self::exec_image`]). Same-process semantics: the personality (`host_procs`) moves
     /// verbatim (fds/pid/env survive exec, POSIX), the exit-hook + signal + stop/term/park cells are
     /// shared so the exec'd image stays kill/stop/wait-addressable, and the process's pipe **ends** are
     /// re-installed into the new powerbox (returned as `(old, new)` remap pairs) with the exec-remap
@@ -31089,8 +30928,8 @@ impl Host {
     /// The new image's starter caps span `window_reserved`, the caller's **whole window** — its
     /// reservation, the confinement bound its `GuestMem` reports ([`GuestMem::window_size`]). The
     /// image replaces the caller's in the same window, so it holds the memory authority the caller
-    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, a root's
-    /// up to its reservation and a §14 child's up to its carve. Spanning only the backed prefix, a
+    /// held there: its `vm_map` grows the heap past the backed prefix as the caller's could, up to
+    /// its reservation. Spanning only the backed prefix, a
     /// process lost its heap's growth on `execve`, and a compiler it ran ran out of memory (#763).
     ///
     /// `Err(errno)` is a refusal that changed nothing — the caller keeps running and gets the errno:
@@ -39063,10 +38902,21 @@ mod channel_budget_tests {
     //! without a double-charge and the refund credits the minter's node exactly once.
     use super::*;
 
+    /// A root whose embedder grants `channel` bytes of channel memory, and the default of the rest.
+    fn root_with_channel(channel: i64) -> Host {
+        let mut h = Host::new();
+        h.set_grant(
+            DEFAULT_MEM as i64,
+            channel,
+            DEFAULT_SPAWN as i64,
+            DEFAULT_MAPS as i64,
+        );
+        h
+    }
+
     #[test]
     fn cap_bounds_guest_pipe_mints_and_refunds_at_last_close() {
-        let mut h = Host::new();
-        h.set_channel_cap(2 * PIPE_CAP as i64); // room for exactly two pipes
+        let mut h = root_with_channel(2 * PIPE_CAP as i64); // room for exactly two pipes
 
         // Two guest mints fit; the third is refused (fail-closed, nothing charged past the cap).
         assert!(h.try_grant_pipe().is_some());
@@ -39109,8 +38959,7 @@ mod channel_budget_tests {
 
     #[test]
     fn fork_shares_a_backing_without_double_charging_and_refunds_the_minter_once() {
-        let mut parent = Host::new();
-        parent.set_channel_cap(4 * PIPE_CAP as i64);
+        let mut parent = root_with_channel(4 * PIPE_CAP as i64);
         assert!(parent.try_grant_pipe().is_some()); // pipe 0, charged to the parent
         assert_eq!(parent.channel_used(), PIPE_CAP as i64);
 
@@ -39188,8 +39037,7 @@ mod channel_budget_tests {
     /// Linux's `pipe` releases what it made when the copy-out faults.
     #[test]
     fn a_mint_whose_fds_fault_leaves_nothing_behind() {
-        let mut h = Host::new();
-        h.set_channel_cap(PIPE_CAP as i64); // room for exactly one pipe
+        let mut h = root_with_channel(PIPE_CAP as i64); // room for exactly one pipe
         let mut window = vec![0u8; 4096];
         let mut mem = WindowMem::new(&mut window, 4096);
         let held = |h: &Host| h.table.iter().filter(|s| s.entry.is_some()).count();
@@ -39223,9 +39071,9 @@ mod channel_budget_tests {
 
     #[test]
     fn embedder_and_terminal_mints_are_uncharged() {
-        let mut h = Host::new();
-        h.set_channel_cap(0); // a guest mint would be refused at this cap
-                              // Embedder-owned inputs are not guest-minted channel memory — uncharged, unaffected by the cap.
+        // A guest mint would be refused at this cap. Embedder-owned inputs are not guest-minted
+        // channel memory — uncharged, unaffected by the cap.
+        let mut h = root_with_channel(0);
         let _ = h.grant_terminal_input();
         let _ = h.grant_input_pipe();
         assert_eq!(

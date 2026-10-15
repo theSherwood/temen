@@ -4280,12 +4280,11 @@ impl CompiledModule {
         // the guard skips, matching the interpreter's fit check. The snapshot paths re-assert RW
         // (`restore_rw`/`read_low`) before any host read.
         let seeded = window.apply_prots(
-            0,
             &self.restore_prots,
             self.win_mapped as u64,
             init_mem.unwrap_or(&[]),
         ) && (self.null_guard > self.win_mapped as u64
-            || window.seed_null_guard(0, self.null_guard));
+            || window.seed_null_guard(self.null_guard));
         seeded.then_some((window, ro))
     }
 

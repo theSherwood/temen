@@ -163,20 +163,6 @@ fn base_linker(engine: &Engine, memory: Memory) -> Linker<HostState> {
     linker
         .func_wrap(
             "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _w: i32,
-             _i: i32,
-             _e: i64,
-             _o: i64,
-             _s: i64,
-             _q: i64|
-             -> i32 { unreachable!("no op-0 instantiate in this unit") },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
             "thread_spawn",
             |_: Caller<'_, HostState>, _f: i32, _sp: i64, _a: i64| -> i32 { unreachable!() },
         )

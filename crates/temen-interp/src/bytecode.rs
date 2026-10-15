@@ -1841,15 +1841,15 @@ fn granted_program(
 }
 
 /// A §5 detached child as every in-process bytecode driver builds it — the **one definition** of
-/// admission and of the child powerbox (INVARIANTS #15), made by [`admit_detached_child`] (and by
-/// `admit_confined_child` for the carve spawn, until it retired, #1867) and shared by the cooperative executor
-/// (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the debug scheduler. Only *how
+/// admission and of the child powerbox (INVARIANTS #15), made by [`admit_detached_child`] and shared
+/// by the cooperative executor (`drive`), the OS-thread parallel driver ([`drive_threads`]) and the
+/// debug scheduler. Only *how
 /// the child is scheduled* differs per driver: an executor task, an OS thread, a debug task. (Until
 /// #1855 each driver admitted a confined child its own way, and two of them trapped on a budget or a
 /// grant list the cooperative driver serves.)
 struct AdmittedChild {
-    /// The child's window: a view of the holder's carve (confined), or a fresh window of its own
-    /// (detached) once its [`FreshWindow`] is built over the driver's backing.
+    /// The child's fresh window of its own, once its [`FreshWindow`] is built over the driver's
+    /// backing.
     mem: Option<Mem>,
     /// The child powerbox: the starter `Instantiator`/`AddressSpace`, the by-name re-grants, the
     /// module the child serves, its import manifest bound, and a funding budget's channel ceiling.
@@ -1857,14 +1857,12 @@ struct AdmittedChild {
     program: ChildProgram,
     /// The entry's arguments: the starter `Instantiator` (plus `AddressSpace` for a two-arg entry).
     args: Vec<Value>,
-    /// The child's fuel (#1944 slice 3): a detached child draws from its own budget node, the one
-    /// that paid for its window; a carve child keeps its fixed allowance (the record's budget, or the
-    /// op's quota, capped at what its parent can still burn).
+    /// The child's fuel (#1944 slice 3): it draws from its own budget node, the one that paid for its
+    /// window.
     fuel: Fuel,
-    /// A detached child's window lease: `Budget` accounts live windows (INVARIANTS #3, 2026-09-29),
-    /// so the driver gives what it holds back to the spawner's budget when the child ends. `None` for
-    /// a confined (carve) child, which spends no `Budget.mem`.
-    lease: Option<Lease>,
+    /// The child's window lease: `Budget` accounts live windows (INVARIANTS #3, 2026-09-29), so the
+    /// driver gives what it holds back to the spawner's budget when the child ends.
+    lease: Lease,
 }
 
 /// An [`AdmittedChild`] ready to schedule ([`AdmittedChild::build`]): its program landed in the run's
@@ -1876,7 +1874,7 @@ struct BuiltChild {
     mem: Option<Mem>,
     host: Host,
     fuel: Fuel,
-    lease: Option<Lease>,
+    lease: Lease,
 }
 
 impl AdmittedChild {
@@ -1916,9 +1914,7 @@ impl AdmittedChild {
                 // #2268 — its window, if built, started: what it held of `maps` goes back too.
                 let mut host = host;
                 host.release_memory();
-                if let Some(lease) = lease {
-                    refund(lease);
-                }
+                refund(lease);
                 Err(t)
             }
         }
@@ -2121,7 +2117,7 @@ fn admit_detached_child(
     let mut child_host = host.child_host();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
-    child_host.set_attestation(host.detached_child_attestation());
+    child_host.set_attestation(host.detached_child_attestation(false));
     // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
     // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
     child_host.set_lane_cap(lane);
@@ -2160,7 +2156,7 @@ fn admit_detached_child(
         program,
         args,
         fuel,
-        lease: Some(lease),
+        lease,
     };
     let window = FreshWindow {
         size_log2: size_log2 as u8,
@@ -2196,9 +2192,7 @@ fn admit_detached_in_process(
         Some(make) => match make(window.size_log2) {
             Some(back) => (Some(back), emit(&child)),
             None => {
-                if let Some(lease) = child.lease {
-                    host.release_detached(lease);
-                }
+                host.release_detached(child.lease);
                 return Ok(None);
             }
         },
@@ -4425,8 +4419,8 @@ impl<'p> Vcpu<'p> {
     }
 
     /// [`new_child_in`] with the window mask chosen by the caller: a thread shares its **spawner's**
-    /// window, which for a §14 confined spawner is its carve — smaller than the guest module's
-    /// declared memory — so the driver passes the actual window's `size_log2` (CONSOLIDATION.md §11).
+    /// window, which a §14 spawn may size past the guest module's declared memory, so the driver
+    /// passes the actual window's `size_log2` (CONSOLIDATION.md §11).
     pub fn new_child_sized(
         prog: &'p VcpuProgram,
         module: u32,
@@ -5104,7 +5098,7 @@ impl<'p> Vcpu<'p> {
                             match self.pending_child(child, window) {
                                 Ok(child) => {
                                     // The window lease, filed against the handle the host delivers.
-                                    self.pending_lease = lease;
+                                    self.pending_lease = Some(lease);
                                     self.pending = Some(dst);
                                     self.pending_child = Some(child);
                                     return VcpuEvent::InstantiateDetached { size_log2 };
@@ -5224,7 +5218,7 @@ impl<'p> Vcpu<'p> {
         };
         let (size_log2, lease) = (window.size_log2, child.lease);
         let child = self.pending_child(child, window)?;
-        self.pending_lease = lease;
+        self.pending_lease = Some(lease);
         Ok(Some((child, size_log2)))
     }
 
@@ -6717,8 +6711,7 @@ fn journaled_write(
 /// ([`ScheduledDebugRun::task_mem`]): the root's (`None`), journaled, or a child env's (#2072). A
 /// child's edit is not journaled, since the journal's pre-images cover the root window only. Each
 /// anchor carries a live detached child's whole window (#2058), so an undo restores it from there and
-/// the replay re-applies the edit at its turn. (A carve's bytes are the root's, which the journal
-/// records for no child — #2064, retiring with the carve.)
+/// the replay re-applies the edit at its turn.
 fn write_task_window(
     journal: &mut super::journal::Journal,
     turn: u64,
@@ -7941,7 +7934,7 @@ fn dbg_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|lease| (spawner, lease)),
+        lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -12801,7 +12794,7 @@ struct ChildEnv {
     /// a fork twin or an exec image, which are not §14 children. A kill descends through it.
     spawner: Option<usize>,
     /// A §14 child's domain, not a fork twin's or an exec image's: its end releases the services
-    /// it was a client of (#1217), as the oracle's does for a nested or detached child's.
+    /// it was a client of (#1217), as the oracle's does for a detached child's.
     nested: bool,
     /// The unit of the run's [`ModuleSource`] this env's domain runs, which a fork twin of it runs
     /// too. The root domain's is unit 0.
@@ -12903,7 +12896,7 @@ fn coop_start_child(
     });
     let cidx = tasks.len();
     tasks.push(TaskSlot {
-        lease: lease.map(|lease| (spawner, lease)),
+        lease: Some((spawner, lease)),
         ..TaskSlot::new(vt, Some(eidx), LiveVcpu::none())
     });
     let handle = tasks[ti].threads.len() as i32;
@@ -15476,8 +15469,8 @@ impl SchedCore {
                 // #816 env-routed tier-up: the thread shares its spawner's env (below), so it may
                 // tier up exactly when that env's window is tier-up-servable — the driver answers
                 // every per-event read (`win` base, mapped extent, page state) for the pending
-                // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
-                // thread tiers up over its own carve. A window the driver cannot flatly address (a
+                // task's env ([`CoopRun::pending_win`] and friends), so a §14 child's thread tiers
+                // up over that child's own window. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
                 // is always right. So does a thread of a child over a memory of its own, whose one
                 // context its root task holds (#1414 ED-2), and a child domain whose calls would not
@@ -16177,9 +16170,8 @@ impl CoopRun {
     /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib
     /// re-syncs to every emitted instance's `"mapped"` global after a [`bounce`](Self::bounce) (a
     /// bounced callback may have grown the window). `0` when there is no window or its state is not
-    /// representable by one bound. #816: routed to the pending round-trip's task env, so a confined
-    /// child's own extent (its fully-mapped carve) bounds its emitted accesses — the confinement
-    /// bound — rather than the root's.
+    /// representable by one bound. #816: routed to the pending round-trip's task env, so a child's
+    /// own extent bounds its emitted accesses — the confinement bound — rather than the root's.
     pub fn window_scalar_extent(&self) -> u64 {
         self.pending_mem()
             .and_then(|m| m.scalar_extent())
@@ -16243,9 +16235,9 @@ impl CoopRun {
 
     /// #1009 paged tier-up: the pending task's window memory-map introspection ([`MemMapInfo`]) — a
     /// paged coop driver rebuilds its page-state table from this. `None` for a memory-less run.
-    /// #816: routed to the pending round-trip's task env, so a confined child's own page map (its
-    /// carve geometry, its `protect`/`unmap` state) is what the emitted page check enforces —
-    /// window-relative on both sides, no translation needed.
+    /// #816: routed to the pending round-trip's task env, so a child's own page map (its
+    /// `protect`/`unmap` state) is what the emitted page check enforces — window-relative on both
+    /// sides, no translation needed.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.pending_mem().map(|m| m.map_info())
     }
@@ -16739,7 +16731,7 @@ mod live_cap_tests {
             program: (0, std::sync::Arc::new(unit())),
             args: Vec::new(),
             fuel: Fuel::fixed(0),
-            lease: Some(lease),
+            lease,
         };
         assert_eq!(held(&host), (WINDOW as i64, 1), "the admission's charge");
         (host, child)

@@ -267,20 +267,6 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
     linker
         .func_wrap(
             "env",
-            "instantiate",
-            |_: Caller<'_, HostState>,
-             _win: i32,
-             _inst: i32,
-             _entry: i64,
-             _off: i64,
-             _slog: i64,
-             _quota: i64|
-             -> i32 { unreachable!("no op-0 spawn in this unit") },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "env",
             "thread_spawn",
             |_: Caller<'_, HostState>, _f: i32, _sp: i64, _a: i64| -> i32 {
                 unreachable!("no thread op in this unit")

@@ -1979,12 +1979,14 @@ SELECT count(*), sum(x), avg(x) FROM t;
   },
 };
 
-// Size the run's shared window from the source's `memory N` declaration (64 KiB minimum — the wasm
-// page granularity §14 carves align to; 16 MiB cap keeps a typo from asking for the whole memory).
+// The threaded runner's window, from the source's `memory N` declaration: at least 64 KiB (one wasm
+// page). A module never runs over less than it declares (#2414: emitted code checks its accesses
+// against the declaration, and the engine refuses a smaller window), so a declaration past 16 MiB, the
+// most this page allocates (a typo shouldn't ask for the whole memory), is refused, not shrunk: `null`.
 function winSizeOf(src) {
   const m = /^\s*memory\s+(\d+)/m.exec(src);
-  const log2 = Math.min(Math.max(m ? Number(m[1]) : 16, 16), 24);
-  return 1 << log2;
+  const log2 = Math.max(m ? Number(m[1]) : 16, 16);
+  return log2 <= 24 ? 1 << log2 : null;
 }
 
 // ---- per-card run machinery ----------------------------------------------------------------------
@@ -4869,6 +4871,14 @@ async function runText(c) {
     return;
   }
 
+  const winSize = winSizeOf(src);
+  if (winSize === null) {
+    const msg = 'run refused: the threaded runner allocates at most 16 MiB (memory 24)';
+    setState(c, 'error', msg);
+    logTo(c, msg);
+    runEnd(rec, { ok: false });
+    return;
+  }
   aborter = new AbortController();
   c.el.run.disabled = true;
   c.el.stop.disabled = false;
@@ -4884,7 +4894,7 @@ async function runText(c) {
     // (fail-closed per-function; validated interp≡tier-up in `browser-tierup-mainline-test.mjs`). The
     // §22-`jit`/§14-`inst` recipes have their own JIT; `io` stays on the interpreter for now.
     tierup: mode === 'plain',
-    winSize: winSizeOf(src),
+    winSize,
     signal: aborter.signal,
   };
   const t0 = performance.now();

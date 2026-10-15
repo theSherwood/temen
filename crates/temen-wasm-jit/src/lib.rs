@@ -847,8 +847,7 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// declared with its import's exact widths: `join: (i32 child) -> (i64 status, i64 value)`,
 /// `instantiate_rec: (i64 record) -> i32`. Every other Instantiator call stays out-of-subset
 /// (fail-closed), interpreted, where the shared contract (`temen_ir::served_contract`)
-/// answers it: the retired carve spawns (ops 0 and 13, #1867) trap `CapFault` there, and the fixed
-/// `env.instantiate` import slot is unused.
+/// answers it: the retired carve spawns (ops 0 and 13, #1867) trap `CapFault` there.
 fn is_nested_cap(type_id: u32, op: u32, sig: &FuncType) -> bool {
     use ValType::{I32, I64};
     type_id == cap_id::INSTANTIATOR
@@ -861,7 +860,7 @@ fn is_nested_cap(type_id: u32, op: u32, sig: &FuncType) -> bool {
 
 /// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
 /// When it does (and only then), nested mode appends the `env.instantiate_rec` import as func
-/// import 8, shifting the emitted-function base to 9 for that module alone: existing modules
+/// import 7, shifting the emitted-function base to 8 for that module alone: existing modules
 /// keep their exact import set, so no driver (wasmi harness or browser JS) changes until it
 /// actually loads an op-17 module.
 fn module_uses_rec(m: &Module) -> bool {
@@ -873,28 +872,6 @@ fn module_uses_rec(m: &Module) -> bool {
                     Inst::CapCall {
                         type_id: cap_id::INSTANTIATOR,
                         op: 17,
-                        ..
-                    }
-                )
-            })
-        })
-    })
-}
-
-/// #816: can this module ever run as (or spawn) a **same-module §14 child** — a task whose window
-/// is a carve *smaller* than the emit-time window? Any `Instantiator` `call.cap` qualifies. No op
-/// spawns one any more: the carve ops are retired (#1867) and so is op 17's `module = -1` (#2219),
-/// so the gate is conservative only, and goes with #1867's wasm-JIT carve gates. When true,
-/// [`emit_module`] turns bound-check **elision** off, because an elision proof against the
-/// emit-time window is no floor for a child carve — see `elide_bound` there.
-fn module_can_spawn_same_module(m: &Module) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
                         ..
                     }
                 )
@@ -934,7 +911,7 @@ fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
 /// carry the run's **powerbox** (the reactor-path contract, not the throwaway-window one), so the
 /// wrapper's `call.cap` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
 /// then encodes identically on both tiers. INSTANTIATOR ops stay **inline** (the dedicated
-/// `env.instantiate`/`env.join` bounce); all other cap ops are left inline and fail closed.
+/// `env.instantiate_rec`/`env.join` bounce); all other cap ops are left inline and fail closed.
 pub fn outline_nested_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
@@ -1863,25 +1840,23 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
 /// `IMPORTED_FUNCS + its position among the emitted functions`.
 const IMPORTED_FUNCS: u32 = 2;
-/// In §14 `nested_caps` mode two more func imports follow `env.call_interp` — `env.instantiate` (2,
-/// unused since the carve spawn retired, #1867) and `env.join` (3) — so emitted functions start at
-/// `IMPORTED_FUNCS + 2 = 4`. These indices are valid only in that mode (the caller sizes `wasm_of`
-/// with the matching base).
-const JOIN_IMPORT_IDX: u32 = 3;
-/// §11 thread/futex host bounces (CONSOLIDATION.md §11 slice 3): func imports 4-7 in nested mode.
+/// In §14 `nested_caps` mode `env.join` follows `env.call_interp` as func import 2. These indices
+/// are valid only in that mode (the caller sizes `wasm_of` with the matching base).
+const JOIN_IMPORT_IDX: u32 = 2;
+/// §11 thread/futex host bounces (CONSOLIDATION.md §11 slice 3): func imports 3-6 in nested mode.
 /// The servicer supplies the unit's module context (it knows which module it instantiated), so the
 /// imports carry none. `thread_join`/`mem_wait` block the calling thread — legal on the par tiers,
 /// where every vCPU is a real thread (the Worker model; `worker.js` already blocks in `Atomics.wait`).
-const THREAD_SPAWN_IMPORT_IDX: u32 = 4;
-const THREAD_JOIN_IMPORT_IDX: u32 = 5;
-const MEM_WAIT_IMPORT_IDX: u32 = 6;
-const MEM_NOTIFY_IMPORT_IDX: u32 = 7;
-/// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.instantiate`,
-/// `env.join`, `env.thread_spawn`, `env.thread_join`, `env.mem_wait`, `env.mem_notify`).
-const NESTED_IMPORTED_FUNCS: u32 = 8;
+const THREAD_SPAWN_IMPORT_IDX: u32 = 3;
+const THREAD_JOIN_IMPORT_IDX: u32 = 4;
+const MEM_WAIT_IMPORT_IDX: u32 = 5;
+const MEM_NOTIFY_IMPORT_IDX: u32 = 6;
+/// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.join`,
+/// `env.thread_spawn`, `env.thread_join`, `env.mem_wait`, `env.mem_notify`).
+const NESTED_IMPORTED_FUNCS: u32 = 7;
 /// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
-/// func import 8 only when [`module_uses_rec`]; the emitted-function base is then 9.
-const INSTANTIATE_REC_IMPORT_IDX: u32 = 8;
+/// func import 7 only when [`module_uses_rec`]; the emitted-function base is then 8.
+const INSTANTIATE_REC_IMPORT_IDX: u32 = 7;
 /// `env.call_interp` scratch: the cross-tier call marshals its arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -2005,11 +1980,12 @@ pub fn compile_module_with_split(
 }
 
 /// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `call.cap` to INSTANTIATOR
-/// `instantiate` (op 0) / `join` (op 1) is lowered to a host-driver bounce (`env.instantiate` /
-/// `env.join`) instead of failing out-of-subset — so a unit whose entry spawns a nested confined VM
-/// runs on the wasm tier, the child spawn/join happening host-side exactly as the interpreter surfaces
-/// `VcpuStop::Instantiate`. Two extra func imports precede the emitted functions, so their wasm indices
-/// start at `NESTED_IMPORTED_FUNCS`. A function outside the nested subset is kept as a **cross-tier
+/// `instantiate_rec` (op 17) / `join` (op 1) is lowered to a host-driver bounce
+/// (`env.instantiate_rec` / `env.join`) instead of failing out-of-subset — so a unit whose entry
+/// spawns a child runs on the wasm tier, the child spawn/join happening host-side exactly as the
+/// interpreter surfaces `VcpuStop::InstantiateDetached`. The nested func imports precede the emitted
+/// functions, so their wasm indices start at `NESTED_IMPORTED_FUNCS` (one more with
+/// `env.instantiate_rec`). A function outside the nested subset is kept as a **cross-tier
 /// leaf** via `env.call_interp` iff its signature is all-integer — the [`outline_nested_cap_calls`]
 /// ADDRESS_SPACE wrappers ride this (run them with a powerbox-carrying callback) — else `Err`; the
 /// entry (func 0) must itself be emittable.
@@ -2170,7 +2146,7 @@ pub fn compile_module_nested_paged(
 ///   instantiate/join/thread functions — still tiers up onto emitted wasm with its bounces intact
 ///   ([`DriveMode::InterpDriven`]).
 ///
-/// Both modes emit the **same** nested import set (`env.instantiate`/`join`/`thread_spawn`/…), so a
+/// Both modes emit the **same** nested import set (`env.join`/`thread_spawn`/…), so a
 /// host driving this artifact provides that one import layout regardless of the chosen mode. This
 /// folds the browser's hand-rolled nested→threaded fallback into the library. Entry is func 0 (the
 /// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `call.cap`s
@@ -3617,34 +3593,22 @@ fn emit_module(
     };
     // #816 env-routed tier-up: the bound-check **elision** budget. Elision proves an access within
     // the emit-time window (`mapped` above) and skips the live-`"mapped"`-global trap branch — sound
-    // only while every window this emitted code may serve is at least that large ("the window only
-    // grows"). A module that can spawn **same-module §14 children** breaks that floor: a child task
-    // tiers up into these same functions over a *carve* smaller than the emit window, where an
-    // elided access could land past the carve (and, with the per-event `win` base, past the run
-    // backing). For such modules emit every access with the full live-bound check (`elide_bound =
-    // 0` makes every `in_window` proof fail, fail-closed); the live `"mapped"` sync then carries
-    // each event's own window bound — root, child carve, or fork twin alike. Pure perf cost,
-    // confinement-neutral for modules that never instantiate.
-    let elide_bound: u64 = if module_can_spawn_same_module(m) {
-        0
-    } else {
-        mapped
-    };
+    // because every window this emitted code serves is at least that large and only grows: a run's
+    // (every driver opens it at the declaration or more, #2414), a thread's (its spawner's), and a
+    // §14 child's (minted at exactly its module's declaration, which the spawn checks).
+    let elide_bound = mapped;
 
     // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
     // one per emitted function (dedup'd).
     let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
     // §14 host-bounce import types (added up front so the import section can reference them):
-    //   env.instantiate: (i32 win, i32 inst, i64 entry, i64 off, i64 size_log2, i64 quota) -> i32
-    //   env.join:        (i32 inst, i32 child) -> (i64 status, i64 value)
-    let (mut instantiate_ty, mut join_ty) = (0u32, 0u32);
+    //   env.join: (i32 inst, i32 child) -> (i64 status, i64 value)
+    let mut join_ty = 0u32;
     let uses_rec = nested_caps && module_uses_rec(m);
     let mut instantiate_rec_ty = 0u32;
     let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
         (0u32, 0u32, 0u32, 0u32);
     if nested_caps {
-        instantiate_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7f, 0x7e, 0x7e, 0x7e, 0x7e], vec![0x7f]));
         join_ty = types.len() as u32;
         types.push((vec![0x7f, 0x7f], vec![0x7e, 0x7e]));
         if uses_rec {
@@ -3933,11 +3897,11 @@ fn emit_module(
 
     // Import section (2): env.memory, env.trap (type 0), env.call_interp (type 1); plus — in
     // shared-reserved (B2) mode — the shared funcref table, and — in §14 `nested_caps` mode —
-    // env.instantiate + env.join (the VM-in-VM host bounce).
+    // env.join (the VM-in-VM host bounce) and the thread/futex bounces.
     let mut sec = Vec::new();
     let n_imports = 3
         + reserved_table_log2.is_some() as u64
-        + if nested_caps { 6 } else { 0 }
+        + if nested_caps { 5 } else { 0 }
         + uses_rec as u64;
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
@@ -3961,10 +3925,7 @@ fn emit_module(
     sec.push(0x00); // func
     uleb(&mut sec, 1); // type index 1
     if nested_caps {
-        // §14 VM-in-VM host bounces (func imports 2 and 3, see JOIN_IMPORT_IDX).
-        import_name(&mut sec, "env", "instantiate");
-        sec.push(0x00); // func
-        uleb(&mut sec, instantiate_ty as u64);
+        // §14 VM-in-VM host bounce (func import 2, see JOIN_IMPORT_IDX).
         import_name(&mut sec, "env", "join");
         sec.push(0x00); // func
         uleb(&mut sec, join_ty as u64);
@@ -3981,7 +3942,7 @@ fn emit_module(
         sec.push(0x00); // func
         uleb(&mut sec, mem_notify_ty as u64);
         if uses_rec {
-            // §3c.3 — appended after the fixed eight (func import 8), so no existing import shifts.
+            // §3c.3 — appended after the fixed seven (func import 7), so no existing import shifts.
             import_name(&mut sec, "env", "instantiate_rec");
             sec.push(0x00); // func
             uleb(&mut sec, instantiate_rec_ty as u64);
