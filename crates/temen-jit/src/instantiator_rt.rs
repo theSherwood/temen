@@ -227,7 +227,7 @@ unsafe fn file_task(
     code: std::sync::Arc<crate::CompiledModule>,
     mapped_log2: u8,
     reserved_log2: u8,
-    init: impl FnOnce(&mut crate::mem::GuestWindow),
+    init: impl FnOnce(&mut crate::mem::GuestWindow) -> bool,
     premap: impl FnOnce(*mut u8, u64, u64) -> bool,
     args: Vec<i64>,
     n_results: usize,
@@ -1128,7 +1128,7 @@ impl Nursery {
                 }
                 // Its protections as captured (the guard follows, as on every child window).
                 let mapped = rw.len() as u64;
-                w.apply_prots(0, &prots, mapped, &image);
+                w.apply_prots(0, &prots, mapped, &image)
             },
             // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {
@@ -1373,9 +1373,10 @@ unsafe fn spawn_detached_child(
             if let Some(a) = durable {
                 init_durable_words(rw, a, freezing);
             }
-            for s in seeds.iter().filter(|s| s.readonly) {
-                w.protect_ro(s.offset, s.bytes.len() as u64);
-            }
+            seeds
+                .iter()
+                .filter(|s| s.readonly)
+                .all(|s| w.protect(s.offset, s.bytes.len() as u64, crate::mem::Prot::Ro))
         },
         // The child's page map takes its read-only pages, and the spawn's pre-mapped region, if any,
         // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.

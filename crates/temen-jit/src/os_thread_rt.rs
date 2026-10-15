@@ -2156,7 +2156,18 @@ impl Domain {
             // its Done cell is pre-filled and it is **not** re-run (its side effects are already in the
             // snapshot). Every child lands at its recorded slot (#1685); a slot joined before the
             // freeze gets an inert, already-joined cell, so a re-join of it traps as it would have.
-            let done = Done::new(v.completed_result.map(|r| (r, 0)));
+            // #2001 — a live one handed its `spawn` back as it unwound for the freeze, and lived before
+            // it: charged again. #2318 — never past the process's pools: one they have no room for is
+            // a vCPU the process cannot hold, so it is not re-run either, and its join answers
+            // `ThreadFault`, as a re-spawn the OS refuses does (below).
+            let ended = match v.completed_result {
+                Some(r) => Some((r, 0)),
+                None if self.node.as_ref().is_some_and(|n| !n.rebuild_vcpu()) => {
+                    Some((0, TrapKind::ThreadFault as i64))
+                }
+                None => None,
+            };
+            let done = Done::new(ended);
             {
                 let mut dc = lock(&self.dchildren);
                 let tbl = dc.entry(v.parent_task as u64).or_default();
@@ -2168,7 +2179,7 @@ impl Domain {
                 tbl.cells[v.slot] = std::sync::Arc::clone(&done);
                 tbl.joined[v.slot] = false;
             }
-            if v.completed_result.is_some() {
+            if ended.is_some() {
                 continue; // already-done: no re-run, no §15 live count, no context
             }
             lock(&self.threads).live += 1;
@@ -2177,10 +2188,6 @@ impl Domain {
             // the thawed one ran, and a joiner's deadlock check saw quiescence (#1820).
             if !std::ptr::eq(self.hub(), self) {
                 lock(&self.hub().threads).live += 1;
-            }
-            // #2001 — it handed its `spawn` back as it unwound for the freeze, and lived before it.
-            if let Some(n) = &self.node {
-                n.force_vcpu();
             }
             let entry = (env.fn_table_base as *const FnEntry).add(v.func as u32 as usize);
             runs.push(Run {

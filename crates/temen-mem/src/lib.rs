@@ -243,8 +243,8 @@ impl Region {
     /// #1312: an owned flat buffer of `size` zero bytes that [`grow_to`](Region::grow_to) can
     /// **enlarge** — the backing a cooperative run's window uses so a guest allocator's `vm_map` can
     /// commit past the declared window (the interpreter oracle reserves 2^37 and grows on demand; a
-    /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`; the whole allocation is
-    /// addressable and zeroed, so a grow inside it costs nothing.
+    /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`. #2407 — its length is what
+    /// was asked for, page-rounded, and no more, so a window's budget can pay for exactly its length.
     ///
     /// `None` when `size` is 0 or the allocation fails, so callers refuse rather than abort. See
     /// [`Region::Growable`] for the single-owner contract the caller must meet — the base moves.
@@ -1207,9 +1207,12 @@ mod growable {
         Ordering::{Acquire, Release},
     };
 
-    /// A growable, **relocating** flat buffer. `size` is the addressable length (always the whole
-    /// allocation — every byte is zeroed, so a grow within it is free); `alloc_len` is the layout
-    /// size `Drop`/`realloc` must pass back to the allocator.
+    /// A growable, **relocating** flat buffer. `size` is the addressable length: what was asked for,
+    /// page-rounded, every byte of it zeroed or written since. `alloc_len` is the allocation, the
+    /// layout size `Drop`/`realloc` must pass back to the allocator. It grows by at least doubling,
+    /// so repeated growth copies little, but its bytes past `size` are neither addressable nor
+    /// touched: they are zeroed only as a grow reaches them (#2407), so a window's budget pays for
+    /// `size`, which is all the host commits, and never for the allocator's slack.
     ///
     /// `Send`/`Sync` come from the atomics, but soundness under *concurrent* use does not: the
     /// single-owner contract on [`Region::Growable`](super::Region::Growable) is what makes a
@@ -1251,12 +1254,14 @@ mod growable {
             Shared::new(self.base.load(Acquire), size)
         }
 
-        /// Make at least `len` bytes addressable, reallocating (and possibly **moving**) the buffer.
-        /// The new tail is zeroed, so grown pages read as fresh zeroes exactly like a `map`-committed
-        /// page elsewhere. `false` = the allocator refused and **nothing changed**, so the caller
-        /// answers `-ENOMEM` (probeable) before any protection state moves.
+        /// Make `len` bytes addressable, page-rounded, reallocating (and possibly **moving**) the
+        /// buffer when the allocation is too short. The new tail is zeroed, so grown pages read as
+        /// fresh zeroes exactly like a `map`-committed page elsewhere. `false` = the allocator refused
+        /// and **nothing changed**, so the caller answers `-ENOMEM` (probeable) before any protection
+        /// state moves.
         pub(super) fn grow(&self, len: u64) -> bool {
-            if len <= self.size.load(Acquire) {
+            let size = self.size.load(Acquire);
+            if len <= size {
                 return true;
             }
             let old_alloc = self.alloc_len.load(Acquire);
@@ -1266,6 +1271,23 @@ mod growable {
             let Some(need) = need.checked_next_multiple_of(self.page) else {
                 return false;
             };
+            if need > old_alloc && !self.reallocate(old_alloc, need) {
+                return false;
+            }
+            // Bytes past the old length were never handed out: `realloc` leaves them uninitialized,
+            // and an earlier grow's slack was left untouched. Zero what becomes addressable.
+            // SAFETY: the allocation covers `need` bytes and `size < need`.
+            unsafe {
+                let base = self.base.load(Acquire);
+                core::ptr::write_bytes(base.add(size as usize), 0, need - size as usize);
+            }
+            self.size.store(need as u64, Release);
+            true
+        }
+
+        /// Reallocate to at least `need > old_alloc` bytes, doubling where the allocator allows.
+        /// `false`, the buffer unchanged, when it serves neither.
+        fn reallocate(&self, old_alloc: usize, need: usize) -> bool {
             // Amortize repeated allocator growth (a bump allocator commits page by page) by at least
             // doubling — but fall back to the exact requirement if the doubled ask is refused, so a
             // legitimate grow near the address-space limit is not lost to the overshoot.
@@ -1293,14 +1315,10 @@ mod growable {
             if p.is_null() {
                 return false;
             }
-            // `realloc` leaves the grown tail uninitialized; commit it as zeroes.
-            // SAFETY: `p` addresses `new_alloc` bytes and `new_alloc > old_alloc`.
-            unsafe { core::ptr::write_bytes(p.add(old_alloc), 0, new_alloc - old_alloc) };
-            // Publish the buffer before the length: a reader that races (contract violation) then
-            // sees at worst the old, smaller length over the new, larger buffer.
+            // Publish the buffer before the length (`grow` stores it): a reader that races (contract
+            // violation) then sees at worst the old, smaller length over the new, larger buffer.
             self.base.store(p, Release);
             self.alloc_len.store(new_alloc, Release);
-            self.size.store(new_alloc as u64, Release);
             true
         }
     }
@@ -2349,7 +2367,7 @@ mod growable_tests {
         r.write_word(64, 8, 0x0123_4567_89ab_cdef);
 
         assert!(r.grow_to(5 * page), "the allocator serves a modest grow");
-        assert!(r.len() >= 5 * page, "the request is now addressable");
+        assert_eq!(r.len(), 5 * page, "the request is now addressable");
 
         let mut got = [0u8; 15];
         r.read_into(0, &mut got);
@@ -2361,6 +2379,27 @@ mod growable_tests {
         // Reachable only because the region grew: write high, read it back.
         r.set_byte(4 * page + 3, 0xab);
         assert_eq!(r.byte(4 * page + 3), 0xab);
+    }
+
+    /// #2407 — a grow makes addressable what was asked for, page-rounded, and no more: the allocation
+    /// may double, but its slack is out of reach, so a write there is dropped, until a later grow
+    /// reaches it and zeroes it.
+    #[test]
+    fn its_length_is_what_was_asked_for() {
+        let page = 4096;
+        let r = Region::growable(4 * page, page).expect("growable region");
+        assert!(r.grow_to(4 * page + 1));
+        assert_eq!(r.len(), 5 * page, "page-rounded, and no more");
+        r.set_byte(6 * page, 0xab);
+        assert_eq!(r.byte(6 * page), 0, "past its length, a write is dropped");
+        assert!(r.grow_to(7 * page), "inside the allocation");
+        assert_eq!(r.len(), 7 * page);
+        let mut grown = vec![0xffu8; 2 * page as usize];
+        r.read_into(5 * page, &mut grown);
+        assert!(
+            grown.iter().all(|&b| b == 0),
+            "the bytes it reaches read zero"
+        );
     }
 
     /// A grow the allocator cannot serve leaves the region **exactly** as it was and reports

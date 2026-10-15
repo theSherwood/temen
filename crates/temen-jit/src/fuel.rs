@@ -26,8 +26,9 @@ pub trait BudgetNode: Send + Sync {
     fn room(&self) -> i64;
     /// Charge one live vCPU to every level, all or nothing: `false` when a level's `spawn` is full.
     fn charge_vcpu(&self) -> bool;
-    /// [`Self::charge_vcpu`] past any ceiling: a vCPU a thaw re-creates, which lived before the freeze.
-    fn force_vcpu(&self);
+    /// [`Self::charge_vcpu`] past any ceiling, since it lived before the freeze, but never past the
+    /// process's pools (#2318): a vCPU a thaw re-creates. `false` when they have no room.
+    fn rebuild_vcpu(&self) -> bool;
     /// Hand back a vCPU's charge when it ends.
     fn vcpu_ended(&self);
     /// #2112 — charge one live fiber, [`temen_ir::FIBER_STACK`] of `mem`, to every level, all or
@@ -278,7 +279,9 @@ mod tests {
         fn charge_vcpu(&self) -> bool {
             true
         }
-        fn force_vcpu(&self) {}
+        fn rebuild_vcpu(&self) -> bool {
+            true
+        }
         fn vcpu_ended(&self) {}
         fn charge_fiber(&self) -> bool {
             true

@@ -100,8 +100,11 @@ as the live cap refuses it (`thread.spawn` traps `ThreadFault`; `fork` and `posi
 windows, charged to `mem` of that node, the twin's with the growth it copies, before the process
 exists, and handed back when it ends; an exec moves the charge to its image's window, the image's
 declared memory: what that needs past the caller's window is charged first, all or nothing, and what
-the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges the
-threads it re-creates. On the resumable `Vcpu` engine a
+the caller's held past it goes back (#2106, #2110, #2332). A thaw re-charges what it rebuilds: the
+threads it re-creates, a relaunched child's lease, its regions and stores. That is past any ceiling,
+since the artifact's use was granted, but never past the process's pools: one they have no room for
+is not rebuilt (a thread or a detached child ends with `ThreadFault`; a region or a store refuses the
+thaw), and what the thaw charged for it goes back (#2318). On the resumable `Vcpu` engine a
 thread's charge goes back at its join, where that engine learns it ended. The run's own node holds
 the embedder's grant (#2113): `Limits` sets its `mem`, `channel`, `spawn` and `maps` ceilings
 (`Host::set_grant`), and a run whose embedder names none holds modest defaults, since a default must

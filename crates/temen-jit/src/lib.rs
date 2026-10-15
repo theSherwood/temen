@@ -1893,7 +1893,7 @@ impl ForkPoint<'_> {
         let page = mem::page_size() as u64;
         let mut prots: BTreeMap<usize, mem::Prot> = BTreeMap::new();
         // The seed-time protections: the NULL guard, then the read-only data segments (host-page
-        // granular, as `protect_ro` applies them).
+        // granular, as `GuestWindow::protect` applies them).
         if let Some(guard) = self.null_guard.filter(|g| g.is_multiple_of(page)) {
             for p in 0..guard / page {
                 prots.insert(p as usize, mem::Prot::None);
@@ -4229,6 +4229,66 @@ impl CompiledModule {
         Ok(())
     }
 
+    /// A run's fresh window, seeded: `init_mem` (the escape-oracle's low bytes, or a thaw's image),
+    /// the data segments with the `readonly` ones made read-only, a thaw's captured page map, and
+    /// the NULL guard. With it, the read-only ranges, for the embedder's page map (`window_ready`).
+    /// `None`, nothing kept, when the OS refuses the reservation or any commit or protection
+    /// (#2305, #2286): a window missing one would let the guest write or read where the
+    /// interpreter traps.
+    fn seed_window(&self, init_mem: Option<&[u8]>) -> Option<(mem::GuestWindow, Vec<[u64; 2]>)> {
+        let mut window = mem::GuestWindow::try_new(self.win_mapped, self.win_reserved)?;
+        // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
+        if let Some(init) = init_mem {
+            let n = init.len().min(self.win_mapped);
+            window.rw_mut()[..n].copy_from_slice(&init[..n]);
+        }
+        // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
+        // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
+        // verifier already bounds every segment to `[0, size)`. Done while fully RW.
+        let mut ro: Vec<[u64; 2]> = Vec::new();
+        if let Some(size_log2) = self.mem_size_log2 {
+            let size = 1u64 << size_log2;
+            let rw = window.rw_mut();
+            for d in &self.data {
+                let lo = d.offset.min(size);
+                let hi = (d.offset + d.bytes.len() as u64).min(size);
+                let (start, end) = (lo as usize, hi as usize);
+                rw[start..end].copy_from_slice(&d.bytes[..end - start]);
+            }
+            // Map the `readonly` segments RO (so a guest write to const data faults into the guard,
+            // §4/§5). Clamp the range to `[0, size)` exactly as the copy loop above: the verifier
+            // already bounds every data segment into the window, so this is defensive consistency —
+            // an out-of-window segment must never `mprotect` past the backed region.
+            for d in self.data.iter().filter(|d| d.readonly) {
+                let lo = d.offset.min(size);
+                let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
+                if hi > lo {
+                    if !window.protect(lo, hi - lo, mem::Prot::Ro) {
+                        return None;
+                    }
+                    ro.push([lo, hi]);
+                }
+            }
+        }
+        // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
+        // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
+        // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
+        // after the init copy + data segments; a grown tail page is committed and seeded here.
+        // #964: then reserve the marked module's NULL region last, after every host write above
+        // (init seed, data segments, durable prots) has landed — the marked layout keeps all
+        // live data at or above the guard, so nothing legitimate is covered. A window smaller than
+        // the guard skips, matching the interpreter's fit check. The snapshot paths re-assert RW
+        // (`restore_rw`/`read_low`) before any host read.
+        let seeded = window.apply_prots(
+            0,
+            &self.restore_prots,
+            self.win_mapped as u64,
+            init_mem.unwrap_or(&[]),
+        ) && (self.null_guard > self.win_mapped as u64
+            || window.seed_null_guard(0, self.null_guard));
+        seeded.then_some((window, ro))
+    }
+
     /// The shared run body: window setup → guarded call → snapshot → teardown. `code` is a
     /// buffer-ABI trampoline owned by the module (the entry's, or an extra function's).
     /// `snapshot_cap` is what of the window the run copies back: `None`, nothing; `Some(cap)`, the
@@ -4288,10 +4348,12 @@ impl CompiledModule {
             (twin.window, t.win_mapped, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
-            // #2305 — a run the address space has no window for ends as one the process cannot hold
-            // (#2268): `ThreadFault` before its first instruction, never a host panic. Nothing ran, so
-            // a snapshot is the window it was handed, unchanged (a session keeps its state).
-            let Some(mut window) = mem::GuestWindow::try_new(t.win_mapped, t.win_reserved) else {
+            // #2305/#2286 — a run the OS will not give its window to ends as one the process cannot
+            // hold (#2268): `ThreadFault` before its first instruction, never a host panic. That is
+            // no room for the reservation, or a commit or protection the window's seeding needs
+            // refused. Nothing ran, so a snapshot is the window it was handed, unchanged (a session
+            // keeps its state).
+            let Some((window, ro)) = t.seed_window(init_mem) else {
                 t.last_trap_backtrace = Vec::new();
                 t.last_trap_fiber = None;
                 let image = snapshot_cap
@@ -4300,59 +4362,6 @@ impl CompiledModule {
                 return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), image));
             };
             let win_size = t.win_mapped;
-            // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
-            if let Some(init) = init_mem {
-                let n = init.len().min(win_size);
-                window.rw_mut()[..n].copy_from_slice(&init[..n]);
-            }
-            // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
-            // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-            // verifier already bounds every segment to `[0, size)`. Done while fully RW.
-            // The ranges made read-only, for the embedder's page map (`window_ready` below).
-            let mut ro: Vec<[u64; 2]> = Vec::new();
-            if let Some(size_log2) = t.mem_size_log2 {
-                let size = 1u64 << size_log2;
-                let rw = window.rw_mut();
-                for d in &t.data {
-                    let lo = d.offset.min(size);
-                    let hi = (d.offset + d.bytes.len() as u64).min(size);
-                    let (start, end) = (lo as usize, hi as usize);
-                    rw[start..end].copy_from_slice(&d.bytes[..end - start]);
-                }
-                // Map the `readonly` segments RO (so a guest write to const data faults into the guard,
-                // §4/§5). Clamp the range to `[0, size)` exactly as the copy loop above: the verifier
-                // already bounds every data segment into the window, so this is defensive consistency —
-                // an out-of-window segment must never `mprotect` past the backed region.
-                for d in &t.data {
-                    if !d.readonly {
-                        continue;
-                    }
-                    let lo = d.offset.min(size);
-                    let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
-                    if hi > lo {
-                        window.protect_ro(lo, hi - lo);
-                        ro.push([lo, hi]);
-                    }
-                }
-            }
-            // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
-            // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
-            // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
-            // after the init copy + data segments; a grown tail page is committed and seeded here.
-            window.apply_prots(
-                0,
-                &t.restore_prots,
-                t.win_mapped as u64,
-                init_mem.unwrap_or(&[]),
-            );
-            // #964: reserve the marked module's NULL region last, after every host write above
-            // (init seed, data segments, durable prots) has landed — the marked layout keeps all
-            // live data at or above the guard, so nothing legitimate is covered. A window smaller than
-            // the guard skips, matching the interpreter's fit check. The snapshot paths below re-assert
-            // RW (`restore_rw`/`read_low`) before any host read.
-            if t.null_guard <= t.win_mapped as u64 {
-                window.seed_null_guard(0, t.null_guard);
-            }
             if let Some((ready, ctx)) = t.window_ready {
                 if ready(
                     ctx,
@@ -4765,12 +4774,12 @@ impl CompiledModule {
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
         // bytes no one reads.
         let final_mem = match snapshot_cap {
-            None => Vec::new(),
+            None => Some(Vec::new()),
             Some(cap) => {
                 // The guest may have made pages non-readable via the Memory cap (unmap/protect), so
                 // restore RW first — else this read faults outside the guarded call and crashes the
-                // host.
-                window.restore_rw();
+                // host. #2286 — one the OS refuses fails the snapshot instead: nothing is read, and
+                // the run reports it once its own state is settled (below).
                 // `cap` widens the snapshot past the backed prefix to also cover reserved-tail pages
                 // the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the read sees
                 // zero/their content instead of faulting. `read_low` clamps to the reservation.
@@ -4785,10 +4794,12 @@ impl CompiledModule {
                 } else {
                     win_size
                 };
-                if snap > win_size {
+                if !window.restore_rw() {
+                    None
+                } else if snap > win_size {
                     window.read_low(snap)
                 } else {
-                    window.rw_mut()[..win_size].to_vec()
+                    Some(window.rw_mut()[..win_size].to_vec())
                 }
             }
         };
@@ -4827,6 +4838,9 @@ impl CompiledModule {
         } else {
             JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
         };
+        let final_mem = final_mem.ok_or(JitError::Unsupported(
+            "the OS refused to open the window for its snapshot",
+        ))?;
         Ok((outcome, final_mem))
     }
 
