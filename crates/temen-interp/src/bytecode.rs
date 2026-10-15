@@ -1730,30 +1730,10 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// `serves_children`: the caller's driver serves the children a module spawns — the cooperative
 /// scheduler, `drive` and [`CoopRun`] alike, whose every domain sits in a cell its children can
 /// call back into (#744). The [`bytecode_serves_children`] escape applies to it alone; every other
-/// driver declines such a module to the tree-walk oracle.
-///
-/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
-/// pager-shaped export ([`Module::declares_pager`]) could build a pager record. A driver that serves
-/// its children pages them (#2164): a paged child's fault is a call into its spawner's domain. Every
-/// other driver declines such a module to the oracle. A module with no such export builds no valid
-/// pager record — spawn validation refuses one identically on every tier — so the record spawn runs
-/// natively. The same key as temen-run's `module_demand_spawns` fold for the JIT.
+/// driver declines such a module to the tree-walk oracle, as it declines one that may page a child
+/// ([`may_page_a_child`]).
 fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
-    let uses_rec = || {
-        m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: super::cap_id::INSTANTIATOR,
-                        op: 17,
-                        ..
-                    }
-                )
-            })
-        })
-    };
-    if !serves_children && m.declares_pager() && uses_rec() {
+    if !serves_children && may_page_a_child(m) {
         return None;
     }
     let escape = serves_children && bytecode_serves_children(m);
@@ -1767,6 +1747,30 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
     )?;
     c.serves_children = serves_children;
     Some(c)
+}
+
+/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
+/// pager-shaped export ([`Module::declares_pager`]) could build a pager record. A driver that serves
+/// its children pages them (#2164): a paged child's fault is a call into its spawner's domain, which
+/// sits in a cell. Every other driver declines such a module to the oracle: `Vcpu` at its compile
+/// ([`compile_module_for`]), the debug scheduler when a session opens
+/// ([`ScheduledDebugRun::new_with_host`]). A module with no such export builds no valid pager record
+/// — spawn validation refuses one identically on every tier — so its record spawn runs natively. The
+/// same key as temen-run's `module_demand_spawns` fold for the JIT.
+fn may_page_a_child(m: &Module) -> bool {
+    m.declares_pager()
+        && m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 17,
+                        ..
+                    }
+                )
+            })
+        })
 }
 
 /// The §14 entry-shape rule and the starter handles each shape takes live in `temen-ir`, the one
@@ -2061,16 +2065,16 @@ fn admit_detached_child(
     source: &ModuleSource,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
     // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
-    // program, as on the tree-walker (#744, #1862). A paged child's faults are calls into the
-    // spawner's serve loop, through its own cell, as a live self-serve grant's are (#744): a spawner
-    // in no cell cannot page one. The record named the pager before anything else was checked, so
-    // it fails first (#2164).
+    // program, as on the tree-walker (#744, #1862). The record named the pager before anything else
+    // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
+    // others decline a module that could page a child ([`may_page_a_child`]), and a granted child
+    // that serves and spawns ([`bytecode_serves_children`]).
     if let Some(export) = s.pager {
         let pages = host
             .self_module
             .as_ref()
             .is_some_and(|sm| sm.is_pager_export(export));
-        if !pages || host.own_cell().is_none() {
+        if !pages {
             return Err(Trap::CapFault);
         }
     }
@@ -7871,8 +7875,9 @@ fn service_advance(
             | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
 
-            // Paging: a page comes from its pager's serve loop. This engine's domains sit in no
-            // cell, so it refuses a paged spawn (`admit_detached_child`), and no fault reaches here.
+            // Paging: a page comes from its pager's serve loop, which this engine runs for no
+            // child; it declines a root that could page one when a session opens
+            // ([`may_page_a_child`]).
             Outcome::PageFault(_) => return Serviced::Declined,
 
             // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
@@ -8350,9 +8355,10 @@ fn dbg_completions(
 
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
-    /// bytecode engine's subset (`compile_module` declines it). The powerbox is empty; use
-    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted capability
-    /// (e.g. a §14 `Instantiator` for `instantiate`).
+    /// bytecode engine's subset (`compile_module` declines it), or may page a child, which this
+    /// scheduler cannot serve and the oracle's debugger can (#2164). The powerbox is empty; use
+    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted
+    /// capability (e.g. a §14 `Instantiator` for `instantiate`).
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<ScheduledDebugRun> {
         ScheduledDebugRun::new_with_host(m, func, args, Host::new())
     }
@@ -8367,6 +8373,11 @@ impl ScheduledDebugRun {
         host: Host,
     ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
+        // #2164 — this scheduler's domains sit in no cell, so it serves no child, as `Vcpu` serves
+        // none.
+        if may_page_a_child(m) {
+            return None;
+        }
         let root_md = std::sync::Arc::new(ModuleDebug::build(m));
         // Unfused: debug stepping (Slice 5a).
         let mut c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?;

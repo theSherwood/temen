@@ -138,11 +138,14 @@ fn record_spawn_is_native_and_matches_the_oracle() {
 }
 
 /// #2164 — the pager admission: a driver that serves its children pages them, so it admits a
-/// pager-capable module; a `Vcpu` serves none, so it declines the module whole to the oracle. What
-/// the paging does is pinned on every driver by `temen`'s `instantiate_record.rs`.
+/// pager-capable module. `Vcpu` and the debug scheduler serve none, so they decline the module whole
+/// to the oracle: `Vcpu` at its compile, the debug scheduler when a session opens. The same module
+/// without its `pager` export opens a session. What the paging does is pinned on every driver by
+/// `temen`'s `instantiate_record.rs`.
 #[test]
 fn a_pager_capable_record_module_runs_where_children_are_served() {
-    let m = parse_module(&rec_with_impl_export()).expect("parse");
+    let src = rec_with_impl_export();
+    let m = parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     assert!(
         bytecode::admits(&m),
@@ -151,6 +154,18 @@ fn a_pager_capable_record_module_runs_where_children_are_served() {
     assert!(
         bytecode::VcpuProgram::compile(&m).is_none(),
         "a `Vcpu` serves no children, so it declines a module that could page one"
+    );
+    let args = [Value::I32(0)];
+    assert!(
+        bytecode::ScheduledDebugRun::new(&m, 0, &args).is_none(),
+        "the debug scheduler serves no children, so it declines a module that could page one"
+    );
+    let export = "export 0 interface \"pager\" 1 { page: 1 }\n";
+    assert!(src.contains(export), "the rewrite must apply");
+    let unpaged = parse_module(&src.replace(export, "")).expect("parse");
+    assert!(
+        bytecode::ScheduledDebugRun::new(&unpaged, 0, &args).is_some(),
+        "without a `pager` export, the debug scheduler opens a session"
     );
 }
 
@@ -281,6 +296,157 @@ block 0 (vsp: i64, vaddr: i64) {
     assert_eq!(tw(&parent, &args, &mut h), served, "oracle");
     let (mut h, args) = powerbox();
     assert_eq!(bc(&parent, &args, &mut h), served, "cooperative driver");
+    let (mut h, args) = powerbox();
+    let mut fuel = 10_000_000u64;
+    let (r, _) = bytecode::compile_and_run_capture_over_parallel_with_host(
+        &m,
+        0,
+        &args,
+        &mut fuel,
+        &[],
+        None,
+        &mut h,
+    )
+    .expect("the parallel driver runs it natively");
+    assert_eq!(r, served, "parallel driver");
+}
+
+/// #2164 — a granted child pages its own grandchild, as a root pages a child. The child runs a
+/// module of its own that declares a `pager` export. It spawns the grandchild through a record
+/// naming that export, serves in `svc.wait` until it answers 0, joins, and returns
+/// `grandchild + serves * 1000`. The grandchild returns the byte the pager supplied, 77. The root
+/// declares no pager; it spawns the child, granting it the grandchild's module as `"grand"`, and
+/// returns `status * 1_000_000 + value`.
+///
+/// The drivers that serve their children page the grandchild, as the oracle does.
+#[test]
+fn a_granted_child_pages_its_grandchild_on_every_engine() {
+    let root = format!(
+        r#"memory 17
+data 17472 "grand"
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vi: i32, vbud: i32, vchild: i32, vgrand: i32) {{
+  vg = i64.const 17408
+  vw = i64.const 21474853952
+  i64.store vg vw
+  vgh = i64.const 17416
+  vgr = i64.extend_i32_u vgrand
+  i64.store vgh vgr
+  vrm = i64.const 17544
+  i32.store vrm vchild
+  vrb = i64.const 17548
+  i32.store vrb vbud
+  vrp = i64.const 17536
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vh)
+  vm = i64.const 1000000
+  vs = i64.mul vj_st vm
+  vr = i64.add vs vj
+  return vr
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17536,
+            &SpawnRec {
+                size_log2: 17,
+                grants_ptr: 17408,
+                grants_n: 1,
+                ..SpawnRec::default()
+            }
+        )
+    );
+    let child = format!(
+        r#"memory 17
+type 0 func (i64) -> (i64)
+type 1 interface {{ page: 0 }}
+export 0 interface "pager" 1 {{ page: 1 }}
+data 17472 "grand"
+data 17480 "budget"
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vbp = i64.const 17480
+  vbl = i64.const 6
+  vbud = self.resolve vbp vbl
+  vgp = i64.const 17472
+  vgl = i64.const 5
+  vgrand = self.resolve vgp vgl
+  vrm = i64.const 17640
+  i32.store vrm vgrand
+  vrb = i64.const 17644
+  i32.store vrb vbud
+  vrp = i64.const 17632
+  vi = i32.wrap_i64 v0
+  vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vz = i64.const 0
+  br 1(vi, vh, vz)
+}}
+block 1 (vi1: i32, vh1: i32, vt: i64) {{
+  vzw = i32.const 0
+  vs = svc.wait vzw
+  vt2 = i64.add vt vs
+  vz1 = i64.const 0
+  vgone = i64.eq vs vz1
+  br_if vgone 2(vi1, vh1, vt2) 1(vi1, vh1, vt2)
+}}
+block 2 (vi2: i32, vh2: i32, vt3: i64) {{
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi2 (vh2)
+  vk = i64.const 1000
+  vsk = i64.mul vt3 vk
+  vr = i64.add vj vsk
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vaddr: i64) {{
+  voff = i64.const 40000
+  vsrc = i64.add vaddr voff
+  vb = i32.const 77
+  i32.store8 vsrc vb
+  return vsrc
+  }}
+}}
+{rec}"#,
+        rec = rec::segment(
+            17632,
+            &SpawnRec {
+                pager: 0,
+                ..SpawnRec::default()
+            }
+        )
+    );
+    let grand = parse_module(
+        "memory 17
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  va = i64.const 49152
+  vb = i32.load8_u va
+  vw = i64.extend_i32_u vb
+  return vw
+  }
+}
+",
+    )
+    .expect("parse");
+    let child = parse_module(&child).expect("parse");
+    for m in [&child, &grand] {
+        temen_verify::verify_module(m).expect("verify");
+    }
+    let m = std::sync::Arc::new(parse_module(&root).expect("parse"));
+    let powerbox = || {
+        let mut h = Host::new();
+        h.set_self_module(&m);
+        let i = h.grant_instantiator();
+        let b = h.grant_budget(-1, -1, -1);
+        let c = h.grant_module(&child);
+        let g = h.grant_module(&grand);
+        (h, [i, b, c, g].map(Value::I32))
+    };
+    let served = Ok(vec![Value::I64(77 + 1000)]);
+    let (mut h, args) = powerbox();
+    assert_eq!(tw(&root, &args, &mut h), served, "oracle");
+    let (mut h, args) = powerbox();
+    assert_eq!(bc(&root, &args, &mut h), served, "cooperative driver");
     let (mut h, args) = powerbox();
     let mut fuel = 10_000_000u64;
     let (r, _) = bytecode::compile_and_run_capture_over_parallel_with_host(

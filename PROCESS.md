@@ -642,8 +642,9 @@ held past it (#2332). A root's processes pay from the run's own node.
 > tree-walker, and the bytecode engine's drivers that serve their children, the cooperative pump
 > and the parallel driver (#2164). There a fault is a `page(addr)` request into the spawner's
 > serve loop, and the faulting op re-executes once the page is in place. The bytecode engine's
-> debug scheduler and `Vcpu` refuse a paged spawn. The Cranelift JIT refuses a pager record, and a
-> module that could build one leaves it for the bytecode engine (#2164).
+> debug scheduler and `Vcpu` serve no child, so they decline a module that could page one, to the
+> oracle. The Cranelift JIT refuses a pager record, and a module that could build one leaves it
+> for the bytecode engine (#2164).
 >
 > **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
 > a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
