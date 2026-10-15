@@ -1806,8 +1806,8 @@ struct DetachedSpawn {
     /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
     /// before it starts.
     premap: Option<(i32, u64)>,
-    /// §2.2 — the pager: an export of the spawner's program, checked at the op, whose `page` op
-    /// supplies the child's demand-paged window (#2164).
+    /// §2.2 — the pager: an export of the spawner's program whose `page` op supplies the child's
+    /// demand-paged window (#2164). Admission checks it ([`admit_detached_child`]).
     pager: Option<u32>,
 }
 
@@ -2060,11 +2060,19 @@ fn admit_detached_child(
     freezes_detached: bool,
     source: &ModuleSource,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
-    // §2.2 — a paged child's faults are calls into its spawner's serve loop, through the spawner's
-    // own cell, as a live self-serve grant's are (#744): a spawner in no cell cannot page one. The
-    // record named the pager before anything else was checked, so it fails first (#2164).
-    if s.pager.is_some() && host.own_cell().is_none() {
-        return Err(Trap::CapFault);
+    // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
+    // program, as on the tree-walker (#744, #1862). A paged child's faults are calls into the
+    // spawner's serve loop, through its own cell, as a live self-serve grant's are (#744): a spawner
+    // in no cell cannot page one. The record named the pager before anything else was checked, so
+    // it fails first (#2164).
+    if let Some(export) = s.pager {
+        let pages = host
+            .self_module
+            .as_ref()
+            .is_some_and(|sm| sm.is_pager_export(export));
+        if !pages || host.own_cell().is_none() {
+            return Err(Trap::CapFault);
+        }
     }
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
@@ -18925,6 +18933,29 @@ impl Vm {
         }
     }
 
+    /// §2.2 / #2164 — the fault arm of [`paged!`](Self::run_ops) in a demand-paged child: a
+    /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
+    /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
+    /// error in the op loop.
+    #[cold]
+    #[inline(never)]
+    fn page_fault_or_trap(
+        &mut self,
+        trap: Trap,
+        mem: &Option<Mem>,
+        (module, cur, base, pc): (usize, usize, usize, usize),
+    ) -> Result<Outcome, Trap> {
+        if trap != Trap::MemoryFault {
+            return Err(trap);
+        }
+        let addr = mem.as_ref().and_then(Mem::take_fault).ok_or(trap)?;
+        self.module = module;
+        self.cur = cur;
+        self.base = base;
+        self.pc = pc;
+        Ok(Outcome::PageFault(addr))
+    }
+
     /// #1904 — under a landing freeze a durable domain never parks (the oracle's `decide`, #1672):
     /// an op that would park took no effect, so it is **abandoned**. `true` when it is: the running
     /// context's re-issue word is set, the op's placeholder results stand, and the call's trailing
@@ -18949,6 +18980,11 @@ impl Vm {
     /// surfaced as a call to it would be, and the results end the task ([`Vm::jit_entry`]). A window
     /// the emitted code cannot bound interprets it. The check sits here, outside the op loop's
     /// function ([`Vm::run_ops`]): at the loop's head it slowed the interpreter's calls by a tenth.
+    ///
+    /// #2164: a demand-paged child's vCPU (its powerbox holds a pager, [`Host::pager`]) runs the op
+    /// loop with the arms that fetch a page on a recoverable fault. Every other vCPU runs it without
+    /// them: in the one loop, they slowed the interpreter's kernels by 2 to 5%, by how they moved its
+    /// register allocation, not by any work they do.
     fn resume(
         &mut self,
         source: &ModuleSource,
@@ -18977,14 +19013,19 @@ impl Vm {
                 });
             }
         }
-        self.run_ops(source, table, fuel, mem, host, budget)
+        if host.with(|p| p.pager.is_some()) {
+            self.run_ops::<true>(source, table, fuel, mem, host, budget)
+        } else {
+            self.run_ops::<false>(source, table, fuel, mem, host, budget)
+        }
     }
 
     /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
     /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
     /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
-    /// before yielding.
-    fn run_ops(
+    /// before yielding. `PAGED`: a recoverable memory fault fetches a page ([`Vm::resume`] says why
+    /// it is a parameter).
+    fn run_ops<const PAGED: bool>(
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
@@ -19037,24 +19078,15 @@ impl Vm {
                 self.regs[base + $i as usize]
             };
         }
-        // §2.2 / #2164 — a memory op's result. In a demand-paged child (its powerbox holds a pager,
-        // [`Host::pager`]), a recoverable fault is a page to fetch, not a trap: the cursor is left AT
-        // the op, which re-executes once the page is in place, and the fault goes to the driver.
-        // The oracle's `handle_mem`. Consulted only on a fault, so an access that succeeds pays
-        // nothing.
+        // §2.2 / #2164 — a memory op's result. In a demand-paged child (`PAGED`), a recoverable
+        // fault is a page to fetch, not a trap: the cursor is left AT the op, which re-executes once
+        // the page is in place, and the fault goes to the driver. The oracle's `handle_mem`.
         macro_rules! paged {
             ($access:expr) => {
                 match $access {
                     Ok(v) => v,
-                    Err(Trap::MemoryFault) if host.with(|p| p.pager.is_some()) => {
-                        let Some(addr) = mem.as_ref().and_then(Mem::take_fault) else {
-                            return Err(Trap::MemoryFault);
-                        };
-                        self.module = module;
-                        self.cur = cur;
-                        self.base = base;
-                        self.pc = pc;
-                        return Ok(Outcome::PageFault(addr));
+                    Err(t) if PAGED => {
+                        return self.page_fault_or_trap(t, mem, (module, cur, base, pc))
                     }
                     Err(t) => return Err(t),
                 }
@@ -20397,25 +20429,13 @@ impl Vm {
                 // confined window and fail closed exactly as the tree-walker's arm does (bad version
                 // or reserved field → `CapFault`). The outcome is served by every driver's detached
                 // arm, where the budget's take and the module resolve happen at the driver's commit
-                // site (`admit_detached_child`). A record's pager must be a `{ page: (i64) -> (i64) }`
-                // export of this domain's own program, as on the tree-walker (#744, #1862), or the
-                // spawn fails closed here (#2164).
+                // site (`admit_detached_child`), and its pager is checked first (#2164).
                 Op::InstantiateRec { handle, rec, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
                     let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
                     let spawn = DetachedSpawn::of(&sr);
-                    if let Some(export) = spawn.pager {
-                        let pages = host.with(|p| {
-                            p.self_module
-                                .as_ref()
-                                .is_some_and(|sm| sm.is_pager_export(export))
-                        });
-                        if !pages {
-                            return Err(Trap::CapFault);
-                        }
-                    }
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;

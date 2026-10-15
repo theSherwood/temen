@@ -28381,7 +28381,10 @@ impl Host {
     /// request's page moves from the pager's window `pager_mem`, the serving vCPU's, into its
     /// child's ([`PageSink::supply`]). The settle runs before the reply is delivered, so the pager
     /// cannot reuse its buffer before the copy, and the child cannot run before its page is in
-    /// place. Returns the value to deliver; any other dispatch's passes through.
+    /// place. Returns the value to deliver; any other dispatch's passes through. Out of line: both
+    /// interpreters' serve loops call it at every settle, and its copy would otherwise grow their
+    /// op loops.
+    #[inline(never)]
     fn settle_page(&mut self, ticket: u64, value: i64, pager_mem: Option<&Mem>) -> i64 {
         match self.page_sinks.remove(&ticket) {
             Some(sink) => sink.supply(value, pager_mem),
@@ -33840,8 +33843,9 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                Some(writable) if writable || !write => {}
-                _ => return Err(self.refused(base, page)),
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
+                _ => {}
             }
         }
         Ok(())
@@ -34284,8 +34288,9 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                Some(writable) if writable || !write => {}
-                _ => return Err(self.refused(base, page)),
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
+                _ => {}
             }
         }
         Ok(())
