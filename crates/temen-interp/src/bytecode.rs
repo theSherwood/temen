@@ -19744,8 +19744,11 @@ impl Vm {
                             self.pc = pc + 1;
                             return Ok(Outcome::CapPending { id, dst: *dst });
                         }
+                        // #1722 — no other reply shape parks, so a host-completed punt, which only
+                        // its embedder can finish, declines as the oracle's does: waiting for it
+                        // would never return (the single-threaded build's wait panics).
                         let comps = host.with(|p| p.completions());
-                        let r = comps.wait(id);
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
                         if let Some(ty) = results.first() {
                             self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
                         }
