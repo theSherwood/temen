@@ -329,18 +329,19 @@ impl ChildTask {
         d: &crate::instantiator_rt::DurableCell,
         mut fibers: Vec<crate::FrozenFiber>,
     ) -> Option<crate::DetachedCapture> {
-        // #1854 — up to the child's high-water, as the root's capture reaches its own, so a page it
-        // grew through the Memory capability rides the artifact.
-        let mapped = self.window.rw_mut().len();
-        let reserved = 1usize << d.reserved_log2;
-        // SAFETY: the hook reads the child's own powerbox, alive until `teardown`.
-        let high = d.high_water.map_or(0, |(f, ctx)| unsafe {
-            f(ctx as *mut core::ffi::c_void, self.window.base() as usize) as usize
-        });
-        let image = if high > mapped {
-            self.window.read_low(high.min(reserved))?
-        } else {
-            self.window.rw_mut().to_vec()
+        // #1854, #2427 — its declared window and each page it holds past that, as the root's capture
+        // reads its own, so a page it grew through the Memory capability rides the artifact.
+        let image = self.window.rw_mut().to_vec();
+        let tail = match d.held_tail {
+            // SAFETY: the hook reads the child's own powerbox, alive until `teardown`.
+            Some((f, ctx)) => self.window.read_pages(&unsafe {
+                f(
+                    ctx as *mut core::ffi::c_void,
+                    self.window.base() as usize,
+                    image.len() as u64,
+                )
+            })?,
+            None => Vec::new(),
         };
         // #2010 — with what its vCPUs left as they ended: the ones that unwound, the ones that
         // finished unjoined, and the fibers they flattened.
@@ -358,6 +359,7 @@ impl ChildTask {
             unsafe { fiber_rt::read_shadow_sp(self.window.base() as u64, d.shadow.region_base(0)) };
         Some(crate::DetachedCapture {
             image,
+            tail,
             residue: crate::DurableResidue {
                 fibers,
                 vcpus,

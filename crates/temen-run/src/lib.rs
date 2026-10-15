@@ -484,6 +484,9 @@ unsafe fn cap_thunk_impl(
     // supposed to hold on all of them.
     #[cfg(any(unix, windows))]
     wm.set_null_guard(temen_ir::module_null_guard());
+    // #2426: and the runtime-private pages of a durable module's window, as its start recorded them.
+    #[cfg(any(unix, windows))]
+    wm.set_shadow(host.cap_window_shadow());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -1409,9 +1412,10 @@ pub fn jit_cap_run(
     let fuel = root_fuel
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
-    let restore = jit_restore_prots(m, host, init);
+    let (restore, restore_tail) = jit_restore(init);
     let init_mem = init.bytes();
-    // #1810: a durable run's capture is its freeze image, so it reaches the guest's high-water.
+    // #1810, #2427: a durable run's capture is its freeze image, so it carries each page the guest
+    // holds past its declared window.
     let durable = host.is_durable();
     // Fiber-hosting grant (`grant_jit_fibers`): the parent must stand up its fiber runtime so a
     // submitted unit's `cont.*` resolve (DESIGN.md §22 "Concurrency"). Read before any `mem::take`.
@@ -1450,10 +1454,10 @@ pub fn jit_cap_run(
         // (`jit_proc::run_image`); without them a granted spawn here was an inert `CapFault`.
         cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
         if durable {
-            cm.set_high_water(Some(cc.high_water()));
+            cm.set_held_tail(Some(cc.held_tail()));
         }
         cm.set_window_ready(Some(cc.window_ready()));
-        cm.set_restore_prots(restore);
+        cm.set_restore_prots(restore, restore_tail);
         cm.set_freeze_controller(freeze);
         if hosts_fibers {
             cm.enable_fiber_hosting()?;
@@ -1491,7 +1495,7 @@ pub fn jit_cap_run(
             jit_durable_leave(&mut cm, &mut hg);
         }
         *host = Host::from_cell(host_cell);
-        return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)));
+        return r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())));
     }
     let cc = CapCtx::Raw(host as *mut Host);
     let mut cm = CompiledModule::compile(
@@ -1510,10 +1514,10 @@ pub fn jit_cap_run(
     // The granted §14 spawns, as in the locked branch above.
     cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
     if durable {
-        cm.set_high_water(Some(cc.high_water()));
+        cm.set_held_tail(Some(cc.held_tail()));
     }
     cm.set_window_ready(Some(cc.window_ready()));
-    cm.set_restore_prots(restore);
+    cm.set_restore_prots(restore, restore_tail);
     cm.set_freeze_controller(freeze);
     if hosts_fibers {
         cm.enable_fiber_hosting()?;
@@ -1532,7 +1536,7 @@ pub fn jit_cap_run(
         return Err(e);
     }
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing — and, for a
-    // durable run, through the guest's high-water (#1810).
+    // durable run, its declared window and each page the guest holds past it (#1810, #2427).
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
     let r = unsafe { CompiledModule::run_raw(cm_ptr, args, Some(init_mem), Some(1 << 18)) };
@@ -1540,7 +1544,7 @@ pub fn jit_cap_run(
     host.set_jit_native_ctx(0);
     host.set_park_hub(0);
     jit_durable_leave(&mut cm, host);
-    r.map(|(o, bytes)| (o, jit_layout(m, host, bytes)))
+    r.map(|(o, bytes)| (o, jit_layout(m, host, bytes, cm.take_tail_out())))
 }
 
 /// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
@@ -1625,6 +1629,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             continue;
         };
         let children = detached_seeds(&mut r.host)?;
+        let (prots, tail) = jit_restore(&window);
         // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
         // from the id an interpreter capture gave it.
         let mut residue = take_residue(&mut r.host);
@@ -1655,7 +1660,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                     .shadow
                     .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
                 image: window.bytes().to_vec(),
-                prots: window.dense_prots().into_iter().map(window_prot).collect(),
+                prots,
+                tail,
                 // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
                 child: unsafe { gc.assume_init() },
                 window: window_lease.map(|l| (l.budget, l.bytes, l.runs)),
@@ -1809,7 +1815,7 @@ fn detached_left(
             }
             // #2010, #2031 — what its root, fibers and vCPUs left rides its artifact too.
             leave_residue(&mut c, capture.residue);
-            jit_layout(&module, &c, capture.image)
+            jit_layout(&module, &c, capture.image, capture.tail)
         };
         captured.push(temen_interp::CapturedDetached {
             parent_task: 0,
@@ -2589,11 +2595,11 @@ impl CapCtx {
         }
     }
 
-    /// The #1810 high-water hook for this shape, with its ctx.
-    fn high_water(self) -> (temen_jit::HighWater, *mut c_void) {
-        let f: temen_jit::HighWater = match self {
-            CapCtx::Raw(_) => high_water,
-            CapCtx::Locked(_) => high_water_locked,
+    /// The #1810, #2427 held-tail hook for this shape, with its ctx.
+    fn held_tail(self) -> (temen_jit::HeldTail, *mut c_void) {
+        let f: temen_jit::HeldTail = match self {
+            CapCtx::Raw(_) => cap_held_tail,
+            CapCtx::Locked(_) => cap_held_tail_locked,
         };
         (f, self.ptr())
     }
@@ -2622,9 +2628,10 @@ unsafe extern "C" fn window_ready(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     let ro = ranges(ro, n_ro);
-    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved, ro)
+    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved, ro, shadow)
 }
 
 /// The `n` ranges a [`temen_jit::WindowReady`] hook is handed at `ro`.
@@ -2639,23 +2646,23 @@ unsafe fn ranges<'a>(ro: *const [u64; 2], n: usize) -> &'a [[u64; 2]] {
     }
 }
 
-/// [`temen_jit::HighWater`] over a raw host: [`Host::cap_high_water`].
+/// [`temen_jit::HeldTail`] over a raw host: [`Host::cap_held_tail`].
 ///
 /// # Safety
 /// `ctx` is the run's live `*mut Host`.
-unsafe extern "C" fn high_water(ctx: *mut c_void, base: usize) -> u64 {
-    (*(ctx as *const Host)).cap_high_water(base)
+unsafe fn cap_held_tail(ctx: *mut c_void, base: usize, mapped: u64) -> Vec<u64> {
+    (*(ctx as *const Host)).cap_held_tail(base, mapped)
 }
 
-/// [`high_water`] over a locked host (the run's vCPUs are joined by the time it is asked).
+/// [`cap_held_tail`] over a locked host (the run's vCPUs are joined by the time it is asked).
 ///
 /// # Safety
 /// `ctx` is the run's live `*const Mutex<Host>`.
-unsafe extern "C" fn high_water_locked(ctx: *mut c_void, base: usize) -> u64 {
+unsafe fn cap_held_tail_locked(ctx: *mut c_void, base: usize, mapped: u64) -> Vec<u64> {
     (*(ctx as *const Mutex<Host>))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .cap_high_water(base)
+        .cap_held_tail(base, mapped)
 }
 
 /// #1944 slice 3 — a budget node as the JIT sees it: a [`temen_jit::FuelCell`] draws from it and
@@ -2703,24 +2710,27 @@ unsafe fn child_budget_node(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::Budge
     Some(Arc::new(HostNode(node)))
 }
 
-/// #1834 — the page map a run seeded with `init` builds its window under: the host's view of it,
-/// just seeded from `init` ([`Host::reset_cap_pages`]), read back as [`jit_layout`] reads a capture,
-/// so a thaw re-applies exactly what the freeze recorded. Empty for an `init` that deviates nowhere:
-/// the fresh window.
-fn jit_restore_prots(
-    m: &Module,
-    host: &Host,
+/// #1834, #2427 — the page map a window seeded with `init`'s bytes is built under, as the JIT
+/// re-applies it ([`temen_jit::CompiledModule::set_restore_prots`]): one protection per codec page
+/// of those bytes, and each page `init` holds past them with its own. Empty for an `init` that
+/// deviates nowhere: the fresh window.
+fn jit_restore(
     init: &temen_interp::MemLayout,
-) -> Vec<temen_jit::WindowProt> {
+) -> (Vec<temen_jit::WindowProt>, Vec<temen_jit::TailPage>) {
     if init.page_map().is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mapped = m.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
-    let npages = init.byte_len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
-    host.capture_window_prots(&m.data, mapped, npages, temen_ir::module_null_guard())
+    let prots = init.dense_prots().into_iter().map(window_prot).collect();
+    let tail = init
+        .tail_pages()
         .into_iter()
-        .map(window_prot)
-        .collect()
+        .map(|(off, p, bytes)| temen_jit::TailPage {
+            off,
+            prot: window_prot(p),
+            bytes: bytes.map(<[u8]>::to_vec),
+        })
+        .collect();
+    (prots, tail)
 }
 
 /// A captured page's protection as the JIT window re-applies it.
@@ -2735,15 +2745,19 @@ fn window_prot(p: temen_interp::CapturedProt) -> temen_jit::WindowProt {
     }
 }
 
-/// #1810 — a JIT run's window image in the interpreter's capture form: its bytes, and the page map the
-/// host rebuilds from the module's `readonly` segments, the NULL guard, and the guest's own
-/// Memory-capability changes ([`Host::capture_window_prots`]). One form for both engines; an embedder
-/// freezes it with `temen_snapshot::freeze_layout`, which keeps the page map.
-fn jit_layout(m: &Module, host: &Host, bytes: Vec<u8>) -> temen_interp::MemLayout {
+/// #1810 — a JIT run's window image in the interpreter's capture form: its bytes, each page it holds
+/// past them (#2427: a durable run's `tail`), and the page map the host rebuilds from the module's
+/// `readonly` segments, the NULL guard, and the guest's own Memory-capability changes
+/// ([`Host::capture_window_layout`]). One form for both engines; an embedder freezes it with
+/// `temen_snapshot::freeze_layout`, which keeps the page map.
+fn jit_layout(
+    m: &Module,
+    host: &Host,
+    bytes: Vec<u8>,
+    tail: Vec<(u64, Vec<u8>)>,
+) -> temen_interp::MemLayout {
     let mapped = m.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
-    let npages = bytes.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
-    let prots = host.capture_window_prots(&m.data, mapped, npages, temen_ir::module_null_guard());
-    temen_interp::MemLayout::from_dense(bytes, &prots, mapped)
+    host.capture_window_layout(&m.data, mapped, temen_ir::module_null_guard(), bytes, tail)
 }
 
 /// The production §14 child hooks for a run with this cap ctx: the family that decodes `ctx`'s shape
@@ -2794,7 +2808,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             premap_stage
         },
         premap_apply,
-        high_water: high_water_locked,
+        held_tail: cap_held_tail_locked,
         budget_node: child_budget_node,
         release: grant_child_release,
         bind_imports: if locked {
@@ -3454,18 +3468,20 @@ pub unsafe extern "C" fn premap_apply(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     let ro = ranges(ro, n_ro);
     let cell = &*(ctx as *const Mutex<Host>);
     let mut host = cell.lock().unwrap_or_else(|e| e.into_inner());
-    window_aliases(&mut host, base, mapped, reserved, ro)
+    window_aliases(&mut host, base, mapped, reserved, ro, shadow)
 }
 
 /// `host`'s fresh window `[base, base+mapped)` starts, before its guest runs: its page map starts
 /// ([`Host::start_window_pages`]) with the read-only pages `ro` its data segments made (#2268), as the
-/// interpreter's own starts with them, then `Host::apply_premap` aliases the op-17 pre-map and a
-/// durable thaw's §13 pages (#2025) — all through the window view its first `call.cap` would set up —
-/// and the domain holds the window's runs of page state ([`Host::start_window`]).
+/// interpreter's own starts with them, and with `shadow`, the arena its module declared (#2426); then
+/// `Host::apply_premap` aliases the op-17 pre-map and a durable thaw's §13 pages (#2025) — all through
+/// the window view its first `call.cap` would set up — and the domain holds the window's runs of page
+/// state ([`Host::start_window`]).
 ///
 /// # Safety
 /// `[base, base+reserved)` is `host`'s live reservation.
@@ -3475,15 +3491,17 @@ unsafe fn window_aliases(
     mapped: u64,
     reserved: u64,
     ro: &[[u64; 2]],
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     #[cfg(any(unix, windows))]
     {
         install_region_hook(host, base, reserved);
-        let pages = host.start_window_pages(base as usize);
+        let pages = host.start_window_pages(base as usize, shadow);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
         // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
         // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
         wm.set_null_guard(temen_ir::module_null_guard());
+        wm.set_shadow(shadow);
         wm.seed_readonly(ro);
         if host.apply_premap(&mut wm) < 0 {
             return 0;
@@ -3493,7 +3511,7 @@ unsafe fn window_aliases(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (base, mapped, reserved, host, ro);
+        let _ = (base, mapped, reserved, host, ro, shadow);
         0
     }
 }
@@ -3700,6 +3718,11 @@ pub struct MprotectWindow {
     /// hardware-protected window and the oracle agree. Set from [`temen_interp::Host::null_guard`]
     /// by the cap thunk ([`MprotectWindow::set_null_guard`]).
     null_guard: u64,
+    /// #2426 — the shadow arena the window's module declared: the pages holding its runtime-private
+    /// words are refused to `map`/`unmap`/`protect` ([`temen_interp::ShadowArena::fences`]), as the
+    /// interpreter's `prot_pages` refuses them. Empty, fencing nothing, until
+    /// [`MprotectWindow::set_shadow`].
+    shadow: temen_interp::ShadowArena,
 }
 
 #[cfg(any(unix, windows))]
@@ -3735,7 +3758,13 @@ impl MprotectWindow {
             page: host_page_size(),
             prot,
             null_guard: 0,
+            shadow: temen_interp::ShadowArena::EMPTY,
         }
+    }
+
+    /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
+    pub fn set_shadow(&mut self, shadow: temen_interp::ShadowArena) {
+        self.shadow = shadow;
     }
 
     /// #964: install the NULL guard (see the `null_guard` field) — the twin of
@@ -3852,8 +3881,9 @@ impl MprotectWindow {
     }
 
     /// Validate a `map`/`unmap`/`protect` range and return its inclusive page-index span, or
-    /// `-EINVAL` (page-aligned offset, non-zero len, within `[0, reserved)`) — matching the
-    /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
+    /// `-EINVAL` (page-aligned offset, non-zero len, within `[0, reserved)`, clear of the NULL guard
+    /// and of a durable module's runtime-private pages) — matching the interpreter's `prot_pages`
+    /// (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
         if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
@@ -3867,7 +3897,13 @@ impl MprotectWindow {
         if end > self.reserved {
             return Err(EINVAL);
         }
-        Ok((offset / self.page)..=((end - 1) / self.page))
+        let (first, last) = (offset / self.page, (end - 1) / self.page);
+        // #2426: the host touches a durable window's runtime-private words outside the guarded
+        // call, so a protection the guest gave their pages would fault in the host.
+        if self.shadow.fences(first, last, self.page) {
+            return Err(EINVAL);
+        }
+        Ok(first..=last)
     }
 
     /// Update one page's software state from cap `prot` bits, mirroring `temen_interp::set_prot`:

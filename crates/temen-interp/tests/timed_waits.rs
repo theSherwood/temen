@@ -151,7 +151,7 @@ fn a_lone_wait_takes_its_timeout() {
     let image = temen_ir::child_image_at(&child, 1).expect("child image");
     let powerbox = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, -1, -1);
         let c = h.grant_module(&image);
         (h, vec![Value::I32(i), Value::I64(b as i64), Value::I32(c)])

@@ -176,60 +176,97 @@ impl GuestWindow {
     }
 
     /// Re-establish a captured page map on a freshly seeded window (DURABILITY.md §12.3): one
-    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] from the window's start. In
-    /// the first `mapped` bytes `Rw` entries keep the default; past them (the reserved tail) an
-    /// `Rw`/`Ro` page is one the guest grew, so it is committed and seeded from `init` (#1834),
-    /// and an `Unmapped` one stays uncommitted. A thawed guest then faults on a restored
+    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] of `init` from the window's start,
+    /// then each page of `tail` (#2427: those the window holds past `init`). In the first `mapped`
+    /// bytes `Rw` entries keep the default; past them (the reserved tail) every page listed is one the
+    /// window holds — grown, or protected to nothing with its contents kept (#1909) — so it is
+    /// committed and seeded with its bytes (#1834). A thawed guest then faults on a restored
     /// `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
-    /// `apply_prots`. The root's thaw and a detached child's (#1733) both apply theirs here.
-    /// `false` when the OS refuses a commit or a protection (#2318): the thaw is refused then, as
-    /// the window cannot hold the page map it captured.
+    /// `apply_layout`. The root's thaw and a detached child's (#1733) both apply theirs here. `false`
+    /// when the OS refuses a commit or a protection (#2318): the thaw is refused then, as the window
+    /// cannot hold the page map it captured.
     #[must_use]
     pub(crate) fn apply_prots(
         &self,
         prots: &[crate::WindowProt],
         mapped: u64,
         init: &[u8],
+        tail: &[crate::TailPage],
     ) -> bool {
         if self.mapped == 0 {
             return true;
         }
         let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
+        let head = prots.iter().enumerate().map(|(i, &p)| {
+            let off = i as u64 * page;
+            (off, p, init.get(off as usize..).unwrap_or(&[]))
+        });
+        let tail = tail
+            .iter()
+            .map(|t| (t.off, t.prot, t.bytes.as_deref().unwrap_or(&[])));
+        head.chain(tail)
+            .all(|(off, p, bytes)| self.apply_page(off, p, mapped, bytes))
+    }
+
+    /// [`Self::apply_prots`] for the one codec page at `off`, given its bytes (from its start; a
+    /// short or empty slice leaves the rest zero).
+    fn apply_page(&self, off: u64, p: crate::WindowProt, mapped: u64, bytes: &[u8]) -> bool {
+        let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
         // Everything but the trailing guard page, as `read_low` bounds it.
         let limit = (self.total - trailing_guard()) as u64;
-        for (i, &p) in prots.iter().enumerate() {
-            let off = i as u64 * page;
-            if off >= mapped {
-                if p == crate::WindowProt::Unmapped {
-                    continue;
-                }
-                if off + page > limit {
-                    break;
-                }
-                let host = pal::page_size();
-                let start = (off as usize / host) * host;
-                let end = round_up((off + page) as usize, host);
-                let src = init.get(off as usize..).unwrap_or(&[]);
-                let n = src.len().min(page as usize);
-                // SAFETY: `[start, end)` lies in the reservation below its guard page (checked
-                // above); committed, it takes the `n` image bytes at its offset.
-                unsafe {
-                    if !pal::commit_rw(self.base.add(start), end - start) {
-                        return false;
-                    }
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(off as usize), n);
-                }
+        if off >= mapped {
+            if off + page > limit {
+                return true;
             }
-            let applied = match p {
-                crate::WindowProt::Ro => self.protect(off, page, Prot::Ro),
-                crate::WindowProt::Unmapped => self.protect(off, page, Prot::None),
-                crate::WindowProt::Rw => true,
-            };
-            if !applied {
-                return false;
+            let host = pal::page_size();
+            let start = (off as usize / host) * host;
+            let end = round_up((off + page) as usize, host);
+            let n = bytes.len().min(page as usize);
+            // SAFETY: `[start, end)` lies in the reservation below its guard page (checked above);
+            // committed, it takes the `n` image bytes at its offset.
+            unsafe {
+                if !pal::commit_rw(self.base.add(start), end - start) {
+                    return false;
+                }
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off as usize), n);
             }
         }
-        true
+        match p {
+            crate::WindowProt::Ro => self.protect(off, page, Prot::Ro),
+            crate::WindowProt::Unmapped => self.protect(off, page, Prot::None),
+            crate::WindowProt::Rw => true,
+        }
+    }
+
+    /// #2427 — read the host pages at byte offsets `offs`, ascending (the pages a window holds past
+    /// its declared size, [`crate::HeldTail`]), each run of consecutive ones committed read/write first
+    /// so the read cannot fault outside the guarded call: what a durable capture carries past the
+    /// window's prefix, read apart, never the span between them. A page whose bytes are all zero is
+    /// left out (its offset says it is held). `None`, nothing read, when the OS refuses a commit
+    /// (#2286).
+    pub(crate) fn read_pages(&self, offs: &[u64]) -> Option<Vec<(u64, Vec<u8>)>> {
+        let page = pal::page_size();
+        let limit = self.total - trailing_guard();
+        let offs: Vec<usize> = offs
+            .iter()
+            .map(|&off| off as usize)
+            .filter(|&off| off + page <= limit)
+            .collect();
+        for run in offs.chunk_by(|a, b| b - a == page) {
+            // SAFETY: the run lies in the reservation below its guard page (filtered above).
+            if !unsafe { pal::commit_rw(self.base.add(run[0]), run.len() * page) } {
+                return None;
+            }
+        }
+        let pages = offs.into_iter().filter_map(|off| {
+            // SAFETY: committed read/write above, so the read cannot fault.
+            let bytes = unsafe { std::slice::from_raw_parts(self.base.add(off), page) };
+            bytes
+                .iter()
+                .any(|&b| b != 0)
+                .then(|| (off as u64, bytes.to_vec()))
+        });
+        Some(pages.collect())
     }
 
     /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL
@@ -1847,10 +1884,10 @@ mod tests {
                 }
                 // A thaw commits the tail page the guest grew inside the inaccessible tail, and
                 // protects a read-only page inside the prefix.
-                if open.apply_prots(&grown, at(16), &[]) {
+                if open.apply_prots(&grown, at(16), &[], &[]) {
                     wrong |= WRONG_THAW_TAIL;
                 }
-                if open.apply_prots(&ro, at(16), &[]) {
+                if open.apply_prots(&ro, at(16), &[], &[]) {
                     wrong |= WRONG_THAW_RO;
                 }
                 // Re-opening the closed prefix for a snapshot, or committing past it for one, splits
@@ -1896,7 +1933,7 @@ mod tests {
         // Away from the limit, each one applies.
         assert!(open.protect(at(2), at(1), Prot::Ro));
         assert!(open.seed_null_guard(at(1)));
-        assert!(open.apply_prots(&grown, at(16), &[]));
+        assert!(open.apply_prots(&grown, at(16), &[], &[]));
         assert!(closed.restore_rw());
         assert_eq!(closed.read_low(20 * page).map(|b| b.len()), Some(20 * page));
     }

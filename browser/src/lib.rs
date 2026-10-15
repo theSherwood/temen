@@ -5997,7 +5997,7 @@ impl OnrampReactor {
             .map_err(|_| STATUS_UNSUPPORTED)?;
 
         let (mut inst, back) =
-            reactor_instance(&module, layout.byte_len() as u64).ok_or(STATUS_UNSUPPORTED)?;
+            reactor_instance(&module, layout.span()).ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout, &host) {
             return Err(STATUS_UNSUPPORTED);
         }

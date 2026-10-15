@@ -274,7 +274,13 @@ use temen_ir::Module;
 /// carries it and `B_FREEZE_AUTHORITY` (12), the carve range, is retired.
 /// v45 (#2433): `B_INSTANTIATOR` (6) carries no payload. The `Instantiator` named the window range a
 /// carve child was confined to, which nothing reads now that every child has a window of its own.
-const FORMAT_VERSION: u16 = 45;
+/// v46 (#2427): Section 1 carries a window sparsely. The header's `mapped` is its head, the bytes
+/// `[0, mapped)` read whole, where an unlisted page is a zero read-write one; past it each page the
+/// window holds is listed, however far apart, and an unlisted page is one it does not hold. A page's
+/// protection byte gains [`PAGE_BYTES`] when its bytes follow, which they do for each page with
+/// contents of its own that are not all zero, an inaccessible one included (its contents are kept,
+/// #1909), so a zero page stores none, whatever its protection.
+const FORMAT_VERSION: u16 = 46;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -360,13 +366,46 @@ const PROT_RO: u8 = 1;
 const PROT_UNMAPPED: u8 = 2;
 /// v39 (#2025): a page aliasing a region inside the cut — no bytes; the region's carry them.
 const PROT_BACKED: u8 = 3;
+/// v46 (#2427): set on a page's protection byte when its bytes follow — never on a `PROT_BACKED`
+/// page, and only for bytes that are not all zero.
+const PAGE_BYTES: u8 = 0x80;
 
 /// Per-page protection carried in the window image (§12.3): the interpreter's `CapturedProt`, one
-/// type for the capture and the codec. A `Rw` zero page is elided from the image, `Ro`/`Unmapped`
-/// are always stored, and a `Backed` page stores no bytes — its region's ride Section 11 (#2025).
-/// On freeze a `Backed` page's `region` is the capturing host's region id; on restore, the id the
-/// restoring host rebuilt it under.
+/// type for the capture and the codec. In the head a zero `Rw` page is elided from the image and
+/// every other page is listed; past it each page the window holds is listed (#2427). A page stores
+/// its bytes when they are not all zero, and a `Backed` page stores none — its region's ride Section
+/// 11 (#2025). On freeze a `Backed` page's `region` is the capturing host's region id; on restore,
+/// the id the restoring host rebuilt it under.
 pub use temen_interp::CapturedProt as PageProt;
+
+/// A window as Section 1 carries it (§12.3): its head — the bytes `[0, len)`, one protection per
+/// page — and each page it holds past the head (#2427): its byte offset, its protection, and its
+/// bytes when they are not all zero (`None` reads zero).
+struct Image<'a> {
+    bytes: &'a [u8],
+    prots: Vec<PageProt>,
+    tail: Vec<(u64, PageProt, Option<&'a [u8]>)>,
+}
+
+impl<'a> Image<'a> {
+    /// The image of a window [`MemLayout`]: its bytes, their [`dense_prots`](MemLayout::dense_prots),
+    /// and its [`tail_pages`](MemLayout::tail_pages).
+    fn of(layout: &'a MemLayout) -> Image<'a> {
+        Image {
+            bytes: layout.bytes(),
+            prots: layout.dense_prots(),
+            tail: layout.tail_pages(),
+        }
+    }
+
+    /// Each page's protection: the head's, then the tail's.
+    fn all_prots(&self) -> impl Iterator<Item = PageProt> + '_ {
+        self.prots
+            .iter()
+            .copied()
+            .chain(self.tail.iter().map(|t| t.1))
+    }
+}
 
 /// Why a domain can't be frozen.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -374,7 +413,9 @@ pub enum FreezeError {
     /// A live handle isn't re-grantable, so freeze refuses rather than dropping authority
     /// (§12.5). The domain must close/drain it first.
     NonDurableHandle(NonDurableHandle),
-    /// The window length isn't a power of two `≥ PAGE` — it can't be a valid masked window.
+    /// The window's geometry is not one restore accepts ([`geometry_ok`]): its head's length, or the
+    /// offset of a page it holds past the head that is not page-aligned, ascending, and inside the
+    /// reservation (#2427).
     WindowGeometry(usize),
     /// The supplied per-page protection map's length doesn't match the window's page count.
     ProtCount { pages: usize, prots: usize },
@@ -490,6 +531,22 @@ fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
         .is_none_or(|mem| (mem.size_log2 as u32) < u64::BITS && 1u64 << mem.size_log2 <= mapped)
 }
 
+/// #2427 — whether a page held past a window's head, at byte offset `off`, lies where restore accepts
+/// it: page-aligned, at or past `floor` (the head's end, then the end of the page listed before it),
+/// and inside the reservation `1 << reserved_log2` ([`geometry_ok`] bounds its log).
+fn tail_ok(off: u64, floor: u64, reserved_log2: u8) -> bool {
+    off.is_multiple_of(PAGE as u64)
+        && off >= floor
+        && off
+            .checked_add(PAGE as u64)
+            .is_some_and(|end| end <= 1u64 << reserved_log2)
+}
+
+/// Whether a page's bytes are not all zero: the pages whose bytes Section 1 stores (v46).
+fn nonzero(page: &[u8]) -> bool {
+    page.iter().any(|&x| x != 0)
+}
+
 /// The first handle whose binding falls outside a window of `size` bytes, as the restore gate reads
 /// it ([`binding_in_window`]).
 fn first_out_of_window(handles: &[DurableHandle], size: u64) -> Option<&DurableHandle> {
@@ -555,36 +612,31 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
     )
 }
 
-/// [`freeze_with_prots`] over the one window-image form ([`MemLayout`], the capture a reactor or
-/// the checkpoint ladder already holds): the image is its bytes, the protection map its
-/// [`dense_prots`](MemLayout::dense_prots) — so a caller never re-derives the codec's page map by
-/// hand. `reserved_log2` is the window's reservation, as for [`freeze_with_prots`].
+/// Freeze over the one window-image form ([`MemLayout`], the capture every engine's freeze, a reactor
+/// or the checkpoint ladder already holds): its bytes as the head, under their
+/// [`dense_prots`](MemLayout::dense_prots), and each page it holds past them (#2427) — so a caller
+/// never re-derives the codec's page map by hand. `reserved_log2` is the window's reservation, as
+/// for [`freeze_with_prots`].
 pub fn freeze_layout(
     module: &Module,
     layout: &MemLayout,
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
-    freeze_with_prots(
-        module,
-        layout.bytes(),
-        &layout.dense_prots(),
-        reserved_log2,
-        host,
-    )
+    freeze_image(module, Image::of(layout), reserved_log2, host)
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
-/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. `Ro` pages are always
-/// stored (bytes + prot) so restore can re-establish them; `Unmapped` pages store no bytes;
-/// zero `Rw` pages are elided.
+/// the window page at `[i*PAGE, (i+1)*PAGE)` and must cover every page. A page stores its bytes
+/// when they are not all zero, and a zero `Rw` page is elided.
 ///
-/// `window` is the guest's **committed extent** (`mapped`) — the `vm_map`-grown high-water, so its
-/// length is page-aligned in `[1 << size_log2, 1 << reserved_log2]` and need **not** be a power of
-/// two (#1154). `reserved_log2` is the mask-domain reservation the window grew within; grown pages
-/// ride the image as `Rw` above `1 << size_log2` (the interp `snapshot_window`/`snapshot_prots`
-/// shape). A flat, non-grown window passes `reserved_log2 = window.len().trailing_zeros()` and
-/// reproduces the pre-#1154 bytes (only the container version differs).
+/// The **dense** form: `window` is the whole image, its length page-aligned in
+/// `[1 << size_log2, 1 << reserved_log2]` and **not** necessarily a power of two (#1154), so a page
+/// past the declared memory is one the window holds, `Rw`, `Ro` or `Unmapped` with its contents
+/// kept — the image of a flat window, which holds its whole buffer. A window that holds pages apart
+/// past its declared memory freezes as a [`MemLayout`] ([`freeze_layout`], #2427), which spends
+/// nothing on the span between them. `reserved_log2` is the mask-domain reservation the window grew
+/// within. A flat, non-grown window passes `reserved_log2 = window.len().trailing_zeros()`.
 pub fn freeze_with_prots(
     module: &Module,
     window: &[u8],
@@ -592,11 +644,26 @@ pub fn freeze_with_prots(
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
+    let image = Image {
+        bytes: window,
+        prots: prots.to_vec(),
+        tail: Vec::new(),
+    };
+    freeze_image(module, image, reserved_log2, host)
+}
+
+/// The depth-0 freeze of `image`: the cut is numbered from it, then [`freeze_at`].
+fn freeze_image(
+    module: &Module,
+    image: Image<'_>,
+    reserved_log2: u8,
+    host: &Host,
+) -> Result<Vec<u8>, FreezeError> {
     let cut = Cut {
         budgets: number_cut_budgets(host)?,
-        regions: number_cut_regions(host, prots)?,
+        regions: number_cut_regions(host, &image)?,
     };
-    freeze_at(module, window, prots, reserved_log2, host, 0, &cut)
+    freeze_at(module, image, reserved_log2, host, 0, &cut)
 }
 
 /// What a freeze numbers once for the whole cut, and every artifact in it names by number: the
@@ -607,12 +674,11 @@ struct Cut {
     regions: Vec<DurableRegion>,
 }
 
-/// [`freeze_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder asked for), in
-/// the [`Cut`] the depth-0 freeze numbered.
+/// Freeze `image` at detached-nesting `depth` (0 for the artifact an embedder asked for), in the
+/// [`Cut`] the depth-0 freeze numbered.
 fn freeze_at(
     module: &Module,
-    window: &[u8],
-    prots: &[PageProt],
+    mut image: Image<'_>,
     reserved_log2: u8,
     host: &Host,
     depth: usize,
@@ -624,16 +690,25 @@ fn freeze_at(
             slot: p.slot,
         });
     }
-    // The committed extent is page-granular (a `vm_map` grows whole pages), covers the declared
-    // window, and fits the mask domain it grew within — restore's own rule ([`geometry_ok`]).
-    if !geometry_ok(module, window.len() as u64, reserved_log2) {
-        return Err(FreezeError::WindowGeometry(window.len()));
+    // The head is page-granular, covers the declared window, and fits the mask domain it grew
+    // within; each page held past it lies in that domain, apart, ascending — restore's own rule
+    // ([`geometry_ok`], [`tail_ok`]).
+    let len = image.bytes.len();
+    if !geometry_ok(module, len as u64, reserved_log2) {
+        return Err(FreezeError::WindowGeometry(len));
     }
-    let npages = window.len() / PAGE;
-    if prots.len() != npages {
+    let mut floor = len as u64;
+    for &(off, _, bytes) in &image.tail {
+        if !tail_ok(off, floor, reserved_log2) || bytes.is_some_and(|b| b.len() != PAGE) {
+            return Err(FreezeError::WindowGeometry(off as usize));
+        }
+        floor = off + PAGE as u64;
+    }
+    let npages = len / PAGE;
+    if image.prots.len() != npages {
         return Err(FreezeError::ProtCount {
             pages: npages,
-            prots: prots.len(),
+            prots: image.prots.len(),
         });
     }
     let handles = host
@@ -660,8 +735,7 @@ fn freeze_at(
     let mut handles = handles;
     let pipes = number_pipes(&host.capture_durable_pipes(), &mut handles)?;
     number_budgets(&cut.budgets, &mut handles);
-    let prots = number_regions(&cut.regions, host, &mut handles, prots)?;
-    let prots = &prots[..];
+    number_regions(&cut.regions, host, &mut handles, &mut image)?;
     let root_sp = host.frozen_root_sp().unwrap_or(
         module
             .memory
@@ -675,42 +749,39 @@ fn freeze_at(
     wire::write_header(&mut out, wire::KIND_SNAPSHOT, FORMAT_VERSION, 0);
 
     // Section 0 — Header (§12.2). `reserved_log2` is the caller's mask domain (v18: no longer derived
-    // from `window.len()`, so a grown committed extent < reservation is representable); `mapped` is the
-    // committed-extent window-image length.
+    // from the image's length, so a head < reservation is representable); `mapped` is the head's
+    // length (v46: the pages held past it are listed apart).
     section(&mut out, TAG_HEADER, |b| {
         b.extend_from_slice(&digest);
         b.push(reserved_log2);
-        write_uleb(b, window.len() as u64); // mapped (committed extent)
+        write_uleb(b, len as u64); // mapped (the head)
         write_uleb(b, PAGE as u64); // host page size at capture
         write_uleb(b, 1 + vcpus.len() as u64); // vcpu_count = root + spawned (§12.4 / slice 3.2.1)
         write_uleb(b, fibers.len() as u64); // fiber_count (§12.4)
     });
 
-    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A page is
-    // stored when it carries protection or content the restore can't infer: `Ro`/`Unmapped`
-    // always, `Rw` only when non-zero (an elided page restores as zero `Rw`).
+    // Section 1 — Window image (§12.3): sparse + zero-eliding, ascending page index. A head page is
+    // listed when it carries protection or content the restore can't infer — every page but a zero
+    // `Rw` one, which an unlisted page restores as — and each page held past the head is listed
+    // (#2427). A page's bytes follow its protection when they are not all zero.
     section(&mut out, TAG_WINDOW, |b| {
-        let entries: Vec<(usize, &[u8])> = window
+        let head = image
+            .bytes
             .chunks_exact(PAGE)
+            .zip(&image.prots)
             .enumerate()
-            .filter(|&(i, p)| match prots[i] {
-                PageProt::Rw => p.iter().any(|&x| x != 0),
-                PageProt::Ro | PageProt::Unmapped | PageProt::Backed { .. } => true,
-            })
-            .collect();
+            .map(|(i, (page, &prot))| ((i * PAGE) as u64, prot, Some(page)))
+            .filter(|&(_, prot, page)| prot != PageProt::Rw || page.is_some_and(nonzero));
+        let entries: Vec<_> = head.chain(image.tail.iter().copied()).collect();
         write_uleb(b, entries.len() as u64);
-        for (idx, page) in entries {
-            write_uleb(b, idx as u64);
-            match prots[idx] {
-                PageProt::Rw => {
-                    b.push(PROT_RW);
-                    b.extend_from_slice(page);
-                }
-                PageProt::Ro => {
-                    b.push(PROT_RO);
-                    b.extend_from_slice(page);
-                }
-                PageProt::Unmapped => b.push(PROT_UNMAPPED), // no bytes
+        for (off, prot, page) in entries {
+            write_uleb(b, off / PAGE as u64);
+            let bytes = page.filter(|p| nonzero(p) && !matches!(prot, PageProt::Backed { .. }));
+            let flag = if bytes.is_some() { PAGE_BYTES } else { 0 };
+            match prot {
+                PageProt::Rw => b.push(PROT_RW | flag),
+                PageProt::Ro => b.push(PROT_RO | flag),
+                PageProt::Unmapped => b.push(PROT_UNMAPPED | flag),
                 // #2025: no bytes — the region's ride Section 11.
                 PageProt::Backed {
                     region,
@@ -722,6 +793,9 @@ fn freeze_at(
                     write_uleb(b, off);
                     b.push(writable as u8);
                 }
+            }
+            if let Some(bytes) = bytes {
+                b.extend_from_slice(bytes);
             }
         }
     });
@@ -891,7 +965,7 @@ fn freeze_at(
 /// captured detached descendant's, parents first in the canonical `(parent_task, slot)` order the
 /// artifacts nest in. A thawed tree re-freezes to the same numbers, because each domain's restore
 /// adopts the regions it names in number order (§12.6).
-fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegion>, FreezeError> {
+fn number_cut_regions(host: &Host, image: &Image<'_>) -> Result<Vec<DurableRegion>, FreezeError> {
     // The ids a domain names. A handle the codec cannot carry refuses the freeze anyway.
     fn named(h: &Host, prots: &[PageProt]) -> BTreeSet<u32> {
         let handles = h.capture_durable_handles().unwrap_or_default();
@@ -912,7 +986,8 @@ fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegi
         let mut order: Vec<&CapturedDetached> = h.captured_detached().iter().collect();
         order.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
         for c in order {
-            out.push((Arc::clone(&c.host), c.window.dense_prots()));
+            let prots = Image::of(&c.window).all_prots().collect();
+            out.push((Arc::clone(&c.host), prots));
             descendants(&c.host.lock().unwrap_or_else(|e| e.into_inner()), out);
         }
     }
@@ -922,19 +997,20 @@ fn number_cut_regions(host: &Host, prots: &[PageProt]) -> Result<Vec<DurableRegi
         .iter()
         .map(|(h, p)| (h.lock().unwrap_or_else(|e| e.into_inner()), p))
         .collect();
-    let mut cut = vec![(host, named(host, prots))];
+    let prots: Vec<PageProt> = image.all_prots().collect();
+    let mut cut = vec![(host, named(host, &prots))];
     cut.extend(guards.iter().map(|(g, p)| (&**g, named(g, p))));
     capture_cut_regions(&cut).map_err(FreezeError::RegionNotCaptured)
 }
 
 /// #2025 — rewrite each region id this artifact's domain names, its handles' and its window pages',
-/// to the region's number in the cut ([`number_cut_regions`]); returns the renumbered page map.
+/// to the region's number in the cut ([`number_cut_regions`]).
 fn number_regions(
     regions: &[DurableRegion],
     host: &Host,
     root: &mut [DurableHandle],
-    prots: &[PageProt],
-) -> Result<Vec<PageProt>, FreezeError> {
+    image: &mut Image<'_>,
+) -> Result<(), FreezeError> {
     let refused = |region, why| FreezeError::RegionNotCaptured(RegionNotCaptured { region, why });
     let number = |id: u32| {
         host.region_key(id)
@@ -947,21 +1023,13 @@ fn number_regions(
             *region = number(*region)?;
         }
     }
-    prots
-        .iter()
-        .map(|&p| match p {
-            PageProt::Backed {
-                region,
-                off,
-                writable,
-            } => Ok(PageProt::Backed {
-                region: number(region)?,
-                off,
-                writable,
-            }),
-            other => Ok(other),
-        })
-        .collect()
+    let tail = image.tail.iter_mut().map(|t| &mut t.1);
+    for p in image.prots.iter_mut().chain(tail) {
+        if let PageProt::Backed { region, .. } = p {
+            *region = number(*region)?;
+        }
+    }
+    Ok(())
 }
 
 /// #1944 — the budget nodes a freeze carries: every node the cut's domains name — the root's handles
@@ -1172,16 +1240,8 @@ fn write_detached(
     for c in order {
         let art = {
             let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
-            let prots = c.window.dense_prots();
-            freeze_at(
-                &c.module,
-                c.window.bytes(),
-                &prots,
-                c.reserved_log2,
-                &h,
-                depth + 1,
-                cut,
-            )?
+            let image = Image::of(&c.window);
+            freeze_at(&c.module, image, c.reserved_log2, &h, depth + 1, cut)?
         };
         let l = &c.launch;
         write_uleb(&mut b, c.parent_task as u64);
@@ -1352,35 +1412,28 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    restore_layout_at(artifact, module, host, 0, &mut ThawCut::default())
-}
-
-/// [`restore_layout`] at detached-nesting `depth`.
-fn restore_layout_at(
-    artifact: &[u8],
-    module: &Module,
-    host: &mut Host,
-    depth: usize,
-    cut: &mut ThawCut,
-) -> Result<(MemLayout, u8), RestoreError> {
-    let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth, cut)?;
-    let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    Ok((MemLayout::from_dense(bytes, &prots, mapped), reserved_log2))
+    restore_at(artifact, module, host, 0, &mut ThawCut::default())
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain
 /// `reserved_log2`: `prots[i]` is the protection to re-establish on the window page at
-/// `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an elided page). The returned `window` is the committed
-/// extent (`mapped`, page-aligned, possibly a grown high-water — #1154), and `reserved_log2` is the
-/// reservation the guest grew within, so a thaw rebuilds its `Mem` with the same mask domain (its
-/// future `vm_map` growth bound), not just the current extent. Re-applying `prots` to the runtime
-/// window is the escape-TCB restore step.
+/// `[i*PAGE, (i+1)*PAGE)` (default `Rw` for an elided page). The returned `window` is page-aligned
+/// and covers the declared memory, and `reserved_log2` is the reservation the guest grew within, so
+/// a thaw rebuilds its `Mem` with the same mask domain (its future `vm_map` growth bound), not just
+/// the current extent. Re-applying `prots` to the runtime window is the escape-TCB restore step.
+///
+/// The **dense** form ([`freeze_with_prots`], [`MemLayout::to_dense`]): the image runs through the
+/// last page the window holds, so a page between two it holds past the declared memory reads as an
+/// `Unmapped` zero one — the image a flat window, which holds its whole buffer, thaws from.
+/// [`restore_layout`] keeps the window as it was held (#2427).
 pub fn restore_with_prots(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
-    restore_at(artifact, module, host, 0, &mut ThawCut::default())
+    let (layout, reserved_log2) = restore_layout(artifact, module, host)?;
+    let (window, prots) = layout.to_dense();
+    Ok((window, prots, reserved_log2))
 }
 
 /// The cut as the depth-0 restore rebuilt it, for every artifact in it to name by number: each budget
@@ -1395,14 +1448,14 @@ struct ThawCut {
     regions_reached: Vec<bool>,
 }
 
-/// [`restore_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
+/// [`restore_layout`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
 fn restore_at(
     artifact: &[u8],
     module: &Module,
     host: &mut Host,
     depth: usize,
     cut: &mut ThawCut,
-) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
+) -> Result<(MemLayout, u8), RestoreError> {
     // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
     // each fail-closed at the header before any section is read.
     let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
@@ -1492,34 +1545,39 @@ fn restore_at(
     }
     let mut region_named = BTreeSet::new();
 
-    // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
+    // ---- Window image: the head zeroed (default `Rw`), each stored page + its prot splatted over it;
+    // past the head, each page the window holds (#2427). ----
     let mut window = vec![0u8; mapped];
     let mut prots = vec![PageProt::Rw; mapped / PAGE];
+    let mut tail: Vec<(u64, PageProt, Option<Vec<u8>>)> = Vec::new();
     let mut w = Reader::new(win_body);
     let n_pages = w.uleb()?;
-    let mut last: Option<u64> = None;
+    let mut floor = 0u64;
     for _ in 0..n_pages {
-        let idx = w.uleb()?;
-        if last.is_some_and(|p| idx <= p) {
-            return Err(RestoreError::Malformed); // non-canonical: pages must ascend
-        }
-        last = Some(idx);
-        let page = idx as usize;
-        let start = page
-            .checked_mul(PAGE)
-            .filter(|&s| s + PAGE <= mapped)
+        // Canonical: pages ascend, and lie inside the reservation.
+        let off = w
+            .uleb()?
+            .checked_mul(PAGE as u64)
             .ok_or(RestoreError::Malformed)?;
-        match w.u8()? {
-            PROT_RW => {
-                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
-            }
-            PROT_RO => {
-                window[start..start + PAGE].copy_from_slice(w.take(PAGE)?);
-                prots[page] = PageProt::Ro;
-            }
-            PROT_UNMAPPED => prots[page] = PageProt::Unmapped, // no bytes; window stays zero
+        if !tail_ok(off, floor, reserved_log2) {
+            return Err(RestoreError::Malformed);
+        }
+        floor = off + PAGE as u64;
+        let kind = w.u8()?;
+        let bytes = match kind & PAGE_BYTES {
+            0 => None,
+            _ => Some(w.take(PAGE)?),
+        };
+        // Canonical: a page stores its bytes only when they are not all zero.
+        if bytes.is_some_and(|b| !nonzero(b)) {
+            return Err(RestoreError::Malformed);
+        }
+        let prot = match kind & !PAGE_BYTES {
+            PROT_RW => PageProt::Rw,
+            PROT_RO => PageProt::Ro,
+            PROT_UNMAPPED => PageProt::Unmapped,
             // #2025: the page aliases a carried region at a page-aligned offset inside it; no bytes.
-            PROT_BACKED => {
+            PROT_BACKED if bytes.is_none() => {
                 let region = u32::try_from(w.uleb()?).map_err(|_| RestoreError::Malformed)?;
                 let off = w.uleb()?;
                 let writable = match w.u8()? {
@@ -1538,13 +1596,26 @@ fn restore_at(
                     return Err(RestoreError::Malformed);
                 }
                 region_named.insert(region);
-                prots[page] = PageProt::Backed {
+                PageProt::Backed {
                     region,
                     off,
                     writable,
-                };
+                }
             }
             _ => return Err(RestoreError::Malformed),
+        };
+        let at = off as usize;
+        if at < mapped {
+            // Canonical: an unlisted head page is a zero `Rw` one, so none is listed.
+            if prot == PageProt::Rw && bytes.is_none() {
+                return Err(RestoreError::Malformed);
+            }
+            prots[at / PAGE] = prot;
+            if let Some(bytes) = bytes {
+                window[at..at + PAGE].copy_from_slice(bytes);
+            }
+        } else {
+            tail.push((off, prot, bytes.map(<[u8]>::to_vec)));
         }
     }
     if !w.at_end() {
@@ -1720,7 +1791,7 @@ fn restore_at(
             *region = region_ids[region];
         }
     }
-    for p in prots.iter_mut() {
+    for p in prots.iter_mut().chain(tail.iter_mut().map(|t| &mut t.1)) {
         if let PageProt::Backed { region, .. } = p {
             *region = region_ids[region];
         }
@@ -1814,7 +1885,13 @@ fn restore_at(
         }
     }
 
-    Ok((window, prots, reserved_log2))
+    // The window: its head under the module's declared memory, then each page it holds past it.
+    let declared = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let mut layout = MemLayout::from_dense(window, &prots, declared);
+    for (off, prot, bytes) in tail {
+        layout.hold(off, prot, bytes);
+    }
+    Ok((layout, reserved_log2))
 }
 
 /// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
@@ -1866,7 +1943,7 @@ fn decode_detached(
             .durable_module_by_digest(&digest)
             .ok_or(RestoreError::ModuleUnresolved(digest))?;
         let mut child = host.detached_thaw_host();
-        let restored = restore_layout_at(art, &module, &mut child, depth + 1, cut);
+        let restored = restore_at(art, &module, &mut child, depth + 1, cut);
         host.reclaim_thaw_seams(&mut child);
         let (window, reserved_log2) = restored?;
         out.push(ThawedDetached {
@@ -2499,6 +2576,144 @@ mod pipe_numbering_tests {
         assert_eq!(
             number_pipes(&[live(7, 2, 1)], &mut root),
             Err(FreezeError::PipeCrossesCut)
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_section_tests {
+    //! #2427 — Section 1 (v46) carries a window's head, dense, and each page it holds past the head,
+    //! apart. An artifact has one encoding, so a restore refuses every other.
+    use super::*;
+
+    const RESERVED_LOG2: u8 = 20;
+    const WINDOW: u64 = 1 << 17;
+
+    fn module() -> Module {
+        let src =
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i64.const 7\n  return v1\n  }\n}\n";
+        let mut m = temen_text::parse_module(src).expect("parse");
+        m.memory = Some(temen_ir::Memory {
+            size_log2: 17,
+            shadow: None,
+        });
+        m
+    }
+
+    /// A page of zeros but for one byte.
+    fn marked() -> Vec<u8> {
+        let mut page = vec![0u8; PAGE];
+        page[7] = 0x5a;
+        page
+    }
+
+    /// A window that holds, past its 128 KiB head, a marked page, a zero one, and one protected to
+    /// nothing with its contents kept, far apart.
+    fn layout() -> MemLayout {
+        let at = |page: u64| WINDOW + page * PAGE as u64;
+        let mut l = MemLayout::from_dense(vec![0; WINDOW as usize], &[PageProt::Rw; 32], WINDOW);
+        l.hold(at(10), PageProt::Rw, Some(marked()));
+        l.hold(at(40), PageProt::Rw, None);
+        l.hold(at(200), PageProt::Unmapped, Some(marked()));
+        l
+    }
+
+    #[test]
+    fn a_sparse_window_round_trips_as_itself() {
+        let (m, l) = (module(), layout());
+        let art = freeze_layout(&m, &l, RESERVED_LOG2, &Host::new()).expect("freeze");
+        assert!(
+            art.len() < 3 * PAGE,
+            "{} bytes: the head is zero, two pages hold bytes",
+            art.len()
+        );
+        let (back, reserved) = restore_layout(&art, &m, &mut Host::new()).expect("restore");
+        assert_eq!(reserved, RESERVED_LOG2);
+        assert_eq!(back.bytes(), l.bytes());
+        assert_eq!(back.tail_pages(), l.tail_pages());
+        let held = 3 * temen_interp::host_page_size();
+        assert_eq!(back.page_map().grown_bytes(), held, "the gaps stay absent");
+        let again = freeze_layout(&m, &back, RESERVED_LOG2, &Host::new()).expect("re-freeze");
+        assert_eq!(again, art, "restore → re-serialize reproduces the artifact");
+    }
+
+    /// `art` with its Section 1 body replaced by `body`.
+    fn with_window(art: &[u8], body: &[u8]) -> Vec<u8> {
+        let (_, payload) = wire::read_header(art).expect("header");
+        let mut out = art[..art.len() - payload.len()].to_vec();
+        let mut r = Reader::new(payload);
+        while !r.at_end() {
+            let tag = r.uleb().expect("tag");
+            let len = r.uleb().expect("len") as usize;
+            let section = r.take(len).expect("body");
+            let section = if tag == TAG_WINDOW { body } else { section };
+            write_uleb(&mut out, tag);
+            write_uleb(&mut out, section.len() as u64);
+            out.extend_from_slice(section);
+        }
+        out
+    }
+
+    /// A Section 1 body of `entries`: each page's index, protection byte, and the bytes that follow.
+    fn window(entries: &[(u64, u8, Option<&[u8]>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        write_uleb(&mut b, entries.len() as u64);
+        for &(idx, kind, bytes) in entries {
+            write_uleb(&mut b, idx);
+            b.push(kind);
+            b.extend_from_slice(bytes.unwrap_or(&[]));
+        }
+        b
+    }
+
+    #[test]
+    fn a_restore_refuses_every_other_encoding() {
+        let m = module();
+        let art = freeze_layout(&m, &layout(), RESERVED_LOG2, &Host::new()).expect("freeze");
+        let (zero, one) = (vec![0u8; PAGE], marked());
+        let (zero, one) = (Some(&zero[..]), Some(&one[..]));
+        let head = WINDOW / PAGE as u64;
+        let past = 1u64 << (RESERVED_LOG2 - 12);
+        let restored =
+            |body: Vec<u8>| restore_layout(&with_window(&art, &body), &m, &mut Host::new());
+        let cases = [
+            (
+                "zero bytes stored",
+                window(&[(head, PROT_RW | PAGE_BYTES, zero)]),
+            ),
+            ("a zero Rw head page listed", window(&[(1, PROT_RW, None)])),
+            (
+                "pages out of order",
+                window(&[(head + 2, PROT_RW, None), (head + 1, PROT_RW, None)]),
+            ),
+            (
+                "a page listed twice",
+                window(&[(head + 1, PROT_RW, None), (head + 1, PROT_RW, None)]),
+            ),
+            (
+                "a page past the reservation",
+                window(&[(past, PROT_RW, None)]),
+            ),
+            (
+                "a region page with bytes",
+                window(&[(head, PROT_BACKED | PAGE_BYTES, one)]),
+            ),
+            ("an unknown protection", window(&[(head, 4, None)])),
+        ];
+        for (what, body) in cases {
+            assert_eq!(
+                restored(body).err(),
+                Some(RestoreError::Malformed),
+                "{what}"
+            );
+        }
+        let held = restored(window(&[
+            (head, PROT_RW | PAGE_BYTES, one),
+            (past - 1, PROT_RO, None),
+        ]));
+        assert!(
+            held.is_ok(),
+            "the control: pages held past the head, at its end and the top"
         );
     }
 }

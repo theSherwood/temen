@@ -85,9 +85,9 @@ pub(crate) struct DurableCell {
     /// What the spawn knew that a thaw needs: the window geometry.
     pub(crate) mapped_log2: u8,
     pub(crate) reserved_log2: u8,
-    /// #1854 — how far the child grew its window, asked of its own powerbox (`(hook, child ctx)`),
-    /// so its image reaches its grown pages; `None` when no hook is installed.
-    pub(crate) high_water: Option<(crate::HighWater, usize)>,
+    /// #1854, #2427 — the pages the child holds past its declared window, asked of its own powerbox
+    /// (`(hook, child ctx)`), so its capture carries them; `None` when no hook is installed.
+    pub(crate) held_tail: Option<(crate::HeldTail, usize)>,
 }
 
 impl DurableCell {
@@ -95,7 +95,7 @@ impl DurableCell {
         shadow: temen_ir::durable_abi::ShadowArena,
         mapped_log2: u8,
         reserved_log2: u8,
-        high_water: Option<(crate::HighWater, usize)>,
+        held_tail: Option<(crate::HeldTail, usize)>,
     ) -> DurableCell {
         DurableCell {
             base: Mutex::new(0),
@@ -103,7 +103,7 @@ impl DurableCell {
             shadow,
             mapped_log2,
             reserved_log2,
-            high_water,
+            held_tail,
         }
     }
 
@@ -481,8 +481,8 @@ pub(crate) struct Nursery {
     /// #1944 slice 3 — the installed [`crate::ChildBudgetNode`] (0 = none: detached children run
     /// un-metered, and their threads uncharged).
     grant_budget_node: std::sync::atomic::AtomicUsize,
-    /// #1854 — the installed child [`crate::HighWater`] (0 = none).
-    grant_high_water: std::sync::atomic::AtomicUsize,
+    /// #1854 — the installed child [`crate::HeldTail`] (0 = none).
+    grant_held_tail: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
     grant_bind_imports: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
@@ -577,7 +577,7 @@ impl Nursery {
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_node: std::sync::atomic::AtomicUsize::new(0),
-            grant_high_water: std::sync::atomic::AtomicUsize::new(0),
+            grant_held_tail: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
             grant_parent_ctx: std::sync::atomic::AtomicUsize::new(0),
@@ -632,10 +632,8 @@ impl Nursery {
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
-        self.grant_high_water.store(
-            hooks.map_or(0, |h| h.high_water as usize),
-            Ordering::Release,
-        );
+        self.grant_held_tail
+            .store(hooks.map_or(0, |h| h.held_tail as usize), Ordering::Release);
         self.grant_budget_node.store(
             hooks.map_or(0, |h| h.budget_node as usize),
             Ordering::Release,
@@ -660,13 +658,13 @@ impl Nursery {
         self.grant_parent_ctx.load(Ordering::Acquire) as *mut core::ffi::c_void
     }
 
-    /// #1854 — the installed child [`crate::HighWater`] over child powerbox `ctx`, for its freeze cell.
-    fn child_high_water(&self, ctx: *mut core::ffi::c_void) -> Option<(crate::HighWater, usize)> {
-        match self.grant_high_water.load(Ordering::Acquire) {
+    /// #1854 — the installed child [`crate::HeldTail`] over child powerbox `ctx`, for its freeze cell.
+    fn child_held_tail(&self, ctx: *mut core::ffi::c_void) -> Option<(crate::HeldTail, usize)> {
+        match self.grant_held_tail.load(Ordering::Acquire) {
             0 => None,
-            // SAFETY: a nonzero value is a `HighWater` stored by `set_grant_hooks`.
+            // SAFETY: a nonzero value is a `HeldTail` stored by `set_grant_hooks`.
             f => Some((
-                unsafe { core::mem::transmute::<usize, crate::HighWater>(f) },
+                unsafe { core::mem::transmute::<usize, crate::HeldTail>(f) },
                 ctx as usize,
             )),
         }
@@ -1049,6 +1047,7 @@ impl Nursery {
             shadow,
             image,
             prots,
+            tail,
             child: gc,
             window,
             children,
@@ -1125,14 +1124,17 @@ impl Nursery {
                 if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
                     th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
                 }
-                // Its protections as captured (the guard follows, as on every child window).
+                // Its protections as captured, and the pages it held past its window (#2427); the
+                // guard follows, as on every child window.
                 let mapped = rw.len() as u64;
-                w.apply_prots(&prots, mapped, &image)
+                w.apply_prots(&prots, mapped, &image, &tail)
             },
             // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {
                 // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-                Some(apply) => apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0) != 0,
+                Some(apply) => {
+                    apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0, shadow) != 0
+                }
                 None => true,
             },
             vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
@@ -1145,7 +1147,7 @@ impl Nursery {
                 shadow,
                 mapped_log2,
                 reserved_log2,
-                self.child_high_water(gc.retained_ctx),
+                self.child_held_tail(gc.retained_ctx),
             )),
             node,
             kid,
@@ -1334,6 +1336,7 @@ unsafe fn spawn_detached_child(
     register_serve(rt, gc.ctx, &code);
     let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
     let premap_ctx = SendRaw(gc.ctx);
+    let shadow = code.shadow;
     // The segments that fit the window, and of them the read-only ranges its window-ready hook hands
     // the child's page map (#2268).
     let len = 1usize << mapped_log2;
@@ -1377,7 +1380,17 @@ unsafe fn spawn_detached_child(
         // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.
         |base, mapped, reserved| match window_ready {
             // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-            Some(ready) => ready(premap_ctx.0, base, mapped, reserved, ro.as_ptr(), ro.len()) != 0,
+            Some(ready) => {
+                ready(
+                    premap_ctx.0,
+                    base,
+                    mapped,
+                    reserved,
+                    ro.as_ptr(),
+                    ro.len(),
+                    shadow,
+                ) != 0
+            }
             None => true,
         },
         args,
@@ -1391,7 +1404,7 @@ unsafe fn spawn_detached_child(
                 a,
                 mapped_log2,
                 reserved_log2,
-                rt.child_high_water(gc.retained_ctx),
+                rt.child_held_tail(gc.retained_ctx),
             )
         }),
         node,

@@ -3993,7 +3993,7 @@ fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout, host: &Host) -> 
     match mem {
         Some(m) => {
             m.restore_layout(layout);
-            host.realias_regions(m, &layout.dense_prots())
+            host.realias_regions(m, layout.page_map())
         }
         None => false,
     }

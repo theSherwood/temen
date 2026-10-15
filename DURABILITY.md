@@ -1268,15 +1268,28 @@ detail; pin the exact one in the implementing crate.
 
 ### 12.3 Section 1 — Window image (sparse)
 
-Captured at the quiescent point. Sparse over **committed** pages, with zero-page
-elision. Per entry:
+Captured at the quiescent point. Sparse over the pages the window **holds**, with zero-page
+elision. The header's `mapped` is the image's **head**: the declared window, which is what every
+engine's capture reads whole, or the whole image a dense caller hands in (`freeze_with_prots`, a
+flat window's buffer). Per entry, in ascending page order:
 
 - `page_index: uleb` (window offset ÷ page)
-- `prot: u8` — `Rw=0, Ro=1, Unmapped=2, Backed=3` (mirrors `CapturedProt`, `temen-interp`)
-- if `prot ∈ {Rw, Ro}`: page bytes (run-length / zero-eliding to keep it small)
+- `prot: u8` — `Rw=0, Ro=1, Unmapped=2, Backed=3` (mirrors `CapturedProt`, `temen-interp`), with
+  `0x80` set when the page's bytes follow (v46)
+- with `0x80`: the page's bytes — stored for each page that has contents of its own that are not
+  all zero, whatever its protection: an `Unmapped` page protected to nothing keeps its contents
+  (#1909), which a guest that protects it readable again reads
 - if `prot = Backed` (#2025, v39): `region: uleb` (the region's number in Section 11), `off: uleb`
   (page-aligned byte offset into it), `writable: u8`. No bytes: the page's contents are the
   region's, which Section 11 carries once however many pages alias it.
+
+In the head an unlisted page is a zero `Rw` one. Past it (v46, #2427) each page the window holds
+is listed, however far apart, and an unlisted page is one it does not hold. So the capture, the
+artifact and the thaw grow with what the guest holds and its budget pays for, never with the span
+its highest page names: a guest that maps one page at the top of its reservation costs a freeze one
+page, and the thawed window's growth (`PageMap::grown_bytes`) is the page its freeze kept charged.
+One window has one encoding: a restore refuses pages out of order or past the reservation, stored
+bytes that are all zero, and a listed zero `Rw` head page.
 
 The in-window shadow stacks + state words ride along in this image for free (§12.0).
 
@@ -1551,9 +1564,10 @@ non-durable freeze refusal. The **cross-backend** property (`crates/temen/tests/
 + the libFuzzer `durable_jit` target) now runs through the codec too: it serializes each
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
-**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_prots`
-both **seeds** an initial per-page protection map (restore) and **returns** the post-run map
-(freeze) — `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
+**Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_layout`
+both **seeds** an initial window layout (restore) and **returns** the post-run one (freeze) — a
+`MemLayout`: the head's bytes, each page held past it (#2427), and the page map, read in the codec's
+form as `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
 (= codec `PAGE`) granularity. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
 data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
@@ -1564,10 +1578,11 @@ it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
 `mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
 exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
 `readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
-map. **JIT-side capture** also landed: `Host::capture_window_prots(data, mapped, npages)`
-reconstructs the window's protection map from the two host-side sources — the module's `readonly`
-data segments (`Ro`) merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
-`map`/`unmap`/`protect`) — mirroring the interpreter's `snapshot_prots`. `durable_prot_capture.rs`
+map. **JIT-side capture** also landed: `Host::capture_window_layout` reconstructs the window's
+protection map from the two host-side sources — the NULL guard and the module's `readonly` data
+segments merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
+`map`/`unmap`/`protect`) — mirroring the interpreter's `layout_snapshot`, and reads the pages held
+past the declared window apart (`Host::cap_held_tail`, #2427). `durable_prot_capture.rs`
 asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
 `cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
 both directions. The page-protection story is complete.
@@ -1607,6 +1622,12 @@ toolchain guest points the arena at a BSS array (the allocator never manages it)
 declares `[0x74000, 0x80000)` and its data block at `0x8000` needed no move. Note the `+8` root-SP value
 quoted in the 4A.5 "Helpers / format" entry below predates the §12.8 stage-1 thaw word: the empty root
 extent is `frame_base(0)` = base+16.
+
+**Its pages keep the runtime's protection (#2426).** The host reads and writes the control words and
+the arena outside the guest's guarded code: a freeze request rings the state word, and a freeze
+flattens each parked fiber into its region. So every engine refuses a guest page op over a page
+either lies on (`ShadowArena::fences`), as it refuses the NULL guard. Before, a guest that made one
+read-only or inaccessible crashed the JIT's host at its next freeze.
 
 The transform's spill/reload code and the suspended representation meet here. Two
 properties drive the whole design:
