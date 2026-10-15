@@ -1461,3 +1461,34 @@ fn a_wait_in_a_bounce_that_nothing_wakes_is_a_deadlock() {
     let waiter = tier(Arc::from([false, true]), bounce_whole_call);
     assert_eq!(run_over(&m, waiter, flat_window()), interpreted);
 }
+
+/// The shared fork-join (the browser corpus runs it too, on real emitted code): the root calls
+/// function 1, which spawns four threads of function 2, sums `1000..1` itself, waits until a thread
+/// has set the word at 16384 and woken it, joins the four, and adds what each returned, its sum of
+/// `500..1`: 500500 + 4 × 125250.
+const FORK_JOIN_IN_A_CALL: &str = include_str!("fixtures/fork_join_in_a_call.temt");
+
+static FORK_JOINS: AtomicUsize = AtomicUsize::new(0);
+
+fn fork_join_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    FORK_JOINS.fetch_add(1, Ordering::SeqCst);
+    bounce_whole_call(call)
+}
+
+/// #2443 — the fork-join with its spawner and its threads' entries on the emitted tier: the
+/// spawner's spawns, wait and joins and each thread's notify stop their tasks from inside bounces,
+/// and the run matches the interpreted one. Nothing it emits uses an atomic: the emitter keeps
+/// those off the tier in a module with threads (#2468).
+#[test]
+fn a_fork_join_runs_with_its_spawner_and_threads_emitted() {
+    let m = module(FORK_JOIN_IN_A_CALL);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(1_001_500)]));
+    let emitted = tier(Arc::from([false, true, true]), fork_join_bounce);
+    assert_eq!(run_over(&m, emitted, flat_window()), interpreted);
+    assert_eq!(
+        FORK_JOINS.load(Ordering::SeqCst),
+        5,
+        "the root's call to the spawner and the four threads' entries ran emitted"
+    );
+}

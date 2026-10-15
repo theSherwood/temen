@@ -1188,10 +1188,10 @@ fn module_uses_page_ops(m: &Module) -> bool {
 /// The cost is bounded: a collecting guest runs wholly on the interpreter, which is the only tier
 /// that can see its roots at all.
 ///
-/// **The exception (#1627):** the B2 tier-up entries take `gc_spill`, which lifts this veto. Every
-/// emitted frame that can sit beneath the op then pushes its live values to a host-owned spill
-/// stack around the call ([`emit_spill_push`]), and the bounce scans them. Every other entry keeps
-/// the veto.
+/// **The exception (#1627):** a B2 tier-up entry whose host spills ([`BounceHost::spill`]) lifts
+/// this veto. Every emitted frame that can sit beneath the op then pushes its live values to a
+/// host-owned spill stack around the call ([`emit_spill_push`]), and the bounce scans them. Every
+/// other entry keeps the veto.
 fn module_uses_gc_roots(m: &Module) -> bool {
     m.funcs.iter().any(Func::uses_gc_roots)
 }
@@ -1402,24 +1402,50 @@ fn func_uses_indirect(f: &Func) -> bool {
     })
 }
 
+/// What a host's cross-tier bounce can do besides run its callee to its end, when it services
+/// `env.call_interp` over the run's **live** window, powerbox and fuel (#888): the input
+/// [`bounce_serviceable`] takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BounceHost {
+    /// #1627 — it scans the words the emitted frames beneath it spilled, so a callee that reaches
+    /// `gc.roots` sees every root. Needs the shared reserved table (B2): the local-table emit has
+    /// no spill path.
+    pub spill: bool,
+    /// #2443 — it can wait for its task: a callee's thread, futex or child op stops the task from
+    /// inside the bounce, as the op stops it interpreted. Executor 2's bounces can, each task
+    /// owning a thread; the pump's region bounces cannot, its other tasks waiting behind them.
+    pub parks: bool,
+}
+
 /// Per function: can a cross-tier bounce *into* it be completed by the nested drive that services
-/// `env.call_interp` (`temen-interp`'s `drive_nested`)? — #1370.
+/// `env.call_interp` (`temen-interp`'s `drive_nested`) for `host`? — #1370.
 ///
 /// A bounce is a **synchronous** nested drive: one `Vm` plus its fibers, run to completion while the
 /// emitted frame that called it is still on the stack. `drive_nested` therefore has arms for exactly
 /// the outcomes that can finish without a scheduler — `Done`/`Suspended`/`CapPending`, the fiber ops
 /// (`ContNew`/`ContResume`/`FiberSuspend`), and the §22 `Jit*` ops — and traps `CapFault` on anything
-/// else. Three op families cannot be served, and each is a *seed* below:
+/// else, unless its host can wait for its task ([`BounceHost::parks`], #2443): then it hands a
+/// scheduler op's stop back to that host, which applies it to the task. Three op families cannot
+/// be served by a bounce that cannot wait, and each is then a *seed* below:
 ///
 /// * **threads** (`thread.spawn`/`join`) — no peer vCPU exists inside a bounce;
 /// * **futex** (`memory.wait`/`notify`) — a wait that matches can never be woken (every party that
 ///   could store is either parked here or blocked behind this bounce), and a notify cannot reach the
 ///   outer driver's waiters, which would be a lost wakeup rather than a trap;
-/// * **`suspend`** — `drive_nested`'s `FiberSuspend` arm needs a resumer on its chain, and the chain
-///   is empty at a bounce entry, so it `CapFault`s. `cont.new`/`cont.resume` are *not* seeds: they
-///   are self-contained (the drive owns both sides) and gating them would drop working coverage.
+/// * **child ops** ([`starts_or_joins`]) — a spawn has no task to start, and a join none to park.
 ///
-/// A fourth seed, **`gc.roots`** (#1546), is here for a different and sharper reason than the three
+/// Whatever its host:
+///
+/// * **`suspend`** — `drive_nested`'s `FiberSuspend` arm needs a resumer on its chain, and the chain
+///   is empty at a bounce entry, so it `CapFault`s. `cont.new` is *not* a seed: the drive owns both
+///   sides of the fibers it makes, and gating it would drop working coverage.
+/// * **`cont.resume`** ([`resumes_a_fiber`]), but only in a module holding an op a fiber cannot run
+///   inside a bounce: a scheduler op, or one of the seeds below. The fiber runs whatever function
+///   its funcref names, which the closure below cannot follow, and its stop cannot wait even where
+///   the call's own can: interpreted, it parks the fiber alone and its resumer runs on, which a
+///   drive that stops cannot do (`temen-interp`'s `park_slot`), so it `CapFault`s.
+///
+/// The **`gc.roots`** seed (#1546) is here for a different and sharper reason than the ones
 /// above. The bounce *can* run it — and that is the problem: it completes and returns an **incomplete
 /// answer**. GC.md §3.1 requires coverage of "every fiber not actively executing guest mutator code
 /// **+ the caller of `gc.roots`**", and at a bounce the caller chain runs down into the **emitted
@@ -1445,40 +1471,56 @@ fn func_uses_indirect(f: &Func) -> bool {
 /// instead lets the emit fixpoint cascade its callers off, so a region is never emitted into a bounce
 /// that cannot complete — and the rest of the module still tiers up.
 ///
-/// A fifth seed, [`needs_its_task`] (#744), has the threads seed's reason: a spawn, a `svc.wait`
-/// or a live call needs a scheduler, and a bounce has none.
+/// The last seed, [`serves_or_calls_a_server`] (#744), holds whatever the host: a `svc.wait` or a
+/// live call parks its task in a way a bounce's host does not take back.
 ///
 /// **Keep the seeds in lockstep with `drive_nested`'s match arms.** Widening that loop to service an
 /// op (e.g. over #1359's yielding bounce) is what earns dropping a seed here — not the reverse.
-fn bounce_serviceable(m: &Module, gc_spill: bool) -> Vec<bool> {
+fn bounce_serviceable(m: &Module, host: BounceHost) -> Vec<bool> {
     // #1627: in spill mode every emitted frame beneath a bounce has pushed its live words, so a
-    // bounce into `gc.roots` scans them (`CoopRun::bounce`'s `spill`) and the fourth seed drops.
+    // bounce into `gc.roots` scans them (`CoopRun::bounce`'s `spill`) and that seed drops.
+    let refused = |f: &Func| (!host.spill && f.uses_gc_roots()) || serves_or_calls_a_server(f);
+    let schedules = |f: &Func| f.uses_threads() || f.uses_futex() || starts_or_joins(f);
+    let a_fiber_may_stop = m.funcs.iter().any(|f| refused(f) || schedules(f));
     reaches(m, |f| {
-        f.uses_threads()
-            || f.uses_futex()
-            || f.uses_suspend()
-            || (!gc_spill && f.uses_gc_roots())
-            || needs_its_task(f)
+        f.uses_suspend()
+            || refused(f)
+            || (!host.parks && schedules(f))
+            || (a_fiber_may_stop && resumes_a_fiber(f))
     })
     .into_iter()
     .map(|b| !b)
     .collect()
 }
 
-/// #744 — whether `f` makes a call only its task's scheduler can serve. Every `Instantiator` op is
-/// the scheduler's: it starts a child, or joins, polls, detaches or kills one; `svc.wait` parks its
-/// task until a client calls; a call through a guest-declared interface may reach a live offer, and
-/// then parks its task until the serving domain replies. A bounce has no task to start, or to park,
-/// so `drive_nested` refuses all three.
+/// Whether `f` resumes a fiber (`cont.resume`), running code the call graph does not name.
+fn resumes_a_fiber(f: &Func) -> bool {
+    f.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::ContResume { .. }))
+}
+
+/// #744 — whether `f` makes an `Instantiator` call: it starts a child, or joins, polls, detaches or
+/// kills one, which only its task's scheduler can serve.
+fn starts_or_joins(f: &Func) -> bool {
+    f.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| matches!(i, Inst::CapCall { type_id, .. } if *type_id == cap_id::INSTANTIATOR))
+}
+
+/// #744 — whether `f` serves calls or makes one to a server: `svc.wait` parks its task until a
+/// client calls, and a call through a guest-declared interface may reach a live offer, then parks
+/// its task until the serving domain replies. `drive_nested` hands back neither, whatever its host.
 /// `svc.poll` does complete in a bounce, but it must refuse beneath a running handler (#2160), and
 /// a bounce cannot see a handler beneath it. A guest interface is one interned at or above
 /// [`cap_id::GUEST_IMPL_BASE`]; a guest that serves a built-in shape still falls to the bounce's
 /// refusal, as before.
-fn needs_its_task(f: &Func) -> bool {
+fn serves_or_calls_a_server(f: &Func) -> bool {
     f.blocks.iter().flat_map(|b| &b.insts).any(|i| match *i {
         Inst::CapCall { type_id, op, .. } => {
-            type_id == cap_id::INSTANTIATOR
-                || temen_ir::durable_abi::is_serve_op(type_id, op)
+            temen_ir::durable_abi::is_serve_op(type_id, op)
                 || (cap_id::GUEST_IMPL_BASE..temen_ir::CAP_DYN_TYPE_ID).contains(&type_id)
         }
         _ => false,
@@ -1547,7 +1589,7 @@ fn interp_leaf(f: &Func) -> bool {
                         | Inst::CallImport { .. }
                         | Inst::ImportAttach { .. }
                         // and `gc.roots` (#1546): it would run, and answer with the emitted
-                        // caller's frame unscanned — see [`bounce_serviceable`]'s fourth seed.
+                        // caller's frame unscanned — see [`bounce_serviceable`]'s `gc.roots` seed.
                         // `uses_concurrency` above does not cover it (that predicate is the
                         // single-thread guarantee for the atomics lowering, a different question),
                         // and neither does the memory rule above — the op writes its buffer through
@@ -1700,9 +1742,10 @@ const GROUP_SCRATCH_SLOTS: usize = 256;
 const GROUP_SCRATCH_OFF: u64 = ENV_SCRATCH_OFF + (XCALL_MAX_SLOTS as u64) * 8;
 /// #1627 — the **spill stack** cursor, past the group scratch: an `i32` linear-memory address the
 /// emitted code bumps by each push and restores after the call ([`emit_spill_push`]). Read and
-/// written only by modules compiled with `gc_spill` (the B2 tier-up entries); the host points it at
-/// the base of a region outside the guest window before the outermost entry into emitted code, and
-/// at a bounce hands `[base, cursor)` to `CoopRun::bounce` as the emitted frames' live words.
+/// written only by modules compiled for a host that spills ([`BounceHost::spill`], the B2 tier-up
+/// entries); the host points it at the base of a region outside the guest window before the
+/// outermost entry into emitted code, and at a bounce hands `[base, cursor)` to `CoopRun::bounce`
+/// as the emitted frames' live words.
 pub const ENV_SPILL_SP_OFF: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_SLOTS * 8;
 /// #1627 — the spill region's end (`i32`, exclusive). A push that would cross it traps
 /// [`TRAP_SPILL_OVERFLOW`] instead of writing.
@@ -1997,6 +2040,11 @@ pub fn compile_module_split(
 /// names at startup — otherwise pure compute + stores, so hoisting its handful of `self.resolve`s
 /// into cross-tier wrappers makes func 0 itself emittable — the last thing keeping a QuickJS-scale
 /// guest (whose hot interpreter loop is all in-subset) off the wasm tier.
+///
+/// #2443: it outlines the scheduler ops too ([`scheduler_op`]). A function that spawns, joins or
+/// waits keeps its loop emitted where the host's bounce can wait for the op
+/// ([`BounceHost::parks`]); elsewhere the wrapper is a seed of [`bounce_serviceable`], so the
+/// function's eligibility is what it was.
 pub fn outline_cap_calls(m: &mut Module) {
     let base = m.funcs.len() as u32;
     let mut wrappers: Vec<Func> = Vec::new();
@@ -2126,11 +2174,74 @@ pub fn outline_cap_calls(m: &mut Module) {
                         func: g,
                         args: call_args,
                     };
+                } else if let Some((operands, op, params, result)) = scheduler_op(inst) {
+                    // #2443: the op over the wrapper's own params, its one result returned.
+                    let g = base + wrappers.len() as u32;
+                    let nparams = params.len() as u32;
+                    let block = Block {
+                        params: params.clone(),
+                        insts: vec![op],
+                        term: Terminator::Return(vec![nparams]),
+                    };
+                    wrappers.push(Func {
+                        params,
+                        results: vec![result],
+                        blocks: vec![block],
+                    });
+                    *inst = Inst::Call {
+                        func: g,
+                        args: operands,
+                    };
                 }
             }
         }
     }
     m.funcs.extend(wrappers);
+}
+
+/// #2443 — a scheduler op [`outline_cap_calls`] hoists: `thread.spawn`, `thread.join`,
+/// `memory.wait` or `memory.notify`. Returns its operands, the same op over a wrapper's parameters,
+/// their types, and its result's type; `None` for any other op.
+fn scheduler_op(inst: &Inst) -> Option<(Vec<u32>, Inst, Vec<ValType>, ValType)> {
+    use ValType::{I32, I64};
+    Some(match *inst {
+        Inst::ThreadSpawn { func, sp, arg } => (
+            vec![sp, arg],
+            Inst::ThreadSpawn {
+                func,
+                sp: 0,
+                arg: 1,
+            },
+            vec![I64, I64],
+            I32,
+        ),
+        Inst::ThreadJoin { handle } => {
+            (vec![handle], Inst::ThreadJoin { handle: 0 }, vec![I32], I64)
+        }
+        Inst::MemoryWait {
+            ty,
+            addr,
+            expected,
+            timeout,
+        } => (
+            vec![addr, expected, timeout],
+            Inst::MemoryWait {
+                ty,
+                addr: 0,
+                expected: 1,
+                timeout: 2,
+            },
+            vec![I64, ty.val(), I64],
+            I32,
+        ),
+        Inst::MemoryNotify { addr, count } => (
+            vec![addr, count],
+            Inst::MemoryNotify { addr: 0, count: 1 },
+            vec![I64, I32],
+            I32,
+        ),
+        _ => return None,
+    })
 }
 
 /// V8 rejects any single wasm function body larger than `kV8MaxWasmFunctionSize` (7,654,321 bytes) at
@@ -2475,8 +2586,7 @@ pub fn compile_module_tierup(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
-        false,
-        false,
+        None,
     )
 }
 
@@ -2501,19 +2611,20 @@ pub fn compile_module_tierup(
 /// same contract the bounce shims already impose — not the throwaway-window bounce the leaf-only
 /// drivers use.
 ///
-/// #1627 — `gc_spill` lifts the #1546 `gc.roots` veto for this mode. A module that can reach the op
-/// then emits a **spill push** around every call that can reach it ([`emit_spill_push`]): the
-/// call site's live values go to the spill stack named by the env cell's
+/// #1627 — [`BounceHost::spill`] lifts the #1546 `gc.roots` veto for this mode. A module that can
+/// reach the op then emits a **spill push** around every call that can reach it
+/// ([`emit_spill_push`]): the call site's live values go to the spill stack named by the env cell's
 /// [`ENV_SPILL_SP_OFF`]/[`ENV_SPILL_END_OFF`] pair, and the cursor is restored when the call
 /// returns. The host contract grows accordingly: point the cursor at a region outside the window
 /// before the outermost entry into emitted code (not a nested one — a bounce can re-enter), and at
 /// a bounce pass `[base, cursor)` to `CoopRun::bounce`, whose drive then scans those words beneath
-/// it. A module that does not use `gc.roots` emits byte-identical code either way.
+/// it. A module that does not use `gc.roots` emits byte-identical code either way. `host`'s other
+/// field, [`BounceHost::parks`], is #2443's.
 pub fn compile_module_tierup_b2(
     m: &Module,
     shared_memory: bool,
     table_log2: u32,
-    gc_spill: bool,
+    host: BounceHost,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     compile_module_tierup_inner(
         m,
@@ -2522,8 +2633,7 @@ pub fn compile_module_tierup_b2(
         Some(table_log2),
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
-        gc_spill,
-        true,
+        Some(host),
     )
 }
 
@@ -2544,8 +2654,7 @@ pub fn compile_module_tierup_b2_budgeted(
         Some(table_log2),
         None,
         module_budget,
-        false,
-        true,
+        Some(BounceHost::default()),
     )
 }
 
@@ -2559,13 +2668,13 @@ pub fn compile_module_tierup_b2_budgeted(
 /// of both — service `env.call_interp` over the **live** window (B2), and before each emitted call
 /// refresh the page-state table from the live map and write its base to `"pagestate"` + its coverage
 /// to `"mapped"` (#750). This is what the single-shot pump uses for a rodata-bearing card.
-/// `gc_spill` is [`compile_module_tierup_b2`]'s.
+/// `host` is [`compile_module_tierup_b2`]'s.
 pub fn compile_module_tierup_b2_paged(
     m: &Module,
     shared_memory: bool,
     table_log2: u32,
     page_log2: u8,
-    gc_spill: bool,
+    host: BounceHost,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     compile_module_tierup_inner(
         m,
@@ -2574,8 +2683,7 @@ pub fn compile_module_tierup_b2_paged(
         Some(table_log2),
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
-        gc_spill,
-        true,
+        Some(host),
     )
 }
 
@@ -2606,8 +2714,7 @@ pub fn compile_module_tierup_paged(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
-        false,
-        false,
+        None,
     )
 }
 
@@ -2638,8 +2745,7 @@ pub fn compile_module_tierup_nullguard(
         None,
         Some(guard),
         MAX_EST_EMITTED_MODULE_BYTES,
-        false,
-        false,
+        None,
     )
 }
 
@@ -2649,12 +2755,18 @@ pub fn compile_module_tierup_nullguard(
 /// a bounce can complete), while dispatch stays the module's own: a function that `call.dyn`s emits
 /// only when the whole module does, through a table of the module's own functions. For a granted
 /// module a child of a cooperative run runs, whose dispatch table the driver's shared table does
-/// not mirror (#2273). `page_log2` emits it paged, as [`compile_module_tierup_paged`] does.
+/// not mirror (#2273). `page_log2` emits it paged, as [`compile_module_tierup_paged`] does. `parks`
+/// is [`BounceHost::parks`]; a local-table emit has no spill path.
 pub fn compile_module_tierup_live(
     m: &Module,
     shared_memory: bool,
     page_log2: Option<u8>,
+    parks: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    let host = BounceHost {
+        spill: false,
+        parks,
+    };
     compile_module_tierup_inner(
         m,
         shared_memory,
@@ -2662,8 +2774,7 @@ pub fn compile_module_tierup_live(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
-        false,
-        true,
+        Some(host),
     )
 }
 
@@ -2675,8 +2786,7 @@ fn compile_module_tierup_inner(
     reserved_table_log2: Option<u32>,
     null_guard: Option<u64>,
     module_budget: usize,
-    gc_spill: bool,
-    live_bounce: bool,
+    bounce: Option<BounceHost>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
     // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
@@ -2753,6 +2863,7 @@ fn compile_module_tierup_inner(
     // #1627: unless the entry asked for spill mode (B2 only — its bounce is the one that can scan
     // spilled words), where every emitted frame that can sit beneath the op pushes its live values
     // instead. `gc_reach[i]` ⇔ a call to `i` can reach the op, and is empty when nothing spills.
+    let gc_spill = bounce.is_some_and(|b| b.spill);
     debug_assert!(!gc_spill || reserved_table_log2.is_some());
     let uses_gc = module_uses_gc_roots(m);
     let gc_veto = uses_gc && !gc_spill;
@@ -2763,11 +2874,11 @@ fn compile_module_tierup_inner(
     };
     // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
-    //   * **a throwaway window** (`!live_bounce`): the strict [`interp_leaf`] set — memory-free,
-    //     call-free, cap-free — because the leaf-only drivers run a bounce over a *throwaway*
-    //     window (a memory-touching leaf would diverge from the shared one).
-    //   * **the live window** (`live_bounce`: #888's B2 mode, `compile_module_tierup_b2`, and a
-    //     cooperative run's granted module, `compile_module_tierup_live`, #2248): the reactor's
+    //   * **a throwaway window** (`bounce` is `None`): the strict [`interp_leaf`] set —
+    //     memory-free, call-free, cap-free — because the leaf-only drivers run a bounce over a
+    //     *throwaway* window (a memory-touching leaf would diverge from the shared one).
+    //   * **the live window** (`bounce` is `Some`: #888's B2 mode, `compile_module_tierup_b2`, and
+    //     a cooperative run's granted module, `compile_module_tierup_live`, #2248): the reactor's
     //     `cross` set — **any** [`marshallable_sig`] non-in-subset function. This host services
     //     `env.call_interp` over the run's **LIVE** window/powerbox/fuel (the pump's
     //     `temen_onramp_tierup_call_interp` → the #846/#880 live-state bounce), exactly
@@ -2776,17 +2887,17 @@ fn compile_module_tierup_inner(
     //     function that calls a memory/cap helper stays emitted instead of being dropped
     //     (#887 measured this as ~30% → ~90% static coverage on the C-family cards).
     // #1370: the widened set admits any marshallable non-subset function, but a bounce into one that
-    // (transitively) uses threads/futex/`suspend` cannot complete — and #1546: one that reaches
-    // `gc.roots` *would* complete, with this emitted frame's roots unscanned. Both are seeds of
-    // [`bounce_serviceable`], which cascades their callers off the emit set.
-    let serviceable = bounce_serviceable(m, gc_spill);
+    // (transitively) uses threads/futex/`suspend` cannot complete unless its host can wait
+    // (#2443) — and #1546: one that reaches `gc.roots` *would* complete, with this emitted frame's
+    // roots unscanned. Both are seeds of [`bounce_serviceable`], which cascades their callers off
+    // the emit set.
+    let serviceable = bounce.map(|host| bounce_serviceable(m, host));
     let leaf: Vec<bool> = (0..n)
         .map(|i| {
             !in_subset[i]
-                && if live_bounce {
-                    marshallable_sig(&m.funcs[i]) && serviceable[i]
-                } else {
-                    interp_leaf(&m.funcs[i])
+                && match &serviceable {
+                    Some(serviceable) => marshallable_sig(&m.funcs[i]) && serviceable[i],
+                    None => interp_leaf(&m.funcs[i]),
                 }
         })
         .collect();

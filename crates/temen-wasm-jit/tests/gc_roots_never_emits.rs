@@ -25,8 +25,8 @@
 
 use temen_wasm_jit::{
     compile_jit, compile_jit_paged, compile_module_reactor, compile_module_reactor_keep,
-    compile_module_reactor_paged, compile_module_tierup, compile_module_tierup_b2, DriveMode,
-    Shape,
+    compile_module_reactor_paged, compile_module_tierup, compile_module_tierup_b2, BounceHost,
+    DriveMode, Shape,
 };
 
 /// **The residual route.** `f0` is in-subset and makes a `call.dyn`, so B2 emits it whatever the
@@ -119,7 +119,7 @@ fn emitted_everywhere(m: &temen_ir::Module) -> Vec<(&'static str, Vec<bool>)> {
     ));
     out.push((
         "tierup b2 (#888 widened)",
-        compile_module_tierup_b2(m, false, 8, false)
+        compile_module_tierup_b2(m, false, 8, BounceHost::default())
             .expect("b2 emits")
             .1,
     ));

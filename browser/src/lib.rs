@@ -964,18 +964,25 @@ fn par_inst() -> Option<&'static ParInstCfg> {
 
 /// The §14 recipe's root powerbox for a run of `module`: an `Instantiator`, the granted module and a
 /// `Budget` when the recipe has them, and the root's args
-/// (their handles, in that order).
+/// (their handles, in that order). A run whose children tier up through their module's emit
+/// (`outline`, #1414 ED-2) grants that module outlined, as the run's own program is, so a child's
+/// spawn, join and wait sit in wrappers its emitted entry bounces to (#2443).
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn par_inst_powerbox(
     cfg: &ParInstCfg,
     module: &std::sync::Arc<temen_ir::Module>,
+    outline: bool,
 ) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_self_module(module);
     let inst = host.grant_instantiator();
     let mut args = vec![Value::I32(inst)];
     if let Some(m) = &cfg.module {
-        args.push(Value::I32(host.grant_module(m)));
+        let mut m = m.clone();
+        if outline {
+            temen_wasm_jit::outline_cap_calls(&mut m);
+        }
+        args.push(Value::I32(host.grant_module(&m)));
     }
     if cfg.minter_quota > 0 {
         args.push(Value::I32(host.grant_budget(
@@ -1746,7 +1753,7 @@ pub extern "C" fn temen_x2_start(
     // the module both tiers then run. A paged emit checks each access against its thread's page-state
     // table, and a spilling one pushes its frames' live words to its thread's spill stack.
     let emit = (tierup != 0)
-        .then(|| coop_emit_for(&m, true, win_log2).ok())
+        .then(|| coop_emit_for(&m, true, win_log2, true).ok())
         .flatten();
     let (m, regions) = match emit {
         Some(e) => {
@@ -1771,7 +1778,7 @@ pub extern "C" fn temen_x2_start(
             io.init.clone(),
         )
     } else if let Some(cfg) = par_inst() {
-        let (host, args) = par_inst_powerbox(cfg, &m);
+        let (host, args) = par_inst_powerbox(cfg, &m, tierup != 0);
         (host, args, Vec::new())
     } else if let Some(cfg) = rt {
         codegen = par_jit_codegen();
@@ -1840,7 +1847,7 @@ pub extern "C" fn temen_x2_start(
             page_checked: paged,
             // Each thread's spill stack is the size of the coop run's.
             spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
-            modules: programs.map(|p| module_emitter(p, true)),
+            modules: programs.map(|p| module_emitter(p, true, true)),
             run: x2_run,
         });
     }
@@ -5876,7 +5883,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // reservation must agree on it (the coop driver convention, with `WARM_MAPPED_LOG2`
         // playing `JIT_RUN_WIN_LOG2.max(declared)`; `temen_warm_open` already gated declared ≤
         // mapped). The emit outlines the same module the same way, so its functions are `wc.m`'s.
-        match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2) {
+        match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2, false) {
             Ok(e) => {
                 wc.regions = Some(WarmRegions {
                     wasm: e.wasm.into(),
@@ -11266,7 +11273,12 @@ fn all_shimmable(m: &temen_ir::Module) -> bool {
     })
 }
 
-fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<CoopEmit, i32> {
+fn coop_emit_for(
+    m0: &temen_ir::Module,
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+) -> Result<CoopEmit, i32> {
     if onramp_check(m0).is_err() || m0.memory.is_none() {
         return Err(STATUS_UNSUPPORTED);
     }
@@ -11316,6 +11328,9 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
     // The local-table fallback has no spill path, so it keeps #1546's veto.
     let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
+    // #2443: `parks` — the run's bounces can wait for their task (executor 2's), so a function that
+    // spawns, joins or waits can sit beneath one.
+    let host = temen_wasm_jit::BounceHost { spill, parks };
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
         temen_wasm_jit::compile_module_tierup_b2_paged(
@@ -11323,10 +11338,10 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
             shared,
             table_log2 as u32,
             page_log2,
-            spill,
+            host,
         )
     } else if all_shimmable {
-        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, spill)
+        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, host)
     } else {
         temen_wasm_jit::compile_module_tierup(&emit_m, shared)
     };
@@ -11389,15 +11404,19 @@ fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> (Vec<bool>, Vec<bool>
 /// #2248 — a session's emitter for the granted modules its children run: it emits a module's
 /// functions for its children to tier up into ([`emit_module`]), and keeps the wasm under the
 /// module's program index in `programs`, where the driver finds it
-/// ([`temen_coop_program_wasm_ptr`]).
-pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::ModuleEmitter {
+/// ([`temen_coop_program_wasm_ptr`]). `parks`: the run's bounces can wait for their task (#2443).
+pub(crate) fn module_emitter(
+    programs: Programs,
+    shared: bool,
+    parks: bool,
+) -> bytecode::ModuleEmitter {
     std::sync::Arc::new(move |o: &bytecode::ModuleOffer| {
-        let (wasm, emit) = emit_module(o.image, shared)?;
+        let (wasm, emit) = emit_module(o.image, shared, parks)?;
         let key = EmitKey {
             digest: o.digest,
             entry: 0,
             leaf: false,
-            parks: false,
+            parks,
             paged: emit.page_checked,
             shared,
         };
@@ -11420,13 +11439,15 @@ pub(crate) fn module_emitter(programs: Programs, shared: bool) -> bytecode::Modu
 fn emit_module(
     m: &temen_ir::Module,
     shared: bool,
+    parks: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
     let paged = m.data.iter().any(|d| d.readonly)
         || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+    let page_log2 = paged.then_some(page_log2);
     let (wasm, emit) =
-        temen_wasm_jit::compile_module_tierup_live(m, shared, paged.then_some(page_log2)).ok()?;
+        temen_wasm_jit::compile_module_tierup_live(m, shared, page_log2, parks).ok()?;
     let (_, eligible) = tierup_eligible(m, &emit);
     eligible.contains(&true).then(|| {
         let emit = bytecode::ProgramEmit {
@@ -11628,7 +11649,7 @@ pub extern "C" fn temen_coop_open(
         table_log2,
         jit_importer,
         spill,
-    } = match coop_emit_for(&m0, shared != 0, win_log2) {
+    } = match coop_emit_for(&m0, shared != 0, win_log2, false) {
         Ok(e) => e,
         Err(status) => {
             set(status);
@@ -11668,7 +11689,7 @@ pub extern "C" fn temen_coop_open(
             page_checked: paged,
         },
         leaf: None,
-        modules: Some(module_emitter(programs.clone(), shared != 0)),
+        modules: Some(module_emitter(programs.clone(), shared != 0, false)),
     };
     let run = match open_run(&m, host, Some(tierup)) {
         Some(Ok(r)) => r,
