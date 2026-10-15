@@ -20126,26 +20126,38 @@ impl HostCharge {
         self.set(bytes, Fits::Forced);
     }
 
-    /// Room in `bytes` for `len` of them, charged as this holds it and then allocated, fallibly: what a
-    /// [`HostBuffer`] grows by, for a buffer its embedder also reads as a plain `Vec` (a host's
-    /// captured stdout). The room grows by doubling, or to exactly `len` when the doubling does not
-    /// fit: `false`, with nothing charged or allocated, when neither does.
+    /// Room for `held` bytes: it grows by doubling, or to exactly `held` when the doubling does not
+    /// fit, so a use that grows a little at a time rarely reaches the budget tree. `false`, holding
+    /// what it held, when neither fits.
+    #[inline]
+    pub fn grow_to(&mut self, held: u64) -> bool {
+        held <= self.bytes
+            || [self.bytes.saturating_mul(2), held]
+                .into_iter()
+                .any(|r| r >= held && usize::try_from(r).is_ok() && self.resize(r))
+    }
+
+    /// #2373 — [`Self::grow_to`]'s other half: once `held` is under a quarter of the room, hand back
+    /// all but twice `held`.
+    #[inline]
+    pub fn shrink_to(&mut self, held: u64) {
+        if held < self.bytes / 4 {
+            self.resize(held * 2);
+        }
+    }
+
+    /// Room in `bytes` for `len` of them, charged as this holds it ([`Self::grow_to`]) and then
+    /// allocated, fallibly: what a [`HostBuffer`] grows by, for a buffer its embedder also reads as a
+    /// plain `Vec` (a host's captured stdout). `false`, with nothing charged or allocated, when there
+    /// is no room.
     pub fn reserve(&mut self, bytes: &mut Vec<u8>, len: u64) -> bool {
         let had = self.bytes;
-        let room = if len <= had {
-            had
-        } else {
-            match [had.saturating_mul(2), len]
-                .into_iter()
-                .find(|&r| r >= len && usize::try_from(r).is_ok() && self.resize(r))
-            {
-                Some(room) => room,
-                None => return false,
-            }
-        };
+        if !self.grow_to(len) {
+            return false;
+        }
         if bytes.capacity() < len as usize
             && bytes
-                .try_reserve_exact((room as usize).saturating_sub(bytes.len()))
+                .try_reserve_exact((self.bytes as usize).saturating_sub(bytes.len()))
                 .is_err()
         {
             self.resize(had);

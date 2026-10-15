@@ -1453,13 +1453,17 @@ struct Proc {
     /// frees stay separate (a fragmentation follow-up, POSIX.md §6); reuse of a same-or-larger block
     /// works regardless.
     free_list: Vec<(u64, u64)>,
-    /// #2373 — what this process's host-side tables cost ([`Proc::tables_cost`]): a [`TABLE_ENTRY`]
-    /// for each heap block `allocated` and `free_list` record and each descriptor slot, its
-    /// arguments (a [`TABLE_ENTRY`] and the bytes of each), its working directory, the `getenv`
-    /// copies it caches (a [`TABLE_ENTRY`] and the name of each), and an exec staged on it. Charged to
-    /// the personality's payer and refused past a ceiling: a `malloc` or a `getenv` with no room
-    /// answers `NULL`, a new descriptor slot `-EMFILE`, a `chdir` or an `execve` `-ENOMEM`, and a fork
-    /// `-EAGAIN`.
+    /// #2373 — what this process's host-side tables cost ([`Proc::tables_cost`]), kept as they
+    /// change: a [`TABLE_ENTRY`] for each heap block `allocated` and `free_list` record and each
+    /// descriptor slot, its arguments (a [`TABLE_ENTRY`] and the bytes of each), its working
+    /// directory, the `getenv` copies it caches (a [`TABLE_ENTRY`] and the name of each), and an exec
+    /// staged on it.
+    held: u64,
+    /// #2373 — the room [`Proc::held`] is charged as, to the personality's payer. It grows by
+    /// doubling and shrinks below a quarter ([`HostCharge::grow_to`]), as a buffer's does, so most
+    /// changes never reach the budget tree. Past a ceiling a change is refused: a `malloc` or a
+    /// `getenv` answers `NULL`, a new descriptor slot `-EMFILE`, a `chdir` or an `execve` `-ENOMEM`,
+    /// and a fork `-EAGAIN`.
     tables: HostCharge,
     /// The host-side fd **table** (indexed by fd) — per-process, POSIX: a fork copies the table, a
     /// child's `close`/`dup2` never disturbs its parent's numbering. Entries point at **shared**
@@ -3192,6 +3196,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         heap_end,
         allocated: HashMap::new(),
         free_list: Vec::new(),
+        held: 0,
         tables: HostCharge::default(),
         fds: vec![
             Some(FdEntry::Stdin),
@@ -3610,6 +3615,7 @@ impl Proc {
             heap_end: self.heap_end,
             allocated: self.allocated.clone(),
             free_list: self.free_list.clone(),
+            held: 0,
             tables: HostCharge::new(self.tables.payer().cloned()),
             fds: {
                 // #972 — entry-wise copy over shared descriptions, EXCEPT CorePipe tokens, which
@@ -3666,8 +3672,8 @@ impl Proc {
             // powerbox table keeps it valid), its own cell (an exec re-points per-process).
             term_in: self.term_in.as_ref().map(|t| CorePipeToken::new(t.get())),
         };
-        let cost = twin.tables_cost();
-        twin.tables.resize(cost).then_some(twin)
+        twin.held = twin.tables_cost();
+        twin.tables.resize(twin.held).then_some(twin)
     }
 
     /// #2373 — what this process's tables cost the host ([`Proc::tables`]).
@@ -3680,21 +3686,39 @@ impl Proc {
             + names_cost(self.env_ptrs.keys())
     }
 
-    /// #2373 — charge `n` more to [`Proc::tables`]: `false`, charging nothing, when the payer has no
-    /// room.
+    /// #2373 — the tables hold `n` more: `false`, charging nothing, when the payer has no room.
     fn grow_tables(&mut self, n: u64) -> bool {
-        self.tables.resize(self.tables.bytes() + n)
+        let fits = self.tables.grow_to(self.held + n);
+        if fits {
+            self.held += n;
+        }
+        fits
+    }
+
+    /// #2373 — the tables hold `n` less.
+    fn shrink_tables(&mut self, n: u64) {
+        self.held -= n;
+        self.tables.shrink_to(self.held);
+    }
+
+    /// #2373 — part of the tables that cost `was` costs `now`: `false`, charging nothing, when it grew
+    /// and the payer has no room.
+    fn retable(&mut self, was: u64, now: u64) -> bool {
+        if now > was {
+            return self.grow_tables(now - was);
+        }
+        self.shrink_tables(was - now);
+        true
     }
 
     /// #2373 — move to `cwd`, its bytes charged first: `false`, unchanged, when the payer has no
     /// room.
     fn chdir(&mut self, cwd: String) -> bool {
-        let held = self.tables.bytes() - self.cwd.len() as u64 + cwd.len() as u64;
-        if !self.tables.resize(held) {
-            return false;
+        let moved = self.retable(self.cwd.len() as u64, cwd.len() as u64);
+        if moved {
+            self.cwd = cwd;
         }
-        self.cwd = cwd;
-        true
+        moved
     }
 
     /// #2373 — drop the `getenv` copy of `name` cached here, handing its entry back.
@@ -3704,16 +3728,11 @@ impl Proc {
         }
     }
 
-    /// #2373 — hand `n` of [`Proc::tables`] back.
-    fn shrink_tables(&mut self, n: u64) {
-        self.tables.resize(self.tables.bytes() - n);
-    }
-
     /// #2373 — charge what the tables cost now, past any ceiling: after a change its embedder made or
     /// its engine committed, or one that only shrank them.
     fn recharge_tables(&mut self) {
-        let cost = self.tables_cost();
-        self.tables.force(cost);
+        self.held = self.tables_cost();
+        self.tables.force(self.held);
     }
 }
 
@@ -5779,9 +5798,8 @@ impl Ctx<'_> {
         // caller's args region and argv exactly as they were.
         // #2373 — what is staged is charged as it is staged: `-ENOMEM` when the payer has no room.
         let staged = Some((blob, lossy_strings(&argv)));
-        let held = self.p.tables.bytes() - staged_cost(self.p.pending_exec.as_ref())
-            + staged_cost(staged.as_ref());
-        if !self.p.tables.resize(held) {
+        let was = staged_cost(self.p.pending_exec.as_ref());
+        if !self.p.retable(was, staged_cost(staged.as_ref())) {
             return Err(ENOMEM);
         }
         self.p.pending_exec = staged;
@@ -9378,7 +9396,7 @@ block 0 () {\n\
                 "a record each: {} blocks fit",
                 blocks.len()
             );
-            let full = host.channel_used();
+            let (full, held) = (host.channel_used(), st.p.held);
             assert_eq!(st.dup(&[1]), EMFILE, "no room for a descriptor's slot");
             let open = st.open(&[0, 2, O_CREAT | O_RDWR], Some(&mut mem)).unwrap()[0];
             assert_eq!(open, EMFILE, "an open refused for one");
@@ -9392,18 +9410,16 @@ block 0 () {\n\
             assert_eq!(getenv(&mut st, &mut mem), 0, "nor for a getenv's copy");
             assert_eq!(host.channel_used(), full, "a refusal charges nothing");
             st.free(&[blocks[0]]);
-            assert_eq!(host.channel_used(), full, "a freed block keeps its record");
+            assert_eq!(st.p.held, held, "a freed block keeps its record");
             st.free(&[blocks[1]]);
-            assert_eq!(
-                host.channel_used(),
-                full - TABLE_ENTRY as i64,
-                "two neighbours merge into one record"
-            );
+            let merged = held - TABLE_ENTRY;
+            assert_eq!(st.p.held, merged, "two neighbours merge into one record");
             st.free(&[blocks[2]]);
             st.free(&[blocks[3]]);
             assert!(st.dup(&[1]) >= 0, "the records handed back hold a slot");
             assert_ne!(getenv(&mut st, &mut mem), 0, "and a getenv's copy");
-            assert_eq!(st.p.tables.bytes(), st.p.tables_cost(), "charged as held");
+            assert_eq!(st.p.held, st.p.tables_cost(), "kept as the tables change");
+            assert!(st.p.tables.bytes() >= st.p.held, "and charged");
         }
         drop(posix);
         assert_eq!(
@@ -9445,7 +9461,7 @@ block 0 () {\n\
         );
         door.exec_commit().expect("staged");
         let p = posix.root.lock().unwrap();
-        assert_eq!(p.tables.bytes(), p.tables_cost(), "charged as held");
+        assert_eq!(p.held, p.tables_cost(), "kept as the tables change");
         assert_eq!(
             host.channel_used(),
             held + args_cost(&p.args) as i64,
@@ -9560,10 +9576,14 @@ block 0 () {\n\
     #[test]
     fn names_are_charged_as_they_change() {
         let (posix, mut host) = bound(-1);
-        // Room for five entries of names past the process's own tables and the two descriptor
-        // slots its opens take (#2373).
-        let own = host.channel_used() + 2 * TABLE_ENTRY as i64;
-        host.set_grant(-1, own + 5 * TABLE_ENTRY as i64, -1, -1);
+        {
+            // #2373 — the descriptor slots its opens take are the process's, charged before the
+            // ceiling, which leaves room for five entries of names.
+            ctx!(posix, w_g, p_g, st);
+            let (a, b) = (st.dup(&[1]), st.dup(&[1]));
+            assert_eq!((st.close(&[a]), st.close(&[b])), (0, 0));
+        }
+        host.set_grant(-1, host.channel_used() + 5 * TABLE_ENTRY as i64, -1, -1);
         let mut win = vec![0u8; 256];
         win[..24].copy_from_slice(b"/d/d/a/d/bb/e/d/zzzzzzzz");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
