@@ -2175,11 +2175,11 @@ fn admit_detached_child(
 /// built at once, over a reservation of the engine's own, or over a backing `backing` makes
 /// ([`ThreadPlatform::child_window`]). A backing it cannot make refuses the spawn, and hands the
 /// window's bytes back to the budget that paid for them. Returns the child, and the emit of the
-/// program it runs, as `emit` answers for it: the cooperative pump's ([`ProgramEmits::for_child`]),
-/// `None` on a driver with no emitted tier, and `None` for a window over its own backing. A child
-/// with an emit gets its window over a [`FreshWindow::flat_backing`] instead, so that it can tier
-/// up on every target (#2102). Only the cooperative pump has emits, and it is the single owner a
-/// backing that relocates needs.
+/// program it runs, as `emit` answers for it ([`ProgramEmits::for_child`]): `None` on a driver with
+/// no emitted tier. Without a backing, a child with an emit gets its window over a
+/// [`FreshWindow::flat_backing`], so that it can tier up on every target (#2102): the cooperative
+/// pump is the single owner a backing that relocates needs. A backing's memory is the child's own,
+/// which its host runs the emit over (#1414 ED-2).
 #[allow(clippy::too_many_arguments)] // the spawn's inputs, its emit, and where its window can live
 fn admit_detached_in_process(
     host: &mut Host,
@@ -2194,7 +2194,7 @@ fn admit_detached_in_process(
     };
     let (back, tierup) = match backing {
         Some(make) => match make(window.size_log2) {
-            Some(back) => (Some(back), None),
+            Some(back) => (Some(back), emit(&child)),
             None => {
                 if let Some(lease) = child.lease {
                     host.release_detached(lease);
@@ -15479,8 +15479,9 @@ impl SchedCore {
                 // task's env ([`CoopRun::pending_win`] and friends), so a §14 confined child's
                 // thread tiers up over its own carve. A window the driver cannot flatly address (a
                 // fork twin's `Paged` private copy on wasm) fails closed to the interpreter, which
-                // is always right. So does a child domain whose calls would not dispatch through
-                // the table the emit reads (#2273, [`child_runs_emit`]).
+                // is always right. So does a thread of a child over a memory of its own, whose one
+                // context its root task holds (#1414 ED-2), and a child domain whose calls would not
+                // dispatch through the table the emit reads (#2273, [`child_runs_emit`]).
                 let (window, dispatches) = match tasks[ti].env {
                     None => (mem.as_ref(), true),
                     Some(k) => (
@@ -15546,8 +15547,12 @@ impl SchedCore {
                 };
                 // #816 env-routed tier-up, as for a confined child: the child tiers up its
                 // program's emit while the driver can address its window flatly, which only a
-                // failed flat allocation prevents.
-                let tierup = tierup.filter(|_| tierup_servable(child.mem.as_ref(), mem.as_ref()));
+                // failed flat allocation prevents. A window in a memory of its own (executor 2's)
+                // holds one context for emitted code, which the child's root task takes, so its
+                // threads interpret (#1414 ED-2).
+                let own = child.mem.as_ref().is_some_and(|m| m.foreign_id().is_some());
+                let tierup =
+                    tierup.filter(|_| own || tierup_servable(child.mem.as_ref(), mem.as_ref()));
                 let started = coop_start_child(tasks, extra_envs, root, ti, child, dst, tierup);
                 if let Err(t) = started {
                     complete(tasks, ti, Err(t));
@@ -16908,6 +16913,10 @@ pub struct ThreadTier {
     /// to (#1627), as the coop driver's spilling emit does; `0` when the emit does not spill. A bounce
     /// under a tier-up hands the interpreter's `gc.roots` what the frames beneath it pushed.
     pub spill: usize,
+    /// The host's emitter for granted modules, as the pump's ([`TierUpConfig::modules`]): a
+    /// detached child tiers up through its module's emit, over its own memory (#1414 ED-2). `None`
+    /// leaves every child interpreted.
+    pub modules: Option<ModuleEmitter>,
     /// Run one call on the emitted tier, on the calling thread. Once the run is over
     /// ([`EmittedCall::over`]) it returns by the emitted code's next fuel check, whatever it
     /// returns: the run waits for its thread.
@@ -16916,9 +16925,9 @@ pub struct ThreadTier {
 
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
 pub enum EmittedTarget<'a> {
-    /// Function `func` of the run's tier-up module: a direct call to it, or the entry of a thread
-    /// the run started, tiered up.
-    Region(u32),
+    /// Function `func` of program `module`, the run's own (`0`) or a granted module a child runs: a
+    /// direct call to it, or the entry of a task the run started, tiered up.
+    Region { module: u32, func: u32 },
     /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
     /// and the types the argument and result slots carry.
     Unit {
@@ -16938,8 +16947,13 @@ pub struct EmittedCall<'a> {
     /// The window's committed extent, the emitted `"mapped"` global (#717). On a page-checked tier,
     /// the coverage of the call's page-state table ([`EmittedCall::pagestate`]).
     pub mapped: u64,
-    /// The window's flat base, the emitted code's `win`. Null for a module with no memory.
+    /// The window's flat base, the emitted code's `win`. Null for a module with no memory, and for
+    /// a window in a memory of its own ([`EmittedCall::memory`]).
     pub win: *const u8,
+    /// The memory the window lives in when it is not the engine's: a detached child's own
+    /// ([`super::Region::foreign_id`], #1414 ED-2), where the host places the window and the
+    /// call's context.
+    pub memory: Option<u32>,
     /// Set once the run is over. Emitted code still running then stops at its next fuel check.
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
@@ -16953,7 +16967,7 @@ pub struct EmittedCall<'a> {
     table: &'a SharedSlots,
     host: &'a std::sync::Mutex<super::Host>,
     now: &'a std::cell::Cell<u64>,
-    pagestate: &'a std::cell::Cell<*const u8>,
+    pagestate: &'a std::cell::Cell<(*const u8, usize)>,
     spill: (*mut u64, usize),
 }
 
@@ -16990,13 +17004,14 @@ impl EmittedCall<'_> {
         self.now.get()
     }
 
-    /// The base of the call's page-state table, a byte per page ([`build_pagestate_table`]), on a
-    /// page-checked tier (`None` otherwise): the emitted `"pagestate"` global. A bounce rebuilds
-    /// the table if the page map moved, so read it again after one, with
+    /// The call's page-state table, a byte per page ([`build_pagestate_table`]), as `(base, len)`,
+    /// on a page-checked tier (`None` otherwise): the emitted `"pagestate"` global. A host whose
+    /// window is in a memory of its own copies it there ([`EmittedCall::memory`]). A bounce
+    /// rebuilds the table if the page map moved, so read it again after one, with
     /// [`mapped_now`](Self::mapped_now).
-    pub fn pagestate(&self) -> Option<*const u8> {
-        let p = self.pagestate.get();
-        (!p.is_null()).then_some(p)
+    pub fn pagestate(&self) -> Option<(*const u8, usize)> {
+        let (p, len) = self.pagestate.get();
+        (!p.is_null()).then_some((p, len))
     }
 
     /// The thread's spill stack, `(base, words)`, on a spilling tier (`None` otherwise): it lives
@@ -17147,13 +17162,15 @@ fn drive_threads(
     };
     let bell = host.external_wake();
     let platform = host.thread_platform();
-    // The platform's tier emits the run's own program only: no granted module is offered.
+    // The platform's tier emits the run's own program, and each granted module a child runs
+    // (#1414 ED-2).
     let programs = ProgramEmits {
         root: platform.tier.as_ref().map(|t| ProgramEmit {
             eligible: std::sync::Arc::clone(&t.eligible),
             page_checked: t.page_checked,
         }),
-        ..ProgramEmits::default()
+        modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
+        granted: Vec::new(),
     };
     if let Some(e) = &programs.root {
         core.arm_tierup(e);
@@ -17353,15 +17370,22 @@ impl ThreadRun {
                     results,
                     mapped,
                 }) => {
-                    // Only a tier arms the eligibility a tier-up needs, and only for the run's own
-                    // program (`drive_threads`).
-                    let tier = (self.platform.tier.as_ref())
-                        .filter(|_| module == 0)
-                        .ok_or(Trap::Malformed)?;
-                    let target = EmittedTarget::Region(func);
+                    // Only a tier arms the eligibility a tier-up needs (`drive_threads`), with the
+                    // page check of the program it is for.
+                    let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
+                    let paged = vm.vt.active.jit_page_checked;
+                    let target = EmittedTarget::Region { module, func };
                     let task = Some(&vm.vt);
-                    let vals =
-                        self.emitted(tier, &mut fibers, task, ctx, state, target, &argv, mapped)?;
+                    let vals = self.emitted(
+                        tier,
+                        &mut fibers,
+                        task,
+                        ctx,
+                        state,
+                        target,
+                        &argv,
+                        (mapped, paged),
+                    )?;
                     // A short reply is malformed, as the pump's `deliver_tierup` has it.
                     if vals.len() < results.len() {
                         return Err(Trap::Malformed);
@@ -17403,9 +17427,8 @@ impl ThreadRun {
             results: &inv.results,
         };
         let mut cell = fibers.cell();
-        let vals = self.emitted(
-            tier, &mut cell, None, ctx, state, target, &inv.argv, inv.mapped,
-        )?;
+        let at = (inv.mapped, tier.page_checked);
+        let vals = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
             return Err(Trap::Malformed);
@@ -17419,9 +17442,9 @@ impl ThreadRun {
     /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up,
     /// as the pump's are, or an invoke's own. A tier-up's `task` is what a `gc.roots` in a bounce
     /// scans beneath it, with what its emitted frames pushed to the thread's spill stack (#1627),
-    /// as the pump's bounce does. On a page-checked tier the call reads the thread's page-state
-    /// table, brought up to the task's page map, and is bounded by its coverage instead of the
-    /// reserved size the stop surfaced with (#750).
+    /// as the pump's bounce does. `at` is the extent the stop surfaced with, and whether the code
+    /// is page-checked: then the call reads the thread's page-state table, brought up to the task's
+    /// page map, and is bounded by its coverage instead (#750).
     #[allow(clippy::too_many_arguments)]
     fn emitted(
         &self,
@@ -17432,13 +17455,19 @@ impl ThreadRun {
         state: &mut TierState,
         target: EmittedTarget<'_>,
         argv: &[i64],
-        mapped: u64,
+        at: (u64, bool),
     ) -> Result<Vec<i64>, Trap> {
-        // Emitted code runs only over a window with a flat span, or none at all.
-        let win = match ctx.mem.as_ref() {
-            None => std::ptr::null(),
-            Some(m) => m.flat_win_base().ok_or(Trap::Malformed)?,
+        // Emitted code runs over a window with a flat span in the engine's memory, over a window in
+        // a memory of its own, which the host places (#1414 ED-2), or over none at all.
+        let (win, memory) = match ctx.mem.as_ref() {
+            None => (std::ptr::null(), None),
+            Some(m) => match (m.flat_win_base(), m.foreign_id()) {
+                (Some(base), _) => (base, None),
+                (None, Some(id)) => (std::ptr::null(), Some(id)),
+                (None, None) => return Err(Trap::Malformed),
+            },
         };
+        let (mapped, paged) = at;
         let host = match &ctx.host {
             HostCell::Shared(h) => *h,
             HostCell::Excl(_) => return Err(Trap::Malformed),
@@ -17447,10 +17476,10 @@ impl ThreadRun {
         if spill.is_empty() {
             spill.resize(tier.spill, 0);
         }
-        let paged = tier.page_checked && ctx.mem.is_some();
+        let paged = paged && ctx.mem.is_some();
         let (mapped, at) = match ctx.mem.as_ref().filter(|_| paged) {
-            Some(m) => (pages.sync(m), pages.table.as_ptr()),
-            None => (mapped, std::ptr::null()),
+            Some(m) => (pages.sync(m), (pages.table.as_ptr(), pages.table.len())),
+            None => (mapped, (std::ptr::null(), 0)),
         };
         let spilled = (spill.as_mut_ptr(), spill.len());
         let now = std::cell::Cell::new(mapped);
@@ -17485,7 +17514,7 @@ impl ThreadRun {
             match mem.as_ref() {
                 Some(m) if paged => {
                     now.set(pages.sync(m));
-                    pagestate.set(pages.table.as_ptr());
+                    pagestate.set((pages.table.as_ptr(), pages.table.len()));
                 }
                 m => now.set(m.map_or(0, |m| m.scalar_extent().unwrap_or(0))),
             }
@@ -17496,6 +17525,7 @@ impl ThreadRun {
             argv,
             mapped,
             win,
+            memory,
             over: &self.over,
             results: Vec::new(),
             fault: None,
@@ -18594,11 +18624,12 @@ impl Vm {
     /// under-admit a page the driver's table admits).
     ///
     /// #1414 B6-3: the emitted code addresses the window as one flat span (`win + addr`), so a
-    /// window backed without one (`Sparse`, `Paged`, `Foreign`) declines whatever its page state.
+    /// window backed without one (`Sparse`, `Paged`) declines whatever its page state. A memory of
+    /// its own (`Foreign`) is one such span, which its host places (#1414 ED-2).
     fn tierup_extent(&self, mem: Option<&Mem>) -> Option<u64> {
         match mem {
             None => Some(0),
-            Some(m) if m.flat_win_base().is_none() => None,
+            Some(m) if m.flat_win_base().is_none() && m.foreign_id().is_none() => None,
             Some(m) if self.jit_page_checked => Some(m.reserved_size()),
             Some(m) => m.scalar_extent(),
         }

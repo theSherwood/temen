@@ -489,13 +489,20 @@ block 0 (v0: i64) {
     const growOpt = { unit: growUnit, winSize: 1 << 20, minter: 2 * 65536 };
     const growInterp = await run(growGuest, { ...growOpt, inst: true });
     const growCodegen = await run(growGuest, { ...growOpt, instCodegen: true });
+    // #1414 ED-2: on the parallel driver each child runs its entry on its granted module's emit, over
+    // its own memory.
+    const onX2 = { x2: true, inst: true, tierup: true, tierupFloor: 0 };
+    const x2 = await run(guest, { ...opt, ...onX2 });
+    const x2Grow = await run(growGuest, { ...growOpt, ...onX2 });
     const ms = (performance.now() - t0).toFixed(0);
     const growOk = growInterp.value === 4242n && growCodegen.value === 4242n && growCodegen.tierups > 0;
-    const ok = interp.value === 600n && codegen.value === 600n && codegen.tierups > 0 && growOk;
+    const x2Ok = x2.value === 600n && x2.tierups === 8 && x2Grow.value === 4242n && x2Grow.tierups === 1;
+    const ok = interp.value === 600n && codegen.value === 600n && codegen.tierups > 0 && growOk && x2Ok;
     set('instcodegen', ok ? 'pass' : 'fail',
       `instcodegen: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
       `(want 600, ${codegen.tierups} detached children ran on emitted wasm) · vm_map growth → interp ` +
-      `${growInterp.value} / codegen ${growCodegen.value} (want 4242) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `${growInterp.value} / codegen ${growCodegen.value} (want 4242) · x2 → ${x2.value}, ${x2.tierups}/8 ` +
+      `children emitted, growth ${x2Grow.value}, ${x2Grow.tierups}/1 ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instcodegen → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted detached children; growth → ${growInterp.value}/${growCodegen.value} across ${codegen.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instcodegen', 'fail', `instcodegen: error ${e}`);
@@ -516,12 +523,16 @@ block 0 (v0: i64) {
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });
+    // #1414 ED-2: on the parallel driver the unit's entry, which spawns and joins, interprets in every
+    // child and grandchild: a region needs no task of its own. So x2 checks the value only.
+    const x2 = await run(guest, { ...opt, x2: true, inst: true, tierup: true, tierupFloor: 0 });
     const ms = (performance.now() - t0).toFixed(0);
     // Non-vacuity: all 16 ran emitted — the 8 spawning children too, not just their pure grandchildren.
-    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups === 16;
+    const ok = interp.value === 672n && codegen.value === 672n && codegen.tierups === 16 && x2.value === 672n;
     set('instnested', ok ? 'pass' : 'fail',
       `instnested: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
-      `(want 672, ${codegen.tierups}/16 emitted incl. the spawning children) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 672, ${codegen.tierups}/16 emitted incl. the spawning children) · x2 → ${x2.value} ` +
+      `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instnested → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instnested', 'fail', `instnested: error ${e}`);
@@ -548,13 +559,20 @@ block 0 (v0: i64) {
     const outcome = (p) => p.then(() => 'done', () => 'trap');
     const trapInterp = await outcome(run(guest, { ...opt, unit: trapUnit, inst: true }));
     const trapCodegen = await outcome(run(guest, { ...opt, unit: trapUnit, instCodegen: true }));
+    // #1414 ED-2: on the parallel driver each child runs its entry emitted over its own memory,
+    // checking each access against the page-state table its Worker copies into the child's header.
+    const onX2 = { x2: true, inst: true, tierup: true, tierupFloor: 0 };
+    const x2 = await run(guest, { ...opt, unit, ...onX2 });
+    const trapX2 = await outcome(run(guest, { ...opt, unit: trapUnit, ...onX2 }));
     const ms = (performance.now() - t0).toFixed(0);
     const ok = interp.value === 60072n && codegen.value === 60072n && codegen.tierups > 0 &&
-      trapInterp === 'trap' && trapCodegen === 'trap';
+      trapInterp === 'trap' && trapCodegen === 'trap' &&
+      x2.value === 60072n && x2.tierups === 8 && trapX2 === 'trap';
     set('instpaged', ok ? 'pass' : 'fail',
       `instpaged: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
       `(want 60072, ${codegen.tierups} page-op children ran on emitted wasm) · store to unmapped page → ` +
-      `interp ${trapInterp} / codegen ${trapCodegen} (want trap) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `interp ${trapInterp} / codegen ${trapCodegen} (want trap) · x2 → ${x2.value}, ${x2.tierups}/8 ` +
+      `children emitted, unmapped store ${trapX2} ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instpaged → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted page-op children; unmapped-page store → ${trapInterp}/${trapCodegen} in ${ms}ms`);
   } catch (e) {
     set('instpaged', 'fail', `instpaged: error ${e}`);
@@ -621,11 +639,15 @@ block 0 (v0: i64) {
     const t0 = performance.now();
     const interp = await run(guest, { ...opt, inst: true });
     const codegen = await run(guest, { ...opt, instCodegen: true });
+    // #1414 ED-2: on the parallel driver the unit's entry, which spawns threads, interprets, and so do
+    // the threads: a child's memory holds one context, its root task's. So x2 checks the value only.
+    const x2 = await run(guest, { ...opt, x2: true, inst: true, tierup: true, tierupFloor: 0 });
     const ms = (performance.now() - t0).toFixed(0);
-    const ok = interp.value === 568n && codegen.value === 568n && codegen.tierups > 0;
+    const ok = interp.value === 568n && codegen.value === 568n && codegen.tierups > 0 && x2.value === 568n;
     set('instthreads', ok ? 'pass' : 'fail',
       `instthreads: ${codegen.started} Workers · interp → ${interp.value} · codegen → ${codegen.value} ` +
-      `(want 568, ${codegen.tierups} emitted incl. threading units) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 568, ${codegen.tierups} emitted incl. threading units) · x2 → ${x2.value} ` +
+      `${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instthreads → interp ${interp.value} / codegen ${codegen.value} with ${codegen.tierups} emitted across ${codegen.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instthreads', 'fail', `instthreads: error ${e}`);

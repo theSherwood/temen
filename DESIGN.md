@@ -2499,8 +2499,11 @@ only the run's own dispatch table (#2273): a `call.dyn` site emits only when the
 A fork twin of the root runs the run's own program over a table of its own, forked from the root's,
 so it and its threads tier up only while its powerbox holds no `Jit`, without which neither table
 can change (`child_runs_emit`).
-The parallel driver's tier (`ThreadTier`, #1414 B6-3a) emits the run's own program only, so there a
-child of a granted module interprets until its tier takes the module emitter too (#1414 ED-2).
+The parallel driver's tier (`ThreadTier`, #1414 B6-3a) takes the module emitter too (#1414 ED-2).
+There a detached child's window is a memory of its own, which the child's root task runs its
+module's emit over: the call names the memory, and the host keeps the call's context (env cell and
+page-state table) in the memory's header, past the guest's reach. The header holds one context, so
+the child's threads interpret.
 
 **A task the run starts tiers up at its entry (#1414 ED-1).** A thread, or a detached child, whose
 entry its program's emit makes eligible runs the entry emitted, as a call to it would: the task's
