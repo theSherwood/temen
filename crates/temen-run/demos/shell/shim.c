@@ -50,7 +50,11 @@ long __spawn_rec(int inst, long rec);
 long __vm_instantiate_join(int inst, long child, long *status);
 /* A command's exit status from its join: what its `main` returned, `n` for an `exit(n)`, or 128 for
    any other trap — the crash status the POSIX build's `waitpid` reaps (FORK.md §8.6). The command's
-   end is never the shell's own. */
+   end is never the shell's own. Only the spawn build joins (`TEMEN_SHELL_SPAWN`, defined in
+   shell_main.c), and only it may call the `Instantiator`: a module that does needs a runtime of its
+   own, so the JIT cannot share its code and compiles the POSIX `/bin/sh` again for every process
+   (#2442). */
+#if !defined(TEMEN_SHELL_SEQUENTIAL) && !defined(TEMEN_SHELL_POSIX)
 static long join_status(long child) {
   long st;
   long r = __vm_instantiate_join(__inst(), child, &st);
@@ -58,6 +62,7 @@ static long join_status(long child) {
   if ((st & 0xffffffff) == 7) return (st >> 32) & 0xff; /* `trap_code::EXIT`, the status in the high half */
   return 128;
 }
+#endif
 /* Ring pipelines (STAGE1.md item 6): mint a shareable region (`AddressSpace` op 5) and alias it into
    this window (`SharedRegion` ops 0/1/3), dispatched on the reflection-discovered handles below. */
 long __as_region(int cap, long len);
