@@ -92,6 +92,9 @@ export const suspendsLeaves = typeof WebAssembly.Suspending === 'function'
 // - `spillBytes()`, `spillPtr()`: the spill stack a collecting guest's frames push to (#1627);
 // - `fuelOut()` (optional): emitted code spent its fuel. Return more for every instance to run on
 //   with, or nothing to let the code trap `OutOfFuel`; without it, it traps.
+// - `envCell` (optional): where in `memory` the env cell is, when the host places it (a detached
+//   child's, in the header of its own memory: #1414 ED-2); without it, the tier allocates one in the
+//   engine's memory.
 // Everything here is synchronous but `syncTable` and `unitFor`, which the coop driver awaits at its
 // event boundaries; a host that cannot await uses `syncTableSync` and `unitForSync`.
 // #2126 — a native wasm trap (no `env.trap`) still names itself in its `RuntimeError` message. The
@@ -136,7 +139,8 @@ export function emittedTier(ex, memory, x) {
   const tsize = 1 << x.tableLog2();
   const table = new WebAssembly.Table({ initial: tsize, maximum: tsize, element: 'anyfunc' });
   const envBytes = ex.temen_wasmjit_env_bytes();
-  const envCell = Number(ex.temen_alloc(envBytes));
+  const placed = x.envCell !== undefined;
+  const envCell = placed ? x.envCell : Number(ex.temen_alloc(envBytes));
   // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
   // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
   const spillBytes = x.spillBytes();
@@ -373,7 +377,9 @@ export function emittedTier(ex, memory, x) {
       program = exports;
       register(exports);
     },
-    free: () => ex.temen_dealloc(envCell, envBytes),
+    free: () => {
+      if (!placed) ex.temen_dealloc(envCell, envBytes);
+    },
   };
 }
 
