@@ -271,9 +271,10 @@ different things depending on which pair you compare:
   `Mem::snapshot_safe` admitted only a window fully reproduced by reseeding the prefix *bytes*, so any
   `Ro`/`Unmapped`/grown entry vetoed it. The checkpoint now captures the window's **page-protection map
   alongside its bytes** (`Mem::layout_snapshot`/`restore_layout`, a new `MemLayout` in both
-  `DebugRunSnapshot` and `ScheduledSnapshot`): the byte range runs to the high-water mark (prefix + any
-  grown tail page — `map`/`unmap` zero on commit, so uncommitted pages read zero and round-trip trivially),
-  and the prot map is reinstalled verbatim on restore. The root gate weakens from `snapshot_safe` to
+  `DebugRunSnapshot` and `ScheduledSnapshot`): the declared window's bytes and each page held past it
+  (#2427: apart, so a capture costs what the window holds, not the span below its highest page), and
+  the prot map is reinstalled verbatim on restore, which first zeroes what the live window held past the
+  prefix, so a page the checkpoint held zero, or not at all, keeps nothing written since. The root gate weakens from `snapshot_safe` to
   `layout_snapshot_safe`, whose sole disqualifier is §13 region aliasing (a `Backed` page's bytes live in a
   shared cross-domain `SharedRegion`, not this window's backing). **#2026 lifts that for the root:** the
   checkpoint carries the root host's regions (bytes, ids, handles) and the restore re-aliases the

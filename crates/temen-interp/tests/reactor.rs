@@ -110,13 +110,13 @@ fn a_dense_page_map_restores_into_the_reactor_window_in_its_own_page_unit() {
 
     assert!(r.restore_window(&layout, &Host::new()));
     let back = r.window_layout().expect("capturable");
+    let (bytes, prots) = back.to_dense();
     assert_eq!(
-        back.dense_prots(),
-        dense,
+        prots, dense,
         "the live window's map, read back in the codec's unit, is the map that was restored"
     );
     assert_eq!(
-        back.bytes(),
+        bytes,
         layout.bytes(),
         "the image round-trips, hole included"
     );

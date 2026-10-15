@@ -285,7 +285,7 @@ block 0 (v0: i64) {
     )
 }
 
-/// #2438 — a demand-paged child's pager rides its launch record (v46), so the thaw re-links its faults
+/// #2438 — a demand-paged child's pager rides its launch record (v47), so the thaw re-links its faults
 /// to it; and it must name a pager export of the spawner's program, as op 17 requires, or the restore
 /// is refused.
 #[test]

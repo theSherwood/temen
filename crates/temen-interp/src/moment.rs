@@ -24,6 +24,7 @@
 //! serialization ([`temen-snapshot`] writes a `ShadowStack` moment as a §12 artifact).
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::{Host, HostReplaySubstate, MemLayout, PageMap, RegionTable};
@@ -171,10 +172,28 @@ const SHARED_PAGE: usize = crate::DURABLE_SNAPSHOT_PAGE as usize;
 enum Image {
     Flat(MemLayout),
     Paged {
-        /// The image in [`SHARED_PAGE`] pages; the last one holds the remainder.
+        /// The image's head in [`SHARED_PAGE`] pages; the last one holds the remainder.
         pages: Vec<Arc<[u8]>>,
+        /// The pages it holds past the head (#2427), a grown heap's own, by offset.
+        tail: BTreeMap<u64, Arc<[u8]>>,
         map: PageMap,
     },
+}
+
+/// `page`, shared with `below`'s page at the same place when their bytes agree.
+fn share(page: &[u8], below: Option<&Arc<[u8]>>) -> Arc<[u8]> {
+    match below {
+        Some(b) if **b == *page => Arc::clone(b),
+        _ => Arc::from(page),
+    }
+}
+
+/// What holding `page` adds beside `below`'s page at the same place: nothing when they are one copy.
+fn unshared(page: &Arc<[u8]>, below: Option<&Arc<[u8]>>) -> usize {
+    match below {
+        Some(b) if Arc::ptr_eq(b, page) => 0,
+        _ => page.len(),
+    }
 }
 
 impl Image {
@@ -182,8 +201,12 @@ impl Image {
     fn layout(&self) -> Cow<'_, MemLayout> {
         match self {
             Image::Flat(l) => Cow::Borrowed(l),
-            Image::Paged { pages, map } => Cow::Owned(MemLayout {
+            Image::Paged { pages, tail, map } => Cow::Owned(MemLayout {
                 bytes: pages.concat(),
+                tail: tail
+                    .iter()
+                    .map(|(&off, page)| (off, page.to_vec()))
+                    .collect(),
                 map: map.clone(),
             }),
         }
@@ -192,46 +215,54 @@ impl Image {
     fn byte_len(&self) -> usize {
         match self {
             Image::Flat(l) => l.byte_len(),
-            Image::Paged { pages, .. } => pages.iter().map(|p| p.len()).sum(),
+            Image::Paged { pages, tail, .. } => {
+                pages.iter().chain(tail.values()).map(|p| p.len()).sum()
+            }
         }
     }
 
-    /// This image in pages, each one shared with `below`'s page at the same index when the bytes
-    /// agree. An image already paged is left as it is.
+    /// This image in pages, each one shared with `below`'s page at the same place when the bytes
+    /// agree, its head's and (#2427) those it holds past the head alike. An image already paged is
+    /// left as it is.
     fn paged(self, below: Option<&Image>) -> Image {
-        let Image::Flat(MemLayout { bytes, map }) = self else {
+        let Image::Flat(MemLayout { bytes, tail, map }) = self else {
             return self;
         };
-        let below: &[Arc<[u8]>] = match below {
-            Some(Image::Paged { pages, .. }) => pages,
-            _ => &[],
-        };
+        let (below, below_tail) = below.map_or((None, None), Image::parts);
         let pages = bytes
             .chunks(SHARED_PAGE)
             .enumerate()
-            .map(|(i, page)| match below.get(i) {
-                Some(b) if **b == *page => Arc::clone(b),
-                _ => Arc::from(page),
-            })
+            .map(|(i, page)| share(page, below.and_then(|b| b.get(i))))
             .collect();
-        Image::Paged { pages, map }
+        let tail = tail
+            .into_iter()
+            .map(|(off, page)| (off, share(&page, below_tail.and_then(|t| t.get(&off)))))
+            .collect();
+        Image::Paged { pages, tail, map }
     }
 
     /// The pages this image holds that `below` does not share — what holding it adds to a ladder.
     fn bytes_beyond(&self, below: Option<&Image>) -> usize {
-        let Image::Paged { pages, .. } = self else {
+        let Image::Paged { pages, tail, .. } = self else {
             return self.byte_len();
         };
-        let below: &[Arc<[u8]>] = match below {
-            Some(Image::Paged { pages, .. }) => pages,
-            _ => &[],
-        };
-        pages
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| !below.get(*i).is_some_and(|b| Arc::ptr_eq(b, p)))
-            .map(|(_, p)| p.len())
-            .sum()
+        let (below, below_tail) = below.map_or((None, None), Image::parts);
+        let head: usize = (pages.iter().enumerate())
+            .map(|(i, p)| unshared(p, below.and_then(|b| b.get(i))))
+            .sum();
+        let tail: usize = (tail.iter())
+            .map(|(off, p)| unshared(p, below_tail.and_then(|t| t.get(off))))
+            .sum();
+        head + tail
+    }
+
+    /// A paged image's head pages and tail pages, to share against; nothing for a flat one.
+    #[allow(clippy::type_complexity)]
+    fn parts(&self) -> (Option<&[Arc<[u8]>]>, Option<&BTreeMap<u64, Arc<[u8]>>>) {
+        match self {
+            Image::Paged { pages, tail, .. } => (Some(pages), Some(tail)),
+            Image::Flat(_) => (None, None),
+        }
     }
 }
 

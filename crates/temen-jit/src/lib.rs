@@ -473,15 +473,26 @@ pub enum JitOutcome {
 }
 
 /// Per-page protection to re-establish on a guest window before a run — the durable-restore
-/// step (DURABILITY.md §12.3). One entry per [`DURABLE_SNAPSHOT_PAGE`]-byte page of the window's
-/// backed prefix; pages beyond the prefix (or a `Rw` entry) are left at the default RW. Lets a
+/// step (DURABILITY.md §12.3). One entry per [`DURABLE_SNAPSHOT_PAGE`]-byte page of the image the
+/// window is seeded with, and one per [`TailPage`] it holds past that (#2427): a `Rw` entry in the
+/// backed prefix keeps the default, and past it every entry is a page the window holds. Lets a
 /// thawed guest fault on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
-/// matching the interpreter (`temen-interp`'s `apply_prots`).
+/// matching the interpreter (`temen-interp`'s `Mem::apply_layout`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowProt {
     Rw,
     Ro,
     Unmapped,
+}
+
+/// #2427 — a page a durable window holds past the image a thaw seeds it with, as the thaw
+/// re-establishes it: its byte offset, its protection, and its bytes (`None` reads zero). A capture
+/// carries each page the window holds there, and nothing between them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TailPage {
+    pub off: u64,
+    pub prot: WindowProt,
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// The host-side residue of a fiber the durable freeze driver flattened (DURABILITY.md §12.8) — the
@@ -835,10 +846,12 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
 /// `ctx` is a [`GrantChild::ctx`] a builder returned and that has not yet been released.
 pub type GrantChildReleaser = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 
-/// #1810 — the embedder's report of how far a guest grew its window at `base` through the Memory
-/// capability: one past its highest page (`0` for none). The host keeps that page map; the JIT does
-/// not. `ctx` is the pointer the hook was installed with ([`CompiledModule::set_high_water`]).
-pub type HighWater = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, base: usize) -> u64;
+/// #1810, #2427 — the embedder's report of the pages the window at `base` holds past `mapped` (its
+/// declared size) with contents of its own, committed through the Memory capability: the byte offset
+/// of each, ascending, in host pages. The host keeps that page map; the JIT does not. A durable
+/// capture reads these pages and nothing between them. `ctx` is the pointer the hook was installed
+/// with ([`CompiledModule::set_held_tail`]). A plain Rust fn: it hands back a `Vec`.
+pub type HeldTail = unsafe fn(ctx: *mut core::ffi::c_void, base: usize, mapped: u64) -> Vec<u64>;
 
 /// PROCESS.md §5 / #1287, D66 — the admission for a detached spawn, the interpreter's
 /// `Host::admit_detached_spawn`: reserve the lane of the budget behind `budget` against the parent's
@@ -909,11 +922,12 @@ pub type PremapStage = unsafe extern "C" fn(
 /// The embedder's hook over a fresh window once it is seeded and protected, before its guest runs: a
 /// root's ([`CompiledModule::set_window_ready`]) and a detached child's (the nursery's, on the child
 /// thread). `ro` lists the `[start, end)` byte ranges its `readonly` data segments made read-only, for
-/// the embedder's page map to record as the interpreter's own does (#2268); then a spawn's pre-map, or
-/// a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside `reserved`) — the
-/// interpreter's `Host::apply_premap` through the host's own window backend, i.e. the same
-/// `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's guest never
-/// runs (a child's `CapFault` outcome, a root's failed run).
+/// the embedder's page map to record as the interpreter's own does (#2268); `shadow` is the arena its
+/// module declared, whose runtime-private pages the embedder's page ops refuse (#2426); then a
+/// spawn's pre-map, or a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside
+/// `reserved`) — the interpreter's `Host::apply_premap` through the host's own window backend, i.e.
+/// the same `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's
+/// guest never runs (a child's `CapFault` outcome, a root's failed run).
 ///
 /// # Safety
 /// `ctx` is the window's powerbox; `[base, base+reserved)` its live reservation; `ro` points at `n_ro`
@@ -925,6 +939,7 @@ pub type WindowReady = unsafe extern "C" fn(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> i32;
 
 /// #1944 slice 3 — a detached child's own budget node (the budget that paid for its window), read off
@@ -953,10 +968,10 @@ pub struct GrantChildHooks {
     pub premap_admit: PremapAdmit,
     pub premap_stage: PremapStage,
     pub premap_apply: WindowReady,
-    /// #1854 — [`HighWater`] over a **child** powerbox (always the shared form): how far a durable
-    /// detached child grew its window, so a freeze's capture of it reaches its grown pages, as the
-    /// root's does.
-    pub high_water: HighWater,
+    /// #1854, #2427 — [`HeldTail`] over a **child** powerbox (always the shared form): the pages a
+    /// durable detached child holds past its declared window, so a freeze's capture of it carries
+    /// them, as the root's does.
+    pub held_tail: HeldTail,
     /// #1944 slice 3 — a **detached** child's own budget node (see [`ChildBudgetNode`]).
     pub budget_node: ChildBudgetNode,
     pub release: GrantChildReleaser,
@@ -1771,8 +1786,10 @@ pub struct DetachedHarvest {
 
 /// #1361 step 4 — what a durable detached child that unwound for a freeze left for the harvest.
 pub struct DetachedCapture {
-    /// Its window image.
+    /// Its window image: its declared window.
     pub image: Vec<u8>,
+    /// #2427 — each page it holds past that with contents of its own, by byte offset.
+    pub tail: Vec<(u64, Vec<u8>)>,
     /// What a run's root leaves beside its image: its fibers (#2031), its `thread.spawn` vCPUs,
     /// including each that finished unjoined, which its root's re-issued join is owed (#2010), and
     /// its root's extent.
@@ -1802,8 +1819,11 @@ pub struct CapturedSeed {
     pub shadow: temen_ir::durable_abi::ShadowArena,
     /// Its restored window image.
     pub image: Vec<u8>,
-    /// Its restored page map, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733).
+    /// Its restored page map over `image`, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733); empty
+    /// when no page deviates from a fresh window's.
     pub prots: Vec<WindowProt>,
+    /// #2427 — and each page it holds past `image`.
+    pub tail: Vec<TailPage>,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
     /// #1971 — the lease its window was charged under, as the spawn filed it: the parent's handle on
@@ -2662,6 +2682,11 @@ pub struct CompiledModule {
     /// Per-page protections to re-establish on the window before a run — the durable-restore
     /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
     restore_prots: Vec<WindowProt>,
+    /// #2427 — and the pages past the seed image the window holds.
+    restore_tail: Vec<TailPage>,
+    /// #2427 — the pages a durable run's capture read past its declared window, by byte offset
+    /// ([`Self::take_tail_out`]).
+    tail_out: Vec<(u64, Vec<u8>)>,
     /// This run is **durable** (DURABILITY.md §12.8): the fiber runtime keeps the active shadow-SP
     /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
     /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
@@ -2705,8 +2730,9 @@ pub struct CompiledModule {
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
     /// can write `UNWINDING` into the running window. `None` for every non-interruptible run.
     freeze_ctl: Option<Arc<FreezeController>>,
-    /// #1810 — a durable run's capture reaches the guest's high-water (see [`HighWater`]).
-    high_water: Option<(HighWater, *mut core::ffi::c_void)>,
+    /// #1810, #2427 — a durable run's capture reads the pages the guest holds past its declared
+    /// window (see [`HeldTail`]).
+    held_tail: Option<(HeldTail, *mut core::ffi::c_void)>,
     /// #2025 — the embedder's hook over a fresh root window, before the guest runs
     /// ([`Self::set_window_ready`]).
     window_ready: Option<(WindowReady, *mut core::ffi::c_void)>,
@@ -3728,6 +3754,8 @@ impl CompiledModule {
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
             restore_prots: Vec::new(),
+            restore_tail: Vec::new(),
+            tail_out: Vec::new(),
             durable: false,
             shadow,
             concurrent_durable: false,
@@ -3740,7 +3768,7 @@ impl CompiledModule {
             detached_seed: Vec::new(),
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
-            high_water: None,
+            held_tail: None,
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
@@ -3949,6 +3977,8 @@ impl CompiledModule {
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
             restore_prots: Vec::new(),
+            restore_tail: Vec::new(),
+            tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
             concurrent_durable: false,
@@ -3961,7 +3991,7 @@ impl CompiledModule {
             detached_seed: Vec::new(),
             thaw_root_sp: self.shadow.frame_base(0),
             freeze_ctl: None,
-            high_water: None,
+            held_tail: None,
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
@@ -4129,11 +4159,18 @@ impl CompiledModule {
         self.freeze_ctl = fc;
     }
 
-    /// #1810 — extend a snapshotting run's capture through the guest's high-water, as `hook`
-    /// reports it for the live window. For a **durable** run, whose capture is its freeze image;
-    /// other captures keep their fixed span (a grown heap is not worth copying for them).
-    pub fn set_high_water(&mut self, hook: Option<(HighWater, *mut core::ffi::c_void)>) {
-        self.high_water = hook;
+    /// #1810, #2427 — make a snapshotting run's capture its declared window and each page the guest
+    /// holds past it, as `hook` reports them for the live window ([`Self::take_tail_out`]). For a
+    /// **durable** run, whose capture is its freeze image; other captures keep their fixed span (a
+    /// grown heap is not worth copying for them).
+    pub fn set_held_tail(&mut self, hook: Option<(HeldTail, *mut core::ffi::c_void)>) {
+        self.held_tail = hook;
+    }
+
+    /// #2427 — the pages the last durable run's capture read past its declared window, by byte offset
+    /// ([`Self::set_held_tail`]): its image's tail, taken.
+    pub fn take_tail_out(&mut self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.tail_out)
     }
 
     /// #2025 — run `hook` over each fresh root window once it is seeded and protected, before the
@@ -4145,11 +4182,12 @@ impl CompiledModule {
     }
 
     /// #1834 — the page map the next run's window is built under (DURABILITY.md §12.3): a thaw's,
-    /// one [`WindowProt`] per [`DURABLE_SNAPSHOT_PAGE`], a page past the backed prefix committed
-    /// and seeded from the run's `init_mem` when `Rw`/`Ro`. Empty (the default) builds the fresh
-    /// window.
-    pub fn set_restore_prots(&mut self, prots: Vec<WindowProt>) {
+    /// one [`WindowProt`] per [`DURABLE_SNAPSHOT_PAGE`] of the run's `init_mem`, a page past the
+    /// backed prefix committed and seeded from it when `Rw`/`Ro`; then (#2427) each page of `tail`,
+    /// those the window holds past `init_mem`. Both empty (the default) builds the fresh window.
+    pub fn set_restore_prots(&mut self, prots: Vec<WindowProt>, tail: Vec<TailPage>) {
         self.restore_prots = prots;
+        self.restore_tail = tail;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
@@ -4272,8 +4310,9 @@ impl CompiledModule {
         }
         // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
         // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
-        // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
-        // after the init copy + data segments; a grown tail page is committed and seeded here.
+        // exactly as the frozen one would — matching `temen-interp`'s `apply_layout`. Applied
+        // after the init copy + data segments; a page held past the prefix is committed and
+        // seeded here (#1834, #2427).
         // #964: then reserve the marked module's NULL region last, after every host write above
         // (init seed, data segments, durable prots) has landed — the marked layout keeps all
         // live data at or above the guard, so nothing legitimate is covered. A window smaller than
@@ -4283,6 +4322,7 @@ impl CompiledModule {
             &self.restore_prots,
             self.win_mapped as u64,
             init_mem.unwrap_or(&[]),
+            &self.restore_tail,
         ) && (self.null_guard > self.win_mapped as u64
             || window.seed_null_guard(self.null_guard));
         seeded.then_some((window, ro))
@@ -4369,6 +4409,7 @@ impl CompiledModule {
                     t.win_reserved as u64,
                     ro.as_ptr(),
                     ro.len(),
+                    t.shadow,
                 ) == 0
                 {
                     return Err(JitError::Unsupported(
@@ -4772,6 +4813,7 @@ impl CompiledModule {
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
         // bytes no one reads.
+        (*this).tail_out = Vec::new();
         let final_mem = match snapshot_cap {
             None => Some(Vec::new()),
             Some(cap) => {
@@ -4782,23 +4824,29 @@ impl CompiledModule {
                 // `cap` widens the snapshot past the backed prefix to also cover reserved-tail pages
                 // the guest grew/`unmap`-ed (§1a growth path), `commit`-ing them so the read sees
                 // zero/their content instead of faulting. `read_low` clamps to the reservation.
-                // #1810: a durable run's capture also reaches the guest's high-water, while the window
-                // lives.
-                let high = match (*this).high_water {
-                    Some((f, ctx)) => f(ctx, mem_base as usize) as usize,
-                    None => 0,
+                // #1810, #2427: a durable run's capture is its declared window and, read apart while the
+                // window lives, each page the guest holds past it: never the span between them.
+                let snap = match (*this).held_tail {
+                    Some(_) => win_size,
+                    None if win_size > 0 => cap.min((mask + 1) as usize).max(win_size),
+                    None => win_size,
                 };
-                let snap = if win_size > 0 {
-                    cap.max(high).min((mask + 1) as usize).max(win_size)
-                } else {
-                    win_size
-                };
-                if !window.restore_rw() {
+                let image = if !window.restore_rw() {
                     None
                 } else if snap > win_size {
                     window.read_low(snap)
                 } else {
                     Some(window.rw_mut()[..win_size].to_vec())
+                };
+                match (image, (*this).held_tail) {
+                    (Some(image), Some((f, ctx))) => {
+                        let held = f(ctx, mem_base as usize, win_size as u64);
+                        window.read_pages(&held).map(|tail| {
+                            (*this).tail_out = tail;
+                            image
+                        })
+                    }
+                    (image, _) => image,
                 }
             }
         };
@@ -5940,6 +5988,8 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
         restore_prots: Vec::new(),
+        restore_tail: Vec::new(),
+        tail_out: Vec::new(),
         durable: false,
         concurrent_durable: false,
         frozen_seed: Vec::new(),
@@ -5952,7 +6002,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         thaw_root_sp: shadow.frame_base(0),
         shadow,
         freeze_ctl: None,
-        high_water: None,
+        held_tail: None,
         window_ready: None,
         fork_hook: None,
         fiber_rt: None,
