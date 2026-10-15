@@ -3791,9 +3791,6 @@ pub struct VcpuProgram {
     mem_size_log2: Option<u8>,
     /// The module compiled — see [`module`](VcpuProgram::module).
     module: std::sync::Arc<Module>,
-    /// The run's fiber registry (#1761) — run-level state, like `dom`'s §22 install slots: see
-    /// [`fibers`](VcpuProgram::fibers).
-    fibers: SharedFibers,
     /// The next dense vCPU id a `thread.spawn` hands out (root = 0), in spawn order across the run —
     /// see [`VcpuEvent::Spawn`]'s `vcpu`.
     next_vcpu: std::sync::atomic::AtomicU64,
@@ -3820,7 +3817,6 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             module: std::sync::Arc::new(m.clone()),
-            fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -3835,20 +3831,6 @@ impl VcpuProgram {
     fn take_vcpu_id(&self) -> u64 {
         self.next_vcpu
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// The run's **shared fiber registry** (#1761), for [`Vcpu::with_shared_fibers`]: an embedder
-    /// that drives one run's vCPUs on separate threads or Workers (the browser's Worker driver)
-    /// attaches it to the root and every `thread.spawn` child, so a fiber migrates between them.
-    /// Like the domain's §22 install slots it is state of the run this program drives — compile a
-    /// fresh program per run.
-    pub fn fibers(&self) -> &SharedFibers {
-        &self.fibers
-    }
-
-    /// Number of functions (a `thread.spawn` target is bounds-checked against this).
-    pub fn func_count(&self) -> usize {
-        self.dom.source.primary().progs.len()
     }
 }
 
@@ -4013,19 +3995,6 @@ pub enum VcpuEvent {
     Done(Vec<Value>),
     /// The vCPU trapped (a joined thread's trap propagates here too; a §14 child's, its join answers).
     Trapped(Trap),
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): the interpreter reached a direct `Call`
-    /// to the eligible function `func` (see [`Vcpu::with_jit_eligible`]). The host runs the emitted
-    /// `f{func}(win, env, ...argv)` region on its Worker — a **top-level** call, so a guest trap is a
-    /// catchable `RuntimeError` and never corrupts the engine — then calls [`Vcpu::deliver_tierup`]
-    /// with the results, or [`Vcpu::deliver_tierup_trap`] if the region trapped. `argv` is the
-    /// marshalled arguments as raw i64 slots (the host reads them per `func`'s signature).
-    TierUp {
-        func: u32,
-        argv: Box<[i64]>,
-        /// The window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — write it to
-        /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-        mapped: u64,
-    },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_child`] with the
     /// host's token for it (the engine issues the handle the guest `join`s it by).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
@@ -4072,7 +4041,7 @@ pub enum VcpuEvent {
     /// A **codegen** host runs the unit on emitted wasm instead ([`Vcpu::deliver_jit_invoke_vals`]).
     /// `mapped` is the window's scalar committed extent at the invoke ([`Mem::scalar_extent`]):
     /// `Some(H)` MUST be written to the emitted unit's `"mapped"` global before running it (#717
-    /// host sync — same contract as [`VcpuEvent::TierUp`]); `None` means the window state is not
+    /// host sync); `None` means the window state is not
     /// representable by the single bound, so the host must **decline** emitted execution for this
     /// invoke and use the interpreted delivery — fail-closed, the interpreter honors the full page
     /// map. `Some(0)` for a memory-less module (nothing to bound).
@@ -4174,10 +4143,6 @@ pub struct Vcpu<'p> {
     /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
     /// host, as before.
     shared_host: Option<&'p std::sync::Mutex<Host>>,
-    /// The run's **shared fiber registry** (#1761, see [`with_shared_fibers`](Vcpu::with_shared_fibers)):
-    /// when set, `cont.*` go through it instead of this vCPU's own `fibers`, so a fiber created on one
-    /// vCPU of the run can be resumed on another. `None` ⇒ the owned tables, as before.
-    shared_fibers: Option<&'p SharedFibers>,
     /// A §14 **confined child**'s own domain (its natural table over the shared source — no parent
     /// §22 install slots); `None` for a root / `thread.spawn` child, which dispatch through
     /// [`VcpuProgram::dom`]'s table (`prog.dom`). The `source` `Arc` is the same either way.
@@ -4187,35 +4152,8 @@ pub struct Vcpu<'p> {
     /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
     /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
     pending_jit: Option<PendingJit>,
-    /// #846 — the **emitted-invoke** fiber registry: while a codegen host services a
-    /// [`VcpuEvent::JitInvoke`] on emitted wasm, each cross-tier callback it bounces back here
-    /// ([`bounce_call`](Vcpu::bounce_call)) shares this registry, so a fiber parked by one callback
-    /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
-    /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
-    invoke_fibers: FiberTables,
-    /// The entry's initial arguments as the constructor built them — a §14 confined child's starter
-    /// cap handles (`[Instantiator, AddressSpace?]`, widened to `i64`), so a host that runs the
-    /// child's entry on emitted wasm (the browser's codegen path) passes exactly the handles the
-    /// interpreter would, and a bounced leaf's `call.cap` resolves them on this vCPU. Empty on the
-    /// other constructors.
-    entry_args: Vec<Value>,
     /// A trap to surface on the next `run` (a joined thread's trap propagates to the joiner).
     trap: Option<Trap>,
-    /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
-    /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
-    /// `Call` to it is surfaced as a [`VcpuEvent::TierUp`] — the host runs the emitted `f{f}` on the
-    /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
-    /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
-    /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
-    /// embedder computes it (e.g. from `temen_wasm_jit::analyze`).
-    jit_eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 paged tier-up: see the `Vm` field of the same name; mirrored here for the `JitInvoke`
-    /// surfacing (which reads the Vcpu, not the Vm).
-    jit_page_checked: bool,
-    /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
-    /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
-    /// slots — the caller's window base is the one the spill persisted).
-    pending_tierup: Option<(usize, Box<[ValType]>)>,
     /// The child the last [`VcpuEvent::InstantiateDetached`] announced — admitted, and waiting for
     /// the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
@@ -4501,17 +4439,11 @@ impl<'p> Vcpu<'p> {
             fuel: Fuel::fixed(u64::MAX),
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: None,
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: Vec::new(),
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
@@ -4555,17 +4487,11 @@ impl<'p> Vcpu<'p> {
             fuel,
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: Some(own_dom),
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: args,
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
@@ -4587,56 +4513,10 @@ impl<'p> Vcpu<'p> {
         self
     }
 
-    /// Set how many vCPUs the driver running this one can run at once ([`Host::set_workers`]) on the
-    /// host its `call.cap`s go through: the shared powerbox when it has one, else its own. The
-    /// browser's per-Worker driver gives each vCPU its own Worker, so it passes the page's core count.
-    pub fn with_workers(mut self, n: usize) -> Vcpu<'p> {
-        match self.shared_host {
-            Some(h) => h.lock_unpoisoned().set_workers(n),
-            None => self.host.set_workers(n),
-        }
-        self
-    }
-
-    /// Attach the run's **shared fiber registry** (#1761, builder-style, the fiber twin of
-    /// [`with_shared_host`](Vcpu::with_shared_host)): every `cont.new` / `cont.resume` / `suspend` of
-    /// this vCPU then goes through `fibers`, so a fiber created on one vCPU of the run can be resumed
-    /// on another — a language runtime's worker pool, whose jobs are fibers pinned to whichever
-    /// worker owns them. Attach one registry to the root and every `thread.spawn` child of a run;
-    /// never to a §14 confined child, whose fibers are its own process's. Every path that touches the
-    /// registry — `step_vcpu`, a tier-up bounce's nested drive, a `gc.roots` view beneath an invoke —
-    /// locks it per fiber transition or scan, never across execution.
-    pub fn with_shared_fibers(mut self, fibers: &'p SharedFibers) -> Vcpu<'p> {
-        self.shared_fibers = Some(fibers);
-        self
-    }
-
     /// Seed this vCPU's `vcpu.tls` word with its dense vCPU id (builder-style) — a `thread.spawn`
     /// child's, from its [`VcpuEvent::Spawn`]'s `vcpu`. A root is 0, the constructors' default.
     pub fn with_vcpu_id(mut self, id: u64) -> Vcpu<'p> {
         self.vt.active.tls = id as i64;
-        self
-    }
-
-    /// Attach the **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice, builder-style). A
-    /// direct `Call` to a function `f` with `eligible[f] == true` then surfaces as
-    /// [`VcpuEvent::TierUp`] instead of interpreting `f` — the host runs the emitted region and
-    /// `deliver_tierup`s the result. `eligible.len()` should cover the primary module's functions;
-    /// an out-of-range index is treated as not-eligible (interprets).
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> Vcpu<'p> {
-        self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
-        self.jit_eligible = Some(eligible);
-        self
-    }
-
-    /// #750 **paged tier-up**: mark the eligible set as emitted with the software page-check
-    /// (`compile_module_tierup_paged`). The dispatch then surfaces tier-up regardless of the
-    /// window's scalar representability — the event's `mapped` is the reserved window size, and the
-    /// driver's page-state table (refreshed per call from [`mem_map_info`](Vcpu::mem_map_info))
-    /// carries the per-page fidelity the scalar cannot.
-    pub fn with_jit_page_checked(mut self) -> Vcpu<'p> {
-        self.vt.active.jit_page_checked = true;
-        self.jit_page_checked = true;
         self
     }
 
@@ -4653,12 +4533,6 @@ impl<'p> Vcpu<'p> {
     /// access may be admitted. `0` for a memory-less module.
     pub fn win_flat_len(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.win_flat_len())
-    }
-
-    /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
-    /// confined child's starter cap handles, for a host that drives the entry on emitted wasm.
-    pub fn entry_args(&self) -> &[Value] {
-        &self.entry_args
     }
 
     /// #1009 paged tier-up: the window's page-map version — a cheap `O(1)` counter bumped on every
@@ -4817,14 +4691,10 @@ impl<'p> Vcpu<'p> {
                     None => HostCell::Excl(&mut self.host),
                 },
             };
-            // The run's shared fiber registry when attached (#1761), else this vCPU's own.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
+            let mut fibers = FiberCell::Excl {
+                fibers: &mut self.fibers,
+                sp: &mut self.fiber_sp,
+                meta: &mut self.fiber_meta,
             };
             let stop = step_vcpu(
                 &mut self.vt,
@@ -4917,22 +4787,9 @@ impl<'p> Vcpu<'p> {
                     }
                     return VcpuEvent::Done(vals);
                 }
-                Ok(VcpuStop::TierUp {
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                    ..
-                }) => {
-                    // A vCPU arms no entry (`with_jit_eligible` sets the bitmap alone), so each of
-                    // its tier-ups is a call.
-                    let TierUpDst::Frame(dst) = dst else {
-                        return VcpuEvent::Trapped(Trap::Malformed);
-                    };
-                    self.pending_tierup = Some((dst, results));
-                    return VcpuEvent::TierUp { func, argv, mapped };
-                }
+                // A vCPU's tasks carry no tier-up eligibility, so its VM never stops for one; a
+                // stop it did not ask for fails closed.
+                Ok(VcpuStop::TierUp { .. }) => return VcpuEvent::Trapped(Trap::Malformed),
                 Ok(VcpuStop::Spawn {
                     func,
                     sp,
@@ -5052,11 +4909,8 @@ impl<'p> Vcpu<'p> {
                     // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
                     // (unrepresentable page state) tells it to decline emitted execution and use
                     // the interpreted delivery instead. A memory-less module has nothing to bound.
-                    // #750: a page-checked run surfaces the reserved size instead (see the tier-up
-                    // dispatch), the table carrying per-page fidelity.
                     let mapped = match self.mem.as_ref() {
                         None => Some(0),
-                        Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                         Some(m) => m.scalar_extent(),
                     };
                     return VcpuEvent::JitInvoke {
@@ -5147,7 +5001,7 @@ impl<'p> Vcpu<'p> {
     /// File the host's `token` for a child this vCPU admitted under the next handle, with the
     /// admission's window lease, and return the handle. What [`deliver_child`](Self::deliver_child)
     /// does for an interpreted spawn, and what a host calls itself for a spawn its emitted code
-    /// issued ([`admit_record`](Self::admit_record)), whose handle goes back to that code.
+    /// issued, whose handle goes back to that code.
     pub fn file_child(&mut self, token: u64) -> i32 {
         let handle = self.children.len() as i32;
         self.children.push(Some(VcpuChild {
@@ -5158,11 +5012,10 @@ impl<'p> Vcpu<'p> {
         handle
     }
 
-    /// A `join` this vCPU's **emitted** code issued (the browser's `env.join` bounce): resolve
-    /// `handle` by the oracle's child-table rule, as the interpreted join does, and return the host's
-    /// token for the child, once. The host waits on the child, then calls
-    /// [`end_join`](Self::end_join). `Err` is the trap the interpreted join raises.
-    pub fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
+    /// A `join`: resolve `handle` by the oracle's child-table rule and return the host's token for the
+    /// child, once. [`deliver_join`](Self::deliver_join) ends it ([`end_join`](Self::end_join)). `Err`
+    /// is the trap the join raises.
+    fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
         let child = super::take_child(&mut self.children, handle)?;
         let token = child.token;
         self.joining = Some(child);
@@ -5171,7 +5024,7 @@ impl<'p> Vcpu<'p> {
 
     /// The child a join resolved has ended: its window's bytes and its first vCPU, or a thread's
     /// `spawn`, go back to the budget that paid.
-    pub fn end_join(&mut self) {
+    fn end_join(&mut self) {
         let Some(VcpuChild { lease, live, .. }) = self.joining.take() else {
             return;
         };
@@ -5179,47 +5032,6 @@ impl<'p> Vcpu<'p> {
             self.release_detached(lease);
         }
         drop(live);
-    }
-
-    /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
-    /// bounce, #1865), admitted as the interpreted op is: the `Instantiator` resolved in this vCPU's
-    /// powerbox, the record read from its window, and a v1 record through [`admit_detached_child`],
-    /// the one detached admission. A v0 (carve) record traps, as the interpreted op does on every
-    /// host that runs this vCPU over a window of its own. `Ok(Some((child, size_log2)))`: admitted —
-    /// the host starts it, then [`file_child`](Self::file_child)s its token; `Ok(None)`: refused
-    /// (`-EINVAL`); `Err`: a trap.
-    pub fn admit_record(
-        &mut self,
-        inst: i32,
-        rec: u64,
-    ) -> Result<Option<(PendingChild, u8)>, Trap> {
-        match self.shared_host {
-            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
-            None => self.host.resolve_instantiator(inst)?,
-        };
-        let sr = read_spawn_rec(self.mem.as_ref().ok_or(Trap::Malformed)?, rec)?;
-        if sr.pager != u32::MAX {
-            return Err(Trap::CapFault);
-        }
-        let spawn = DetachedSpawn::of(&sr);
-        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
-        let admitted = match self.shared_host {
-            Some(m) => admit_detached_child(
-                &mut m.lock_unpoisoned(),
-                self.mem.as_ref(),
-                spawn,
-                true,
-                source,
-            ),
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, source),
-        }?;
-        let Some((child, window)) = admitted else {
-            return Ok(None);
-        };
-        let (size_log2, lease) = (window.size_log2, child.lease);
-        let child = self.pending_child(child, window)?;
-        self.pending_lease = Some(lease);
-        Ok(Some((child, size_log2)))
     }
 
     /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
@@ -5263,9 +5075,7 @@ impl<'p> Vcpu<'p> {
     /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]) and install it into
     /// this vCPU's domain ([`jit_install`]): the **shared** [`Domain`] for a root, so every
     /// vCPU/Worker can `call.dyn` it, or a §14 child's own. An `Err` resolution traps, as does a unit
-    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst. A
-    /// wasm-tier host mirrors the table into a per-Worker `WebAssembly.Table` (§22 Model B2
-    /// cross-Worker: funcrefs can't cross Workers) from [`Vcpu::slot_unit`].
+    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst.
     pub fn deliver_jit_install(&mut self, unit: Result<super::ResolvedJitUnit, Trap>) {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
@@ -5288,20 +5098,6 @@ impl<'p> Vcpu<'p> {
         if let Err(t) = jit_uninstall(authorized, &dom.source, &dom.table, slot, active, dst) {
             self.trap = Some(t);
         }
-    }
-
-    /// #1339 — the `(domain, unit)` installed at `slot` of this vCPU's dispatch table (`None` =
-    /// empty or one of the program's own functions): what a per-Worker `WebAssembly.Table` holds
-    /// there. The root's table is the one its threads share; a §14 child's is its own (#1296).
-    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        dom.table.slot_unit(slot as usize)
-    }
-
-    /// #1339 — the generation of this vCPU's dispatch table ([`Vcpu::slot_unit`]): it moves with
-    /// every install and uninstall, so a Worker rebuilds its mirror only when it changed.
-    pub fn table_gen(&self) -> u32 {
-        self.own_dom.as_ref().unwrap_or(&self.prog.dom).table.gen()
     }
 
     /// Deliver the resolved unit for a `JitInvoke` ([`Host::resolve_jit_unit`], as for
@@ -5329,12 +5125,8 @@ impl<'p> Vcpu<'p> {
             Some(m) => HostCell::Shared(m),
             None => HostCell::Excl(&mut self.host),
         };
-        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660): the run-shared
-        // registry when attached — locked only while such a scan reads it — else our own.
-        let parked = match self.shared_fibers {
-            Some(s) => FiberRegRef::Shared(s),
-            None => FiberRegRef::Owned(&self.fibers),
-        };
+        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660).
+        let parked = FiberRegRef::Owned(&self.fibers);
         let ran = jit_invoke_unit(unit, &dom.source, &dom.table, &argv, &params, &results)
             .and_then(|(umod, args)| {
                 run_invoke(
@@ -5367,7 +5159,6 @@ impl<'p> Vcpu<'p> {
     /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
     /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
             panic!("deliver_jit_invoke_vals with no pending invoke");
         };
@@ -5378,162 +5169,12 @@ impl<'p> Vcpu<'p> {
         set_slot_results(&mut self.vt.active, dst, &results, vals.iter().copied());
     }
 
-    /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
-    /// is mid-way through running a [`VcpuEvent::JitInvoke`] on emitted wasm (this vCPU is parked on
-    /// the pending invoke), and the unit reached a call the emit routed to `env.call_interp` — a
-    /// trampoline'd `call.dyn` target or a cross-tier direct call. `target` resolves through
-    /// the **shared dispatch table** exactly as [`Op::CallIndirect`] does (the natural prefix maps a
-    /// program function's index to itself; an installed unit sits at its install slot; empty padding
-    /// is an `IndirectCallType` trap), and the resolved function runs on a nested interpretation
-    /// over this vCPU's **live** window/powerbox/fuel — observably identical to the same call inside
-    /// an interpreted invoke. Fibers are serviced against the persistent emitted-invoke registry
-    /// ([`invoke_fibers`](Vcpu::invoke_fibers)), so a fiber parked by one callback is resumable by a
-    /// later one within the same invoke.
-    ///
-    /// `io` carries the i64 arg slots in and the result slots out (the `env.call_interp` scratch
-    /// ABI — floats by bits, i32s in the low half). Returns the result count. `Err` is the
-    /// callback's trap — the host must unwind the emitted unit and deliver it via
-    /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
-    /// resolve the invoke as the interpreted path would, not be swallowed).
-    ///
-    /// A §22 `Jit.install`/`uninstall` the callback reaches (a guest whose *emitted* frame defines
-    /// and dispatches units) moves this vCPU's table, and so its generation ([`Vcpu::table_gen`]): a
-    /// driver mirroring the table rebuilds before the emitted frame resumes (#1339).
-    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
-        step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let slot = (target as usize) & (dom.table.len() - 1);
-        let ts = dom.table.slot(slot);
-        if ts.module == super::TABLE_EMPTY {
-            return Err(Trap::IndirectCallType);
-        }
-        let tm = dom.source.get(ts.module as usize).ok_or(Trap::Malformed)?;
-        let (cp, cr) = tm.sigs[ts.func as usize].clone();
-        if cp.len() > io.len() || cr.len() > io.len() {
-            return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
-        }
-        // The i64-slot transport carries scalars only; a v128-sig target can never have been given
-        // a trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
-        let scalar =
-            |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
-        if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
-            return Err(Trap::Malformed);
-        }
-        let args: Vec<Value> = cp
-            .iter()
-            .zip(io.iter())
-            .map(|(ty, s)| slot_to_val(*ty, *s))
-            .collect();
-        let payer = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().own_node(),
-            None => self.host.own_node(),
-        };
-        let mut vm = Vm::new(&tm, ts.func as usize, &args, Some(payer))?;
-        vm.module = ts.module as usize;
-        vm.tls = self.vt.active.tls; // the callback runs on this vCPU: its `vcpu.tls` word
-        let mut cell = match self.shared_host {
-            Some(m) => HostCell::Shared(m),
-            None => HostCell::Excl(&mut self.host),
-        };
-        // Registry context (#880): during an emitted **invoke**, callbacks share the
-        // invoke-confined registry (`run_invoke` parity — fibers die with the invoke). During an
-        // emitted **TIERUP region**, the callback is interpreted-inline-call territory: its fibers
-        // register in the vCPU's *run-level* registry (parallel arrays mirrored), so one created
-        // here persists for the run to resume later — exactly as the same call inline would.
-        let vals = if self.pending_jit.is_some() {
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                // Invoke fibers live as long as the invoke, across its bounces.
-                &mut self.invoke_fibers.cell(),
-                None,
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        } else {
-            // The run-level registry: the run-shared one when attached (#1761), else this vCPU's.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
-            };
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                &mut fibers,
-                Some(BounceRunCtx { park: None }),
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        };
-        for (i, v) in vals.iter().enumerate() {
-            io[i] = val_to_slot(*v);
-        }
-        Ok(cr.len())
-    }
-
-    /// The window's committed **scalar extent** right now ([`Mem::scalar_extent`]) — the #717 value
-    /// the codegen host re-syncs to every live instance's `"mapped"` global after a
-    /// [`bounce_call`](Vcpu::bounce_call) (a bounced callback may have `vm_map`-grown the window
-    /// mid-invoke; the fan-out makes the growth visible to the emitted tier exactly when the
-    /// interpreted path would see it — after the call returns). `0` when the window state is no
-    /// longer scalar-representable — deny-everything, the diverge-toward-refusal posture
-    /// (INVARIANTS.md #9), or when there is no window.
-    pub fn window_scalar_extent(&self) -> u64 {
-        self.mem
-            .as_ref()
-            .and_then(|m| m.scalar_extent())
-            .unwrap_or(0)
-    }
-
     /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
     /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
     /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
     /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         self.pending_jit = None;
-        self.trap = Some(trap);
-    }
-
-    /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64
-    /// result slots, one per the callee's result type). Re-tag each into the awaiting `dst` slot(s) of
-    /// the caller's window and resume — the tier-up call then looks exactly like an interpreted call
-    /// that returned. Too few results is a `Malformed` trap (a mis-marshalled host reply).
-    pub fn deliver_tierup(&mut self, vals: &[i64]) {
-        let Some((dst, results)) = self.pending_tierup.take() else {
-            panic!("deliver_tierup with no pending tier-up");
-        };
-        if vals.len() < results.len() {
-            self.trap = Some(Trap::Malformed);
-            return;
-        }
-        for (i, ty) in results.iter().enumerate() {
-            self.vt.active.set(
-                dst as u32 + i as u32,
-                Reg::from_value(slot_to_val(*ty, vals[i])),
-            );
-        }
-    }
-
-    /// Deliver a **trap** from a [`VcpuEvent::TierUp`] region (the emitted `f{func}` hit a guest
-    /// `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a catchable
-    /// `RuntimeError`). The vCPU traps on its next `run`, exactly as if the interpreted call had.
-    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
-        self.pending_tierup = None;
         self.trap = Some(trap);
     }
 
@@ -10860,55 +10501,30 @@ struct FiberMeta {
     charge: LiveFiber,
 }
 
-/// A **run-shared** §12 fiber registry for vCPUs on separate OS threads or Web Workers (#1761): one
-/// handle namespace for the root and all its `thread.spawn` children, so a fiber created on one vCPU
-/// can be resumed on another (D57 migration) — the cooperative driver's single registry, and the
-/// tree-walker's `FiberRegistry`, made shareable. Attach with [`Vcpu::with_shared_fibers`]. The
-/// lock is a leaf, held only for a fiber state transition
-/// (`cont.new`, the `cont.resume` claim, `suspend`, a fiber's return) or a `gc.roots` scan, never
-/// across execution. The claim is the arbiter: `cont.resume` swaps a parked fiber for a `Running`
-/// marker under the lock, so exactly one resumer wins and any other gets `FiberFault`.
-#[derive(Default)]
-pub struct SharedFibers(std::sync::Mutex<FiberTables>);
-
-impl SharedFibers {
-    pub fn new() -> SharedFibers {
-        SharedFibers::default()
-    }
-}
-
 /// How [`step_vcpu`] reaches the run's fiber registry — the fiber twin of [`HostCell`]: exclusively
-/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu` with no shared registry), or a
-/// [`SharedFibers`] locked per transition (the parallel driver, the browser's Worker driver).
+/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu`), or a registry inside
+/// executor 2's scheduling core, locked per transition.
 enum FiberCell<'a> {
     Excl {
         fibers: &'a mut Vec<FiberState>,
         sp: &'a mut Vec<u64>,
         meta: &'a mut Vec<FiberMeta>,
     },
-    Shared(&'a SharedFibers),
     /// Executor 2 ([`drive_threads`]): a domain's registry inside the run's scheduling core, under
     /// the core's lock — the root domain's (`None`) or child env `k`'s (`Some(k)`).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
 
 impl FiberCell<'_> {
-    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Shared`,
-    /// `Core`). `f` is called in one place, so each use inlines one copy of it.
+    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Core`). `f` is called in one place, so each use inlines one copy of it.
     #[inline]
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Vec<FiberState>, &mut Vec<u64>, &mut Vec<FiberMeta>) -> R,
     ) -> R {
-        let mut shared;
         let mut core;
         let (fibers, sp, meta) = match self {
             FiberCell::Excl { fibers, sp, meta } => (&mut **fibers, &mut **sp, &mut **meta),
-            FiberCell::Shared(s) => {
-                shared = s.0.lock_unpoisoned();
-                let t = &mut *shared;
-                (&mut t.fibers, &mut t.sp, &mut t.meta)
-            }
             FiberCell::Core(m, env) => {
                 core = m.lock_unpoisoned();
                 let c = &mut core.core;
@@ -10928,7 +10544,6 @@ impl FiberCell<'_> {
     fn view(&self) -> FiberRegRef<'_> {
         match self {
             FiberCell::Excl { fibers, .. } => FiberRegRef::Owned(fibers),
-            FiberCell::Shared(s) => FiberRegRef::Shared(s),
             FiberCell::Core(m, env) => FiberRegRef::Core(m, *env),
         }
     }
@@ -10951,13 +10566,12 @@ impl FiberCell<'_> {
     }
 }
 
-/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or a run-shared
-/// registry locked only while the scan reads it (#1761) — so a drive paused beneath a nested one
-/// never holds the lock across the nested one's execution.
+/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or executor 2's
+/// registry locked only while the scan reads it — so a drive paused beneath a nested one never
+/// holds the lock across the nested one's execution.
 #[derive(Clone, Copy)]
 enum FiberRegRef<'a> {
     Owned(&'a [FiberState]),
-    Shared(&'a SharedFibers),
     /// A registry inside executor 2's core ([`FiberCell::Core`]).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
@@ -11865,8 +11479,6 @@ fn gc_scan_beneath(
         for r in &view.fibers {
             match *r {
                 FiberRegRef::Owned(f) => scan(f),
-                // A run-shared registry is locked only for the scan (#1761).
-                FiberRegRef::Shared(s) => scan(&s.0.lock_unpoisoned().fibers),
                 FiberRegRef::Core(m, env) => {
                     let g = m.lock_unpoisoned();
                     scan(match env {
@@ -11982,7 +11594,7 @@ impl Nested {
     }
 }
 
-/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`Vcpu::bounce_call`]
+/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`CoopRun::bounce`]
 /// (#846 — one cross-tier callback out of an *emitted* unit): run `vt` — the unit's entry or the
 /// callback, and the fibers it resumes — to its end over the shared window, powerbox and dispatch
 /// table, servicing fibers against `fibers`. The registry is caller-owned so the bounce path can
@@ -14709,7 +14321,7 @@ impl CoopSched {
     /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
     /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
     /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
-    /// slots per the recorded result types (mirroring [`Vcpu::deliver_tierup`]). A short reply is a
+    /// slots per the recorded result types. A short reply is a
     /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
     fn deliver_tierup(&mut self, vals: &[i64]) {
         let (ti, dst, results) = self
@@ -14738,7 +14350,7 @@ impl CoopSched {
     }
 
     /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
-    /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
+    /// would by trapping the paused task.
     fn deliver_tierup_trap(&mut self, trap: Trap) {
         let (ti, _dst, _results) = self
             .emit
@@ -16375,7 +15987,7 @@ impl CoopRun {
     /// to *that task's* env — a §14 confined child steps its own window/powerbox/dispatch table
     /// (`env == Some`), the root and its `thread.spawn` threads the shared ones (`env == None`) — so a
     /// confined leaf's callback can never reach outside its window (the confinement hinge). The fiber
-    /// registry is picked by which round-trip is outstanding (#926 slice 2g, `Vcpu::bounce_call` parity):
+    /// registry is picked by which round-trip is outstanding (#926 slice 2g):
     /// a tier-up region uses the **run-level** registry (a parked fiber persists for the run to resume),
     /// while a surfaced `Jit.invoke` uses the **invoke-confined** registry (`invoke_fibers` — its fibers
     /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
@@ -16560,10 +16172,9 @@ fn child_runs_emit(module: u32, host: &Host) -> bool {
 /// region**'s callbacks run against the **run-level** registry (`fiber_meta = Some(shadow-SP/freeze
 /// halves)` — a parked fiber persists for the run, the same registry `step_vcpu` mirrors its parallel
 /// arrays into), while a surfaced **`Jit.invoke`** unit's callbacks run against an **invoke-confined**
-/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` and `Vcpu::bounce_call`'s
-/// invoke branch use — its fibers die when the invoke resolves). The multi-task analogue of
-/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *paused task's*
-/// env (resolved by [`CoopRun::bounce`]).
+/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` uses — its fibers die
+/// when the invoke resolves). The window/powerbox/table come from the *paused task's* env (resolved
+/// by [`CoopRun::bounce`]).
 #[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
 fn coop_bounce(
     source: &ModuleSource,
@@ -18515,8 +18126,8 @@ struct Vm {
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
     /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for program `jit_module`'s
-    /// functions only. Set on the root Vm via [`Vcpu::with_jit_eligible`], and on a cooperative
-    /// task running a program with an emit ([`ProgramEmits`]); a direct `Call` in that program to
+    /// functions only. Set by [`Vm::tier_up`] on a task running a program with an emit
+    /// ([`ProgramEmits`]); a direct `Call` in that program to
     /// an eligible function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
     /// invoked units, non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never
     /// a correctness gate.
@@ -18532,7 +18143,7 @@ struct Vm {
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
-    /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
+    /// a table-admitted page). Set by [`Vm::tier_up`] from the emit it arms.
     jit_page_checked: bool,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
@@ -18773,7 +18384,7 @@ impl Vm {
             pc: 0,
             scratch: Vec::new(),
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
-            jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_eligible: None, // set by `Vm::tier_up`
             jit_module: 0,
             jit_entry: false,
             jit_page_checked: false,

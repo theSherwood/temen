@@ -267,7 +267,6 @@ fn drive<'s, 'e>(
                 vcpu.deliver_jit_invoke(unit);
             }
             // Named, not `_`: a new event fails to build here as in every driver (#1414).
-            bytecode::VcpuEvent::TierUp { .. } => unorchestrated("TierUp"),
             bytecode::VcpuEvent::Wait { .. } => unorchestrated("Wait"),
             bytecode::VcpuEvent::Notify { .. } => unorchestrated("Notify"),
             bytecode::VcpuEvent::JitUninstall { .. } => unorchestrated("JitUninstall"),

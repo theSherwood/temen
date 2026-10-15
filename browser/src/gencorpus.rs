@@ -1524,10 +1524,8 @@ block 7 () {{
 // none, the child reads its own "K" (75), spawns the module it was granted as `"unit"` — itself —
 // detached through an op-17 v1 record, paid from its own `"budget"` (the node that paid for its
 // window, #1944), with a one-word payload that makes it the pure grandchild (→ 9), joins it and
-// returns 75 + 9 = 84. With [`inst_detached_root`] granting the unit on: 8 × 84 = 672. On the codegen
-// tier the spawn and join arrive as the Worker's `env.instantiate_rec`/`env.join`, admitted and
-// resolved by the child's own vCPU; the name lookups (`self.resolve`, outside the emitter subset) are
-// func 1, a bounce, so the entry emits.
+// returns 75 + 9 = 84. With [`inst_detached_root`] granting the unit on: 8 × 84 = 672. On executor 2
+// the entry spawns and joins, so it interprets until #2443.
 fn inst_nested_detached_unit() -> String {
     let rec = temen_ir::SpawnRec {
         args: (24576, 8),

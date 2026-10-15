@@ -914,7 +914,11 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
 > `Vcpu` driver the slices below built on (`temen_par_run`, the `instCodegen`/`jitB2` options, and
 > the Node harnesses `threads-spawn.mjs`, `tierup.mjs` and `jitcodegen*.mjs`) is deleted; the
 > slices record it as history. The Chromium `#x2` item and the `#inst*` items cover what its page
-> items did.
+> items did. Since B6-4b the nested emit its §14 codegen ran (`compile_nested*`,
+> `outline_nested_cap_calls`, the `env.join`/`env.instantiate_rec`/`env.thread_*` bounces) and the
+> `Vcpu` lanes only it used (`with_jit_eligible`, `VcpuEvent::TierUp`, `bounce_call`,
+> `with_shared_fibers`) are deleted too: a function that spawns, joins or waits interprets on executor
+> 2 until #2443.
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any

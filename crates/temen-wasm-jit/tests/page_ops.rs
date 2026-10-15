@@ -15,7 +15,7 @@
 //! an otherwise identical module without the op still emits — the gate is specific, not a blanket
 //! disable — and a map(5,0)-only module keeps its pure leaves eligible.
 
-use temen_wasm_jit::{compile_jit, compile_module_tierup, compile_nested, DriveMode, Shape};
+use temen_wasm_jit::{compile_jit, compile_module_tierup, DriveMode, Shape};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store};
 
 fn parse(src: &str) -> temen_ir::Module {
@@ -94,14 +94,6 @@ fn compile_jit_plain_module_still_emits() {
     let a = compile_jit(&m, Shape::Batch { entry: 0 }, false).expect("artifact");
     assert_eq!(a.drive, DriveMode::WasmDriven { entry: 0 });
     assert_eq!(a.emitted, vec![true]);
-}
-
-#[test]
-fn compile_nested_page_op_module_emits_nothing() {
-    let m = parse(PROTECT_UNIT);
-    let a = compile_nested(&m, false).expect("artifact");
-    assert_eq!(a.drive, DriveMode::InterpDriven);
-    assert_eq!(a.emitted, vec![false]);
 }
 
 // A page-op orchestrator (func 0: `protect`, out of subset — the interpreter drives it) plus a
