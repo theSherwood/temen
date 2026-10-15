@@ -909,11 +909,12 @@ pub type PremapStage = unsafe extern "C" fn(
 /// The embedder's hook over a fresh window once it is seeded and protected, before its guest runs: a
 /// root's ([`CompiledModule::set_window_ready`]) and a detached child's (the nursery's, on the child
 /// thread). `ro` lists the `[start, end)` byte ranges its `readonly` data segments made read-only, for
-/// the embedder's page map to record as the interpreter's own does (#2268); then a spawn's pre-map, or
-/// a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside `reserved`) — the
-/// interpreter's `Host::apply_premap` through the host's own window backend, i.e. the same
-/// `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's guest never
-/// runs (a child's `CapFault` outcome, a root's failed run).
+/// the embedder's page map to record as the interpreter's own does (#2268); `shadow` is the arena its
+/// module declared, whose runtime-private pages the embedder's page ops refuse (#2426); then a
+/// spawn's pre-map, or a thaw's §13 pages, are aliased onto the window `[base, base+mapped)` (inside
+/// `reserved`) — the interpreter's `Host::apply_premap` through the host's own window backend, i.e.
+/// the same `map_region` a `SharedRegion.map` would take. Nonzero on success; `0` ⇒ the window's
+/// guest never runs (a child's `CapFault` outcome, a root's failed run).
 ///
 /// # Safety
 /// `ctx` is the window's powerbox; `[base, base+reserved)` its live reservation; `ro` points at `n_ro`
@@ -925,6 +926,7 @@ pub type WindowReady = unsafe extern "C" fn(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> i32;
 
 /// #1944 slice 3 — a detached child's own budget node (the budget that paid for its window), read off
@@ -4370,6 +4372,7 @@ impl CompiledModule {
                     t.win_reserved as u64,
                     ro.as_ptr(),
                     ro.len(),
+                    t.shadow,
                 ) == 0
                 {
                     return Err(JitError::Unsupported(

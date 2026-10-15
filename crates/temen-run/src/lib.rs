@@ -484,6 +484,9 @@ unsafe fn cap_thunk_impl(
     // supposed to hold on all of them.
     #[cfg(any(unix, windows))]
     wm.set_null_guard(temen_ir::module_null_guard());
+    // #2426: and the runtime-private pages of a durable module's window, as its start recorded them.
+    #[cfg(any(unix, windows))]
+    wm.set_shadow(host.cap_window_shadow());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -2622,9 +2625,10 @@ unsafe extern "C" fn window_ready(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     let ro = ranges(ro, n_ro);
-    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved, ro)
+    window_aliases(&mut *(ctx as *mut Host), base, mapped, reserved, ro, shadow)
 }
 
 /// The `n` ranges a [`temen_jit::WindowReady`] hook is handed at `ro`.
@@ -3454,18 +3458,20 @@ pub unsafe extern "C" fn premap_apply(
     reserved: u64,
     ro: *const [u64; 2],
     n_ro: usize,
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     let ro = ranges(ro, n_ro);
     let cell = &*(ctx as *const Mutex<Host>);
     let mut host = cell.lock().unwrap_or_else(|e| e.into_inner());
-    window_aliases(&mut host, base, mapped, reserved, ro)
+    window_aliases(&mut host, base, mapped, reserved, ro, shadow)
 }
 
 /// `host`'s fresh window `[base, base+mapped)` starts, before its guest runs: its page map starts
 /// ([`Host::start_window_pages`]) with the read-only pages `ro` its data segments made (#2268), as the
-/// interpreter's own starts with them, then `Host::apply_premap` aliases the op-17 pre-map and a
-/// durable thaw's §13 pages (#2025) — all through the window view its first `call.cap` would set up —
-/// and the domain holds the window's runs of page state ([`Host::start_window`]).
+/// interpreter's own starts with them, and with `shadow`, the arena its module declared (#2426); then
+/// `Host::apply_premap` aliases the op-17 pre-map and a durable thaw's §13 pages (#2025) — all through
+/// the window view its first `call.cap` would set up — and the domain holds the window's runs of page
+/// state ([`Host::start_window`]).
 ///
 /// # Safety
 /// `[base, base+reserved)` is `host`'s live reservation.
@@ -3475,15 +3481,17 @@ unsafe fn window_aliases(
     mapped: u64,
     reserved: u64,
     ro: &[[u64; 2]],
+    shadow: temen_interp::ShadowArena,
 ) -> i32 {
     #[cfg(any(unix, windows))]
     {
         install_region_hook(host, base, reserved);
-        let pages = host.start_window_pages(base as usize);
+        let pages = host.start_window_pages(base as usize, shadow);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
         // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
         // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
         wm.set_null_guard(temen_ir::module_null_guard());
+        wm.set_shadow(shadow);
         wm.seed_readonly(ro);
         if host.apply_premap(&mut wm) < 0 {
             return 0;
@@ -3493,7 +3501,7 @@ unsafe fn window_aliases(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (base, mapped, reserved, host, ro);
+        let _ = (base, mapped, reserved, host, ro, shadow);
         0
     }
 }
@@ -3700,6 +3708,11 @@ pub struct MprotectWindow {
     /// hardware-protected window and the oracle agree. Set from [`temen_interp::Host::null_guard`]
     /// by the cap thunk ([`MprotectWindow::set_null_guard`]).
     null_guard: u64,
+    /// #2426 — the shadow arena the window's module declared: the pages holding its runtime-private
+    /// words are refused to `map`/`unmap`/`protect` ([`temen_interp::ShadowArena::fences`]), as the
+    /// interpreter's `prot_pages` refuses them. Empty, fencing nothing, until
+    /// [`MprotectWindow::set_shadow`].
+    shadow: temen_interp::ShadowArena,
 }
 
 #[cfg(any(unix, windows))]
@@ -3735,7 +3748,13 @@ impl MprotectWindow {
             page: host_page_size(),
             prot,
             null_guard: 0,
+            shadow: temen_interp::ShadowArena::EMPTY,
         }
+    }
+
+    /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
+    pub fn set_shadow(&mut self, shadow: temen_interp::ShadowArena) {
+        self.shadow = shadow;
     }
 
     /// #964: install the NULL guard (see the `null_guard` field) — the twin of
@@ -3852,8 +3871,9 @@ impl MprotectWindow {
     }
 
     /// Validate a `map`/`unmap`/`protect` range and return its inclusive page-index span, or
-    /// `-EINVAL` (page-aligned offset, non-zero len, within `[0, reserved)`) — matching the
-    /// interpreter's `prot_pages` (growth into the reserved tail is allowed).
+    /// `-EINVAL` (page-aligned offset, non-zero len, within `[0, reserved)`, clear of the NULL guard
+    /// and of a durable module's runtime-private pages) — matching the interpreter's `prot_pages`
+    /// (growth into the reserved tail is allowed).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<std::ops::RangeInclusive<u64>, i64> {
         if len == 0 || !offset.is_multiple_of(self.page) {
             return Err(EINVAL);
@@ -3867,7 +3887,13 @@ impl MprotectWindow {
         if end > self.reserved {
             return Err(EINVAL);
         }
-        Ok((offset / self.page)..=((end - 1) / self.page))
+        let (first, last) = (offset / self.page, (end - 1) / self.page);
+        // #2426: the host touches a durable window's runtime-private words outside the guarded
+        // call, so a protection the guest gave their pages would fault in the host.
+        if self.shadow.fences(first, last, self.page) {
+            return Err(EINVAL);
+        }
+        Ok(first..=last)
     }
 
     /// Update one page's software state from cap `prot` bits, mirroring `temen_interp::set_prot`:

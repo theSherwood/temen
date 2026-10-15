@@ -1608,6 +1608,12 @@ declares `[0x74000, 0x80000)` and its data block at `0x8000` needed no move. Not
 quoted in the 4A.5 "Helpers / format" entry below predates the §12.8 stage-1 thaw word: the empty root
 extent is `frame_base(0)` = base+16.
 
+**Its pages keep the runtime's protection (#2426).** The host reads and writes the control words and
+the arena outside the guest's guarded code: a freeze request rings the state word, and a freeze
+flattens each parked fiber into its region. So every engine refuses a guest page op over a page
+either lies on (`ShadowArena::fences`), as it refuses the NULL guard. Before, a guest that made one
+read-only or inaccessible crashed the JIT's host at its next freeze.
+
 The transform's spill/reload code and the suspended representation meet here. Two
 properties drive the whole design:
 

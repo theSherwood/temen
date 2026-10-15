@@ -83,6 +83,22 @@ fn check_with(parent: &temen_ir::Module, src: &str, want: Out) {
     assert!(wrong.is_empty(), "want {want:?}; got\n{}", wrong.join("\n"));
 }
 
+/// #2426: make a page of the child's shadow arena (`[16448, 65536)`, as [`child`] declares it)
+/// read-only.
+const ARENA_PROTECT: &str = "  va0 = i64.const 49152
+  va1 = i64.const 16384
+  va2 = i64.const 1
+  pr = call.cap 5 2 (i64, i64, i64) -> (i64) vsp (va0, va1, va2)
+";
+
+/// #2426: a detached child's window fences its runtime's pages as a root's does, whether its window
+/// was built by a spawn or by a thaw: the host flattens the child's fibers into its arena at a
+/// freeze, outside its guarded code.
+#[test]
+fn a_detached_childs_arena_refuses_page_ops() {
+    check(ARENA_PROTECT, Out::Ret(EINVAL));
+}
+
 /// Control: the readonly segment reads back after a thaw.
 #[test]
 fn a_thawed_detached_child_reads_its_readonly_segment() {

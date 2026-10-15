@@ -1133,7 +1133,9 @@ impl Nursery {
             // Its page map was restored with the window's (`prots` above), read-only pages and all.
             |base, mapped, reserved| match premap_apply {
                 // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-                Some(apply) => apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0) != 0,
+                Some(apply) => {
+                    apply(premap_ctx.0, base, mapped, reserved, [].as_ptr(), 0, shadow) != 0
+                }
                 None => true,
             },
             vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
@@ -1339,6 +1341,7 @@ unsafe fn spawn_detached_child(
     register_serve(rt, gc.ctx, &code);
     let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
     let premap_ctx = SendRaw(gc.ctx);
+    let shadow = code.shadow;
     // The segments that fit the window, and of them the read-only ranges its window-ready hook hands
     // the child's page map (#2268).
     let len = 1usize << mapped_log2;
@@ -1382,7 +1385,17 @@ unsafe fn spawn_detached_child(
         // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.
         |base, mapped, reserved| match window_ready {
             // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
-            Some(ready) => ready(premap_ctx.0, base, mapped, reserved, ro.as_ptr(), ro.len()) != 0,
+            Some(ready) => {
+                ready(
+                    premap_ctx.0,
+                    base,
+                    mapped,
+                    reserved,
+                    ro.as_ptr(),
+                    ro.len(),
+                    shadow,
+                ) != 0
+            }
             None => true,
         },
         args,

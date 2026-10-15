@@ -622,6 +622,19 @@ pub mod durable_abi {
         pub const fn ctx_of_sp(self, sp: u64) -> usize {
             ((sp - self.base) / self.stride) as usize
         }
+
+        /// #2426 — whether a page op over the host pages `first..=last` (of `page` bytes) would
+        /// change the protection of a page holding this window's runtime-private words: the control
+        /// words, `[STATE_OFF, DURABLE_CONTROL_END)`, and the arena. A durable run's host reads and
+        /// writes them outside the guest's guarded code (a freeze request rings the state word, and a
+        /// freeze flattens each parked fiber into its region), so a page the guest made read-only or
+        /// inaccessible there would fault in the host. Every engine refuses such an op, as it refuses
+        /// the NULL guard. A module that declared no arena is not freezable, and fences nothing.
+        pub fn fences(self, first: u64, last: u64, page: u64) -> bool {
+            let touches = |lo: u64, hi: u64| lo / page <= last && first <= (hi - 1) / page;
+            self.size() > 0
+                && (touches(STATE_OFF, DURABLE_CONTROL_END) || touches(self.base, self.end))
+        }
     }
 }
 
@@ -7405,6 +7418,29 @@ mod page0_tests {
                 assert!(ao + al <= bo || bo + bl <= ao, "{a} overlaps {b}");
             }
         }
+    }
+
+    /// #2426: a declared arena fences the pages its runtime's words lie on, the control words' and
+    /// its own, at any host page size, and nothing else; an undeclared one fences nothing.
+    #[test]
+    fn an_arena_fences_its_runtimes_pages() {
+        let arena = d::ShadowArena::new(1 << 17, 1 << 18);
+        let fenced =
+            |page: u64, at: u64, len: u64| arena.fences(at / page, (at + len - 1) / page, page);
+        let g = POWERBOX_NULL_GUARD;
+        for page in [1 << 12, 1 << 14] {
+            assert!(fenced(page, g, page), "the control words' page, at {page}");
+            assert!(!fenced(page, g + page, page), "the page above them");
+            assert!(fenced(page, 1 << 17, page) && fenced(page, (1 << 18) - page, page));
+            assert!(
+                fenced(page, (1 << 17) - page, 2 * page),
+                "a span straddling into the arena"
+            );
+            assert!(!fenced(page, (1 << 17) - page, page) && !fenced(page, 1 << 18, page));
+            assert!(!d::ShadowArena::EMPTY.fences(g / page, g / page, page));
+        }
+        // On a 64 KiB-page host the control words share page 0 with the NULL guard.
+        assert!(fenced(1 << 16, 0, 1 << 16) && !fenced(1 << 16, 1 << 16, 1 << 16));
     }
 }
 

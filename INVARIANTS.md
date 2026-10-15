@@ -520,4 +520,7 @@ calls it — invariant 15). (Owner decision 2026-09-16, #1503; sharpens 4 — gu
 15. It earned its place by rejecting three real proposals in one afternoon: donating heap to move
 the guest's data around the reserve, mapping the NULL guard as scratch during freeze, and widening
 the session snapshot to make room — each a workaround for the substrate owning a placement that was
-the guest's to make.)
+the guest's to make.) The substrate also fixes the *protection* of the pages those words, and a
+declared arena, lie on: the host reads and writes them outside the guest's guarded code, so every
+engine refuses a page op over them, as over the NULL guard (owner decision 2026-10-15, #2426). The
+placement stays the guest's; only the protection of what it declared to the runtime is fixed.

@@ -23115,6 +23115,11 @@ pub struct Host {
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears;
     /// filed under [`UNCLAIMED_BASE`] while seeded for a window not built yet ([`Host::reset_cap_pages`]).
     cap_pages: Option<(usize, CapPageMap)>,
+    /// #2426 — the shadow arena the module in that window declared, given as the window starts
+    /// ([`Host::start_window_pages`]): it fences the window's runtime-private pages against the
+    /// guest's page ops ([`ShadowArena::fences`]), as the interpreters' `Mem` fences its own.
+    /// [`ShadowArena::EMPTY`], fencing nothing, for a window no engine started so.
+    cap_shadow: ShadowArena,
     /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
@@ -23829,6 +23834,7 @@ impl Host {
             thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
+            cap_shadow: ShadowArena::EMPTY,
             jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
@@ -25513,19 +25519,29 @@ impl Host {
             _ => {
                 let m = Arc::new(Mutex::new(BTreeMap::new()));
                 self.cap_pages = Some((base, Arc::clone(&m)));
+                self.cap_shadow = ShadowArena::EMPTY;
                 m
             }
         }
     }
 
+    /// #2426 — the shadow arena of the window [`Host::cap_window_pages`] last named
+    /// ([`Host::cap_shadow`]).
+    pub fn cap_window_shadow(&self) -> ShadowArena {
+        self.cap_shadow
+    }
+
     /// #2268 — the page map of JIT window `base` as the window starts, before its guest runs: what
     /// [`Host::reset_cap_pages`] staged for it (a thaw's), else a fresh one, never an earlier window's,
     /// whose address this one may reuse. Its first `call.cap` finds it ([`Host::cap_window_pages`]).
-    pub fn start_window_pages(&mut self, base: usize) -> CapPageMap {
+    /// #2426 — with the shadow arena its module declared, which fences its runtime-private pages.
+    pub fn start_window_pages(&mut self, base: usize, shadow: ShadowArena) -> CapPageMap {
         if !matches!(self.cap_pages, Some((UNCLAIMED_BASE, _))) {
             self.cap_pages = None;
         }
-        self.cap_window_pages(base)
+        let pages = self.cap_window_pages(base);
+        self.cap_shadow = shadow;
+        pages
     }
 
     /// Start the JIT window page map (see [`Host::cap_window_pages`]) of a run about to build a fresh
@@ -30760,6 +30776,7 @@ impl Host {
         self.cap_pages = pages;
         let mut twin = twin?;
         twin.cap_pages = Some((twin_base, Arc::new(Mutex::new(copy))));
+        twin.cap_shadow = self.cap_shadow;
         Some(twin)
     }
 
@@ -34356,7 +34373,9 @@ impl Mem {
     /// Validate a `map`/`unmap`/`protect` range (§3e): the offset must be page-aligned and the
     /// whole `[offset, offset+len)` must lie within the **reserved** window `[0, reserved)` — the
     /// guest may now grow into the reserved tail `[mapped, reserved)`, not just the initial backed
-    /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`.
+    /// prefix. Returns the inclusive page-index range it covers, or `Err(EINVAL)`: also for a range
+    /// over the NULL guard, or (#2426) over a page that holds a durable module's runtime-private
+    /// words ([`ShadowArena::fences`]).
     fn prot_pages(&self, offset: u64, len: u64) -> Result<core::ops::RangeInclusive<u64>, i64> {
         // `offset` is the guest's — every window starts at 0 of its own backing (a §14 child owns a
         // window of its own) — so it keys the prot map (`check_prot`/`page_access`) and indexes the
@@ -34373,7 +34392,12 @@ impl Mem {
         if end > self.window.reserved() {
             return Err(EINVAL);
         }
-        Ok((offset / self.page)..=((end - 1) / self.page)) // len need not be a page multiple; round up
+        let (first, last) = (offset / self.page, (end - 1) / self.page); // len need not be a page multiple
+                                                                         // #2426: nor may one touch the pages a durable module's runtime keeps its words on.
+        if self.shadow.fences(first, last, self.page) {
+            return Err(EINVAL);
+        }
+        Ok(first..=last)
     }
 
     /// Zero the window's own backing under `pages` (a [`prot_pages`](Mem::prot_pages) range) in one
