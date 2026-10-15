@@ -606,9 +606,9 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-module digest, its lane, its import names and, for a demand-paged child, its pager export (v47,
-#2438; a child starts at its module's function 0 and binds its manifest strictly, so the record
-carried an entry and a same-module flag only until v43, #2219). Its
+module digest, its lane, its import names and, for a demand-paged child, its pager export
+(v47, #2438). A child starts at its module's function 0 and binds its manifest strictly, so the
+record carried an entry and a same-module flag only until v43 (#2219). Its
 fuel, `spawn` and `channel` bounds are its budget node's (Section 10, #1944 slice 3; the launch record
 carried them itself until v38). A thaw
 may narrow those bounds, never widen them. Restore rebuilds each child
@@ -625,25 +625,27 @@ is bounded by the window's **reservation**, not its committed image: a detached 
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
 contained by the reservation, whose uncommitted tail faults inside the window.
 
-**A demand-paged child is durable too (#2438).** A child whose spawn record named a pager (§2.2,
-#1862) freezes like any detached child, and its pager rides its launch record: the codec refuses a
-record naming anything but a `{ page: (i64) -> (i64) }` export of the spawner's program, as op 17
-does, and the thaw re-links the child's faults to that export on the re-created spawner. Nothing
-about faults rides the artifact. A page the pager never supplied is still unmapped in the child's
-image, so after the thaw it faults again and the pager supplies it then: the rewound access is the
-re-issue (INVARIANTS #7). The runtime's own words are never demand-paged: the pages a durable
-module's page ops may not touch (`ShadowArena::fences`, #2426), its control words and its declared
-shadow arena, stay mapped, because the runtime reads and writes them at every safepoint, freeze and
-thaw, and the pager, which cannot see the child's window, could only supply a stale copy (the cause
-of #2438's silent wrong results). A child parked on a fault when the
-freeze fires declines it (the census, #1940). One that faults after the census, before it reaches a
-safepoint, cannot unwind, since its pager has unwound and serves nothing: the run's harvest leaves it
-unreached and the freeze is refused (`DetachedUnreached`), never written as if it had unwound. The
-harvest captures only a child whose run ended by unwinding; one that trapped, or that a deadlock
-teardown reaped, keeps a window but has nothing to resume. Paging runs on the tree-walker only
-(#2164): a routed run of a pager-capable program thaws there as it runs there, and the Cranelift JIT
-refuses to thaw a paged child rather than run it with no pager. Pinned by `temen`'s
-`durable_paged_detached.rs` and `temen-snapshot`'s `detached_roundtrip.rs`.
+**A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
+(§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
+codec refuses a record naming anything but a `{ page: (i64) -> (i64) }` export of the
+spawner's program, as op 17 does, and the thaw re-links the child's faults to that export on
+the re-created spawner. Nothing about faults rides the artifact. A page the pager never
+supplied is still unmapped in the child's image, so after the thaw it faults again and the
+pager supplies it then: the rewound access is the re-issue (INVARIANTS #7). The runtime's own
+words are never demand-paged: the pages a durable module's page ops may not touch
+(`ShadowArena::fences`, #2426), its control words and its declared shadow arena, stay mapped,
+because the runtime reads and writes them at every safepoint, freeze and thaw, and the pager,
+which cannot see the child's window, could only supply a stale copy (the cause of #2438's
+silent wrong results). A child parked on a fault when the freeze fires declines it (the
+census, #1940). One that faults after the census, before it reaches a safepoint, cannot
+unwind, since its pager has unwound and serves nothing: the run's harvest leaves it unreached
+and the freeze is refused (`DetachedUnreached`), never written as if it had unwound (#2455).
+The harvest captures only a child whose run ended by unwinding; one that trapped, or that a
+deadlock teardown reaped, keeps a window but has nothing to resume. Paging runs on the
+tree-walker only (#2164): a routed run of a pager-capable program thaws there as it runs
+there, and the Cranelift JIT refuses to thaw a paged child rather than run it with no pager.
+Pinned by `temen`'s `durable_paged_detached.rs` and `temen-snapshot`'s
+`detached_roundtrip.rs`.
 
 **The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
 its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,

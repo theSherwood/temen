@@ -34494,13 +34494,12 @@ impl Mem {
         Some(())
     }
 
-    /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
-    /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
-    /// the current context's region (D-fiber-cont option A). Falls back to the root region base (`ShadowArena::region_base(0)`) if the
-    /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
-    /// A context's shadow-SP word at `sp_word`, or `None` when its page cannot be read. Never a
-    /// stand-in: an SP the caller did not read is one it must not use (#2438, where a demand-paged
-    /// control page read as the region base and the next freeze spilled over the region's header).
+    /// A context's **shadow-SP** word at `sp_word` (its shadow-stack pointer, which the runtime reads
+    /// and writes on a fiber switch to keep it pointing at that context's region, D-fiber-cont option
+    /// A), or `None` when the word's page cannot be read (a malformed durable window; `set` then
+    /// no-ops). Never a stand-in: an SP the caller did not read is one it must not use (#2438, where a
+    /// demand-paged control page read as the region base and the next freeze spilled over the
+    /// region's header).
     fn durable_get_sp(&self, sp_word: u64) -> Option<u64> {
         self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
