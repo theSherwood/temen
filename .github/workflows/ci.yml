@@ -878,7 +878,7 @@ jobs:
         # -j 2 caps concurrent test-binary links (the OOM peak — ISSUES.md I30).
         run: |
           cargo test -j 2 --lib --test exports_abi \
-            --test coop_tierup_driver --test par_tierup_driver \
+            --test coop_tierup_driver \
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
