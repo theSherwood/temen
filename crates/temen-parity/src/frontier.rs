@@ -205,7 +205,7 @@ impl Capability {
 /// failure this matrix exists to prevent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
-    /// Can a **§14 child** (nested carve or detached) be granted this? Decided by
+    /// Can a **§14 child** be granted this? Decided by
     /// `Host::can_regrant`.
     Nesting,
     /// Does a handle of this kind **survive a freeze**? Decided by the `NonDurableKind` match in

@@ -214,7 +214,7 @@ fn run(
     let mut host = Host::new();
     let _sink = host.shared_stdout(); // route the stdout Stream + re-granted child streams to one sink
     let out_h = host.grant_stream(StreamRole::Out);
-    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator();
     // The `Budget` each child's detached window spends (`vm_spawn` finds it by reflection).
     let _budget_h = host.grant_budget(-1, 1 << 20, -1);
     let echo_h = host.grant_module(cmd);

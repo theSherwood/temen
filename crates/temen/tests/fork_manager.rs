@@ -157,7 +157,7 @@ fn a_guest_forks_with_real_libc_and_both_copies_write_through_the_shared_memfs()
     let win = 1u64 << 19;
     // Forkable posix libc on the manager's host (slice 1). The guest inherits it re-granted (slice 3).
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 64 << 20, -1);
     let [server, guest] = images(&mut host, &m);
 
@@ -386,7 +386,7 @@ fn run_budgeted(ceiling: i64, bytecode: bool) -> (Vec<Value>, Vec<i64>, i64) {
     let mut host = Host::new();
     let win = WINDOW as u64;
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, ceiling, -1);
     let [server, guest] = images(&mut host, &m);
     let mut fuel = 40_000_000u64;

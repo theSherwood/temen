@@ -958,7 +958,7 @@ block 0 (vx: i64) {
     let c = instrumented_image(&src, 2);
     let powerbox = || {
         let mut h = durable_host(&inst);
-        let i = h.grant_instantiator(0, WINDOW as u64);
+        let i = h.grant_instantiator();
         let m = h.grant_durable_module(&c);
         let b = h.grant_budget(-1, 1 << 20, -1);
         h.grant_freeze_authority();

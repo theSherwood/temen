@@ -127,7 +127,7 @@ fn run_handoff(
 ) -> Result<Vec<Value>, temen_interp::Trap> {
     let mut host = Host::new();
     host.set_handoff(handoff);
-    let h = host.grant_instantiator(0, 1u64 << 17);
+    let h = host.grant_instantiator();
     let b = host.grant_budget(-1, 1 << 20, -1);
     let m = host.grant_module(&temen_ir::child_image_at(module, 1).expect("child image"));
     let mut fuel = 5_000_000u64;

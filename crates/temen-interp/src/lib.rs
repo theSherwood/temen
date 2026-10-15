@@ -19112,14 +19112,11 @@ enum Binding {
         base: u64,
         size: u64,
     },
-    /// A §14 `Instantiator` handle conferring authority to spawn children confined to the window
-    /// sub-range `[base, base+size)` in the **holder's own (guest-relative) coordinates**. The eval
-    /// loop (not the generic dispatch) services it — spawning needs executor access — translating to
-    /// backing-absolute via the holder's window base, so nesting composes at any depth.
-    Instantiator {
-        base: u64,
-        size: u64,
-    },
+    /// A §14 `Instantiator` handle: the authority to spawn children, each in a fresh window of its
+    /// own that a `Budget` pays for (#2433: it once named the window sub-range a carve child was
+    /// confined to). The eval loop (not the generic dispatch) services it, since spawning needs
+    /// executor access.
+    Instantiator,
     /// **Freeze authority** over every **detached** child the holder spawns — the authority to
     /// snapshot them, all or none (#1440, INVARIANTS #14 R1, PROCESS.md O14).
     ///
@@ -19609,17 +19606,19 @@ impl BudgetTree {
     /// `room` what is left of them. `-1` when every level is unbounded. The lane is `n`'s own ceiling
     /// in both.
     ///
-    /// A guest sees every level but the tree's root (#1944 slice 3): the run's own node, whose fuel
-    /// ceiling is its embedder's per-activation limit ([`Host::begin_activation`]), not a budget any
-    /// guest holds. What is left of it moves with when each engine's vCPUs draw their chunks, and
-    /// engines must give a guest the same answers, so `read`, `split` and `transfer` bound by the
-    /// levels below it. A use is bounded by, and charged to, every level ([`Self::left`]).
+    /// A guest sees every level, the tree's root included, except the root's fuel (#1944 slice 3,
+    /// #2337): the run's own fuel ceiling is its embedder's per-activation limit
+    /// ([`Host::begin_activation`]), not a budget any guest holds, and what is left of it moves with
+    /// when each engine's vCPUs draw their chunks. Engines must give a guest the same answers, so
+    /// `read`, `split` and `transfer` bound fuel by the levels below it. A use is bounded by, and
+    /// charged to, every level ([`Self::left`]).
     fn bound(nodes: &[BudgetNode], n: u32, room: bool) -> [i64; BUDGET_DIMS] {
         let mut out = [-1i64; BUDGET_DIMS];
-        for i in Self::chain(nodes, n).filter(|&i| i != Self::RUN_NODE) {
+        for i in Self::chain(nodes, n) {
             let node = &nodes[i as usize];
+            let shown = |d: usize| d != BUDGET_LANE && !(i == Self::RUN_NODE && d == BUDGET_FUEL);
             let dims = out.iter_mut().zip(node.ceiling).zip(node.used).enumerate();
-            for (_, ((o, ceiling), used)) in dims.filter(|&(d, _)| d != BUDGET_LANE) {
+            for (_, ((o, ceiling), used)) in dims.filter(|&(d, _)| shown(d)) {
                 if ceiling >= 0 {
                     let left = if room {
                         (ceiling - used).max(0)
@@ -20501,10 +20500,7 @@ pub enum DurableBinding {
         base: u64,
         size: u64,
     },
-    Instantiator {
-        base: u64,
-        size: u64,
-    },
+    Instantiator,
     /// Freeze authority over detached progeny (#1440). Durable, so a thawed parent holds the same
     /// authority over its thawed child that it held before the freeze — without this, a round trip
     /// would launder a domain's exposure away and `attest` would start lying.
@@ -25423,7 +25419,7 @@ impl Host {
     /// takes none and can only find them this way. The one place every tier's child builders mint them.
     /// Registered first, so they own those names.
     pub fn grant_starter_caps(&mut self, size: u64) -> (i32, i32) {
-        let inst = self.grant_instantiator(0, size);
+        let inst = self.grant_instantiator();
         let space = self.grant_address_space(0, size);
         self.register_cap_name("instantiator", inst);
         self.register_cap_name("addrspace", space);
@@ -25906,7 +25902,7 @@ impl Host {
                 Binding::Exit => DurableBinding::Exit,
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
-                Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
+                Binding::Instantiator => DurableBinding::Instantiator,
                 Binding::FreezeAuthority => DurableBinding::FreezeAuthority,
                 // #2025: durable here; whether the cut holds every holder is the codec's check.
                 Binding::SharedRegion(region) => DurableBinding::SharedRegion { region },
@@ -26013,7 +26009,7 @@ impl Host {
                 | Binding::Exit
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
-                | Binding::Instantiator { .. }
+                | Binding::Instantiator
                 | Binding::FreezeAuthority
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
@@ -26081,7 +26077,7 @@ impl Host {
                 DurableBinding::Exit => Binding::Exit,
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
-                DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+                DurableBinding::Instantiator => Binding::Instantiator,
                 DurableBinding::FreezeAuthority => Binding::FreezeAuthority,
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
@@ -28751,11 +28747,10 @@ impl Host {
         self.grant(cap_id::ADDRESS_SPACE, Binding::AddressSpace { base, size })
     }
 
-    /// Grant a §14 `Instantiator` capability over the window sub-range `[base, base+size)` — the
-    /// authority to spawn children (`instantiate`/`join`) confined to power-of-two sub-windows of it
-    /// (§14). Like `grant_address_space`, `size` must be a power of two and `base` a multiple of it.
-    pub fn grant_instantiator(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(cap_id::INSTANTIATOR, Binding::Instantiator { base, size })
+    /// Grant a §14 `Instantiator` capability: the authority to spawn children, each in a window of
+    /// its own that a `Budget` pays for, and to join and signal them.
+    pub fn grant_instantiator(&mut self) -> i32 {
+        self.grant(cap_id::INSTANTIATOR, Binding::Instantiator)
     }
 
     /// Grant **freeze authority** over every detached child this domain spawns — the authority to
@@ -28785,12 +28780,12 @@ impl Host {
             .any(|slot| matches!(slot.entry, Some(Binding::FreezeAuthority)))
     }
 
-    /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
-    /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
-    /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
-    fn resolve_instantiator(&self, handle: i32) -> Result<(u64, u64), Trap> {
+    /// Check that a handle is an `Instantiator` (§14): a `CapFault` for a forged / closed /
+    /// wrong-type one. Used by the eval loop, which services the spawn ops itself (the generic
+    /// dispatch can't reach the executor).
+    fn resolve_instantiator(&self, handle: i32) -> Result<(), Trap> {
         match self.resolve(handle, cap_id::INSTANTIATOR)? {
-            Binding::Instantiator { base, size } => Ok((base, size)),
+            Binding::Instantiator => Ok(()),
             _ => Err(Trap::CapFault),
         }
     }
@@ -29620,8 +29615,9 @@ impl Host {
         // a strict subset of what this guest already holds, never a new frontier:
         //
         // - a named `"instantiator"` must be present — the embedder's own decision to hand this
-        //   guest §14 spawn authority over its window; its size is the budget, exactly as both
-        //   reference powerboxes pass one `win` to both calls. No instantiator, no grant.
+        //   guest §14 spawn authority. No instantiator, no grant. The budget is one window, the one
+        //   the unit was validated against (`mem_log2`): the `win` every reference powerbox grants
+        //   its spawn set from.
         // - `"child"` is the **running module's** child image ([`Host::set_self_module`]), i.e. this
         //   guest's own code, and `grant_detached_spawn_caps` no-ops with none registered.
         // - **not durable**: a durable domain spawns detached only from an attested-freezable grant
@@ -29632,12 +29628,9 @@ impl Host {
         // #2222 — at most three grants, mid-run, into a table the guest may have filled: with no room
         // for them the unit installs without the set, and its spawns refuse as before #1529.
         if unit_spawns_detached && !self.durable && self.room() >= 3 {
-            if let Some(win) = self
-                .resolve_cap_name("instantiator")
-                .and_then(|h| self.resolve_instantiator(h).ok())
-                .map(|(_, size)| size)
-            {
-                self.grant_detached_spawn_caps(win);
+            let inst = self.resolve_cap_name("instantiator");
+            if inst.is_some_and(|h| self.resolve_instantiator(h).is_ok()) {
+                self.grant_detached_spawn_caps(mem_log2.map_or(0, |m| 1u64 << m));
             }
         }
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
@@ -30371,7 +30364,7 @@ impl Host {
                     | DurableBinding::Exit
                     | DurableBinding::Clock
                     | DurableBinding::AddressSpace { .. }
-                    | DurableBinding::Instantiator { .. }
+                    | DurableBinding::Instantiator
                     | DurableBinding::FreezeAuthority
                     | DurableBinding::Budget { .. }
             )
@@ -32136,14 +32129,15 @@ impl Host {
                     _ => EINVAL,
                 }])
             }
-            // The interpreter services `instantiate`/`join` in its eval loop (spawning a child vCPU
-            // needs the executor the generic dispatch can't reach), so it never routes an Instantiator
-            // here. A flat-window backend (the JIT) *does* — but only to **resolve this handle's
-            // authority**: op 0 returns the carve range `[base, base+size)` so the JIT can compile and
-            // run the child confined to a sub-window of it (the JIT owns the actual spawn). Other ops
-            // are inert here (the JIT routes `join` to its own child table, never to the Host).
-            Binding::Instantiator { base, size } => match op {
-                0 => Ok(vec![base as i64, size as i64]),
+            // Every engine services the spawn ops in its own executor (spawning a child vCPU needs
+            // what the generic dispatch can't reach), and no guest call reaches here: every engine
+            // refuses an Instantiator op it does not service (`temen_ir::served_shape_ok`). The
+            // Cranelift JIT, which cannot name a `Host`, routes op 0 here to resolve the handle's
+            // authority before it services an op itself: the resolve above has refused a forged or
+            // closed handle, so a live one answers with nothing (#2433: it once returned the carve
+            // range).
+            Binding::Instantiator => match op {
+                0 => Ok(vec![]),
                 _ => Err(Trap::CapFault),
             },
             // §14 `ModuleLoader` (iface 7): op 0 `from_bytes(ptr, len) -> module_handle | -errno`.
@@ -36882,7 +36876,7 @@ mod fork_powerbox_tests {
     #[test]
     fn fork_copies_the_handle_namespace_and_mints_a_new_domain() {
         let mut host = Host::new();
-        let h_inst = host.grant_instantiator(0, 1u64 << 16);
+        let h_inst = host.grant_instantiator();
         let h_out = host.grant_stream(StreamRole::Out);
         let twin = host.fork_powerbox(7, 0).expect("a simple domain forks");
         // A distinct domain identity — the twin is its own domain.
@@ -36895,7 +36889,7 @@ mod fork_powerbox_tests {
         assert!(
             matches!(
                 twin.resolve(h_inst, cap_id::INSTANTIATOR),
-                Ok(Binding::Instantiator { .. })
+                Ok(Binding::Instantiator)
             ),
             "the instantiator handle resolves in the twin"
         );
@@ -38879,7 +38873,7 @@ block 0 (v0: i64) {
             bytes: temen_ir::SpawnRec::v1().encode(),
         });
         let mut host = Host::new();
-        let inst = host.grant_instantiator(0, 128 << 10);
+        let inst = host.grant_instantiator();
         let budget = host.grant_budget(-1, 1 << 20, -1);
         let child = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         let mut fuel = 10_000_000u64;

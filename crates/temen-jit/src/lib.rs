@@ -5562,7 +5562,7 @@ pub(crate) struct ChildCompile<'a> {
     /// `funcs` resolve to their `FuncType` during lowering.
     pub(crate) types: &'a [temen_ir::TypeEntry],
     pub(crate) entry: FuncIdx,
-    /// Its committed window, inside a reservation of `reserved_log2` (equal for a carve child).
+    /// Its committed window, inside a reservation of `reserved_log2`.
     pub(crate) mapped_log2: u8,
     pub(crate) reserved_log2: u8,
     /// The `call.cap` thunk its sites call.
@@ -5588,7 +5588,7 @@ pub(crate) struct ChildCompile<'a> {
 /// is paid at setup" (§14): this is the setup. The confinement mask is the reservation, the thunks
 /// see `(mapped, reserved)` so the child's `vm_map` commits tail pages through the same path a root
 /// run's does, and an access past the committed extent faults on the inaccessible tail.
-/// `mapped_log2 == reserved_log2` is the fully-mapped carve child.
+/// `mapped_log2 == reserved_log2` is a fully-mapped window.
 ///
 /// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
 /// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
@@ -6471,8 +6471,8 @@ impl ThreadEnv {
 /// which pass each thunk the instance's §14 nursery, loaded from its vmctx ([`VmCtx::nursery`],
 /// temen#2168). All `0` when the compile has no nursery: a module that holds no `Instantiator`, or a
 /// §14 child that cannot spawn. Its `Instantiator` `call.cap` then takes the ordinary `call.cap`
-/// path, an inert `CapFault`. A durable carve child and a detached child (#1956) that use the
-/// `Instantiator` each get a nursery of their own.
+/// path, an inert `CapFault`. A detached child (#1956) that uses the `Instantiator` gets a nursery
+/// of its own.
 #[derive(Clone, Copy)]
 struct InstEnv {
     /// Whether the compile lowers `Instantiator` calls to the nesting runtime: every instance of
@@ -9462,10 +9462,11 @@ fn lower_cap_call(
 }
 
 /// Lower a §14 `Instantiator` `call.cap` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
-/// reached when this (parent) compile has a live `Nursery` (`lower.inst.is_active()`). `op 0`
-/// `instantiate(entry, off, size_log2, fuel) -> child_handle` and `op 1` `join(child_handle) ->
-/// result` call the baked thunks, threading `mem_base` (the live parent window) + `trap_out`; a thunk
-/// that sets the trap cell (forged handle, bad carve, child trap) propagates here like any `call.cap`.
+/// reached when this (parent) compile has a live `Nursery` (`lower.inst.is_active()`). Each served op
+/// (`temen_ir::served_contract`: 17 `instantiate_rec`, 1 `join`, 9/10/12 supervision, 14
+/// `child_offer`, 19 `grant`) calls its baked thunk, threading `mem_base` (the live parent window) +
+/// `trap_out`; a thunk that sets the trap cell (forged handle, refused spawn, child trap) propagates
+/// here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
     module: &mut JITModule,

@@ -4,7 +4,7 @@
 //! and, when it is spent, calls the cell's refill (word 1) instead of trapping at once: the refill
 //! draws the next chunk from the budget chain the embedder accounts in ([`BudgetNode`]), and only a
 //! spent chain traps `OutOfFuel`. A cell with no source is a fixed allowance, refilled never — a
-//! carve child's, or a harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
+//! harness's `u64` budget. The JIT meters; the embedder's budget tree accounts.
 //!
 //! The refill is called through a `PreserveAll` trampoline ([`refill_trampoline`]), which clobbers
 //! no register. A plain call would clobber the caller-saved registers at every safepoint, so a value

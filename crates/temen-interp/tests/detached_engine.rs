@@ -134,7 +134,7 @@ fn run_in(
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
     let mut host = Host::new();
     host.set_durable(durable);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, (minter_quota) as i64, -1);
     let back = Arc::new(Region::new(1u64 << 17, 4096));

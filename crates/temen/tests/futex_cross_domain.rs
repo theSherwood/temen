@@ -69,7 +69,7 @@ fn setup(child: &str) -> impl Fn() -> (Host, Vec<Value>) {
     let child = module(child);
     move || {
         let mut host = Host::new();
-        let inst = host.grant_instantiator(0, 1 << 18);
+        let inst = host.grant_instantiator();
         let aspace = host.grant_address_space(0, 1 << 18);
         let modh = host.grant_module(&child);
         let budget = host.grant_budget(-1, 1 << 17, -1);

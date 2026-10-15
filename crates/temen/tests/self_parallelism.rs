@@ -147,7 +147,7 @@ fn a_child_has_its_parents_workers_within_its_own_lane() {
     for (workers, want) in [(8, 2), (1, 1)] {
         let setup = || {
             let mut host = host(Some(workers), -1);
-            let inst = host.grant_instantiator(0, WIN as u64);
+            let inst = host.grant_instantiator();
             let child = host.grant_module(&module(CHILD));
             let budget = host.grant_budget(-1, 1 << 20, -1);
             (host, [inst, child, budget].map(Value::I32).to_vec())

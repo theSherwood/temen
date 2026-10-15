@@ -58,7 +58,7 @@ fn both_with(parent_src: &str, child_src: &str) -> BothOut {
     let grant = |h: &mut Host| {
         let budget = h.grant_budget(-1, 1 << 20, -1);
         h.register_cap_name("budget", budget);
-        (h.grant_instantiator(0, 128 << 10), h.grant_module(&child))
+        (h.grant_instantiator(), h.grant_module(&child))
     };
 
     let mut hi = Host::new();

@@ -1,5 +1,6 @@
-//! Validation of `AddressSpace`/`Instantiator` handle bindings (the §14 sub-window base/size) at
-//! both codec boundaries. A frozen artifact is untrusted, persisted input and its
+//! Validation of `AddressSpace` handle bindings (the window range a holder may page) at both codec
+//! boundaries. (The `Instantiator` carried a range too, the window a carve child was confined to,
+//! until #2433 made it a unit binding.) A frozen artifact is untrusted, persisted input and its
 //! (non-cryptographic) module digest does not cover the handle bindings — so the
 //! window-containment invariant the grant path guarantees (and the §14 JIT instantiator's
 //! `unsafe` window copy *assumes*) must be re-checked on restore: a forged `base` smuggled into a
@@ -50,7 +51,6 @@ fn tamper(art: &mut [u8], find: &[u8], replace: &[u8]) {
 // The encoded forms this test forges around (see `write_binding`): tag byte, ULEB base, ULEB size.
 // 0x10000 and 0x40000 both encode as 3-byte ULEBs, so the swap is framing-preserving.
 const B_ADDRESS_SPACE: u8 = 5;
-const B_INSTANTIATOR: u8 = 6;
 const ULEB_0X10000: [u8; 3] = [0x80, 0x80, 0x04];
 const ULEB_0X40000: [u8; 3] = [0x80, 0x80, 0x10];
 
@@ -96,7 +96,7 @@ fn freeze_rejects_out_of_window_binding() {
     let m = module();
     let window = vec![0u8; WINDOW];
     let mut host = Host::new();
-    host.grant_instantiator(WINDOW as u64, 4096);
+    host.grant_address_space(WINDOW as u64, 4096);
     assert!(
         matches!(
             freeze(&m, &window, &host),
@@ -107,33 +107,10 @@ fn freeze_rejects_out_of_window_binding() {
 }
 
 #[test]
-fn restore_rejects_out_of_window_instantiator_binding() {
-    let m = module();
-    let window = vec![0u8; WINDOW];
-    let mut host = Host::new();
-    // A legitimate interior carve — then forge its encoded base out the top of the window
-    // (0x10000 → 0x40000 = the window size; base+size lands past `mapped`). Restore must reject:
-    // otherwise the §14 JIT instantiator would later compute `parent_mem_base + base + off`
-    // outside the window and `from_raw_parts`/`copy_*` through it.
-    host.grant_instantiator(0x10000, 0x10000);
-    let mut art = freeze(&m, &window, &host).expect("freeze");
-    tamper(
-        &mut art,
-        &binding_bytes(B_INSTANTIATOR, ULEB_0X10000, ULEB_0X10000),
-        &binding_bytes(B_INSTANTIATOR, ULEB_0X40000, ULEB_0X10000),
-    );
-    let mut rhost = Host::new();
-    assert_eq!(
-        restore(&art, &m, &mut rhost),
-        Err(RestoreError::BindingOutOfWindow),
-        "an out-of-window Instantiator binding must be rejected on restore"
-    );
-}
-
-#[test]
 fn restore_rejects_out_of_window_address_space_binding() {
-    // The AddressSpace twin of the Instantiator pin above — same forged edit, other kind. (Note
-    // the whole-window form `{0, u64::MAX}` is *not* reachable by this tamper: it pattern-matches
+    // A legitimate interior range, then its encoded base forged out the top of the window (0x10000 →
+    // 0x40000 = the window size; base+size lands past `mapped`): restore must reject it. (The
+    // whole-window form `{0, u64::MAX}` is *not* reachable by this tamper: it pattern-matches
     // exactly, and any other u64::MAX-sized spelling still fails the power-of-two checks.)
     let m = module();
     let window = vec![0u8; WINDOW];

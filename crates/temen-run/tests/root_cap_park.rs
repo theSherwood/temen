@@ -173,7 +173,7 @@ fn setup(m: &Module, lanes: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
         let ticks = Arc::new(Ticks::default());
         let mut h = Host::new();
         h.set_lane_cap(lanes);
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let forked = Arc::clone(&ticks);
         let tick = h.grant_host_proc_forkable(
             tick_proc(&ticks),

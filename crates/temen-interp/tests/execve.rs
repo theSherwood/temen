@@ -77,7 +77,7 @@ fn exec_module_replaces_the_image_with_a_separate_command_module() {
     let mut host = Host::new();
     host.set_self_module(&guest);
     let sink = host.shared_stdout();
-    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
     let cmd_h = host.grant_module(&cmd);
 
@@ -123,7 +123,7 @@ fn a_command_prepared_once_execs_from_every_host_it_is_granted_into() {
         let mut host = Host::new();
         host.set_self_module(&guest);
         let sink = host.shared_stdout();
-        let inst = host.grant_instantiator(0, 1u64 << 12);
+        let inst = host.grant_instantiator();
         let stream = host.grant_stream(StreamRole::Out);
         let cmd_h = host.grant_prepared(&cmd);
         let mut fuel = 40_000_000u64;
@@ -164,7 +164,7 @@ fn exec_module_image_replaces_on_the_bytecode_engine() {
     let mut host = Host::new();
     host.set_self_module(&guest);
     let sink = host.shared_stdout();
-    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
     let cmd_h = host.grant_module(&cmd);
 
@@ -206,7 +206,7 @@ fn exec_module_folds_to_the_oracle_on_the_fast_path() {
     let mut host = Host::new();
     host.set_self_module(&guest);
     let sink = host.shared_stdout();
-    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
     let cmd_h = host.grant_module(&cmd);
 
@@ -247,7 +247,7 @@ fn a_failed_exec_module_returns_einval_and_leaves_the_caller_running() {
     let mut host = Host::new();
     host.set_self_module(&guest);
     let sink = host.shared_stdout();
-    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
     // A module handle that was never granted — `resolve_module` fails, so the exec is refused.
     let bogus_cmd: i64 = 999;
@@ -286,7 +286,7 @@ fn a_failed_exec_module_on_the_bytecode_engine_leaves_the_caller_running() {
     let mut host = Host::new();
     host.set_self_module(&guest);
     let sink = host.shared_stdout();
-    let inst = host.grant_instantiator(0, 1u64 << 12);
+    let inst = host.grant_instantiator();
     let stream = host.grant_stream(StreamRole::Out);
     let bogus_cmd: i64 = 999;
 
@@ -380,7 +380,7 @@ fn exec_module_starts_the_command_in_a_fresh_window() {
         let cmd = module(FRESH_CMD);
         let mut host = Host::new();
         host.set_self_module(&guest);
-        let inst = host.grant_instantiator(0, 1u64 << 16);
+        let inst = host.grant_instantiator();
         let cmd_h = host.grant_module(&cmd);
         let mut fuel = 40_000_000u64;
         let args = [Value::I32(inst), Value::I64(cmd_h as i64)];

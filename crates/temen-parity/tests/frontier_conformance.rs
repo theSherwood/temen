@@ -52,10 +52,7 @@ fn mintable(host: &mut Host, m: &temen_ir::Module) -> Vec<(Capability, i32)> {
             Capability::AddressSpace,
             host.grant_address_space(0, 1 << 16),
         ),
-        (
-            Capability::Instantiator,
-            host.grant_instantiator(0, 1 << 16),
-        ),
+        (Capability::Instantiator, host.grant_instantiator()),
         (Capability::Budget, host.grant_budget(-1, 1 << 16, -1)),
         (Capability::Module, host.grant_module(m)),
         (Capability::ModuleLoader, host.grant_module_loader()),

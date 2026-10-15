@@ -92,7 +92,7 @@ fn spawn_rec() -> Option<Data> {
 fn powerbox(child: &Module) -> (Host, Vec<Value>) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.grant_freeze_authority();
@@ -225,7 +225,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
     let spawn = |authority: bool| {
         let mut host = Host::new();
         host.set_durable(true);
-        let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+        let inst = host.grant_instantiator();
         let modh = host.grant_durable_module(&child);
         let budget = host.grant_budget(-1, 1 << 20, -1);
         if authority {

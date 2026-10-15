@@ -534,9 +534,9 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   *process model*. The filesystem half exists; this is the process half.
 
   The primitives are largely already here — a **process is a confined child domain**: DESIGN.md §14's
-  `Instantiator` already spawns a child in an **attenuated power-of-two sub-window** ("a sub-window is
-  indistinguishable from a top-level window"; the sub-window placement is retiring for a detached
-  window of its own — INVARIANTS #13 ruling 2026-09-29), `thread.spawn` gives OS-thread vCPUs, the `Exit`
+  `Instantiator` spawns a child in a **window of its own** with attenuated capabilities (it once
+  placed it in a power-of-two sub-window of the parent's, retired by INVARIANTS #13's 2026-09-29
+  ruling, #1867), `thread.spawn` gives OS-thread vCPUs, the `Exit`
   capability carries an exit *code*, and **F13** (capability revocation) is the cap-level analogue of
   `kill`. And §2/§9 already name **"a separate process" as the robust distrust boundary**, so a
   first-class process model *aligns with* the isolation-tier design rather than fighting it. What a
@@ -560,9 +560,9 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   *Status (Stage 1, landed; the carve spawns and the tests named here are retired since, #1867 —
   `stage1_posix_spawn.rs` and `stage1_applet_dispatch.rs` pin the detached spawn):* the
   `posix_spawn`+`wait` core was proven differentially
-  (`stage1_spawn_wait.rs`: a parent seeds argv into a child's carve — the spawn record's args payload once carves
-  retire — spawns a separate host-verified
-  `Module` via `Instantiator.instantiate_module` (op 5), and `join`s (op 1) for the child's exit
+  (`stage1_spawn_wait.rs`: a parent seeded argv into a child's carve — the spawn record's args payload
+  now — spawned a separate host-verified
+  `Module` via `Instantiator.instantiate_module` (op 5), and `join`ed (op 1) for the child's exit
   status — need (1)'s spawn-with-argv + wait). Stdio inheritance landed as capability forwarding:
   `instantiate_named` (op 11, a named grant list — a parent re-grants its `stdout` by name,
   `stage1_stdio_child.rs`) and **`instantiate_module_named` (op 13 = op 5 + op 11)**, under which an

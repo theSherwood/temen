@@ -83,14 +83,14 @@ pays for the domain (the run's root node, or the budget named in a detached spaw
 to every level, and a vCPU that ends or freezes refunds the unburned rest of its chunk. So no subtree
 burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
 one in a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
-(`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` see only the
+(`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` bound fuel by the
 budgets below it, since what is left of it differs by engine (each draws on its own schedule). Every
 host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
 compile-once programs, which re-arm their fuel cell for each run (#2113). *Node 0's other dimensions
-(owner, 2026-10-06):* once #1867 deletes the carve, a guest sees node 0's `mem`, `channel` and
-`spawn` too; while the carve spawned, showing them would have bounded every budget's `spawn`, which
-the carve's budget-funded spawns refused. Every engine now refuses the carve spawn, and showing them
-is #2337. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
+(owner, 2026-10-06; #2337):* a guest sees node 0's `mem`, `channel`, `spawn` and `maps` as it sees any
+level's, so the embedder's grant bounds what its reads report. They stayed hidden while the carve
+spawned (#1867): showing them would have bounded every budget's `spawn`, which the carve's
+budget-funded spawns refused. *Spawn and channel (2026-09-30, #1944 slice 3):* a node's `spawn`
 ceiling counts the live vCPUs of its subtree (the cgroups `pids.max` model). A detached child's first
 vCPU is charged with its window at the admission, so a spawn-0 budget funds no child, and handed back
 with the window when the child ends. Every other vCPU a domain makes (a thread, a fork twin, a spawned
@@ -114,9 +114,7 @@ it as a child is to its budget, on every engine: its window and main vCPU when a
 (`Host::begin_activation`), past any ceiling, since they are what the embedder chose to run, but
 never past the process's pools of mappings and of address space (a run the process cannot hold ends
 with `ThreadFault` before it starts; every domain's window is held against the address-space pool at
-its admission, #2305), and everything it makes after, its growth and its processes' windows included. A carve child, which
-only a thaw of an artifact frozen around one can still re-create, charges no node: `MAX_VCPUS` alone
-bounds its vCPUs and `MAX_FIBERS` its fibers until #1867 deletes the carve. A pipe's worst-case FIFO is charged to the
+its admission, #2305), and everything it makes after, its growth and its processes' windows included. A pipe's worst-case FIFO is charged to the
 `channel` of the node of the domain that minted it, and every ancestor, until its last end closes. A
 region a guest mints is charged there too, its bytes, until no domain holds it; a domain lets go of a
 region when it closes its handle (`SharedRegion.close`, #2358), and a domain a budget paid for lets go
@@ -144,7 +142,7 @@ exec its way out of its budget.
 
 *No code exceeds its grant (owner, 2026-10-06):* every resource a domain uses is charged to a grant
 from above, so no code can use more than it was granted, and the root is a domain like any other,
-its grant the embedder's. The gaps are tracked, not exceptions: the carve (#1867), a `Vcpu` child its
+its grant the embedder's. The gaps are tracked, not exceptions: a `Vcpu` child its
 parent never joins (#2119), the pipe ends a spawn refused after its admission re-granted (#2120), and
 the wasm-JIT's emitted `thread.spawn` (#2007) and fuel (#1997).
 
@@ -349,12 +347,12 @@ through the carve while both ran completed on the oracle and deadlocked on the C
 a parked difference. The resolution is the one this ruling reserved: **every §14 child is placed in a
 detached window, and the carve path is deleted** — on every engine, with its spawn forms, its
 host-side machinery, and the docs that describe it. No live-aliasing fix is built for carves, and no
-new feature lands on the carve path. Retiring it is invariant-14 work: *in flight*, prioritized as the
-frontier's own repair, never parked. Until it is gone:
+new feature lands on the carve path. **It is gone (#1867, 2026-10-15):**
 
 - **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 and the version-0 record trap
-  `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. A thaw
-  of an artifact frozen around a carve child still re-creates one, until the nested freeze goes.
+  `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. The
+  nested freeze and thaw went with it (slice 3), so no artifact carries a carve child, and every
+  window starts at 0 of its own reservation.
 - **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
   detached, with the spawn-time args payload and the pre-mapped region as fields. The v0 carve record
   is retired (it traps `CapFault`), and so is op 15's positional form (#2067): every engine traps it
@@ -373,11 +371,12 @@ frontier's own repair, never parked. Until it is gone:
 - **Live and bulk sharing is explicit:** a `SharedRegion` pre-mapped into the child (the record's
   `region` and `child_off`), with futex keyed on the region's canonical identity. Argv rides the
   record's spawn-time args payload; results ride the join and the region.
-- **What still leans on the carve moves first:** the §2.2 pager (the parent wrote the page through
-  its own window — now a byte transfer at supply, #1862, retiring "pager ⇒ nested"); the durable subtree
-  freeze (the `UNWINDING` word written into the carve — becomes the detached child's freeze doorbell;
-  freeze authority's carve-named form folds into the detached one — both done, #1867). The carve-specific escape oracle and fuzz targets retire with the path they test, once
-  detached-window twins cover the same confinement property.
+- **What leaned on the carve moved first:** the §2.2 pager (the parent wrote the page through its
+  own window — now a byte transfer at supply, #1862); the durable subtree freeze (the `UNWINDING`
+  word written into the carve — now the detached child's freeze doorbell; freeze authority has one
+  form, #1867). The carve-specific escape-oracle passes and fuzz arms went with the path they tested,
+  replaced by detached-window twins (#1867 decision 3). The `Instantiator` no longer names a window
+  range (#2433).
 
 ## 14. One frontier, consistent across every axis
 
@@ -420,13 +419,12 @@ O14's conceptual half):** who may snapshot a domain is a capability (invariant 3
 its placement. The platform holds freeze authority over every domain it runs; an ancestor holds it
 over a descendant *only by grant*, attenuating down the grant graph like any other authority, and
 `attest.freeze_authority` reports the actual holders. Because a snapshot is a read of the window
-(PROCESS.md §6), freeze-ability follows window-read authority: a **nested carve** child's window is a
-sub-range of its parent's, so the parent can read — hence freeze — it by construction (the grant is
-implied by the aliasing, the current behavior); a **detached** child owns its window, so an ancestor
-can freeze it *only if granted*. The converse holds too (owner, 2026-10-01, #1866): reading a detached
-child's window, as a debugger does, *is* that grant, with no separate inspect authority; no guest-held
-inspection surface is built until a consumer needs one (2026-10-02). (The nested case is being retired with the carve path — #13's 2026-09-29 ruling — after which every
-child is the detached case.) Placement is therefore orthogonal to durability, and §6's rule reads:
+(PROCESS.md §6), freeze-ability follows window-read authority: a §14 child owns its window, so an
+ancestor can freeze it *only if granted*. (A nested carve child, whose window was a sub-range of its
+parent's, was freezable by construction until the carve went, #1867.) The converse holds too (owner,
+2026-10-01, #1866): reading a detached child's window, as a debugger does, *is* that grant, with no
+separate inspect authority; no guest-held inspection surface is built until a consumer needs one
+(2026-10-02). Placement is therefore orthogonal to durability, and §6's rule reads:
 *confidential = freezable by nobody below the platform; a domain is confidential **or**
 ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**
 ancestor-confidential at once. A detached child freezes as its own root-shaped artifact (the one codec
@@ -451,7 +449,7 @@ three engines is therefore the resting state until (a) freeze authority is **rep
 held, and askable through `Host::holds_freeze_authority`. Its first form named a §14 **nested
 carve** by the carve's range and went with the carve (#1867). A **detached** child, which owns its
 own window and has no sub-range to be named by, is covered by the all-or-nothing form, the one that
-remains — and never self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
+remains — and never self-minted: a nested parent read its child's carve, so self-granting there documented a fact,
 whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very
 isolation the spawn asked for. Authority over detached children therefore arrives from above or not at
 all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is

@@ -2599,7 +2599,7 @@ fn jit_instantiate_rec_reads_the_record_from_a_grown_tail_page() {
     let powerbox = || {
         let mut h = Host::new();
         let mem = h.grant_memory();
-        let inst = h.grant_instantiator(0, 1 << 16);
+        let inst = h.grant_instantiator();
         let modh = h.grant_module(&child);
         let budget = h.grant_budget(-1, 1 << 20, -1);
         (h, [mem, inst, modh, budget])

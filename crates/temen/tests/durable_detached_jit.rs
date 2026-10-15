@@ -98,7 +98,7 @@ fn instrument(src: &str) -> temen_ir::Module {
 fn powerbox(child: &temen_ir::Module) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.grant_freeze_authority();
@@ -147,7 +147,7 @@ fn a_durable_domain_refuses_its_own_program_detached() {
         let mut host = Host::new();
         host.set_durable(true);
         host.set_self_module(&std::sync::Arc::new(m.clone()));
-        let inst = host.grant_instantiator(0, 1 << 17);
+        let inst = host.grant_instantiator();
         let budget = host.grant_budget(-1, 1 << 20, -1);
         host.grant_freeze_authority();
         host.grant_child_image();
@@ -908,7 +908,7 @@ fn nest_modules(child: &str) -> (temen_ir::Module, Nest) {
 fn nest_powerbox(nest: &Nest, settle_ms: i32, live: i64) -> (Host, Vec<i64>) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let (modh, [nest1, nest2]) = nest.grant(&mut host);
     let budget = host.grant_budget(-1, 1 << 20, live + 2);
     let freeze = host.grant_freeze_authority();

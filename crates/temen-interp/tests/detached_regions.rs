@@ -79,7 +79,7 @@ fn a_minted_region_spends_the_childs_channel_until_it_ends_on_every_driver() {
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, -1, -1);
         let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
         (h, [i, b, c].map(Value::I32).to_vec())
@@ -188,7 +188,7 @@ fn a_notify_on_a_region_word_wakes_the_childs_wait_on_every_scheduling_driver() 
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 17);
+        let i = h.grant_instantiator();
         let a = h.grant_address_space(0, 1 << 17);
         let b = h.grant_budget(-1, 1 << 20, -1);
         let c = h.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));

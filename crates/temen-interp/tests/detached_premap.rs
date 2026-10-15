@@ -101,7 +101,7 @@ const ROUND_TRIP: i64 = 42_082;
 
 fn host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let aspace = host.grant_address_space(0, 1u64 << 17);
     let modh = host.grant_module(child);
     let budget = host.grant_budget(-1, 1i64 << 17, -1); // exactly one 2^17 window

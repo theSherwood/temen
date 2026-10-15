@@ -121,7 +121,7 @@ fn setup(guest: &temen_ir::Module, module: &str) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     host.set_self_module(&std::sync::Arc::new(guest.clone()));
     let jit = grant_jit(&mut host, guest, 4);
-    let inst = host.grant_instantiator(0, 128 << 10);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     host.register_cap_name("budget", budget);
     let kid = host.grant_module(&parse_module(KID).expect("parse kid"));

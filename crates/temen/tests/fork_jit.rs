@@ -201,7 +201,7 @@ fn run(bytecode: bool) -> (Vec<Value>, Vec<i64>) {
     let m = parse_module(&src()).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 1u64 << 18);
+    let ih = host.grant_instantiator();
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let jh = grant_jit(&mut host, &m, 4); // 16 install slots, carried into C by the grant

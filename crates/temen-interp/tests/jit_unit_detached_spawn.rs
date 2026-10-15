@@ -12,9 +12,9 @@
 //! detached — the same least-authority rule, evaluated at install instead of at powerbox build. It
 //! is the only point that sees both the validated unit and the host (the injected validator is a
 //! bare `fn`), and it stays a strict subset of what the guest holds: a named `"instantiator"` must
-//! already be granted (its window sizes the budget), `"child"` is the guest's own code, and a
-//! durable domain is excluded (it may spawn only an attested-freezable module, which the child
-//! image is not).
+//! already be granted (the window the unit runs over sizes the budget), `"child"` is the guest's own
+//! code, and a durable domain is excluded (it may spawn only an attested-freezable module, which the
+//! child image is not).
 //!
 //! The blob validator is stubbed inline (the `invoke_fibers.rs` pattern), so this stays in the
 //! temen-interp suite with no Cranelift dependency.
@@ -187,13 +187,13 @@ fn validator(bytes: &[u8], _mem_log2: Option<u8>, _symtab: &[u8]) -> Result<JitV
     })
 }
 
-/// A reference-powerbox-shaped host: the running module registered and a named `"instantiator"`
-/// over its window — and **no** `"child"` / `"budget"`, exactly what a guest whose root module
-/// never spawns gets today.
+/// A reference-powerbox-shaped host: the running module registered and a named `"instantiator"` —
+/// and **no** `"child"` / `"budget"`, exactly what a guest whose root module never spawns gets
+/// today.
 fn powerbox(m: &temen_ir::Module) -> Host {
     let mut host = Host::new();
     host.set_self_module(&Arc::new(m.clone()));
-    let inst = host.grant_instantiator(0, 1 << WIN_LOG2);
+    let inst = host.grant_instantiator();
     host.register_cap_name("instantiator", inst);
     host
 }

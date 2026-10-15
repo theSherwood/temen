@@ -179,7 +179,7 @@ fn run(
     let mut host = Host::new();
     let sink = host.shared_stdout(); // the child's re-granted Stream writes here…
     let out_h = host.grant_stream(StreamRole::Out);
-    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator();
     let echo_h = host.grant_module(cmd);
     let _budget_h = host.grant_budget(-1, 1 << 20, -1); // the command's window is paid from this
                                                         // The personality's heap sits in the top 64 KiB, clear of the shell's data/stack (a lean shell
