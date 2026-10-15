@@ -167,9 +167,11 @@ export function nimToolchain(bundle) {
 }
 
 // #958 — compile `source` as `prog.nim` with nimony's own driver and run what it builds:
-// `nimony t -r --isMain prog.nim`, one `temen_nim_open` session over `toolchain` ([`nimToolchain`])
-// that `driveCoopTierupRun` runs. The process tree (nimony, nifmake, nimsem, the shell) runs on the
-// interpreter, each leaf process (nifler2, hexer, the program itself) whole on the emitted tier
+// `nimony t -r --novalidate --isMain prog.nim`, one `temen_nim_open` session over `toolchain`
+// ([`nimToolchain`]) that `driveCoopTierupRun` runs. No plugin validator ships with the toolchain, so
+// `--novalidate` keeps nimony from warning about it at every plugin it builds. The process tree
+// (nimony, nifmake, nimsem, the shell) runs on the interpreter, each leaf process (nifler2, shoggoth,
+// the program itself) whole on the emitted tier
 // (#1896), and temen-link natively. Each build continues in the directory the engine's last one left
 // (#2099), so nimony redoes only what `source` changed. nimony prints nothing when a build succeeds,
 // so what the session prints is the program's. When the build fails, nothing is linked and what it
@@ -194,7 +196,7 @@ export async function nimCompileRun(ex, memory, toolchain, source) {
   // last build's: remove it, and the program after this build is this build's.
   ex.temen_nim_remove(...put(program));
   const files = registryBlob([...toolchain.files, [`${cwd}/prog.nim`, enc.encode(source)]]);
-  const argv = enc.encode(['bin/nimony', 't', '-r', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
+  const argv = enc.encode(['bin/nimony', 't', '-r', '--novalidate', '--isMain', 'prog.nim'].map((a) => `${a}\0`).join(''));
   const args = [put(toolchain.nimony), put(toolchain.commands), put(files), put(argv), put(enc.encode(cwd))];
   const opened = ex.temen_nim_open(...args.flat(), suspendsLeaves ? 1 : 0);
   // The session holds its own copies of what it was opened with.
