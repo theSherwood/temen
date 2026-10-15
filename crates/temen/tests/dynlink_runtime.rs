@@ -25,7 +25,6 @@ fn compile_host(src: &str) -> CompiledModule {
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,
@@ -101,7 +100,6 @@ fn loaded_client_links_to_a_newly_installed_service_by_name() {
         INERT_CAP_THUNK,
         core::ptr::null_mut(),
         DEFAULT_RESERVED_LOG2,
-        None,
         None,
         None,
         None, // fuel

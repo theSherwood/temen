@@ -1424,7 +1424,6 @@ pub fn jit_cap_run(
             cc.thunk(),
             cc.ptr(),
             reserved_log2,
-            None,                         // sub
             Some(module_resolver_locked), // §14 module children resolve their `Module` grant
             None,                         // interrupt
             fuel,
@@ -1486,7 +1485,6 @@ pub fn jit_cap_run(
         cc.thunk(),
         cc.ptr(),
         reserved_log2,
-        None,                  // sub
         Some(module_resolver), // §14 module children resolve their `Module` grant
         None,                  // interrupt
         fuel,
@@ -1938,7 +1936,6 @@ pub fn recompact_jit(
         cap_thunk,
         host as *mut Host as *mut c_void,
         reserved_log2,
-        None, // sub
         None, // resolve_module
         None, // interrupt
         old.fuel_cell(),
@@ -2149,7 +2146,6 @@ impl JitSession {
             cap_thunk_locked,
             ctx,
             reserved_log2,
-            None, // sub
             None, // resolve_module
             None, // interrupt
             Some(&mut *fuel as *mut _),
@@ -2229,7 +2225,6 @@ impl JitSession {
             cap_thunk_locked,
             ctx,
             self.reserved_log2,
-            None, // sub
             None, // resolve_module
             None, // interrupt
             Some(&mut *self.fuel as *mut _),
@@ -3725,9 +3720,8 @@ impl MprotectWindow {
     /// - not a multiple of the host page (e.g. a 64 KiB-page aarch64 host against the 16 KiB guard):
     ///   a page-map seed would swallow live scratch above the guard, so both tiers disengage and keep
     ///   per-platform trap parity.
-    /// - larger than the window (a tiny §14 sub-window): seeding would unmap the whole carve, and
-    ///   this tier could not mirror it without protecting past the carve — so a small child stays
-    ///   usable on both tiers.
+    /// - larger than the window (a module that declares less memory than the guard): seeding would
+    ///   unmap the whole window, so a small window stays usable on both tiers.
     ///
     /// Assigning the constant *unconditionally* here once broke the granted-child test: a granted
     /// child's carve is smaller than the guard, the interpreter left it unguarded, and this tier
@@ -5304,7 +5298,6 @@ impl PowerboxProgram {
                 cc.thunk(),
                 cc.ptr(),
                 temen_ir::DEFAULT_RESERVED_LOG2,
-                None, // sub
                 // §14 module children (ops 5/13/15) resolve their `Module` grant through the
                 // powerbox host — the ctx is that host's box (`cc.ptr()`), as `cap_thunk`'s.
                 Some(module_resolver),

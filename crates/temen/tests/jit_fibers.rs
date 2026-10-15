@@ -329,7 +329,6 @@ debug.loc 2 0 0 0 9 3
         DEFAULT_RESERVED_LOG2,
         None,
         None,
-        None,
         None, // fuel
         None,
         None,

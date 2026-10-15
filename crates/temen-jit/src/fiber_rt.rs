@@ -1755,12 +1755,12 @@ unsafe fn scan_words(
 /// fibers are scanned normally.
 ///
 /// # Safety
-/// `mem_base`/`mask`/`mapped`/`sub_base`/`trap_out` are the threaded guest-window context (as for
+/// `mem_base`/`mask`/`mapped`/`trap_out` are the threaded guest-window context (as for
 /// `call.cap`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
 /// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
 /// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
 /// clears more than the top byte faults (`FiberFault`).
-/// The ten `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
+/// The nine `gc.roots` arguments, marshalled by the JIT into one stack slot so the flush trampoline
 /// ([`temen_gc_roots_flush`]) can hand them to [`gc_roots`] as a single pointer with no per-argument
 /// register/stack reshuffle. Field order is the historical argument order. `#[repr(C)]` so the JIT's
 /// 8-byte-slot stores line up with these reads.
@@ -1774,7 +1774,6 @@ pub(crate) struct GcRootsArgs {
     mem_base: u64,
     mask: u64,
     mapped: u64,
-    sub_base: u64,
     trap_out: u64,
 }
 
@@ -1786,9 +1785,9 @@ pub(crate) struct GcRootsArgs {
 /// # Safety
 /// `args` points at a live [`GcRootsArgs`] (the JIT's stack slot, valid for the call).
 pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
-    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only caller.
+    // SAFETY: the JIT hands the address of a live 9-field slot; the flush trampoline is the only caller.
     let a = unsafe { &*args };
-    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base, trap_out) = (
+    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out) = (
         a.heap_lo,
         a.heap_hi,
         a.payload_mask,
@@ -1797,7 +1796,6 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         a.mem_base,
         a.mask,
         a.mapped,
-        a.sub_base,
         a.trap_out,
     );
     let rt = current();
@@ -1910,8 +1908,8 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     let total = roots.len();
     let nwrite = total.min(cap.max(0) as usize);
     if nwrite > 0 {
-        // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`
-        // (child-relative), physically at `mem_base + sub_base + off`. #826: `bound` (the `mapped`
+        // Confine the buffer offset exactly like the JIT's `mask_addr`: the window `[0, bound)`,
+        // physically at `mem_base + off`. #826: `bound` (the `mapped`
         // slot) carries the **reserved** span, so a roots buffer in a `map`-grown tail page is
         // admitted where the interpreter's live page map admits it; a write into an uncommitted or
         // `Ro` page faults through the SIGSEGV guard (`MemoryFault`), exactly like a guest store.
@@ -1921,7 +1919,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
             fault(trap_out); // a forged / out-of-window buffer — like the interp's `MemoryFault`
             return 0;
         }
-        let dst = (mem_base + sub_base + masked) as *mut u8;
+        let dst = (mem_base + masked) as *mut u8;
         let mut off = 0usize;
         for w in roots.iter().take(nwrite) {
             std::ptr::copy_nonoverlapping(w.to_le_bytes().as_ptr(), dst.add(off), 8);

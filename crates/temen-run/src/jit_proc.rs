@@ -981,7 +981,6 @@ pub(crate) unsafe fn compile_image(
         cc.thunk(),
         cc.ptr(),
         temen_ir::DEFAULT_RESERVED_LOG2,
-        None,
         Some(resolver),
         interrupt,
         fuel, // the root budget's cell when `Limits.fuel` bounds the run (`jit_run`)

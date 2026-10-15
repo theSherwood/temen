@@ -27,15 +27,13 @@
 //!
 //! ## The confinement lowering (§4, invariant I1, trap-confinement)
 //! Every access **bounds-checks the final effective address** against the reserved
-//! window (`addr + offset` vs the compile-time constant `reserved − offset − width`;
-//! cold `MemoryFault` trap on failure — this is [`temen_mask::Window::checked`], the
-//! isolated, separately-fuzzed spec), then **clamps** the address feeding the access
-//! with `& (reserved − 1)` before adding the window base. The clamp is architecturally
-//! a no-op past the check; on the *speculative* path it is a data dependency that
-//! confines misspeculated OOB accesses to the window+guard — the Spectre-v1 hardening
-//! (§4, D38). The window allocation carries a small guard margin so a base near the top
-//! plus the access width never escapes the allocation (a real deployment uses guard
-//! *pages* + a fault for the width overrun).
+//! window (`addr` vs the compile-time constant `reserved − offset − width` — the
+//! predicate of [`temen_mask::Window::checked_reserved`], the isolated, separately-fuzzed
+//! spec) and redirects an out-of-bounds one, branchlessly (`select_spectre_guard`), to
+//! the window's trailing guard page, where the access itself faults as `MemoryFault`
+//! (§4, D63). The redirect is a speculation barrier, so a misspeculated OOB access lands
+//! on the guard too — the Spectre-v1 hardening. Every window starts at 0 of its own
+//! reservation (§14), so the address is added to the window base unchanged.
 //!
 //! **Check/clamp elision (§1a guard-when-bounded, D36–D38).** A conservative per-block
 //! upper-bound analysis ([`ub_of`]) proves some effective addresses are *already* `< size`;
@@ -202,9 +200,9 @@ mod durable_shadow;
 #[cfg(fiber_rt)]
 mod fiber_registry;
 
-// §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — `instantiate`
-// re-compiles a child confined to a sub-window (nesting cost paid at setup) and runs it over the
-// parent's live window; `join` returns its result. Available where children can run (`fiber_rt`).
+// §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — a spawn compiles
+// the child's module for a window of its own (nesting cost paid at setup) and runs it on the child
+// executor; `join` returns its result. Available where children can run (`fiber_rt`).
 /// D66 — the child-domain executor: detached §14 children as migrating tasks over a lane-bounded
 /// worker pool (DESIGN.md §23).
 #[cfg(fiber_rt)]
@@ -1171,7 +1169,6 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
         empty_cap_thunk,
         core::ptr::null_mut(),
         DEFAULT_RESERVED_LOG2,
-        None, // sub
         None, // resolve_module
         None, // interrupt
         None, // fuel
@@ -1415,40 +1412,6 @@ pub fn compile_and_run_capture_reserved(
     )
 }
 
-/// Run the guest confined to a §14 **nested sub-window** `[base, base+size)` of a fully-backed
-/// parent of `parent_bytes` (both seeded from / snapshotted into `init_mem`-sized buffers). The
-/// module's declared memory is the *child* (`size = 1 << size_log2`); `base` must be size-aligned
-/// and `base + size ≤ parent_bytes`. The masking lowering adds `base` to every confined address
-/// (matching [`temen_mask::Window::sub`]), so this is the JIT side of the **sub-window escape-oracle**:
-/// pair it with the interpreter's [`temen_interp::run_capture_sub`] and byte-compare the whole parent —
-/// a verified guest must leave every byte *outside* `[base, base+size)` untouched (confinement) and
-/// the slice itself byte-identical to the interpreter (codegen). `init_mem` seeds the parent's low
-/// bytes; the returned `Vec` is the whole parent window.
-pub fn compile_and_run_capture_sub(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    init_mem: &[u8],
-    base: u64,
-    parent_bytes: u64,
-) -> Result<(JitOutcome, Vec<u8>), JitError> {
-    run_inner(
-        m,
-        func,
-        args,
-        empty_cap_thunk,
-        core::ptr::null_mut(),
-        RunOpts {
-            init_mem: Some(init_mem),
-            // fully-mapped child (reserved == size); the parent is fully backed
-            reserved_log2: 0,
-            sub: Some(SubWindow { base, parent_bytes }),
-            snapshot_cap: Some(0), // the backed prefix: the whole parent
-            ..RunOpts::default()
-        },
-    )
-}
-
 /// [`compile_and_run_capture_reserved`] + a live powerbox: `call.cap`s dispatch through
 /// `cap_thunk`/`cap_ctx` (so a granted handle takes its **success** path) *and* the final window
 /// is captured for the escape-oracle. Pairs with the interpreter's
@@ -1586,7 +1549,6 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        None, // no sub-window
         None, // no module resolver
         None, // no interrupt
         None, // no fuel budget
@@ -2047,7 +2009,6 @@ pub fn compile_and_run_durable(
             cap_thunk,
             cap_ctx,
             reserved_log2,
-            None, // sub
             None, // resolve_module
             None, // interrupt
             None, // fuel
@@ -2070,17 +2031,6 @@ pub fn compile_and_run_durable(
     r
 }
 
-/// A §14 **nested sub-window**: run the guest confined to `[base, base+child_size)` of a
-/// parent region of `parent_bytes` (both fully backed). The masking lowering adds `base` to
-/// every confined address (matching [`temen_mask::Window::sub`]); `base == 0` is the ordinary
-/// top-level window (the add is elided). The parent is seeded/snapshotted whole, so the
-/// escape-oracle can assert the child only ever touched its own slice.
-#[derive(Clone, Copy)]
-pub struct SubWindow {
-    pub base: u64,
-    pub parent_bytes: u64,
-}
-
 #[allow(clippy::too_many_arguments)]
 /// The optional policy knobs [`run_inner`] threads to the lowering + runtime. Every field defaults
 /// to a no-op (the empty-powerbox reservation, no kill-path / fuel / quota / nesting / capture), so a
@@ -2095,8 +2045,6 @@ struct RunOpts<'a> {
     /// What of the window to snapshot back ([`CompiledModule::run`]): `None`, nothing; `Some(cap)`,
     /// the backed prefix, widened to `cap` bytes.
     snapshot_cap: Option<usize>,
-    /// §14 nested sub-window confinement `[base, base+size)` of a larger parent.
-    sub: Option<SubWindow>,
     /// §14 module resolver for a guest `instantiate` of a separate-module child.
     resolve_module: Option<ModuleResolver>,
     /// The detached-child powerbox builder/releaser ([`GrantChildHooks`], PROCESS.md S2).
@@ -2122,7 +2070,6 @@ impl Default for RunOpts<'_> {
             // The default reservation policy (§4): a large reserved range, only `mapped` backed.
             reserved_log2: DEFAULT_RESERVED_LOG2,
             snapshot_cap: None,
-            sub: None,
             resolve_module: None,
             grant_child: None,
             interrupt: None,
@@ -2146,7 +2093,6 @@ fn run_inner(
         init_mem,
         reserved_log2,
         snapshot_cap,
-        sub,
         resolve_module,
         grant_child,
         interrupt,
@@ -2166,7 +2112,6 @@ fn run_inner(
         cap_thunk,
         cap_ctx,
         reserved_log2,
-        sub,
         resolve_module,
         interrupt,
         fuel,
@@ -2657,8 +2602,6 @@ pub struct CompiledModule {
     inst: InstEnv,
     setjmp: SetjmpEnv,
     mask: u64,
-    cap_mapped: u64,
-    sub_base: u64,
     /// Whether this module's code polls a kill-path cell / charges a fuel cell (see [`Lower::epoch`]
     /// / [`Lower::fuel`]) — the code's shape, which `define_extra` compiles new units to match.
     epoch: bool,
@@ -2707,13 +2650,11 @@ pub struct CompiledModule {
     // --- extents are baked into the code, so they were fixed at compile time).
     win_mapped: usize,
     win_reserved: usize,
-    win_size: usize,
     mem_size_log2: Option<u8>,
     /// #964/#1094: the module's NULL guard (`0` = unguarded). Captured at compile from
     /// [`temen_ir::module_null_guard`] (unconditional now — #1094); each run `mprotect`s `[0, guard)`
     /// inaccessible after the window is seeded, so a NULL dereference faults into the §5 guard exactly
-    /// where the interpreter's `Unmapped`-seeded page map traps. Always `0` for a §14 sub-window compile
-    /// (a carve child mirrors the interpreter's unguarded sub-window).
+    /// where the interpreter's `Unmapped`-seeded page map traps.
     null_guard: u64,
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
@@ -3062,7 +3003,6 @@ impl CompiledModule {
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         reserved_log2: u8,
-        sub: Option<SubWindow>,
         resolve_module: Option<ModuleResolver>,
         interrupt: Option<*const AtomicU64>,
         fuel: Option<*mut FuelCell>,
@@ -3079,7 +3019,6 @@ impl CompiledModule {
             cap_thunk,
             cap_ctx,
             reserved_log2,
-            sub,
             resolve_module,
             interrupt,
             fuel,
@@ -3100,7 +3039,6 @@ impl CompiledModule {
         cap_thunk: CapThunk,
         cap_ctx: *mut core::ffi::c_void,
         reserved_log2: u8,
-        sub: Option<SubWindow>,
         resolve_module: Option<ModuleResolver>,
         interrupt: Option<*const AtomicU64>,
         fuel: Option<*mut FuelCell>,
@@ -3161,59 +3099,24 @@ impl CompiledModule {
         // Plan the guest window if the module declares memory (allocation happens per `run`):
         // `mapped` backed RW bytes inside a host-configured `reserved` virtual range whose
         // unmapped tail + guard page fault (§4). `mask` is the §4 confinement mask (`reserved − 1`,
-        // the mask domain); `win_size` is the seed/snapshot extent (the parent for a sub-window);
-        // `cap_mapped` is the child's backed `mapped` that cap-call buffer borrows bound against.
-        // `sub_base` is the §14 sub-window offset the masking lowering adds (0 for a top-level
-        // window). All of these are baked into the code, so they are fixed at compile time.
-        let (win_mapped, win_reserved, mask, win_size, cap_mapped, sub_base): (
-            usize,
-            usize,
-            u64,
-            usize,
-            u64,
-            u64,
-        ) = match m.memory {
+        // the mask domain). All of these are baked into the code, so they are fixed at compile time.
+        let (win_mapped, win_reserved, mask): (usize, usize, u64) = match m.memory {
             Some(mc) => {
                 if mc.size_log2 > MAX_JIT_WINDOW_LOG2 {
                     return Err(JitError::Unsupported(
                         "window too large for the reference JIT",
                     ));
                 }
-                let mapped = 1usize << mc.size_log2;
                 // Host reservation policy: at least `mapped` (fully mapped if `reserved_log2` is
                 // smaller, e.g. 0), capped so the reference JIT's reservation stays sane.
                 let reserved_log2 = reserved_log2.max(mc.size_log2).min(MAX_JIT_RESERVED_LOG2);
-                match sub {
-                    // §14 sub-window: a fully-backed parent of `parent_bytes`, with the child
-                    // confined (mask = child `reserved − 1`) into the slice at `base`. The child's
-                    // mask domain `[0, reserved)` plus `base` must fit in the parent — the
-                    // verifier-bounded child size + host-chosen `base` guarantee it (the
-                    // Instantiator will enforce this).
-                    Some(sw) => {
-                        let parent = sw.parent_bytes as usize;
-                        (
-                            parent,
-                            parent,
-                            (1u64 << reserved_log2) - 1,
-                            parent,
-                            mapped as u64,
-                            sw.base,
-                        )
-                    }
-                    None => {
-                        let reserved = 1usize << reserved_log2;
-                        (
-                            mapped,
-                            reserved,
-                            (1u64 << reserved_log2) - 1,
-                            mapped,
-                            mapped as u64,
-                            0,
-                        )
-                    }
-                }
+                (
+                    1usize << mc.size_log2,
+                    1usize << reserved_log2,
+                    (1u64 << reserved_log2) - 1,
+                )
             }
-            None => (0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0),
         };
 
         let mut module = new_jit_module()?;
@@ -3510,8 +3413,7 @@ impl CompiledModule {
                 &mut ctx.func,
                 f,
                 mask,
-                cap_mapped,
-                sub_base,
+                win_mapped as u64,
                 guard_offset_of(win_reserved as u64),
                 epoch_addr != 0,
                 fuel_addr != 0,
@@ -3808,8 +3710,6 @@ impl CompiledModule {
             inst,
             setjmp,
             mask,
-            cap_mapped,
-            sub_base,
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
             instance,
@@ -3823,10 +3723,7 @@ impl CompiledModule {
             last_trap_fiber: None,
             win_mapped,
             win_reserved,
-            win_size,
-            // #964: the marker opts this module's window into the NULL guard — window-relative,
-            // so a §14 sub-window compile guards `[sub_base, sub_base + guard)`, exactly where the
-            // interpreter's `run_capture_sub` seeds its child-relative guard.
+            // #964: the marker opts this module's window into the NULL guard.
             null_guard: temen_ir::module_null_guard(),
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
@@ -4035,8 +3932,6 @@ impl CompiledModule {
             inst: InstEnv::null(),
             setjmp: self.setjmp,
             mask: self.mask,
-            cap_mapped: self.cap_mapped,
-            sub_base: self.sub_base,
             epoch: self.epoch,
             fuel: self.fuel,
             instance: addrs,
@@ -4050,7 +3945,6 @@ impl CompiledModule {
             last_trap_fiber: None,
             win_mapped: self.win_mapped,
             win_reserved: self.win_reserved,
-            win_size: self.win_size,
             null_guard: self.null_guard,
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
@@ -4391,7 +4285,7 @@ impl CompiledModule {
             // window's seeding below applies.
             let t = &*this;
             let fn_table_ptr = t.fn_table.as_ptr() as *const core::ffi::c_void;
-            (twin.window, t.win_size, t.mask, fn_table_ptr)
+            (twin.window, t.win_mapped, t.mask, fn_table_ptr)
         } else {
             let t = &mut *this;
             // #2305 — a run the address space has no window for ends as one the process cannot hold
@@ -4405,7 +4299,7 @@ impl CompiledModule {
                     .map_or_else(Vec::new, <[u8]>::to_vec);
                 return Ok((JitOutcome::Trapped(TrapKind::ThreadFault), image));
             };
-            let win_size = t.win_size;
+            let win_size = t.win_mapped;
             // Escape-oracle: seed the window's low bytes so a divergent read/store is observable.
             if let Some(init) = init_mem {
                 let n = init.len().min(win_size);
@@ -4413,16 +4307,15 @@ impl CompiledModule {
             }
             // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
             // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-            // verifier already bounds every segment to `[0, size)`. Segment offsets are child-relative, so
-            // a §14 sub-window shifts them by `sub_base` into the parent backing. Done while fully RW.
+            // verifier already bounds every segment to `[0, size)`. Done while fully RW.
             // The ranges made read-only, for the embedder's page map (`window_ready` below).
             let mut ro: Vec<[u64; 2]> = Vec::new();
             if let Some(size_log2) = t.mem_size_log2 {
                 let size = 1u64 << size_log2;
                 let rw = window.rw_mut();
                 for d in &t.data {
-                    let lo = t.sub_base + d.offset.min(size);
-                    let hi = t.sub_base + (d.offset + d.bytes.len() as u64).min(size);
+                    let lo = d.offset.min(size);
+                    let hi = (d.offset + d.bytes.len() as u64).min(size);
                     let (start, end) = (lo as usize, hi as usize);
                     rw[start..end].copy_from_slice(&d.bytes[..end - start]);
                 }
@@ -4437,8 +4330,8 @@ impl CompiledModule {
                     let lo = d.offset.min(size);
                     let hi = d.offset.saturating_add(d.bytes.len() as u64).min(size);
                     if hi > lo {
-                        window.protect_ro(t.sub_base + lo, hi - lo);
-                        ro.push([t.sub_base + lo, t.sub_base + hi]);
+                        window.protect_ro(lo, hi - lo);
+                        ro.push([lo, hi]);
                     }
                 }
             }
@@ -4447,20 +4340,18 @@ impl CompiledModule {
             // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
             // after the init copy + data segments; a grown tail page is committed and seeded here.
             window.apply_prots(
-                t.sub_base,
+                0,
                 &t.restore_prots,
                 t.win_mapped as u64,
                 init_mem.unwrap_or(&[]),
             );
             // #964: reserve the marked module's NULL region last, after every host write above
             // (init seed, data segments, durable prots) has landed — the marked layout keeps all
-            // live data at or above the guard, so nothing legitimate is covered. Window-relative
-            // (`sub_base` shifts a §14 sub-window's guard into the parent backing); a (sub-)window
-            // smaller than the guard skips — protecting past the carve would false-trap the
-            // parent — matching the interpreter's fit check. The snapshot paths below re-assert RW
-            // (`restore_rw`/`read_low`) before any host read.
-            if t.null_guard <= t.cap_mapped {
-                window.seed_null_guard(t.sub_base, t.null_guard);
+            // live data at or above the guard, so nothing legitimate is covered. A window smaller than
+            // the guard skips, matching the interpreter's fit check. The snapshot paths below re-assert
+            // RW (`restore_rw`/`read_low`) before any host read.
+            if t.null_guard <= t.win_mapped as u64 {
+                window.seed_null_guard(0, t.null_guard);
             }
             if let Some((ready, ctx)) = t.window_ready {
                 if ready(
@@ -4700,7 +4591,7 @@ impl CompiledModule {
                     let point = ForkPoint {
                         window: &window,
                         data: &t.data,
-                        null_guard: (t.null_guard <= t.cap_mapped).then_some(t.null_guard),
+                        null_guard: (t.null_guard <= t.win_mapped as u64).then_some(t.null_guard),
                         shadow: t.shadow,
                         args,
                     };
@@ -5060,8 +4951,7 @@ impl CompiledModule {
                 &mut ctx.func,
                 f,
                 self.mask,
-                self.cap_mapped,
-                self.sub_base,
+                self.win_mapped as u64,
                 guard_offset_of(self.win_reserved as u64),
                 self.epoch,
                 self.fuel, // charges the running instance's fuel cell, as the parent's functions do
@@ -5845,14 +5735,13 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
             &mut ctx.func,
             f,
             mask,
-            mapped, // the committed prefix (== reserved for a carve child; the declared size detached)
-            0,      // top-level confinement over the child's own window
+            mapped,                    // the committed prefix
             guard_offset_of(reserved), // its own window's trailing guard
-            epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
+            epoch_addr != 0,           // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
-            true,   // a §14 child always runs beside its parent, which may tear it down
-            fn_table_mask, // the child's own (reserved) table mask
-            None,   // §14 child: own window/table, `ref.func N` = slot N (no remap)
+            true,           // a §14 child always runs beside its parent, which may tear it down
+            fn_table_mask,  // the child's own (reserved) table mask
+            None,           // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
             None, // …nor value-label points (Stage 3a)
@@ -6018,8 +5907,6 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         inst: inst_env,
         setjmp: SetjmpEnv::null(),
         mask,
-        cap_mapped: mapped,
-        sub_base: 0,
         epoch: epoch_addr != 0,
         fuel: fuel_addr != 0,
         // The child's own instance: its powerbox, the parent's kill-path cell, its own budget cell,
@@ -6036,7 +5923,6 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         last_trap_fiber: None,
         win_mapped: mapped as usize,
         win_reserved: reserved as usize,
-        win_size: mapped as usize,
         null_guard: temen_ir::module_null_guard(),
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
@@ -6681,16 +6567,9 @@ struct Lower<'a> {
     /// thunk (`[mem_base, mem_base+mapped)`), so buffer borrows and Memory-cap ops bound against
     /// the *backed* region, not the larger reserved mask domain. `0` when the module has no memory.
     mapped: u64,
-    /// The §14 nested sub-window base (`temen_mask::Window::sub`'s `base`): the masking lowering
-    /// adds it to every confined address so the child lands in `[mem_base+base, …+reserved)`.
-    /// `0` for an ordinary top-level window — the add is elided.
-    sub_base: u64,
-    /// Offset from `mem_base` of the **enclosing window's trailing guard page** —
-    /// `round_up(win_reserved, page)`, where `win_reserved` is this window's own reservation for a
-    /// top-level guest or the *parent's* reservation for a §14 sub-window. Always `PROT_NONE`, so the
-    /// D63 branchless lowering redirects an out-of-bounds access here to fault it (for a sub-window the
-    /// parent guard is the only guaranteed fault site — the child slice has parent memory on both
-    /// sides). `0` when the module has no memory (the branchless path isn't taken).
+    /// Offset from `mem_base` of the **window's trailing guard page** — `round_up(win_reserved,
+    /// page)`. Always `PROT_NONE`, so the D63 branchless lowering redirects an out-of-bounds access
+    /// here to fault it. `0` when the module has no memory (the branchless path isn't taken).
     guard_offset: u64,
     /// The target's frontend config (pointer width + default call conv), for the Cranelift
     /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
@@ -6827,7 +6706,6 @@ fn build_clif(
     f: &Func,
     mask: u64,
     mapped: u64,
-    sub_base: u64,
     guard_offset: u64,
     epoch: bool,
     fuel: bool,
@@ -6917,7 +6795,6 @@ fn build_clif(
         result_tys: f.results.iter().map(|t| clif_ty(*t)).collect(),
         mask,
         mapped,
-        sub_base,
         guard_offset,
         frontend_config: module.target_config(),
         fn_table_mask,
@@ -7619,12 +7496,12 @@ fn lower_block(
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, sub_base,
-            // trap_out) -> i64 count. The thunk walks the live fiber stacks (runtime via the
-            // thread-local), masks each word with `payload_mask` (§GC tagged pointers; distinct from
-            // the window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out)
+            // -> i64 count. The thunk walks the live fiber stacks (runtime via the thread-local),
+            // masks each word with `payload_mask` (§GC tagged pointers; distinct from the
+            // window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
             // writes the first `cap` deduped words to guest `buf` — confining/bounds-checking it
-            // with the same `mask`/bound/`sub_base` as `mask_addr`, so a forged buffer faults
+            // with the same `mask`/bound as `mask_addr`, so a forged buffer faults
             // (below). #826: the bound is the **reserved** mask domain (not the compile-time
             // `mapped`), so a roots buffer in a legitimately `map`-grown tail page is admitted
             // where the interpreter's live page map admits it; committed-ness and write-protection
@@ -7639,15 +7516,14 @@ fn lower_block(
             let maskv = b.ins().iconst(I64, lower.mask as i64);
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mappedv = b.ins().iconst(I64, win_reserved as i64);
-            let subv = b.ins().iconst(I64, lower.sub_base as i64);
             let trap_out = b.use_var(lower.vmctx_var);
-            // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
+            // Marshal the nine args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
             // `#[repr(C)]` field order) and pass a single pointer. The thunk is the register-flush
             // trampoline, which spills the callee-saved registers before the scan; a one-pointer ABI
             // lets it do so with no per-argument reshuffle (see `fiber_rt::temen_gc_roots_flush`).
             let slot = b.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                80, // 10 × 8 bytes
+                72, // 9 × 8 bytes
                 3,  // 8-byte aligned
             ));
             for (i, v) in [
@@ -7659,7 +7535,6 @@ fn lower_block(
                 mem_base,
                 maskv,
                 mappedv,
-                subv,
                 trap_out,
             ]
             .into_iter()
@@ -9765,31 +9640,9 @@ fn result_as(b: &mut FunctionBuilder, v: Value, declared: ValType) -> Value {
     }
 }
 
-/// The §4 confinement lowering (invariant I1, **branchless confinement**, D63): bounds-test the
-/// final effective address `addr + offset` against `reserved − offset − width`, then
-/// `select_spectre_guard(oob, guard_offset, sub_base + addr + offset)` and add the base, giving the
-/// physical address `mem_base + (oob ? guard_offset : sub_base + addr + offset)`. An out-of-bounds
-/// access is redirected to `guard_offset` — the offset of the enclosing window's trailing guard page
-/// (`round_up(win_reserved, page)`) — so the access *itself* faults there (`MemoryFault`, the
-/// architectural fault, mirroring `temen_mask::Window::checked`), with no per-access branch. The
-/// `select_spectre_guard` is also a speculation barrier: a misspeculated OOB access likewise receives
-/// `guard_offset`, confining it to the guard — the Spectre-v1 hardening (§4, D63; supersedes the D38
-/// `trapnz` + `& mask` clamp). This is uniform for top-level and §14 nested (`sub_base != 0`) windows:
-/// a nested child redirects to the **parent's** guard (its own slice has committed parent memory on
-/// both sides), so an out-of-child access lands on the parent guard, never in the parent.
-///
-/// When `elide` is set the check and clamp are both dropped — but **only** the caller's
-/// [`in_window`] proof (the address is provably `< size`) may set it, so the unclamped
-/// `addr + offset` already stays in `[0, size)` (a proven bound holds speculatively too:
-/// the proof is over data dependencies, e.g. `(i & K)*W`). This is the
-/// elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a confinement
-/// escape, caught by the escape-oracle (final-memory differential, §18). The `+ sub_base`
-/// is independent of elision (it shifts the whole `[0, size)` child window into its parent
-/// slice) and is itself elided when `sub_base == 0`.
-///
-/// Offset from `mem_base` of the enclosing window's trailing guard page (`round_up(win_reserved,
-/// page)`), the always-`PROT_NONE` redirect target for the D63 branchless out-of-bounds fault. `0`
-/// (unused) when the window has no reservation.
+/// Offset from `mem_base` of the window's trailing guard page (`round_up(win_reserved, page)`),
+/// the always-`PROT_NONE` redirect target for the D63 branchless out-of-bounds fault. `0` (unused)
+/// when the window has no reservation.
 fn guard_offset_of(win_reserved: u64) -> u64 {
     if win_reserved == 0 {
         return 0;
@@ -9799,14 +9652,12 @@ fn guard_offset_of(win_reserved: u64) -> u64 {
 }
 
 /// How far past `reserved` an access may reach and still fault on the window's trailing guard
-/// ([`mem::trailing_guard`], DESIGN.md D67), when that guard starts exactly at `reserved`: a top-level
-/// window whose reservation is page-aligned. `0` otherwise (a §14 child's slice has parent memory past
-/// its end, and an unaligned reservation shares its last page with the window), and then
-/// [`CheckedBases`] checks every access exactly, as [`mask_addr`] does.
+/// ([`mem::trailing_guard`], DESIGN.md D67), when that guard starts exactly at `reserved`: a window
+/// whose reservation is page-aligned. `0` otherwise (an unaligned reservation shares its last page
+/// with the window), and then [`CheckedBases`] checks every access exactly, as [`mask_addr`] does.
 fn guard_reach(lower: &Lower) -> u64 {
     let reserved = lower.mask.wrapping_add(1);
     let guard_at_reserved = lower.mask != 0
-        && lower.sub_base == 0
         && reserved != 0
         && reserved.is_multiple_of(mem::page_size() as u64)
         && lower.guard_offset == reserved;
@@ -9956,6 +9807,23 @@ impl CheckedBases {
     }
 }
 
+/// The §4 confinement lowering (invariant I1, **branchless confinement**, D63): bounds-test the
+/// final effective address `addr + offset` against `reserved − offset − width`, then
+/// `select_spectre_guard(oob, guard_offset, addr + offset)` and add the base, giving the physical
+/// address `mem_base + (oob ? guard_offset : addr + offset)`. An out-of-bounds access is redirected
+/// to `guard_offset` — the offset of the window's trailing guard page (`round_up(win_reserved,
+/// page)`) — so the access *itself* faults there (`MemoryFault`, the architectural fault, mirroring
+/// `temen_mask::Window::checked`), with no per-access branch. The
+/// `select_spectre_guard` is also a speculation barrier: a misspeculated OOB access likewise receives
+/// `guard_offset`, confining it to the guard — the Spectre-v1 hardening (§4, D63; supersedes the D38
+/// `trapnz` + `& mask` clamp).
+///
+/// When `elide` is set the check and clamp are both dropped — but **only** the caller's
+/// [`in_window`] proof (the address is provably `< size`) may set it, so the unclamped
+/// `addr + offset` already stays in `[0, size)` (a proven bound holds speculatively too:
+/// the proof is over data dependencies, e.g. `(i & K)*W`). This is the
+/// elide-when-provably-bounded half of §1a (D36–D38); a wrong proof is a confinement
+/// escape, caught by the escape-oracle (final-memory differential, §18).
 fn mask_addr(
     b: &mut FunctionBuilder,
     lower: &Lower,
@@ -9984,11 +9852,8 @@ fn mask_addr(
     // interpreter's `confine_checked` (reserved-domain bound) + `check_prot` (per-page) — the redirect
     // is invisible to that mirror (it only fires on an access the interpreter also faults; the
     // interpreter doesn't speculate) — so the two agree on the same fault under the §18 escape oracle.
-    // A §14 nested child (`sub_base != 0`) bounds-tests the same way, shifts the in-bounds offset into
-    // its parent slice (`+ sub_base`), and redirects an out-of-child access to the parent guard, so it
-    // too faults out-of-child instead of aliasing parent memory. Elided accesses (proven `< reserved`)
-    // need no check. The no-memory / degenerate `mask == 0` case keeps the mask (a 1-byte / memoryless
-    // window has no reservation to bound against).
+    // Elided accesses (proven `< reserved`) need no check. The no-memory / degenerate `mask == 0`
+    // case keeps the mask (a 1-byte / memoryless window has no reservation to bound against).
     if !elide && lower.mask != 0 {
         // `reserved = mask + 1` (a power of two ≤ 2^63); the reservation this window is confined to.
         let reserved = lower.mask.wrapping_add(1);
@@ -10004,21 +9869,15 @@ fn mask_addr(
             // `offset + width` alone exceeds the reservation ⇒ no `addr` is in-bounds; always fault.
             None => b.ins().iconst(I8, 1),
         };
-        // **Branchless confinement** (invariant I1, D63), matching Wasmtime's spectre-guarded heap and
-        // uniform for top-level *and* §14 nested windows. No `trapnz`: shift the (proven in-bounds when
-        // `!oob`) offset into its window slice (`+ sub_base`, elided top-level), then
-        // `select_spectre_guard(oob, guard_offset, …)` redirects an out-of-bounds access to
-        // `guard_offset` — the offset of the **enclosing window's trailing guard page** from `mem_base`
-        // — so the load/store *itself* faults there (SIGSEGV → `MemoryFault`, unwound by the guard
-        // handler like any in-window guard fault), with no per-access branch.
+        // **Branchless confinement** (invariant I1, D63), matching Wasmtime's spectre-guarded heap.
+        // No `trapnz`: `select_spectre_guard(oob, guard_offset, …)` redirects an out-of-bounds access
+        // to `guard_offset` — the offset of the **window's trailing guard page** from `mem_base` — so
+        // the load/store *itself* faults there (SIGSEGV → `MemoryFault`, unwound by the guard handler
+        // like any in-window guard fault), with no per-access branch.
         //
         // `guard_offset = round_up(win_reserved, page)` is always `PROT_NONE` (`GuestWindow` maps
-        // `[round_up(mapped,page), round_up(reserved,page)+page)` inaccessible). For a top-level window
-        // `win_reserved == reserved`, so this is the window's own guard; for a nested sub-window it is
-        // the **parent's** guard — the only guaranteed fault site, since the child slice has committed
-        // parent memory on both sides (redirecting to the child's own `reserved` could alias valid
-        // parent memory: a child→parent escape). Redirecting the *whole* physical offset (past
-        // `+ sub_base`) means an out-of-child access lands on the parent guard, never in the parent.
+        // `[round_up(mapped,page), round_up(reserved,page)+page)` inaccessible), and
+        // `win_reserved == reserved`, so this is the window's own guard.
         //
         // `select_spectre_guard` is a **speculation barrier** (a data-dependent cmov, not a predicted
         // branch): a *misspeculated* OOB access also receives `guard_offset`, so it can never
@@ -10030,14 +9889,8 @@ fn mask_addr(
         // matmul_eb 1.34→0.97 temen÷wt64; see the `confine` harness / DESIGN.md §4). The
         // clear-`MemoryFault`-at-the-offending-access property of §4/D38 is preserved — only the
         // mechanism (guard-page fault vs `ud2`) differs.
-        let shifted = if lower.sub_base == 0 {
-            eff
-        } else {
-            let sb = b.ins().iconst(I64, lower.sub_base as i64);
-            b.ins().iadd(eff, sb)
-        };
         let guard = b.ins().iconst(I64, lower.guard_offset as i64);
-        let confined = b.ins().select_spectre_guard(oob, guard, shifted);
+        let confined = b.ins().select_spectre_guard(oob, guard, eff);
         let base = b.use_var(lower.mem_var);
         return b.ins().iadd(base, confined);
     }
@@ -10048,14 +9901,6 @@ fn mask_addr(
     } else {
         let m = b.ins().iconst(I64, lower.mask as i64);
         b.ins().band(eff, m)
-    };
-    // §14 sub-window: shift the confined child offset into its parent slice. Elided (no add) for a
-    // top-level window so ordinary codegen is byte-identical to before nesting existed.
-    let confined = if lower.sub_base == 0 {
-        confined
-    } else {
-        let sb = b.ins().iconst(I64, lower.sub_base as i64);
-        b.ins().iadd(confined, sb)
     };
     let base = b.use_var(lower.mem_var);
     b.ins().iadd(base, confined)
@@ -10165,7 +10010,7 @@ fn copy_inline(
 }
 
 /// Confine a **dynamic-length span** `[ptr, ptr+len)` to the reserved domain `[0, reserved)` and
-/// return its physical base `mem_base + (ptr & mask) + sub_base` — the bulk-memory hinge (D62). Where
+/// return its physical base `mem_base + (ptr & mask)` — the bulk-memory hinge (D62). Where
 /// [`mask_addr`] confines one fixed-width access, this confines a whole span with a *single* range
 /// check: it traps [`TrapKind::MemoryFault`] (native `trapnz`) when `len != 0 && (len > reserved ||
 /// ptr > reserved − len)`, i.e. any byte of the span would fall outside `[0, reserved)`. The two
@@ -10198,14 +10043,8 @@ fn confine_span(b: &mut FunctionBuilder, lower: &Lower, ptr: Value, len: Value) 
         .trapnz(oob, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
     let m = b.ins().iconst(I64, lower.mask as i64);
     let clamped = b.ins().band(ptr, m);
-    let shifted = if lower.sub_base == 0 {
-        clamped
-    } else {
-        let sb = b.ins().iconst(I64, lower.sub_base as i64);
-        b.ins().iadd(clamped, sb)
-    };
     let base = b.use_var(lower.mem_var);
-    b.ins().iadd(base, shifted)
+    b.ins().iadd(base, clamped)
 }
 
 // The confinement bound-proof (`UB_TOP`/`ub_at`/`ub_of`/`in_window`) now lives in one audited place,

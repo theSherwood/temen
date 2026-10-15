@@ -230,14 +230,15 @@ different things depending on which pair you compare:
   children, `active_coro`, `root_shadow_sp`) instead of only the root `Vm`, and `ScheduledSnapshot` adds
   the **run-shared** `fibers` registry (a fiber migrates across vCPUs — D57) and the §14 same-module
   `instantiate`-child environments (`extra_envs`, as `EnvSnapshot`). On restore each coroutine window
-  (`rebuild_coro`, shared with the single-vCPU path) and each child env (`rebuild_env`: `nested_view` +
-  a deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
+  (`rebuild_coro`, shared with the single-vCPU path) and each child env (a `nested_view` + a
+  deterministic `Instantiator`/`AddressSpace` powerbox over `[0, child_size)` + fuel) is rebuilt over
   the reseeded shared window. Admitting `instantiate` children is what unlocked **scheduled coroutines**:
   the bytecode engine rejected `coroutine + thread`, so a scheduled coroutine only ever arose alongside
   an `instantiate` sibling. (Both are since retired: the coroutine ops by #2069, the carve
-  `instantiate` by #1867.) Still excluded (→ fall back to replay-from-turn-0): any child/coroutine that
-  **maps its own pages** (non-pristine `nested_view` layout — a **demand** coroutine), plus event-parked
-  (`memory.wait`) fibers. Oracles:
+  `instantiate` by #1867. A child env is now a detached child's own window image and powerbox,
+  rebuilt under its spawner's by `rebuild_detached_env`, #1866.) Still excluded (→ fall back to
+  replay-from-turn-0): any child/coroutine that **maps its own pages** (non-pristine `nested_view`
+  layout — a **demand** coroutine), plus event-parked (`memory.wait`) fibers. Oracles:
   `dap_checkpoints.rs::scheduled_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
   worker vCPUs each driving a fiber body) and
   `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
@@ -283,7 +284,11 @@ different things depending on which pair you compare:
   entry were dropped) and the terminal unmapped load (would *not* fault, diverging, if the `Unmapped` entry
   were dropped), so it pins protection-map fidelity, not just bytes.
 
-  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** The bytes
+  **Subset extended to page-mapping *children* + demand coroutines (slice 6b, both engines).** *(Retired
+  with the carve windows, #1867: `EnvSnapshot.prot`, `Mem::prot_snapshot`/`install_prot`,
+  `child_checkpointable` and `nested_within_prefix` are deleted. A child's window is its own (#1866), so
+  its env snapshot carries its bytes and page map whole — `DetachedLive.image`, a `MemLayout` — under the
+  checkpoint's own gate, `ScheduledDebugRun::checkpointable`.)* The bytes
   +protmap capture now reaches §14 children too. A **demand** (`fault_yields`) coroutine — its window
   starts all-`Unmapped`, pages supplied `Rw` by the parent on fault — and a coroutine or `instantiate`
   child that `map`/`unmap`/`protect`ed its own confined window were the last non-pristine cases still
