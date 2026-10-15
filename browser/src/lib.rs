@@ -2932,11 +2932,14 @@ pub extern "C" fn temen_par_free(v: *mut ParVcpu) {
 //   thread. 0 when the request is posted; nonzero when this agent cannot start Workers.
 // - `x2_now_ms()`: milliseconds since the epoch, below a millisecond, on a clock every Worker reads
 //   alike (`performance.timeOrigin + performance.now()`).
-// - `x2_tierup(func, argv, argc, win, mapped, over, out)`: run `f{func}(win, env, ...argv)` of the
-//   run's tier-up module ([`temen_x2_wasm_ptr`]) on this Worker's emitted tier, with `"mapped"` set,
-//   and write its results at `out`. Returns how many, or `-(1 + code)` when it trapped with `code`.
-//   The emitted code's fuel checks look at the byte at `over`, and once it is set the next one ends
-//   the call ([`bytecode::EmittedCall::over`]).
+// - `x2_tierup(module, func, argv, argc, win, mapped, over, out, mem)`: run `f{func}(win, env,
+//   ...argv)` of program `module`'s emit on this Worker's emitted tier, with `"mapped"` set, and write
+//   its results at `out`. Returns how many, or `-(1 + code)` when it trapped with `code`. The emitted
+//   code's fuel checks look at the byte at `over`, and once it is set the next one ends the call
+//   ([`bytecode::EmittedCall::over`]). With `mem` -1 the program is the run's own
+//   ([`temen_x2_wasm_ptr`]), over the engine's memory at `win`. Otherwise `mem` is a detached child's
+//   memory, which the Worker registered, and the program a granted module ([`temen_x2_program_len`]):
+//   the window starts past the child's header and the call's context is in it (#1414 ED-2).
 // - `x2_invoke(code, wasm, wasm_len, types, nparams, nresults, argv, win, mapped, over, out)`: as
 //   `x2_tierup`, for the entry `f0` of the §22 unit the guest invoked with code handle `code`, whose
 //   emitted module is `[wasm, wasm + wasm_len)`. The unit's parameter and then result types are the
@@ -2947,6 +2950,7 @@ extern "C" {
     fn x2_spawn(start: *mut core::ffi::c_void, mem: i32) -> i32;
     fn x2_now_ms() -> f64;
     fn x2_tierup(
+        module: u32,
         func: u32,
         argv: *const i64,
         argc: u32,
@@ -2954,6 +2958,7 @@ extern "C" {
         mapped: u64,
         over: u32,
         out: *mut i64,
+        mem: i32,
     ) -> i32;
     fn x2_invoke(
         code: i32,
@@ -2974,6 +2979,24 @@ extern "C" {
 /// when no function of the run tiers up.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 static X2_WASM: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// The granted modules the run's children tier up into (#1414 ED-2), by program index: what the
+/// tier's module emitter emitted for them ([`module_emitter`]).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+static X2_PROGRAMS: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(None);
+
+/// Program `module`'s emit ([`X2_PROGRAMS`]), for the Worker to copy ([`temen_x2_bytes_ptr`]): its
+/// length, `0` when the run emitted none for it.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
+    let programs = X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let wasm = programs.and_then(|p| {
+        let p = p.lock().unwrap_or_else(|e| e.into_inner());
+        p.get(&module).cloned().flatten().map(|e| e.wasm)
+    });
+    x2_keep(wasm)
+}
 
 /// The run's tier-up module ([`X2_WASM`]): its bytes.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
@@ -3027,8 +3050,9 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let (argv, argc) = (call.argv.as_ptr(), call.argv.len() as u32);
     let (win, mapped) = (call.win as usize as u32, call.mapped);
     let over = call.over.as_ptr() as usize as u32;
+    let mem = call.memory.map_or(-1, |id| id as i32);
     let unit = match call.target {
-        bytecode::EmittedTarget::Region(func) => Err(func),
+        bytecode::EmittedTarget::Region { module, func } => Err((module, func)),
         bytecode::EmittedTarget::Unit {
             code,
             wasm,
@@ -3061,7 +3085,17 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     // this run's.
     let n = unsafe {
         match &unit {
-            Err(func) => x2_tierup(*func, argv, argc, win, mapped, over, out.as_mut_ptr()),
+            Err((module, func)) => x2_tierup(
+                *module,
+                *func,
+                argv,
+                argc,
+                win,
+                mapped,
+                over,
+                out.as_mut_ptr(),
+                mem,
+            ),
             Ok((code, wasm, types, nparams, nresults)) => x2_invoke(
                 *code,
                 wasm.as_ptr(),
@@ -3248,9 +3282,17 @@ pub extern "C" fn temen_x2_spill_bytes() -> usize {
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_pagestate_ptr() -> *const u8 {
-    x2_call(|c| c.pagestate())
+    x2_call(|c| c.pagestate().map(|(base, _)| base))
         .flatten()
         .unwrap_or(core::ptr::null())
+}
+
+/// The length of the running call's page-state table ([`temen_x2_pagestate_ptr`]), which a Worker
+/// copies into a detached child's header (#1414 ED-2): `0` when the call is not page-checked.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_x2_pagestate_len() -> usize {
+    x2_call(|c| c.pagestate().map_or(0, |(_, len)| len)).unwrap_or(0)
 }
 
 /// The parallel driver's [`bytecode::ThreadPlatform`] in a browser: each thread a Worker, the
@@ -3408,7 +3450,9 @@ pub extern "C" fn temen_x2_start(
     let codegen = codegen && all_shimmable(&m);
     let mut back = None;
     let mut platform = X2_PLATFORM;
-    if regions.is_some() || codegen {
+    // With `tierup`, a detached child tiers up through its granted module's emit, over its own
+    // memory, whether or not the run's own program has regions (#1414 ED-2).
+    if tierup != 0 || codegen {
         let page = temen_interp::host_page_size();
         let Some(flat) = temen_interp::Region::owned_zeroed(1u64 << win_log2, page) else {
             set(STATUS_UNSUPPORTED);
@@ -3436,11 +3480,14 @@ pub extern "C" fn temen_x2_start(
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect();
         X2_TABLE_LOG2.store(host.jit_table_log2(), Ordering::Relaxed);
+        let programs = (tierup != 0).then(Programs::default);
+        *X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()) = programs.clone();
         platform.tier = Some(bytecode::ThreadTier {
             eligible: eligible.into(),
             page_checked: paged,
             // Each thread's spill stack is the size of the coop run's.
             spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
+            modules: programs.map(|p| module_emitter(p, true)),
             run: x2_run,
         });
     }
@@ -14439,12 +14486,20 @@ mod foreign_mem {
 }
 
 /// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
-/// emitted tier's `env` bounce cell (at 0) and, for a paged run, its `pagestate` table (at
-/// [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the header is unreachable by
-/// the guest (spans are bounded by `"mapped"` before `win` is added) and never moves on `memory.grow`.
+/// contexts its emitted code runs in ([`DETACHED_CONTEXTS`], from 0) and, for a paged run, its
+/// `pagestate` table (at [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the
+/// header is unreachable by the guest (spans are bounded by `"mapped"` before `win` is added) and
+/// never moves on `memory.grow`.
 pub const DETACHED_HEADER_BYTES: u64 = 65536;
-/// Where the paged run's page-state table lives inside the header (after the `env` cell).
-pub const DETACHED_PAGESTATE_OFF: u64 = 4096;
+/// The bytes of a context in a detached child's header: an env cell and its call scratch
+/// (`temen_wasmjit_env_bytes`), which a task running emitted code over the child's memory uses. The
+/// header holds [`DETACHED_CONTEXTS`] of them, from its start, then its page-state table (#1414 ED-2).
+pub const DETACHED_CONTEXT_BYTES: u64 = 4096;
+/// How many tasks of a detached child can run emitted code at once: its root task. Its threads
+/// interpret (#1414 ED-2).
+pub const DETACHED_CONTEXTS: u64 = 1;
+/// Where the paged run's page-state table lives inside the header: after the contexts.
+pub const DETACHED_PAGESTATE_OFF: u64 = DETACHED_CONTEXTS * DETACHED_CONTEXT_BYTES;
 /// The default `maximum` of a minted detached child memory (its guest window, excluding the header),
 /// and the byte quota the op-13 loop's `WindowMinter` carries: 1 GiB, the engine's own ceiling. V8
 /// reserves a shared memory's `maximum` as address space, so this bounds per-child reservation; the

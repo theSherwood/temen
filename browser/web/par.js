@@ -105,8 +105,10 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //               of its own, under the same recipes (`io`, `onramp`, `inst`, `jit`, `jitRuntime`,
 //               none). Of the emitted-tier options it takes `tierup` and the §22 ones (`jitCodegen`,
 //               `jitRuntimeCodegen`, `jitB2`): each thread runs its task's tier-ups and emitted
-//               invokes on its own Worker, over a window of `winSize` that cannot grow. It refuses
-//               `instCodegen` (#1414 B6-3c). A run it ends with a trap rejects with an Error whose
+//               invokes on its own Worker, over a window of `winSize` that cannot grow. Under
+//               `tierup` a detached child's root task runs its granted module's emit over the
+//               child's own memory (#1414 ED-2), so it refuses `instCodegen`, the per-Worker
+//               driver's switch for that. A run it ends with a trap rejects with an Error whose
 //               `faultAddr` is where a memory fault faulted, window-relative (`-1n` for none, #2275);
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
 //   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
@@ -119,7 +121,7 @@ export function makeRunner({ module, memory, ex }) {
 
   return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [], x2 = false } = {}) {
     if (x2 && instCodegen) {
-      throw new Error('the parallel driver runs no detached child on emitted code yet (#1414 B6-3c)');
+      throw new Error('the parallel driver runs a detached child emitted under `tierup`, not `instCodegen` (#1414 ED-2)');
     }
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);

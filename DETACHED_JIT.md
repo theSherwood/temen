@@ -256,7 +256,8 @@ mapping on native. So:
   instances is the floor.
   `Region::Foreign` is not flat-addressable (`raw_base_at = None`), so `tierup_servable`'s
   flat-window arm declines it — correct, since tier-up *into* the child's memory is the
-  emitted run itself.
+  emitted run itself. On executor 2 that run is the child's root task's: it alone is armed over a
+  memory of its own, its context in the memory's header (#1414 ED-2).
 - **Parent seeding argv / reading output**: a copy into the child's memory before `start`,
   a copy out after `join`. Data segments are already a copy (`init_data` on the child's own
   `Mem`, as the op-15 arm does). **argv has no detached path today**: the op-13 convention is a

@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::bytecode::{
-    self, EmittedCall, EmittedTarget, ThreadPlatform, ThreadStart, ThreadTier,
+    self, EmittedCall, EmittedTarget, ModuleOffer, ProgramEmit, ThreadPlatform, ThreadStart,
+    ThreadTier,
 };
 use temen_interp::{ForeignOps, Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
@@ -185,7 +186,7 @@ fn flat_window() -> Option<Arc<Region>> {
 /// Emitted code that hands the whole call back to the interpreter through its bounce: a tier-up
 /// served end to end on the thread, with the interpreter as the emitted code.
 fn bounce_whole_call(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
-    let EmittedTarget::Region(func) = call.target else {
+    let EmittedTarget::Region { func, .. } = call.target else {
         panic!("only tier-ups reach this tier");
     };
     let mut io = [0i64; 8];
@@ -204,6 +205,7 @@ fn tier(
             eligible,
             page_checked: false,
             spill: 0,
+            modules: None,
             run,
         }),
         ..ThreadPlatform::OS
@@ -238,7 +240,7 @@ static ENTRIES: AtomicUsize = AtomicUsize::new(0);
 /// Emitted code for the counters' entry, function 1, counted.
 fn counting_entries(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     assert!(
-        matches!(call.target, EmittedTarget::Region(1)),
+        matches!(call.target, EmittedTarget::Region { module: 0, func: 1 }),
         "the threads' entry alone tiers up"
     );
     ENTRIES.fetch_add(1, Ordering::SeqCst);
@@ -520,6 +522,7 @@ fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatf
             eligible: Arc::from([false, false]),
             page_checked: false,
             spill: 0,
+            modules: None,
             run,
         }),
         ..ThreadPlatform::OS
@@ -605,6 +608,7 @@ fn run_paged(
             eligible: count_eligible(),
             page_checked: true,
             spill: 0,
+            modules: None,
             run,
         }),
         ..ThreadPlatform::OS
@@ -625,7 +629,7 @@ fn run_paged(
 
 /// The page-state table a page-checked call reads now: a byte per page, up to its coverage.
 fn pagestate_now(call: &EmittedCall<'_>) -> Vec<u8> {
-    let at = call
+    let (at, _) = call
         .pagestate()
         .expect("a page-checked call carries a page-state table");
     let pages = (call.mapped_now() / temen_interp::host_page_size()) as usize;
@@ -802,6 +806,7 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
             eligible: Arc::from([false, true, false, false]),
             page_checked: false,
             spill: 64,
+            modules: None,
             run: spill_then_collect,
         }),
         ..ThreadPlatform::OS
@@ -878,14 +883,14 @@ block 0 (vsp: i64, varg: i64) {
 }
 ";
 
-/// Run [`spawn_and_join`] under `platform`, granting it [`CHILD_AND_THREAD`] and a budget of `mem`
+/// Run [`spawn_and_join`] under `platform`, granting it `child` (its program) and a budget of `mem`
 /// bytes.
-fn run_detached(platform: ThreadPlatform, mem: i64) -> Result<Vec<Value>, Trap> {
+fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<Value>, Trap> {
     let m = module(&spawn_and_join());
     let mut host = Host::new();
     host.set_thread_platform(platform);
     let inst = host.grant_instantiator(0, 1 << 17);
-    let child = host.grant_module(&module(CHILD_AND_THREAD));
+    let child = host.grant_module(&module(child));
     let budget = host.grant_budget(-1, mem, -1);
     let args = [
         Value::I32(inst),
@@ -1000,7 +1005,7 @@ fn recording_spawn(f: ThreadStart, window: Option<u32>) -> std::io::Result<()> {
 fn a_detached_childs_window_is_in_the_platforms_memory() {
     let want = Ok(vec![Value::I64(42)]);
     assert_eq!(
-        run_detached(ThreadPlatform::OS, 1 << 20),
+        run_detached(ThreadPlatform::OS, 1 << 20, CHILD_AND_THREAD),
         want,
         "7 + 35, in a window of the engine's"
     );
@@ -1009,19 +1014,19 @@ fn a_detached_childs_window_is_in_the_platforms_memory() {
         child_window: Some(fake_child_window),
         ..ThreadPlatform::OS
     };
-    assert_eq!(run_detached(platform, 1 << 20), want);
-    let mems = FAKE_MEMS.lock().unwrap();
-    assert_eq!(mems.len(), 1, "one child, one memory");
-    let word = |at: usize| i64::from_le_bytes(mems[0][at..at + 8].try_into().unwrap());
+    assert_eq!(run_detached(platform, 1 << 20, CHILD_AND_THREAD), want);
+    let spawned = SPAWNED_OVER.lock().unwrap().clone();
+    let id = spawned[0].expect("the child's task runs over its memory");
+    assert_eq!(
+        spawned,
+        [Some(id), Some(id)],
+        "the child's task and its thread were each spawned over its memory"
+    );
+    let word = |at: usize| fake_word(id, at);
     assert_eq!(
         (word(16400), word(16408)),
         (7, 35),
         "the child and its thread stored into the platform's memory"
-    );
-    assert_eq!(
-        *SPAWNED_OVER.lock().unwrap(),
-        [Some(0), Some(0)],
-        "the child's task and its thread were each spawned over its memory"
     );
 }
 
@@ -1045,6 +1050,106 @@ fn a_child_window_the_platform_cannot_make_refuses_the_spawn_and_charges_nothing
         child_window: Some(refuse_the_first_window),
         ..ThreadPlatform::OS
     };
-    assert_eq!(run_detached(platform, 1 << 16), Ok(vec![Value::I64(42)]));
+    assert_eq!(
+        run_detached(platform, 1 << 16, CHILD_AND_THREAD),
+        Ok(vec![Value::I64(42)])
+    );
     assert_eq!(WINDOWS_ASKED.load(Ordering::SeqCst), 2);
+}
+
+/// The word at `at` of the test's foreign memory `id`.
+fn fake_word(id: u32, at: usize) -> i64 {
+    let mems = FAKE_MEMS.lock().unwrap();
+    i64::from_le_bytes(mems[id as usize][at..at + 8].try_into().unwrap())
+}
+
+/// #1414 ED-2 — the child: its entry spawns a thread (f1), calls f2 with 7 itself, joins the
+/// thread, and returns the sum. The thread calls f2 with 35. f2 stores its argument at `16384 + 8x`
+/// of the child's window and returns it.
+const CHILD_CALLS_A_LEAF: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vz = i64.const 0
+  t = thread.spawn 1 vz vz
+  v7 = i64.const 7
+  va = call 2 (v7)
+  j = thread.join t
+  vs = i64.add va j
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v35 = i64.const 35
+  vr = call 2 (v35)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v8 = i64.const 8
+  vo = i64.mul vx v8
+  vb = i64.const 16384
+  va = i64.add vb vo
+  i64.store va vx
+  return vx
+  }
+}
+";
+
+/// What each emitted call of [`a_childs_root_task_tiers_up_over_its_own_memory`] named:
+/// `(program, function, memory)`.
+static CHILD_CALLS: Mutex<Vec<(u32, u32, Option<u32>)>> = Mutex::new(Vec::new());
+
+fn recording_child_calls(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { module, func } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    CHILD_CALLS
+        .lock()
+        .unwrap()
+        .push((module, func, call.memory));
+    bounce_whole_call(call)
+}
+
+#[test]
+fn a_childs_root_task_tiers_up_over_its_own_memory() {
+    // The host emits the child's program, its leaf f2 alone eligible; the run's own program has
+    // nothing eligible.
+    let platform = ThreadPlatform {
+        tier: Some(ThreadTier {
+            eligible: Arc::from([false]),
+            page_checked: false,
+            spill: 0,
+            modules: Some(Arc::new(|_: &ModuleOffer| {
+                Some(ProgramEmit {
+                    eligible: Arc::from([false, false, true]),
+                    page_checked: false,
+                })
+            })),
+            run: recording_child_calls,
+        }),
+        child_window: Some(fake_child_window),
+        ..ThreadPlatform::OS
+    };
+    assert_eq!(
+        run_detached(platform, 1 << 20, CHILD_CALLS_A_LEAF),
+        run_detached(ThreadPlatform::OS, 1 << 20, CHILD_CALLS_A_LEAF),
+        "the oracle's 7 + 35"
+    );
+    let calls = CHILD_CALLS.lock().unwrap().clone();
+    let [(module, func, Some(id))] = calls[..] else {
+        panic!("one call ran emitted, over a memory of the platform's: {calls:?}");
+    };
+    assert_eq!(
+        (module, func),
+        (1, 2),
+        "the child's root task tiered up its call to f2, in the child's program; its thread's \
+         call interpreted"
+    );
+    assert_eq!(
+        (fake_word(id, 16384 + 8 * 7), fake_word(id, 16384 + 8 * 35)),
+        (7, 35),
+        "both calls stored into the child's memory"
+    );
 }
