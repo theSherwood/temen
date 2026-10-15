@@ -641,6 +641,11 @@ held past it (#2332). A root's processes pay from the run's own node.
 > naming any other export fails the spawn closed. Demand paging runs on the tree-walker only: the
 > native tiers refuse a pager record and fold a module that could build one to the oracle (native
 > paging is #2164).
+>
+> **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
+> a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
+> pages only: a durable window's control words and declared shadow arena are the runtime's, and stay
+> mapped.
 
 Two different things surface as "SIGSEGV" and the design splits them:
 
