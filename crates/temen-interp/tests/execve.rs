@@ -391,3 +391,76 @@ fn exec_module_starts_the_command_in_a_fresh_window() {
         );
     }
 }
+
+/// A 256 KiB caller whose shadow arena is `[64 KiB, 128 KiB)`: it execs the command with no grants.
+const ARENA_GUEST: &str = r#"
+memory 18 shadow 65536 131072
+func (i32, i64) -> (i64) {
+block 0 (vinst: i32, vcmd: i64) {
+  vz = i32.const 0
+  vgp = i64.const 0
+  vgn = i64.const 0
+  ventry = i64.const 0
+  vsl = i64.const 18
+  vr = call.cap 4294967295 14 (i64, i64, i64, i64, i64) -> (i64) vz (vcmd, vgp, vgn, ventry, vsl)
+  v99 = i64.const 99
+  return v99
+  }
+}
+"#;
+
+/// A 256 KiB command whose own arena is `[192 KiB, 256 KiB)`: it makes a page at 64 KiB, in the
+/// caller's arena, read-write, then one at 192 KiB, in its own, and returns `first * 1000 + second`.
+const ARENA_CMD: &str = r#"
+memory 18 shadow 196608 262144
+func (i64, i64) -> (i64) {
+block 0 (vinst: i64, vas: i64) {
+  vh = i32.wrap_i64 vas
+  vlen = i64.const 4096
+  vrw = i64.const 3
+  vold = i64.const 65536
+  vr1 = call.cap 5 2 (i64, i64, i64) -> (i64) vh (vold, vlen, vrw)
+  vown = i64.const 196608
+  vr2 = call.cap 5 2 (i64, i64, i64) -> (i64) vh (vown, vlen, vrw)
+  vk = i64.const 1000
+  vhi = i64.mul vr1 vk
+  vr = i64.add vhi vr2
+  return vr
+  }
+}
+"#;
+
+/// An exec replaces the layout too: the command's page ops are fenced by the shadow arena it
+/// declares (#2426), not by the one the caller declared. A page in the caller's arena is the
+/// command's to protect (`0`); one in its own arena is refused (`-EINVAL`). A nim program exec'd
+/// through the shell used to inherit the shell's caller's arena and could not grow its heap over it.
+#[test]
+fn an_execd_command_is_fenced_by_its_own_arena() {
+    type Run = fn(&temen_ir::Module, &[Value], &mut u64, &mut Host) -> Vec<Value>;
+    let engines: [(&str, Run); 2] = [
+        ("tree-walker", |m, a, f, h| {
+            run_with_host(m, 0, a, f, h).expect("run")
+        }),
+        ("bytecode", |m, a, f, h| {
+            temen_interp::bytecode::compile_and_run_with_host(m, 0, a, f, h)
+                .expect("the bytecode engine compiles it")
+                .expect("run")
+        }),
+    ];
+    for (engine, run) in engines {
+        let guest = module(ARENA_GUEST);
+        let cmd = module(ARENA_CMD);
+        let mut host = Host::new();
+        host.set_self_module(&guest);
+        let inst = host.grant_instantiator();
+        let cmd_h = host.grant_module(&cmd);
+        let mut fuel = 40_000_000u64;
+        let args = [Value::I32(inst), Value::I64(cmd_h as i64)];
+        assert_eq!(
+            run(&guest, &args, &mut fuel, &mut host),
+            vec![Value::I64(-22)],
+            "{engine}: the caller's arena fences nothing after the exec (0); the command's own does \
+             (-EINVAL)"
+        );
+    }
+}

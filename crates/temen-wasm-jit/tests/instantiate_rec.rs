@@ -4,7 +4,7 @@
 //! present only when the module actually uses op 17 — so every existing nested-mode module
 //! keeps its exact import set and no driver changes until it loads an op-17 module.
 //!
-//! The proof: the emitted parent builds a v1 (detached) record in its window with ordinary stores,
+//! The proof: the emitted parent builds a detached spawn record in its window with ordinary stores,
 //! bounces, and the servicer reads the record back out of linear memory (the full marshalling
 //! round-trip), decodes it with the one shared [`temen_ir::SpawnRec::parse`], runs the child
 //! detached — the interpreter oracle, in a window of its own — and `env.join` returns its result.

@@ -246,7 +246,7 @@ fn emitted_run(src: &str, with_inst: bool) -> (i64, u32, u32) {
                 let st = caller.data_mut();
                 assert!(
                     Some(rec.modh) == st.child,
-                    "a v1 spawn of the child's image: {rec:?}"
+                    "a spawn of the child's image: {rec:?}"
                 );
                 st.inst_bounces += 1;
                 let image = child_image(&st.m);
