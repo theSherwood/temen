@@ -250,25 +250,35 @@ impl GuestWindow {
         }
     }
 
-    /// #2427 — read the host pages at byte offsets `offs` (the pages a window holds past its declared
-    /// size, [`crate::HeldTail`]), each committed read/write first so the read cannot fault outside the
-    /// guarded call: what a durable capture carries past the window's prefix, read apart, never the
-    /// span between them. `None`, nothing read, when the OS refuses a commit (#2286).
+    /// #2427 — read the host pages at byte offsets `offs`, ascending (the pages a window holds past
+    /// its declared size, [`crate::HeldTail`]), each run of consecutive ones committed read/write first
+    /// so the read cannot fault outside the guarded call: what a durable capture carries past the
+    /// window's prefix, read apart, never the span between them. A page whose bytes are all zero is
+    /// left out (its offset says it is held). `None`, nothing read, when the OS refuses a commit
+    /// (#2286).
     pub(crate) fn read_pages(&self, offs: &[u64]) -> Option<Vec<(u64, Vec<u8>)>> {
         let page = pal::page_size();
         let limit = self.total - trailing_guard();
-        offs.iter()
-            .filter(|&&off| off as usize + page <= limit)
-            .map(|&off| {
-                // SAFETY: `[base+off, base+off+page)` lies in the reservation below its guard page
-                // (filtered above); once `commit_rw` makes it committed + RW, the read cannot fault.
-                unsafe {
-                    let at = self.base.add(off as usize);
-                    pal::commit_rw(at, page)
-                        .then(|| (off, std::slice::from_raw_parts(at, page).to_vec()))
-                }
-            })
-            .collect()
+        let offs: Vec<usize> = offs
+            .iter()
+            .map(|&off| off as usize)
+            .filter(|&off| off + page <= limit)
+            .collect();
+        for run in offs.chunk_by(|a, b| b - a == page) {
+            // SAFETY: the run lies in the reservation below its guard page (filtered above).
+            if !unsafe { pal::commit_rw(self.base.add(run[0]), run.len() * page) } {
+                return None;
+            }
+        }
+        let pages = offs.into_iter().filter_map(|off| {
+            // SAFETY: committed read/write above, so the read cannot fault.
+            let bytes = unsafe { std::slice::from_raw_parts(self.base.add(off), page) };
+            bytes
+                .iter()
+                .any(|&b| b != 0)
+                .then(|| (off as u64, bytes.to_vec()))
+        });
+        Some(pages.collect())
     }
 
     /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL

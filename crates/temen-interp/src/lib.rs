@@ -25579,8 +25579,8 @@ impl Host {
     }
 
     /// Capture a **JIT** window for a durable freeze (DURABILITY.md §12.3): `bytes`, its prefix, and
-    /// `tail`, each page past it the window holds ([`Host::cap_held_tail`]), under the page map the
-    /// host rebuilds for it. The JIT keeps protections in the OS page tables, so — unlike the
+    /// `tail`, each page past it the window holds ([`Host::cap_held_tail`]) whose bytes are not all
+    /// zero, under the page map the host rebuilds for it. The JIT keeps protections in the OS page tables, so — unlike the
     /// interpreter, whose `Mem` reads its own map — the map comes from two host-side sources,
     /// mirroring the interpreter's `init_data`/`seed_null_guard`/page ops so the backends agree page
     /// for page:
@@ -25639,10 +25639,7 @@ impl Host {
         }
         MemLayout {
             bytes,
-            tail: tail
-                .into_iter()
-                .filter(|(_, b)| b.iter().any(|&x| x != 0))
-                .collect(),
+            tail: tail.into_iter().collect(),
             map: PageMap { prot, page, mapped },
         }
     }
