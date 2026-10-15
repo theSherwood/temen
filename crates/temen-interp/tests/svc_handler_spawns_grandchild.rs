@@ -252,7 +252,7 @@ fn a_child_cap_call_is_serviced_by_a_handler_that_nests_a_grandchild_spawn() {
         "serve+instantiate folds to the oracle"
     );
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 18);
+    let hi = host.grant_instantiator();
     let hb = host.grant_budget(-1, 4 << 20, -1);
     let [s, c, g] = [1, 2, 4]
         .map(|f| host.grant_module(&temen_ir::child_image_at(&m, f).expect("child image")));
@@ -280,7 +280,7 @@ fn a_serve_handler_services_a_dispatch_by_nesting_a_spawn_and_join() {
 
     let mut host = Host::new();
     host.set_self_module(&servicer);
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hg = host.grant_module(&grandchild);
     let hb = host.grant_budget(-1, 1 << 20, -1);
     // The host enqueues one dispatch to "svc".go (embedder-enqueue path); its result cell is filled

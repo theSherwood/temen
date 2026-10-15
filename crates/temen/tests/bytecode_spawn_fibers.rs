@@ -106,7 +106,7 @@ fn parse(src: &str) -> Module {
 
 fn powerbox(child: &Module) -> (Host, [Value; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << PARENT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget].map(Value::I32))

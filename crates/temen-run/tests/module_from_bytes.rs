@@ -131,7 +131,7 @@ fn run_parent(child_bytes: &[u8]) -> (Vec<Value>, MemFsHandle) {
         })
     };
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);
-    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let inst = host.grant_instantiator();
     let loader = temen_run::grant_module_loader(&mut host);
     let budget = host.grant_budget(-1, 1 << 16, -1);
 

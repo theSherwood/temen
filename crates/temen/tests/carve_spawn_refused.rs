@@ -130,7 +130,7 @@ fn forms() -> Vec<(&'static str, Module)> {
 /// `Budget` a detached child's window spends, with their handles.
 fn powerbox() -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let child = host.grant_module(&module(CHILD));
     let budget = host.grant_budget(-1, 1 << 20, -1);
     (host, [inst, child, budget])

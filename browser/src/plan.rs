@@ -282,7 +282,7 @@ impl Plan {
     pub fn root_args(&self, host: &mut Host, modules: &[&Module], caps: &[i32]) -> Vec<Value> {
         debug_assert_eq!(modules.len(), self.nodes.len());
         debug_assert_eq!(caps.len(), self.caps.len());
-        let inst = host.grant_instantiator(0, 1u64 << ROOT_WINDOW_LOG2);
+        let inst = host.grant_instantiator();
         let mods: Vec<i32> = modules.iter().map(|m| host.grant_module(m)).collect();
         let budget = host.grant_budget(-1, -1, -1);
         std::iter::once(inst)

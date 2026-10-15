@@ -135,7 +135,7 @@ fn table_log2(mode: u32) -> u8 {
 /// probe) with a `units` compile quota, a `Budget` that pays for the child, and the child.
 fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, [i32; 4]) {
     let mut host = Host::new();
-    let ih = host.grant_instantiator(0, 128 << 10);
+    let ih = host.grant_instantiator();
     let jh = grant_jit(&mut host, m, table_log2(mode));
     host.set_jit_quota(units, 1 << 20);
     let bh = host.grant_budget(-1, 1 << 20, -1);

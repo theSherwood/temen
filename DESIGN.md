@@ -128,9 +128,8 @@ wasm?" answer lives in one place:
   page supply, and lending sub-ranges out. Large or sparse programs that fight
   wasm's flat linear memory are the target.
 - **Nested sandboxes (VM-in-VM) + composition (VM-beside-VM)** — a guest can use an
-  `Instantiator` capability to spawn a child domain in its own window (the power-of-two
-  **sub-window** placement is retiring, 2026-09-29) with an **attenuated** subset of its own
-  capabilities (§13/§14); confinement
+  `Instantiator` capability to spawn a child domain in a window of its own with an
+  **attenuated** subset of its own capabilities (§13/§14); confinement
   composes to any depth at depth-independent per-access cost. wasm has no native
   *runtime* nesting (only interpreter-in-wasm or link-time component composition),
   so multi-tenant hosts and plugin-in-plugin fall out for free.
@@ -1055,7 +1054,7 @@ every tier reserves `[0, POWERBOX_NULL_GUARD)`: the interpreter seeds those
 pages `Unmapped` (a guard fault is fatal, never the §14 recoverable kind), the
 native JIT `mprotect`s them inaccessible, and the wasm tier emits a one-compare
 first-byte guard (measured free). The reservation is **permanent** — page ops
-and `instantiate` carves below the guard are refused (the `mmap_min_addr`
+below the guard are refused (the `mmap_min_addr`
 analogue), which is what keeps the baked per-tier guard constants sound. The
 guard is **unconditional** (#1094 — the one canonical layout): every producer
 (temen-llvm, temen-leng, chibicc) shifts its scratch up, and the host seeds
@@ -1462,7 +1461,7 @@ something new is a capability**:
   could already invoke every one of those handles), adds no edge to the grant graph, and
   reveals exactly the leaves of the egress closure — never anything the host did not grant.
   It reads **live generation state** (revoked handles drop out) and is a per-domain view, so
-  a nested child (§14) reflects only its *attenuated* carve — discovery attenuates for free,
+  a §14 child reflects only its *attenuated* grants — discovery attenuates for free,
   like `AddressSpace.sub`. It earns its keep precisely under **late binding**, where the
   guest may no longer statically know its full set. *Consequence (accepted):* there are **no
   deniable grants** — a guest can always audit its exact authority. We treat that as a
@@ -1920,8 +1919,19 @@ the pool's answer only once nothing else can run, so its schedule stays determin
 vCPU, under either thunk, waits outside the run with its D66 lane given back and the §5 kill
 re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
 context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
-on an outstanding call, so a call waiting on the world never holds back a timed waiter (the clock
-stays logical, #1979). Pinned on every engine in `temen-run/tests/root_cap_park.rs`.
+on an outstanding call, so a call waiting on the world never holds back a timed waiter. Pinned on
+every engine in `temen-run/tests/root_cap_park.rs`.
+
+**An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
+logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
+run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call ends the
+wait early, or with none outstanding a ring of the embedder's bell, and the clock moves by the time
+that passed, so the schedule is the clock's as before. A run with no outside input keeps its
+schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
+after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
+debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
+too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -2266,47 +2276,39 @@ default above still stands for every handle-gated capability.
 
 ### VM-in-VM (nesting), transparent & zero-overhead
 
-> **Retiring (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289):** the sub-window placement
-> described here is being deleted. Every child gets a **detached** window (its own reservation, op 17;
-> PROCESS.md §5): the child still sees a zero-based `[0, size)` and cannot learn it is nested, but the
-> parent no longer sees child memory as a superset. Lending memory is a pre-mapped `SharedRegion` (§13);
-> lazy page supply becomes a pager that *supplies* bytes rather than writing through the parent's
-> window. The two placements had diverged into two mechanisms (a live alias on the interpreters and the
-> wasm-JIT, a private copy on the Cranelift JIT — #1814); R3's escape hatch deletes one.
-- A child's **window is a power-of-two sub-region of the parent's window** (§4).
-  Confinement `child_base + (offset & (size−1))` is one AND + ADD with constant
-  base/size, so the child sees a zero-based space `[0, size)` and **cannot learn
-  it is nested**. Composes to any depth — a grandchild's base is still a single
-  resolved constant — so **per-access cost is depth-independent**.
-- The parent intrinsically sees all child memory (superset); the child sees only
-  its slice (masking). One-way transparency in the correct privilege direction.
-- **Lending memory to inner VMs** (the explicit ask): carve a sub-window, or
-  share a region into it (§13). For *lazy* page supply, the parent registers as
-  the **fault handler** for the child's sub-window (userfaultfd-style): mapped
-  access stays zero-overhead; the parent is trapped only on faults it chose to
-  virtualize.
-- **Instantiation primitive:** an **`Instantiator`** capability lets a holder
-  spawn a child domain with (a) a sub-window, (b) an attenuated subset of its own
-  capabilities, and (c) a resource/core quota. A parent can only sub-allocate
-  what it holds (attenuation), so **a child's isolation tier can never exceed the
-  parent's** — a tier-3 child requires the *host* to grant a real process; a
-  guest cannot manufacture isolation it lacks.
+- A child's **window is its own**: a fresh, zero-based reservation of its module's declared size
+  that a `Budget` pays for (op 17; PROCESS.md §5). The child sees `[0, size)` and **cannot learn
+  it is nested**: it is confined as a root is, at depth-independent per-access cost.
+- The parent sees none of the child's memory. Data flows through the module's own segments, the
+  spawn's named grants and args payload, a pre-mapped `SharedRegion` (§13) and the join. (Until
+  #1867 a child could instead sit in a power-of-two sub-window of its parent's window, which the
+  parent saw as a superset. The two placements had diverged into two mechanisms — a live alias on
+  the interpreters and the wasm-JIT, a private copy on the Cranelift JIT, #1814 — so the sub-window
+  was deleted: INVARIANTS.md #13's 2026-09-29 ruling.)
+- **Lending memory to inner VMs** (the explicit ask): share a region into the child (§13). For
+  *lazy* page supply the parent registers as the child's **pager** (userfaultfd-style): it supplies
+  each page's bytes at first touch, mapped access stays zero-overhead, and the parent is trapped
+  only on faults it chose to virtualize.
+- **Instantiation primitive:** an **`Instantiator`** capability lets a holder spawn a child domain
+  with (a) a window paid from a `Budget` it holds, (b) an attenuated subset of its own
+  capabilities, and (c) a resource/core quota from that budget. A parent can only sub-allocate
+  what it holds (attenuation), so **a child's isolation tier can never exceed the parent's** — a
+  tier-3 child requires the *host* to grant a real process; a guest cannot manufacture isolation it
+  lacks.
 
 ### New primitives introduced here
 - **`SharedRegion`** (§13): create / map / unmap / grant.
 - **`AddressSpace`** (memory-management) capability, attenuable to a window
   sub-range: `map` / `unmap` / `protect` within scope; can mint a sub-range
-  capability for a child.
-- **`Instantiator`**: spawn child domain (sub-window + attenuated caps + quota) — its own detached
-  window once the carve placement is retired (2026-09-29). `join` answers how the child ended —
-  `(0, value)` if it returned, else `(trap code, 0)` — and never traps the parent (#2066): a child's
-  trap ends its own domain only.
+  capability.
+- **`Instantiator`**: spawn a child domain in a window of its own (attenuated caps, a budget's
+  quota). `join` answers how the child ended — `(0, value)` if it returned, else `(trap code, 0)` —
+  and never traps the parent (#2066): a child's trap ends its own domain only.
 
 ### Honest bounds on "zero overhead"
-- Power-of-two, aligned sub-windows → a buddy-style carve of the parent window. *(The carve and the
-  VA-subdivision tradeoff below go with the sub-window placement — retiring, 2026-09-29.)*
-- Deep nesting subdivides VA: a real **window-size vs. nesting-depth** tradeoff
-  (a 2^37 window nests many levels, but it is finite).
+- Each child's window is its own reservation, so nesting depth costs address space per child
+  rather than subdividing one window (the sub-window placement's window-size vs. nesting-depth
+  tradeoff went with it, #1867).
 - "Zero slowdown" = zero *marginal, steady-state* cost for pass-through caps and
   already-mapped memory at any depth. You pay one crossing per *interposed*
   capability op and per *virtualized* fault — the best achievable, and the same
@@ -3030,7 +3032,7 @@ host/guest (and guest/guest-as-host) boundary is.**
 is real or parent-emulated" (§14). Only the *realized cost* differs, gated by **isolation
 tier**, not by the interface:
 
-- **Same process (tiers 0/1 — cooperating / nested sub-window):** trampoline + table lookup,
+- **Same process (tiers 0/1 — cooperating / nested child):** trampoline + table lookup,
   **inline-able to ~free, no flush** (§9 path 1). Virtualized hops add one trampoline each;
   pass-through hops add nothing → the zero-overhead-nesting steady state.
 - **Across distrust (tier 3 — separate process):** the interface stays synchronous in
@@ -3713,9 +3715,8 @@ until their children become scheduler tasks (slices 2–3), which is when their 
 as a value with the budget un-spent (#1587).
 
 *The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
-non-durable §14 child — the **carve** children of ops 0/5/8/11/13 (retiring with the carve
-placement, 2026-09-29; the copy-in/`copy_back` below goes with them) and the **detached** children of
-op 17 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+non-durable §14 child — the **detached** children of op 17 (and, until #1867, the **carve** children
+of ops 0/5/8/11/13, with the copy-in/`copy_back` below) — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
@@ -3762,8 +3763,8 @@ differed: how the window is seeded, whether a `copy_back` wrote it back at finis
 gone with #1867), and the lane chain.
 `run_child_code`, `run_child_code_then` and `run_detached_child_then` are gone with the OS threads
 they drove, and so is `Nursery::child_threads` — run teardown is the executor's quiescence alone.
-A carve child has no lane of its own to be granted, so it runs in its parent's: the hook family
-carries the parent's `(domain, lane cap)`, read once when the family is built. What was three
+The hook family carries the parent's `(domain, lane cap)`, read once when the family is built, which
+a child's lane chain starts from. What was three
 propagation sites for every future scheduling change (invariant 14's burden) is one.
 
 *A child task's own fibers and threads* (#1469): a task carries a fiber runtime of its own — its own
@@ -3928,7 +3929,7 @@ team has **no expert safety net**.
   `wait`/`notify` futex + C11 atomics, in IR/interp/JIT across the parity matrix
   (interp everywhere; JIT on x86-64 unix, aarch64 unix, x86-64 Windows) — **no VM
   scheduler**, M:N is guest-built (D56/§12). **§14 nesting** has also landed on both
-  backends (sub-windows, the attenuable `AddressSpace`, the `Instantiator` incl.
+  backends (detached windows, the attenuable `AddressSpace`, the `Instantiator` incl.
   recursion + co-fibers + fault-driven yield, separate-module "plugin" children, and
   cross-domain `SharedRegion` `create`/`grant`), as has the **§5 fuel/epoch kill-path**
   (the lowering polls a host-owned interrupt cell, so a watchdog stops a runaway guest
@@ -4008,7 +4009,7 @@ as open-ended, not a byproduct of the build.
 | D16 | Module ⊥ domain ⊥ thread; mapping to OS process/thread is invisible host policy | Settled | Enables transparent, zero-overhead nesting; domain↔one process |
 | D17 | Shared memory = `SharedRegion` mapped into multiple windows; region-relative offsets | Settled | One mechanism for all sharing; zero-overhead masked access; data plane for composition |
 | D18 | Nesting cost paid at setup not runtime; pass-through caps + child-window memory are depth-independent | Settled | Transparent + zero steady-state overhead; cost only where parent interposes |
-| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | **Amended 2026-09-29 — retiring** (INVARIANTS #13 ruling; #1289): every child gets a detached window of its own; the sub-region placement is deleted. Attenuation (caps, quota, tier ≤ parent's) is unchanged | Child can't tell it's nested; tier can't exceed parent's |
+| D19 | Child window = power-of-two sub-region of parent; `Instantiator` grants sub-window + attenuated caps + quota | **Superseded** (INVARIANTS #13 ruling 2026-09-29; deleted in #1867): every child gets a detached window of its own, and the `Instantiator` names no range (#2433). Attenuation (caps, quota, tier ≤ parent's) is unchanged | Child can't tell it's nested; tier can't exceed parent's |
 | D20 | Split host: secret-less in-process fast runtime + out-of-process privileged supervisor | Settled | Fast where it's safe to be fast; flush tax only at distrust boundaries, amortized per quantum |
 | D21 | Direct confined syscalls by default; broker (gVisor-style) only when distrusting the kernel | Settled | Native syscall speed for granted resources; surface-reduction is an opt-in dial |
 | D22 | Mechanism-only concurrency: free uncapped fibers + capped vCPU capabilities; runtime builds the model | Settled | Sane target for every threading model; no built-in scheduler / no double-scheduling |

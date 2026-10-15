@@ -563,7 +563,7 @@ fn confined(src: &str) -> Module {
 fn sharing_host(child: &Module, backing: Arc<dyn SharedBacking>) -> (Host, [Value; 4]) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, WINDOW as u64);
+    let inst = host.grant_instantiator();
     let modh = host.grant_durable_module(child);
     let budget = host.grant_budget(-1, 1 << 20, 4);
     for (o, b) in 1111i64.to_le_bytes().into_iter().enumerate() {

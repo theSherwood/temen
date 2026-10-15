@@ -21,7 +21,7 @@ fn host(m: &Module) -> (Host, i32) {
     let mut h = Host::new();
     let budget = h.grant_budget(-1, 1 << 20, -1);
     h.register_cap_name("budget", budget);
-    let inst = h.grant_instantiator(0, 128 << 10);
+    let inst = h.grant_instantiator();
     let child = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
     h.register_cap_name("child", child);
     (h, inst)

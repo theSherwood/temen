@@ -22,9 +22,9 @@ fn both(src: &str, win_log2: u8) -> Both {
         .collect();
 
     let mut hi = Host::new();
-    let ih = hi.grant_instantiator(0, win);
+    let ih = hi.grant_instantiator();
     let mut hj = Host::new();
-    let jh = hj.grant_instantiator(0, win);
+    let jh = hj.grant_instantiator();
     assert_eq!(ih, jh, "the Instantiator grant must encode identically");
 
     let mut fuel = 5_000_000u64;

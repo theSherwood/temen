@@ -153,7 +153,7 @@ export function makeRunner({ module, memory, ex }) {
         u8().set(unit, uptr);
         ulen = unit.length;
       }
-      if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen, BigInt(minter)) !== 1) {
+      if (ex.temen_par_powerbox_inst(uptr, ulen, BigInt(minter)) !== 1) {
         throw new Error('temen_par_powerbox_inst failed');
       }
     }

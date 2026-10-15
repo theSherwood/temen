@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use temen_ir::{Func, SpawnRec};
 
-/// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
+/// Negative-errno a refused spawn returns (§3e D42) — the one shared table.
 use temen_ir::errno::EINVAL;
 
 /// One spawned child's **completion cell** (S1c): `(result, trap)` once the child has finished (`trap`
@@ -321,10 +321,9 @@ unsafe fn file_task(
 }
 
 /// A raw pointer a task's closures carry to a worker. SAFETY (for every use in this file): the
-/// parent window outlives every task (`join_children` runs before it frees) and a carve child
-/// touches only its own carve for copy-in / copy-back — disjoint from siblings and the parent's
-/// live data, the §14 disjointness the guest owns; a child powerbox is handed over wholesale to
-/// its task (`Host: Send`) and never touched by the parent after the spawn.
+/// parent window outlives every task (`join_children` runs before it frees) and a child touches
+/// only a window of its own; a child powerbox is handed over wholesale to its task (`Host: Send`)
+/// and never touched by the parent after the spawn.
 struct SendRaw<T>(T);
 unsafe impl<T> Send for SendRaw<T> {}
 
@@ -344,11 +343,11 @@ unsafe fn release_seed(release: crate::GrantChildReleaser, seed: crate::Detached
     }
 }
 
-/// D66 — a granted child's teardown: release its powerbox and, for a detached child, return its
-/// lane to the parent through the `lane_give` hook (`-1` for a carve child: a no-op, it holds none).
-/// `window` is the `(budget, bytes, runs)` lease a detached spawn's admission charged for the child's
-/// window: it goes back to that budget here, when the window goes (owner, 2026-09-29 — `Budget`
-/// accounts live windows). `None` for a carve child.
+/// D66 — a granted child's teardown: release its powerbox and return its lane to the parent through
+/// the `lane_give` hook (`-1`: a no-op, it holds none). `window` is the `(budget, bytes, runs)` lease
+/// a detached spawn's admission charged for the child's window: it goes back to that budget here,
+/// when the window goes (owner, 2026-09-29 — `Budget` accounts live windows). `None` for a thawed
+/// child whose parent holds no handle on the budget that paid ([`crate::CapturedSeed::window`]).
 unsafe fn granted_teardown(
     rt: &Nursery,
     release: crate::GrantChildReleaser,
@@ -1196,12 +1195,11 @@ impl Nursery {
         resolver(self.cap_ctx, module as i32, &mut rm) != 0 && rm.durable
     }
 
-    /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
-    /// carve range `[base, base+size)`. `None` (and `*trap_out` set) for a forged/closed/wrong handle.
-    unsafe fn resolve(&self, mem_base: u64, handle: i32, trap_out: *mut i64) -> Option<(u64, u64)> {
-        let mut out = [0i64; 2];
-        // op 0 on an `Instantiator` binding returns `[base, size]` (see `cap_dispatch_slots`); a bad
-        // handle sets `*trap_out` to a `CapFault` and we propagate by returning `None`.
+    /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk: `false` (and
+    /// `*trap_out` set) for a forged/closed/wrong handle.
+    unsafe fn resolve(&self, mem_base: u64, handle: i32, trap_out: *mut i64) -> bool {
+        // op 0 on an `Instantiator` binding is the host's authority probe, answering nothing for a
+        // live handle (see `cap_dispatch_slots`); a bad handle sets `*trap_out` to a `CapFault`.
         (self.cap_thunk)(
             self.cap_ctx,
             mem_base as *mut u8,
@@ -1212,14 +1210,11 @@ impl Nursery {
             handle,
             core::ptr::null(),
             0,
-            out.as_mut_ptr(),
-            out.len() as u64,
+            core::ptr::null_mut(),
+            0,
             trap_out,
         );
-        if unsafe { *trap_out } != 0 {
-            return None;
-        }
-        Some((out[0] as u64, out[1] as u64))
+        unsafe { *trap_out == 0 }
     }
 }
 
@@ -1504,9 +1499,8 @@ unsafe fn spawn_detached(
     } else {
         rt.cap_thunk
     };
-    // The Instantiator is the authority (a forged handle is a CapFault); its carve range is unused —
-    // a detached child lives in no carve.
-    if rt.resolve(mem_base, handle, trap_out).is_none() {
+    // The Instantiator is the authority (a forged handle is a CapFault).
+    if !rt.resolve(mem_base, handle, trap_out) {
         return 0;
     }
     let Some((child, mod_mem, child_shadow, digest)) = rt.resolve_granted(module, trap_out) else {
@@ -1750,7 +1744,7 @@ pub(crate) unsafe extern "C" fn child_offer(
 ) -> i32 {
     const EINVAL: i32 = -22;
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mint_addr = rt.grant_mint.load(Ordering::Acquire);
@@ -1787,7 +1781,7 @@ pub(crate) unsafe extern "C" fn child_grant(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let grant_addr = rt.grant_into.load(Ordering::Acquire);
@@ -1828,7 +1822,7 @@ pub(crate) unsafe extern "C" fn join(
 ) -> i64 {
     *status_out = 0;
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
@@ -2011,7 +2005,7 @@ pub(crate) unsafe extern "C" fn poll(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
@@ -2047,7 +2041,7 @@ pub(crate) unsafe extern "C" fn detach(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
@@ -2076,7 +2070,7 @@ pub(crate) unsafe extern "C" fn kill(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    if rt.resolve(mem_base, inst, trap_out).is_none() {
+    if !rt.resolve(mem_base, inst, trap_out) {
         return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
     }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());

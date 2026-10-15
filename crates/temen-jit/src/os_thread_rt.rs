@@ -34,7 +34,7 @@
 //! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
 //! *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the same cell at
 //! every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
-//! unwinds from there. A §14 carve child has a cell of its own, which the parent's teardown sets
+//! unwinds from there. A §14 child has a cell of its own, which the parent's teardown sets
 //! (`ChildExec::shutdown_and_join`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
@@ -487,8 +487,8 @@ pub(crate) struct Domain {
     /// the run under one scheduler: one live cap, one futex, one deadlock count.
     hub: usize,
     /// #2001 — the budget node this domain's spawned vCPUs are charged to, one `spawn` each while
-    /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for a carve
-    /// child's (#1867) and for shared code's ([`Self::fresh`]), which spawns nothing.
+    /// it lives: a run's own (the embedder's grant, #2113) or a detached child's. `None` for shared
+    /// code's ([`Self::fresh`]), which spawns nothing.
     node: Option<std::sync::Arc<dyn crate::BudgetNode>>,
 }
 

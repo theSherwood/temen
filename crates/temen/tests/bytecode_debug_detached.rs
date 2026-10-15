@@ -145,7 +145,7 @@ fn session(root: &str, child: &str, journal: bool) -> ScheduledDebugRun {
     let root = parse_module(&root).expect("parse the root");
     let child = parse_module(child).expect("parse the child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let modh = host.grant_module(&child);
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let out = host.grant_stream(StreamRole::Out);
@@ -472,7 +472,7 @@ fn self_session(journal: bool) -> ScheduledDebugRun {
     let m = parse_module(SELF_ROOT).expect("parse the root");
     let image = temen_ir::child_image_at(&m, 1).expect("func 1 starts a child");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let modh = host.grant_module(&image);
     let args = [inst, budget, modh].map(Value::I32);
@@ -788,7 +788,7 @@ fn nested_session() -> ScheduledDebugRun {
     let m = parse_module(&src).expect("parse the root");
     let image = |f| temen_ir::child_image_at(&m, f).expect("a child entry");
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     let budget = host.grant_budget(-1, 1 << 20, -1);
     let child = host.grant_module(&image(1));
     let grand = host.grant_module(&image(2));

@@ -92,7 +92,7 @@ fn powerbox(m: &temen_ir::Module) -> Host {
     h.set_self_module(&Arc::new(m.clone()));
     h.set_region_factory(temen_run::new_shared_region);
     h.grant_powerbox_prefix(win);
-    let inst = h.grant_instantiator(0, win);
+    let inst = h.grant_instantiator();
     h.register_cap_name("instantiator", inst);
     h.grant_detached_spawn_caps(win);
     h

@@ -991,8 +991,8 @@ vCPU on one thread, and the page's core count under the browser's parallel drive
 
 **Sleeping.** `nanosleep` is a timed wait (the shim's row 47), so an idle pool worker naps between
 polls rather than spins. The threaded engines sleep in real time. The bytecode engine's cooperative
-scheduler sleeps on its logical clock, which moves with the other threads' work, one ns per op, and
-jumps ahead when none can run (#2224).
+scheduler sleeps on its logical clock, which moves with the other threads' work, one ns per op
+(#2224), and in real time when none can run (#1979).
 
 **What is not served.**
 - CPU affinity is a no-op.

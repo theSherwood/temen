@@ -111,7 +111,7 @@ fn module(src: &str) -> Module {
 fn setup(m: &Module) -> impl Fn() -> (Host, Vec<Value>) + '_ {
     move || {
         let mut h = Host::new();
-        let i = h.grant_instantiator(0, 1 << 16);
+        let i = h.grant_instantiator();
         let b = h.grant_budget(-1, -1, -1);
         let c = h.grant_module(&temen_ir::child_image_at(m, 1).expect("child image"));
         (h, [i, b, c].map(Value::I32).to_vec())

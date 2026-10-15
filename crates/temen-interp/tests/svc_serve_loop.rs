@@ -295,7 +295,7 @@ fn a_slot_attached_live_call_parks_and_wakes_like_the_direct_form() {
         bound: false,
         rebindable: true,
     }]);
-    let h = host.grant_instantiator(0, 1u64 << 17);
+    let h = host.grant_instantiator();
     let b = host.grant_budget(-1, 1 << 20, -1);
     let c = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     let mut fuel = 5_000_000u64;
@@ -392,7 +392,7 @@ fn a_bad_export_on_a_separate_module_child_refuses_probeably() {
     let b = temen_text::parse_module(SEPARATE_MODULE_POLL_SERVER).expect("parse server");
     temen_verify::verify_module(&b).expect("verify server");
     let mut host = Host::new();
-    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hi = host.grant_instantiator();
     let hm = host.grant_module(&b);
     let hb = host.grant_budget(-1, 1 << 20, -1);
     let mut fuel = 5_000_000u64;
@@ -511,7 +511,7 @@ fn a_sibling_calls_a_sibling_through_a_regranted_live_offer() {
         m
     });
     let mut host = Host::new();
-    let h = host.grant_instantiator(0, 1u64 << 17);
+    let h = host.grant_instantiator();
     let b = host.grant_budget(-1, 1 << 20, -1);
     let ca = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("A's image"));
     let cb = host.grant_module(&temen_ir::child_image_at(&m, 2).expect("B's image"));
@@ -530,7 +530,7 @@ fn a_caller_parks_on_a_live_child_and_wakes_with_the_reply() {
     let m = temen_text::parse_module(&caller_parking()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let mut host = Host::new();
-    let h = host.grant_instantiator(0, 1u64 << 17);
+    let h = host.grant_instantiator();
     let b = host.grant_budget(-1, 1 << 20, -1);
     let c = host.grant_module(&temen_ir::child_image_at(&m, 1).expect("child image"));
     let mut fuel = 5_000_000u64;

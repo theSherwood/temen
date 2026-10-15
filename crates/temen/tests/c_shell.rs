@@ -209,7 +209,7 @@ fn run_shell_ex(
         let sink = host.shared_stdout();
         let out_h = host.grant_stream(StreamRole::Out);
         let (in_h, in_fifo) = host.grant_input_pipe();
-        let inst_h = host.grant_instantiator(0, win as u64);
+        let inst_h = host.grant_instantiator();
         let _as_h = host.grant_address_space(0, win as u64);
         // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
         // returned when the child ends: room for the widest pipeline's three concurrent stages.
@@ -339,7 +339,7 @@ fn shell_bytecode_stdout(
     let sink = host.shared_stdout();
     let out_h = host.grant_stream(StreamRole::Out);
     let (in_h, in_fifo) = host.grant_input_pipe();
-    let _inst_h = host.grant_instantiator(0, win as u64);
+    let _inst_h = host.grant_instantiator();
     let _as_h = host.grant_address_space(0, win as u64);
     // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.

@@ -82,7 +82,7 @@ block 3 (v12: i64) {
 fn frozen_root(m: &Module) -> (MemLayout, Host) {
     let mut host = Host::new();
     host.set_durable(true);
-    let inst = host.grant_instantiator(0, 1 << 17);
+    let inst = host.grant_instantiator();
     host.grant_address_space(0, 1 << 17);
     let mut win = init_durable_window(1 << 17, ARENA);
     write_state(&mut win, STATE_UNWINDING);

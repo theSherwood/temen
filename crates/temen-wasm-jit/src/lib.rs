@@ -2018,12 +2018,12 @@ fn compile_module_nested_inner(
         ));
     }
     // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
-    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers, an
-    // op-13 grant-seeding `call.cap` helper) reached via `env.call_interp` — whose host callback must
+    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers, a
+    // spawn-record-seeding `call.cap` helper) reached via `env.call_interp` — whose host callback must
     // therefore carry the run's powerbox over the **live window** (the reactor-path contract, not the
     // throwaway-window one). A leaf may touch memory and caps under that contract — so a host must
     // never service these leaves on a throwaway window; the browser's §14 codegen path services them
-    // on the child's own vCPU over its carve (`bounce_call`, #1151 Slice 2c). Anything else fails closed.
+    // on the child's own vCPU over its window (`bounce_call`, #1151 Slice 2c). Anything else fails closed.
     let nested_ok = |f: &Func| {
         f.blocks.iter().all(|b| {
             block_value_types(m, b, true)
@@ -2157,7 +2157,7 @@ pub fn compile_module_nested_paged(
 /// interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
 /// [`module_uses_page_ops`]); [`compile_nested_paged`] is the entry that carries those.
 /// `page_size`/`sub` (queries/attenuation) are unaffected. A `WasmDriven` artifact's `env.call_interp`
-/// leaves may touch memory and caps (a `map`-calling allocator helper, an op-13 grant seeder) — the
+/// leaves may touch memory and caps (a `map`-calling allocator helper, a spawn-record seeder) — the
 /// servicer contract is the powerbox over the live window, never a throwaway one (#1151).
 pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
     if module_uses_page_ops(m) || module_uses_gc_roots(m) {
@@ -6145,7 +6145,7 @@ fn emit_align_trap(cx: &mut FnCtx, code: &mut Vec<u8>, width: u64) {
 
 /// The NULL-guard extent to **emit** for `m`: [`temen_ir::module_null_guard`] (unconditional, #1094),
 /// but no-op'd (→ `None`) for a window smaller than the guard — mirroring `Mem::seed_null_guard`, which
-/// skips the seed there. Without this a sub-guard confined child (e.g. a 1 KiB carve declared
+/// skips the seed there. Without this a sub-guard confined child (e.g. a 1 KiB window declared
 /// `memory 10`) would get a guard check covering its whole window and trap every access, diverging from
 /// the interpreter oracle (which seeds no guard for that window).
 fn emit_null_guard_extent(m: &temen_ir::Module) -> Option<u64> {

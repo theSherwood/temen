@@ -62,8 +62,8 @@ The Instantiator's spawn (the op-17 record; the carve spawns 0 `instantiate` and
 `instantiate_module` this section was written against are retired, #1867) return an `i32`
 **`child_handle`**, non-blocking. That handle is a **capability** — "holding the handle is the authority
 to nest (D19)". It resolves (in the *parent's* runtime) to a scheduler `TaskId` → the child's `VCpu`
-(its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is being retired,
-INVARIANTS #13 2026-09-29; a detached child's handle names its own window). Sibling ops
+(its own `vcpu_ctx`, shadow region, and window carve via `nested_view` — the carve is retired,
+INVARIANTS #13 2026-09-29, deleted in #1867; a detached child's handle names its own window). Sibling ops
 already take it: `join` (1), `poll` (9), `kill` (12), `child_offer` (14). It is **capability-scoped,
 not a global PID table**: a parent only holds handles to children it spawned.
 
@@ -114,8 +114,8 @@ it `clone_caller() -> twin_child_handle` (self-namespace, servicer-side) or `clo
    **reply slot** — the reply-injection capture, not a placeholder and not a re-issue arm.
 2. **Twin it.** Copy the caller's carve (window slice) into a fresh child domain (via the
    `spawn_named_child` path), re-grant its pass-through handles, and re-seed a `CapReply` park for the
-   twin with a second `(callee, ticket')` in `ticket_waiters`. (The carve is being retired —
-   INVARIANTS #13, 2026-09-29; #1289. A detached caller's window is its own, and `Mem::fork_private`
+   twin with a second `(callee, ticket')` in `ticket_waiters`. (The carve is retired —
+   INVARIANTS #13, 2026-09-29; #1289; deleted with `spawn_named_child` in #1867. A detached caller's window is its own, and `Mem::fork_private`
    already copies into a fresh private window.)
 3. **Reply to each.** The servicer delivers `A` to the caller's ticket and `B` to the twin's — each
    fiber reloads its injected reply and resumes **past** the call.

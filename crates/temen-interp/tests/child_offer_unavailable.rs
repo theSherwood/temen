@@ -35,7 +35,7 @@ fn guest() -> temen_ir::Module {
 
 fn oracle() -> Result<Vec<Value>, Trap> {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let mut fuel = 1_000_000u64;
     temen_interp::run_with_host(&guest(), 0, &[Value::I32(inst)], &mut fuel, &mut host)
 }
@@ -52,7 +52,7 @@ fn single_vcpu() -> Result<Vec<Value>, Trap> {
     // SAFETY: `size` valid 8-aligned bytes, owned here and never freed.
     let back = Arc::new(unsafe { Region::shared(base, size as u64) });
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << 16);
+    let inst = host.grant_instantiator();
     let mut vcpu =
         bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[Value::I32(inst)], back, &[], host)
             .expect("root");

@@ -162,7 +162,7 @@ fn a_childs_named_fork_import_binds_to_the_live_fork_offer_and_forks_twice() {
     let mut host = Host::new();
     let win = 1u64 << 19;
     let (libc, posix) = temen_posix::grant(&mut host, win / 2, win, Vec::new());
-    let inst = host.grant_instantiator(0, win);
+    let inst = host.grant_instantiator();
     let gmod = host.grant_module(&guest);
     let budget = host.grant_budget(-1, 64 << 20, -1);
     let server = host.grant_module(&temen_ir::child_image_at(&manager, 1).expect("server image"));

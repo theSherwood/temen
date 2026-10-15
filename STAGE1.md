@@ -13,7 +13,7 @@ no fork-returns-twice yet.
 
 ## The substrate already exists
 
-> **Retiring:** this section describes the carve path, which is being deleted (INVARIANTS #13,
+> **Retired (#1867):** this section describes the carve path, deleted in #1867 (INVARIANTS #13,
 > 2026-09-29; #1289). The detached equivalent is the op-17 spawn record (its own window,
 > by-name grants), with argv in its spawn-time args payload and the status through `join`
 > (DETACHED_JIT.md §1).
@@ -54,9 +54,9 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 
 ## Slice plan
 
-> **Retiring:** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's carve,
-> parent-as-pager output read back from it), and the carve path is being deleted (INVARIANTS #13,
-> 2026-09-29; #1289). The detached equivalent is the op-17 spawn record: argv in its spawn-time args
+> **Retired (#1867):** slices 1–6 spawn commands into carves (op 5/13, argv seeded into the child's
+> carve, parent-as-pager output read back from it), and the carve path is deleted (INVARIANTS #13,
+> 2026-09-29; #1289; #1867). The detached equivalent is the op-17 spawn record: argv in its spawn-time args
 > payload, output through inherited stdio or a `SharedRegion` pre-mapped by its `region` and
 > `child_off`, status
 > through `join`. Slice 6's ring already runs between detached stages.

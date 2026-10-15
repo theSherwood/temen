@@ -92,7 +92,7 @@ block 0 (vi: i32, vm: i32, vb: i32) {{
 /// `Budget`. Returns the host and the root's arguments.
 pub fn powerbox(child: &Module) -> (Host, [i32; 3]) {
     let mut host = Host::new();
-    let inst = host.grant_instantiator(0, 1 << ROOT_LOG2);
+    let inst = host.grant_instantiator();
     let module = host.grant_module(child);
     let budget = host.grant_budget(-1, -1, -1);
     (host, [inst, module, budget])
