@@ -23088,6 +23088,10 @@ pub struct Host {
     /// #972 — hooks the exec image-replace fires with the pipe-end handle remap (see
     /// [`ForkedProc::exec_remap`]); carried across exec like `exit_hooks` (same process).
     exec_remap_hooks: Vec<ExecRemapHook>,
+    /// #2373 — what the providers registered for this domain as its powerbox was built (a fork
+    /// twin's factories, a spawned child's re-grants, [`ForkedProc::abandon`]): the fork or spawn
+    /// that refuses the domain before it runs undoes them ([`Host::abandon`]).
+    abandon_hooks: Vec<Box<dyn FnOnce() + Send>>,
     /// #798 slice 2 — the domain's **job-control stop depth**: raised (+1) by the personality's stop
     /// closure and lowered (−1) by its continue ([`SignalSource::set_stop`]); every vCPU of the
     /// domain polls it per op (beside `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`]
@@ -23847,6 +23851,7 @@ impl Host {
             sig_source: None,
             exit_hooks: Vec::new(),
             exec_remap_hooks: Vec::new(),
+            abandon_hooks: Vec::new(),
             stop_depth: Arc::new(AtomicI64::new(0)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
@@ -24082,24 +24087,21 @@ impl Host {
         let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
         let mut twin_exec_remap: Vec<ExecRemapHook> = Vec::new();
         twin.host_procs = Vec::with_capacity(self.host_procs.len());
-        // #2373 — what each factory registered for the twin, undone if the fork is refused after it.
-        let mut minted: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        let refuse = |minted: Vec<Box<dyn FnOnce() + Send>>| minted.into_iter().for_each(|a| a());
         for e in self.host_procs.iter() {
             let factory = e.fork.as_ref().unwrap();
             // #2373, #2428 — a provider with no room for the twin's copy of its state refuses it.
             let Some(forked) = factory(twin_pid) else {
-                refuse(minted);
+                twin.abandon();
                 return None;
             };
-            minted.extend(forked.abandon);
+            twin.abandon_hooks.extend(forked.abandon);
             if let Some(door) = forked.signal {
                 if twin_sig.is_some() {
                     // Latch it: this powerbox cannot be forked faithfully, and every later attempt
                     // now refuses before any factory runs (see [`Host::multi_door`]). The caller
                     // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
                     self.multi_door.store(true, Ordering::SeqCst);
-                    refuse(minted);
+                    twin.abandon();
                     return None;
                 }
                 twin_sig = Some(door);
@@ -30244,6 +30246,7 @@ impl Host {
                     // without registering it in its process table (#863 slice 2). A provider with
                     // no room for the child's copy refuses the re-grant (#2373).
                     let forked = factory(0)?;
+                    child.abandon_hooks.extend(forked.abandon);
                     if let Some((source, armed)) = forked.signal {
                         child.set_signal_source(source, armed);
                     }
@@ -30554,9 +30557,16 @@ impl Host {
             self.give_child_budget(lease, &mut ch);
         }
         for (name, handle) in grants {
-            // Pre-checked above, so this cannot fail: each entry is granted into the child under its
-            // name, a live self-serve grant as an offer over this host's own cell.
-            self.grant_entry_into_child(cell, name, *handle, &mut ch)?;
+            // Each entry is granted into the child under its name, a live self-serve grant as an offer
+            // over this host's own cell. Pre-checked above, so only a provider with no room for the
+            // child's copy refuses one (#2373), which refuses the spawn and undoes the grants before it.
+            if self
+                .grant_entry_into_child(cell, name, *handle, &mut ch)
+                .is_none()
+            {
+                ch.abandon();
+                return None;
+            }
         }
         Some((ch, cinst, cas))
     }
@@ -30653,6 +30663,14 @@ impl Host {
             source.spawn_commit(plan);
         }
         Some(twin)
+    }
+
+    /// #2373 — the fork or spawn building this domain refused it before it ran: undo what its
+    /// providers registered for it, so no personality keeps a process that never was.
+    fn abandon(&mut self) {
+        std::mem::take(&mut self.abandon_hooks)
+            .into_iter()
+            .for_each(|undo| undo());
     }
 
     /// A spawned process whose image could not be built in its powerbox (this, from
@@ -31034,6 +31052,7 @@ impl Host {
             &mut starters,
         );
         if carried.is_err() {
+            host.abandon();
             return Err(refused(self));
         }
         // #2106, #2332 — committed: the domain pays for the image's window now, as a root's main vCPU
@@ -39586,6 +39605,47 @@ mod signal_door_claim_tests {
         h.fork_powerbox(8, 1 << 16).expect("room found later forks");
         assert_eq!(abandoned.load(Ordering::SeqCst), 1, "abandoning nothing");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// #2373 — so does a spawn: a provider with no room for the child's copy refuses its re-grant,
+    /// which refuses the spawn, and what the grants before it registered for the child is undone.
+    #[test]
+    fn a_provider_with_no_room_refuses_a_spawn_and_abandons_the_grants_before_it() {
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let mut h = Host::new();
+        let gone = Arc::clone(&abandoned);
+        let first = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                let gone = Arc::clone(&gone);
+                Some(ForkedProc {
+                    abandon: Some(Box::new(move || {
+                        gone.fetch_add(1, Ordering::SeqCst);
+                    })),
+                    ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless)
+                })
+            }),
+            CapState::Stateless,
+        );
+        let full = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(|_pid| None),
+            CapState::Stateless,
+        );
+        let lease = Lease {
+            budget: h.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 16,
+            runs: WINDOW_RUNS,
+        };
+        let grants = [("first".to_string(), first), ("full".to_string(), full)];
+        assert!(h
+            .spawn_detached_child(&grants, 1 << 16, lease, -1)
+            .is_none());
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "the first grant is undone"
+        );
     }
 }
 
