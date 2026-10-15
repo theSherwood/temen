@@ -6788,12 +6788,19 @@ fn build_clif(
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
 
-    // One CLIF block per IR block, with params mirroring the IR block params. A
-    // separate CLIF entry block holds the native params and jumps into IR block 0.
-    let blocks: Vec<_> = f.blocks.iter().map(|_| b.create_block()).collect();
+    // One CLIF block per IR block, with params mirroring the IR block params, but those the
+    // lowering takes as the values they forward (#2448). A separate CLIF entry block holds the
+    // native params and jumps into IR block 0.
+    let mut blocks = Blocks {
+        clif: f.blocks.iter().map(|_| b.create_block()).collect(),
+        fwd: f.forwards(),
+        vals: vec![Vec::new(); f.blocks.len()],
+    };
     for (i, blk) in f.blocks.iter().enumerate() {
-        for p in &blk.params {
-            b.append_block_param(blocks[i], clif_ty(*p));
+        for (j, p) in blk.params.iter().enumerate() {
+            if blocks.taken(i, j).is_none() {
+                b.append_block_param(blocks.clif[i], clif_ty(*p));
+            }
         }
     }
     let sret = uses_sret(&f.results);
@@ -6904,10 +6911,10 @@ fn build_clif(
     emit_signal_check(module, &mut b, &lower); // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
-    b.ins().jump(blocks[0], &entry_args);
+    b.ins().jump(blocks.clif[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, i, &mut blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -7110,13 +7117,21 @@ fn lower_block(
     b: &mut FunctionBuilder,
     blk: &Block,
     block_idx: usize,
-    cb: cranelift_codegen::ir::Block,
-    blocks: &[cranelift_codegen::ir::Block],
+    blocks: &mut Blocks,
     lower: &Lower,
 ) -> Result<(), JitError> {
+    let cb = blocks.clif[block_idx];
     b.switch_to_block(cb);
-    // The CLIF block params are the IR block params; seed the value map with them.
-    let mut vals: Vec<Value> = b.block_params(cb).to_vec();
+    // Seed the value map with the IR block params: each a CLIF block param, or the value a taken
+    // param forwards, which a block lowered before this one holds (#2448).
+    let mut own = b.block_params(cb).to_vec().into_iter();
+    let mut vals: Vec<Value> = Vec::with_capacity(blk.params.len() + blk.insts.len());
+    for i in 0..blk.params.len() {
+        vals.push(match blocks.taken(block_idx, i) {
+            Some((sb, si)) => *blocks.vals[sb].get(si).ok_or(JitError::Malformed)?,
+            None => own.next().ok_or(JitError::Malformed)?,
+        });
+    }
     // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
     // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
     // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
@@ -8578,8 +8593,11 @@ fn lower_block(
 
     match &blk.term {
         Terminator::Br { target, args } => {
-            let ba = map_args(&vals, args)?;
-            let t = *blocks.get(*target as usize).ok_or(JitError::Malformed)?;
+            let ba = map_edge(&vals, blocks, *target, args)?;
+            let t = *blocks
+                .clif
+                .get(*target as usize)
+                .ok_or(JitError::Malformed)?;
             // §5 kill-path: poll the interrupt cell before taking any branch — every loop body ends
             // in one of these terminators, so this bounds a non-terminating intra-function loop.
             emit_epoch_check(b, lower);
@@ -8603,10 +8621,16 @@ fn lower_block(
             else_args,
         } => {
             let c = get(&vals, *cond)?;
-            let ta = map_args(&vals, then_args)?;
-            let ea = map_args(&vals, else_args)?;
-            let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
-            let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
+            let ta = map_edge(&vals, blocks, *then_blk, then_args)?;
+            let ea = map_edge(&vals, blocks, *else_blk, else_args)?;
+            let tb = *blocks
+                .clif
+                .get(*then_blk as usize)
+                .ok_or(JitError::Malformed)?;
+            let eb = *blocks
+                .clif
+                .get(*else_blk as usize)
+                .ok_or(JitError::Malformed)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
             if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
                 emit_domain_poll(b, lower); // (see `Br`)
@@ -8685,8 +8709,8 @@ fn lower_block(
             )> = Vec::new();
             let mut entries = Vec::with_capacity(targets.len());
             for (t, args) in targets {
-                let ba = map_args(&vals, args)?;
-                let blk = *blocks.get(*t as usize).ok_or(JitError::Malformed)?;
+                let ba = map_edge(&vals, blocks, *t, args)?;
+                let blk = *blocks.clif.get(*t as usize).ok_or(JitError::Malformed)?;
                 if mixed && is_be(*t) {
                     let tramp = b.create_block();
                     entries.push(BlockCall::new(
@@ -8704,8 +8728,8 @@ fn lower_block(
                 }
             }
             let (dt, dargs) = default;
-            let dba = map_args(&vals, dargs)?;
-            let dblk = *blocks.get(*dt as usize).ok_or(JitError::Malformed)?;
+            let dba = map_edge(&vals, blocks, *dt, dargs)?;
+            let dblk = *blocks.clif.get(*dt as usize).ok_or(JitError::Malformed)?;
             let dcall = if mixed && is_be(*dt) {
                 let tramp = b.create_block();
                 let call = BlockCall::new(
@@ -8783,6 +8807,7 @@ fn lower_block(
             emit_trap(b, lower, TrapKind::Unreachable);
         }
     }
+    blocks.vals[block_idx] = vals;
     Ok(())
 }
 
@@ -10354,10 +10379,40 @@ fn float_cc(op: FCmpOp) -> FloatCC {
 }
 
 /// Map IR edge args to CLIF block-call args (`BlockArg`, the 0.132 block-call type).
-fn map_args(vals: &[Value], args: &[u32]) -> Result<Vec<BlockArg>, JitError> {
+/// An edge's arguments, but those for the params of `target` the lowering takes (#2448).
+fn map_edge(
+    vals: &[Value],
+    blocks: &Blocks,
+    target: u32,
+    args: &[u32],
+) -> Result<Vec<BlockArg>, JitError> {
     args.iter()
-        .map(|a| get(vals, *a).map(BlockArg::from))
+        .enumerate()
+        .filter(|&(i, _)| blocks.taken(target as usize, i).is_none())
+        .map(|(_, a)| get(vals, *a).map(BlockArg::from))
         .collect()
+}
+
+/// A function's IR blocks as its lowering goes: each one's CLIF block, which of its params the
+/// lowering takes as the values they forward (#2448), with no CLIF param and no edge argument, and,
+/// once it is lowered, its values, which a later block's taken params read.
+struct Blocks {
+    clif: Vec<cranelift_codegen::ir::Block>,
+    fwd: temen_ir::Forwards,
+    vals: Vec<Vec<Value>>,
+}
+
+impl Blocks {
+    /// The block and index of the value block `b`'s param `i` is taken as, if it is taken. Blocks
+    /// lower in index order, so a param is taken only where the block of its value comes before its
+    /// own. That block is lowered by then, and it dominates the param's ([`temen_ir::Forwards`]), so
+    /// the value is defined wherever the param is used.
+    fn taken(&self, b: usize, i: usize) -> Option<(usize, usize)> {
+        self.fwd
+            .source(b, i)
+            .map(|(sb, si)| (sb as usize, si as usize))
+            .filter(|&(sb, _)| sb < b)
+    }
 }
 
 fn int_bin(b: &mut FunctionBuilder, op: BinOp, x: Value, y: Value) -> Value {
