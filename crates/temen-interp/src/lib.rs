@@ -32922,6 +32922,18 @@ impl MemLayout {
             .all(|at| self.tail.contains_key(&at))
     }
 
+    /// #2427 — how far into the window this layout reaches: the end of the last page it holds, its
+    /// head included. What a flat window restoring it must cover, as it holds its whole buffer.
+    pub fn span(&self) -> u64 {
+        let head = self.bytes.len() as u64;
+        let page = self.map.page;
+        self.map
+            .prot
+            .range(head / page..)
+            .next_back()
+            .map_or(head, |(&pg, _)| head.max((pg + 1) * page))
+    }
+
     /// What holding this layout costs: its head's bytes and those of each page it holds past it (the
     /// protection map is a handful of entries beside them).
     pub fn byte_len(&self) -> usize {
