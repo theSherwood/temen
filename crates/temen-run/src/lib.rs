@@ -6678,17 +6678,16 @@ fn jit_run(
     code: Option<&JitCodeCache>,
 ) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // #1944 slice 3, #2113 — `Limits.fuel` is the root budget's fuel ceiling on the JIT too (#1705),
-    // the default grant's when it names none: the root's cell draws from the host's own node, which
-    // pays for its window and main vCPU as an interpreter's does.
+    // the default grant's when it names none: the run's fuel cells draw from the host's own node,
+    // which pays for its window and main vCPU as an interpreter's does. A chain unbounded at every
+    // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
     let window = RootWindow::fresh(m, temen_ir::DEFAULT_RESERVED_LOG2);
     let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());
     };
-    let mut root_fuel = temen_jit::FuelCell::metering(Arc::new(HostNode(node)));
-    let fuel = root_fuel
-        .as_deref_mut()
-        .map(|c| c as *mut temen_jit::FuelCell);
+    let chain =
+        (node.fuel_room() >= 0).then(|| Arc::new(HostNode(node)) as Arc<dyn temen_jit::BudgetNode>);
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
     let (run, results) = with_deadline(limits.deadline, |interrupt| {
@@ -6702,11 +6701,14 @@ fn jit_run(
                     interrupt,
                     init_mem,
                     snapshot_cap,
-                    fuel,
+                    chain,
                     code,
                 )
             }
         } else {
+            // What the cell drew and did not burn goes back to its node as it drops, with the run.
+            let mut cell = chain.map(temen_jit::FuelCell::drawing);
+            let fuel = cell.as_deref_mut().map(|c| c as *mut temen_jit::FuelCell);
             let start = jit_proc::Entry::Fresh {
                 args: slots,
                 init_mem,
@@ -6723,7 +6725,6 @@ fn jit_run(
             (r, m.funcs[func as usize].results.clone())
         }
     });
-    drop(root_fuel); // what the root drew and did not burn goes back to its node
     let run = run.map_err(|e| format!("JIT compile failed: {e:?}"))?;
     if let JitOutcome::Trapped(kind) = run.outcome {
         let who = match run.trap_fiber {
