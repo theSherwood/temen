@@ -4022,6 +4022,263 @@ impl Func {
     }
 }
 
+/// #2474 — a value the interpreter and emitted code pass in an `i64` slot, as its bits.
+fn in_a_slot(t: &ValType) -> bool {
+    matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
+}
+
+impl Func {
+    /// #2474 — the blocks where a call of this function can go on in emitted code mid-call: the
+    /// headers of its outermost loops, in block order. A loop is what the interpreter meters as
+    /// one, a branch back to a block at or before the branching one, which is its header. A header
+    /// is outermost when it lies outside every loop that starts before it, from that loop's header
+    /// to its last branch back. One whose params do not all fit an `i64` slot is left out.
+    pub fn loop_entries(&self) -> Vec<BlockIdx> {
+        // Each header's last branch back.
+        let mut last = vec![None; self.blocks.len()];
+        for (s, b) in self.blocks.iter().enumerate() {
+            for (t, _) in b.term.edges() {
+                if let Some(l) = last.get_mut(t as usize).filter(|_| t as usize <= s) {
+                    *l = Some(l.map_or(s, |e: usize| e.max(s)));
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        let mut spanned: Option<usize> = None;
+        for (h, end) in last.iter().enumerate() {
+            let Some(end) = *end else { continue };
+            match spanned {
+                Some(e) if h <= e => spanned = Some(e.max(end)),
+                _ => {
+                    spanned = Some(end);
+                    if self.blocks[h].params.iter().all(in_a_slot) {
+                        entries.push(h as BlockIdx);
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// The loop entries [`Func::osr_entry`] enters at, or `None` when it makes none.
+    fn osr_entries(&self) -> Option<Vec<BlockIdx>> {
+        let entries = self.loop_entries();
+        let widen = self.results.iter().any(|t| *t != ValType::I64);
+        let tail_call = |b: &Block| {
+            matches!(
+                b.term,
+                Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+            )
+        };
+        let enters = !entries.is_empty()
+            && self.results.iter().all(in_a_slot)
+            && !(widen && self.blocks.iter().any(tail_call));
+        enters.then_some(entries)
+    }
+
+    /// #2474 — this function entered at a loop entry ([`Func::loop_entries`]) instead of its entry
+    /// block: where a call that has run long in the interpreter goes on in emitted code. Its params
+    /// are the entry's position in that list, then as many `i64` slots as the widest entry has
+    /// params, each holding a param's bits as the interpreter's registers do. Its results are this
+    /// function's, each in an `i64` slot. Its first block converts the slots and branches to the
+    /// chosen entry. The rest are this function's blocks from the entries on, in order, so a
+    /// branch back stays a branch back. `None` with no loop entry, a result that does not fit a
+    /// slot, or a tail call when a result is not an `i64` (it would return unconverted).
+    pub fn osr_entry(&self) -> Option<Func> {
+        let entries = self.osr_entries()?;
+        let widen = self.results.iter().any(|t| *t != ValType::I64);
+        // The blocks the entries reach, numbered from 1 in their order.
+        let mut at = vec![0 as BlockIdx; self.blocks.len()];
+        let mut todo = entries.clone();
+        while let Some(b) = todo.pop() {
+            if at[b as usize] == 0 {
+                at[b as usize] = 1;
+                todo.extend(self.blocks[b as usize].term.edges().iter().map(|e| e.0));
+            }
+        }
+        let mut next = 1;
+        for a in at.iter_mut().filter(|a| **a != 0) {
+            *a = next;
+            next += 1;
+        }
+        let ret = next; // the block that widens the results, when they need it
+
+        // The first block: the selector, then the slots, converted as each entry's params need.
+        let width = entries
+            .iter()
+            .map(|&h| self.blocks[h as usize].params.len())
+            .max()
+            .unwrap_or(0);
+        let slots = 1 + width as ValIdx;
+        let mut insts = Vec::new();
+        let mut made: Vec<(usize, ValType, ValIdx)> = Vec::new();
+        let mut value = |j: usize, t: ValType, insts: &mut Vec<Inst>| {
+            if t == ValType::I64 {
+                return 1 + j as ValIdx;
+            }
+            if let Some(&(.., v)) = made.iter().find(|m| m.0 == j && m.1 == t) {
+                return v;
+            }
+            let mut push = |i: Inst| {
+                insts.push(i);
+                slots + insts.len() as ValIdx - 1
+            };
+            let wrapped = |push: &mut dyn FnMut(Inst) -> ValIdx| {
+                push(Inst::Convert {
+                    op: ConvOp::WrapI64,
+                    a: 1 + j as ValIdx,
+                })
+            };
+            let v = match t {
+                ValType::I32 => wrapped(&mut push),
+                ValType::F64 => push(Inst::Cast {
+                    op: CastOp::ReinterpI64F64,
+                    a: 1 + j as ValIdx,
+                }),
+                _ => {
+                    let a = wrapped(&mut push);
+                    push(Inst::Cast {
+                        op: CastOp::ReinterpI32F32,
+                        a,
+                    })
+                }
+            };
+            made.push((j, t, v));
+            v
+        };
+        let mut edges: Vec<Edge> = Vec::new();
+        for &h in &entries {
+            let params = &self.blocks[h as usize].params;
+            let args = params
+                .iter()
+                .enumerate()
+                .map(|(j, t)| value(j, *t, &mut insts))
+                .collect();
+            edges.push((at[h as usize], args));
+        }
+        let term = match edges.len() {
+            1 => {
+                let (target, args) = edges.pop()?;
+                Terminator::Br { target, args }
+            }
+            _ => {
+                insts.push(Inst::Convert {
+                    op: ConvOp::WrapI64,
+                    a: 0,
+                });
+                Terminator::BrTable {
+                    idx: slots + insts.len() as ValIdx - 1,
+                    default: edges[0].clone(),
+                    targets: edges,
+                }
+            }
+        };
+        let mut blocks = vec![Block {
+            params: vec![ValType::I64; slots as usize],
+            insts,
+            term,
+        }];
+
+        // This function's blocks, renumbered, a return widened where the results need it.
+        for (b, block) in self.blocks.iter().enumerate() {
+            if at[b] == 0 {
+                continue;
+            }
+            let mut block = block.clone();
+            match &mut block.term {
+                Terminator::Br { target, .. } => *target = at[*target as usize],
+                Terminator::BrIf {
+                    then_blk, else_blk, ..
+                } => {
+                    *then_blk = at[*then_blk as usize];
+                    *else_blk = at[*else_blk as usize];
+                }
+                Terminator::BrTable {
+                    targets, default, ..
+                } => {
+                    for (t, _) in targets.iter_mut().chain(core::iter::once(default)) {
+                        *t = at[*t as usize];
+                    }
+                }
+                Terminator::Return(vals) if widen => {
+                    block.term = Terminator::Br {
+                        target: ret,
+                        args: core::mem::take(vals),
+                    };
+                }
+                _ => {}
+            }
+            blocks.push(block);
+        }
+        if widen {
+            let n = self.results.len() as ValIdx;
+            let mut insts = Vec::new();
+            let mut push = |i: Inst| {
+                insts.push(i);
+                n + insts.len() as ValIdx - 1
+            };
+            let vals = (0..n)
+                .zip(&self.results)
+                .map(|(a, t)| match t {
+                    ValType::I32 => push(Inst::Convert {
+                        op: ConvOp::ExtendI32U,
+                        a,
+                    }),
+                    ValType::F64 => push(Inst::Cast {
+                        op: CastOp::ReinterpF64I64,
+                        a,
+                    }),
+                    ValType::F32 => {
+                        let a = push(Inst::Cast {
+                            op: CastOp::ReinterpF32I32,
+                            a,
+                        });
+                        push(Inst::Convert {
+                            op: ConvOp::ExtendI32U,
+                            a,
+                        })
+                    }
+                    _ => a,
+                })
+                .collect();
+            blocks.push(Block {
+                params: self.results.clone(),
+                insts,
+                term: Terminator::Return(vals),
+            });
+        }
+        Some(Func {
+            params: vec![ValType::I64; slots as usize],
+            results: vec![ValType::I64; self.results.len()],
+            blocks,
+        })
+    }
+}
+
+/// #2474 — `m` with each function's [`Func::osr_entry`] appended, in function order: function
+/// `f`'s is at `m.funcs.len() + ` the number of functions before `f` that have one. Emitted code
+/// carries them; the interpreter finds them by that rule ([`osr_entries`]) in the module it runs,
+/// which has none appended.
+pub fn append_osr_entries(m: &mut Module) {
+    let entries: Vec<Func> = m.funcs.iter().filter_map(Func::osr_entry).collect();
+    m.funcs.extend(entries);
+}
+
+/// #2474 — where [`append_osr_entries`] puts each of `funcs`' OSR entries: per function, its
+/// index, or `None` for one without.
+pub fn osr_entries(funcs: &[Func]) -> Vec<Option<FuncIdx>> {
+    let mut next = funcs.len() as FuncIdx;
+    funcs
+        .iter()
+        .map(|f| {
+            f.osr_entries().map(|_| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
 /// a power of two, so confinement is a single `addr & (size − 1)` mask. The window
 /// is a reserved virtual range; guest pointers are offsets into it.

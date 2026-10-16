@@ -27,7 +27,7 @@ mod coop;
 mod rec;
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::{ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
+use temen_interp::bytecode::{Hotness, ModuleEmitter, ModuleOffer, ProgramEmit, TierUpConfig};
 use temen_interp::{
     bytecode, CapState, ForkedProc, Host, HostProc, HostProcFork, ParkEvent, SignalSource, Trap,
     Value,
@@ -77,24 +77,30 @@ fn oracle(m: &temen_ir::Module) -> Result<Vec<Value>, Trap> {
     bytecode::compile_and_run(m, 0, &[], &mut fuel).expect("supported")
 }
 
+/// An emit whose `eligible` functions tier up at every call's start.
+fn at_start(eligible: impl Into<Arc<[bool]>>) -> ProgramEmit {
+    ProgramEmit {
+        eligible: eligible.into(),
+        ..Default::default()
+    }
+}
+
 /// Drive the cooperative run under `host` with tier-up enabled, emulating the browser host: each
 /// `TierUp(func, argv)` is serviced by running `func` standalone (what the emitted region computes)
-/// and delivering its i64 results back. Returns the whole-run result and the functions that tiered
-/// up, in order.
+/// over the module the host emits, `m` with its OSR entries appended (#2474), and delivering its
+/// i64 results back. Returns the whole-run result and the functions that tiered up, in order.
 fn coop_tierup_run(
     m: &temen_ir::Module,
-    eligible: std::sync::Arc<[bool]>,
+    root: ProgramEmit,
     host: Host,
 ) -> (Result<Vec<Value>, Trap>, Vec<u32>) {
     let tierup = TierUpConfig {
-        root: ProgramEmit {
-            eligible,
-            page_checked: false,
-            ..Default::default()
-        },
+        root,
         leaf: None,
         modules: None,
     };
+    let mut emitted = m.clone();
+    temen_ir::append_osr_entries(&mut emitted);
     let mut run = coop::coop_run(m, 0, &[], FUEL, host, Some(tierup))
         .expect("supported")
         .expect("entry in range");
@@ -125,7 +131,9 @@ fn coop_tierup_run(
                 // Emulate `f{func}(win, env, ...argv)`: run the callee standalone over its i64 args.
                 let args: Vec<Value> = argv.iter().map(|&s| Value::I64(s)).collect();
                 let mut fuel = FUEL;
-                match bytecode::compile_and_run(m, func, &args, &mut fuel).expect("supported") {
+                match bytecode::compile_and_run(&emitted, func, &args, &mut fuel)
+                    .expect("supported")
+                {
                     Ok(vals) => {
                         let slots: Vec<i64> = vals
                             .iter()
@@ -142,6 +150,61 @@ fn coop_tierup_run(
             }
         }
     }
+}
+
+/// The root calls function 1 with 1000, which counts to it, a taken back edge a step.
+const ONE_LONG_CALL: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 1000
+  vr = call 1 (vn)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+";
+
+/// #2474 — on the pump as on executor 2 (`thread_platform.rs`), a call that has done 100 work goes
+/// on in its function's OSR entry at its next branch back to the loop, and returns from there.
+#[test]
+fn a_long_call_goes_on_in_its_osr_entry_on_the_pump() {
+    let m = parse_module(ONE_LONG_CALL).unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let entry = temen_ir::osr_entries(&m.funcs)[1].expect("function 1 has one");
+    let mut eligible = vec![false; m.funcs.len() + 1];
+    eligible[entry as usize] = true;
+    let root = ProgramEmit {
+        eligible: eligible.into(),
+        hot: Hotness {
+            in_call: 100,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (got, tierups) = coop_tierup_run(&m, root, Host::new());
+    assert_eq!(got, oracle(&m));
+    assert_eq!(
+        tierups,
+        [entry],
+        "function 1 went on in its OSR entry, once"
+    );
 }
 
 // Bisection probe: does the hand-written threaded guest even terminate under the pure-interpreter
@@ -163,7 +226,7 @@ fn coop_tierup_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
+    let (got, tierups) = coop_tierup_run(&m, at_start(eligible), Host::new());
 
     // f(x) = 3x + 7: root f(3)=16, worker f(5)=22 → 16 + 22 = 38.
     assert_eq!(want, Ok(vec![Value::I64(38)]), "oracle value");
@@ -197,7 +260,7 @@ fn a_thread_tiers_up_at_its_entry() {
     ] {
         let mut host = Host::new();
         host.set_durable(durable);
-        let (got, mut tierups) = coop_tierup_run(&m, std::sync::Arc::from(eligible), host);
+        let (got, mut tierups) = coop_tierup_run(&m, at_start(eligible), host);
         tierups.sort();
         assert_eq!(got, want, "eligible {eligible:?}, durable {durable}");
         assert_eq!(
@@ -246,7 +309,7 @@ fn coop_tierup_trap_parity() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, _) = coop_tierup_run(&m, eligible, Host::new());
+    let (got, _) = coop_tierup_run(&m, at_start(eligible), Host::new());
 
     // The worker divides 100/(5-5) → div-by-zero: the run must trap, exactly as the interpreter does.
     assert!(
@@ -308,8 +371,7 @@ fn a_task_tiers_up_once_per_call() {
         let m = parse_module(&SRC_LOOP.replace("N_ITERS", &n.to_string())).unwrap();
         temen_verify::verify_module(&m).expect("verify");
         let want = oracle(&m);
-        let eligible = std::sync::Arc::from(vec![false, true]);
-        let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
+        let (got, tierups) = coop_tierup_run(&m, at_start(vec![false, true]), Host::new());
         assert_eq!(
             want, got,
             "the tier-up run diverged from the oracle at n={n}"
@@ -586,7 +648,7 @@ fn coop_tierup_fiber_scheduler_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
+    let (got, tierups) = coop_tierup_run(&m, at_start(eligible), Host::new());
 
     // fiber A f(3)=16, fiber B f(5)=22, root f(9)=34 → 72.
     assert_eq!(want, Ok(vec![Value::I64(72)]), "oracle value");
@@ -663,7 +725,7 @@ fn coop_tierup_live_futex_matches_pure_interp() {
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, false, true]);
 
     let want = oracle(&m);
-    let (got, tierups) = coop_tierup_run(&m, eligible, Host::new());
+    let (got, tierups) = coop_tierup_run(&m, at_start(eligible), Host::new());
 
     // The fiber wakes WAIT_WOKEN(0), then the leaf f(4) = 19 → 0 + 19 = 19.
     assert_eq!(want, Ok(vec![Value::I64(19)]), "oracle value");

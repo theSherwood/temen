@@ -166,7 +166,12 @@ fn wasm_run(m: &temen_ir::Module, wasm: &[u8], args: &[Value], fuel: u64) -> Out
 /// Both control-flow lowerings run: structured, and the dispatcher that irreducible control flow
 /// and split functions fall back to.
 fn diff(name: &str, src: &str, sweep: &[i64], fuel: u64) {
-    let m = parse(name, src);
+    diff_module(name, &parse(name, src), sweep, fuel);
+}
+
+/// [`diff`] over a module already built.
+fn diff_module(name: &str, m: &temen_ir::Module, sweep: &[i64], fuel: u64) {
+    let m = m.clone();
     let lowerings = [
         ("structured", compile_module(&m)),
         ("dispatcher", with_dispatcher_only(|| compile_module(&m))),
@@ -190,6 +195,77 @@ fn diff(name: &str, src: &str, sweep: &[i64], fuel: u64) {
             );
         }
     }
+}
+
+/// #2474 — `f0` enters function 1, an OSR entry, at its first loop with that loop's state on
+/// reaching it from `n`: selector 0, then `n` and the four zeros the loop starts from.
+const OSR_CALLER: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  z = i64.const 0
+  vr = call 1 (z, vn, z, z, z, z)
+  return vr
+  }
+}
+func (i64, i64, i64, i64, i64, i64) -> (i64) {
+block 0 (s: i64, a: i64, b: i64, c: i64, d: i64, e: i64) {
+  return s
+  }
+}
+";
+
+/// A loop whose header carries an `i64` bound and count, an `i32` stepping by 2, an `f64` by 3 and
+/// an `f32` by 1, returning the count plus the `i32` and both floats' bits.
+const MIXED_LOOP: &str = "memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  v0 = i64.const 0
+  w0 = i32.const 0
+  d0 = f64.const 0.0
+  s0 = f32.const 0.0
+  br 1(vn, v0, w0, d0, s0)
+}
+block 1 (vm: i64, vk: i64, vw: i32, vd: f64, vs: f32) {
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vw, vd, vs) 3(vk, vw, vd, vs)
+}
+block 2 (am: i64, ak: i64, aw: i32, ad: f64, as: f32) {
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  w2 = i32.const 2
+  aw1 = i32.add aw w2
+  d3 = f64.const 3.0
+  ad1 = f64.add ad d3
+  s1 = f32.const 1.0
+  as1 = f32.add as s1
+  br 1(am, ak1, aw1, ad1, as1)
+}
+block 3 (rk: i64, rw: i32, rd: f64, rs: f32) {
+  rw64 = i64.extend_i32_u rw
+  rd64 = i64.reinterpret_f64 rd
+  rs32 = i32.reinterpret_f32 rs
+  rs64 = i64.extend_i32_u rs32
+  r1 = i64.add rk rw64
+  r2 = i64.add r1 rd64
+  r3 = i64.add r2 rs64
+  return r3
+  }
+}
+";
+
+/// #2474 — a function's OSR entry, emitted, goes on from its loop as the function does
+/// (`temen-interp`'s `osr_entry.rs` holds the entry itself to the function): the same results, and
+/// out of fuel at the same safepoint.
+#[test]
+fn osr_entry() {
+    let entry = parse("osr_entry", MIXED_LOOP).funcs[0]
+        .osr_entry()
+        .expect("the loop is an entry");
+    let mut m = parse("osr_entry", OSR_CALLER);
+    m.funcs[1] = entry;
+    temen_verify::verify_module(&m).expect("verify");
+    diff_module("osr_entry", &m, &[0, 1, 7, 100], 1 << 20);
+    diff_module("osr_entry fuel", &m, &[100], 50);
 }
 
 fn parse(name: &str, src: &str) -> temen_ir::Module {

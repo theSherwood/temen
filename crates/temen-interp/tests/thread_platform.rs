@@ -354,10 +354,172 @@ fn a_call_tiers_up_once_its_calls_have_done_enough_work() {
     platform.tier.as_mut().expect("a tier").root.hot = Hotness {
         per_call: 100,
         window: 4,
+        ..Default::default()
     };
     assert_eq!(run_over(&m, platform, flat_window()), interpreted);
     let ran = HOT_CALLS.lock().unwrap().clone();
     assert_eq!(ran, [2; 46], "function 2, on its 5th to 50th calls");
+}
+
+/// The root calls function 1 with 1000 and returns its count: function 1 counts to its argument, a
+/// taken back edge a step.
+const ONE_LONG_CALL: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vn = i64.const 1000
+  vr = call 1 (vn)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+";
+
+/// The root spawns a thread of function 1 with 1000, joins it, and returns what it counted.
+const ONE_LONG_THREAD: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vn = i64.const 1000
+  t = thread.spawn 1 vz vn
+  j = thread.join t
+  return j
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+";
+
+/// Held by each test of the OSR entries: they share the statics below.
+static OSR_TEST: Mutex<()> = Mutex::new(());
+/// The module whose OSR entries [`osr_entries_interpreted`] runs.
+static OSR_MODULE: Mutex<Option<Module>> = Mutex::new(None);
+/// Each call the emitted tier ran: its function and arguments.
+static OSR_CALLS: Mutex<Vec<(u32, Vec<i64>)>> = Mutex::new(Vec::new());
+
+/// Emitted code whose OSR entries are the interpreter's: it runs a function appended past the
+/// module's own on a fresh interpreter over the module with its OSR entries
+/// ([`temen_ir::append_osr_entries`]). These guests touch no memory, so that one runs as the task
+/// would.
+fn osr_entries_interpreted(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { func, .. } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    OSR_CALLS.lock().unwrap().push((func, call.argv.to_vec()));
+    let mut m = OSR_MODULE.lock().unwrap().clone().expect("a module");
+    let own = m.funcs.len() as u32;
+    if func < own {
+        return bounce_whole_call(call);
+    }
+    temen_ir::append_osr_entries(&mut m);
+    let args: Vec<Value> = call.argv.iter().map(|a| Value::I64(*a)).collect();
+    let mut fuel = 1 << 30;
+    let vals = bytecode::compile_and_run(&m, func, &args, &mut fuel).expect("in subset")?;
+    call.results = vals
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => *x,
+            v => panic!("an OSR entry's results are i64 slots, not {v:?}"),
+        })
+        .collect();
+    Ok(())
+}
+
+/// A tier for the OSR entries of `src`'s functions `of` alone: none of its functions tiers up at
+/// its start, and a call of one of those goes on in its OSR entry once it has done 100 work.
+fn osr_tier(src: &str, of: &[usize]) -> (Module, ThreadPlatform) {
+    let m = module(src);
+    *OSR_MODULE.lock().unwrap() = Some(m.clone());
+    OSR_CALLS.lock().unwrap().clear();
+    let mut eligible = vec![false; m.funcs.len()];
+    for (f, e) in temen_ir::osr_entries(&m.funcs).iter().enumerate() {
+        if e.is_some() {
+            eligible.push(of.contains(&f));
+        }
+    }
+    let mut platform = tier(Arc::from(eligible), osr_entries_interpreted);
+    platform.tier.as_mut().expect("a tier").root.hot = Hotness {
+        in_call: 100,
+        ..Default::default()
+    };
+    (m, platform)
+}
+
+/// #2474 — a call that has run long goes on in its function's OSR entry at its next branch back to
+/// the loop: the transfer gives the entry its loop's state, and its results return from the call.
+/// It is the 101st branch back that goes, the call having done 100 work, with the count at 101.
+#[test]
+fn a_long_call_goes_on_in_its_osr_entry_at_its_loop() {
+    let _one = OSR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, platform) = osr_tier(ONE_LONG_CALL, &[1]);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(1000)]));
+    assert_eq!(run_over(&m, platform, flat_window()), interpreted);
+    assert_eq!(
+        OSR_CALLS.lock().unwrap().clone(),
+        [(2, vec![0, 1000, 101])],
+        "function 1's OSR entry, after its second function: the loop's state at the transfer"
+    );
+}
+
+/// #2474 — a thread's entry, the call that started its task, goes on emitted too: its OSR entry's
+/// results end the thread, and its join sees them.
+#[test]
+fn a_threads_long_entry_goes_on_in_its_osr_entry() {
+    let _one = OSR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, platform) = osr_tier(ONE_LONG_THREAD, &[1]);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(1000)]));
+    assert_eq!(run_over(&m, platform, flat_window()), interpreted);
+    let calls = OSR_CALLS.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one transfer: {calls:?}");
+    assert_eq!(calls[0].0, 2);
+}
+
+/// #2474 — a call doing less than the threshold's work never goes on emitted, however often it is
+/// made: function 1's 50 calls count to 3, function 2's to 200, so each of function 2's calls
+/// alone reaches its loop with 100 work done.
+#[test]
+fn only_a_call_that_has_run_long_goes_on_emitted() {
+    let _one = OSR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    let (m, platform) = osr_tier(LIGHT_AND_HEAVY_CALLS, &[1, 2]);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(run_over(&m, platform, flat_window()), interpreted);
+    let calls = OSR_CALLS.lock().unwrap().clone();
+    let entry = temen_ir::osr_entries(&m.funcs)[2].expect("function 2 has one");
+    assert_eq!(calls, vec![(entry, vec![0, 200, 101]); 50]);
 }
 
 static SPARSE_TIERUPS: AtomicUsize = AtomicUsize::new(0);
