@@ -5756,6 +5756,54 @@ mod compile_verified_tests {
             "{err}"
         );
     }
+
+    /// A loop summing `0..n`: block params, a branch and a back edge for Cranelift's passes.
+    fn summing(isa: &dyn cranelift_codegen::isa::TargetIsa) -> Function {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+        let [entry, head, body, exit] = [(); 4].map(|_| b.create_block());
+        b.append_block_params_for_function_params(entry);
+        let (i, sum) = (
+            b.append_block_param(head, I64),
+            b.append_block_param(head, I64),
+        );
+        let total = b.append_block_param(exit, I64);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        let zero = b.ins().iconst(I64, 0);
+        b.ins()
+            .jump(head, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+        b.switch_to_block(head);
+        let done = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, n);
+        b.ins().brif(done, exit, &[BlockArg::Value(sum)], body, &[]);
+        b.switch_to_block(body);
+        let (sum, i) = (b.ins().iadd(sum, i), b.ins().iadd_imm(i, 1));
+        b.ins()
+            .jump(head, &[BlockArg::Value(i), BlockArg::Value(sum)]);
+        b.switch_to_block(exit);
+        b.ins().return_(&[total]);
+        b.seal_all_blocks();
+        b.finalize();
+        func
+    }
+
+    /// [`compile_verified`] repeats the steps of Cranelift's `Context::compile` with the verifier
+    /// around its passes, so a Cranelift whose compile gains a step fails here rather than
+    /// compiling without it.
+    #[test]
+    fn compile_verified_emits_what_cranelifts_compile_emits() {
+        let isa = jit_isa().unwrap();
+        let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
+        let code = compile_verified(&*isa, &mut ours).unwrap();
+        let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
+        let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
+        assert_eq!(code.code_buffer(), want.code_buffer());
+        assert_eq!(code.buffer.relocs().len(), want.buffer.relocs().len());
+    }
 }
 
 /// Declare every function (natural ABI, `f{i}` local linkage) up front so any call site can
