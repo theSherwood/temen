@@ -55,7 +55,7 @@ pub mod fs;
 mod jit_proc;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
-use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind};
+use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
@@ -287,7 +287,7 @@ impl HostParkReq {
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
-        match temen_jit::park_host_call(trap_out, unwind_base, key, still_parked) {
+        match temen_jit::park_host_call(trap_out, unwind_base, key, Parks::Fiber, still_parked) {
             temen_jit::HostPark::Woken => true,
             temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
             temen_jit::HostPark::Deadlock => {
@@ -1686,8 +1686,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
 /// join table per spawning vCPU, so two children of different spawners can share a slot number; the
 /// JIT keeps one per domain, where both handles would name one child.
 ///
-/// #2438 — and none is demand-paged: the JIT has no fault seam to serve its pager (#2164). A routed
-/// run of a pager-capable program thaws on the interpreter ([`folds_to_oracle`]), as it runs there.
+/// #2438 — and none is demand-paged: a durable JIT run pages no child, so its relaunch re-links no
+/// pager (#2489). A paged artifact thaws on the interpreter, where it was frozen.
 fn jit_relaunches(host: &Host) -> bool {
     let mut slots: Vec<usize> = host
         .thawed_detached()
@@ -1772,7 +1772,8 @@ fn detached_left(
         let Some(module) = module else {
             continue;
         };
-        // A JIT child is never demand-paged: its op-17 thunk refuses a pager record (#2164).
+        // A durable JIT run's child is never demand-paged: its op-17 thunk refuses a pager record in
+        // a durable run (#2489).
         let spawn = temen_interp::DetachedSpawn {
             digest: temen_interp::module_digest(&module),
             module: std::sync::Arc::clone(&module),
@@ -2946,11 +2947,11 @@ unsafe fn ring(g: &Host) {
 }
 
 /// #2173 — a parked-transport wait: park on the run's one host-call park
-/// ([`temen_jit::park_host_call`]) until the cell's `bell` moves past `seen`, the value read under
-/// the cell's lock together with the state that made the wait park. So it is counted for the run's
-/// deadlock verdict as every other park is, ends on a kill or the domain's teardown, and a task's
-/// wait parks the task rather than its worker thread. With no bell nothing can ring it: it ends
-/// only on the verdict, a kill or the teardown.
+/// ([`temen_jit::park_host_call`]), as `parks` says, until the cell's `bell` moves past `seen`, the
+/// value read under the cell's lock together with the state that made the wait park. So it is
+/// counted for the run's deadlock verdict as every other park is, ends on a kill or the domain's
+/// teardown, and a task's wait parks the task rather than its worker thread. With no bell nothing
+/// can ring it: it ends only on the verdict, a kill or the teardown.
 ///
 /// # Safety
 /// `trap_out` is the live call's trap cell, and the caller holds no lock.
@@ -2958,9 +2959,10 @@ unsafe fn park_on_bell(
     trap_out: *mut i64,
     bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
     seen: u64,
+    parks: Parks,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(trap_out, 0, key, || {
+    temen_jit::park_host_call(trap_out, 0, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -3032,7 +3034,9 @@ unsafe fn serve_locked(
             // sees the same kill and releases, so until then re-check on a short sleep.
             let seen = bell_now(bell.as_ref());
             drop(guard);
-            if park_on_bell(trap_out, bell.as_ref(), seen) != temen_jit::HostPark::Woken {
+            if park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber)
+                != temen_jit::HostPark::Woken
+            {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -3104,7 +3108,7 @@ unsafe fn serve_locked(
         let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         drop(guard);
-        let parked = park_on_bell(trap_out, bell.as_ref(), seen);
+        let parked = park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber);
         guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
         // A claim taken during the park holds this domain until its release (the arm above).
@@ -3139,11 +3143,11 @@ fn crossing_depth_ok() -> bool {
 }
 
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
-/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then
-/// **thread-block** on the cell's Condvar until the child's serve loop settles `t` — the §10.2
-/// arm-5 transport, caller half. Fail-closed edges: full callee queue ⇒ `-EAGAIN` (probeable
-/// backpressure, the interp's exact answer); a callee cell with no Condvar (not a shared JIT
-/// child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
+/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then park on
+/// the cell's bell until the child's serve loop settles `t` ([`await_settle`]: a task's fiber
+/// yields, an OS vCPU waits, #2173) — the §10.2 arm-5 transport, caller half. Fail-closed edges:
+/// full callee queue ⇒ `-EAGAIN` (probeable backpressure, the interp's exact answer); a callee cell
+/// with no bell (not a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
 /// exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
 /// unwind via the trap cell. `callee`/`export` are the live-impl the handle resolved to and `fast`
 /// the caller's handoff knob, each read by the caller from its own powerbox before the call (a
@@ -3222,19 +3226,20 @@ unsafe fn live_impl_call(
         return EAGAIN; // full queue / unservable op: probeable backpressure
     };
     ring(&guard); // the callee's serve loop, parked on its empty queue
-    await_settle(callee, guard, &bell, ticket, trap_out).unwrap_or(0)
+    await_settle(callee, guard, &bell, ticket, Parks::Fiber, trap_out).unwrap_or(0)
 }
 
-/// The arm-5 caller park: wait, from `guard` on `callee`'s cell, for its serve loop to settle
-/// `ticket`. The result, `CAP_REVOKED` when the callee's serve loop is gone with it unserved (the
-/// dead-callee edge, probeable, never a hang: D37 death-is-revocation), or `None` when the wait ended
-/// without one: the deadlock verdict, a kill, or this domain's teardown, with the trap cell set to
-/// unwind the caller.
+/// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its
+/// serve loop to settle `ticket`. The result, `CAP_REVOKED` when the callee's serve loop is gone with
+/// it unserved (the dead-callee edge, probeable, never a hang: D37 death-is-revocation), or `None`
+/// when the wait ended without one: the deadlock verdict, a kill, or this domain's teardown, with the
+/// trap cell set to unwind the caller.
 unsafe fn await_settle<'a>(
     callee: &'a Mutex<Host>,
     mut guard: std::sync::MutexGuard<'a, Host>,
     bell: &Arc<std::sync::atomic::AtomicU64>,
     ticket: u64,
+    parks: Parks,
     trap_out: *mut i64,
 ) -> Option<i64> {
     loop {
@@ -3247,21 +3252,23 @@ unsafe fn await_settle<'a>(
         // Until the callee's settle (or its end) rings its bell.
         let seen = bell_now(Some(bell));
         drop(guard);
-        if !park_until_rung(bell, seen, trap_out) {
+        if !park_until_rung(bell, seen, parks, trap_out) {
             return None;
         }
         guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     }
 }
 
-/// Park on `bell` until it rings past `seen`: `true`, or `false` with the trap cell set — nothing
-/// live can ring it (the oracle's deadlock verdict), a kill, or this domain's teardown.
+/// Park on `bell`, as `parks` says, until it rings past `seen`: `true`, or `false` with the trap
+/// cell set — nothing live can ring it (the oracle's deadlock verdict), a kill, or this domain's
+/// teardown.
 unsafe fn park_until_rung(
     bell: &Arc<std::sync::atomic::AtomicU64>,
     seen: u64,
+    parks: Parks,
     trap_out: *mut i64,
 ) -> bool {
-    match park_on_bell(trap_out, Some(bell), seen) {
+    match park_on_bell(trap_out, Some(bell), seen, parks) {
         temen_jit::HostPark::Woken => true,
         temen_jit::HostPark::Deadlock => {
             *trap_out = temen_jit::TrapKind::ThreadFault as i64;
@@ -3307,13 +3314,13 @@ unsafe fn request_page(
         }
         let seen = bell_now(Some(&bell));
         drop(guard);
-        if !park_until_rung(&bell, seen, trap_out) {
+        if !park_until_rung(&bell, seen, Parks::Vcpu, trap_out) {
             return None;
         }
         guard = pager.lock().unwrap_or_else(|e| e.into_inner());
     };
     ring(&guard); // the pager's serve loop, parked on its empty queue
-    let reply = await_settle(pager, guard, &bell, ticket, trap_out);
+    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, trap_out);
     if reply.is_none_or(|r| r == CAP_REVOKED) {
         pager
             .lock()
@@ -3511,7 +3518,7 @@ pub unsafe extern "C" fn child_grant(
 /// build_detached`]): read `grants_n` 16-byte records `{name_off: u32, name_len: u32, handle: i32,
 /// flags: u32}` at window-relative `grants_ptr` and re-grant each record's copyable handle into a
 /// fresh child powerbox `Host` **under its name**, built through [`Host::spawn_detached_child`]: the
-/// child attests `window_exposed = false`, its starter caps span `child_size` = the window
+/// child attests `window_exposed = false` (unless paged, below), its starter caps span `child_size` = the window
 /// reservation (a root's shape; the JIT thunk passes it), and it gets what [`budget_mem_take`] just
 /// admitted it with: the lease's `budget` as its `"budget"`, the `runs` its window is paid for up
 /// to, and `lane`.
@@ -8219,8 +8226,8 @@ impl Instance {
         // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
         // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
         // (the cap thunk's serve loop, #2166). Everything else `folds_to_oracle` catches — op-14
-        // offer mints, park-capable servers, pager-capable spawners — leaves the JIT down the
-        // ladder: bytecode first, whose compile gate falls the rest through to the tree-walker.
+        // offer mints, park-capable servers — leaves the JIT down the ladder: bytecode first, whose
+        // compile gate falls the rest through to the tree-walker.
         let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
             Backend::Bytecode
         } else {

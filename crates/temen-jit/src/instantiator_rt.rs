@@ -1251,9 +1251,9 @@ fn temen_ir_iface_instantiator() -> u32 {
 /// - a nonzero padding word → `CapFault` (fail closed, [`SpawnRec::parse`]).
 /// - a pager (`pager != u32::MAX`, §2.2, #2164): the child is demand-paged, its faults served by
 ///   that export of the spawner's program, which [`spawn_detached`] checks before the rest of the
-///   record. Except in a durable run, where it is `CapFault`: a freeze of a paged child needs the
-///   interpreters' hold (#2455), and a thaw of one their pager edge (#2438), so a durable paging
-///   program runs on the tree-walker.
+///   record. Except in a durable run, where it is `CapFault` until #2489: a freeze of a paged child
+///   needs the interpreters' hold (#2455), and a thaw of one their pager edge (#2438), so a durable
+///   paging program is the tree-walker's.
 ///
 /// # Safety
 /// Called from JITted code on the spawning vCPU's thread with the run's live nursery, window
@@ -1492,8 +1492,8 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 /// transparency), the payload fits the args region, and the budget quota covers the window (a forged /
 /// exhausted budget refuses, charging nothing). The child powerbox is the by-name grant list plus
 /// starter caps spanning the **reservation** (a root's shape, so its `vm_map` grows the window);
-/// it attests `window_exposed = false`. Data segments + the payload are seeded into the child's own
-/// window before it starts. A durable run refuses outright (multi-window freeze is O6).
+/// it attests `window_exposed = false`, or true when the record names a pager, which pages it
+/// (#2164). Data segments + the payload are seeded into the child's own window before it starts.
 ///
 /// # Safety
 /// `rt`/`mem_base`/`mem_size`/`trap_out` are the instance's nursery, live parent window base,

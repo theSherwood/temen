@@ -125,8 +125,10 @@ fn jit_row(site: ParkSite) -> Row {
                   `LiveImpl` onto a re-launched detached child",
         },
         ParkSite::PageFault => Row::Pending {
-            issue: 2164,
-            why: "the engine has no demand paging: a pager-capable program runs on an interpreter",
+            issue: 2489,
+            why:
+                "a durable run refuses a pager record: its freeze cannot hold for a paged child's \
+                  page request yet, nor its thaw re-link the pager",
         },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,

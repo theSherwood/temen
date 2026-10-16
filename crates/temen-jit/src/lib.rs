@@ -113,7 +113,7 @@ mod os_thread_rt;
 #[cfg(not(loom))]
 pub use os_thread_rt::{
     park_host_call, region_canon_forget_window, region_canon_lookup, region_canon_new_owner,
-    region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in, HostPark,
+    region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in, HostPark, Parks,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -987,7 +987,8 @@ pub type ChildBudgetNode =
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list, the
-    /// child attesting `window_exposed = false`, its starter caps spanning `child_size` = the window
+    /// child attesting `window_exposed = false` (true when it is paged, #2164), its starter caps
+    /// spanning `child_size` = the window
     /// **reservation** (a root's shape), and the budget that paid for its window its own (see
     /// [`GrantDetachedChildBuilder`]).
     pub build_detached: GrantDetachedChildBuilder,

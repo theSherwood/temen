@@ -30917,9 +30917,9 @@ impl Host {
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: each of `grants` (a list of
     /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`
     /// (stdout/stderr grants share the spawner's sinks), or `None` if any handle is forged or not
-    /// re-grantable — the whole spawn fails closed. The child is never paged, so it attests
-    /// `window_exposed = false` (no ancestor below the platform holds rights over its minted window),
-    /// and its starter caps span `reservation` — the whole window reservation, a root's shape, so the
+    /// re-grantable — the whole spawn fails closed. It attests `window_exposed = false` (no ancestor
+    /// below the platform holds rights over its minted window) unless it is `paged`: its spawner pages
+    /// it (#2095, #2164). Its starter caps span `reservation` — the whole window reservation, a root's shape, so the
     /// child's `vm_map` grows it. The native JIT's op-17 thunk builds the child powerbox through this
     /// (`temen_run::grant_detached_child_build`), so both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
     /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.

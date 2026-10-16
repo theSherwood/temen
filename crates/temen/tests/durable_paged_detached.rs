@@ -232,8 +232,8 @@ fn a_thawed_pager_holds_its_relaunched_children_again() {
     );
 }
 
-/// The Cranelift JIT has no demand paging (#2164), so it refuses to thaw a paged child rather than
-/// run it with no pager. A routed run folds a pager-capable program to the interpreter instead.
+/// The Cranelift JIT pages a child only outside a durable run (#2489), so it refuses to thaw a paged
+/// child rather than run it with no pager. A paged artifact thaws on the interpreter.
 #[test]
 fn the_jit_refuses_to_thaw_a_paged_child() {
     let child = child_module(&child_src(false));

@@ -20369,9 +20369,10 @@ impl Vm {
                 Op::Eval { inst, dst } => {
                     // Run the op against the frame, its operands frame slots; reuse the reference
                     // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
-                    // (disjoint), so we read the result before writing it back.
+                    // (disjoint), so we read the result before writing it back. A `v128` access
+                    // pages as the oracle's `eval_inst` fallback does (its `handle_mem`).
                     let win_hi = base + c.progs[cur].nslots as usize;
-                    let r = super::eval_inst(inst, &self.regs[base..win_hi], mem)?;
+                    let r = paged!(super::eval_inst(inst, &self.regs[base..win_hi], mem));
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
