@@ -6302,6 +6302,99 @@ pub fn nim_program_units(
     Ok(units)
 }
 
+/// The files of a nimony tree as a build in it reads them, keyed by where the build has the tree,
+/// `at`: all of them but those under its `bin/` (the toolchain, which a guest has as commands) and its
+/// `nimcache/` (what a build writes), in path order. A guest build is seeded with them before
+/// anything is derived from them, so everything a phase derives is newer: the memfs stamps write
+/// order into `st_mtim`, which is what the freshness checks in `deps.nim` and nifmake read. The
+/// self-hosted lane seeds its tree with them (`examples/nim_selfhost_lane.rs`), and so does the
+/// card's build (`examples/nim_card_bundle.rs`).
+pub fn nim_tree_files(tree: &std::path::Path, at: &str) -> Vec<(String, Vec<u8>)> {
+    fn walk(path: &std::path::Path, name: String, top: bool, out: &mut Vec<(String, Vec<u8>)>) {
+        if !path.is_dir() {
+            let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            out.push((name, bytes));
+            return;
+        }
+        let mut entries: Vec<String> = std::fs::read_dir(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|e| !(top && (e == "bin" || e == "nimcache")))
+            .collect();
+        entries.sort();
+        for e in entries {
+            walk(&path.join(&e), format!("{name}/{e}"), false, out);
+        }
+    }
+    let mut files = Vec::new();
+    walk(tree, at.trim_end_matches('/').to_string(), true, &mut files);
+    files
+}
+
+/// The **library pack** of a build run in `at`: every file it wrote under `<at>/nimcache/` for a
+/// library module, in the order it wrote them, and nimony's memos of the options it was built with
+/// ([`OPTIONS_MEMO`]). A library module is one whose `.p.nif` records a source in nimony's tree:
+/// under `lib/`, or under `src/`, which the library imports (#2033). Its files include what the
+/// Temen backend wrote for it under `t/` (nim-lang/nimony#2616): its `.x.nif`, and what a build of
+/// it as a program wrote (`t/<stem>/…`), such as the helper compile-time evaluation runs. So do the
+/// plugins the library declares (#2049): their executables, which nimony links into the cache's
+/// root (`deps.nim`'s `pluginExe`). Seeded into a later build in the same directory, after the
+/// library's sources and in this order, they are newer than everything they were made from, so that
+/// build compiles only its own modules (#958). `examples/nim_card_bundle.rs` ships the card's.
+pub fn nim_library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8>)> {
+    let cache = format!("{at}/nimcache/");
+    let mut library = std::collections::HashMap::new();
+    let mut pack = Vec::new();
+    for name in posix.file_names_by_write() {
+        let Some(rest) = name.strip_prefix(&cache) else {
+            continue;
+        };
+        let Some(bytes) = posix.read_file(&name) else {
+            continue;
+        };
+        let in_backend = rest.strip_prefix("t/").unwrap_or(rest);
+        let stem = in_backend
+            .split(['.', '/'])
+            .next()
+            .unwrap_or(in_backend)
+            .to_string();
+        let keep = rest.rsplit('/').next() == Some(OPTIONS_MEMO)
+            || (!rest.contains('/') && temen_encode::wire::is_module_blob(&bytes))
+            || *library.entry(stem).or_insert_with_key(|stem| {
+                posix
+                    .read_file(&format!("{cache}{stem}.p.nif"))
+                    .is_some_and(|nif| {
+                        nif_source(&nif)
+                            .is_some_and(|src| src.starts_with("lib/") || src.starts_with("src/"))
+                    })
+            });
+        if keep {
+            pack.push((name, bytes));
+        }
+    }
+    pack
+}
+
+/// nimony's memo of the options a stage's artifacts were made with (`deps.nim`'s `memoDiffers`,
+/// nim-lang/nimony#2616): the frontend's at the cache's root, and each program's backend one in its
+/// build directory (`t/<main>/`). A build that finds its stage's missing or different reruns every
+/// step of the stage, so a pack without them would be rebuilt from its sources. A card build reads
+/// the backend memo of `prog.nim`, the program the pack is built as (`scripts/rebuild-assets.sh`).
+const OPTIONS_MEMO: &str = "config.nif";
+
+/// The source file a `.p.nif` was parsed from: the file of its top `stmts` node's line info
+/// (`(stmts@<col>,<line>,<file>`).
+fn nif_source(nif: &[u8]) -> Option<&str> {
+    const TOP: &[u8] = b"(stmts@";
+    let at = nif.windows(TOP.len()).position(|w| w == TOP)? + TOP.len();
+    let info = nif[at..]
+        .split(|b| b.is_ascii_whitespace() || *b == b')')
+        .next()?;
+    let file = info.splitn(3, |&b| b == b',').nth(2)?;
+    core::str::from_utf8(file).ok()
+}
+
 /// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
 /// frame first. An empty trace leaves the message untouched, so an engine that records none says
 /// nothing rather than printing a bare header.

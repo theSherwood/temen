@@ -968,6 +968,129 @@ fn a_threaded_program_given_an_argv_runs_on_the_bytecode_engine() {
     assert_eq!(run, Ok(Outcome::Returned(vec![])));
 }
 
+/// A nimony tree seeds a build with every file but its toolchain (`bin/`) and what a build wrote
+/// (`nimcache/`), in path order, under the directory the build has it at; a linked directory is
+/// walked like any other (the card's tree links nimony's `lib/` and `src/`).
+#[cfg(unix)]
+#[test]
+fn a_nimony_tree_seeds_its_files_in_path_order_without_bin_or_nimcache() {
+    let tree = std::env::temp_dir().join(format!("temen_nim_tree_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tree);
+    let lib = tree.with_extension("lib");
+    let _ = std::fs::remove_dir_all(&lib);
+    for (path, text) in [
+        (lib.join("std/sys.nim"), "sys"),
+        (lib.join("a.nim"), "a"),
+        (tree.join("prog.nim"), "prog"),
+        (tree.join("bin/nimony"), "the driver"),
+        (tree.join("nimcache/prog.p.nif"), "built"),
+        (tree.join("src/nimony/lib/nifcore.nim"), "nifcore"),
+        (tree.join("src/bin/kept.nim"), "kept"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+    }
+    std::os::unix::fs::symlink(&lib, tree.join("lib")).unwrap();
+    let files = temen_run::nim_tree_files(&tree, "/nim/");
+    let _ = (
+        std::fs::remove_dir_all(&tree),
+        std::fs::remove_dir_all(&lib),
+    );
+    let got: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("/nim/lib/a.nim", &b"a"[..]),
+            ("/nim/lib/std/sys.nim", b"sys"),
+            ("/nim/prog.nim", b"prog"),
+            ("/nim/src/bin/kept.nim", b"kept"),
+            ("/nim/src/nimony/lib/nifcore.nim", b"nifcore"),
+        ]
+    );
+}
+
+/// A build's library pack is what it wrote under its `nimcache/` for library modules — each module
+/// told by the source its `.p.nif` records, in nimony's `lib/` or `src/` — the plugins it built
+/// into the cache's root, and nimony's memos of the options it was built with, the program's too, in
+/// the order they were written, which is the order that keeps them newer than their sources when
+/// seeded.
+#[test]
+fn a_library_pack_is_the_librarys_cache_in_write_order() {
+    let mut host = temen_interp::Host::new();
+    let (_px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
+    // Any module's encoding: what a built plugin is.
+    let executable = temen_encode::encode_module(&load(
+        "memory 17\n\
+         func (i64) -> (i64) {\n\
+         block 0 (v0: i64) {\n\
+         \x20 return v0\n\
+           }\n\
+         }\n",
+    ));
+    let files: [(&str, &[u8]); 16] = [
+        ("/w/lib/std/sys.nim", b"proc x() = discard"),
+        ("/w/src/lib/nifcore.nim", b"proc y() = discard"),
+        ("/w/prog.nim", b"echo 1"),
+        // nimony's options memos (nim-lang/nimony#2616): the frontend's, and each program's backend one.
+        ("/w/nimcache/config.nif", b"(.nif24)\n(config (frontend))"),
+        (
+            "/w/nimcache/sys1.p.nif",
+            b"(.nif24)\n(stmts@,1,lib/std/sys.nim (proc))",
+        ),
+        (
+            "/w/nimcache/nif3.p.nif",
+            b"(.nif24)\n(stmts@,1,src/lib/nifcore.nim (proc))",
+        ),
+        (
+            "/w/nimcache/pro2.p.nif",
+            b"(.nif24)\n(stmts@,1,prog.nim (call))",
+        ),
+        ("/w/nimcache/sys1.s.nif", b"sem"),
+        ("/w/nimcache/nif3.s.nif", b"sem"),
+        ("/w/nimcache/pro2.s.nif", b"sem"),
+        // A plugin the library declares, which nimony links into the cache's root.
+        ("/w/nimcache/regex", &executable),
+        // The Temen backend's directory (nim-lang/nimony#2616): every module's `.x.nif`, and a
+        // directory for each program built.
+        ("/w/nimcache/t/sys1.x.nif", b"lowered"),
+        ("/w/nimcache/t/sys1/sys1.c.nif", b"lowered for sys1"),
+        ("/w/nimcache/t/pro2/sys1.c.nif", b"lowered for pro2"),
+        // The program: an executable too, but in its own directory.
+        ("/w/nimcache/t/pro2/prog.temen", &executable),
+        (
+            "/w/nimcache/t/pro2/config.nif",
+            b"(.nif24)\n(config (frontend) (backend))",
+        ),
+    ];
+    for (path, bytes) in files {
+        posix.write_file(path, bytes);
+    }
+    // Rewritten last: it goes where its latest write puts it.
+    posix.write_file("/w/nimcache/sys1.p.nif", files[4].1);
+    let pack = temen_run::nim_library_pack(&posix, "/w");
+    let names: Vec<&str> = pack.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "/w/nimcache/config.nif",
+            "/w/nimcache/nif3.p.nif",
+            "/w/nimcache/sys1.s.nif",
+            "/w/nimcache/nif3.s.nif",
+            "/w/nimcache/regex",
+            "/w/nimcache/t/sys1.x.nif",
+            "/w/nimcache/t/sys1/sys1.c.nif",
+            "/w/nimcache/t/pro2/config.nif",
+            "/w/nimcache/sys1.p.nif",
+        ]
+    );
+    assert!(pack
+        .iter()
+        .all(|(n, b)| posix.read_file(n).as_ref() == Some(b)));
+}
+
 // ----------------------------------------------------------------------------
 // §7 named capability imports (manifest binding, IMPORTS.md phase 4): a frontend
 // declares `extern`-style capability imports by name in the module manifest; the

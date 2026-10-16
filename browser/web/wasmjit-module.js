@@ -153,7 +153,7 @@ export function registryBlob(entries) {
 }
 
 // #958 — nimony's toolchain as the nim card ships it (`web/assets/nimony.blob.gz`, written by
-// `nimbuild --bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
+// temen-run's `nim_card_bundle`): a registry blob of `cwd`, the directory a build with it runs in (its library
 // pack names it); `commands`, as `temen_nim_open` takes them, nimony first; and `files`, what a build
 // seeds before its program — nimony's library, the library pack, the guest libc.
 export function nimToolchain(bundle) {

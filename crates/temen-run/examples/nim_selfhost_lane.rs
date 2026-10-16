@@ -450,26 +450,8 @@ fn main() {
     posix.set_cwd(&dir);
 
     // Seed the tree, where native nimony has it, and the guest libc where `temen-link` looks for it
-    // (`/lib/temen/libc.temeno`): every artifact is derived in-guest. The tree's `bin/` is the
-    // toolchain, which the guest has as commands, and its `nimcache/` is what a build writes, so
-    // neither is seeded. Sources go in first so everything a phase derives from them is genuinely
-    // newer — the memfs stamps write order into `st_mtim`, which is what the freshness checks in
-    // `deps.nim` and nifmake read.
-    let mut seed: Vec<(String, Vec<u8>)> = Vec::new();
-    for e in std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{dir}: {e}"))
-        .flatten()
-    {
-        let name = e.file_name().to_string_lossy().into_owned();
-        match (name.as_str(), e.path().is_dir()) {
-            ("bin" | "nimcache", _) => {}
-            (_, true) => collect(&e.path(), &format!("{dir}/{name}/"), &mut seed),
-            (_, false) => seed.push((
-                format!("{dir}/{name}"),
-                std::fs::read(e.path()).unwrap_or_else(|e| panic!("read {name}: {e}")),
-            )),
-        }
-    }
+    // (`/lib/temen/libc.temeno`): every artifact is derived in-guest.
+    let mut seed = temen_run::nim_tree_files(Path::new(&dir), &dir);
     assert!(
         seed.iter().any(|(k, _)| *k == format!("{dir}/{prog}")),
         "{prog} is not a file of {dir}"
