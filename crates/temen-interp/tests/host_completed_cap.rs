@@ -69,6 +69,7 @@ fn host_completed(recorded: &Recorded) -> (Host, i32) {
             let rec = Arc::clone(&rec);
             OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     (host, h)
@@ -86,6 +87,7 @@ fn pool_completed() -> (Host, i32) {
             }
             OffloadOutcome::Offload(Box::new(move || a + 100))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     (host, h)
@@ -170,6 +172,7 @@ fn host_completing_inside_submit_does_not_park() {
                 c.complete_host(id, a + 100);
             }))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let mut v = vcpu(&prog, host, h);
@@ -255,6 +258,7 @@ fn sync_ops_never_pay_for_the_host_posture() {
     let comps = host.completions();
     let h = host.grant_host_proc_offloadable(
         Box::new(|_op, args| OffloadOutcome::Done(Ok(vec![*args.first().unwrap_or(&0) + 100]))),
+        None,
         temen_interp::CapState::Stateless,
     );
     let mut v = vcpu(&prog, host, h);

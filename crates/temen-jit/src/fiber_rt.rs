@@ -363,6 +363,11 @@ pub(crate) enum ParkOn {
     Thread,
     /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
+    /// #2424 — a host call's answer from outside the run (a job on the embedder's offload pool,
+    /// which may wait on the world): never counted blocked, as an OS vCPU waiting outside is not
+    /// ([`crate::wait_outside`]), since it may yet end a peer's wait. The answer re-offers it
+    /// ([`crate::outside_waker`]).
+    Outside,
 }
 
 impl ParkOn {

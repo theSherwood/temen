@@ -346,6 +346,31 @@ pub unsafe fn wait_outside<R>(
     answer.filter(|_| back && !ended())
 }
 
+/// #2424 — what re-offers a §14 child's task parked on an answer from outside the run
+/// ([`crate::fiber_park_outside`]), for the thread that posts the answer to call: it re-offers the
+/// run's parked tasks, as a `notify` does, so the task sees its answer now rather than at the
+/// executor's next sweep. It holds the executor weakly: once the run has ended it does nothing.
+/// `None` off a task (an OS vCPU waits on the answer itself, [`wait_outside`]).
+///
+/// # Safety
+/// `trap_out` is a live JIT call's trap cell (its `VmCtx`).
+#[cfg(not(loom))]
+pub unsafe fn outside_waker(trap_out: *mut i64) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+    let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
+    if vm.sched.is_null() || !fiber_rt::in_task() {
+        return None;
+    }
+    let dom = current_domain(vm.sched as *const Domain);
+    let exec = lock(&dom.hub().child_exec)
+        .as_ref()
+        .map(std::sync::Arc::downgrade)?;
+    Some(std::sync::Arc::new(move || {
+        if let Some(exec) = exec.upgrade() {
+            exec.wake_all_parked_locked();
+        }
+    }))
+}
+
 /// #1826 — wake every host call parked on `key` ([`park_host_call`]): each re-checks its predicate.
 ///
 /// # Safety

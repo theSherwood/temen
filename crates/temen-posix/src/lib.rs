@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use temen_interp::{
     cap_id, CapState, ForkedProc, GuestMem, Host, HostBuffer, HostCharge, HostProc, HostProcFork,
-    NamedCapGrant, NodeRef, OpParks, SignalSource, Trap, TABLE_ENTRY,
+    NamedCapGrant, NodeRef, OpParks, ProcHandler, SignalSource, Trap, TABLE_ENTRY,
 };
 use temen_ir::ResolvedCap;
 
@@ -2910,7 +2910,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             {
                 drop(w);
                 return ForkedProc {
-                    handler: handler(Arc::clone(&world), Arc::clone(&existing)),
+                    handler: ProcHandler::Sync(handler(Arc::clone(&world), Arc::clone(&existing))),
                     signal: None,
                     refork: Some(fork_factory(Arc::clone(&world), existing)),
                     exit: None,
@@ -2977,7 +2977,7 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
             }
         });
         ForkedProc {
-            handler: handler(Arc::clone(&world), Arc::clone(&child)),
+            handler: ProcHandler::Sync(handler(Arc::clone(&world), Arc::clone(&child))),
             signal: Some((
                 Arc::new(SignalDoor(Arc::clone(&child), Arc::clone(&world))),
                 armed,
@@ -6139,6 +6139,14 @@ mod tests {
     use temen_jit::{compile_and_run_capture_reserved_with_host, JitOutcome};
     use temen_text::parse_module;
 
+    /// A forked process's handler, which this personality always mints synchronous.
+    fn sync(h: &mut ProcHandler) -> &mut HostProc {
+        match h {
+            ProcHandler::Sync(f) => f,
+            ProcHandler::Offloadable(_) => panic!("posix mints a synchronous handler"),
+        }
+    }
+
     /// Lock the personality's world + root proc (canonical order — see [`World`]) and build the
     /// [`Ctx`] dispatch view a test drives op methods through, as [`handler`] does.
     macro_rules! ctx {
@@ -6221,12 +6229,12 @@ mod tests {
         win[0..4].copy_from_slice(b"/sub");
         let mut mem = temen_interp::WindowMem::new(&mut win, 256);
         assert_eq!(
-            (first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
+            sync(&mut first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
             0,
             "chdir through the first entry"
         );
         assert!(
-            (second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
+            sync(&mut second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
             "getcwd through the second entry"
         );
         let got = &win[64..][..win[64..].iter().position(|&b| b == 0).unwrap_or(0)];
@@ -6373,7 +6381,7 @@ mod tests {
         let mut forked = cap_fork_factory(&posix)(7);
         // The twin installs a handler for signal 10 through its own dispatch.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         {
@@ -6392,7 +6400,7 @@ mod tests {
             );
         }
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the twin's own sigcheck delivers the pid-targeted signal"
         );
@@ -6413,22 +6421,22 @@ mod tests {
         );
         let mut forked = cap_fork_factory(&posix)(9);
         assert_eq!(
-            (forked.handler)(OP_GETPID, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_GETPID, &[], None, None).unwrap(),
             vec![9],
             "a twin's getpid is the pid fork() returned to its parent"
         );
         // Self-kill by own pid: handler + raise + sigcheck, all through the twin's dispatch.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, 0x99], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_KILL, &[9, 12], None, None).unwrap(),
             vec![0],
             "kill(own pid) short-circuits to self — no deadlock on the table entry"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99]
         );
     }
@@ -6480,11 +6488,11 @@ mod tests {
         let mut forked = cap_fork_factory(&posix)(7);
         // Deliverability on the twin: caught handler + registered signal stack.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGALTSTACK, &[0x500, 0x100], None, None).unwrap(),
             vec![0]
         );
         let (door, _armed) = forked.signal.as_ref().expect("the twin has its own door");
@@ -6597,7 +6605,7 @@ mod tests {
             // (Install handlers through the table procs directly — unit-level.)
         }
         assert_eq!(
-            (t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
+            sync(&mut t7.handler)(OP_SIGNAL, &[10, 0x71], None, None).unwrap(),
             vec![0]
         );
         {
@@ -6610,7 +6618,7 @@ mod tests {
             assert_eq!(st.kill(&[-77, 10]), ESRCH, "an empty group");
         }
         assert_eq!(
-            (t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut t7.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x71],
             "group member 7's own doorbell rang"
         );
@@ -6763,7 +6771,7 @@ mod tests {
         );
         // SIG_IGN'd SIGUSR2 (12): discarded at generation — a reset to SIG_DFL finds nothing.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_IGN], None, None).unwrap(),
             vec![SIG_DFL]
         );
         assert_eq!(
@@ -6771,7 +6779,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[12, SIG_DFL], None, None).unwrap(),
             vec![SIG_IGN]
         );
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -6784,7 +6792,8 @@ mod tests {
         // Masked SIGTERM (15): held pending; the unblock runs the default action.
         mem.write_bytes(64, &(1u64 << 15).to_le_bytes()).unwrap();
         assert_eq!(
-            (forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_BLOCK, 64, 0], Some(&mut mem), None)
+                .unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -6798,7 +6807,8 @@ mod tests {
             "a masked fatal signal is held"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGPROCMASK, &[SIG_UNBLOCK, 64, 0], Some(&mut mem), None)
+                .unwrap(),
             vec![0]
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -6895,12 +6905,12 @@ mod tests {
 
         // SIGKILL/SIGSTOP dispositions are immutable.
         assert_eq!(
-            (forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
+            sync(&mut forked3.handler)(OP_SIGNAL, &[SIGKILL as i64, 0x77], None, None).unwrap(),
             vec![EINVAL]
         );
         mem.write_bytes(128, &[0u8; 24]).unwrap();
         assert_eq!(
-            (forked3.handler)(
+            sync(&mut forked3.handler)(
                 OP_SIGACTION,
                 &[SIGSTOP as i64, 128, 0],
                 Some(&mut mem),
@@ -6910,7 +6920,7 @@ mod tests {
             vec![EINVAL]
         );
         assert_eq!(
-            (forked3.handler)(
+            sync(&mut forked3.handler)(
                 OP_SIGACTION,
                 &[SIGKILL as i64, 0, 128],
                 Some(&mut mem),
@@ -6974,7 +6984,7 @@ mod tests {
         );
         // While stopped: an ordinary signal is HELD — the twin's sigcheck stays empty.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[10, 0x77], None, None).unwrap(),
             vec![0]
         );
         assert_eq!(
@@ -6982,7 +6992,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0],
             "a stopped process delivers nothing"
         );
@@ -7009,13 +7019,13 @@ mod tests {
             "report-once"
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x77],
             "the held signal delivers after the continue"
         );
         // A CAUGHT SIGTSTP never stops: ordinary pending.
         assert_eq!(
-            (forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGNAL, &[SIGTSTP as i64, 0x99], None, None).unwrap(),
             vec![0]
         );
         dir.store(0, Ordering::SeqCst);
@@ -7024,7 +7034,7 @@ mod tests {
             vec![0]
         );
         assert_eq!(
-            (forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
+            sync(&mut forked.handler)(OP_SIGCHECK, &[], None, None).unwrap(),
             vec![0x99],
             "caught TSTP takes the pending path"
         );

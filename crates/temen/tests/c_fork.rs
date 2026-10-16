@@ -23,7 +23,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, Host, StreamRole, Value};
+use temen_interp::{run_with_host, Host, HostProc, ProcHandler, StreamRole, Value};
 use temen_text::parse_module as parse_module_raw;
 use temen_verify::verify_module;
 
@@ -34,6 +34,14 @@ use chibicc_mod::chibicc;
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
 use temen_ir::SpawnRec;
+
+/// A posix fork factory's handler, which it always mints synchronous.
+fn sync_handler(h: ProcHandler) -> HostProc {
+    match h {
+        ProcHandler::Sync(f) => f,
+        ProcHandler::Offloadable(_) => panic!("posix mints a synchronous handler"),
+    }
+}
 
 /// `src` with its spawn records (#1867), both detached and paid from the root's `Budget`: the fork
 /// server at 17536, the manager's child image of its func 1 (#2219), whose handle is the root's
@@ -1454,7 +1462,7 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -1562,7 +1570,7 @@ fn a_shell_appends_a_command_output_to_a_file() {
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -1674,7 +1682,7 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -1780,7 +1788,7 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -2155,7 +2163,7 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -2565,7 +2573,7 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     };
     let fs_cap = {
         let m = make(0);
-        host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
+        host.grant_host_proc_forkable(sync_handler(m.handler), make.clone(), m.state)
     };
 
     let mut fuel = 120_000_000u64;
@@ -2694,11 +2702,11 @@ int main(int argc, char **argv) {
 fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork {
     Arc::new(move |pid| {
         let forked = base(pid);
-        let mut inner = forked.handler;
+        let mut inner = sync_handler(forked.handler);
         temen_interp::ForkedProc {
-            handler: Box::new(move |_slot_op, args, mem, minter| {
+            handler: ProcHandler::Sync(Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
-            }),
+            })),
             signal: forked.signal,
             refork: forked.refork.map(opshift_fork),
             exit: forked.exit,

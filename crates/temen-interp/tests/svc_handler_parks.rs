@@ -353,6 +353,7 @@ fn a_handler_punt_parks_the_dispatch_not_the_serve_loop() {
                 111
             }))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
