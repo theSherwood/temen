@@ -6207,10 +6207,11 @@ struct ChildCodeKey {
     reserved_log2: u8,
     thunk: usize,
     /// Which cells the code's instances have, which decides the checks it emits
-    /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain, the nursery, and an access
-    /// table (#2164: a paged and an unpaged spawn of one module run two compiles).
-    cells: [bool; 5],
+    /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain and the nursery.
+    cells: [bool; 4],
     table_reserve_log2: u8,
+    /// The miss thunk a paged compile calls, or `0`: a paged and an unpaged spawn of one module run
+    /// two compiles (#2164).
     page_miss: usize,
 }
 
@@ -6228,7 +6229,6 @@ impl ChildCodeKey {
                 !a.fuel.is_null(),
                 !a.sched.is_null(),
                 !a.nursery.is_null(),
-                !a.pages.is_null(),
             ],
             table_reserve_log2: c.table_reserve_log2,
             page_miss: c.page_miss.map_or(0, |t| t as usize),
