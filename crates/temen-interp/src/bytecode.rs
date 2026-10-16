@@ -8314,6 +8314,10 @@ fn dbg_take_pool_answer(
         Some((_, _, comps, id)) if !comps.is_host_owned(*id) => {}
         _ => return false,
     }
+    let calls: Vec<_> = parked
+        .iter()
+        .map(|(_, _, comps, id)| (std::sync::Arc::clone(comps), *id))
+        .collect();
     loop {
         for (p, dst, comps, id) in &parked {
             if let Some(r) = comps.try_take(*id) {
@@ -8323,10 +8327,6 @@ fn dbg_take_pool_answer(
                 return true;
             }
         }
-        let calls: Vec<_> = parked
-            .iter()
-            .map(|(_, _, comps, id)| (std::sync::Arc::clone(comps), *id))
-            .collect();
         super::Completions::wait_any(&calls, None);
     }
 }
@@ -11481,25 +11481,25 @@ fn outstanding_calls(
     fibers: &[FiberState],
     extra_envs: &[ChildEnv],
 ) -> Vec<(Option<usize>, u64)> {
-    let cap_parked = |reg: &[FiberState], env: Option<usize>| -> Vec<(Option<usize>, u64)> {
-        reg.iter()
-            .filter_map(|f| match f {
-                FiberState::CapParked {
-                    id, woken: None, ..
-                } => Some((env, *id)),
-                _ => None,
-            })
-            .collect()
-    };
-    let mut calls = cap_parked(fibers, None);
-    for (k, e) in extra_envs.iter().enumerate() {
-        calls.extend(cap_parked(&e.fibers.fibers, Some(k)));
-    }
-    calls.extend(tasks.iter().filter_map(|t| match t.state {
+    let regs = std::iter::once((None, fibers)).chain(
+        extra_envs
+            .iter()
+            .enumerate()
+            .map(|(k, e)| (Some(k), &e.fibers.fibers[..])),
+    );
+    let fiber_calls = regs.flat_map(|(env, reg)| {
+        reg.iter().filter_map(move |f| match f {
+            FiberState::CapParked {
+                id, woken: None, ..
+            } => Some((env, *id)),
+            _ => None,
+        })
+    });
+    let task_calls = tasks.iter().filter_map(|t| match t.state {
         TaskState::BlockedHostCap { id, .. } => Some((t.env, id)),
         _ => None,
-    }));
-    calls
+    });
+    fiber_calls.chain(task_calls).collect()
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).

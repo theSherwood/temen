@@ -21200,11 +21200,6 @@ impl Completions {
         *self.notify.lock_unpoisoned() = f;
     }
 
-    /// Whether a hook is installed ([`Completions::set_notify`]).
-    pub fn has_notify(&self) -> bool {
-        self.notify.lock_unpoisoned().is_some()
-    }
-
     /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
     /// and completes them via `deliver_cap`, admitting [`OffloadOutcome::Host`] punts on this host.
     pub fn allow_host_completed(&self) {
@@ -23090,9 +23085,9 @@ pub struct Host {
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
     pending_inherited: Vec<(u32, StreamRole)>,
-    /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
-    /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
-    /// workers ([`OffloadPool`]'s `Drop`).
+    /// The §12 bounded blocking-offload pool, created lazily on the first punted call
+    /// ([`Host::punt_or_inline`]), so a `Host` that never offloads spawns no threads. Dropping it
+    /// joins the workers ([`OffloadPool`]'s `Drop`).
     pool: Option<OffloadPool>,
     /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
     /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
@@ -24010,8 +24005,10 @@ impl Host {
         //   * In-flight run state, not a capability — cloning it into a *second* live domain would
         //     double-drive it, so fork refuses even though a snapshot (which resumes the SAME domain,
         //     not a duplicate) serializes some of it: the serve queue/results (a twin re-serving the
-        //     same dispatches would double-execute — snapshot carries them to resume one domain), the
-        //     offload pool, §13.4 replay recording, and freeze residue (a freeze in progress).
+        //     same dispatches would double-execute — snapshot carries them to resume one domain),
+        //     §13.4 replay recording, and freeze residue (a freeze in progress). Not the offload
+        //     pool (#2424): its jobs are punted calls, which never touch the window and answer into
+        //     this domain's own store, so the twin, with a fresh store and pool, shares none of them.
         //   * `self_instance` is the run's own §3.5 reflection surface, re-registered by the embedder.
         // Fork is MORE capable than snapshot for: forkable host procs (a provider fork factory carries
         // them; snapshot cannot), and — carried in the twin below, not gated — shared regions, module
@@ -24025,7 +24022,6 @@ impl Host {
             && self.svc_queue.is_empty()
             && self.svc_results.is_empty()
             && self.self_instance.is_none()
-            && self.pool.is_none()
             // The §12 completion store is deliberately NOT gated (#799): its wake hook is per-run
             // executor wiring, not a capability — a root-domain personality `fork` must not fail
             // on it. The twin gets a fresh store (`Host::new`); its first park wires it to the
@@ -37641,6 +37637,59 @@ mod fork_powerbox_tests {
         assert!(
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"
+        );
+    }
+
+    /// #2424 — an offloadable host proc whose provider gave it a fork factory goes with a spawned
+    /// child and a fork twin, even after its domain has called it, and each new domain's call
+    /// punts into its own completion store.
+    #[test]
+    fn an_offloadable_host_proc_goes_with_a_child_and_a_twin() {
+        let offload = || -> OffloadHostProc {
+            Box::new(|_op, args| {
+                let x = args[0];
+                OffloadOutcome::Offload(Box::new(move || x + 1))
+            })
+        };
+        let mut parent = Host::new();
+        let h = parent.grant_host_proc_offloadable(
+            offload(),
+            Some(Arc::new(move |_pid| {
+                ForkedProc::offloadable(offload(), CapState::Stateless)
+            })),
+            CapState::Stateless,
+        );
+        let call = |host: &mut Host, handle: i32, x: i64| {
+            let mut id = None;
+            let r =
+                host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, handle, &[x], None, &mut id);
+            assert_eq!(r, Ok(vec![]), "a punted call answers later");
+            host.completions().wait(id.expect("the call punts"))
+        };
+        assert_eq!(call(&mut parent, h, 1), 2, "the parent's own call");
+        let mut child = Host::new();
+        let ch = parent
+            .regrant_into_child(h, &mut child)
+            .expect("an offloadable proc with a fork factory re-grants into a child");
+        let mut twin = parent
+            .fork_powerbox(7, 0)
+            .expect("a domain that has punted still forks");
+        assert_eq!(call(&mut child, ch, 10), 11, "the child's call");
+        assert_eq!(call(&mut twin, h, 20), 21, "the twin's call");
+        assert_eq!(
+            parent.completions().minted(),
+            1,
+            "the parent's store has only its own call"
+        );
+        assert_eq!(
+            child.completions().minted(),
+            1,
+            "the child's store has its call"
+        );
+        assert_eq!(
+            twin.completions().minted(),
+            1,
+            "the twin's store has its call"
         );
     }
 }
