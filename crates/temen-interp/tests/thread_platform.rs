@@ -890,7 +890,9 @@ fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<V
 }
 
 /// Run the root `root`, given `(instantiator, child module, budget)`, under `platform`, granting
-/// it `child` (its program) and a budget of `mem` bytes.
+/// it `child` (its program) and a budget of `mem` bytes. The root's window is flat, as executor 2's
+/// is in a browser: a tier-up over a window without a flat span runs interpreted (#1414 B6-3a), and
+/// the driver's own reservation is flat only where it is an `mmap`.
 fn run_detached_root(
     root: &str,
     platform: ThreadPlatform,
@@ -898,6 +900,8 @@ fn run_detached_root(
     child: &str,
 ) -> Result<Vec<Value>, Trap> {
     let m = module(root);
+    let size = 1 << m.memory.expect("the root has a window").size_log2;
+    let back = Region::owned_zeroed(size, temen_interp::host_page_size()).expect("a flat window");
     let mut host = Host::new();
     host.set_thread_platform(platform);
     let inst = host.grant_instantiator();
@@ -915,7 +919,7 @@ fn run_detached_root(
         &args,
         &mut fuel,
         &[],
-        None,
+        Some(Arc::new(back)),
         &mut host,
     )
     .expect("the parallel driver runs the module")
