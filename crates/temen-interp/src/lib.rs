@@ -2975,6 +2975,7 @@ fn relaunch_detached(
     child.durable = true;
     child.kill = Some(Arc::clone(&kflag));
     child.freeze_bell = Some(Arc::clone(&bell));
+    child.spawner_domain = Some(domain_key_of(spawner)); // #2455, as op 17 sets it
     child.window_lease = lease;
     // #2438 — a demand-paged child's faults go to its spawner's pager again, as op 17 wired them: its
     // unsupplied pages are still unmapped in its image. The codec checked the export against the
@@ -3282,8 +3283,17 @@ fn drive_over_cell(
                 // region (R4, #2025).
                 // #2438 — only a child that unwound. One that trapped, or that a deadlock teardown
                 // reaped before it reached its poll, keeps its window but has nothing to resume: it is
-                // unreached, never written as if it had unwound.
-                let out = sched.lock().results.remove(&p.child_task);
+                // unreached, never written as if it had unwound. So is one that ran to its end while
+                // its domain was held for its own paged children (#2455): it did not unwind.
+                let out = {
+                    let mut s = sched.lock();
+                    let unwound = s.unwound.contains(&p.child_task);
+                    s.withheld
+                        .remove(&p.child_task)
+                        .map(|w| w.outcome)
+                        .or_else(|| s.results.remove(&p.child_task))
+                        .filter(|_| unwound)
+                };
                 let Some(m) = out.filter(|o| o.result.is_ok()).and_then(|o| o.mem) else {
                     unreached.push(p);
                     continue;
@@ -3315,9 +3325,12 @@ fn drive_over_cell(
     }
     let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
+        // Whether the run froze: its root unwound. Some vCPU can have unwound in a run whose root
+        // then finished, held at `NORMAL` for its paged children (#2455): that run did not freeze.
+        let froze = s.unwound.contains(&root_id);
         // #1684 — every fiber slot the freeze did not flatten rides too: a fresh one (never
         // resumed) and a free one (its generation), so the thaw rebuilds the table slot for slot.
-        if s.froze {
+        if froze {
             host_shared
                 .lock_unpoisoned()
                 .frozen_fibers
@@ -3325,7 +3338,7 @@ fn drive_over_cell(
         }
         // #1685 — a thread that finished and was never joined rides the freeze as completed
         // residue at its join slot; the thaw hands its result to the rewound `join`.
-        if s.froze {
+        if froze {
             for (task, f) in std::mem::take(&mut s.finished_threads) {
                 let Some(Ok(r)) = s.results.get(&task).map(|o| join_outcome(o.result.clone()))
                 else {
@@ -3350,7 +3363,7 @@ fn drive_over_cell(
         // was in flight — a §14 child's backstop refusal, say — fails the run, though the root
         // itself unwound `Ok` before it. Otherwise the residue already recorded looks like a whole
         // freeze.
-        if let (Ok(_), Some(t)) = (&out.result, s.freeze_fault) {
+        if let (true, Ok(_), Some(t)) = (froze, &out.result, s.freeze_fault) {
             out.result = Err(t);
         }
         (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
@@ -5071,6 +5084,15 @@ impl Outcome {
     }
 }
 
+/// #2455 — a child that unwound while its spawner's domain was held ([`Sched::withheld`]).
+struct Withheld {
+    /// The child's own domain ([`domain_key_of`]), which a `kill` names.
+    domain: usize,
+    outcome: Outcome,
+    /// Its window's lease, handed back if a kill ends it ([`VCpu::window_lease`]).
+    lease: Option<(Arc<Mutex<Host>>, Lease)>,
+}
+
 /// What the first vCPU to trap recorded about *its own* trap — the run-shared, first-wins capture
 /// [`Sched::trap_origin`] holds and [`drive`] reports, rather than the root's join-site residue.
 struct TrapOrigin {
@@ -5436,7 +5458,9 @@ struct PagerRef {
 
 /// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
 /// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
-/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see.
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see. Both
+/// interpreters file and settle it through the pager's host ([`Host::request_page`],
+/// [`Host::settle_page`], #2164).
 struct PageSink {
     child: Mem,
     /// The page's child-relative base.
@@ -5448,36 +5472,38 @@ struct PageSink {
     off: u64,
 }
 
-/// §2.2 / #1862 — settle a `page(addr)` request: copy the page the pager's reply `value` names
-/// out of the **pager's own window** (`pager_mem`, the serving vCPU's) into the faulting child's,
-/// then mark it mapped. `value` is the pager-window address of the faulting byte's source; the
-/// page around it is `[value - off, value - off + len)`. Runs on the pager's vCPU at the settle,
-/// before the reply is delivered, so the pager cannot reuse its buffer before the copy. Returns
-/// the value to deliver: unchanged, or `EFAULT` when the pager's window cannot supply that range
-/// (the child's fault is then fatal, as a pagerless one is). A ticket with no sink (not a page
-/// request) passes through.
-fn supply_page_at_settle(
-    sched: &SchedRef,
-    pager: &Arc<Mutex<Host>>,
-    ticket: u64,
-    value: i64,
-    pager_mem: Option<&Mem>,
-) -> i64 {
-    let Some(sink) = sched.take_page_sink(pager, ticket) else {
-        return value;
-    };
-    if value < 0 {
-        return value;
-    }
-    let bytes = (value as u64)
-        .checked_sub(sink.off)
-        .and_then(|src| pager_mem?.read_bytes_impl(src, sink.len));
-    match bytes {
-        Some(b) => {
-            sink.child.supply_page(sink.page, &b);
-            value
+impl PageSink {
+    /// The sink for a recoverable fault at `addr` in `child`'s window: the host page around it.
+    fn at(child: &Mem, addr: u64) -> PageSink {
+        let page = addr / child.page * child.page;
+        PageSink {
+            child: child.fork_for_thread(),
+            page,
+            len: child.page.min(child.window.mapped() - page),
+            off: addr - page,
         }
-        None => EFAULT,
+    }
+
+    /// Settle the request: copy the page the pager's reply `value` names out of the **pager's own
+    /// window** (`pager_mem`, the serving vCPU's) into the faulting child's, then mark it mapped.
+    /// `value` is the pager-window address of the faulting byte's source; the page around it is
+    /// `[value - off, value - off + len)`. Returns the value to deliver: unchanged, or `EFAULT`
+    /// when the pager's window cannot supply that range (the child's fault is then fatal, as a
+    /// pagerless one is).
+    fn supply(self, value: i64, pager_mem: Option<&Mem>) -> i64 {
+        if value < 0 {
+            return value;
+        }
+        let bytes = (value as u64)
+            .checked_sub(self.off)
+            .and_then(|src| pager_mem?.read_bytes_impl(src, self.len));
+        match bytes {
+            Some(b) => {
+                self.child.supply_page(self.page, &b);
+                value
+            }
+            None => EFAULT,
+        }
     }
 }
 
@@ -5801,13 +5827,13 @@ impl ParkSite {
             | ParkSite::Stopped
             | ParkSite::StreamRead
             | ParkSite::Reply => FreezeRule::Reissue,
-            ParkSite::Join | ParkSite::Lane => FreezeRule::Phase,
-            // A `wait(-1)` needs a live fork twin (#1688). A faulting access is no call, and it cannot
-            // unwind until its page arrives (#1940). A completion is a host operation outside the cut
-            // (#1902). A durable caller never animates an offer, so never waits to enter one (#1681).
-            ParkSite::ReapAny | ParkSite::PageFault | ParkSite::Completion | ParkSite::Admit => {
-                FreezeRule::Decline
-            }
+            // A faulting access is no call to re-issue, and cannot unwind until its page arrives
+            // (#1940); a freeze holds its pager to serve it (#2455), so it waits, then unwinds.
+            ParkSite::Join | ParkSite::Lane | ParkSite::PageFault => FreezeRule::Phase,
+            // A `wait(-1)` needs a live fork twin (#1688). A completion is a host operation outside
+            // the cut (#1902). A durable caller never animates an offer, so never waits to enter one
+            // (#1681).
+            ParkSite::ReapAny | ParkSite::Completion | ParkSite::Admit => FreezeRule::Decline,
         }
     }
 }
@@ -5863,36 +5889,43 @@ impl Sched {
         }
     }
 
-    /// Take the vCPUs parked at `site` out of it; its parked fibers stay, unless `fibers_too`, when
-    /// they are dropped with it (a run's teardown).
+    /// Take the vCPUs parked at `site` out of it, of each domain `of` picks; its parked fibers stay,
+    /// unless `fibers_too`, when they are dropped with it (a run's teardown).
     #[allow(clippy::vec_box)]
-    fn take(&mut self, site: ParkSite, fibers_too: bool) -> Vec<Box<VCpu>> {
-        fn pick<T: DomainMember>(fibers_too: bool) -> impl FnMut(&T) -> bool {
-            move |e| fibers_too || e.vcpu().is_some()
+    fn take(
+        &mut self,
+        site: ParkSite,
+        fibers_too: bool,
+        of: &dyn Fn(usize) -> bool,
+    ) -> Vec<Box<VCpu>> {
+        fn pick<'a, T: DomainMember>(
+            fibers_too: bool,
+            of: &'a dyn Fn(usize) -> bool,
+        ) -> impl FnMut(&T) -> bool + 'a {
+            move |e| (fibers_too || e.vcpu().is_some()) && of(e.domain_key())
         }
         let f = fibers_too;
         match site {
-            ParkSite::Svc => drain_queues(&mut self.svc_waiters, pick(f)),
-            ParkSite::Futex => drain_queues(&mut self.wait_waiters, pick(f)),
-            ParkSite::PipeRead => drain_queues(&mut self.pipe_waiters, pick(f)),
-            ParkSite::PipeWrite => drain_queues(&mut self.pipe_write_waiters, pick(f)),
-            ParkSite::Reap => drain_queues(&mut self.posix_reap_waiters, pick(f)),
-            ParkSite::Stopped => drain_queues(&mut self.stopped, pick(f)),
-            ParkSite::StreamRead => drain_queues(&mut self.cap_waiters, pick(f)),
-            ParkSite::Join => drain_where(&mut self.join_waiters, pick(f)),
-            ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f)),
-            ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f)),
+            ParkSite::Svc => drain_queues(&mut self.svc_waiters, pick(f, of)),
+            ParkSite::Futex => drain_queues(&mut self.wait_waiters, pick(f, of)),
+            ParkSite::PipeRead => drain_queues(&mut self.pipe_waiters, pick(f, of)),
+            ParkSite::PipeWrite => drain_queues(&mut self.pipe_write_waiters, pick(f, of)),
+            ParkSite::Reap => drain_queues(&mut self.posix_reap_waiters, pick(f, of)),
+            ParkSite::Stopped => drain_queues(&mut self.stopped, pick(f, of)),
+            ParkSite::StreamRead => drain_queues(&mut self.cap_waiters, pick(f, of)),
+            ParkSite::Join => drain_where(&mut self.join_waiters, pick(f, of)),
+            ParkSite::Lane => drain_where(&mut self.lane_waiters, pick(f, of)),
+            ParkSite::ReapAny => drain_where(&mut self.reap_any_waiters, pick(f, of)),
             ParkSite::Reply => {
-                let mut pick = pick(f);
+                let mut pick = pick(f, of);
                 drain_where(&mut self.ticket_waiters, |e| is_reply(e) && pick(e))
             }
             ParkSite::PageFault => {
-                drain_where(&mut self.ticket_waiters, |e: &((usize, u64), Waiter)| {
-                    !is_reply(e)
-                })
+                let mut pick = pick(f, of);
+                drain_where(&mut self.ticket_waiters, |e| !is_reply(e) && pick(e))
             }
-            ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f)),
-            ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f)),
+            ParkSite::Completion => drain_where(&mut self.completion_waiters, pick(f, of)),
+            ParkSite::Admit => drain_queues(&mut self.admit_waiters, pick(f, of)),
         }
     }
 }
@@ -6030,17 +6063,18 @@ fn client_gone_locked(s: &mut Sched, service: usize) {
 }
 
 /// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
-/// releases: its §2.2 pager, and — for a §14 child's entry vCPU (the one vCPU with a `freeze_bell`):
-/// the child domain's end, not a thread of it finishing — the
-/// provider of every live offer its powerbox still holds ([`Binding::LiveImpl`], the re-granted
-/// `child_offer` shape). Instanced offers (CALLS.md 4x, animated on the caller's own vCPU) never
-/// park a provider on this client, so they are not listed. Locks the host cells briefly, never
-/// nested; call it before taking the scheduler lock.
+/// releases. Only a §14 child's entry vCPU (the one vCPU with a `freeze_bell`) has any: its end is
+/// the child domain's, where a thread of it finishing is not. They are its §2.2 pager, which its
+/// threads share (#2164), and the provider of every live offer its powerbox still holds
+/// ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers (CALLS.md 4x,
+/// animated on the caller's own vCPU) never park a provider on this client, so they are not
+/// listed. Locks the host cells briefly, never nested; call it before taking the scheduler lock.
 fn client_gone_targets(v: &VCpu) -> Vec<usize> {
-    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
-    if v.freeze_bell.is_some() {
-        cells.extend(v.host.lock_unpoisoned().live_offer_providers());
+    if v.freeze_bell.is_none() {
+        return Vec::new();
     }
+    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
+    cells.extend(v.host.lock_unpoisoned().live_offer_providers());
     let mut ids: Vec<usize> = cells
         .iter()
         .map(|c| c.lock_unpoisoned().domain_id() as usize)
@@ -6209,11 +6243,6 @@ struct Sched {
     /// that itself dies (its reply never comes). Bounded by in-flight-calls-across-a-death, not by
     /// call volume.
     orphan_tickets: BTreeSet<(usize, u64)>,
-    /// §2.2 / #1862 — the page each in-flight `page(addr)` request supplies, keyed like
-    /// [`Sched::ticket_waiters`] by `(pager domain id, ticket)`. Filed by the faulting child in
-    /// the same scheduler critical section as its enqueue, so the pager can never settle the
-    /// request before its sink exists; taken at the settle ([`supply_page_at_settle`]).
-    page_sinks: BTreeMap<(usize, u64), PageSink>,
     /// §3.6 slice 3 — serving vCPUs parked in `svc.wait` on an empty queue, keyed by their
     /// domain identity (the powerbox `Arc` pointer — all vCPUs of a domain share it). Woken by
     /// a caller's enqueue ([`Scheduler::svc_wake`]); resume re-executes the `svc.wait`.
@@ -6306,6 +6335,14 @@ struct Sched {
     /// #1685 — the vCPUs that finished by unwinding for the freeze: their results are placeholders,
     /// so a `join` that takes one is re-issued on thaw rather than reloaded.
     unwound: std::collections::BTreeSet<TaskId>,
+    /// #2455 — leaves-first: a domain ([`domain_key_of`]) that pages live detached children when a
+    /// freeze reaches it is **held** at `NORMAL`, so it keeps serving their faults, until each child
+    /// it waits on here has ended. Then [`release_hold`] lets it unwind ([`hold_for_paged`]).
+    held: BTreeMap<usize, std::collections::BTreeSet<TaskId>>,
+    /// #2455 — a child that unwound while its spawner's domain was held. Its outcome is kept from
+    /// `results`, so to its spawner, which runs on, it reads as running, as the spawner's own cut will
+    /// record it; the harvest takes it, and a `kill` ends it ([`kill_withheld`]).
+    withheld: BTreeMap<TaskId, Withheld>,
     /// #1689 — the first trap of any vCPU (a fork twin's excepted) that finished once the freeze was
     /// in flight. `drive` fails the run with it: a freeze with a failed member is not a freeze.
     freeze_fault: Option<Trap>,
@@ -6761,9 +6798,12 @@ impl Scheduler {
     /// fiber early-probe, so the pair can't deadlock.
     fn cap_reply_or_stash(&self, ticket: u64, result: i64, callee: &Arc<Mutex<Host>>) {
         let mut s = self.lock();
-        let callee_id = callee.lock_unpoisoned().domain_id() as usize;
-        // #1862 — a page request settled without a copy (an error reply) drops its sink here.
-        s.page_sinks.remove(&(callee_id, ticket));
+        let callee_id = {
+            let mut c = callee.lock_unpoisoned();
+            // #1862 — a page request answered without a settle (an error reply) drops its sink.
+            c.page_sinks.remove(&ticket);
+            c.domain_id() as usize
+        };
         match s.ticket_waiters.remove(&(callee_id, ticket)) {
             Some(Waiter::VCpu(mut v)) => {
                 v.pending = Some(Pending::CapResult(result));
@@ -7642,6 +7682,7 @@ fn kill_child_locked(s: &mut Sched, flag: &AtomicBool, host: Option<&Arc<Mutex<H
     if let Some(h) = host {
         let key = h.lock_unpoisoned().domain_id() as usize;
         teardown_domain(s, key, &Trap::ThreadFault, h);
+        kill_withheld(s, key, h); // #2455 — one that unwound while its spawner was held
     }
 }
 
@@ -7717,6 +7758,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         wake_reap_any(s, id); // a `wait(-1)` caller reaps this twin if no named waiter claimed it
     }
     s.results.insert(id, outcome);
+    end_hold_member(s, id); // #2455
     s.live -= 1;
     if s.live == 0 {
         s.shutdown = true;
@@ -7856,7 +7898,7 @@ fn teardown_run(s: &mut Sched) {
     // waiters, whose reap drops their `admit_parked`); a parked fiber's stack dies with it.
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     for site in ParkSite::ALL {
-        victims.extend(s.take(site, true));
+        victims.extend(s.take(site, true, &|_| true));
     }
     s.reap_pending.clear();
     for v in victims {
@@ -8062,13 +8104,145 @@ fn freeze_in_flight(s: &Sched) -> bool {
 }
 
 /// #1584 — would [`admit_parks_for_freeze`] re-admit anything? A vCPU at a [`FreezeRule::Reissue`]
-/// site; a joiner or lane waiter is woken by something else, and a fiber park is its owner's
-/// `freeze_drive`'s. Without this an in-flight freeze with only those left would spin the worker loop
-/// instead of falling through to the deadlock check.
+/// site, outside a held domain (#2455); a joiner or lane waiter is woken by something else, and a
+/// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
+/// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
-    ParkSite::ALL
+    ParkSite::ALL.iter().any(|&site| {
+        site.freeze_rule() == FreezeRule::Reissue
+            && s.parked(site)
+                .iter()
+                .any(|v| !s.held.contains_key(&domain_key_of(v)))
+    })
+}
+
+/// #2455 — **leaves first.** A paged child's pages arrive only through its pager's serve loop, so a
+/// child that faults on its way to a safepoint unwinds only once its pager has served the fault. A
+/// freeze must not take a pager down while a child it pages still runs: a freeze that reaches a
+/// domain paging live detached children **holds** it instead. The domain's phase stays `NORMAL`, so
+/// it runs on and serves. Each such child is rung now and its parks are brought through the freeze
+/// ([`reach`]), and the hold waits on them ([`Sched::held`]) until [`release_hold`] lets the domain
+/// unwind after them. `me` is the running vCPU, whose tables the scheduler does not hold. Answers
+/// whether `domain` is held.
+fn hold_for_paged(s: &mut Sched, domain: usize, me: Option<&Seat>) -> bool {
+    let mut rung: Vec<(Arc<AtomicBool>, TaskId, usize)> = Vec::new();
+    {
+        let others: Vec<Seat> = scheduled_vcpus(s)
+            .into_iter()
+            .filter(|v| domain_key_of(v) == domain)
+            .map(VCpu::seat)
+            .collect();
+        for seat in me.into_iter().chain(others.iter()) {
+            for (slot, (bell, spawn)) in seat.child_freeze {
+                let Some(&Some(cid)) = seat.threads.get(*slot) else {
+                    continue;
+                };
+                let live = spawn.pager.is_some()
+                    && !s.results.contains_key(&cid)
+                    && !s.unwound.contains(&cid);
+                if let (true, Some(h)) = (live, seat.child_hosts.get(slot)) {
+                    rung.push((
+                        Arc::clone(bell),
+                        cid,
+                        h.lock_unpoisoned().domain_id() as usize,
+                    ));
+                }
+            }
+        }
+    }
+    if rung.is_empty() {
+        return s.held.contains_key(&domain);
+    }
+    for (bell, cid, child_domain) in rung {
+        bell.store(true, Ordering::Relaxed);
+        s.held.entry(domain).or_default().insert(cid);
+        reach(s, child_domain);
+    }
+    true
+}
+
+/// #2455 — the freeze reaches `domain`'s parks: it is held if it pages live children
+/// ([`hold_for_paged`]); otherwise each of its parks follows its site's rule ([`admit_parks`]).
+fn reach(s: &mut Sched, domain: usize) {
+    if !hold_for_paged(s, domain, None) {
+        admit_parks(s, &|d| d == domain);
+    }
+}
+
+/// #2455 — `id` has ended (unwound, returned, trapped or been killed): the hold that waits on it, if
+/// any, no longer does, and is released once it waits on nothing.
+fn end_hold_member(s: &mut Sched, id: TaskId) {
+    let Some(domain) = s
+        .held
         .iter()
-        .any(|&site| site.freeze_rule() == FreezeRule::Reissue && !s.parked(site).is_empty())
+        .find(|(_, waits)| waits.contains(&id))
+        .map(|(&d, _)| d)
+    else {
+        return;
+    };
+    let waits = s.held.get_mut(&domain).expect("found just above");
+    waits.remove(&id);
+    if waits.is_empty() {
+        release_hold(s, domain);
+    }
+}
+
+/// #2455 — the children a held domain waited on have all ended, so the freeze reaches the domain now:
+/// each of its vCPUs takes the `UNWINDING` phase, which the `dispatch` prologue writes into the window
+/// before it runs, and its parks follow their rules ([`reach`]). A join parked on a child whose unwind
+/// was withheld would wait for an end that has already come, so it wakes, and re-issues as a join on
+/// any child the freeze unwound does (#1904).
+fn release_hold(s: &mut Sched, domain: usize) {
+    s.held.remove(&domain);
+    let ends: Vec<TaskId> = s
+        .withheld
+        .keys()
+        .copied()
+        .filter(|c| {
+            s.join_waiters
+                .get(c)
+                .is_some_and(|v| domain_key_of(v) == domain)
+        })
+        .collect();
+    for child in ends {
+        let joiner = s.join_waiters.remove(&child).expect("filtered just above");
+        s.runnable.push_back(joiner);
+    }
+    for v in s.runnable.iter_mut() {
+        if domain_key_of(v) == domain && v.dstate != STATE_REWINDING {
+            v.dstate = STATE_UNWINDING;
+        }
+    }
+    reach(s, domain);
+}
+
+/// #2455 — a `kill` of a child whose unwind is withheld ends it, as a kill of a running child does:
+/// its outcome becomes the kill's, its window goes back to its budget ([`reap`]), and a join on it
+/// wakes. The spawner's cut is past the kill, so the child must not ride the artifact.
+fn kill_withheld(s: &mut Sched, domain: usize, host: &Arc<Mutex<Host>>) {
+    let Some(id) = s
+        .withheld
+        .iter()
+        .find(|(_, w)| w.domain == domain)
+        .map(|(&id, _)| id)
+    else {
+        return;
+    };
+    let w = s.withheld.remove(&id).expect("found just above");
+    host.lock_unpoisoned().release_memory();
+    if let Some((cell, lease)) = w.lease {
+        cell.lock_unpoisoned().release_detached(lease);
+    }
+    s.unwound.remove(&id);
+    if let Some(joiner) = s.join_waiters.remove(&id) {
+        s.runnable.push_back(joiner);
+    }
+    let outcome = Outcome {
+        result: Err(Trap::ThreadFault),
+        mem: None,
+        ..w.outcome
+    };
+    s.results.insert(id, outcome);
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -8096,11 +8270,29 @@ fn freeze_can_admit(s: &Sched) -> bool {
 ///
 /// A parked **fiber** stays where it is: its owner's `freeze_drive` purges and flattens it (§13.4
 /// step 2), and the thaw re-issues its wait.
+///
+/// #2455 — leaves first: a domain paging live children is held instead, and its parks wait for the
+/// hold's release ([`hold_for_paged`]).
 fn admit_parks_for_freeze(s: &mut Sched) {
+    let parked: BTreeSet<usize> = ParkSite::ALL
+        .iter()
+        .flat_map(|&site| s.parked(site))
+        .map(domain_key_of)
+        .collect();
+    for domain in parked {
+        hold_for_paged(s, domain, None);
+    }
+    let held: BTreeSet<usize> = s.held.keys().copied().collect();
+    admit_parks(s, &|d| !held.contains(&d));
+}
+
+/// The parks of each domain `of` picks, through the freeze by their sites' rules
+/// ([`admit_parks_for_freeze`]).
+fn admit_parks(s: &mut Sched, of: &dyn Fn(usize) -> bool) {
     for site in ParkSite::ALL {
         match site.freeze_rule() {
             FreezeRule::Reissue => {
-                for mut v in s.take(site, false) {
+                for mut v in s.take(site, false, of) {
                     v.dstate = STATE_UNWINDING;
                     match site {
                         // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
@@ -8130,7 +8322,9 @@ fn admit_parks_for_freeze(s: &mut Sched) {
             }
             FreezeRule::Phase => {
                 for v in s.parked_mut(site) {
-                    v.dstate = STATE_UNWINDING;
+                    if of(domain_key_of(v)) {
+                        v.dstate = STATE_UNWINDING;
+                    }
                 }
             }
             // The census declined a freeze with a vCPU parked here before it began.
@@ -8728,6 +8922,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
                 let key = domain_key_of(&v);
+                let spawner_domain = v.spawner_domain;
                 let dying_host = Arc::clone(&v.host);
                 let own_tickets: Vec<u64> = v
                     .handler_parks
@@ -8757,12 +8952,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // service it could have called (its pager, its granted live offers).
                 let gone = client_gone_targets(&v);
                 // A detached child's window goes back to the budget that paid for it (no lock held
-                // here). Never during a freeze unwind: the child is captured, not ended.
-                if !froze {
-                    if let Some((cell, lease)) = v.window_lease.take() {
+                // here). Never during a freeze unwind: the child is captured, not ended, unless a kill
+                // ends it while its unwind is withheld (#2455, [`kill_withheld`]).
+                let frozen_lease = match v.window_lease.take() {
+                    Some((cell, lease)) if !froze => {
                         cell.lock_unpoisoned().release_detached(lease);
+                        None
                     }
-                }
+                    kept => kept,
+                };
                 // #1685 — a durable thread that finished cleanly: its result must ride a freeze
                 // until it is joined.
                 let finished_thread = match &v.spawn_residue {
@@ -8804,6 +9002,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 if froze {
                     s.unwound.insert(id);
                 }
+                // #2455 — a child that unwound while its spawner's domain is held is withheld from the
+                // spawner, which runs on: until the hold releases, it reads as still running.
+                let withhold = froze && spawner_domain.is_some_and(|d| s.held.contains_key(&d));
                 if s.froze && !s.forked_twins.contains_key(&id) {
                     if let Err(t) = &outcome.result {
                         s.freeze_fault.get_or_insert(*t);
@@ -8867,17 +9068,30 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     }
                 }
                 let died: Option<Trap> = outcome.result.as_ref().err().cloned();
-                if let Some(parent) = s.join_waiters.remove(&id) {
-                    s.runnable.push_back(parent);
-                    sched.work.notify_one();
-                } else if wake_reap_any(&mut s, id) {
-                    // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
-                    sched.work.notify_one();
+                // A withheld child's join wakes when the hold releases ([`release_hold`]).
+                if !withhold {
+                    if let Some(parent) = s.join_waiters.remove(&id) {
+                        s.runnable.push_back(parent);
+                        sched.work.notify_one();
+                    } else if wake_reap_any(&mut s, id) {
+                        // a `wait(-1)` caller reaps this twin (no named `wait(pid)` claimed it).
+                        sched.work.notify_one();
+                    }
                 }
                 if let Some(f) = finished_thread {
                     s.finished_threads.insert(id, f);
                 }
-                s.results.insert(id, outcome);
+                if withhold {
+                    let w = Withheld {
+                        domain: key,
+                        outcome,
+                        lease: frozen_lease,
+                    };
+                    s.withheld.insert(id, w);
+                } else {
+                    s.results.insert(id, outcome);
+                }
+                end_hold_member(&mut s, id);
                 s.live -= 1;
                 // Domain lifetime & teardown (DESIGN.md §12 / ISSUES.md I37, owner 2026-07-24):
                 // executors never anchor a domain's lifetime — ownership does. `exit(n)` or any trap
@@ -8907,7 +9121,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     sched.work.notify_all();
                     return;
                 };
-                if s.results.contains_key(&child) {
+                // #2455 — a child whose unwind is withheld has ended once the joiner's domain is no
+                // longer held.
+                let ended = s.results.contains_key(&child)
+                    || (s.withheld.contains_key(&child)
+                        && !s.held.contains_key(&domain_key_of(&v)));
+                if ended {
                     // Already finished between the join check and here — resume immediately.
                     s.runnable.push_back(v);
                     sched.work.notify_one();
@@ -9187,26 +9406,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     return;
                 };
                 // #1862: the pager gets the fault address in the child's own coordinates, and its
-                // reply is copied into the child through the sink filed here. Enqueue and sink are
-                // one scheduler critical section (lock order sched → host), so the pager cannot
-                // settle the request before its sink exists.
+                // reply is copied into the child through the sink filed with the request.
                 let (ticket, pager_id) = {
                     let m = v.mem.as_ref().expect("a demand child has a window");
-                    let page = addr / m.page * m.page;
-                    let sink = PageSink {
-                        child: m.fork_for_thread(),
-                        page,
-                        len: m.page.min(m.window.mapped() - page),
-                        off: addr - page,
-                    };
-                    let mut s = sched.lock();
+                    let sink = PageSink::at(m, addr);
                     let mut cg = pb.cell.lock_unpoisoned();
-                    let id = cg.domain_id();
-                    let t = cg.svc_enqueue(pb.export, 0, vec![addr as i64]);
-                    if let Some(t) = t {
-                        s.page_sinks.insert((id as usize, t), sink);
-                    }
-                    (t, id)
+                    (cg.request_page(pb.export, sink), cg.domain_id())
                 };
                 let Some(t) = ticket else {
                     // Full pager queue is backpressure, not a trap: requeue and re-fault (the access
@@ -9425,17 +9630,6 @@ enum SchedRef {
 }
 
 impl SchedRef {
-    /// §2.2 / #1862 — take the page sink filed for `pager`'s dispatch `ticket`, if that dispatch is
-    /// a page request. The explorer runs no demand children, so it never has one.
-    fn take_page_sink(&self, pager: &Arc<Mutex<Host>>, ticket: u64) -> Option<PageSink> {
-        match self {
-            SchedRef::Real(s) => {
-                let id = pager.lock_unpoisoned().domain_id() as usize;
-                s.lock().page_sinks.remove(&(id, ticket))
-            }
-            SchedRef::Det(_) => None,
-        }
-    }
     fn spawn(&self, make: impl FnOnce(TaskId) -> Box<VCpu>) -> Option<TaskId> {
         match self {
             SchedRef::Real(s) => s.spawn(make),
@@ -9574,6 +9768,40 @@ impl SchedRef {
         match self {
             SchedRef::Real(s) => s.lock().results.contains_key(&id),
             SchedRef::Det(d) => d.lock().results.contains_key(&id),
+        }
+    }
+    /// #2455 — a freeze reached `domain` at `me`: hold the domain if it pages live children
+    /// ([`hold_for_paged`]). The explorer has no durable freeze.
+    fn hold_for_paged(&self, domain: usize, me: &Seat) -> bool {
+        match self {
+            SchedRef::Real(s) => {
+                let held = hold_for_paged(&mut s.lock(), domain, Some(me));
+                s.work.notify_all();
+                held
+            }
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// #2455 — whether `domain` is held for its paged children.
+    fn held(&self, domain: usize) -> bool {
+        match self {
+            SchedRef::Real(s) => s.lock().held.contains_key(&domain),
+            SchedRef::Det(_) => false,
+        }
+    }
+    /// #2455 — `domain`, at `me`, has spawned a paged child. If the freeze has reached it (it is
+    /// `unwinding`, or held), it holds for the child as for any other ([`hold_for_paged`]).
+    fn hold_spawn(&self, domain: usize, me: &Seat, unwinding: bool) -> bool {
+        match self {
+            SchedRef::Real(s) => {
+                let mut g = s.lock();
+                let held = (unwinding || g.held.contains_key(&domain))
+                    && hold_for_paged(&mut g, domain, Some(me));
+                drop(g);
+                s.work.notify_all();
+                held
+            }
+            SchedRef::Det(_) => false,
         }
     }
     /// `Instantiator.kill` (#2074): [`kill_child_locked`] on this run's scheduler.
@@ -11598,6 +11826,14 @@ struct VCpu {
     /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
     /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
     freeze_bell: Option<Arc<AtomicBool>>,
+    /// #2455 — on a detached child's root, its spawner's domain ([`domain_key_of`]): while that
+    /// domain is held for a leaves-first freeze ([`Sched::held`]), this child's unwind is withheld
+    /// from it.
+    spawner_domain: Option<usize>,
+    /// #2455 — this vCPU's bell found its domain paging live children, so the domain is held at
+    /// `NORMAL` ([`hold_for_paged`]) instead of unwinding; the bell is not asked again until the hold
+    /// releases, which puts the domain's phase to `UNWINDING`.
+    held_for_paged: bool,
     /// The window a detached spawn spent on this vCPU — `(parent powerbox, budget, bytes)` — on a
     /// detached child's root only. Its bytes go back to that budget when the child ends (the `Done`
     /// arm, or [`reap`] at a teardown): `Budget.mem` accounts live windows (owner, 2026-09-29), the
@@ -11787,6 +12023,8 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
@@ -11866,6 +12104,8 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
@@ -11960,6 +12200,8 @@ impl VCpu {
             debug: None,
             kill: None,
             freeze_bell: None,
+            spawner_domain: None,
+            held_for_paged: false,
             window_lease: None,
             live: LiveVcpu::none(),
             sig_handler_stack: Vec::new(),
@@ -12792,7 +13034,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         chain,
         cur,
         fault_pager,
-        pager: _,
+        pager,
         page_fault: _,
         reply_ticket: _,
         frames,
@@ -12829,6 +13071,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         debug,
         kill,
         freeze_bell,
+        spawner_domain: _, // read where the vCPU ends (`Done`)
+        held_for_paged,
         sig_handler_stack,
         child_kill,
         child_freeze,
@@ -12868,19 +13112,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // (its freeze word now reads `UNWINDING`). If the cut cannot complete, put the word back to
     // `NORMAL` before any poll reads it — nothing has unwound, so the run continues untouched — and
     // record the decline on the run root's powerbox for the embedder.
-    macro_rules! freeze_census_at_trigger {
-        ($m:expr) => {{
-            let seat = Seat {
+    //
+    // #2455 — a cut that can complete reaches this domain now: if it pages live children it is held
+    // instead, back at `NORMAL`, to serve them until they have unwound ([`hold_for_paged`]).
+    macro_rules! seat {
+        () => {
+            Seat {
                 id: *id,
                 threads: threads.as_slice(),
                 child_hosts: &*child_hosts,
                 child_freeze: &*child_freeze,
                 host: &*host,
                 registry: &*registry,
-            };
+            }
+        };
+    }
+    macro_rules! freeze_census_at_trigger {
+        ($m:expr) => {{
+            let seat = seat!();
             if let Some(d) = freeze_census(Some(&seat), sched, host) {
                 $m.durable_set_state(STATE_NORMAL);
                 host.lock_unpoisoned().freeze_declined = Some(d);
+            } else if sched.hold_for_paged(sig_domain, &seat) {
+                $m.durable_set_state(STATE_NORMAL);
             }
         }};
     }
@@ -13498,13 +13752,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // a doorbell for it (#15). Idempotent, and placed here rather than at a safepoint for the
             // same reason `kill` is — a child must be reachable even in a loop with no back-edge.
             // Free when unarmed (`None`); when armed, one relaxed load per op.
+            //
+            // #2455 — unless this domain pages live children: then it is held, still `NORMAL`, to
+            // serve them until they have unwound ([`hold_for_paged`]), and the bell is not asked again.
             if freeze_bell
                 .as_deref()
                 .is_some_and(|b| b.load(Ordering::Relaxed))
+                && !*held_for_paged
             {
                 if let Some(m) = mem.as_mut() {
                     if m.durable_state() == STATE_NORMAL {
-                        m.durable_set_state(STATE_UNWINDING);
+                        if sched.hold_for_paged(sig_domain, &seat!()) {
+                            *held_for_paged = true;
+                        } else {
+                            m.durable_set_state(STATE_UNWINDING);
+                        }
                     }
                 }
             }
@@ -14097,7 +14359,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i32(&frames[top].vals, *args.first().ok_or(Trap::Malformed)?)?;
                             let slot = resolve_thread(threads, ch)?;
                             if let Some(flag) = child_kill.get(&slot) {
+                                // #2455 — a kill can end the last child this domain is held for. The
+                                // release then reaches every vCPU of the domain but this running one,
+                                // which takes the freeze itself.
+                                let held = durable && sched.held(sig_domain);
                                 sched.kill_child(flag, child_hosts.get(&slot));
+                                if held && !sched.held(sig_domain) {
+                                    if let Some(m) = mem.as_mut() {
+                                        m.durable_set_state(STATE_UNWINDING);
+                                    }
+                                }
                             }
                             frames[top].vals.push(Reg::from_i32(0));
                         }
@@ -14432,6 +14703,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         child.freeze_bell = Some(bell_child); // and so does the freeze
+                                        child.spawner_domain = Some(sig_domain); // #2455
                                         child.window_lease = Some(lease); // its window's bytes, until it ends
                                         if let Some((cell, export)) = pager_for_child {
                                             child.pager = Some(PagerRef { cell, export });
@@ -14463,6 +14735,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             frames[top]
                                                 .vals
                                                 .push(Reg::from_i32((threads.len() - 1) as i32));
+                                            // #2455 — a domain the freeze has reached that now pages
+                                            // a live child holds for it, as at the trigger: one still
+                                            // unwinding goes back to `NORMAL`, to serve the child
+                                            // until it has unwound.
+                                            if pager_export.is_some() && durable {
+                                                let unwinding = mem.as_ref().is_some_and(|m| {
+                                                    m.durable_state() == STATE_UNWINDING
+                                                });
+                                                if sched.hold_spawn(sig_domain, &seat!(), unwinding)
+                                                    && unwinding
+                                                {
+                                                    if let Some(m) = mem.as_mut() {
+                                                        m.durable_set_state(STATE_NORMAL);
+                                                    }
+                                                }
+                                            }
                                         }
                                         None => {
                                             // #2268 — and its window's own charge, as it started.
@@ -14579,9 +14867,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 if !run.replied {
                                     // #1862: a page request's bytes move now, from this serving
                                     // vCPU's window, before the reply can wake the child.
-                                    let value = supply_page_at_settle(
-                                        sched,
-                                        host,
+                                    let value = host.lock_unpoisoned().settle_page(
                                         run.ticket,
                                         value,
                                         mem.as_ref(),
@@ -16290,6 +16576,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // flag, so killing the §14 child terminates its whole thread subtree; `None` (root
                     // / top-level thread) stays unkillable.
                     let kill_inherit = kill.clone();
+                    // §2.2 / #2164 — and its pager: the thread runs over the same demand-paged window,
+                    // whose pages the pager supplies whichever vCPU touches one first.
+                    let pager_inherit = pager.clone();
                     // #2001 — the thread is one `spawn` of its domain's node while it lives: a full
                     // ceiling refuses it as the live cap does (dropped with the closure if that does).
                     let mut h = host.lock_unpoisoned();
@@ -16328,6 +16617,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.spawn_residue = Some((entry, vec![spv, av], slot));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
+                        child.fault_pager = pager_inherit.is_some();
+                        child.pager = pager_inherit;
                         child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         child.live = live;
                         Box::new(child)
@@ -22938,6 +23229,17 @@ pub struct Host {
     frozen_handlers: BTreeMap<u32, u64>,
     /// Completion cells for served dispatches, keyed by ticket ([`Host::svc_result`] drains).
     svc_results: BTreeMap<u64, i64>,
+    /// §2.2 / #1862 — where each in-flight `page(addr)` request on this domain lands, by ticket:
+    /// filed with the request ([`Host::request_page`]), taken at its settle
+    /// ([`Host::settle_page`]) or dropped by an error reply that settles nothing. Never cut data:
+    /// a freeze holds a pager until its paged children have unwound, so no request is in flight
+    /// at the cut (#2455).
+    page_sinks: BTreeMap<u64, PageSink>,
+    /// §2.2 / #2164 — the bytecode engine's pager edge, on a demand-paged detached child's
+    /// powerbox: the export, on its spawner's program, whose `page` op supplies this domain's
+    /// window, served by its spawner's domain. A recoverable fault in the window is a request to it.
+    /// (The tree-walker keeps its edge on the vCPU, [`VCpu::pager`].)
+    pager: Option<u32>,
     svc_next_ticket: u64,
     /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
     /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
@@ -23800,6 +24102,8 @@ impl Host {
             self_reified: BTreeMap::new(),
             svc_queue: VecDeque::new(),
             svc_results: BTreeMap::new(),
+            page_sinks: BTreeMap::new(),
+            pager: None,
             reply_waits: BTreeMap::new(),
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
@@ -28060,6 +28364,32 @@ impl Host {
             ticket,
         });
         Some(ticket)
+    }
+
+    /// §2.2 / #1862 — enqueue a demand child's `page(addr)` request on pager export `export`, the
+    /// fault address `sink`'s, and file `sink`, where its reply lands. One lock of this host covers
+    /// both, so the pager cannot settle the request before its sink exists. `None` when the queue
+    /// is full: backpressure, and the child re-faults.
+    fn request_page(&mut self, export: u32, sink: PageSink) -> Option<u64> {
+        let addr = sink.page + sink.off;
+        let ticket = self.svc_enqueue(export, 0, vec![addr as i64])?;
+        self.page_sinks.insert(ticket, sink);
+        Some(ticket)
+    }
+
+    /// §2.2 / #1862 — settle served dispatch `ticket`, whose handler returned `value`: a page
+    /// request's page moves from the pager's window `pager_mem`, the serving vCPU's, into its
+    /// child's ([`PageSink::supply`]). The settle runs before the reply is delivered, so the pager
+    /// cannot reuse its buffer before the copy, and the child cannot run before its page is in
+    /// place. Returns the value to deliver; any other dispatch's passes through. Out of line: both
+    /// interpreters' serve loops call it at every settle, and its copy would otherwise grow their
+    /// op loops.
+    #[inline(never)]
+    fn settle_page(&mut self, ticket: u64, value: i64, pager_mem: Option<&Mem>) -> i64 {
+        match self.page_sinks.remove(&ticket) {
+            Some(sink) => sink.supply(value, pager_mem),
+            None => value,
+        }
     }
 
     /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
@@ -33095,7 +33425,12 @@ struct Mem {
     /// after a `MemoryFault` to distinguish a recoverable page fault (suspend to the parent, which
     /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
     /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
+    /// It holds the access's first byte, which a report names (#2126).
     last_fault: AtomicU64,
+    /// #2469 — the first byte of that access in the page that refused it: the page a pager must
+    /// supply ([`Mem::take_fault`]). It differs from [`last_fault`] only for an access that crosses
+    /// into the refused page from one it may touch. Valid while `last_fault` is set.
+    refused_at: AtomicU64,
     /// #1190 debugger side-channel: the confined address of the most recent **fatal** memory fault
     /// (a NULL-guard access, an unmapped/read-only page), recorded by `check_prot` for the DAP layer
     /// to report a segfault's address (a NULL deref → `0`). Distinct from [`last_fault`], which is the
@@ -33215,6 +33550,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -33288,6 +33624,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
@@ -33345,6 +33682,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
             last_fault: AtomicU64::new(NO_FAULT),
+            refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: self.null_guard,
@@ -33505,23 +33843,32 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                // A **recoverable** in-window page fault: record the confined address so a §14
-                // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
-                None if page * self.page < self.null_guard => {
-                    // #964: a NULL dereference — fatal, never a recoverable §14 page fault (a
-                    // demand parent could not legally map the reserved region anyway). #1190: record
-                    // the faulting address for the debugger (a segfault at `base`) in the dedicated
-                    // report field — *not* `last_fault`, whose recoverable-fault contract the guard
-                    // deliberately sidesteps here.
-                    self.fault_report.store(base, Ordering::Relaxed);
-                    return Err(Trap::MemoryFault);
-                }
-                None => return Err(self.page_fault(base)), // unmapped
-                Some(false) if write => return Err(self.page_fault(base)), // read-only store
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// The fault for an access starting at `base` that `page` refuses: the page is unmapped, or the
+    /// access stores to it and it is read-only.
+    ///
+    /// - **Below the NULL guard**, fatal (#964): never a recoverable §14 page fault, since a demand
+    ///   parent could not legally map the reserved region anyway. #1190: the address goes to the
+    ///   debugger (a segfault at `base`) in the dedicated report field, not in `last_fault`, whose
+    ///   recoverable-fault contract the guard sidesteps.
+    /// - **Otherwise recoverable**: a demand child's pager supplies the page. A report names the
+    ///   access's first byte, `base`, on every engine (#2126). The page to supply is `page`, the one
+    ///   that refused it, which holds the access's first byte only when the access starts there: one
+    ///   that crosses into `page` starts in a page it may touch (#2469).
+    fn refused(&self, base: u64, page: u64) -> Trap {
+        let start = page * self.page;
+        if start < self.null_guard {
+            self.fault_report.store(base, Ordering::Relaxed);
+            return Trap::MemoryFault;
+        }
+        self.page_fault(base, base.max(start))
     }
 
     /// The **scalar-representable committed extent** (#717 wasm-JIT host sync): `Some(H)` iff the
@@ -33687,21 +34034,23 @@ impl Mem {
         self.prot_dirty.store(true, Ordering::Release);
     }
 
-    /// Record `base` as the pending recoverable page fault (for §14 fault-driven yield) and return the
-    /// `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a coroutine
-    /// child reads the recorded address and suspends to its parent instead.
-    fn page_fault(&self, base: u64) -> Trap {
+    /// Record a pending recoverable page fault of the access starting at `base`, refused at `at`, and
+    /// return the `MemoryFault` to propagate. A normal guest treats it as a trap (detect-and-kill); a
+    /// demand child's pager supplies the page instead.
+    fn page_fault(&self, base: u64, at: u64) -> Trap {
         self.last_fault.store(base, Ordering::Relaxed);
+        self.refused_at.store(at, Ordering::Relaxed);
         Trap::MemoryFault
     }
 
-    /// Take the pending recoverable page-fault address (set by [`check_prot`], cleared by
-    /// [`confine_checked`]), clearing it. `None` if the last `MemoryFault` was an out-of-window fault
-    /// (a real trap), not a recoverable page fault.
+    /// Take the pending recoverable page fault (set by [`check_prot`], cleared by
+    /// [`confine_checked`]), clearing it: the access's first byte in the page that refused it, the
+    /// page to supply (#2469). `None` if the last `MemoryFault` was an out-of-window fault (a real
+    /// trap), not a recoverable page fault.
     fn take_fault(&self) -> Option<u64> {
         match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
             NO_FAULT => None,
-            addr => Some(addr),
+            _ => Some(self.refused_at.load(Ordering::Relaxed)),
         }
     }
 
@@ -33939,8 +34288,8 @@ impl Mem {
         }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
-                None => return Err(self.page_fault(base)),
-                Some(false) if write => return Err(self.page_fault(base)),
+                None => return Err(self.refused(base, page)), // unmapped
+                Some(false) if write => return Err(self.refused(base, page)), // read-only store
                 _ => {}
             }
         }

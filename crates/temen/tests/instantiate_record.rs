@@ -21,6 +21,15 @@ use temen_verify::verify_module;
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
+/// Every driver a detached run takes: each backend, then the bytecode engine's parallel driver
+/// (`None`).
+const DRIVERS: [Option<Backend>; 4] = [
+    Some(Backend::TreeWalk),
+    Some(Backend::Bytecode),
+    Some(Backend::Jit),
+    None,
+];
+
 /// #744 — whether the cooperative bytecode driver runs `src` itself, serving its children, rather
 /// than declining it to the tree-walker: a `Backend::Bytecode` run of it then pins that driver.
 fn runs_on_bytecode(src: &str) -> bool {
@@ -455,7 +464,7 @@ block 0 (va: i64, vb: i64) {{
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32);
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS.map(Some).into_iter().chain([None]) {
+    for b in DRIVERS {
         // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
         // the default) run inline on the child's thread when it finds the parent parked.
         for handoff in [true, false] {
@@ -464,7 +473,7 @@ fn a_parent_serves_its_childs_exec_with_its_own_code() {
                 ..RunConfig::default()
             };
             assert_eq!(
-                run_detached_on(b, &src, 1 << 20, cfg),
+                run_detached_with(b, &src, 1 << 20, cfg),
                 Ok(4_201),
                 "{b:?}, handoff {handoff}: the child's exec.run(40,2) → the parent's handler \
                  replies 42; the parent served 1 and joined 42"
@@ -488,9 +497,9 @@ fn a_child_image_that_carries_its_programs_serve_loop_runs_where_the_program_doe
          func 1 {funcs}func 3 () -> (i32) {{\n{serve}"
     );
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS.map(Some).into_iter().chain([None]) {
+    for b in DRIVERS {
         assert_eq!(
-            run_detached_on(b, &src, 1 << 20, RunConfig::default()),
+            run_detached(b, &src),
             Ok(4_201),
             "{b:?}: the child runs its image, and the parent serves its exec.run(40, 2)"
         );
@@ -728,25 +737,21 @@ block 0 (v0: i64) {{
 /// Run with the Instantiator (`"vm"`), an AddressSpace (`"as"`), a detached-window budget
 /// (`"budget"`, 1 MiB of `Budget.mem`), and, under its export name, the child image (#2219) of each
 /// function the program exports: a program exports the functions it spawns. The root returns its
-/// answer.
-fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
+/// answer. On `backend`, or on the parallel driver for `None`.
+fn run_detached(backend: impl Into<Option<Backend>>, src: &str) -> Result<i32, String> {
     run_detached_with(backend, src, 1 << 20, RunConfig::default())
 }
 
 /// [`run_detached`] with a `mem`-byte budget, under `cfg`. The run gets its own thread and a
 /// deadline: the #1217 pins guard against a *hang* (a pager parked for a child that is gone), so a
 /// regression must fail the test, not stall the binary until CI's timeout.
-fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> Result<i32, String> {
-    run_detached_on(Some(backend), src, mem, cfg)
-}
-
-/// [`run_detached_with`] on `backend`, or on the parallel driver for `None`.
-fn run_detached_on(
-    backend: Option<Backend>,
+fn run_detached_with(
+    backend: impl Into<Option<Backend>>,
     src: &str,
     mem: u64,
     cfg: RunConfig,
 ) -> Result<i32, String> {
+    let backend = backend.into();
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let images: Vec<(String, Arc<Module>)> = m
@@ -890,6 +895,10 @@ block 0 (vaddr: i64) {
             && src.contains(&format!("va = i64.const {fault}\n")),
         "the rewrites must apply"
     );
+    assert!(
+        runs_on_bytecode(&src),
+        "the cooperative driver pages its child itself (#2164)"
+    );
     src
 }
 
@@ -900,7 +909,7 @@ block 0 (vaddr: i64) {
 #[test]
 fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
     let src = detached_pager_program_at(20000);
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
     }
 }
@@ -915,7 +924,7 @@ fn a_paged_child_attests_its_window_exposed() {
         "  vz = i32.const 0\n  vat = call.cap 4294967295 4 () -> (i64) vz ()\n  return vat\n",
     );
     assert!(src.contains("return vat\n"), "the rewrite must apply");
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 1257, "{b:?}");
     }
 }
@@ -940,7 +949,7 @@ fn a_pager_that_is_not_a_page_export_refuses_the_spawn() {
             !src.contains("interface { page: 0 }"),
             "the rewrite must apply"
         );
-        for b in BACKENDS {
+        for b in DRIVERS {
             let r = run_detached(b, &src);
             assert!(
                 matches!(&r, Err(e) if e.contains("CapFault")),
@@ -963,7 +972,7 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
         handoff: false,
         ..RunConfig::default()
     };
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(
             run_detached_with(b, &src, 1 << 20, cfg()).expect("run"),
             1077,
@@ -977,16 +986,80 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
 /// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
 /// no-progress answer) so its `join` answers the child's `MEMORY_FAULT` — the run ends instead of
 /// hanging.
+///
+/// #2469 — a bulk op on the guard is fatal too: a `mem.copy` from it, a `mem.fill` of it. Their span
+/// check had no guard arm, so it recorded a recoverable fault, the pager was asked for the guard
+/// page, and its supply mapped the guard read-write.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
-    let src = detached_pager_program_at(0);
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in BACKENDS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            faulted,
-            "{b:?}: a NULL fault in a paged child is fatal to it"
+    for (what, access) in [
+        ("a load", None),
+        (
+            "a copy's source",
+            Some("  vd = i64.const 32768\n  vn = i64.const 4\n  mem.copy vd va vn\n  vb = i32.load8_u vd\n"),
+        ),
+        (
+            "a fill",
+            Some("  vf = i32.const 5\n  vn = i64.const 4\n  mem.fill va vf vn\n  vb = i32.load8_u va\n"),
+        ),
+    ] {
+        let mut src = detached_pager_program_at(0);
+        if let Some(access) = access {
+            src = src.replace("  vb = i32.load8_u va\n", access);
+            assert!(src.contains(access), "the rewrite must apply");
+        }
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                faulted,
+                "{b:?}: {what} of the NULL guard in a paged child is fatal to it"
+            );
+        }
+    }
+}
+
+/// #2469 — an access that crosses from a supplied page into one not yet supplied faults on the page
+/// it needs. The child touches 32765, which brings in the page below 32768 (a 16 KiB boundary, so a
+/// page boundary on any host), then reads a word across it: a scalar load, a `mem.copy` whose source
+/// crosses, a `mem.fill` whose destination does. The fault used to be recorded where the access
+/// starts, in the page already supplied: the pager supplied that page again, and the child faulted
+/// again. The root serves both faults and returns `child + 2 * 1000`. The child returns the byte it
+/// touched, 77, plus the word: the pager's 77 lands at 32768, the word's third byte.
+#[test]
+fn a_paged_access_that_crosses_into_an_unsupplied_page_faults_on_that_page() {
+    let read = "  vx = i64.const 32766\n  vw = i32.load vx\n";
+    let copy = "  vd = i64.const 32700\n  vsrc = i64.const 32760\n  vn = i64.const 16\n  \
+                mem.copy vd vsrc vn\n  vx = i64.const 32706\n  vw = i32.load vx\n";
+    let fill = "  vd = i64.const 32760\n  vf = i32.const 5\n  vn = i64.const 16\n  \
+                mem.fill vd vf vn\n  vx = i64.const 32766\n  vw = i32.load vx\n";
+    for (what, access, word) in [
+        ("a load", read, 77 << 16),
+        ("a copy's source", copy, 77 << 16),
+        ("a fill", fill, 0x0505_0505),
+    ] {
+        let src = detached_pager_program_at(32765)
+            .replace(
+                "  vs = svc.wait vz\n",
+                "  vs1 = svc.wait vz\n  vs2 = svc.wait vz\n  vs = i64.add vs1 vs2\n",
+            )
+            .replace(
+                "  return vbw\n",
+                &format!(
+                    "{access}  vw64 = i64.extend_i32_u vw\n  vr = i64.add vbw vw64\n  return vr\n"
+                ),
+            );
+        assert!(
+            src.contains("vs2 = svc.wait") && src.contains(access),
+            "the rewrites must apply"
         );
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                77 + word + 2000,
+                "{what} on {b:?}"
+            );
+        }
     }
 }
 
@@ -998,7 +1071,7 @@ fn pager_child_that_never_faults_releases_the_parked_pager() {
     let src =
         detached_pager_program_at(0).replace("  vb = i32.load8_u va\n", "  vb = i32.const 5\n");
     assert!(src.contains("vb = i32.const 5\n"), "the rewrite must apply");
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
     }
 }
@@ -1017,7 +1090,7 @@ fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
         src.contains("vb = i32.const 5\n") && src.contains("(vch)\n  vs = svc.wait"),
         "the rewrites must apply"
     );
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
     }
 }
@@ -1034,7 +1107,7 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
     );
     assert!(src.contains("return vbad"), "the rewrite must apply");
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000 + 1000;
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(
             run_detached(b, &src).expect("run"),
             faulted,

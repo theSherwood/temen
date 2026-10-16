@@ -4,7 +4,7 @@
 #![allow(dead_code)] // each including binary uses a different subset
 
 #[path = "../../../temen-interp/tests/support/rec.rs"]
-mod rec;
+pub mod rec;
 
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
