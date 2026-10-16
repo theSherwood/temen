@@ -182,10 +182,10 @@ pub(crate) struct Tree {
     interrupt: Arc<AtomicU64>,
     /// Whether the run armed a deadline (then every image polls the cell, the root's included).
     deadline: bool,
-    /// #1944 slice 3 — the root budget's fuel cell when `Limits.fuel` bounds the run (`0`: un-metered).
-    /// Every image of the tree charges it: a process shares its forker's budget node, as a fork twin
-    /// does on the interpreters.
-    fuel: usize,
+    /// #1944 slice 3 — the run's fuel chain when `Limits.fuel` bounds the run (`None`: un-metered).
+    /// Each process charges a cell of its own that draws from it ([`Self::fuel_cell`]): a process
+    /// shares its forker's budget node, as a fork twin does on the interpreters.
+    fuel: Option<Arc<dyn temen_jit::BudgetNode>>,
     /// The programs the tree compiled (#1825), by what their code depends on: its own, or the
     /// embedder's when it keeps them past the run (`kept`, #2145).
     code: JitCodeCache,
@@ -208,7 +208,7 @@ struct TreeState {
 impl Tree {
     fn new(
         interrupt: Option<&Arc<AtomicU64>>,
-        fuel: Option<*mut temen_jit::FuelCell>,
+        fuel: Option<Arc<dyn temen_jit::BudgetNode>>,
         code: Option<&JitCodeCache>,
     ) -> Arc<Tree> {
         Arc::new(Tree {
@@ -225,7 +225,7 @@ impl Tree {
                 .cloned()
                 .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             deadline: interrupt.is_some(),
-            fuel: fuel.map_or(0, |c| c as usize),
+            fuel,
             code: code.cloned().unwrap_or_default(),
             kept: code.is_some(),
         })
@@ -241,14 +241,30 @@ impl Tree {
     }
 
     /// Where an instance of shared code runs in this tree: over the powerbox `cc` names, polling
-    /// `interrupt` and charging the tree's fuel cell — this run's cells, whichever run compiled it.
-    fn addrs(&self, cc: CapCtx, interrupt: Option<*const AtomicU64>) -> InstanceAddrs {
+    /// `interrupt` and charging `fuel`, its process's cell ([`Self::fuel_cell`]) — this run's cells,
+    /// whichever run compiled it.
+    fn addrs(
+        &self,
+        cc: CapCtx,
+        interrupt: Option<*const AtomicU64>,
+        fuel: *mut temen_jit::FuelCell,
+    ) -> InstanceAddrs {
         InstanceAddrs {
             cap_ctx: cc.ptr(),
             epoch: interrupt.unwrap_or(std::ptr::null()),
-            fuel: self.fuel as *mut temen_jit::FuelCell,
+            fuel,
             ..InstanceAddrs::NONE
         }
+    }
+
+    /// A fuel cell of its own for a process to charge, drawing from the run's chain; `None` when the
+    /// run meters nothing. Every fuel safepoint stores to its cell, so processes running at once on
+    /// one cell stall on each other's stores to its cache line: while a tree's processes shared one,
+    /// a build on four CPUs burned more than twice the CPU time of the same build on one (#2459). A
+    /// process holds its cell until it ends, and the cell hands back what it did not burn as it
+    /// drops, before the process can be reaped.
+    fn fuel_cell(&self) -> Option<Box<temen_jit::FuelCell>> {
+        self.fuel.clone().map(temen_jit::FuelCell::drawing)
     }
 
     /// Something happened a blocked process may be waiting for: wake every waiter to re-run its op.
@@ -296,7 +312,7 @@ impl Tree {
     /// which no other process starts; a program that can extend its code, which is then its own; a
     /// concurrent program, whose code is never shared (it owns a runtime) and whose powerbox is
     /// locked; the first start of a program, whose compile the cache keeps. A `process` image (not a
-    /// serve handler) may fork.
+    /// serve handler) may fork. The code charges `fuel`, the process's cell ([`Self::fuel_cell`]).
     ///
     /// # Safety
     /// As [`compile_image`].
@@ -307,6 +323,7 @@ impl Tree {
         program: &Program<'_>,
         entry: FuncIdx,
         process: bool,
+        fuel: *mut temen_jit::FuelCell,
     ) -> Result<Loaded, temen_jit::JitError> {
         let m = program.module();
         let calls = host_calls(m);
@@ -327,7 +344,7 @@ impl Tree {
                     digest,
                     entry,
                     polls: interrupt.is_some(),
-                    fuel: self.fuel != 0,
+                    fuel: self.fuel.is_some(),
                     debug: m.debug_info.is_some(),
                     sites: plan.as_ref().map(|p| p.sites.clone()),
                 };
@@ -345,21 +362,22 @@ impl Tree {
                 );
                 let mut kept = slot.image.lock().unwrap_or_else(|e| e.into_inner());
                 match kept.clone() {
-                    Some(Some(image)) => {
-                        (image.code.instance(self.addrs(cc, interrupt)), Some(image))
-                    }
+                    Some(Some(image)) => (
+                        image.code.instance(self.addrs(cc, interrupt, fuel)),
+                        Some(image),
+                    ),
                     Some(None) => {
                         drop(kept);
-                        compile(cc, program, entry, jit, plan, interrupt, self)?
+                        compile(cc, program, entry, jit, plan, interrupt, fuel)?
                     }
                     None => {
-                        let (cm, image) = compile(cc, program, entry, jit, plan, interrupt, self)?;
+                        let (cm, image) = compile(cc, program, entry, jit, plan, interrupt, fuel)?;
                         *kept = Some(image.clone());
                         (cm, image)
                     }
                 }
             }
-            _ => compile(cc, program, entry, jit, plan, interrupt, self)?,
+            _ => compile(cc, program, entry, jit, plan, interrupt, fuel)?,
         };
         Ok(Loaded { cm, image })
     }
@@ -738,6 +756,11 @@ unsafe fn run_process(
     // The running image's powerbox once an exec has replaced the first one.
     let mut image_host: Option<Host> = None;
     let mut start = first;
+    // The fuel cell it charges through every image it execs.
+    let mut own_fuel = tree.fuel_cell();
+    let fuel = own_fuel
+        .as_deref_mut()
+        .map_or(std::ptr::null_mut(), |c| c as *mut temen_jit::FuelCell);
     loop {
         let cur: &mut Host = match image_host.as_mut() {
             Some(h) => h,
@@ -760,7 +783,7 @@ unsafe fn run_process(
                 }
                 let threads = module.funcs.iter().any(temen_ir::Func::uses_threads);
                 let r = with_cap_ctx(cur, locked(module), |cc| {
-                    tree.load(pid, cc, &program, entry, process)
+                    tree.load(pid, cc, &program, entry, process, fuel)
                         .and_then(|code| {
                             let ctx = ProcCtx {
                                 tree: Arc::clone(tree),
@@ -786,7 +809,7 @@ unsafe fn run_process(
                 cur.arm_caller_requests();
                 let cc = CapCtx::Raw(&mut *cur);
                 let interrupt = tree.interrupt_for(pid, true);
-                let cm = image.code.instance(tree.addrs(cc, interrupt));
+                let cm = image.code.instance(tree.addrs(cc, interrupt, fuel));
                 let results = image.results.clone();
                 let ctx = ProcCtx {
                     tree: Arc::clone(tree),
@@ -866,8 +889,8 @@ struct Loaded {
 
 /// Compile `program` at `entry` over the powerbox `cc` names — instrumented to fork when `plan` says
 /// it can — and share its code as an [`Image`], unless the program can extend its code (`jit`) or the
-/// code is more than code ([`CompiledModule::share`]: a concurrent program's is). `tree` is the run's:
-/// its quota, and its fuel cell if armed.
+/// code is more than code ([`CompiledModule::share`]: a concurrent program's is). The compile charges
+/// `fuel`, its process's cell (null: un-metered).
 ///
 /// # Safety
 /// As [`compile_image`].
@@ -878,15 +901,21 @@ unsafe fn compile(
     jit: bool,
     plan: Option<ForkPlan>,
     interrupt: Option<*const AtomicU64>,
-    tree: &Tree,
+    fuel: *mut temen_jit::FuelCell,
 ) -> Result<(CompiledModule, Option<Arc<Image>>), temen_jit::JitError> {
     let m = program.module();
     let instrumented = plan.as_ref().and_then(|p| p.instrument(m, entry));
     let (code, at) = instrumented
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
-    let fuel = (tree.fuel != 0).then_some(tree.fuel as *mut temen_jit::FuelCell);
-    let cm = compile_image(cc, code, at, interrupt, jit, fuel)?;
+    let cm = compile_image(
+        cc,
+        code,
+        at,
+        interrupt,
+        jit,
+        (!fuel.is_null()).then_some(fuel),
+    )?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
@@ -983,7 +1012,7 @@ pub(crate) unsafe fn compile_image(
         temen_ir::DEFAULT_RESERVED_LOG2,
         Some(resolver),
         interrupt,
-        fuel, // the root budget's cell when `Limits.fuel` bounds the run (`jit_run`)
+        fuel, // the cell the code charges when `Limits.fuel` bounds the run (`jit_run`)
         fast,
         cc.with_host(|h| crate::run_node(h)), // #2113 — what its vCPUs, fibers and processes charge
         CLI_JIT_TABLE_LOG2,
@@ -1317,7 +1346,8 @@ fn trap_of(kind: TrapKind) -> Trap {
 /// the tree with it. Returns the root's last run and the result types of the entry that produced it
 /// (an exec'd command's, not the caller's). The embedder's `host` stays the powerbox it granted: an
 /// image-replace swaps the running image's powerbox, not the caller's. The tree compiles into `code`
-/// when the embedder keeps one (#2145).
+/// when the embedder keeps one (#2145). Each of its processes charges a fuel cell of its own that
+/// draws from `fuel`, the run's chain when the run is metered.
 ///
 /// # Safety
 /// `host` is live and exclusively the run's; `interrupt` (when `Some`) outlives the call.
@@ -1330,7 +1360,7 @@ pub(crate) unsafe fn run_root(
     interrupt: Option<&Arc<AtomicU64>>,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
-    fuel: Option<*mut temen_jit::FuelCell>,
+    fuel: Option<Arc<dyn temen_jit::BudgetNode>>,
     code: Option<&JitCodeCache>,
 ) -> (Result<JitRun, temen_jit::JitError>, Vec<ValType>) {
     let tree = Tree::new(interrupt, fuel, code);
