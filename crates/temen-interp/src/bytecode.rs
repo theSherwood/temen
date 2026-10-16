@@ -10275,23 +10275,28 @@ fn fork_bare<T>(children: &[Option<T>], vt: &VTask) -> bool {
 }
 
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
-/// node they share while it lives (#2001), a private copy of its window `mem`, and its powerbox
-/// `host` duplicated as process `pid`, which pays the node for the copy (#2106). `None` refuses the
-/// fork, with nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated.
-/// The window is copied outside the powerbox's lock.
+/// node they share while it lives (#2001), its task ([`twin_task`]: the `parent` frame answered
+/// `reply` at `dst`), a private copy of its window `mem`, and its powerbox `host` duplicated as
+/// process `pid`, which pays the node for the copy (#2106). `None` refuses the fork, with nothing
+/// left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The powerbox
+/// comes last: its providers register the process as they copy it, so nothing after may refuse the
+/// fork (#2373). The window is copied outside the powerbox's lock.
 fn fork_process(
     host: &std::sync::Mutex<Host>,
     mem: Option<&Mem>,
     pid: u64,
-) -> Option<(Option<Mem>, Host, LiveVcpu)> {
-    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())?;
+    (parent, dst, reply): (&Vm, u32, i64),
+) -> Option<(Option<Mem>, Host, LiveVcpu, VTask)> {
+    let payer = host.lock_unpoisoned().own_node();
+    let live = LiveVcpu::charge(payer.clone())?;
+    let task = twin_task(parent, dst, reply, payer)?;
     let twin_mem = match mem {
         Some(m) => Some(m.fork_private()?),
         None => None,
     };
     let window = mem.map_or(0, Mem::mapped_size);
     let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
-    Some((twin_mem, twin_host, live))
+    Some((twin_mem, twin_host, live, task))
 }
 
 /// Wire a new process's powerbox as the root's is: its own park door, which its personality's
@@ -10326,9 +10331,9 @@ fn wire_kill(host: &Host) {
 
 /// A fork twin's task: its parent's frame (`parent`, a bare root's, so no resume chain or invoke) at
 /// the post-fork resume point, answered `reply` at `dst` — the return-twice value. #2336 — its copy
-/// of its parent's register file is its own, charged to `payer`, its node, as its window is: `None`,
-/// with nothing charged, when there is no room for it, which fails the fork as no room for the
-/// window does.
+/// of its parent's register file is its own, charged to `payer`, the node it shares with its parent,
+/// as its window is: `None`, with nothing charged, when there is no room for it, which fails the
+/// fork as no room for the window does.
 fn twin_task(parent: &Vm, dst: u32, reply: i64, payer: NodeRef) -> Option<VTask> {
     let mut active = parent.clone();
     active.room = RegsRoom::new(Some(payer));
@@ -11069,7 +11074,8 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 
 /// #1538 — whether a durable freeze is in progress (the global freeze word reads `UNWINDING`): a park
 /// under it is **fresh** (the resumer's trailing poll unwinds before it observes the value), one under
-/// `NORMAL` is consumed by the resumer that runs on.
+/// `NORMAL` is consumed by the resumer that runs on. Callers ask only for a durable run: any other
+/// keeps its own data at the guard base (#2101).
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
 }
@@ -11335,7 +11341,7 @@ fn suspend_fiber(
     // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
     resumer.tls = vt.active.tls;
     let suspended = std::mem::replace(&mut vt.active, resumer);
-    let consumed = !is_unwinding(mem);
+    let consumed = !(durable && is_unwinding(mem));
     fibers.with(|f, _, _| {
         f[id] = FiberState::Parked {
             vm: suspended,
@@ -15217,25 +15223,20 @@ impl SchedCore {
                     // here and that push, so the fork factories learn it up front (#863 slice 2).
                     let twin_pid = tasks.len() as u64;
                     // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
+                    // The twin's continuation is the caller's, with `reply_twin` injected at the
+                    // caller's reply slot.
                     let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                         caller_env.and_then(|ck| {
                             let env = &extra_envs[ck];
-                            let (twin_mem, twin_host, live) =
-                                fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
-                            Some((ck, twin_mem, twin_host, live))
+                            let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
+                            let (twin_mem, twin_host, live, twin_vt) =
+                                fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
+                            Some((ck, twin_mem, twin_host, live, twin_vt))
                         })
                     } else {
                         None
                     };
-                    let Some((ck, twin_mem, twin_host, live)) = forked else {
-                        break 'fork degrade(tasks, Some(caller_ti));
-                    };
-                    // The twin's continuation is the caller's, with `reply_twin` injected at the
-                    // caller's reply slot.
-                    let active = &tasks[caller_ti].vm.vt.active;
-                    let Some(mut twin_vt) =
-                        twin_task(active, caller_dst, reply_twin, twin_host.own_node())
-                    else {
+                    let Some((ck, twin_mem, twin_host, live, mut twin_vt)) = forked else {
                         break 'fork degrade(tasks, Some(caller_ti));
                     };
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
@@ -15506,15 +15507,12 @@ impl SchedCore {
                         Some(k) => extra_envs[k].mem.as_ref(),
                         None => mem.as_ref(),
                     };
-                    fork_process(task_host(root, extra_envs, env), win, twin_pid)
+                    // The return-twice `0`; the parent keeps the twin's pid, set below.
+                    let at = (&tasks[ti].vm.vt.active, dst, 0);
+                    fork_process(task_host(root, extra_envs, env), win, twin_pid, at)
                 } else {
                     None
                 };
-                // The return-twice `0`; the parent keeps the twin's pid, set below.
-                let forked = forked.and_then(|(twin_mem, twin_host, live)| {
-                    let twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0, twin_host.own_node())?;
-                    Some((twin_mem, twin_host, live, twin_vt))
-                });
                 match forked {
                     None => {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
@@ -19948,8 +19946,11 @@ impl Vm {
                             self.pc = pc + 1;
                             return Ok(Outcome::CapPending { id, dst: *dst });
                         }
+                        // #1722 — no other reply shape parks, so a host-completed punt, which only
+                        // its embedder can finish, declines as the oracle's does: waiting for it
+                        // would never return (the single-threaded build's wait panics).
                         let comps = host.with(|p| p.completions());
-                        let r = comps.wait(id);
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
                         if let Some(ty) = results.first() {
                             self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
                         }

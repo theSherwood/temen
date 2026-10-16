@@ -107,7 +107,8 @@ singleton case, not a replacement for first-class handles.
 
 Op numbers on the shared `HOST_FN` handle. `ptr`/`buf` are **window offsets**; `-errno` on
 failure (`< 0`), a `>= 0` count / handle on success (except `malloc`, which returns `0` for
-"no memory", the C `NULL`). Pure-compute functions are **guest code** (no cap) and are listed
+"no memory", the C `NULL`: no room in the arena, or none in the payer's budget for the host's record
+of the block, #2373; `getenv` too, for its cached copy). Pure-compute functions are **guest code** (no cap) and are listed
 only to mark the boundary.
 
 | # | Function | Shape | Backed by | Status |

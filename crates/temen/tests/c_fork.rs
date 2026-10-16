@@ -1442,18 +1442,18 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1550,18 +1550,18 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1662,18 +1662,18 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1768,18 +1768,18 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -2143,18 +2143,18 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -2553,18 +2553,18 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -2693,9 +2693,9 @@ int main(int argc, char **argv) {
 /// and the replacement factory is re-wrapped so fork-of-fork keeps the shape.
 fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork {
     Arc::new(move |pid| {
-        let forked = base(pid);
+        let forked = base(pid)?;
         let mut inner = forked.handler;
-        temen_interp::ForkedProc {
+        Some(temen_interp::ForkedProc {
             handler: Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }),
@@ -2704,7 +2704,8 @@ fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork 
             exit: forked.exit,
             exec_remap: None,
             state: forked.state,
-        }
+            abandon: forked.abandon,
+        })
     })
 }
 

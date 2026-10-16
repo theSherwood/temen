@@ -623,7 +623,11 @@ its parent, the twin's with the growth its copy holds, before the process exists
 room refuses the `fork` or `posix_spawn` with `-EAGAIN`, and no personality has registered it. The
 charge goes back when the process ends; an exec moves it to its image's window, the image's declared
 memory, charging what that needs past the caller's window first and handing back what the caller's
-held past it (#2332). A root's processes pay from the run's own node.
+held past it (#2332). A root's processes pay from the run's own node. What a capability holds for
+the parent is copied for the twin by its provider, charged within every limit too: a provider with no
+room for its copy (a POSIX process's tables and directory streams, a seeded store) refuses the fork
+with `-EAGAIN`, and every twin the providers before it minted is abandoned, so none stays registered
+(#2373, #2428).
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 

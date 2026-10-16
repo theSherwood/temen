@@ -162,14 +162,14 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let c2 = Arc::clone(counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
-        ForkedProc::shared(
+        Some(ForkedProc::shared(
             Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Stateless,
-        )
+        ))
     });
     host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
 }

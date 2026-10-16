@@ -2604,11 +2604,12 @@ fn seed_domain(
         detached: thaw_detached,
         live_detached: thaw_live_detached,
     } = residue;
-    root.dstate = root
-        .mem
-        .as_ref()
-        .map(|m| m.durable_load_dstate(root.vcpu_ctx))
-        .unwrap_or(STATE_NORMAL);
+    // Only a durable window has control words at the guard base; any other run keeps its own data
+    // there, and starts in no freeze phase whatever it holds (#2101).
+    root.dstate = match root.mem.as_ref() {
+        Some(m) if root.durable => m.durable_load_dstate(root.vcpu_ctx),
+        _ => STATE_NORMAL,
+    };
     // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
     // the window's active-SP word otherwise (a fresh/freeze run leaves it at the root region base; a
     // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
@@ -16539,11 +16540,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // state word — under a freeze it spawns into `UNWINDING` so it too unwinds at its next
                     // safepoint. (A child existing *before* the freeze point is reconstructed by the
                     // runtime at thaw, not re-spawned here — the root's rewind skips the prologue
-                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.)
-                    let child_state = mem
-                        .as_ref()
-                        .map(|m| m.durable_state())
-                        .unwrap_or(STATE_NORMAL);
+                    // `thread.spawn`, so thaw re-attach is a `drive`-setup concern, not this op's.) Any
+                    // other run's word there is its own data, and its child starts `NORMAL` (#2101).
+                    let child_state = match mem.as_ref() {
+                        Some(m) if durable => m.durable_state(),
+                        _ => STATE_NORMAL,
+                    };
                     // Durable multi-vCPU (slice 3.2.2): reserve this child's shadow context top-down
                     // (`MAX_SHADOW_CTX`, −1, …) so it can't collide with a fiber's `slot+1` region.
                     // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
@@ -20415,26 +20417,38 @@ impl HostCharge {
         self.set(bytes, Fits::Forced);
     }
 
-    /// Room in `bytes` for `len` of them, charged as this holds it and then allocated, fallibly: what a
-    /// [`HostBuffer`] grows by, for a buffer its embedder also reads as a plain `Vec` (a host's
-    /// captured stdout). The room grows by doubling, or to exactly `len` when the doubling does not
-    /// fit: `false`, with nothing charged or allocated, when neither does.
+    /// Room for `held` bytes: it grows by doubling, or to exactly `held` when the doubling does not
+    /// fit, so a use that grows a little at a time rarely reaches the budget tree. `false`, holding
+    /// what it held, when neither fits.
+    #[inline]
+    pub fn grow_to(&mut self, held: u64) -> bool {
+        held <= self.bytes
+            || [self.bytes.saturating_mul(2), held]
+                .into_iter()
+                .any(|r| r >= held && usize::try_from(r).is_ok() && self.resize(r))
+    }
+
+    /// #2373 — [`Self::grow_to`]'s other half: once `held` is under a quarter of the room, hand back
+    /// all but twice `held`.
+    #[inline]
+    pub fn shrink_to(&mut self, held: u64) {
+        if held < self.bytes / 4 {
+            self.resize(held * 2);
+        }
+    }
+
+    /// Room in `bytes` for `len` of them, charged as this holds it ([`Self::grow_to`]) and then
+    /// allocated, fallibly: what a [`HostBuffer`] grows by, for a buffer its embedder also reads as a
+    /// plain `Vec` (a host's captured stdout). `false`, with nothing charged or allocated, when there
+    /// is no room.
     pub fn reserve(&mut self, bytes: &mut Vec<u8>, len: u64) -> bool {
         let had = self.bytes;
-        let room = if len <= had {
-            had
-        } else {
-            match [had.saturating_mul(2), len]
-                .into_iter()
-                .find(|&r| r >= len && usize::try_from(r).is_ok() && self.resize(r))
-            {
-                Some(room) => room,
-                None => return false,
-            }
-        };
+        if !self.grow_to(len) {
+            return false;
+        }
         if bytes.capacity() < len as usize
             && bytes
-                .try_reserve_exact((room as usize).saturating_sub(bytes.len()))
+                .try_reserve_exact((self.bytes as usize).saturating_sub(bytes.len()))
                 .is_err()
         {
             self.resize(had);
@@ -20454,6 +20468,12 @@ impl HostCharge {
     /// when they have no room.
     pub fn rebind(&mut self, payer: &NodeRef) -> bool {
         self.bind_as(payer, Fits::Pool)
+    }
+
+    /// #2428 — [`Self::bind`] for a copy a guest's own act makes (a fork twin's): within every
+    /// ceiling and pool, as a resize is. `false`, charging no one, when they have no room.
+    pub fn bind_within(&mut self, payer: &NodeRef) -> bool {
+        self.bind_as(payer, Fits::All)
     }
 
     fn bind_as(&mut self, payer: &NodeRef, fits: Fits) -> bool {
@@ -20552,6 +20572,11 @@ impl HostBuffer {
     /// [`HostCharge::rebind`].
     pub fn rebind(&mut self, payer: &NodeRef) -> bool {
         self.room.rebind(payer)
+    }
+
+    /// [`HostCharge::bind_within`].
+    pub fn bind_within(&mut self, payer: &NodeRef) -> bool {
+        self.room.bind_within(payer)
     }
 
     /// Hold `bytes` instead, charged past every limit: what a rewind puts back, which it held before.
@@ -21682,7 +21707,11 @@ pub type HostProc = Box<
 /// parent's `fork()` returns), so a personality can register the new process in its own process
 /// table at birth (`kill(pid)`/`waitpid(pid)` then mean the same pid everywhere). A provider with
 /// no process table ignores it ([`ForkedProc::shared`] mints).
-pub type HostProcFork = Arc<dyn Fn(u64) -> ForkedProc + Send + Sync>;
+///
+/// #2373, #2428 — what a fork copies is charged with it: `None` when the provider has no room for
+/// the twin's copy of its state, and the fork then fails with `-EAGAIN`, as a full `spawn` ceiling
+/// does.
+pub type HostProcFork = Arc<dyn Fn(u64) -> Option<ForkedProc> + Send + Sync>;
 
 /// #863 — what a [`HostProcFork`] factory mints for a **new process domain**. Beyond the fresh
 /// handler closure, a personality may hand the new domain two extras — both *mechanism-neutral*:
@@ -21730,6 +21759,10 @@ pub struct ForkedProc {
     /// #1699 — the new handler's own [`CapState`]: its serializer closes over the *new* domain's
     /// state, which the parent's would not.
     pub state: CapState,
+    /// #2373 — undo what the factory registered for the twin when the fork is refused after it ran
+    /// (a later provider had no room for its copy): the twin never runs, so a personality drops it
+    /// from its process table rather than retiring it there. `None` = nothing to undo.
+    pub abandon: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ForkedProc {
@@ -21744,6 +21777,7 @@ impl ForkedProc {
             exit: None,
             exec_remap: None,
             state,
+            abandon: None,
         }
     }
 }
@@ -23368,6 +23402,10 @@ pub struct Host {
     /// #972 — hooks the exec image-replace fires with the pipe-end handle remap (see
     /// [`ForkedProc::exec_remap`]); carried across exec like `exit_hooks` (same process).
     exec_remap_hooks: Vec<ExecRemapHook>,
+    /// #2373 — what the providers registered for this domain as its powerbox was built (a fork
+    /// twin's factories, a spawned child's re-grants, [`ForkedProc::abandon`]): the fork or spawn
+    /// that refuses the domain before it runs undoes them ([`Host::abandon`]).
+    abandon_hooks: Vec<Box<dyn FnOnce() + Send>>,
     /// #798 slice 2 — the domain's **job-control stop depth**: raised (+1) by the personality's stop
     /// closure and lowered (−1) by its continue ([`SignalSource::set_stop`]); every vCPU of the
     /// domain polls it per op (beside `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`]
@@ -24129,6 +24167,7 @@ impl Host {
             sig_source: None,
             exit_hooks: Vec::new(),
             exec_remap_hooks: Vec::new(),
+            abandon_hooks: Vec::new(),
             stop_depth: Arc::new(AtomicI64::new(0)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
@@ -24366,13 +24405,19 @@ impl Host {
         twin.host_procs = Vec::with_capacity(self.host_procs.len());
         for e in self.host_procs.iter() {
             let factory = e.fork.as_ref().unwrap();
-            let forked = factory(twin_pid);
+            // #2373, #2428 — a provider with no room for the twin's copy of its state refuses it.
+            let Some(forked) = factory(twin_pid) else {
+                twin.abandon();
+                return None;
+            };
+            twin.abandon_hooks.extend(forked.abandon);
             if let Some(door) = forked.signal {
                 if twin_sig.is_some() {
                     // Latch it: this powerbox cannot be forked faithfully, and every later attempt
                     // now refuses before any factory runs (see [`Host::multi_door`]). The caller
                     // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
                     self.multi_door.store(true, Ordering::SeqCst);
+                    twin.abandon();
                     return None;
                 }
                 twin_sig = Some(door);
@@ -30537,11 +30582,13 @@ impl Host {
                 .host_procs
                 .get(idx as usize)
                 .and_then(|e| e.fork.clone())
-                .map(|factory| {
+                .and_then(|factory| {
                     // Pid `0` = anonymous: this re-grant wires a *spawned* child (no fork pid — its
                     // TaskId is minted later, by the spawn), so the personality mints the clone
-                    // without registering it in its process table (#863 slice 2).
-                    let forked = factory(0);
+                    // without registering it in its process table (#863 slice 2). A provider with
+                    // no room for the child's copy refuses the re-grant (#2373).
+                    let forked = factory(0)?;
+                    child.abandon_hooks.extend(forked.abandon);
                     if let Some((source, armed)) = forked.signal {
                         child.set_signal_source(source, armed);
                     }
@@ -30569,7 +30616,7 @@ impl Host {
                             }
                         }
                     }
-                    h
+                    Some(h)
                 });
         }
         // #1296 — a §22 **`Jit`** grant: the child gets a **fresh, empty unit table** of its own, not an
@@ -30852,9 +30899,16 @@ impl Host {
             self.give_child_budget(lease, &mut ch);
         }
         for (name, handle) in grants {
-            // Pre-checked above, so this cannot fail: each entry is granted into the child under its
-            // name, a live self-serve grant as an offer over this host's own cell.
-            self.grant_entry_into_child(cell, name, *handle, &mut ch)?;
+            // Each entry is granted into the child under its name, a live self-serve grant as an offer
+            // over this host's own cell. Pre-checked above, so only a provider with no room for the
+            // child's copy refuses one (#2373), which refuses the spawn and undoes the grants before it.
+            if self
+                .grant_entry_into_child(cell, name, *handle, &mut ch)
+                .is_none()
+            {
+                ch.abandon();
+                return None;
+            }
         }
         Some((ch, cinst, cas))
     }
@@ -30951,6 +31005,14 @@ impl Host {
             source.spawn_commit(plan);
         }
         Some(twin)
+    }
+
+    /// #2373 — the fork or spawn building this domain refused it before it ran: undo what its
+    /// providers registered for it, so no personality keeps a process that never was.
+    fn abandon(&mut self) {
+        std::mem::take(&mut self.abandon_hooks)
+            .into_iter()
+            .for_each(|undo| undo());
     }
 
     /// A spawned process whose image could not be built in its powerbox (this, from
@@ -31332,6 +31394,7 @@ impl Host {
             &mut starters,
         );
         if carried.is_err() {
+            host.abandon();
             return Err(refused(self));
         }
         // #2106, #2332 — committed: the domain pays for the image's window now, as a root's main vCPU
@@ -37809,7 +37872,10 @@ mod fork_powerbox_tests {
         host.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![1])),
             Arc::new(|_pid| {
-                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![1])), CapState::Stateless)
+                Some(ForkedProc::shared(
+                    Box::new(|_, _, _, _| Ok(vec![1])),
+                    CapState::Stateless,
+                ))
             }),
             CapState::Stateless,
         );
@@ -37840,7 +37906,7 @@ mod fork_powerbox_tests {
         let mut host = Host::new();
         let h = host.grant_host_proc_forkable(
             make(),
-            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
             CapState::Stateless,
         );
         let twin = host
@@ -37877,7 +37943,10 @@ mod fork_powerbox_tests {
         parent.grant_host_proc_forkable(
             Box::new(|_, _, _, _| Ok(vec![0])),
             Arc::new(move |_pid| {
-                ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), captured(9))
+                Some(ForkedProc::shared(
+                    Box::new(|_, _, _, _| Ok(vec![0])),
+                    captured(9),
+                ))
             }),
             captured(1),
         );
@@ -37908,7 +37977,7 @@ mod fork_powerbox_tests {
         let mut parent = Host::new();
         let h = parent.grant_host_proc_forkable(
             make(),
-            Arc::new(move |_pid| ForkedProc::shared(make(), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(make(), CapState::Stateless))),
             CapState::Stateless,
         );
         let mut child = Host::new();
@@ -37935,6 +38004,16 @@ mod fork_powerbox_tests {
         assert!(
             parent.regrant_into_child(opaque, &mut child).is_none(),
             "a factory-less host proc fails the re-grant closed"
+        );
+        // #2373 — as does a provider with no room for the child's copy.
+        let full = parent.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(|_pid| None),
+            CapState::Stateless,
+        );
+        assert!(
+            parent.regrant_into_child(full, &mut child).is_none(),
+            "no room for the child's copy fails the re-grant closed"
         );
     }
 }
@@ -39746,7 +39825,7 @@ mod signal_door_claim_tests {
         let calls = Arc::clone(calls);
         Arc::new(move |_pid| {
             calls.fetch_add(1, Ordering::SeqCst);
-            ForkedProc {
+            Some(ForkedProc {
                 handler: Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
                 signal: claims_door.then(|| {
                     let door: Arc<dyn SignalSource + Send + Sync> = Arc::new(NoSignals);
@@ -39756,7 +39835,8 @@ mod signal_door_claim_tests {
                 exit: None,
                 exec_remap: None,
                 state: CapState::Stateless,
-            }
+                abandon: None,
+            })
         })
     }
 
@@ -39828,6 +39908,104 @@ mod signal_door_claim_tests {
             calls.load(Ordering::SeqCst),
             first,
             "and it is latched: no factory runs again, so no further processes are minted"
+        );
+    }
+
+    /// #2373 — a provider with no room for its copy refuses the fork whole: the twins the providers
+    /// before it minted are abandoned, the ones after it mint nothing, and the fork's own charge
+    /// goes back. Unlike two claimants, the refusal does not latch: a later fork may find room.
+    #[test]
+    fn a_provider_with_no_room_refuses_the_fork_and_abandons_the_twins_before_it() {
+        let shared = || ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless);
+        let (calls, abandoned) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let room = Arc::new(AtomicBool::new(false));
+        let mut h = Host::new();
+        let gone = Arc::clone(&abandoned);
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                let gone = Arc::clone(&gone);
+                Some(ForkedProc {
+                    abandon: Some(Box::new(move || {
+                        gone.fetch_add(1, Ordering::SeqCst);
+                    })),
+                    ..shared()
+                })
+            }),
+            CapState::Stateless,
+        );
+        let fits = Arc::clone(&room);
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| fits.load(Ordering::SeqCst).then(shared)),
+            CapState::Stateless,
+        );
+        h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            factory(false, &calls),
+            CapState::Stateless,
+        );
+        let mem = h.budgets.used(h.own_budget, BUDGET_MEM);
+        assert!(h.fork_powerbox(7, 1 << 16).is_none(), "no room refuses it");
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "the twin before is abandoned"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the provider after mints nothing"
+        );
+        assert_eq!(
+            h.budgets.used(h.own_budget, BUDGET_MEM),
+            mem,
+            "the fork's charge goes back"
+        );
+        room.store(true, Ordering::SeqCst);
+        h.fork_powerbox(8, 1 << 16).expect("room found later forks");
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1, "abandoning nothing");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// #2373 — so does a spawn: a provider with no room for the child's copy refuses its re-grant,
+    /// which refuses the spawn, and what the grants before it registered for the child is undone.
+    #[test]
+    fn a_provider_with_no_room_refuses_a_spawn_and_abandons_the_grants_before_it() {
+        let abandoned = Arc::new(AtomicUsize::new(0));
+        let mut h = Host::new();
+        let gone = Arc::clone(&abandoned);
+        let first = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(move |_pid| {
+                let gone = Arc::clone(&gone);
+                Some(ForkedProc {
+                    abandon: Some(Box::new(move || {
+                        gone.fetch_add(1, Ordering::SeqCst);
+                    })),
+                    ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![0])), CapState::Stateless)
+                })
+            }),
+            CapState::Stateless,
+        );
+        let full = h.grant_host_proc_forkable(
+            Box::new(|_, _, _, _| Ok(vec![0])),
+            Arc::new(|_pid| None),
+            CapState::Stateless,
+        );
+        let lease = Lease {
+            budget: h.grant_budget(-1, 1 << 20, -1),
+            bytes: 1 << 16,
+            runs: WINDOW_RUNS,
+        };
+        let grants = [("first".to_string(), first), ("full".to_string(), full)];
+        assert!(h
+            .spawn_detached_child(&grants, 1 << 16, lease, -1)
+            .is_none());
+        assert_eq!(
+            abandoned.load(Ordering::SeqCst),
+            1,
+            "the first grant is undone"
         );
     }
 }

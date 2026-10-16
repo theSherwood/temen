@@ -121,11 +121,16 @@ region when it closes its handle (`SharedRegion.close`, #2358), and a domain a b
 of the rest when it ends, while a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
 stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
-listings or mappings) is `channel` of
+listings or mappings; a POSIX process's heap records, arguments, working directory and `getenv`
+copies, #2373) is
+`channel` of
 the node of the domain the capability's state was granted to, and every ancestor, plus one `maps` for
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling
 (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed back as it shrinks or
-goes (#2306). A descriptor a guest causes holds one of the process's pool over its soft
+goes (#2306). A fork twin's copy of that state, or a spawned child's, is the guest's own act: it is
+charged with the fork, within every limit, and a provider with no room for it refuses the fork
+(`-EAGAIN`) or the re-grant, having registered nothing (#2373, #2428). A descriptor a guest causes
+holds one of the process's pool over its soft
 `RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A stack an engine keeps in
 host memory (the bytecode engine's register file) is `mem` of its vCPU's domain past the
 `FIBER_STACK` the vCPU's own charge pays for, plus its one `maps` from 128 KiB, and growing past a

@@ -146,7 +146,7 @@ fn on_ramp_child_reads_argv_paths_and_copies_a_file_over_a_regranted_memfs() {
         let factory = std::sync::Arc::clone(&factory);
         std::sync::Arc::new(move |_pid| {
             let (h, s) = (*factory)();
-            ForkedProc::shared(h, s)
+            Some(ForkedProc::shared(h, s))
         })
     };
     let fs_h = host.grant_host_proc_forkable(init, fork, init_state);

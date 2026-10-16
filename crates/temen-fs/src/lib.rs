@@ -414,10 +414,27 @@ impl MemFsState {
     /// past the process's pools ([`HostBuffer::rebind`]): `false` at the first part they have no room
     /// for. Its caller then drops the store, and each part hands back what it was charged.
     fn rebind(&mut self, payer: &NodeRef) -> bool {
-        self.tables.rebind(payer)
+        self.bind_each(payer, HostCharge::rebind, HostBuffer::rebind)
+    }
+
+    /// #2428 — [`Self::rebind`] within every ceiling as well ([`HostBuffer::bind_within`]): for a
+    /// copy a guest's own act makes, a fork twin's.
+    fn bind_within(&mut self, payer: &NodeRef) -> bool {
+        self.bind_each(payer, HostCharge::bind_within, HostBuffer::bind_within)
+    }
+
+    /// Bind the store's table charge with `table` and each buffer with `data`: `false` at the first
+    /// part refused.
+    fn bind_each(
+        &mut self,
+        payer: &NodeRef,
+        table: fn(&mut HostCharge, &NodeRef) -> bool,
+        data: fn(&mut HostBuffer, &NodeRef) -> bool,
+    ) -> bool {
+        table(&mut self.tables, payer)
             && self
                 .buffers()
-                .all(|data| data.lock().unwrap_or_else(|e| e.into_inner()).rebind(payer))
+                .all(|d| data(&mut d.lock().unwrap_or_else(|e| e.into_inner()), payer))
     }
 
     /// Every buffer the store holds: its files', its open descriptors' and its mappings'.
@@ -1153,6 +1170,16 @@ impl MemFsHandle {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).bind(payer);
     }
 
+    /// #2428 — [`Self::bind`] for a store a guest's own act copies (a fork twin's, or a spawned
+    /// child's it was re-granted): what it holds is charged within every limit. `false` when there is
+    /// no room. Its caller then drops the store, and each part hands back what it was charged.
+    pub fn bind_within(&self, payer: &NodeRef) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bind_within(payer)
+    }
+
     /// A store rebuilt from a [`capture_state`](Self::capture_state), unbound. `Err` on bytes this
     /// version cannot fully read.
     pub fn from_state(bytes: &[u8]) -> Result<MemFsHandle, String> {
@@ -1327,7 +1354,12 @@ pub fn regrant_vm_fs(
 /// `vm_fs` is exactly as re-grantable as a fresh one.
 pub fn vm_fs_fork(fs: &MemFsHandle) -> temen_interp::HostProcFork {
     let fs = fs.clone();
-    Arc::new(move |_pid| temen_interp::ForkedProc::shared(vm_fs_handler(&fs), fs.cap_state()))
+    Arc::new(move |_pid| {
+        Some(temen_interp::ForkedProc::shared(
+            vm_fs_handler(&fs),
+            fs.cap_state(),
+        ))
+    })
 }
 
 /// The `vm_fs` seam's handler over `fs`: the fs op in `args[0]`, its arguments after. What

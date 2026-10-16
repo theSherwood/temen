@@ -109,13 +109,19 @@ pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCa
 /// A memfs [`HostCap`] whose every grant mints a fresh store from `store` **and declares its state**
 /// (#1491), so a checkpoint, a debugger rebuild and a §12 freeze carry the files, directories and
 /// open descriptors the guest has — not just the continuation that expects them. A `fork()` twin
-/// gets a fresh store, as [`HostCap::host_proc`] gives any `make`-built capability.
+/// gets a fresh store, as [`HostCap::host_proc`] gives any `make`-built capability: charged within
+/// its grantee's limits, so a fork with no room for it fails (#2428).
 fn mem_fs_cap(store: impl Fn() -> temen_fs::MemFsHandle + Send + Sync + 'static) -> HostCap {
-    let store = std::sync::Arc::new(store);
-    HostCap::host_proc(0, move |payer| {
+    HostCap::host_proc(0, move |payer, mint| {
         let fs = store();
-        fs.bind(payer);
-        (fs.handler(), fs.cap_state())
+        let bound = match mint {
+            crate::Mint::Grant => {
+                fs.bind(payer);
+                true
+            }
+            crate::Mint::Inherit => fs.bind_within(payer),
+        };
+        bound.then(|| (fs.handler(), fs.cap_state()))
     })
 }
 
@@ -736,7 +742,7 @@ pub fn host_fs_mmap(root: PathBuf) -> HostCap {
 }
 
 fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
-    HostCap::host_proc(0, move |payer| {
+    HostCap::host_proc(0, move |payer, _| {
         let mut st = HostFsState::new(root.clone(), crashy.then(CrashCtl::default), payer);
         let h = Box::new(
             move |op: u32,
@@ -747,7 +753,7 @@ fn host_fs_impl(root: PathBuf, crashy: bool) -> HostCap {
             },
         ) as HostProc;
         // Open host files and directories, guest-visible cursors: `Uncaptured` (#1699).
-        (h, temen_interp::CapState::Uncaptured)
+        Some((h, temen_interp::CapState::Uncaptured))
     })
 }
 
