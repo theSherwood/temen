@@ -3845,6 +3845,183 @@ impl Func {
     }
 }
 
+/// The block params of a function that only forward a value (#2448).
+///
+/// Block-local SSA (D1, D32) makes every value live across a block one of its params, so most of a
+/// large function's params only pass on a value that a block dominating theirs defined: every edge
+/// into such a param passes it that value, or the param itself. A backend may take the param as the
+/// value, with no phi and no copy. That is sound for the reason trivial-phi removal is: the value's
+/// block dominates the param's. Cranelift's `remove_constant_phis` finds the same set. Only edges
+/// from reachable blocks count. A param of the entry block, or of a block nothing reaches, is its own.
+pub struct Forwards {
+    /// Each block's first param's place in `src`, then one past the last block's last.
+    first: Vec<u32>,
+    /// Per param, the value it forwards (`block << 32 | index`), or [`Forwards::OWN`].
+    src: Vec<u64>,
+}
+
+impl Forwards {
+    /// A param that is its own value.
+    const OWN: u64 = u64::MAX;
+    /// A param no edge has spoken for yet (only while [`Func::forwards`] runs).
+    const UNKNOWN: u64 = u64::MAX - 1;
+    /// Passes over a function before the analysis gives up and calls every param its own. A pass
+    /// costs one look at each edge argument; real code settles in a few.
+    const PASSES: usize = 32;
+
+    /// The value block `b`'s param `i` forwards, as its block and its index there (a param of
+    /// that block that is its own, or a result in it), or `None` for a param that is its own or
+    /// that the block does not have (an edge's extra argument stays an argument).
+    pub fn source(&self, b: usize, i: usize) -> Option<(BlockIdx, ValIdx)> {
+        let (lo, hi) = (
+            *self.first.get(b)? as usize,
+            *self.first.get(b + 1)? as usize,
+        );
+        match *self.src[lo..hi].get(i)? {
+            Self::OWN => None,
+            v => Some(((v >> 32) as BlockIdx, v as ValIdx)),
+        }
+    }
+}
+
+impl Func {
+    /// This function's block params that only forward a value ([`Forwards`]).
+    ///
+    /// A fixpoint over the edges from reachable blocks, in reverse postorder. A value is
+    /// `block << 32 | index`. An argument that names a param stands for what that param forwards,
+    /// or for the param once it is its own. A param whose arguments, its own aside, all stand for
+    /// one value forwards it; two values make it its own.
+    pub fn forwards(&self) -> Forwards {
+        let n = self.blocks.len();
+        let mut first = Vec::with_capacity(n + 1);
+        let mut total = 0usize;
+        for b in &self.blocks {
+            first.push(total as u32);
+            total += b.params.len();
+        }
+        first.push(total as u32);
+        let edges: Vec<Vec<(BlockIdx, &[ValIdx])>> =
+            self.blocks.iter().map(|b| b.term.edges()).collect();
+        // The blocks reachable from the entry, in reverse postorder.
+        let mut reach = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        if n > 0 {
+            reach[0] = true;
+            stack.push((0, 0));
+        }
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            match edges[b].get(k) {
+                Some(&(t, _)) => {
+                    top.1 += 1;
+                    let t = t as usize;
+                    if t < n && !reach[t] {
+                        reach[t] = true;
+                        stack.push((t, 0));
+                    }
+                }
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
+        // An edge into a block from a reachable one: its source block (a value's high half), where
+        // that block's params start in `src`, how many it has, and the arguments.
+        #[derive(Clone, Copy)]
+        struct In<'a> {
+            from: u64,
+            at: usize,
+            np: usize,
+            args: &'a [ValIdx],
+        }
+        let mut into: Vec<Vec<In>> = vec![Vec::new(); n];
+        for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
+            for &(t, args) in es {
+                if let Some(e) = into.get_mut(t as usize) {
+                    e.push(In {
+                        from: (u as u64) << 32,
+                        at: first[u] as usize,
+                        np: self.blocks[u].params.len(),
+                        args,
+                    });
+                }
+            }
+        }
+        let mut src = vec![Forwards::UNKNOWN; total];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if b == 0 || !reach[b] {
+                let at = first[b] as usize;
+                src[at..at + blk.params.len()].fill(Forwards::OWN);
+            }
+        }
+        let mut settled = false;
+        for _ in 0..Forwards::PASSES {
+            let mut changed = false;
+            for &t in &order {
+                for i in 0..self.blocks[t].params.len() {
+                    let at = first[t] as usize + i;
+                    if src[at] == Forwards::OWN {
+                        continue;
+                    }
+                    let me = (t as u64) << 32 | i as u64;
+                    let mut val = Forwards::UNKNOWN;
+                    for e in &into[t] {
+                        let Some(&a) = e.args.get(i) else {
+                            val = Forwards::OWN;
+                            break;
+                        };
+                        let mut v = e.from | a as u64;
+                        if (a as usize) < e.np {
+                            v = match src[e.at + a as usize] {
+                                Forwards::OWN => v,
+                                Forwards::UNKNOWN => continue,
+                                w => w,
+                            };
+                        }
+                        if v == me || v == val {
+                            continue;
+                        }
+                        if val != Forwards::UNKNOWN {
+                            val = Forwards::OWN;
+                            break;
+                        }
+                        val = v;
+                    }
+                    if val != src[at] {
+                        src[at] = val;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                // A param no edge spoke for (a cycle of params that never meets a value) is its
+                // own, and whatever counted on it looks again.
+                let mut forced = false;
+                for &t in &order {
+                    let at = first[t] as usize;
+                    for s in &mut src[at..at + self.blocks[t].params.len()] {
+                        if *s == Forwards::UNKNOWN {
+                            *s = Forwards::OWN;
+                            forced = true;
+                        }
+                    }
+                }
+                if !forced {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        if !settled {
+            src.fill(Forwards::OWN);
+        }
+        Forwards { first, src }
+    }
+}
+
 /// A linear-memory window declaration (§4). The window is `1 << size_log2` bytes —
 /// a power of two, so confinement is a single `addr & (size − 1)` mask. The window
 /// is a reserved virtual range; guest pointers are offsets into it.
@@ -8174,6 +8351,326 @@ mod spawn_rec_tests {
             SpawnRec::parse(&[b.as_slice(), &[0]].concat()),
             None,
             "one byte long"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwards_tests {
+    use super::*;
+
+    fn blk(params: usize, consts: usize, term: Terminator) -> Block {
+        Block {
+            params: vec![ValType::I32; params],
+            insts: (0..consts).map(|_| Inst::ConstI32(0)).collect(),
+            term,
+        }
+    }
+
+    fn br(target: BlockIdx, args: &[ValIdx]) -> Terminator {
+        Terminator::Br {
+            target,
+            args: args.to_vec(),
+        }
+    }
+
+    fn br_if(cond: ValIdx, t: (BlockIdx, &[ValIdx]), e: (BlockIdx, &[ValIdx])) -> Terminator {
+        Terminator::BrIf {
+            cond,
+            then_blk: t.0,
+            then_args: t.1.to_vec(),
+            else_blk: e.0,
+            else_args: e.1.to_vec(),
+        }
+    }
+
+    fn func(blocks: Vec<Block>) -> Func {
+        Func {
+            params: blocks[0].params.clone(),
+            results: Vec::new(),
+            blocks,
+        }
+    }
+
+    #[test]
+    fn a_chain_forwards_to_the_value_and_the_entry_param() {
+        // b0(x): c; br b1(c, x) — b1(p, q): br b2(p, q) — b2(r, s): return
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br(2, &[0, 1])),
+            blk(2, 0, Terminator::Return(Vec::new())),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None, "an entry param is its own");
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), Some((0, 0)));
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((0, 0)));
+        assert_eq!(w.source(1, 2), None, "a param the block does not have");
+        assert_eq!(w.source(3, 0), None, "a block the function does not have");
+    }
+
+    #[test]
+    fn a_loop_forwards_its_invariant_and_keeps_its_counter() {
+        // b0(x): c; br b1(c, x)
+        // b1(inv, n): br_if n b2(inv, n) b3(inv)
+        // b2(inv, n): m; br b1(inv, m)
+        // b3(inv): return inv
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br_if(1, (2, &[0, 1]), (3, &[0]))),
+            blk(2, 1, br(1, &[0, 2])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), None, "the counter is a phi");
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((1, 1)), "the counter forwards the phi");
+        assert_eq!(w.source(3, 0), Some((0, 1)));
+    }
+
+    #[test]
+    fn a_join_of_two_values_is_its_own_and_is_forwarded_on() {
+        // b0(x): c1 c2; br_if x b1(c1) b2(c2) — b1(a): br b3(a) — b2(b): br b3(b)
+        // b3(m): br b4(m) — b4(k): return k
+        let f = func(vec![
+            blk(1, 2, br_if(0, (1, &[1]), (2, &[2]))),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(4, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 0), Some((0, 2)));
+        assert_eq!(w.source(3, 0), None);
+        assert_eq!(w.source(4, 0), Some((3, 0)));
+    }
+
+    #[test]
+    fn edges_from_unreachable_blocks_do_not_count() {
+        // b0(x): br b1(x) — b1(y): return y — b2(z) (unreachable): c; br b1(c)
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+            blk(1, 1, br(1, &[1])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+        assert_eq!(
+            w.source(2, 0),
+            None,
+            "a param of an unreachable block is its own"
+        );
+    }
+
+    #[test]
+    fn self_loops_and_cycles_of_params_forward_what_enters_them() {
+        // b0(x): br b1(x)
+        // b1(p): br_if p b1(p) b2(p) — b2(q): br_if q b1(q) b3(q) — b3(r): return r
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, br_if(0, (1, &[0]), (2, &[0]))),
+            blk(1, 0, br_if(0, (1, &[0]), (3, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        for b in 1..4 {
+            assert_eq!(w.source(b, 0), Some((0, 0)), "block {b}");
+        }
+    }
+
+    #[test]
+    fn a_branch_back_to_the_entry_keeps_its_params() {
+        // b0(x): c; br_if x b0(c) b1(x) — b1(y): return y
+        let f = func(vec![
+            blk(1, 1, br_if(0, (0, &[1]), (1, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None);
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+    }
+
+    /// A small deterministic generator (xorshift), so the test needs no crate.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// A random function: blocks with random params and constants, each ending in a branch to
+    /// random blocks with random arguments from its own values, or a return.
+    fn random_func(r: &mut Rng) -> Func {
+        let n = 2 + r.below(10);
+        let params: Vec<usize> = (0..n)
+            .map(|b| if b == 0 { 1 } else { r.below(5) })
+            .collect();
+        let blocks = (0..n)
+            .map(|b| {
+                let consts = r.below(3);
+                let locals = params[b] + consts;
+                let args = |r: &mut Rng, t: usize| -> Vec<ValIdx> {
+                    (0..params[t])
+                        .map(|_| {
+                            if locals == 0 {
+                                0
+                            } else {
+                                r.below(locals) as ValIdx
+                            }
+                        })
+                        .collect()
+                };
+                // A block with no values has nothing to pass or test: it returns.
+                let term = match (locals, r.below(4)) {
+                    (0, _) | (_, 0) => Terminator::Return(Vec::new()),
+                    (_, 1) => {
+                        let t = r.below(n);
+                        let a = args(r, t);
+                        Terminator::Br {
+                            target: t as BlockIdx,
+                            args: a,
+                        }
+                    }
+                    _ => {
+                        let (t, e) = (r.below(n), r.below(n));
+                        let (ta, ea) = (args(r, t), args(r, e));
+                        Terminator::BrIf {
+                            cond: 0,
+                            then_blk: t as BlockIdx,
+                            then_args: ta,
+                            else_blk: e as BlockIdx,
+                            else_args: ea,
+                        }
+                    }
+                };
+                // A target with params needs a block that has values to pass.
+                let term = match &term {
+                    Terminator::Br { target, .. }
+                        if locals == 0 && params[*target as usize] > 0 =>
+                    {
+                        Terminator::Return(Vec::new())
+                    }
+                    _ => term,
+                };
+                blk(params[b], consts, term)
+            })
+            .collect();
+        func(blocks)
+    }
+
+    /// Each block's dominators among the reachable blocks (the iterative definition).
+    fn dominators(f: &Func) -> Vec<Option<Vec<bool>>> {
+        let n = f.blocks.len();
+        let mut reach = vec![false; n];
+        let mut stack = vec![0];
+        reach[0] = true;
+        while let Some(b) = stack.pop() {
+            for (t, _) in f.blocks[b].term.edges() {
+                if !reach[t as usize] {
+                    reach[t as usize] = true;
+                    stack.push(t as usize);
+                }
+            }
+        }
+        let mut dom: Vec<Option<Vec<bool>>> = (0..n)
+            .map(|b| reach[b].then(|| (0..n).map(|d| b != 0 || d == 0).collect()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                if !reach[b] {
+                    continue;
+                }
+                let mut meet = vec![true; n];
+                for (u, blk) in f.blocks.iter().enumerate() {
+                    if reach[u] && blk.term.edges().iter().any(|&(t, _)| t as usize == b) {
+                        let du = dom[u].as_ref().unwrap();
+                        for d in 0..n {
+                            meet[d] &= du[d];
+                        }
+                    }
+                }
+                meet[b] = true;
+                if dom[b].as_ref() != Some(&meet) {
+                    dom[b] = Some(meet);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return dom;
+            }
+        }
+    }
+
+    #[test]
+    fn a_forwarded_value_dominates_its_param_and_is_its_value_on_every_path() {
+        let mut r = Rng(0x2448_5eed);
+        let (mut forwarded, mut checked) = (0, 0);
+        for _ in 0..3000 {
+            let f = random_func(&mut r);
+            let w = f.forwards();
+            let dom = dominators(&f);
+            for (b, blk) in f.blocks.iter().enumerate() {
+                for i in 0..blk.params.len() {
+                    let Some((sb, si)) = w.source(b, i) else {
+                        continue;
+                    };
+                    let (sb, si) = (sb as usize, si as usize);
+                    forwarded += 1;
+                    assert!(dom[b].as_ref().is_some_and(|d| d[sb]), "{f:?}: ({b}, {i})");
+                    assert!(sb != b, "{f:?}: ({b}, {i}) forwards its own block's value");
+                    let own = si >= f.blocks[sb].params.len() || w.source(sb, si).is_none();
+                    assert!(own, "{f:?}: ({b}, {i}) forwards a param that forwards");
+                }
+            }
+            // Walk random paths: every value an instruction defines is fresh each time it runs, a
+            // param takes its argument's value, and a forwarded param must hold its value's
+            // latest definition whenever its block is entered.
+            let mut next = 0u64;
+            for _ in 0..8 {
+                let mut cur: Vec<Vec<Option<u64>>> = f
+                    .blocks
+                    .iter()
+                    .map(|b| vec![None; b.params.len() + b.insts.len()])
+                    .collect();
+                let (mut b, mut incoming) = (0usize, vec![Some(u64::MAX)]);
+                for _ in 0..64 {
+                    let blk = &f.blocks[b];
+                    for (i, v) in incoming.iter().enumerate() {
+                        cur[b][i] = *v;
+                    }
+                    for i in 0..blk.params.len() {
+                        if let Some((sb, si)) = w.source(b, i) {
+                            checked += 1;
+                            assert_eq!(
+                                cur[b][i], cur[sb as usize][si as usize],
+                                "{f:?}: ({b}, {i})"
+                            );
+                        }
+                    }
+                    for k in 0..blk.insts.len() {
+                        next += 1;
+                        cur[b][blk.params.len() + k] = Some(next);
+                    }
+                    let edges = blk.term.edges();
+                    if edges.is_empty() {
+                        break;
+                    }
+                    let (t, args) = edges[r.below(edges.len())];
+                    incoming = args.iter().map(|a| cur[b][*a as usize]).collect();
+                    b = t as usize;
+                }
+            }
+        }
+        assert!(
+            forwarded > 1000 && checked > 1000,
+            "{forwarded} forwarded, {checked} checked"
         );
     }
 }

@@ -142,11 +142,12 @@ struct Copies {
 }
 impl Copies {
     /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
-    /// (so a one-pass sequential copy could clobber a not-yet-read source). O(n²) over a tiny edge.
+    /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
+    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for.
     fn new(pairs: Box<[(u32, u32)]>) -> Copies {
-        let aliasing = pairs
-            .iter()
-            .any(|&(_, d)| pairs.iter().any(|&(s, _)| s == d));
+        let mut srcs: Vec<u32> = pairs.iter().map(|&(s, _)| s).collect();
+        srcs.sort_unstable();
+        let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
         Copies { pairs, aliasing }
     }
 }
@@ -616,12 +617,12 @@ enum Op {
     /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
-    /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
-    /// **block-local** operand indices, so it's run against the sub-window `regs[base + block_base
-    /// ..]`; `dst` is the frame-relative result slot (unused when `eval_inst` yields no value).
+    /// [`super::eval_inst`] — same semantics, no duplication. The instruction's operands are
+    /// rewritten to the **frame slots** every other op reads (an operand that names a forwarded
+    /// param reads its value's slot, #2448), so it's run against the frame `regs[base..]`; `dst`
+    /// is the frame-relative result slot (unused when `eval_inst` yields no value).
     Eval {
         inst: Box<Inst>,
-        block_base: u32,
         dst: u32,
     },
     /// §12.8 4A.5 durable-runtime-internal: push the active context's shadow-SP word address (the
@@ -2473,17 +2474,38 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
     // never single-stepped (debug/trace compile unfused), so no source location is lost there.
     let mut src: Vec<Option<(u32, u32)>> = Vec::new();
+    // #2448: in the fused compile, a block param that only forwards a value reads that value's
+    // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
+    // frames, read by `(block, value)`) keeps every param in a slot of its own.
+    let forwards = fuse.then(|| f.forwards());
+    let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
+    // The slots a forwarding param reads: read outside their block with no edge copy, so their
+    // values must be written (the `IntCmp` fusion below checks this).
+    let mut read_forwarded = vec![false; nslots as usize];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for i in 0..blk.params.len() {
+            if let Some((sb, si)) = forwarded(b, i) {
+                read_forwarded[(base[sb as usize] + si) as usize] = true;
+            }
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
-        let g = |local: u32| base[bi] + local; // operand: block-local index -> frame slot
-        let mut local = b.params.len() as u32;
+        let params = b.params.len() as u32;
+        // operand: block-local index -> frame slot
+        let g = |local: u32| match local < params {
+            true => forwarded(bi, local as usize)
+                .map_or(base[bi] + local, |(sb, si)| base[sb as usize] + si),
+            false => base[bi] + local,
+        };
+        let mut local = params;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = match view.results(inst) {
                 0 => discard,
                 _ => base[bi] + local,
             };
             local += view.results(inst) as u32;
-            ops.push(compile_inst(inst, dst, base[bi], view, &g)?);
+            ops.push(compile_inst(inst, dst, view, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
@@ -2497,6 +2519,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             let pairs: Box<[(u32, u32)]> = args
                 .iter()
                 .enumerate()
+                .filter(|&(i, _)| forwarded(bidx, i).is_none())
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
                 .filter(|(src, dst)| src != dst)
                 .collect();
@@ -2519,9 +2542,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let cond_slot = g(*cond);
                 // Slice 5a: fuse a block-final `IntCmp` whose result is this branch's condition and
                 // is used nowhere else into a single `BrIfCmp`. Valid because the compare is pure and
-                // single-use *here*: it is the last instruction (so no later in-block reader) and the
-                // cond slot is not carried to any successor (not an edge-copy source). Fused compile
-                // only — `fuse == false` (debug/trace) keeps the compare as its own steppable op.
+                // single-use *here*: it is the last instruction (so no later in-block reader), the
+                // cond slot is not carried to any successor (not an edge-copy source), and no
+                // forwarding param reads it (#2448). Fused compile only — `fuse == false`
+                // (debug/trace) keeps the compare as its own steppable op.
                 let fused = if fuse && !b.insts.is_empty() {
                     match ops.last() {
                         Some(Op::IntCmp {
@@ -2531,6 +2555,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                             ty,
                             op,
                         }) if *dst == cond_slot
+                            && !read_forwarded[cond_slot as usize]
                             && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
                             && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
                         {
@@ -2640,7 +2665,6 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
 fn compile_inst(
     inst: &Inst,
     dst: u32,
-    block_base: u32,
     view: &ModuleView<'_>,
     g: &impl Fn(u32) -> u32,
 ) -> Option<Op> {
@@ -3149,13 +3173,17 @@ fn compile_inst(
         Inst::VcpuTlsGet => Op::VcpuTlsGet { dst },
         Inst::VcpuTlsSet { val } => Op::VcpuTlsSet { val: g(*val) },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
-        // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
-        // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
-        other => Op::Eval {
-            inst: Box::new(other.clone()),
-            block_base,
-            dst,
-        },
+        // already implements (the SIMD/`v128`/fence long tail): delegate to it against the frame,
+        // its operands the frame slots `g` gives, reusing the exact semantics rather than
+        // re-inlining ~30 lane ops.
+        other => {
+            let mut inst = other.clone();
+            inst.for_each_operand_mut(&mut |v| *v = g(*v));
+            Op::Eval {
+                inst: Box::new(inst),
+                dst,
+            }
+        }
     })
 }
 
@@ -20439,17 +20467,12 @@ impl Vm {
                     return Err(Trap::Unreachable);
                 }
                 Op::CapFault => return Err(Trap::CapFault),
-                Op::Eval {
-                    inst,
-                    block_base,
-                    dst,
-                } => {
-                    // Run the op against this block's sub-window with its original block-local operand
-                    // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
-                    // and `mem` mutably (disjoint), so we read the result before writing it back.
-                    let win_lo = base + *block_base as usize;
+                Op::Eval { inst, dst } => {
+                    // Run the op against the frame, its operands frame slots; reuse the reference
+                    // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
+                    // (disjoint), so we read the result before writing it back.
                     let win_hi = base + c.progs[cur].nslots as usize;
-                    let r = super::eval_inst(inst, &self.regs[win_lo..win_hi], mem)?;
+                    let r = super::eval_inst(inst, &self.regs[base..win_hi], mem)?;
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }
