@@ -70,7 +70,7 @@ fn marshal(host: &mut Host, window: &[u8], grants_ptr: u64, grants_n: u64) -> Re
         runs: WINDOW_RUNS,
     };
     Ok(host
-        .spawn_detached_child(&grants, CHILD_SIZE, lease, -1)
+        .spawn_detached_child(&grants, CHILD_SIZE, lease, -1, false)
         .is_some())
 }
 

@@ -1775,6 +1775,9 @@ pub(crate) struct GcRootsArgs {
     mask: u64,
     mapped: u64,
     trap_out: u64,
+    /// #2164 — a demand-paged instance's declared page count, which bounds its access table
+    /// ([`crate::VmCtx::pages`]); `0` for any other.
+    pages: u64,
 }
 
 /// The scan itself. Reached **only** via [`temen_gc_roots_flush`], which has already spilled the
@@ -1785,7 +1788,8 @@ pub(crate) struct GcRootsArgs {
 /// # Safety
 /// `args` points at a live [`GcRootsArgs`] (the JIT's stack slot, valid for the call).
 pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
-    // SAFETY: the JIT hands the address of a live 9-field slot; the flush trampoline is the only caller.
+    // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only
+    // caller.
     let a = unsafe { &*args };
     let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out) = (
         a.heap_lo,
@@ -1918,6 +1922,16 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         if masked.checked_add(nbytes).is_none_or(|end| end > mapped) {
             fault(trap_out); // a forged / out-of-window buffer — like the interp's `MemoryFault`
             return 0;
+        }
+        // #2164 — a demand-paged child's unsupplied pages are committed, and its access table gates
+        // them: a page the table does not let it write faults, as the interpreters' checked buffer
+        // write does (never paged in: they write the buffer from the host, as this does).
+        if a.pages != 0 {
+            let table = crate::VmCtx::of_trap_out(trap_out as *mut i64).pages;
+            if !crate::table_admits(table, a.pages, masked, nbytes, temen_ir::PAGE_WRITE) {
+                fault(trap_out);
+                return 0;
+            }
         }
         let dst = (mem_base + masked) as *mut u8;
         let mut off = 0usize;
