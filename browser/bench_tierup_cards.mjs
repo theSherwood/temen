@@ -31,8 +31,11 @@ const readStdout = () => dec.decode(u8().slice(
 // Event counters, observed from outside: one TIERUP service reads temen_coop_func once; a
 // JIT_INVOKE reads temen_coop_jit_wasm_ptr once; every cross-tier bounce goes through
 // temen_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
-// #1026 slice 4: the production leaf tier-up size floor (temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES).
-const DEFAULT_FLOOR = 4096;
+// #2474: when calls tier up, as `per_call,window,in_call` triples (temen_coop_set_hotness): every
+// eligible call at its start, the production default (null), and never. `HOTNESS="16,8,10000;..."`
+// adds triples to calibrate the default against.
+const HOTNESS = [['every-call', [0, 0, 0]], ['default', null], ['never', [0xffffffff, 1, 0]],
+  ...(process.env.HOTNESS ?? '').split(';').filter(Boolean).map((t) => [t, t.split(',').map(Number)])];
 let forceRegions = false;
 const counts = { tierups: 0, invokes: 0, bounces: 0, path: 'interp' };
 const resetCounts = () => { counts.tierups = 0; counts.invokes = 0; counts.bounces = 0; counts.path = 'interp'; };
@@ -123,29 +126,29 @@ for (const [name, rel, workload] of cards) {
     `(${(bBest / warmBest).toFixed(2)}x) | path ${warm.path} | tierups ${warm.tierups} invokes ${warm.invokes} bounces ${warm.bounces} | ${parity}`,
   );
   // The #839 column proper: the region run forced (what a guest gets when the emitter declines its
-  // root), same workload. #1026 slice 4 A/B: sweep the leaf tier-up size floor — `0` = the old
-  // "leaves on" (every emittable leaf tiers up), the production default = "leaves off" for dispatch
-  // leaves. Both must stay parity=OK (the floor changes which tier runs, never the result).
+  // root), same workload, swept over when calls tier up (#2474). Every row must stay parity=OK (the
+  // rule changes which tier runs, never the result).
   forceRegions = true;
-  for (const [label, floor] of [['leaves-on', 0], ['default', DEFAULT_FLOOR], ['leaves-off', 1 << 30]]) {
+  for (const [label, hot] of HOTNESS) {
+    const arm = () => (hot ? ex.temen_coop_set_hotness(...hot) : ex.temen_coop_reset_hotness());
     try {
-      ex.temen_coop_set_tierup_floor(floor);
+      arm();
       const pcold = await pumpRun(modBytes, stdin, `bench#${name}#regions#${label}`);
       let pBest = Infinity, pw;
       for (let i = 0; i < N; i++) {
-        ex.temen_coop_set_tierup_floor(floor);
+        arm();
         const r = await pumpRun(modBytes, stdin, `bench#${name}#regions#${label}`);
         if (r.ms < pBest) { pBest = r.ms; pw = r; }
       }
       const pparity = pw.out === b[0].out && pw.st === b[0].st ? 'parity=OK' : 'parity=MISMATCH';
       console.log(
-        `${name}: regions-forced [${label} floor=${floor}] cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
+        `${name}: regions-forced [${label}] cold ${pcold.ms.toFixed(1)}ms, warm best ${pBest.toFixed(1)}ms ` +
         `(${(bBest / pBest).toFixed(2)}x) | path ${pw.path} | tierups ${pw.tierups} invokes ${pw.invokes} bounces ${pw.bounces} | ${pparity}`,
       );
     } catch (e) {
       console.log(`${name}: regions-forced [${label}] REFUSED/failed (${e.message})`);
     }
   }
-  ex.temen_coop_set_tierup_floor(DEFAULT_FLOOR);
+  ex.temen_coop_reset_hotness();
   forceRegions = false;
 }
