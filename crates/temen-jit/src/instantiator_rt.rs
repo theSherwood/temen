@@ -433,7 +433,8 @@ unsafe fn register_serve(
     }
 }
 
-/// The per-run §14 nesting runtime, baked into the module's `Instantiator` `call.cap` sites. Holds
+/// The per-run §14 nesting runtime the module's `Instantiator` `call.cap` sites load from their
+/// instance's vmctx (temen#2168): each instance has its own (temen#2389). Holds
 /// what compiling + running a child needs: the run's `call.cap` thunk/ctx (to resolve an
 /// `Instantiator` handle's authority), the host's grant hooks, and the child executor. Children run
 /// **asynchronously** as executor tasks; outcomes land in per-child completion cells `join` parks on.

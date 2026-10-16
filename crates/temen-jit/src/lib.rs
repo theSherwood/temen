@@ -2741,8 +2741,9 @@ pub struct CompiledModule {
     /// #1768 — the embedder's fork hook ([`Self::set_fork_hook`]): set on a run armed to fork, whose
     /// root unwinds at a fork call for the hook to duplicate. `None` for every other run.
     fork_hook: Option<ForkHook>,
-    // --- §12/§14 runtimes whose stable addresses are baked into the code; they must live
-    // --- exactly as long as the code can run, i.e. as long as `module`.
+    // --- §12/§14 runtimes this instance's code runs on, which its vmctx names or an entry publishes;
+    // --- they must live exactly as long as the instance can run. Each instance has its own
+    // --- ([`Self::instance`], temen#2389).
     #[cfg(fiber_rt)]
     fiber_rt: Option<Box<fiber_rt::FiberRuntime>>,
     #[cfg(fiber_rt)]
@@ -2750,10 +2751,16 @@ pub struct CompiledModule {
     /// Kept alive because the instance names it ([`VmCtx::nursery`]) for its `Instantiator` sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
-    /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
-    /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
+    /// Kept alive because the instance names it ([`VmCtx::setjmp`]) for its `SetJmp`/`LongJmp` sites
+    /// (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
     #[cfg(setjmp_rt)]
     _setjmp_rt: Option<Box<setjmp_rt::SetjmpRuntime>>,
+    /// temen#2389 — the `call.cap` thunk and module resolver a root's §14 nursery spawns with: what
+    /// [`Self::instance`] stands an instance's own nursery up over.
+    #[cfg(fiber_rt)]
+    cap_thunk: CapThunk,
+    #[cfg(fiber_rt)]
+    resolve_module: Option<ModuleResolver>,
     #[cfg(fiber_rt)]
     call_tramp: Option<fiber_rt::FiberCallTramp>,
     /// `(fiber_type_id, fiber_mask)` when the module uses `cont.*` — the per-vCPU fiber config
@@ -2783,15 +2790,13 @@ pub struct CompiledModule {
     /// The §6 structured type graph (`debug_info.types`), emitted as `DW_TAG_*_type` DIEs (W5
     /// JIT/DWARF Stage 3b). Empty unless the module carried `-g` types. Host-side tooling.
     debug_types: Vec<temen_ir::TypeDef>,
-    /// #1825 — whether an instance of the code needs a runtime [`Self::instance`] does not make, so
-    /// the code cannot be shared: the §14 nursery a root's `Instantiator` sites spawn through, the
-    /// `setjmp` table its `SetJmp`/`LongJmp` sites bake, the fiber table and runtimes its `cont.*`
-    /// and `thread.*` sites run on, or one a §22 hosting entry stood up after the compile. (A nursery
-    /// stood up only for units this module may install, #1726, is not named by the module's own
-    /// code.) Code that only waits and notifies needs nothing but a thread domain, and each instance
-    /// gets its own. A §14 child's runtimes are its task's and its nursery its spawn's, so its code
-    /// needs none of these (temen#2168).
-    needs_runtime: bool,
+    /// #1825 — whether a §22 hosting entry stood a runtime up after the compile
+    /// ([`Self::enable_fiber_hosting`], [`Self::enable_thread_hosting`]): one [`Self::instance`] does
+    /// not make, so the code cannot be shared. Every runtime the compile itself stands up (the thread
+    /// domain, the fiber table and runtime, the §14 nursery, the `setjmp` table) an instance makes
+    /// anew (temen#2389). A §14 child's runtimes are its task's and its nursery its spawn's
+    /// (temen#2168).
+    hosted: bool,
     /// temen#2168 — whether the code's own `Instantiator` sites spawn through its instance's nursery
     /// ([`VmCtx::nursery`]): every instance of it has one exactly then.
     nests: bool,
@@ -3184,8 +3189,8 @@ impl CompiledModule {
             fast_resolver,
         };
 
-        // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (its address baked into
-        // the `cont.*` sites). The `FiberRuntime` box is created now so its address is stable; the
+        // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (an entry publishes it
+        // in a thread-local the `cont.*` thunks read). The `FiberRuntime` box is created now; the
         // call-trampoline address is filled in after finalize. On targets without stack-switch support,
         // `ensure_supported` has already rejected the fiber ops, so this stays `null`.
         #[cfg(fiber_rt)]
@@ -3261,8 +3266,8 @@ impl CompiledModule {
         #[cfg(not(fiber_rt))]
         let fiber = FiberEnv::null();
 
-        // §12 threads: stand up the 1:1 OS-thread executor `Domain` whose stable address is baked into the
-        // `thread.*` sites. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
+        // §12 threads: stand up the 1:1 OS-thread executor `Domain` the `thread.*` sites load from the
+        // instance's vmctx. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
         // guest builds any M:N model itself, D22). The per-run `Env` (call-trampoline, window, trap cell)
         // is supplied after finalize via `set_env`; the address is stable now. Also stood up for a
         // **nesting** module with no thread ops of its own: §14 children compile their `atomic.wait`/
@@ -3303,24 +3308,16 @@ impl CompiledModule {
         // #1726: also for a module that can **install** §22 units (a reserved `call.dyn` table): an
         // installed unit that instantiates runs in this module's frames, so it needs this nursery
         // even when the module itself names no `Instantiator` (it may only pass the handle on).
-        let nursery: Option<Box<instantiator_rt::Nursery>> = if spawns || table_reserve_log2 > 0 {
-            Some(Box::new(instantiator_rt::Nursery::new(
+        let nursery = (spawns || table_reserve_log2 > 0).then(|| {
+            nursery_over(
                 cap_thunk,
                 cap_ctx,
                 resolve_module,
-                epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
-                // The run's thread `Domain` (always stood up for a nesting module, above): children
-                // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
-                // the parent rendezvous in one table.
-                domain
-                    .as_ref()
-                    .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
-                    .unwrap_or(0),
-                None, // the run's own child executor
-            )))
-        } else {
-            None
-        };
+                epoch_addr as usize,
+                // Always stood up for a nesting module, above.
+                domain.as_deref(),
+            )
+        });
         // temen#2168: the code loads the nursery from its instance's vmctx, as it loads the domain.
         #[cfg(fiber_rt)]
         if let Some(n) = &nursery {
@@ -3332,8 +3329,8 @@ impl CompiledModule {
         let inst = InstEnv::null();
 
         // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): when the module uses them, stand up
-        // the per-run host `jmp_buf` table whose stable address is baked into the `SetJmp`/`LongJmp`
-        // sites. Owned by the `CompiledModule` (`_setjmp_rt`), so it outlives every (re-)run. Unix-only
+        // the per-run host `jmp_buf` table the `SetJmp`/`LongJmp` sites load from the instance's vmctx.
+        // Owned by the `CompiledModule` (`_setjmp_rt`), so it outlives every (re-)run. Unix-only
         // (the `setjmp_rt` cfg); elsewhere `ensure_supported` has already rejected the ops.
         #[cfg(setjmp_rt)]
         let uses_setjmp = module_uses_setjmp(m);
@@ -3357,8 +3354,9 @@ impl CompiledModule {
         };
         #[cfg(setjmp_rt)]
         let setjmp = if let Some(r) = &setjmp_runtime {
+            // temen#2389: the sites load the table from the instance's vmctx, as they load the domain.
+            instance.setjmp = &**r as *const setjmp_rt::SetjmpRuntime as *const core::ffi::c_void;
             SetjmpEnv {
-                rt_addr: (&**r as *const setjmp_rt::SetjmpRuntime) as i64,
                 slot_thunk: setjmp_rt::rt_setjmp_slot as *const () as i64,
                 lookup_thunk: setjmp_rt::rt_setjmp_lookup as *const () as i64,
                 setjmp_addr: setjmp_rt::setjmp_addr(),
@@ -3712,18 +3710,10 @@ impl CompiledModule {
             })
             .collect();
         #[cfg(not(fiber_rt))]
-        let _ = &node;
-        #[cfg(fiber_rt)]
-        let needs_runtime = uses_fibers
-            || m.funcs.iter().any(temen_ir::Func::uses_threads)
-            || module_uses_instantiator(m);
-        #[cfg(not(fiber_rt))]
-        let needs_runtime = false;
-        #[cfg(setjmp_rt)]
-        let needs_runtime = needs_runtime || setjmp_runtime.is_some();
+        let _ = (&node, resolve_module);
         MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
         Ok(CompiledModule {
-            needs_runtime,
+            hosted: false,
             nests: cfg!(fiber_rt) && module_uses_instantiator(m),
             fn_table,
             tramp_code,
@@ -3782,6 +3772,10 @@ impl CompiledModule {
             _nursery: nursery,
             #[cfg(setjmp_rt)]
             _setjmp_rt: setjmp_runtime,
+            #[cfg(fiber_rt)]
+            cap_thunk,
+            #[cfg(fiber_rt)]
+            resolve_module,
             #[cfg(fiber_rt)]
             call_tramp,
             #[cfg(fiber_rt)]
@@ -3906,44 +3900,123 @@ impl CompiledModule {
     }
 
     /// #1825 — this module's code as [`SharedCode`], for more instances to run. `None` unless the code
-    /// is **only code**: an instance of it needs no runtime but a thread domain (see `needs_runtime`),
-    /// and nothing was defined past it. From here on no instance can extend it ([`arena_mut`]) — this
+    /// is **only code**: no hosting entry stood a runtime up past the compile (see `hosted`), and
+    /// nothing was defined past it. From here on no instance can extend it ([`arena_mut`]) — this
     /// module included, which goes on running as the first instance.
     pub fn share(&self) -> Option<SharedCode> {
         self.is_only_code().then(|| {
-            // The kept instance is never run: it names none of this one's state.
-            SharedCode(self.instance(InstanceAddrs {
-                cap_ctx: core::ptr::null_mut(),
-                embedder: core::ptr::null_mut(),
-                sched: core::ptr::null(),
-                nursery: core::ptr::null(),
-                ..self.instance
-            }))
+            // The kept instance is never run: it names none of this one's state, and no run's node.
+            SharedCode(self.instance(
+                InstanceAddrs {
+                    cap_ctx: core::ptr::null_mut(),
+                    embedder: core::ptr::null_mut(),
+                    sched: core::ptr::null(),
+                    nursery: core::ptr::null(),
+                    setjmp: core::ptr::null(),
+                    ..self.instance
+                },
+                None,
+            ))
         })
     }
 
     /// See [`Self::share`].
     fn is_only_code(&self) -> bool {
-        !self.needs_runtime && self.next_extra == 0
+        !self.hosted && self.next_extra == 0
+    }
+
+    /// Whether an instance of this code stands up its own §14 nursery ([`Self::instance`]): a root's
+    /// that spawns does; a child's is its spawn's.
+    fn makes_nursery(&self) -> bool {
+        #[cfg(fiber_rt)]
+        {
+            self.nests && self._nursery.is_some()
+        }
+        #[cfg(not(fiber_rt))]
+        {
+            false
+        }
     }
 
     /// A new instance of this module's code at `addrs` ([`SharedCode::instance`]): the compile's
     /// products, the function table copied (a run is handed its address; nothing bakes it), and fresh
-    /// run state. Only for code [`Self::is_only_code`] admits, so it carries no runtime but a thread
-    /// domain of its own, when the code waits or notifies — not even the §14 nursery a module with
-    /// install room gets for its units (#1726): no unit can be defined into shared code. A §14
-    /// child's runtimes are its task's, and its domain and nursery are the ones `addrs` names: its
-    /// parent's domain, and the nursery its spawn made for it (temen#2168).
+    /// run state. Only for code [`Self::is_only_code`] admits.
+    ///
+    /// temen#2389 — each runtime the compile stood up, the instance gets one of its own, charged to
+    /// `node`, its run's budget: a thread domain, the fiber table and the root vCPU's fiber runtime,
+    /// the §14 nursery its `Instantiator` sites spawn through, the `setjmp` table. Its vmctx names
+    /// them; nothing in the code does. Not the nursery a module with install room gets for its units
+    /// (#1726): no unit can be defined into shared code. A §14 child's runtimes are its task's, and
+    /// its domain and nursery are the ones `addrs` names: its parent's domain, and the nursery its
+    /// spawn made for it (temen#2168).
     #[cfg_attr(not(fiber_rt), allow(unused_mut))]
-    fn instance(&self, mut addrs: InstanceAddrs) -> CompiledModule {
+    fn instance(
+        &self,
+        mut addrs: InstanceAddrs,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
+    ) -> CompiledModule {
         #[cfg(fiber_rt)]
-        let domain = self.domain.as_ref().map(|d| Box::new(d.fresh()));
+        let domain = self
+            .domain
+            .as_ref()
+            .map(|_| Box::new(os_thread_rt::Domain::new(node.clone())));
         #[cfg(fiber_rt)]
         if let Some(d) = &domain {
             addrs.sched = &**d as *const os_thread_rt::Domain as *const core::ffi::c_void;
         }
+        #[cfg(fiber_rt)]
+        let fiber_table = self.fiber_table.as_ref().map(|_| {
+            std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                temen_ir::MAX_FIBERS,
+                self.shadow,
+                node.clone(),
+            ))
+        });
+        #[cfg(fiber_rt)]
+        let fiber_rt = match (
+            &self.fiber_rt,
+            &fiber_table,
+            self.fiber_cfg,
+            self.call_tramp,
+        ) {
+            (Some(_), Some(t), Some((type_id, mask)), Some(tramp)) => {
+                let mut rt = Box::new(fiber_rt::FiberRuntime::new(
+                    std::sync::Arc::clone(t),
+                    type_id,
+                    mask,
+                ));
+                rt.set_call_tramp(tramp);
+                Some(rt)
+            }
+            _ => None,
+        };
+        #[cfg(fiber_rt)]
+        let nursery = self.makes_nursery().then(|| {
+            nursery_over(
+                self.cap_thunk,
+                addrs.cap_ctx,
+                self.resolve_module,
+                addrs.epoch as usize,
+                domain.as_deref(),
+            )
+        });
+        #[cfg(fiber_rt)]
+        if let Some(n) = &nursery {
+            addrs.nursery = &**n as *const instantiator_rt::Nursery as *const core::ffi::c_void;
+        }
+        #[cfg(setjmp_rt)]
+        let setjmp_runtime = self
+            ._setjmp_rt
+            .as_ref()
+            .map(|_| Box::new(setjmp_rt::SetjmpRuntime::new()));
+        #[cfg(setjmp_rt)]
+        if let Some(r) = &setjmp_runtime {
+            addrs.setjmp = &**r as *const setjmp_rt::SetjmpRuntime as *const core::ffi::c_void;
+        }
+        #[cfg(not(fiber_rt))]
+        let _ = node;
         CompiledModule {
-            needs_runtime: self.needs_runtime,
+            hosted: self.hosted,
             nests: self.nests,
             fn_table: self
                 .fn_table
@@ -3998,21 +4071,25 @@ impl CompiledModule {
             window_ready: None,
             fork_hook: None,
             #[cfg(fiber_rt)]
-            fiber_rt: None,
+            fiber_rt,
             #[cfg(fiber_rt)]
             domain,
             #[cfg(fiber_rt)]
-            _nursery: None,
+            _nursery: nursery,
             #[cfg(setjmp_rt)]
-            _setjmp_rt: None,
+            _setjmp_rt: setjmp_runtime,
+            #[cfg(fiber_rt)]
+            cap_thunk: self.cap_thunk,
+            #[cfg(fiber_rt)]
+            resolve_module: self.resolve_module,
             #[cfg(fiber_rt)]
             call_tramp: self.call_tramp,
             #[cfg(fiber_rt)]
             fiber_cfg: self.fiber_cfg,
             #[cfg(fiber_rt)]
-            fiber_table: None,
+            fiber_table,
             #[cfg(fiber_rt)]
-            node: None,
+            node,
             src_ranges: self.src_ranges.clone(),
             src_files: self.src_files.clone(),
             func_names: self.func_names.clone(),
@@ -4445,7 +4522,7 @@ impl CompiledModule {
         let trap_cell = &vm.trap;
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
-        // vCPUs run on their own OS threads via the baked `Domain`. Seed the `Domain`'s per-run `Env` now
+        // vCPUs run on their own OS threads via the instance's `Domain`. Seed its per-run `Env` now
         // that the window / fn-table / trap-cell / call-trampoline are all known.
         #[cfg(fiber_rt)]
         {
@@ -5188,7 +5265,7 @@ impl CompiledModule {
         };
         rt.set_call_tramp(tramp);
         self.fiber_rt = Some(rt);
-        self.needs_runtime = true;
+        self.hosted = true;
         self.call_tramp = Some(tramp);
         self.fiber_cfg = Some((fiber_type_id, fiber_mask));
         self.fiber = FiberEnv {
@@ -5215,7 +5292,7 @@ impl CompiledModule {
     /// left `self.thread` null at `compile`, so a thread-using submitted unit would lower `thread.*`
     /// through null thunks (`define_extra` rejects it via [`ThreadEnv::is_null`]). This installs the
     /// **same** runtime `compile` builds for a threaded module: the 1:1 OS-thread executor `Domain`
-    /// (its stable address baked into the unit's `thread.*` sites), the domain-shared fiber table the
+    /// (which the unit's `thread.*` sites load from the vmctx), the domain-shared fiber table the
     /// spawned vCPUs allocate their durable contexts over (D57 3b-ii — created even for a fiber-free
     /// threaded module), and the generic call-trampoline vCPU entries run through.
     ///
@@ -5287,7 +5364,7 @@ impl CompiledModule {
             notify_thunk: os_thread_rt::thread_notify as *const () as i64,
         };
         self.domain = Some(domain);
-        self.needs_runtime = true;
+        self.hosted = true;
         self.call_tramp = Some(tramp);
         // `fiber_table` set above; `fiber_cfg` left as-is (None ⇒ pure-thread host, matching a
         // fiber-free threaded module — spawned vCPUs then build no per-vCPU fiber runtime).
@@ -5530,9 +5607,17 @@ impl SharedCode {
     /// A new instance of the code at `addrs`: `cap_ctx` is its own powerbox, and `epoch`, `fuel` and
     /// `sig_armed` the cells its checks poll — its run's, which need not be the cells of the run that
     /// compiled it (#2145). A cell is set exactly when the code was compiled with its check: code
-    /// without the check never reads it, and a check of a null cell would fault in the host. The
-    /// same holds for `nursery`, set exactly when the code spawns.
-    pub fn instance(&self, addrs: InstanceAddrs) -> CompiledModule {
+    /// without the check never reads it, and a check of a null cell would fault in the host.
+    ///
+    /// The instance stands up the runtimes its code runs on (temen#2389), and `node` is the budget
+    /// its threads and fibers are charged to: its run's. A §14 child's are its task's instead, and
+    /// its nursery is its spawn's, set in `addrs` exactly when the code spawns (temen#2168); a root
+    /// makes its own.
+    pub fn instance(
+        &self,
+        addrs: InstanceAddrs,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
+    ) -> CompiledModule {
         assert_eq!(addrs.epoch.is_null(), !self.0.epoch, "kill-path cell");
         assert_eq!(addrs.fuel.is_null(), !self.0.fuel, "fuel cell");
         assert_eq!(
@@ -5540,9 +5625,12 @@ impl SharedCode {
             self.0.instance.sig_armed.is_null(),
             "signal cell"
         );
-        // Code that spawns hands its `Instantiator` thunks the nursery it loads (temen#2168).
-        assert_eq!(addrs.nursery.is_null(), !self.0.nests, "nursery");
-        self.0.instance(addrs)
+        assert_eq!(
+            addrs.nursery.is_null(),
+            !self.0.nests || self.0.makes_nursery(),
+            "nursery"
+        );
+        self.0.instance(addrs, node)
     }
 }
 
@@ -6054,7 +6142,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         // A §14 child's runtimes are its task's (`child_exec`) and its nursery is its instance's
         // (temen#2168), so its code is only code: every spawn of it can run one compile
         // ([`ChildCodeCache`]).
-        needs_runtime: false,
+        hosted: false,
         nests: inst_env.is_active() && funcs_use_instantiator(funcs),
         fn_table,
         tramp_code: code,
@@ -6112,6 +6200,9 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         _nursery: None,
         #[cfg(setjmp_rt)]
         _setjmp_rt: None,
+        // A child's nursery is its spawn's: its instances never stand one up of their own.
+        cap_thunk: INERT_CAP_THUNK,
+        resolve_module: None,
         call_tramp,
         fiber_cfg,
         fiber_table: None,
@@ -6207,7 +6298,8 @@ impl ChildCodeCache {
         );
         let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(code) = &*kept {
-            return Ok(code.instance(c.addrs));
+            // A child's runtimes are its task's: its instance stands none up, and charges no node.
+            return Ok(code.instance(c.addrs, None));
         }
         let first = compile_child_windowed(c)?;
         *kept = first.share();
@@ -6683,15 +6775,14 @@ impl InstEnv {
     }
 }
 
-/// The per-run `setjmp` table address + the four thunk/libc addresses baked into the module's
-/// `SetJmp`/`LongJmp` sites (LLVM.md §"JIT `longjmp`", Option B). All `0` (`null`) when the module uses
-/// no `setjmp`, or the target lacks the `setjmp_rt` runtime (non-unix / non-`fiber_rt`), in which case
-/// `ensure_supported` has already rejected any `SetJmp`/`LongJmp`. `rt_addr` is the per-run
-/// `SetjmpRuntime` (owned by the `CompiledModule`); `setjmp_addr`/`longjmp_addr` are libc `_setjmp`/
-/// `_longjmp`, called inline in the guest frame.
+/// The four thunk/libc addresses baked into the module's `SetJmp`/`LongJmp` sites (LLVM.md §"JIT
+/// `longjmp`", Option B). All `0` (`null`) when the module uses no `setjmp`, or the target lacks the
+/// `setjmp_rt` runtime (non-unix / non-`fiber_rt`), in which case `ensure_supported` has already
+/// rejected any `SetJmp`/`LongJmp`. The sites load the instance's `SetjmpRuntime` from its vmctx
+/// ([`vmctx::SETJMP`], temen#2389); `setjmp_addr`/`longjmp_addr` are libc `_setjmp`/`_longjmp`,
+/// called inline in the guest frame.
 #[derive(Clone, Copy)]
 struct SetjmpEnv {
-    rt_addr: i64,
     slot_thunk: i64,
     lookup_thunk: i64,
     setjmp_addr: i64,
@@ -6701,7 +6792,6 @@ struct SetjmpEnv {
 impl SetjmpEnv {
     fn null() -> SetjmpEnv {
         SetjmpEnv {
-            rt_addr: 0,
             slot_thunk: 0,
             lookup_thunk: 0,
             setjmp_addr: 0,
@@ -7143,7 +7233,7 @@ fn module_uses_threads(m: &IrModule) -> bool {
 }
 
 /// Whether `m` contains any `setjmp`/`longjmp` op, so `run_inner` knows to stand up the per-run
-/// [`setjmp_rt::SetjmpRuntime`] whose address is baked into those sites.
+/// [`setjmp_rt::SetjmpRuntime`] those sites load from the vmctx.
 #[cfg(setjmp_rt)]
 fn module_uses_setjmp(m: &IrModule) -> bool {
     m.funcs.iter().any(|f| f.uses_setjmp())
@@ -7154,6 +7244,28 @@ fn module_uses_setjmp(m: &IrModule) -> bool {
 #[cfg(fiber_rt)]
 fn module_uses_instantiator(m: &IrModule) -> bool {
     funcs_use_instantiator(&m.funcs)
+}
+
+/// A run's §14 nursery, which its `Instantiator` sites spawn and join through: a compile's for the
+/// instance it runs as, or one more instance's of shared code (temen#2389). Its children poll the
+/// run's kill-path cell (§5), and compile their `atomic.wait`/`notify` against the run's thread
+/// `domain`, so concurrent children and the parent rendezvous in one futex table.
+#[cfg(fiber_rt)]
+fn nursery_over(
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    resolve_module: Option<ModuleResolver>,
+    epoch_addr: usize,
+    domain: Option<&os_thread_rt::Domain>,
+) -> Box<instantiator_rt::Nursery> {
+    Box::new(instantiator_rt::Nursery::new(
+        cap_thunk,
+        cap_ctx,
+        resolve_module,
+        epoch_addr,
+        domain.map_or(0, |d| d as *const os_thread_rt::Domain as usize),
+        None, // the run's own child executor
+    ))
 }
 
 /// [`module_uses_instantiator`] over a bare function list — a §22 unit's, in `define_extra`.
@@ -7590,7 +7702,7 @@ fn lower_block(
             s1.returns.push(AbiParam::new(I64));
             let r1 = b.import_signature(s1);
             let slot_thunk = b.ins().iconst(I64, lower.setjmp.slot_thunk);
-            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = b.ins().call_indirect(r1, slot_thunk, &[rt_addr, bufv]);
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
@@ -7620,7 +7732,7 @@ fn lower_block(
             s1.returns.push(AbiParam::new(I64));
             let r1 = b.import_signature(s1);
             let lookup_thunk = b.ins().iconst(I64, lower.setjmp.lookup_thunk);
-            let rt_addr = b.ins().iconst(I64, lower.setjmp.rt_addr);
+            let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
             let c1 = b
                 .ins()
                 .call_indirect(r1, lookup_thunk, &[rt_addr, bufv, trap_out]);

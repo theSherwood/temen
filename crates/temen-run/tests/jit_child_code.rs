@@ -6,7 +6,9 @@
 //! once from a metered one, and every level spawns and joins the next itself. That is twelve spawns
 //! of one module, and every engine returns the same sum. On the JIT a run compiles the nester twice,
 //! once for each shape: a metered child's code charges its fuel cell, and an unmetered one's does
-//! not. Runs handed one `JitCodeCache` share those compiles, so a later run compiles none.
+//! not. Runs handed one `JitCodeCache` share those compiles, so a later run compiles none — the
+//! root's included, though it spawns: each instance of its code stands up a nursery of its own
+//! (temen#2389).
 //!
 //! The only test in its binary, so the process-wide compile counter moves only for its runs.
 
@@ -123,15 +125,18 @@ fn run(backend: Backend, cfg: RunConfig) -> Outcome {
     })
 }
 
-/// How many children a JIT run under `cfg` compiles.
-fn child_compiles(cfg: &RunConfig) -> u64 {
-    let before = temen_jit::child_compiles();
+/// How many children, and how many roots, a JIT run under `cfg` compiles.
+fn compiles(cfg: &RunConfig) -> (u64, u64) {
+    let (children, roots) = (temen_jit::child_compiles(), temen_jit::module_compiles());
     assert_eq!(
         run(Backend::Jit, cfg.clone()),
         Outcome::Returned(vec![Value::I64(SUM)]),
         "Jit"
     );
-    temen_jit::child_compiles() - before
+    (
+        temen_jit::child_compiles() - children,
+        temen_jit::module_compiles() - roots,
+    )
 }
 
 #[test]
@@ -152,9 +157,9 @@ fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
         );
     }
     assert_eq!(
-        child_compiles(&unmetered),
-        2,
-        "twelve spawns of one child: its metered code and its unmetered code"
+        compiles(&unmetered),
+        (2, 1),
+        "twelve spawns of one child: its metered code and its unmetered code; and the root"
     );
 
     let cache = JitCodeCache::default();
@@ -162,7 +167,16 @@ fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
         jit_code: Some(cache.clone()),
         ..unmetered
     };
-    assert_eq!(child_compiles(&cached), 2, "the first run compiles both");
-    assert_eq!(child_compiles(&cached), 0, "a later run compiles neither");
+    assert_eq!(
+        compiles(&cached),
+        (2, 1),
+        "the first run compiles all three"
+    );
+    assert_eq!(
+        compiles(&cached),
+        (0, 0),
+        "a later run compiles none: the root that spawns them is shared too (temen#2389)"
+    );
     assert_eq!(cache.children_compiled(), 2);
+    assert_eq!(cache.compiled(), 1);
 }

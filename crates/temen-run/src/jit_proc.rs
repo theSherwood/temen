@@ -121,7 +121,9 @@ impl ForkPlan {
     /// into (INVARIANTS.md #16: the placement is the module's; there is no default), and is **bare** —
     /// no fibers, threads, `setjmp`, §14 children or §22 units, the state a fork would have to
     /// duplicate that lives outside the window, or code the transform never saw on the stack. (The
-    /// oracle forks such a module when it is momentarily bare; FORK.md §9.5.)
+    /// oracle forks such a module when it is momentarily bare; FORK.md §9.5.) Nor does it run over
+    /// the locked powerbox ([`locked`]): a twin's is raw, and its code bakes the thunk for the
+    /// powerbox it was compiled over (temen#2389).
     ///
     /// The plan is what the program is instrumented by ([`Self::instrument`]) and what the cap thunk
     /// reads a fork call against ([`serve_request`]): a call is a site by its dispatch pair — the pair
@@ -134,7 +136,7 @@ impl ForkPlan {
         // §14 children and §22 units run code the transform never saw: a child on its own vCPU, a unit
         // through the `call.dyn` slot `Jit.install` gives it.
         let foreign = |t: u32, _| t == cap_id::INSTANTIATOR || t == cap_id::JIT;
-        let bare = !m.funcs.iter().any(|f| f.uses_fibers_or_threads())
+        let bare = !locked(m)
             && !m
                 .funcs
                 .iter()
@@ -321,8 +323,7 @@ impl Tree {
             Program::Embedder(_) => None,
         };
         let (cm, image) = match digest {
-            // Shared code is compiled for a raw powerbox.
-            Some(digest) if !jit && !cc.is_locked() => {
+            Some(digest) if !jit => {
                 let key = CodeKey {
                     digest,
                     entry,
@@ -330,6 +331,7 @@ impl Tree {
                     fuel: self.fuel != 0,
                     debug: m.debug_info.is_some(),
                     sites: plan.as_ref().map(|p| p.sites.clone()),
+                    locked: cc.is_locked(),
                 };
                 let slot = Arc::clone(
                     self.code
@@ -346,7 +348,10 @@ impl Tree {
                 let mut kept = slot.image.lock().unwrap_or_else(|e| e.into_inner());
                 match kept.clone() {
                     Some(Some(image)) => {
-                        (image.code.instance(self.addrs(cc, interrupt)), Some(image))
+                        // temen#2389 — the instance's threads, fibers and children charge its run.
+                        let node = cc.with_host(|h| crate::run_node(h));
+                        let cm = image.code.instance(self.addrs(cc, interrupt), node);
+                        (cm, Some(image))
                     }
                     Some(None) => {
                         drop(kept);
@@ -604,6 +609,9 @@ struct CodeKey {
     debug: bool,
     /// The fork sites its powerbox reads it as having — what its instrumentation depends on.
     sites: Option<Vec<(u32, u32)>>,
+    /// Whether it runs over the locked powerbox ([`locked`]): its code bakes the `call.cap` thunk
+    /// for the powerbox's shape (temen#2389).
+    locked: bool,
 }
 
 /// One command's compile, made by the first process to exec it; a later one waits on the lock while
@@ -786,7 +794,8 @@ unsafe fn run_process(
                 cur.arm_caller_requests();
                 let cc = CapCtx::Raw(&mut *cur);
                 let interrupt = tree.interrupt_for(pid, true);
-                let cm = image.code.instance(tree.addrs(cc, interrupt));
+                let node = cc.with_host(|h| crate::run_node(h));
+                let cm = image.code.instance(tree.addrs(cc, interrupt), node);
                 let results = image.results.clone();
                 let ctx = ProcCtx {
                     tree: Arc::clone(tree),
