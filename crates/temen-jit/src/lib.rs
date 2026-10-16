@@ -69,10 +69,11 @@ use cranelift_codegen::ir::{
     StackSlotKind, Type, UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::CompiledCode;
 use cranelift_codegen::LabelValueLoc;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module, ModuleReloc};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use temen_ir::bounds::{in_window, ub_at, ub_of, UB_TOP};
@@ -3413,68 +3414,70 @@ impl CompiledModule {
         let var_labels = (!var_label_map.is_empty()).then_some(&var_label_map);
         let mut raw_var_locs: RawVarLocs = Vec::new();
 
-        // Define each function body. `clear_context` after each define resets the cached
-        // CFG/domtree so the next function never compiles against a stale CFG.
-        let mut ctx = module.make_context();
+        // Define each function body (#2450: compiled on worker threads, defined in order).
+        // Optional codegen dump for performance work: `TEMEN_JIT_DUMP_CLIF=1` prints each function's
+        // CLIF and (post-compile) the Cranelift VCODE disassembly to stderr. A pure diagnostic — no
+        // effect unless the env var is set; used to compare temen-jit's generated code against other
+        // backends (e.g. the Embench cross-engine bench).
+        let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
         let mut base_bytes = 0usize;
-        for (fi, (f, id)) in m.funcs.iter().zip(&ids).enumerate() {
-            // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in `lower_block`)
-            // takes effect and `value_labels_ranges` is populated. Gated on `-g` vars ⇒ no effect on
-            // an ordinary build. Must be set on the fresh `ctx.func` before lowering populates it.
-            if var_labels.is_some() {
-                ctx.func.collect_debug_info();
-            }
-            build_clif(
-                &mut module,
-                &ids,
-                &m.funcs,
-                &distinct,
-                &m.types,
-                cap,
-                fiber,
-                thread,
-                inst,
-                setjmp,
-                sig, // #932 async signal delivery arm (null unless a `SignalArm` was supplied)
-                &mut ctx.func,
-                f,
-                mask,
-                win_mapped as u64,
-                guard_offset_of(win_reserved as u64),
-                epoch_addr != 0,
-                fuel_addr != 0,
-                !thread.is_null(), // spawned vCPUs run this code beside the root
-                (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
-                None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
-                fi as u32,
-                srcloc_map.as_ref(),
-                var_labels,
-            )?;
-            // Optional codegen dump for performance work: `TEMEN_JIT_DUMP_CLIF=1` prints each function's
-            // CLIF and (post-compile) the Cranelift VCODE disassembly to stderr. A pure diagnostic — no
-            // effect unless the env var is set; used to compare temen-jit's generated code against other
-            // backends (e.g. the Embench cross-engine bench).
-            let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
-            if dump_codegen {
-                eprintln!("=== TEMEN-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
-                ctx.set_disasm(true);
-            }
-            module
-                .define_function(*id, &mut ctx)
-                .map_err(|e| JitError::Backend(e.to_string()))?;
-            // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile bound
-            // rejecting any function whose frame exceeds `RED_ZONE` (so a function can't grow the stack
-            // past the limit before its callee re-checks). Cranelift 0.132 doesn't expose the final
-            // frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are ABI-internal), so this
-            // bound is DEFERRED — see the increment plan. Until then the check assumes frames ≤ RED_ZONE.
-            if dump_codegen {
-                if let Some(d) = ctx.compiled_code().and_then(|c| c.vcode.as_ref()) {
-                    eprintln!("=== TEMEN-JIT VCODE fn{fi} ===\n{d}");
+        define_funcs(
+            &mut module,
+            &ids,
+            |module, ctx, fi| {
+                // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
+                // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
+                // vars ⇒ no effect on an ordinary build. Must be set on the fresh `ctx.func` before
+                // lowering populates it.
+                if var_labels.is_some() {
+                    ctx.func.collect_debug_info();
                 }
-            }
-            base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
-            if srcloc_map.is_some() {
-                if let Some(cc) = ctx.compiled_code() {
+                build_clif(
+                    module,
+                    &ids,
+                    &m.funcs,
+                    &distinct,
+                    &m.types,
+                    cap,
+                    fiber,
+                    thread,
+                    inst,
+                    setjmp,
+                    sig, // #932 async signal delivery arm (null unless a `SignalArm` was supplied)
+                    &mut ctx.func,
+                    &m.funcs[fi],
+                    mask,
+                    win_mapped as u64,
+                    guard_offset_of(win_reserved as u64),
+                    epoch_addr != 0,
+                    fuel_addr != 0,
+                    !thread.is_null(), // spawned vCPUs run this code beside the root
+                    (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
+                    None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
+                    fi as u32,
+                    srcloc_map.as_ref(),
+                    var_labels,
+                )?;
+                if dump_codegen {
+                    eprintln!("=== TEMEN-JIT CLIF fn{fi} ===\n{}", ctx.func.display());
+                    ctx.set_disasm(true);
+                }
+                Ok(())
+            },
+            |module, cc, fi| {
+                // NOTE (feature `stack-check`, STACK_GUARD.md §2): soundness wants a post-compile
+                // bound rejecting any function whose frame exceeds `RED_ZONE` (so a function can't
+                // grow the stack past the limit before its callee re-checks). Cranelift 0.132 doesn't
+                // expose the final frame size on `CompiledCode` (`FrameLayout`/`total_stacksize` are
+                // ABI-internal), so this bound is DEFERRED — see the increment plan. Until then the
+                // check assumes frames ≤ RED_ZONE.
+                if dump_codegen {
+                    if let Some(d) = cc.vcode.as_ref() {
+                        eprintln!("=== TEMEN-JIT VCODE fn{fi} ===\n{d}");
+                    }
+                }
+                base_bytes += cc.code_buffer().len();
+                if srcloc_map.is_some() {
                     let ranges: Vec<(u32, u32, u32)> = cc
                         .buffer
                         .get_srclocs_sorted()
@@ -3486,12 +3489,10 @@ impl CompiledModule {
                         raw_srclocs.push((fi as u32, ranges));
                     }
                 }
-            }
-            // Stage 3a: capture this function's value-label ranges, translating each Cranelift
-            // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
-            // dropped — that sub-range simply has no location, like an optimized-out gap).
-            if var_labels.is_some() {
-                if let Some(cc) = ctx.compiled_code() {
+                // Stage 3a: capture this function's value-label ranges, translating each Cranelift
+                // `LabelValueLoc` to DWARF terms now (the ISA is in hand; a `Reg` we cannot map is
+                // dropped — that sub-range simply has no location, like an optimized-out gap).
+                if var_labels.is_some() {
                     let isa = module.isa();
                     let mut per_label: Vec<(u32, VarLocRanges)> = Vec::new();
                     for (label, ranges) in &cc.value_labels_ranges {
@@ -3501,11 +3502,12 @@ impl CompiledModule {
                                 continue;
                             }
                             let loc = match r.loc {
-                                LabelValueLoc::Reg(reg) => match isa.map_regalloc_reg_to_dwarf(reg)
-                                {
-                                    Ok(d) => VarMachineLoc::Reg(d),
-                                    Err(_) => continue,
-                                },
+                                LabelValueLoc::Reg(reg) => {
+                                    match isa.map_regalloc_reg_to_dwarf(reg) {
+                                        Ok(d) => VarMachineLoc::Reg(d),
+                                        Err(_) => continue,
+                                    }
+                                }
                                 LabelValueLoc::CFAOffset(off) => VarMachineLoc::CfaOffset(off),
                             };
                             out.push((r.start, r.end, loc));
@@ -3518,9 +3520,9 @@ impl CompiledModule {
                         raw_var_locs.push((fi as u32, per_label));
                     }
                 }
-            }
-            module.clear_context(&mut ctx);
-        }
+            },
+        )?;
+        let mut ctx = module.make_context();
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
         build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false);
@@ -4995,41 +4997,43 @@ impl CompiledModule {
         };
 
         let inst = self.inst;
+        // Byte-accurate occupancy: each function's emitted code size.
+        let mut extra_bytes = 0;
+        define_funcs(
+            &mut *module,
+            &ids,
+            |module, ctx, fi| {
+                build_clif(
+                    module,
+                    &ids,
+                    funcs,
+                    &self.distinct,
+                    types,
+                    self.cap,
+                    self.fiber,
+                    self.thread,
+                    inst,
+                    self.setjmp,
+                    SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
+                    &mut ctx.func,
+                    &funcs[fi],
+                    self.mask,
+                    self.win_mapped as u64,
+                    guard_offset_of(self.win_reserved as u64),
+                    self.epoch,
+                    self.fuel, // charges the running instance's fuel cell, as the parent's functions do
+                    !self.thread.is_null(), // as the parent module's functions
+                    self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
+                    ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
+                    0,
+                    None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
+                    None, // …nor value-label points (Stage 3a)
+                )
+            },
+            |_, cc, _| extra_bytes += cc.code_buffer().len(),
+        )?;
+        self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
-        for (f, id) in funcs.iter().zip(&ids) {
-            build_clif(
-                &mut *module,
-                &ids,
-                funcs,
-                &self.distinct,
-                types,
-                self.cap,
-                self.fiber,
-                self.thread,
-                inst,
-                self.setjmp,
-                SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
-                &mut ctx.func,
-                f,
-                self.mask,
-                self.win_mapped as u64,
-                guard_offset_of(self.win_reserved as u64),
-                self.epoch,
-                self.fuel, // charges the running instance's fuel cell, as the parent's functions do
-                !self.thread.is_null(), // as the parent module's functions
-                self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
-                ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
-                0,
-                None, // extra/installed units carry no source-loc map (W5 JIT/DWARF)
-                None, // …nor value-label points (Stage 3a)
-            )?;
-            module
-                .define_function(*id, &mut ctx)
-                .map_err(|e| JitError::Backend(e.to_string()))?;
-            // Byte-accurate occupancy: the just-emitted code size, read before `clear_context`.
-            self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
-            module.clear_context(&mut ctx);
-        }
         // One buffer-ABI trampoline per function, so the host can invoke any of them (any arity).
         let tramp_ids: Vec<FuncId> = funcs
             .iter()
@@ -5559,21 +5563,7 @@ const _: fn() = || {
 /// fiber's low bound *before* the check (silent neighbour-slot corruption under the arena, which has
 /// no guard page). Pinning it here locks that assumption against a future Cranelift default flip.
 fn new_jit_module() -> Result<JITModule, JitError> {
-    let mut flags = settings::builder();
-    // A JIT'd function is called directly, not relocated into a shared object.
-    let _ = flags.set("is_pic", "false");
-    // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
-    let _ = flags.set("preserve_frame_pointers", "true");
-    // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
-    // forwarding), as Wasmtime does; "SSA on the wire" keeps cold start ahead even with it on.
-    let _ = flags.set("opt_level", "speed");
-    // The escape-TCB pin — see this fn's doc.
-    let _ = flags.set("enable_probestack", "false");
-    let isa = cranelift_native::builder()
-        .map_err(|e| JitError::Backend(e.to_string()))?
-        .finish(settings::Flags::new(flags))
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     // Code + read-only data (float constants, jump tables) from a single contiguous 256 MiB arena
     // (VA only, committed on demand) rather than separate `mmap`s: x64's 32-bit PC-relative
     // relocations (`X86CallPCRel4`/`X86PCRel4`) overflow if ASLR places independent mmaps > 2 GiB
@@ -5583,6 +5573,117 @@ fn new_jit_module() -> Result<JITModule, JitError> {
         builder.memory_provider(Box::new(arena));
     }
     Ok(JITModule::new(builder))
+}
+
+/// The ISA every compile uses: [`new_jit_module`]'s, and the one [`define_funcs`]'s workers compile
+/// with, so the two cannot differ.
+fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
+    let mut flags = settings::builder();
+    // A JIT'd function is called directly, not relocated into a shared object.
+    let _ = flags.set("is_pic", "false");
+    // Cranelift's x64 `return_call` (tail calls, §3b) lowering requires frame pointers.
+    let _ = flags.set("preserve_frame_pointers", "true");
+    // Run Cranelift's mid-end optimizer (GVN/CSE, constant materialization, store-to-load
+    // forwarding), as Wasmtime does; "SSA on the wire" keeps cold start ahead even with it on.
+    let _ = flags.set("opt_level", "speed");
+    // The escape-TCB pin — see `new_jit_module`'s doc.
+    let _ = flags.set("enable_probestack", "false");
+    cranelift_native::builder()
+        .map_err(|e| JitError::Backend(e.to_string()))?
+        .finish(settings::Flags::new(flags))
+        .map_err(|e| JitError::Backend(e.to_string()))
+}
+
+/// What a worker hands back for one function: its code and relocations, the compile's error, or
+/// the payload of a panic in the compile.
+type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), String>>;
+
+/// Lower and define functions `0..ids.len()` (#2450), every compile path's one loop. `lower` builds
+/// function `i`'s CLIF on this thread, where the module's declarations are. Worker threads compile
+/// the CLIF, each function in a context of its own, and this thread defines the code in function
+/// order, `defined` seeing each function's as it goes. A function's code depends on its CLIF and the
+/// ISA alone, so the module's code is the same on any number of threads; a compile that fails or
+/// panics fails or panics here, at its function, as it would on one thread.
+fn define_funcs(
+    module: &mut JITModule,
+    ids: &[FuncId],
+    mut lower: impl FnMut(
+        &mut JITModule,
+        &mut cranelift_codegen::Context,
+        usize,
+    ) -> Result<(), JitError>,
+    mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
+) -> Result<(), JitError> {
+    let isa = jit_isa()?;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, ids.len().max(1));
+    let (work_tx, work_rx) =
+        std::sync::mpsc::sync_channel::<(usize, cranelift_codegen::Context)>(2 * workers);
+    let work_rx = std::sync::Mutex::new(work_rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, CompiledFn)>();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (work_rx, done_tx, isa) = (&work_rx, done_tx.clone(), &*isa);
+            scope.spawn(move || loop {
+                let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok((i, mut ctx)) = job else { break };
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ctx.compile(isa, &mut Default::default())
+                        .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
+                    let code = ctx
+                        .take_compiled_code()
+                        .expect("a compiled function's code");
+                    let relocs = code
+                        .buffer
+                        .relocs()
+                        .iter()
+                        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, ids[i]))
+                        .collect();
+                    Ok((code, relocs))
+                }));
+                if done_tx.send((i, out)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(done_tx);
+        let mut done: Vec<Option<CompiledFn>> = (0..ids.len()).map(|_| None).collect();
+        let mut next = 0;
+        // Define, in order, every function compiled so far.
+        let mut define = |module: &mut JITModule, done: &mut [Option<CompiledFn>]| {
+            while let Some(out) = done.get_mut(next).and_then(Option::take) {
+                let (code, relocs) = match out {
+                    Ok(compiled) => compiled.map_err(JitError::Backend)?,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                };
+                let align = code.buffer.alignment as u64;
+                module
+                    .define_function_bytes(ids[next], align, code.code_buffer(), &relocs)
+                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                defined(module, &code, next);
+                next += 1;
+            }
+            Ok::<(), JitError>(())
+        };
+        for i in 0..ids.len() {
+            let mut ctx = module.make_context();
+            lower(module, &mut ctx, i)?;
+            work_tx
+                .send((i, ctx))
+                .map_err(|_| JitError::Backend("no compile worker".into()))?;
+            for (j, out) in done_rx.try_iter() {
+                done[j] = Some(out);
+            }
+            define(module, &mut done)?;
+        }
+        drop(work_tx);
+        for (j, out) in done_rx.iter() {
+            done[j] = Some(out);
+            define(module, &mut done)?;
+        }
+        Ok(())
+    })
 }
 
 /// Declare every function (natural ABI, `f{i}` local linkage) up front so any call site can
@@ -5778,41 +5879,41 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     } else {
         ThreadEnv::null()
     };
-    let mut ctx = module.make_context();
     let mut base_bytes = 0usize;
-    for (f, id) in funcs.iter().zip(&ids) {
-        build_clif(
-            &mut module,
-            &ids,
-            funcs,
-            &distinct,
-            types,
-            cap,
-            fiber,
-            thread_env,
-            inst_env, // a child that spawns loads its own nursery from its vmctx (temen#2168)
-            SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
-            SigEnv::null(), // #932 — a §14 child is not signal-delivery armed (slice 1b)
-            &mut ctx.func,
-            f,
-            mask,
-            mapped,                    // the committed prefix
-            guard_offset_of(reserved), // its own window's trailing guard
-            epoch_addr != 0,           // §5 kill-path: the child polls the parent's interrupt cell
-            fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
-            true,           // a §14 child always runs beside its parent, which may tear it down
-            fn_table_mask,  // the child's own (reserved) table mask
-            None,           // §14 child: own window/table, `ref.func N` = slot N (no remap)
-            0,
-            None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
-            None, // …nor value-label points (Stage 3a)
-        )?;
-        module
-            .define_function(*id, &mut ctx)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
-        base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
-        module.clear_context(&mut ctx);
-    }
+    define_funcs(
+        &mut module,
+        &ids,
+        |module, ctx, fi| {
+            build_clif(
+                module,
+                &ids,
+                funcs,
+                &distinct,
+                types,
+                cap,
+                fiber,
+                thread_env,
+                inst_env, // a child that spawns loads its own nursery from its vmctx (temen#2168)
+                SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
+                SigEnv::null(),    // #932 — a §14 child is not signal-delivery armed (slice 1b)
+                &mut ctx.func,
+                &funcs[fi],
+                mask,
+                mapped,                    // the committed prefix
+                guard_offset_of(reserved), // its own window's trailing guard
+                epoch_addr != 0, // §5 kill-path: the child polls the parent's interrupt cell
+                fuel_addr != 0, // counted fuel: the child charges its own budget cell (else un-metered)
+                true,           // a §14 child always runs beside its parent, which may tear it down
+                fn_table_mask,  // the child's own (reserved) table mask
+                None,           // §14 child: own window/table, `ref.func N` = slot N (no remap)
+                0,
+                None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
+                None, // …nor value-label points (Stage 3a)
+            )
+        },
+        |_, cc, _| base_bytes += cc.code_buffer().len(),
+    )?;
+    let mut ctx = module.make_context();
     build_trampoline(
         &mut module,
         &mut ctx.func,
@@ -6788,12 +6889,19 @@ fn build_clif(
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
 
-    // One CLIF block per IR block, with params mirroring the IR block params. A
-    // separate CLIF entry block holds the native params and jumps into IR block 0.
-    let blocks: Vec<_> = f.blocks.iter().map(|_| b.create_block()).collect();
+    // One CLIF block per IR block, with params mirroring the IR block params, but those the
+    // lowering takes as the values they forward (#2448). A separate CLIF entry block holds the
+    // native params and jumps into IR block 0.
+    let mut blocks = Blocks {
+        clif: f.blocks.iter().map(|_| b.create_block()).collect(),
+        fwd: f.forwards(),
+        vals: vec![Vec::new(); f.blocks.len()],
+    };
     for (i, blk) in f.blocks.iter().enumerate() {
-        for p in &blk.params {
-            b.append_block_param(blocks[i], clif_ty(*p));
+        for (j, p) in blk.params.iter().enumerate() {
+            if blocks.taken(i, j).is_none() {
+                b.append_block_param(blocks.clif[i], clif_ty(*p));
+            }
         }
     }
     let sret = uses_sret(&f.results);
@@ -6904,10 +7012,10 @@ fn build_clif(
     emit_signal_check(module, &mut b, &lower); // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
-    b.ins().jump(blocks[0], &entry_args);
+    b.ins().jump(blocks.clif[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, i, blocks[i], &blocks, &lower)?;
+        lower_block(module, &mut b, blk, i, &mut blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -7110,13 +7218,21 @@ fn lower_block(
     b: &mut FunctionBuilder,
     blk: &Block,
     block_idx: usize,
-    cb: cranelift_codegen::ir::Block,
-    blocks: &[cranelift_codegen::ir::Block],
+    blocks: &mut Blocks,
     lower: &Lower,
 ) -> Result<(), JitError> {
+    let cb = blocks.clif[block_idx];
     b.switch_to_block(cb);
-    // The CLIF block params are the IR block params; seed the value map with them.
-    let mut vals: Vec<Value> = b.block_params(cb).to_vec();
+    // Seed the value map with the IR block params: each a CLIF block param, or the value a taken
+    // param forwards, which a block lowered before this one holds (#2448).
+    let mut own = b.block_params(cb).to_vec().into_iter();
+    let mut vals: Vec<Value> = Vec::with_capacity(blk.params.len() + blk.insts.len());
+    for i in 0..blk.params.len() {
+        vals.push(match blocks.taken(block_idx, i) {
+            Some((sb, si)) => *blocks.vals[sb].get(si).ok_or(JitError::Malformed)?,
+            None => own.next().ok_or(JitError::Malformed)?,
+        });
+    }
     // Parallel upper-bound map (for mask elision); block params are unknown. Kept in lockstep
     // with `vals` so `ubs[i]` describes IR value `i` — a misalignment could mis-elide a mask (the
     // INVARIANTS #2 escape class). Rather than re-growing it by hand in every multi-result arm (a
@@ -8578,8 +8694,11 @@ fn lower_block(
 
     match &blk.term {
         Terminator::Br { target, args } => {
-            let ba = map_args(&vals, args)?;
-            let t = *blocks.get(*target as usize).ok_or(JitError::Malformed)?;
+            let ba = map_edge(&vals, blocks, *target, args)?;
+            let t = *blocks
+                .clif
+                .get(*target as usize)
+                .ok_or(JitError::Malformed)?;
             // §5 kill-path: poll the interrupt cell before taking any branch — every loop body ends
             // in one of these terminators, so this bounds a non-terminating intra-function loop.
             emit_epoch_check(b, lower);
@@ -8603,10 +8722,16 @@ fn lower_block(
             else_args,
         } => {
             let c = get(&vals, *cond)?;
-            let ta = map_args(&vals, then_args)?;
-            let ea = map_args(&vals, else_args)?;
-            let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
-            let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
+            let ta = map_edge(&vals, blocks, *then_blk, then_args)?;
+            let ea = map_edge(&vals, blocks, *else_blk, else_args)?;
+            let tb = *blocks
+                .clif
+                .get(*then_blk as usize)
+                .ok_or(JitError::Malformed)?;
+            let eb = *blocks
+                .clif
+                .get(*else_blk as usize)
+                .ok_or(JitError::Malformed)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
             if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
                 emit_domain_poll(b, lower); // (see `Br`)
@@ -8685,8 +8810,8 @@ fn lower_block(
             )> = Vec::new();
             let mut entries = Vec::with_capacity(targets.len());
             for (t, args) in targets {
-                let ba = map_args(&vals, args)?;
-                let blk = *blocks.get(*t as usize).ok_or(JitError::Malformed)?;
+                let ba = map_edge(&vals, blocks, *t, args)?;
+                let blk = *blocks.clif.get(*t as usize).ok_or(JitError::Malformed)?;
                 if mixed && is_be(*t) {
                     let tramp = b.create_block();
                     entries.push(BlockCall::new(
@@ -8704,8 +8829,8 @@ fn lower_block(
                 }
             }
             let (dt, dargs) = default;
-            let dba = map_args(&vals, dargs)?;
-            let dblk = *blocks.get(*dt as usize).ok_or(JitError::Malformed)?;
+            let dba = map_edge(&vals, blocks, *dt, dargs)?;
+            let dblk = *blocks.clif.get(*dt as usize).ok_or(JitError::Malformed)?;
             let dcall = if mixed && is_be(*dt) {
                 let tramp = b.create_block();
                 let call = BlockCall::new(
@@ -8783,6 +8908,7 @@ fn lower_block(
             emit_trap(b, lower, TrapKind::Unreachable);
         }
     }
+    blocks.vals[block_idx] = vals;
     Ok(())
 }
 
@@ -10354,10 +10480,40 @@ fn float_cc(op: FCmpOp) -> FloatCC {
 }
 
 /// Map IR edge args to CLIF block-call args (`BlockArg`, the 0.132 block-call type).
-fn map_args(vals: &[Value], args: &[u32]) -> Result<Vec<BlockArg>, JitError> {
+/// An edge's arguments, but those for the params of `target` the lowering takes (#2448).
+fn map_edge(
+    vals: &[Value],
+    blocks: &Blocks,
+    target: u32,
+    args: &[u32],
+) -> Result<Vec<BlockArg>, JitError> {
     args.iter()
-        .map(|a| get(vals, *a).map(BlockArg::from))
+        .enumerate()
+        .filter(|&(i, _)| blocks.taken(target as usize, i).is_none())
+        .map(|(_, a)| get(vals, *a).map(BlockArg::from))
         .collect()
+}
+
+/// A function's IR blocks as its lowering goes: each one's CLIF block, which of its params the
+/// lowering takes as the values they forward (#2448), with no CLIF param and no edge argument, and,
+/// once it is lowered, its values, which a later block's taken params read.
+struct Blocks {
+    clif: Vec<cranelift_codegen::ir::Block>,
+    fwd: temen_ir::Forwards,
+    vals: Vec<Vec<Value>>,
+}
+
+impl Blocks {
+    /// The block and index of the value block `b`'s param `i` is taken as, if it is taken. Blocks
+    /// lower in index order, so a param is taken only where the block of its value comes before its
+    /// own. That block is lowered by then, and it dominates the param's ([`temen_ir::Forwards`]), so
+    /// the value is defined wherever the param is used.
+    fn taken(&self, b: usize, i: usize) -> Option<(usize, usize)> {
+        self.fwd
+            .source(b, i)
+            .map(|(sb, si)| (sb as usize, si as usize))
+            .filter(|&(sb, _)| sb < b)
+    }
 }
 
 fn int_bin(b: &mut FunctionBuilder, op: BinOp, x: Value, y: Value) -> Value {

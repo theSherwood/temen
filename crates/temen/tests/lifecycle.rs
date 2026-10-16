@@ -1,5 +1,5 @@
 //! PROCESS.md S3 — the §14 child lifecycle ops `poll` (9), `detach` (10) and `kill` (12), on the
-//! interpreter and the JIT. Each guest spawns its child detached, through a v1 record paid from a
+//! interpreter and the JIT. Each guest spawns its child detached, through a spawn record paid from a
 //! `Budget`; a JIT child runs as a task on the run's child executor (D66), concurrently with its
 //! parent.
 //!
@@ -28,7 +28,7 @@ use temen_verify::verify_module;
 /// shared-memory object so the JIT can alias it into a child's window, and a stdout stream it can
 /// resolve as `"out"`, a cap it may grant into a child.
 fn setup(src: &str) -> (Module, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::v1()));
+    let src = format!("{src}{}", rec::segment(20480, &SpawnRec::default()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut h = Host::new();
@@ -98,9 +98,9 @@ fn poll_loop(end: &str, child: &str) -> String {
         "memory 17
 func (i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, vb: i32, vmod: i32) {{
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -175,9 +175,9 @@ fn poll_terminal_status_converges_trapping_child() {
 const POLL_RUNNING_THEN_DETACH: &str = "memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vb: i32, vmod: i32) {
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -230,13 +230,13 @@ block 0 (v0: i32, vb: i32, vmod: i32) {
   vlen = i64.const 65536
   vprot = i32.const 3
   vm = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrg (vgo, vro, vlen, vprot)
-  vrr = i64.const 20552
+  vrr = i64.const 20528
   i32.store vrr vrg
-  vro2 = i64.const 20560
+  vro2 = i64.const 20536
   i64.store vro2 vgo
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -303,9 +303,9 @@ fn kill_ends_a_running_child_before_it_can_return() {
 const KILL_DETACH: &str = "memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vb: i32, vmod: i32) {
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -347,9 +347,9 @@ fn kill_detach_match_interp() {
 const POLL_RUNNING: &str = "memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vb: i32, vmod: i32) {
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vch = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -410,9 +410,9 @@ fn three_children(ops: &str) -> String {
 data 24000 \"out\"
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vb: i32, vmod: i32) {{
-  vrb = i64.const 20508
+  vrb = i64.const 20492
   i32.store vrb vb
-  vrm = i64.const 20504
+  vrm = i64.const 20488
   i32.store vrm vmod
   vrp = i64.const 20480
   vh0 = call.cap 6 17 (i64) -> (i32) vinst (vrp)

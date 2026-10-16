@@ -311,7 +311,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   differential, byte-for-byte) and wasm64 (`run_capture() == 1007`). Closes the last output channel —
   return value ✓, streams ✓, **memory image ✓**.
 - [x] **§14 nested child guests (`temen_run_nested`).** Function 0 gets an `Instantiator` (iface 6) and
-  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 v1 records) —
+  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 records) —
   each in a fresh window of its own paid from the budget, running on the cooperative executor and
   joinable through the §12 thread machinery. 5-case differential (all matching native): isolation — a
   child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
@@ -1187,7 +1187,7 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
    sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
    the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
-   children now — the spawn is an op-17 v1 record, serviced from emitted code as `env.instantiate_rec`
+   children now — the spawn is an op-17 record, serviced from emitted code as `env.instantiate_rec`
    (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
    `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
    #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a

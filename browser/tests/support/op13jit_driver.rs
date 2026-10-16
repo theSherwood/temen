@@ -1,6 +1,6 @@
 //! The op-13 JIT loop's test driver (`temen_op13jit_open_detached`, entry `(inst, module, budget)`):
 //! it re-grants each of `grants` — resolved by name on its own powerbox — to the child under the same
-//! name, spawns the child detached through an op-17 v1 record (its declared window, paid from the
+//! name, spawns the child detached through an op-17 record (its declared window, paid from the
 //! budget), joins it into `vr`, then runs `tail`, which must leave the result in `vo` (empty: return
 //! `vr`). Names sit at 18432 + 16·i and grant records at 17536 + 16·i, above the NULL guard.
 
@@ -22,7 +22,7 @@ pub fn driver(grants: &[&str], tail: &str) -> Vec<u8> {
     let rec = temen_ir::SpawnRec {
         grants_ptr: 17536,
         grants_n: grants.len() as u64,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     let (seg, stores) = temen_browser::plan::spawn_rec_ir(17408, &rec, "v1", "v2");
     let (tail, ret) = if tail.is_empty() {

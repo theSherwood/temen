@@ -26,7 +26,7 @@ const CHILD_LOG2: u8 = 16;
 fn parent_src() -> String {
     let child = SpawnRec {
         size_log2: CHILD_LOG2.into(),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory {PARENT_LOG2}
@@ -46,8 +46,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {{
   }}
 }}
 {rec}",
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }

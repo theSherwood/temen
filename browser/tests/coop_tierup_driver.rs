@@ -3520,7 +3520,7 @@ impl Drop for InstantiatorGuard {
 }
 
 /// The #816 guest: `_start` resolves its (knob-granted) `"instantiator"` and `"budget"` by name,
-/// spawns its child image (f1) detached through a v1 record — a window of its own — joins it,
+/// spawns its child image (f1) detached through a spawn record — a window of its own — joins it,
 /// then calls the eligible leaf f2 itself. f2 stores marker 21 at offset 16384 of whichever window
 /// runs it and returns x*3 + 7. The child adds the marker it reads back in its own window to its
 /// result (f(5) = 22, + 21); the root reads its own 16384 before its leaf call (0) and after (21). A
@@ -3537,10 +3537,10 @@ const BUDGET_NAME: i64 = i64::from_le_bytes(*b"budget\0\0");
 const CHILD_NAME: i64 = i64::from_le_bytes(*b"child\0\0\0");
 
 /// The stores that resolve `"budget"` and `"child"` (the guest's child image, which starts at its
-/// bootstrap, function 0, which calls f1) and build a v1 record at 34816 spawning that image
+/// bootstrap, function 0, which calls f1) and build a spawn record at 34816 spawning that image
 /// detached — its declared window, no pager or pre-mapped region — paid from that budget. Leaves
 /// the record's address in `vrec`.
-fn v1_record_f1() -> String {
+fn record_f1() -> String {
     format!(
         "  vbw = i64.const {BUDGET_NAME}
   vba = i64.const 33808
@@ -3553,14 +3553,12 @@ fn v1_record_f1() -> String {
   vcl = i64.const 5
   vrm = self.resolve vca vcl
   vrec = i64.const 34816
-  vrw0 = i64.const 1
+  vrw0 = i64.const -4294967296
   i64.store vrec vrw0
-  vrw2 = i64.const -4294967296
-  i64.store vrec vrw2 offset=16
-  i32.store vrec vrm offset=24
-  i32.store vrec vb offset=28
-  vrw9 = i64.const 4294967295
-  i64.store vrec vrw9 offset=72
+  i32.store vrec vrm offset=8
+  i32.store vrec vb offset=12
+  vrw6 = i64.const 4294967295
+  i64.store vrec vrw6 offset=48
 "
     )
 }
@@ -3631,7 +3629,7 @@ block 0 (vx: i64) {{
 export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
-        record = v1_record_f1()
+        record = record_f1()
     )
 }
 
@@ -3794,17 +3792,15 @@ block 0 () {{
   vwl = i64.const 6
   vw = self.resolve vwp vwl
   vrec = i64.const 34816
-  vw0 = i64.const 1
+  vw0 = i64.const -4294967296
   i64.store vrec vw0
-  vw2 = i64.const -4294967296
-  i64.store vrec vw2 offset=16
-  i32.store vrec vw offset=24
-  i32.store vrec vb offset=28
-  i64.store vrec vsa offset=56
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  i64.store vrec vsa offset=32
   vpl = i64.const 8
-  i64.store vrec vpl offset=64
-  vw9 = i64.const 4294967295
-  i64.store vrec vw9 offset=72
+  i64.store vrec vpl offset=40
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vz = i64.const 0
@@ -3951,14 +3947,12 @@ block 0 () {{
   vwl = i64.const 6
   vw = self.resolve vwp vwl
   vrec = i64.const 34816
-  vw0 = i64.const 1
+  vw0 = i64.const -4294967296
   i64.store vrec vw0
-  vw2 = i64.const -4294967296
-  i64.store vrec vw2 offset=16
-  i32.store vrec vw offset=24
-  i32.store vrec vb offset=28
-  vw9 = i64.const 4294967295
-  i64.store vrec vw9 offset=72
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   v3 = i64.const 3
@@ -4070,7 +4064,7 @@ block 0 (vx: i64) {
 // ---- #744: a parent serves its child's calls on the coop tier -----------------------------------
 
 /// The #744 guest (EXEC.md row 4) on the coop tier. `_start` resolves `"instantiator"`, `"budget"`
-/// and `"child"`, spawns its child image (#2219: f1 is its `_child`) through the v1 record at 17408,
+/// and `"child"`, spawns its child image (#2219: f1 is its `_child`) through the spawn record at 17408,
 /// granting it an `"exec"` capability backed by its own impl export (`GRANT_SERVE_LIVE_TAG`), serves
 /// one call with `svc.wait`, joins the child and returns `join*100 + served`. The child calls `exec.run(40, 2)`
 /// through the helper f3, then the leaf f4 on the reply. The handler f2 answers `f4(a) + b`. f4,
@@ -4081,7 +4075,7 @@ fn coop_serve_guest_text() -> String {
     let child = temen_ir::SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -4172,8 +4166,8 @@ export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
         rec = rec::segment(17408, &child),
-        budget_at = 17408 + rec::BUDGET_AT,
-        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + temen_ir::SpawnRec::BUDGET_AT,
+        module_at = 17408 + temen_ir::SpawnRec::MODULE_AT,
         tag = temen_interp::GRANT_SERVE_LIVE_TAG as i32,
     )
 }
@@ -4286,7 +4280,7 @@ fn coop_tierup_serves_a_parents_children() {
 // ---- #1151: a §14 child page-op traps in REAL emitted wasm over its own window --------------------
 
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
-/// a child at f1 (`child`) detached through a v1 record, join it, return the join's status: how the
+/// a child at f1 (`child`) detached through a spawn record, join it, return the join's status: how the
 /// child ended, its trap's wire code if it trapped (#2066). f1 (child
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
@@ -4338,7 +4332,7 @@ block 0 (vx: i64) {{
 export 0 func "_start" 0
 export 1 func "_child" 1
 "#,
-        record = v1_record_f1()
+        record = record_f1()
     )
 }
 

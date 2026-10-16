@@ -278,7 +278,7 @@ fn a_serve_nested_under_a_handler_is_refused() {
 }
 
 /// The §3.6 separate-module corpus: the parent spawns a serving child from a granted module, detached
-/// (`v1` the module, `v2` the `Budget` its window spends, patched into the v1 record [`sep_caller`]
+/// (`v1` the module, `v2` the `Budget` its window spends, patched into the spawn record [`sep_caller`]
 /// appends at 17408), mints a live offer over its export (op 14), calls through it (enqueue + park),
 /// and joins — 142 = join(served=1)*100 + add(40,2).
 const SEP_CALLER: &str = r#"
@@ -286,9 +286,9 @@ memory 17
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v1
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v2
   vrp = i64.const 17408
   v5 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -332,7 +332,7 @@ block 0 (va: i64, vb: i64) {
 fn sep_caller() -> String {
     format!(
         "{SEP_CALLER}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1())
+        rec::segment(17408, &temen_ir::SpawnRec::default())
     )
 }
 
@@ -500,9 +500,9 @@ export 0 interface "svc" 1 { op: 3 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v2
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v1
   vrp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -540,7 +540,7 @@ block 0 (vx: i64) {
 fn a_live_offer_over_a_thread_is_refused() {
     let m = module(&format!(
         "{OFFER_OVER_A_THREAD}{}",
-        rec::segment(17408, &temen_ir::SpawnRec::v1())
+        rec::segment(17408, &temen_ir::SpawnRec::default())
     ));
     let run = |entry: Entry| {
         let mut host = Host::new();

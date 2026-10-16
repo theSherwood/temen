@@ -74,7 +74,7 @@ pub struct Row {
 /// NULL guard's base, in the probe's 64 KiB window.
 ///
 /// Op 17's one argument is a record pointer, so a real value for it names the record's `Module`
-/// instead: the probe stores a v1 record naming that module here, with every other field none, and
+/// instead: the probe stores a spawn record naming that module here, with every other field none, and
 /// points the call at it. With the sweep's zero the call reads its record from the NULL guard and
 /// faults, so the admission path where the drivers once differed (#1570, on the retired op 13) goes
 /// untested. With it, the sweep reaches admission — refused for want of a `Budget` — and the drivers'
@@ -314,12 +314,14 @@ fn build_probe(
             .find(|(idx, _)| *idx == i)
             .map_or(0, |(_, v)| *v);
         if record && i == 0 && v != 0 {
-            // A v1 record naming module `v` ([`RECORD_AT`]); every field not stored is 0, none.
+            // A spawn record naming module `v` ([`RECORD_AT`]); every field not stored is 0, none.
             body.push_str(&format!(
-                "  vrec = i64.const {RECORD_AT}\n  vone = i32.const 1\n  i32.store vrec vone\n  \
-                 vnone = i32.const -1\n  i32.store vrec vnone offset=20\n  \
-                 vmod = i32.const {v}\n  i32.store vrec vmod offset=24\n  \
-                 i32.store vrec vnone offset=72\n"
+                "  vrec = i64.const {RECORD_AT}\n  \
+                 vnone = i32.const -1\n  i32.store vrec vnone offset=4\n  \
+                 vmod = i32.const {v}\n  i32.store vrec vmod offset={module_at}\n  \
+                 i32.store vrec vnone offset={region_at}\n",
+                module_at = temen_ir::SpawnRec::MODULE_AT,
+                region_at = temen_ir::SpawnRec::REGION_AT,
             ));
             v = RECORD_AT as i64;
         }

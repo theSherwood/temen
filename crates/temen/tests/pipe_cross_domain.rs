@@ -1,5 +1,5 @@
 //! PROCESS.md §4 / S4 — a **cross-domain pipe**: a parent mints a pipe (`grant_pipe`), keeps the read
-//! end, and re-grants the **write end** into a §14 child via the v1 record's named-grant list — the
+//! end, and re-grants the **write end** into a §14 child via the spawn record's named-grant list — the
 //! child resolves it as `"g"`. The child writes bytes to its granted end; after `join` the parent reads
 //! them from its read end. The FIFO is `Arc`-shared, so the two domains see the same queue — the
 //! substrate half of `cmd1 | cmd2`.
@@ -18,7 +18,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// func 0 (parent, `(Instantiator, read_end, write_end, Budget, Module)`): spawn the child (the
-/// `Module`, func 1's child image, #2219) detached through the v1 record at 20544, paid from the
+/// `Module`, func 1's child image, #2219) detached through the spawn record at 20544, paid from the
 /// `Budget` and re-granting the **write end** as `"g"`;
 /// `join`; then read 2 bytes from the **read end** into window offset 16400 and encode
 /// `read_count * 65536 + byte0 * 256 + byte1`. The child writes `"hi"` (`'h'=104`, `'i'=105`), so the
@@ -42,9 +42,9 @@ block 0 (vinst: i32, vread: i32, vwrite: i32, vbud: i32, vmod: i32) {
   i32.store vgr1 vnl1
   vgr2 = i64.const 20496
   i32.store vgr2 vwrite
-  rrm = i64.const 20568
+  rrm = i64.const 20552
   i32.store rrm vmod
-  rrb = i64.const 20572
+  rrb = i64.const 20556
   i32.store rrb vbud
   rra0 = i64.const 20544
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)
@@ -92,7 +92,7 @@ fn setup() -> (Module, Host, [i32; 5]) {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");

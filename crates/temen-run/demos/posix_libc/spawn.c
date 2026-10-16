@@ -4,7 +4,7 @@
  * Per-child attenuation is the grant list: a parent narrows handles in its own table first
  * (`AddressSpace.sub`, `Budget.split`, an exported wrapper) and lists a different subset for each
  * child — the child's powerbox is exactly what it is handed here (DESIGN.md §3c "Attenuation needs
- * no new IR"). This file only removes the byte-laying: the 88-byte record (`temen_ir::SpawnRec`) and
+ * no new IR"). This file only removes the byte-laying: the 64-byte record (`temen_ir::SpawnRec`) and
  * the `{name_off, name_len, handle, flags}` grant records that every C consumer used to write by hand.
  *
  * Reaches the Instantiator through two frontend builtins (`__vm_instantiate_rec` = op 17,
@@ -12,7 +12,7 @@
  * reaches its seam only through a static `call.cap`) on the handle the guest discovers itself via
  * `cap.self` reflection — no new IR op.
  *
- * The record is `<temen.h>`'s `struct vm_spawn_rec` (the v1 **detached** record, #1863: the child
+ * The record is `<temen.h>`'s `struct vm_spawn_rec` (the **detached** spawn record, #1863: the child
  * gets a window of its own, funded by a `Budget`), followed here by `n` × 16-byte grant records.
  * `scratch` must be 8-byte aligned and hold `88 + 16 * n` bytes; the names are referenced in place
  * (window pointers), not copied.

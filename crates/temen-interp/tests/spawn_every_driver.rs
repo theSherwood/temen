@@ -3,9 +3,9 @@
 //! grant-carrying op-17 spawn trapped `Malformed` on the parallel driver and the debug scheduler (the
 //! grant list on `Vcpu` too). The §5 detached spawn had a second admission on `Vcpu`, whose host
 //! built the child's powerbox and seeded its window (#1414). The carve forms this file pinned beside
-//! them (ops 0, 5 and 13 and a version-0 record) are retired, and so is op 15's positional spawn: every
+//! them (ops 0, 5 and 13 and the carve record) are retired, and so is op 15's positional spawn: every
 //! driver refuses them, which `crates/temen/tests/carve_spawn_refused.rs` and `self_spawn_refused.rs`
-//! pin (#1867, #2067). Every spawn here is a v1 record (op 17).
+//! pin (#1867, #2067). Every spawn here is a spawn record (op 17).
 //!
 //! Each case runs on the oracle, the cooperative executor, the parallel driver, the debug scheduler
 //! and an orchestrated `Vcpu`, and every one must give the oracle's result and stream bytes.
@@ -82,14 +82,14 @@ const JOIN_BOTH: &str = "\
 ";
 
 /// An op-17 parent `(i32 inst, i32 out, i32 err, i32 budget, i32 child) -> i64` that re-grants
-/// `stdout` and `stderr` by name to `child` (func 1's child image, #2219), spawned detached by the v1
+/// `stdout` and `stderr` by name to `child` (func 1's child image, #2219), spawned detached by the
 /// record at 17408 and paid from `budget`. Func 1 resolves the two names from the module's data,
 /// writes `O` and `E` through them and returns 7.
 fn op17_granted() -> String {
     let child = SpawnRec {
         grants_ptr: 17600,
         grants_n: 2,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -97,9 +97,9 @@ data 17700 \"stdout\"
 data 17710 \"stderr\"
 func (i32, i32, i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vout: i32, verr: i32, vbud: i32, vmod: i32) {{
-{g0}{g1}  vmf = i64.const 17432
+{g0}{g1}  vmf = i64.const 17416
   i32.store vmf vmod
-  vbf = i64.const 17436
+  vbf = i64.const 17420
   i32.store vbf vbud
   vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -141,21 +141,21 @@ block 0 (v0: i64) {
 ";
 
 /// A module-form op-17 parent `(i32 inst, i32 module, i64 budget) -> i64`: `module`'s entry 0 in its
-/// declared window, spawned detached by the v1 record at 17536 and paid from `budget`.
+/// declared window, spawned detached by the spawn record at 17536 and paid from `budget`.
 fn op17_module_funded() -> String {
     format!(
         "memory 17
 func (i32, i32, i64) -> (i64) {{
 block 0 (vinst: i32, vmod: i32, vbud: i64) {{
-  vma = i64.const 17560
+  vma = i64.const 17544
   i32.store vma vmod
   vb = i32.wrap_i64 vbud
-  vba = i64.const 17564
+  vba = i64.const 17548
   i32.store vba vb
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 {JOIN_OR_ERRNO}{rec}",
-        rec = rec::segment(17536, &SpawnRec::v1()),
+        rec = rec::segment(17536, &SpawnRec::default()),
     )
 }
 
@@ -198,7 +198,7 @@ fn a_budget_funded_module_record_spawn() {
 /// The payload word a [`detached`] parent hands its child at `module_args_base()`.
 const PAYLOAD: i64 = 1000;
 
-/// Where a detached spawn's v1 record sits in its parent's window.
+/// Where a detached spawn's spawn record sits in its parent's window.
 const REC_AT: u64 = 17408;
 
 /// Text IR storing the parent's `vmod` and `vbud` into the record at [`REC_AT`]: the module the child
@@ -206,12 +206,12 @@ const REC_AT: u64 = 17408;
 fn store_handles() -> String {
     format!(
         "  rm = i64.const {m}\n  i32.store rm vmod\n  rb = i64.const {b}\n  i32.store rb vbud\n",
-        m = REC_AT + rec::MODULE_AT,
-        b = REC_AT + rec::BUDGET_AT,
+        m = REC_AT + SpawnRec::MODULE_AT,
+        b = REC_AT + SpawnRec::BUDGET_AT,
     )
 }
 
-/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` spawning from the v1 record at
+/// A parent `(i32 inst, i32 module, i32 budget, i32 out) -> i64` spawning from the spawn record at
 /// [`REC_AT`]: `module`'s entry 0 in a fresh 32 KiB window, funded by `budget`, handed `PAYLOAD` as
 /// its 8-byte args payload and, iff `grant`, `stdout` by name.
 fn detached(grant: bool) -> String {
@@ -244,7 +244,7 @@ fn detached_then(grant: bool, tail: &str) -> String {
         grants_ptr: 16384,
         grants_n: u64::from(grant),
         args: (20480, 8),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -587,28 +587,28 @@ fn a_detached_childs_fuel_is_capped_by_its_budget() {
     );
 }
 
-/// #1944 slice 3 — the per-spawn fuel `quota` is retired (the budget is the one fuel limit): the
-/// record's word at 32, where it was, is reserved, so a nonzero one traps `CapFault` on every driver.
+/// A spawn record's padding word (offset 52) must be zero: a nonzero one traps `CapFault` on every
+/// driver, as any malformed record does (#2091).
 #[test]
-fn a_detached_spawn_with_a_fuel_quota_traps() {
-    let clean = SpawnRec::v1();
+fn a_spawn_record_with_nonzero_padding_traps() {
+    let clean = SpawnRec::default();
     let mut bytes = clean.encode();
-    bytes[32] = 5;
-    let quota: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
+    bytes[52] = 5;
+    let padded: String = bytes.iter().map(|b| format!("\\x{b:02x}")).collect();
     let src = record_spawn(&clean).replace(
         &rec::segment(17408, &clean),
-        &format!("data 17408 \"{quota}\"\n"),
+        &format!("data 17408 \"{padded}\"\n"),
     );
     let m = module(&src);
     agree_on_every_driver(
-        "a v1 record with a fuel quota at 32",
+        "a record with nonzero padding",
         &m,
         &generations_setup(&m, &[1]),
         &trapped(Trap::CapFault),
     );
     let m = module(&record_spawn(&clean));
     agree_on_every_driver(
-        "a v1 record with no quota",
+        "the same record, zero-padded",
         &m,
         &generations_setup(&m, &[1]),
         &ok(3),
@@ -833,7 +833,7 @@ fn three_generations(mem: i64, spawn: i64) -> String {
     let r1 = SpawnRec {
         grants_ptr: 17600,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 16
@@ -848,9 +848,9 @@ block 0 (vinst: i32, vc1: i32, vc2: i32) {{
   cap = i64.const {mem}
   sp = i64.const {spawn}
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, sp)
-  bf = i64.const 17436
+  bf = i64.const 17420
   i32.store bf vsub
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vc1
 {g2}  rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -866,12 +866,12 @@ block 0 (va: i64) {{
   np = i64.const 16384
   nl = i64.const 6
   vb = self.resolve np nl
-  bf = i64.const 17532
+  bf = i64.const 17516
   i32.store bf vb
   gp = i64.const 16400
   gl = i64.const 2
   vg = self.resolve gp gl
-  mf = i64.const 17528
+  mf = i64.const 17512
   i32.store mf vg
   rp = i64.const 17504
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -898,7 +898,7 @@ block 0 (va: i64) {{
 }}
 ",
         r1 = rec::segment(17408, &r1),
-        r2 = rec::segment(17504, &SpawnRec::v1()),
+        r2 = rec::segment(17504, &SpawnRec::default()),
         g2 = store_grant("g", 17600, 16400, "g2", "vc2"),
     )
 }
@@ -924,7 +924,7 @@ fn generations_setup<'a>(
 }
 
 /// A `memory 16` root `(i32 inst, i32 child) -> i64` that spawns `child` (func 1's child image) by the
-/// v1 record `rec`, paid from its `"budget"`, and returns the join. Func 1 returns 3.
+/// spawn record `rec`, paid from its `"budget"`, and returns the join. Func 1 returns 3.
 fn record_spawn(rec: &SpawnRec) -> String {
     format!(
         "memory 16
@@ -934,9 +934,9 @@ block 0 (vinst: i32, vmod: i32) {{
   np = i64.const 16384
   nl = i64.const 6
   vb = self.resolve np nl
-  bf = i64.const 17436
+  bf = i64.const 17420
   i32.store bf vb
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vmod
   rp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -985,7 +985,7 @@ fn payload_rec() -> SpawnRec {
     SpawnRec {
         size_log2: 15,
         args: (0, 8),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     }
 }
 
@@ -997,7 +997,7 @@ fn spawn_into(dst: &str, at: u64, word: i64) -> String {
          \x20 ap{dst} = i64.const {args_at}\n  i64.store ap{dst} pa{dst}\n\
          \x20 rp{dst} = i64.const {REC_AT}\n\
          \x20 {dst} = call.cap 6 17 (i64) -> (i32) vinst (rp{dst})\n",
-        args_at = REC_AT + 56,
+        args_at = REC_AT + 32, // the record's args pointer (`temen_ir::SpawnRec`)
     )
 }
 
@@ -1563,7 +1563,7 @@ fn op17_granting_then(grants: &[(&str, Option<u32>)], tail: &str) -> String {
     let rec = SpawnRec {
         grants_ptr: GRANTS,
         grants_n: grants.len() as u64,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let mut segments = rec::segment(REC, &rec);
     let mut stores = String::new();
@@ -1594,8 +1594,8 @@ block 0 (vinst: i32, vmod: i32, vbud: i32, vout: i32) {{
 {stores}  vrp = i64.const {REC}
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 {tail}{segments}",
-        ma = REC + rec::MODULE_AT,
-        ba = REC + rec::BUDGET_AT,
+        ma = REC + SpawnRec::MODULE_AT,
+        ba = REC + SpawnRec::BUDGET_AT,
     )
 }
 
@@ -1746,8 +1746,8 @@ fn a_run_whose_every_task_waits_forever_is_a_deadlock() {
     );
 }
 
-/// The root spawns a serving child, func 1's image (its second argument), through a v1 record
-/// (`SpawnRec::v1()` at 17600) paid from the `Budget` its third argument names. It mints a
+/// The root spawns a serving child, func 1's image (its second argument), through a spawn record
+/// (`SpawnRec::default()` at 17600) paid from the `Budget` its third argument names. It mints a
 /// live-callee offer over the child (`child_offer`) and calls `add(40, 2)` through it. The call parks
 /// the root until the child's `svc.wait` serves it; the child returns how many calls it served, which
 /// the root joins: `1 * 100 + 42`. A fixture, so the browser runs it too, with the child image as the
@@ -1760,7 +1760,7 @@ const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     // Without its newline: a Windows checkout ends the fixture's lines with `\r\n`.
-    let record = rec::segment(17600, &SpawnRec::v1());
+    let record = rec::segment(17600, &SpawnRec::default());
     assert!(
         LIVE_CALLER.contains(record.trim_end()),
         "the fixture's spawn record starts the child image at its entry"

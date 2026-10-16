@@ -1,7 +1,7 @@
 //! §14 **separate-module children on the JIT**, differentially vs. the interpreter — the
 //! "plugin-in-plugin" story end to end. The host verifies a *different* module, grants both backends
 //! an identical `Module` capability (iface 8), and the parent guest spawns a child domain running
-//! that module through a v1 record (op 17). On the JIT the child module is resolved through
+//! that module through a spawn record (op 17). On the JIT the child module is resolved through
 //! `temen_run::module_resolver` (a host callback, never guest-reachable) and **compiled at the
 //! spawn** — §14's "nesting cost paid at setup" for foreign code. Both backends must agree on the
 //! child's result (its data segments seeded into its own window), a forged module handle's
@@ -100,19 +100,19 @@ fn jit_powerbox_entry_child_matches_interp() {
     if !temen_jit::fiber_supported() {
         return; // no JIT nesting runtime on this target
     }
-    // Spawn the module's entry 0 detached, through a v1 record paid from its `"budget"` → join →
+    // Spawn the module's entry 0 detached, through a spawn record paid from its `"budget"` → join →
     // the child's result.
     let parent = format!(
         "memory 17
 data 16640 \"budget\"
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  rma = i64.const 17432
+  rma = i64.const 17416
   i32.store rma v1
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  rba = i64.const 17436
+  rba = i64.const 17420
   i32.store rba vb
   rp = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
@@ -121,7 +121,7 @@ block 0 (v0: i32, v1: i32) {{
   }}
 }}
 {}",
-        rec::segment(17408, &SpawnRec::v1())
+        rec::segment(17408, &SpawnRec::default())
     );
     let status = "memory 16
 export 0 func \"_start\" 0
@@ -167,12 +167,12 @@ fn a_forged_module_handle_faults_on_both_backends() {
 data 16640 \"budget\"
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  rma = i64.const 17432
+  rma = i64.const 17416
   i32.store rma v0
   vnp = i64.const 16640
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  rba = i64.const 17436
+  rba = i64.const 17420
   i32.store rba vb
   rp = i64.const 17408
   v6 = call.cap 6 17 (i64) -> (i32) v0 (rp)
@@ -181,7 +181,7 @@ block 0 (v0: i32, v1: i32) {{
   }}
 }}
 {}",
-        rec::segment(17408, &SpawnRec::v1())
+        rec::segment(17408, &SpawnRec::default())
     );
     let (ir, _i, jo, _j) = both(&parent);
     assert_eq!(ir, Err(Trap::CapFault), "interp: a forged module handle");

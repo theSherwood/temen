@@ -16,18 +16,18 @@ use temen_ir::{Data, SpawnRec};
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
-/// Where a parent lays its v1 spawn record ([`spawn_rec`]): past the shadow arena, which spans
+/// Where a parent lays its spawn record ([`spawn_rec`]): past the shadow arena, which spans
 /// `[16448, 65536)`.
 const REC_AT: u64 = 65536;
 
-/// The parent: spawn the child detached (its v1 record at [`REC_AT`]: module, budget, no grants,
+/// The parent: spawn the child detached (its spawn record at [`REC_AT`]: module, budget, no grants,
 /// `size_log2` 17), join it, return what it returns.
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vma = i64.const 65560
+  vma = i64.const 65544
   i32.store vma v1
-  vba = i64.const 65564
+  vba = i64.const 65548
   i32.store vba v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -73,7 +73,7 @@ fn instrument(src: &str, data: Option<Data>) -> Module {
     inst
 }
 
-/// A parent's v1 spawn record, at [`REC_AT`]: a `size_log2` 17 child, whose module and budget the
+/// A parent's spawn record, at [`REC_AT`]: a `size_log2` 17 child, whose module and budget the
 /// parent stores in at run time.
 fn spawn_rec() -> Option<Data> {
     Some(Data {
@@ -81,7 +81,7 @@ fn spawn_rec() -> Option<Data> {
         readonly: false,
         bytes: SpawnRec {
             size_log2: 17,
-            ..SpawnRec::v1()
+            ..SpawnRec::default()
         }
         .encode(),
     })
@@ -209,9 +209,9 @@ fn a_durable_parent_without_authority_is_refused_the_spawn() {
     const SPAWN_ONLY: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vma = i64.const 65560
+  vma = i64.const 65544
   i32.store vma v1
-  vba = i64.const 65564
+  vba = i64.const 65548
   i32.store vba v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)

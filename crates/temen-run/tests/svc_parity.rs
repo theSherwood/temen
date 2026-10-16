@@ -17,7 +17,7 @@ mod drivers;
 use drivers::{agree_on, Driver, Ran};
 
 /// `_start`: resolve the granted `"vm"` Instantiator, `"budget"` and `"child"` by name, spawn the
-/// serving child (the image of func 1) detached through a v1 record, mint
+/// serving child (the image of func 1) detached through a spawn record, mint
 /// `child_offer(child, export 0)`, call `add(40, 2)` through the live cap (parking until the child's
 /// `svc.wait` serves it), join, and return the reply — 42. The image keeps the `"adder"` export, so
 /// the child serves it.
@@ -42,17 +42,15 @@ block 0 () {
   vcp = i64.const 16416
   vcl = i64.const 5
   vchild = self.resolve vcp vcl
-  ; a v1 record at 17536 (above the #1094 NULL guard and the durable control words): entry 0 of
-  ; the `child` image, its declared window, no pager or pre-mapped region, paid from `budget`
+  ; a spawn record at 17536 (above the #1094 NULL guard and the durable control words): the
+  ; `child` image, its declared window, no pager or pre-mapped region, paid from `budget`
   q0a0 = i64.const 17536
-  q0v0 = i64.const 1
+  q0v0 = i64.const -4294967296
   i64.store q0a0 q0v0
-  q0v2 = i64.const -4294967296
-  i64.store q0a0 q0v2 offset=16
-  i32.store q0a0 vchild offset=24
-  i32.store q0a0 vbud offset=28
-  q0v9 = i64.const 4294967295
-  i64.store q0a0 q0v9 offset=72
+  i32.store q0a0 vchild offset=8
+  i32.store q0a0 vbud offset=12
+  q0v6 = i64.const 4294967295
+  i64.store q0a0 q0v6 offset=48
   v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) vh (v5, v6)
@@ -211,14 +209,12 @@ block 0 () {
   vkl = i64.const 3
   vkid = self.resolve vkp vkl
   q0a0 = i64.const 17536
-  q0v0 = i64.const 1
+  q0v0 = i64.const -4294967296
   i64.store q0a0 q0v0
-  q0v2 = i64.const -4294967296
-  i64.store q0a0 q0v2 offset=16
-  i32.store q0a0 vkid offset=24
-  i32.store q0a0 vbud offset=28
-  q0v9 = i64.const 4294967295
-  i64.store q0a0 q0v9 offset=72
+  i32.store q0a0 vkid offset=8
+  i32.store q0a0 vbud offset=12
+  q0v6 = i64.const 4294967295
+  i64.store q0a0 q0v6 offset=48
   v5 = call.cap 6 17 (i64) -> (i32) vh (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) vh (v5, v6)

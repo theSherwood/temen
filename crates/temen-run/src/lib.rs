@@ -5744,10 +5744,11 @@ fn module_nests(m: &temen_ir::Module) -> bool {
 /// CONSOLIDATION.md §2.2/§3, #744: the module could build a **pager** record — it uses the §3
 /// config-record spawn (op 17) and declares a pager-shaped export ([`Module::declares_pager`], the
 /// one predicate spawn validation checks too). The record's `pager` field is runtime data, so such a
-/// module folds: the JIT has no native arm for the fault seam (native paging is #2164), and its
-/// op-17 thunk `CapFault`s any pager. A module with no pager-shaped export cannot build a valid pager
-/// record — every engine refuses one identically — so it runs natively through the
-/// `instantiate_rec` thunk, serving its own children if it serves (#744).
+/// module folds: the JIT has no native arm for the fault seam (#2164), and its op-17 thunk
+/// `CapFault`s any pager. It folds to the bytecode engine, which pages a child itself. A module with
+/// no pager-shaped export cannot build a valid pager record — every engine refuses one identically —
+/// so it runs natively through the `instantiate_rec` thunk, serving its own children if it serves
+/// (#744).
 fn module_demand_spawns(m: &temen_ir::Module) -> bool {
     m.declares_pager()
         && m.funcs.iter().any(|f| {
@@ -6076,7 +6077,7 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     Some(temen_ir::Resolved::Cap(cap))
 }
 
-/// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 v1 record,
+/// A §14 **conductor**: spawn a granted `Module` as a detached child — an op-17 spawn record,
 /// so the child runs in a window of its own (its declared memory: `size_log2 = 0`), paid from a `Budget`
 /// and returned to it when the child ends — with `caps` re-granted to it by name and `argv` as the
 /// spawn's args payload (`{argc, envc = 0}` + packed NUL-terminated strings, landing at the child's
@@ -6125,7 +6126,18 @@ fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
     let n = 3 + caps.len();
     let sig = vec!["i32"; n].join(", ");
     let params: Vec<String> = (0..n).map(|i| format!("v{i}: i32")).collect();
-    let mut data = format!("data {args} \"{}\"\n", esc(&payload));
+    // Every field but the module and budget handles, which only the entry knows, is data.
+    let record = temen_ir::SpawnRec {
+        grants_ptr: grants,
+        grants_n: caps.len() as u64,
+        args: (args, payload.len() as u64),
+        ..temen_ir::SpawnRec::default()
+    };
+    let mut data = format!(
+        "data {args} \"{}\"\ndata {rec} \"{}\"\n",
+        esc(&payload),
+        esc(&record.encode())
+    );
     let mut body = String::new();
     for (i, name) in caps.iter().enumerate() {
         let (noff, goff) = (names + 16 * i as u64, grants + 16 * i as u64);
@@ -6143,22 +6155,8 @@ fn conductor_src(caps: &[&str], argv: &[&str]) -> String {
 {data}func ({sig}) -> (i64, i64) {{
 block 0 ({params}) {{
 {body}  r = i64.const {rec}
-  w0 = i64.const 1
-  i64.store r w0
-  w2 = i64.const {w2}
-  i64.store r w2 offset=16
-  i32.store r v1 offset=24
-  i32.store r v2 offset=28
-  gp = i64.const {grants}
-  i64.store r gp offset=40
-  gn = i64.const {gn}
-  i64.store r gn offset=48
-  ap = i64.const {args}
-  i64.store r ap offset=56
-  al = i64.const {al}
-  i64.store r al offset=64
-  none = i32.const -1
-  i32.store r none offset=72
+  i32.store r v1 offset={module_at}
+  i32.store r v2 offset={budget_at}
   h = call.cap 6 17 (i64) -> (i32) v0 (r)
   z = i32.const 0
   refused = i32.lt_s h z
@@ -6176,10 +6174,8 @@ block 2 (inst: i32, c: i32) {{
 }}
 "#,
         params = params.join(", "),
-        // size_log2 0 (the module's declared window) | pager u32::MAX (none)
-        w2 = (0xFFFF_FFFFu64 << 32) as i64,
-        gn = caps.len(),
-        al = payload.len(),
+        module_at = temen_ir::SpawnRec::MODULE_AT,
+        budget_at = temen_ir::SpawnRec::BUDGET_AT,
     )
 }
 
@@ -6784,6 +6780,18 @@ type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
 /// consumer→native op remap, and the requirement set (names + sigs) retained for `import.attach`.
 type GroupedSlot = (usize, Arc<[u32]>, Vec<String>, Vec<FuncType>);
 
+/// #2428 — what a [`HostCap::host_proc`]'s `make` mints a handler for, which decides how the state it
+/// makes is charged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mint {
+    /// The embedder's grant: state it chose to hand over, the grantee's from now on past any ceiling.
+    Grant,
+    /// A process the guest makes (a `fork()` twin, a spawned child re-granted the capability): its
+    /// copy of the state is the guest's own act, charged within every limit and refused when there
+    /// is no room, which fails that fork or re-grant.
+    Inherit,
+}
+
 #[derive(Clone)]
 pub struct HostCap {
     type_id: u32,
@@ -7016,10 +7024,14 @@ impl HostCap {
     /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
     /// where the handler is made. `make` is handed the node of the domain the capability is granted
     /// to (#2306), which pays for the host memory a guest grows that state by
-    /// ([`temen_interp::HostCharge`]).
+    /// ([`temen_interp::HostCharge`]), and what it mints for ([`Mint`]): `None` refuses an
+    /// [`Mint::Inherit`] with no room for its state, and is never returned for a [`Mint::Grant`].
     pub fn host_proc(
         op: u32,
-        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef, Mint) -> Option<(HostProc, temen_interp::CapState)>
+            + Send
+            + Sync
+            + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
@@ -7031,16 +7043,17 @@ impl HostCap {
                 // state (`ForkedProc::shared`), the right default for an arbitrary host cap whose
                 // state the runtime cannot split. A personality with real per-process state supplies
                 // its own factory via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`). What a twin
-                // mints is paid for by the grantee, as a child's re-grant is (#2306).
+                // mints is paid for by the grantee, as a child's re-grant is (#2306), within its
+                // limits (#2428).
                 let payer = h.own_node();
                 let fork: temen_interp::HostProcFork = Arc::new({
                     let (make, payer) = (Arc::clone(&make), payer.clone());
                     move |_pid| {
-                        let (h, state) = make(&payer);
-                        temen_interp::ForkedProc::shared(h, state)
+                        let (h, state) = make(&payer, Mint::Inherit)?;
+                        Some(temen_interp::ForkedProc::shared(h, state))
                     }
                 });
-                let (f, state) = make(&payer);
+                let (f, state) = make(&payer, Mint::Grant).expect("a grant always mints");
                 h.grant_host_proc_forkable(f, fork, state)
             }),
             unbound: false,

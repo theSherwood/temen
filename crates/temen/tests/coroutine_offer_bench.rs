@@ -6,7 +6,7 @@
 //! Until §2.3 this file raced the offer lane against the bespoke coroutine ops (Instantiator
 //! ops 2/3 + `Yielder`) it replaced; the collapse deleted those ops, so the offer lane is now the
 //! only transport and this pin holds the absolute per-round shape: the parent spawns a serving
-//! child detached (a v1 record paid from its `"budget"`), mints a live offer over its `adder`
+//! child detached (a spawn record paid from its `"budget"`), mints a live offer over its `adder`
 //! export (op 14), and calls `add(i, 1)`
 //! through it n times, the child replying from a `svc.wait` loop — checksum
 //! `Σ_{i=0}^{n-1}(i+1) = n(n+1)/2`. Known asymmetry, same as `serving_bench` documents: the
@@ -56,9 +56,9 @@ block 0 () {{
   vcp = i64.const 16416
   vcl = i64.const 5
   vcm = self.resolve vcp vcl
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vcm
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vb
   q0a0 = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vh (q0a0)
@@ -115,7 +115,7 @@ block 0 (va: i64, vb: i64) {{
             &SpawnRec {
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),

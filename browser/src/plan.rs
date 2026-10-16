@@ -61,7 +61,7 @@ pub struct Pipe {
     pub to_name: String,
 }
 
-/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17 v1) in
+/// One §14 child: a module the host grants the root (func 0 is its entry), run detached (op 17) in
 /// a fresh window paid from the root's budget.
 pub struct Node {
     /// The node's window, `1 << window_log2` bytes.
@@ -216,7 +216,7 @@ impl Plan {
         if REC_BASE + r * SLOT > NAME_BASE {
             return Err(format!("{r} grant records do not fit"));
         }
-        // Spawn every node (op 17 v1: its own window, paid from the budget), then join every node.
+        // Spawn every node (op 17: its own window, paid from the budget), then join every node.
         let sfx = |k: usize| {
             if k == 0 {
                 String::new()
@@ -233,7 +233,7 @@ impl Plan {
                 grants_ptr: first_rec[k],
                 grants_n: rec_n[k] as u64,
                 args: (argv_at[k].0, argv_at[k].1 as u64),
-                ..temen_ir::SpawnRec::v1()
+                ..temen_ir::SpawnRec::default()
             };
             let (seg, stores) =
                 spawn_rec_ir(at, &rec, &format!("v{}", 1 + k), &format!("v{}", 1 + n));
@@ -307,8 +307,8 @@ pub fn spawn_rec_ir(
     let stores = format!(
         "  rm{at} = i64.const {m}\n  i32.store rm{at} {modh}\n  rb{at} = i64.const {b}\n  \
          i32.store rb{at} {budget}\n",
-        m = at + 24,
-        b = at + 28
+        m = at + temen_ir::SpawnRec::MODULE_AT,
+        b = at + temen_ir::SpawnRec::BUDGET_AT
     );
     (format!("data {at} \"{esc}\"\n"), stores)
 }

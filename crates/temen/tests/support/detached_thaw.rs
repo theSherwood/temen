@@ -4,7 +4,7 @@
 #![allow(dead_code)] // each including binary uses a different subset
 
 #[path = "../../../temen-interp/tests/support/rec.rs"]
-mod rec;
+pub mod rec;
 
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
@@ -17,15 +17,15 @@ use temen_jit::{JitError, JitOutcome};
 pub const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 pub const PARENT_LOG2: u8 = 18;
 
-/// Spawn the child detached through the v1 record at 65536 ([`parent_of`] lays it), its module and
+/// Spawn the child detached through the spawn record at 65536 ([`parent_of`] lays it), its module and
 /// budget stored there, join it, return `status * 1000 + value`: what it returns, or its trap's wire
 /// code times 1000 (#2066).
 pub const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -97,7 +97,7 @@ pub fn parent() -> temen_ir::Module {
 pub fn parent_of(src: &str) -> temen_ir::Module {
     let spawn = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     parent_with(src, &spawn)
 }

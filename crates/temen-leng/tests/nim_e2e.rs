@@ -3645,12 +3645,12 @@ fn ring_parent() -> temen_ir::Module {
     let nim_child = temen_ir::SpawnRec {
         size_log2: 24,
         child_off: 8388608,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     let c_child = temen_ir::SpawnRec {
         size_log2: 17,
         child_off: 65536,
-        ..temen_ir::SpawnRec::v1()
+        ..temen_ir::SpawnRec::default()
     };
     let text = format!(
         "memory 17
@@ -3681,12 +3681,12 @@ block 0 (inst: i32, aspace: i32, nim: i32, c: i32, budget: i32) {{
   }}
 }}
 {nim_rec}{c_rec}",
-        nim_module = 17408 + rec::MODULE_AT,
-        nim_budget = 17408 + rec::BUDGET_AT,
-        nim_region = 17408 + rec::REGION_AT,
-        c_module = 17536 + rec::MODULE_AT,
-        c_budget = 17536 + rec::BUDGET_AT,
-        c_region = 17536 + rec::REGION_AT,
+        nim_module = 17408 + temen_ir::SpawnRec::MODULE_AT,
+        nim_budget = 17408 + temen_ir::SpawnRec::BUDGET_AT,
+        nim_region = 17408 + temen_ir::SpawnRec::REGION_AT,
+        c_module = 17536 + temen_ir::SpawnRec::MODULE_AT,
+        c_budget = 17536 + temen_ir::SpawnRec::BUDGET_AT,
+        c_region = 17536 + temen_ir::SpawnRec::REGION_AT,
         nim_rec = rec::segment(17408, &nim_child),
         c_rec = rec::segment(17536, &c_child),
     );

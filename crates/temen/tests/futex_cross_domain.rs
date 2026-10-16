@@ -25,14 +25,14 @@ fn module(src: &str) -> Module {
 }
 
 /// The parent `(Instantiator, AddressSpace, child Module, Budget) -> i64`: mints a 64 KiB region, maps
-/// it at 128 KiB, spawns the child detached through the v1 record at 17408 with the region pre-mapped
+/// it at 128 KiB, spawns the child detached through the spawn record at 17408 with the region pre-mapped
 /// at 64 KiB of the child's window, then runs `body` (which sees the child as `vc` and the region
 /// byte 20480 as `va`) and returns its `vr`.
 fn parent(body: &str) -> Module {
     let spawn = SpawnRec {
         size_log2: 17,
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     module(&format!(
         "memory 18
@@ -45,11 +45,11 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
   vro = i64.const 0
   vprot = i32.const 3
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
-  vpm = i64.const 17432
+  vpm = i64.const 17416
   i32.store vpm v2
-  vpb = i64.const 17436
+  vpb = i64.const 17420
   i32.store vpb v3
-  vpr = i64.const 17480
+  vpr = i64.const 17456
   i32.store vpr vrh
   vp = i64.const 17408
   vc = call.cap 6 17 (i64) -> (i32) v0 (vp)

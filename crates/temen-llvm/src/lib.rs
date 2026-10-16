@@ -4201,7 +4201,7 @@ const HOST_PROC_TYPE_ID: u32 = 13;
 /// numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `shared_region_type_id_matches` test locks them.
 const SHARED_REGION_TYPE_ID: u32 = 4;
 /// The `Instantiator` interface id (`temen_interp::cap_id::INSTANTIATOR`) — the §14 VM-in-VM spawner,
-/// reached from a guest via `__vm_instantiate_rec` (op 17, the v1 spawn record) and `__vm_join`
+/// reached from a guest via `__vm_instantiate_rec` (op 17, the spawn record) and `__vm_join`
 /// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s
 /// `instantiator_type_id_matches` test locks the two together.
 const INSTANTIATOR_TYPE_ID: u32 = 6;
@@ -13269,8 +13269,8 @@ fn lower_vm_builtin(
             Ok(true)
         }
         // §14 spawn: `long __vm_instantiate_rec(int inst, long rec)` → `call.cap INSTANTIATOR 17 inst
-        // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 **v1** record
-        // (`temen_ir::SpawnRec`, 88 bytes) in the guest window naming the module (a `Module` handle
+        // (rec)` — the one spawn form (INVARIANTS #13, #1863): `rec` points at an op-17 record
+        // (`temen_ir::SpawnRec`, 64 bytes) in the guest window naming the module (a `Module` handle
         // the host granted, started at its function 0, #2219), the `Budget` that pays for the child's
         // window of its own, the by-name grant list,
         // the spawn-time args payload and an optional pre-mapped region. The same builtin chibicc

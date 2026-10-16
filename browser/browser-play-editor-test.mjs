@@ -83,7 +83,7 @@ try {
     : fail(`hello run: ${JSON.stringify(hello)}`);
 
   // The `detached` card: a §5 detached child spawned from the guest's OWN module over a pre-mapped
-  // SharedRegion (Instantiator op 17, a v1 spawn record) on the on-ramp recipe — the parent reads the
+  // SharedRegion (Instantiator op 17, a spawn record) on the on-ramp recipe — the parent reads the
   // child's answer back through its own mapping: 1000 × 42 + 82.
   await runCard(page, 'detached', 30_000);
   const det = await page.evaluate((sel) => ({

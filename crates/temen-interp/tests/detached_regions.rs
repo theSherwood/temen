@@ -31,13 +31,13 @@ fn src() -> String {
         "memory 16
 func (i32, i32, i32) -> (i64) {{
 block 0 (vinst: i32, vbud: i32, vmod: i32) {{
-  rm = i64.const 17432
+  rm = i64.const 17416
   i32.store rm vmod
   f = i64.const -1
   c = i64.const {CEILING}
   vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i64) vbud (f, f, f, c)
   vnode = i32.wrap_i64 vsub
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vnode
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -69,7 +69,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 {rec}",
-        rec = rec::segment(17408, &SpawnRec::v1()),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 
@@ -99,7 +99,7 @@ fn a_minted_region_spends_the_childs_channel_until_it_ends_on_every_driver() {
 fn shared_futex_src() -> String {
     let child = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -172,9 +172,9 @@ block 0 (v0: i64) {{
 }}
 {rec}",
         rec = rec::segment(17408, &child),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
-        region_at = 17408 + 72,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        region_at = 17408 + SpawnRec::REGION_AT,
     )
 }
 

@@ -17,7 +17,7 @@ the "nested stays" / "opt-in" / "alias grant" passages below as the pre-2026-09-
 features (the §2.2 pager, the nested subtree freeze) onto it and deleting the rest of the carve path —
 tracked in #1289. The carve spawn itself is gone: every engine traps it `CapFault` (#1867).
 
-**Op 15 is retired too (owner, 2026-10-14, #2067).** Every spawn is the op-17 v1 record, which carries
+**Op 15 is retired too (owner, 2026-10-14, #2067).** Every spawn is the op-17 record, which carries
 op 15's operands as fields. Op 15 traps `CapFault` on every engine, and no producer emits it. This
 note was written while op 15 was the detached spawn: where it says op 15 or names one of its 7-, 9-
 or 11-arg forms, read the record (`size_log2`, `budget`, `module`, the grant list, the args payload,

@@ -211,7 +211,7 @@ fn run_shell_ex(
         let (in_h, in_fifo) = host.grant_input_pipe();
         let inst_h = host.grant_instantiator();
         let _as_h = host.grant_address_space(0, win as u64);
-        // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+        // The `Budget` every spawned command / ring stage's detached window is paid from (op 17),
         // returned when the child ends: room for the widest pipeline's three concurrent stages.
         let _budget_h = host.grant_budget(-1, 4 << 20, -1);
         let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
@@ -294,7 +294,7 @@ fn run_shell_ex(
     );
 
     // Bytecode cooperative engine — the browser's wasm-safe entry (`posix_shell_exec` runs this exact
-    // path in the playground). External-command spawns (op 17 v1) and concurrent ring pipelines
+    // path in the playground). External-command spawns (op 17) and concurrent ring pipelines
     // (op 11 + `SharedRegion` + futex) run single-thread/clockless here; its output must match interp,
     // making the differential interp==JIT==bytecode across the whole shell surface.
     let bout = shell_bytecode_stdout(&m, &cmd_mods, win, stdin, env, files, args);
@@ -318,7 +318,7 @@ fn run_shell_ex(
 /// Run the already-built shell module on the **bytecode cooperative engine** — the browser's wasm-safe
 /// entry ([`bytecode::compile_and_run_with_host`], the same one `posix_shell_exec` drives in the
 /// playground). Unlike [`run_shell_ex`]'s interp/JIT arms (OS threads + a wall clock), this is
-/// single-thread and clockless: external-command spawns (op 17 v1) and concurrent ring pipelines
+/// single-thread and clockless: external-command spawns (op 17) and concurrent ring pipelines
 /// (op 11 + `SharedRegion` + futex) run cooperatively — the browser-parity path slices 1–2 unblocked,
 /// plus the child-manifest binding this slice added (a chibicc command's `write` resolves).
 /// Regions use the default software backing (`VecBacking`) — no OS shared memory, exactly as the
@@ -341,7 +341,7 @@ fn shell_bytecode_stdout(
     let (in_h, in_fifo) = host.grant_input_pipe();
     let _inst_h = host.grant_instantiator();
     let _as_h = host.grant_address_space(0, win as u64);
-    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17 v1),
+    // The `Budget` every spawned command / ring stage's detached window is paid from (op 17),
     // returned when the child ends: room for the widest pipeline's three concurrent stages.
     let _budget_h = host.grant_budget(-1, 4 << 20, -1);
     let cmd_handles: Vec<(&str, i32, u8)> = cmd_mods
@@ -1146,9 +1146,9 @@ fn stage0_shell_hash_comments() {
 #[test]
 #[ignore = "writes browser/tests/fixtures/{shell,stage_runner}.temen; run explicitly to regenerate"]
 fn gen_browser_shell_fixture() {
-    // The **full** shell — external-command spawn (op 17 v1, detached) and concurrent ring pipelines
+    // The **full** shell — external-command spawn (op 17, detached) and concurrent ring pipelines
     // (`SharedRegion` + futex), `RING` included. These `Instantiator`/`SharedRegion` call.cap calls
-    // compile on the browser's bytecode cooperative engine (op 17 v1 routes to its detached arm, region
+    // compile on the browser's bytecode cooperative engine (op 17 routes to its detached arm, region
     // + futex, child-manifest binding); the differential above proves the module runs there
     // byte-identically to the tree-walk/JIT oracle. `posix_shell_exec` grants the `__stage` runner
     // below so `cat f | sort | uniq`-style pipelines take the ring path in the playground.

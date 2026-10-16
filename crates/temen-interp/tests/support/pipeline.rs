@@ -1,4 +1,4 @@
-//! The detached ring pipeline: two stages spawned detached from v1 spawn records (op 17), each into
+//! The detached ring pipeline: two stages spawned detached from spawn records (op 17), each into
 //! a window the parent cannot read, moving four items through a one-slot ring in a `SharedRegion`
 //! the parent grants them by name. One program for every engine: temen-interp's `concurrent_stages`
 //! runs it on the interpreters, temen's `bytecode_concurrent_stages` on the cooperative bytecode
@@ -19,7 +19,7 @@ use temen_ir::{Module, SpawnRec};
 
 /// The **detached** variant — the §5 model sentence as a test ("a shell would plausibly run
 /// coreutils detached"): the same one-slot ring, but the two stages are spawned through a
-/// detached-spawn `Budget` (a v1 spawn record, op 17) from their own module into windows the parent
+/// detached-spawn `Budget` (a spawn record, op 17) from their own module into windows the parent
 /// cannot read. The region grant rides the same op-11-format named-grant records; the module's own
 /// data segment carries the `"ring"` name into each private window. Private memory and an explicit
 /// shared channel compose — exactly the separate-process discipline, in-process.
@@ -144,14 +144,14 @@ block 5 (vsum: i64, vtos: i64) {
 
 /// The detached-pipeline parent: mint the region, build the grant record, spawn the producer (the
 /// granted stages' module, whose func 0 it is) and the consumer (that module's child image of func
-/// 1, #2219) DETACHED, from their v1 records at 17408 and 17536, each granted the region; join both
+/// 1, #2219) DETACHED, from their spawn records at 17408 and 17536, each granted the region; join both
 /// → 410.
 pub fn parent() -> String {
     let stage = SpawnRec {
         size_log2: 17,
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"
@@ -171,15 +171,15 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   i32.store va2 vv2
   va3 = i64.const 16648
   i32.store va3 vrh
-  vpma = i64.const 17432
+  vpma = i64.const 17416
   i32.store vpma v2
-  vpba = i64.const 17436
+  vpba = i64.const 17420
   i32.store vpba v3
   vprp = i64.const 17408
   vp = call.cap 6 17 (i64) -> (i32) v0 (vprp)
-  vcma = i64.const 17560
+  vcma = i64.const 17544
   i32.store vcma v4
-  vcba = i64.const 17564
+  vcba = i64.const 17548
   i32.store vcba v3
   vcrp = i64.const 17536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vcrp)

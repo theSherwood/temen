@@ -1392,17 +1392,15 @@ type 1 interface { echo: 0 }
 export 0 interface "svc" 1 { echo: 1 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  ; a v1 record at 17536 (op 17): entry 0 of the durable image `v1`, its declared window, no
-  ; pager or pre-mapped region, paid from the budget `v2`
+  ; a spawn record at 17536 (op 17): the durable image `v1`, its declared window, no pager or
+  ; pre-mapped region, paid from the budget `v2`
   q0a0 = i64.const 17536
-  q0v0 = i64.const 1
+  q0v0 = i64.const -4294967296
   i64.store q0a0 q0v0
-  q0v2 = i64.const -4294967296
-  i64.store q0a0 q0v2 offset=16
-  i32.store q0a0 v1 offset=24
-  i32.store q0a0 v2 offset=28
-  q0v9 = i64.const 4294967295
-  i64.store q0a0 q0v9 offset=72
+  i32.store q0a0 v1 offset=8
+  i32.store q0a0 v2 offset=12
+  q0v6 = i64.const 4294967295
+  i64.store q0a0 q0v6 offset=48
   v5 = call.cap 6 17 (i64) -> (i32) v0 (q0a0)
   v6 = i64.const 0
   v7 = call.cap 6 14 (i32, i64) -> (i32) v0 (v5, v6)

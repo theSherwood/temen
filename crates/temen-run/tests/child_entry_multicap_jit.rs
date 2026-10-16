@@ -85,7 +85,7 @@ fn spawn() -> Spawn {
         let f = Arc::clone(&factory);
         Arc::new(move |_pid| {
             let (h, s) = (*f)();
-            ForkedProc::shared(h, s)
+            Some(ForkedProc::shared(h, s))
         })
     };
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork, fs_init_state);

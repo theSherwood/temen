@@ -242,14 +242,12 @@ block 0 () {
   vcl = i64.const 5
   vc = self.resolve vcp vcl
   vrec = i64.const 34816
-  vw0 = i64.const 1
+  vw0 = i64.const -4294967296
   i64.store vrec vw0
-  vw2 = i64.const -4294967296
-  i64.store vrec vw2 offset=16
-  i32.store vrec vc offset=24
-  i32.store vrec vb offset=28
-  vw9 = i64.const 4294967295
-  i64.store vrec vw9 offset=72
+  i32.store vrec vc offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
   vsl = i64.const 35840

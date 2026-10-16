@@ -1,13 +1,12 @@
 //! CONSOLIDATION.md §3a — **the config-record spawn** (`Instantiator` op 17,
-//! `instantiate_rec(record_ptr)`): one 88-byte v1 record (`SpawnRec`) names a detached spawn as
-//! data — the child module and its entry, its window (`size_log2`, `0` = the module's declared
-//! memory), a pager export (`u32::MAX` = none), the `Budget` that funds it, a named-grant list, an
-//! args payload and a pre-mapped `SharedRegion`. The version-0 record, which spelled a carve spawn,
-//! is refused (#1867, `carve_spawn_refused.rs`).
+//! `instantiate_rec(record_ptr)`): one 64-byte spawn record (`SpawnRec`) names a detached spawn as
+//! data — the child module, its window (`size_log2`, `0` = the module's declared memory), a pager
+//! export (`u32::MAX` = none), the `Budget` that funds it, a named-grant list, an args payload and a
+//! pre-mapped `SharedRegion`. The carve spawn is refused (#1867, `carve_spawn_refused.rs`).
 //!
 //! What a record carries, on every tier: granted offers and the deadlocks around them (#1217), a
 //! budget's `channel` bounding the child (#989), a parent serving its child's `exec` (#744), and the
-//! v1 record's payload, window, pager, budget and region rules (#1863).
+//! spawn record's payload, window, pager, budget and region rules (#1863).
 
 #[path = "../../temen-interp/tests/support/rec.rs"]
 mod rec;
@@ -21,6 +20,15 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
+
+/// Every driver a detached run takes: each backend, then the bytecode engine's parallel driver
+/// (`None`).
+const DRIVERS: [Option<Backend>; 4] = [
+    Some(Backend::TreeWalk),
+    Some(Backend::Bytecode),
+    Some(Backend::Jit),
+    None,
+];
 
 /// #744 — whether the cooperative bytecode driver runs `src` itself, serving its children, rather
 /// than declining it to the tree-walker: a `Backend::Bytecode` run of it then pins that driver.
@@ -37,7 +45,7 @@ fn granted_client_program(guest: &str) -> String {
     let guest_rec = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "\
@@ -60,23 +68,23 @@ block 0 () {{
   vbp = i64.const 16400
   vbl = i64.const 6
   vb = self.resolve vbp vbl
-  vsb = i64.const 17436
+  vsb = i64.const 17420
   i32.store vsb vb
   vsrvp = i64.const 16448
   vsrvl = i64.const 6
   vserver = self.resolve vsrvp vsrvl
-  vsrvm = i64.const 17432
+  vsrvm = i64.const 17416
   i32.store vsrvm vserver
   vgstp = i64.const 16456
   vgstl = i64.const 5
   vguest = self.resolve vgstp vgstl
-  vgstm = i64.const 17528
+  vgstm = i64.const 17512
   i32.store vgstm vguest
   vsp = i64.const 17408
   vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
   vz0 = i64.const 0
   voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
-{fork_grant}  vgb = i64.const 17532
+{fork_grant}  vgb = i64.const 17516
   i32.store vgb vb
   vgp = i64.const 17504
   vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
@@ -104,7 +112,7 @@ block 0 (v0: i64) {{
   }}
 }}
 ",
-        server_rec = rec::segment(17408, &SpawnRec::v1()),
+        server_rec = rec::segment(17408, &SpawnRec::default()),
         guest_rec = rec::segment(17504, &guest_rec),
         fork_grant = rec::grant("gf", 16640, 16684, 4, "voff"),
     )
@@ -240,7 +248,7 @@ fn a_root_joining_a_child_that_waits_forever_deadlocks_to_threadfault() {
 const PIPE_CAP: i64 = 64 << 10;
 
 /// Host-level harness for the §14 channel bound: a parent `(Instantiator, Budget-with-channel,
-/// child Module)` spawns its child image (#2219) through a v1 record the budget funds; the child loops
+/// child Module)` spawns its child image (#2219) through a spawn record the budget funds; the child loops
 /// minting host-served pipes (`self.pipe`, op 16) into its OWN powerbox and returns how many it minted
 /// before the mint was refused. A child's pipes are charged to the budget that paid for it (#1944), so
 /// a bounded `channel` fails the mint closed at exactly `channel / PIPE_CAP` pipes; an unbounded
@@ -294,9 +302,9 @@ block 3 (vnok: i64) {{
   }}
 }}
 {record}"#,
-        module_at = rec::MODULE_AT,
-        budget_at = rec::BUDGET_AT,
-        record = rec::segment(17408, &SpawnRec::v1()),
+        module_at = SpawnRec::MODULE_AT,
+        budget_at = SpawnRec::BUDGET_AT,
+        record = rec::segment(17408, &SpawnRec::default()),
     );
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
@@ -356,7 +364,7 @@ fn channel_budget_bounds_a_spawned_childs_pipe_mints() {
 /// grant is a named-grant record whose `handle` carries `GRANT_SERVE_LIVE_TAG` over the parent's
 /// impl-export index (export 0 here, interface `"exec"` with one op `run`) — the record's reserved
 /// `flags` word stays 0 and ignored, as the ABI promises. The parent spawns `"child"` detached
-/// through a v1 record; the spawn installs into the CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
+/// through a spawn record; the spawn installs into the CHILD a live-callee offer whose callee is the parent's running powerbox. The child resolves
 /// `"exec"` by name and calls `run(40, 2)` — which parks it until the PARENT's `svc.wait` serve
 /// loop runs handler func 2 over the parent's live world and replies `42`. The parent joins the
 /// child and returns `join*100 + served` = `42*100 + 1` = `4201`. The parent never holds a
@@ -369,7 +377,7 @@ fn serve_live_program(handle: i32) -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "\
@@ -442,8 +450,8 @@ block 0 (va: i64, vb: i64) {{
 ",
         rec = rec::segment(17408, &child),
         exec_grant = rec::grant("ge", 16640, 16684, 4, "vgh"),
-        budget_at = 17408 + rec::BUDGET_AT,
-        module_at = 17408 + rec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
     )
 }
 
@@ -456,7 +464,7 @@ block 0 (va: i64, vb: i64) {{
 fn a_parent_serves_its_childs_exec_with_its_own_code() {
     let src = serve_live_program(temen_interp::GRANT_SERVE_LIVE_TAG as i32);
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS.map(Some).into_iter().chain([None]) {
+    for b in DRIVERS {
         // Both transports: the child's call queued for the parent's serve loop, and (handoff on,
         // the default) run inline on the child's thread when it finds the parent parked.
         for handoff in [true, false] {
@@ -465,7 +473,7 @@ fn a_parent_serves_its_childs_exec_with_its_own_code() {
                 ..RunConfig::default()
             };
             assert_eq!(
-                run_detached_on(b, &src, 1 << 20, cfg),
+                run_detached_with(b, &src, 1 << 20, cfg),
                 Ok(4_201),
                 "{b:?}, handoff {handoff}: the child's exec.run(40,2) → the parent's handler \
                  replies 42; the parent served 1 and joined 42"
@@ -489,9 +497,9 @@ fn a_child_image_that_carries_its_programs_serve_loop_runs_where_the_program_doe
          func 1 {funcs}func 3 () -> (i32) {{\n{serve}"
     );
     assert!(runs_on_bytecode(&src), "the cooperative driver serves it");
-    for b in BACKENDS.map(Some).into_iter().chain([None]) {
+    for b in DRIVERS {
         assert_eq!(
-            run_detached_on(b, &src, 1 << 20, RunConfig::default()),
+            run_detached(b, &src),
             Ok(4_201),
             "{b:?}: the child runs its image, and the parent serves its exec.run(40, 2)"
         );
@@ -581,9 +589,9 @@ fn client_death_releases_the_server_while_a_resumer_is_parked_under_its_key() {
   vro = i64.const 0
   vprot = i32.const 3
   vmap = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
-  vreg = i64.const 17480
+  vreg = i64.const 17456
   i32.store vreg vrh
-  vcoff = i64.const 17488
+  vcoff = i64.const 17464
   i64.store vcoff vwo
   vsp = i64.const 17408
 ",
@@ -647,12 +655,12 @@ block 0 (vsp: i64, varg: i64) {
     }
 }
 
-// ---- #1863: the v1 (detached) record ----
+// ---- #1863: the (detached) spawn record ----
 
-/// Stores building an 88-byte v1 record at `at` from the i64 values `vr0`..`vr80` in scope (one per
-/// 8-byte word, named by offset).
-fn store_record_v1(at: u64) -> String {
-    (0..11)
+/// Stores building a spawn record at `at` from the i64 values `vr0`..`vr56` in scope (one per 8-byte
+/// word, named by offset).
+fn store_record(at: u64) -> String {
+    (0..8)
         .map(|k| {
             let o = k * 8;
             format!(
@@ -663,7 +671,7 @@ fn store_record_v1(at: u64) -> String {
         .collect()
 }
 
-/// A root that spawns `"child"` detached through a v1 record: the child's window is its own
+/// A root that spawns `"child"` detached through a spawn record: the child's window is its own
 /// (`size_log2` 17, the module's declared memory), funded by the `"budget"` grant, with a one-byte
 /// args payload (`*` = 42) the child reads back at `module_args_base`. The child returns
 /// `payload + 100`; the root returns the join result. `pager` is `u32::MAX` here; `extra` rewrites
@@ -694,17 +702,14 @@ block 0 () {{
   v32 = i64.const 32
   vbsh = i64.shl vb64 v32
   vmod = i64.extend_i32_u vchild
-  vr0 = i64.const 1
-  vr8 = i64.const 0
-  vr16 = i64.const -4294967279
-  vr24 = i64.or vbsh vmod
-  vr32 = i64.const 0
-  vr40 = i64.const 0
-  vr48 = i64.const 0
-  vr56 = i64.const 16416
-  vr64 = i64.const 1
-  vr72 = i64.const 4294967295
-  vr80 = i64.const 0
+  vr0 = i64.const -4294967279
+  vr8 = i64.or vbsh vmod
+  vr16 = i64.const 0
+  vr24 = i64.const 0
+  vr32 = i64.const 16416
+  vr40 = i64.const 1
+  vr48 = i64.const 4294967295
+  vr56 = i64.const 0
 {stores}
   vrp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
@@ -725,32 +730,28 @@ block 0 (v0: i64) {{
   }}
 }}
 ",
-        stores = store_record_v1(17408),
+        stores = store_record(17408),
     )
 }
 
 /// Run with the Instantiator (`"vm"`), an AddressSpace (`"as"`), a detached-window budget
 /// (`"budget"`, 1 MiB of `Budget.mem`), and, under its export name, the child image (#2219) of each
 /// function the program exports: a program exports the functions it spawns. The root returns its
-/// answer.
-fn run_detached(backend: Backend, src: &str) -> Result<i32, String> {
+/// answer. On `backend`, or on the parallel driver for `None`.
+fn run_detached(backend: impl Into<Option<Backend>>, src: &str) -> Result<i32, String> {
     run_detached_with(backend, src, 1 << 20, RunConfig::default())
 }
 
 /// [`run_detached`] with a `mem`-byte budget, under `cfg`. The run gets its own thread and a
 /// deadline: the #1217 pins guard against a *hang* (a pager parked for a child that is gone), so a
 /// regression must fail the test, not stall the binary until CI's timeout.
-fn run_detached_with(backend: Backend, src: &str, mem: u64, cfg: RunConfig) -> Result<i32, String> {
-    run_detached_on(Some(backend), src, mem, cfg)
-}
-
-/// [`run_detached_with`] on `backend`, or on the parallel driver for `None`.
-fn run_detached_on(
-    backend: Option<Backend>,
+fn run_detached_with(
+    backend: impl Into<Option<Backend>>,
     src: &str,
     mem: u64,
     cfg: RunConfig,
 ) -> Result<i32, String> {
+    let backend = backend.into();
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
     let images: Vec<(String, Arc<Module>)> = m
@@ -799,26 +800,26 @@ fn run_detached_on(
     }
 }
 
-/// #1863: a v1 record spawns a child image into a window of its own, and the args payload arrives
+/// #1863: a spawn record spawns a child image into a window of its own, and the args payload arrives
 /// at the child's `module_args_base` — identically on every tier.
 #[test]
-fn a_v1_record_spawns_a_child_detached_with_an_args_payload() {
+fn a_record_spawns_a_child_detached_with_an_args_payload() {
     let src = detached_record_program();
     for b in BACKENDS {
         assert_eq!(run_detached(b, &src).expect("run"), 142, "{b:?}");
     }
 }
 
-/// A v1 record whose `size_log2` is `0` asks for the module's declared window — a spawner holding a
+/// A spawn record whose `size_log2` is `0` asks for the module's declared window — a spawner holding a
 /// module it did not build need not know its size. A nonzero size that is not the declared memory
 /// is still refused, probeably: the root returns 7 when the spawn returns a negative handle.
 #[test]
-fn a_v1_record_with_size_zero_gets_the_declared_window() {
+fn a_record_with_size_zero_gets_the_declared_window() {
     let base = detached_record_program();
     // size_log2 0 | pager u32::MAX
     let src = base.replace(
-        "  vr16 = i64.const -4294967279\n",
-        "  vr16 = i64.const -4294967296\n",
+        "  vr0 = i64.const -4294967279\n",
+        "  vr0 = i64.const -4294967296\n",
     );
     assert!(src.contains("-4294967296"), "the rewrite must apply");
     for b in BACKENDS {
@@ -827,8 +828,8 @@ fn a_v1_record_with_size_zero_gets_the_declared_window() {
     // size_log2 16 against a declared 17: refused before any join.
     let wrong = base
         .replace(
-            "  vr16 = i64.const -4294967279\n",
-            "  vr16 = i64.const -4294967280\n",
+            "  vr0 = i64.const -4294967279\n",
+            "  vr0 = i64.const -4294967280\n",
         )
         .replace(
             "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
@@ -840,38 +841,20 @@ fn a_v1_record_with_size_zero_gets_the_declared_window() {
     }
 }
 
-/// #1863: a record is version 1 with its reserved words zero — `off` at 8, where the retired carve
-/// offset sat, and the word after the region handle at 76. Anything else is malformed, not some other
-/// spawn, and traps on every tier (a version-0 record is `carve_spawn_refused.rs`'s).
+/// A record's padding word, after the region handle, is zero (#2091). Anything else is malformed,
+/// not some other spawn, and traps on every tier.
 #[test]
-fn a_malformed_v1_record_fails_closed() {
-    for (what, from, to) in [
-        (
-            "an offset",
-            "  vr8 = i64.const 0\n",
-            "  vr8 = i64.const 65536\n",
-        ),
-        (
-            "version 2",
-            "  vr0 = i64.const 1\n",
-            "  vr0 = i64.const 2\n",
-        ),
-        (
-            "a nonzero word 76",
-            "  vr72 = i64.const 4294967295\n",
-            "  vr72 = i64.const -1\n",
-        ),
-    ] {
-        let src = detached_record_program().replace(from, to);
-        assert!(src.contains(to), "{what}: the rewrite must apply");
-        for b in BACKENDS {
-            let e = run_detached(b, &src).expect_err("a malformed record is refused");
-            assert!(e.contains("CapFault"), "{what} on {b:?}: {e}");
-        }
+fn a_record_with_nonzero_padding_fails_closed() {
+    let (from, to) = ("  vr48 = i64.const 4294967295\n", "  vr48 = i64.const -1\n");
+    let src = detached_record_program().replace(from, to);
+    assert!(src.contains(to), "the rewrite must apply");
+    for b in BACKENDS {
+        let e = run_detached(b, &src).expect_err("a malformed record is refused");
+        assert!(e.contains("CapFault"), "{b:?}: {e}");
     }
 }
 
-/// A root that serves its own detached demand child: the v1 record names impl export 0 as the
+/// A root that serves its own detached demand child: the spawn record names impl export 0 as the
 /// pager, and the root waits in `svc.wait` before it joins the child, then returns `byte + serves *
 /// 1000 + status * 1_000_000`, the join's status the wire code of a trap the child ended in
 /// (#2066). The child (func 1) returns the byte at `fault`, its first touch of that page. The pager
@@ -885,7 +868,7 @@ fn detached_pager_program_at(fault: u64) -> String {
              export 0 interface \"pager\" 1 { page: 2 }\n",
         )
         // pager = impl export 0
-        .replace("  vr16 = i64.const -4294967279\n", "  vr16 = i64.const 17\n")
+        .replace("  vr0 = i64.const -4294967279\n", "  vr0 = i64.const 17\n")
         .replace(
             "  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vc = i32.wrap_i64 vj\n",
             "  vz = i32.const 0\n  vs = svc.wait vz\n  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)\n  vk1 = i64.const 1000\n  vsk = i64.mul vs vk1\n  vt = i64.add vj vsk\n  vk2 = i64.const 1000000\n  vstk = i64.mul vj_st vk2\n  vt2 = i64.add vt vstk\n  vc = i32.wrap_i64 vt2\n",
@@ -907,10 +890,14 @@ block 0 (vaddr: i64) {
 ";
     assert!(
         src.contains("interface \"pager\"")
-            && src.contains("vr16 = i64.const 17\n")
+            && src.contains("vr0 = i64.const 17\n")
             && src.contains("svc.wait")
             && src.contains(&format!("va = i64.const {fault}\n")),
         "the rewrites must apply"
+    );
+    assert!(
+        runs_on_bytecode(&src),
+        "the cooperative driver pages its child itself (#2164)"
     );
     src
 }
@@ -922,7 +909,7 @@ block 0 (vaddr: i64) {
 #[test]
 fn a_detached_demand_child_is_served_by_a_pager_that_cannot_address_it() {
     let src = detached_pager_program_at(20000);
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
     }
 }
@@ -937,7 +924,7 @@ fn a_paged_child_attests_its_window_exposed() {
         "  vz = i32.const 0\n  vat = call.cap 4294967295 4 () -> (i64) vz ()\n  return vat\n",
     );
     assert!(src.contains("return vat\n"), "the rewrite must apply");
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 1257, "{b:?}");
     }
 }
@@ -962,7 +949,7 @@ fn a_pager_that_is_not_a_page_export_refuses_the_spawn() {
             !src.contains("interface { page: 0 }"),
             "the rewrite must apply"
         );
-        for b in BACKENDS {
+        for b in DRIVERS {
             let r = run_detached(b, &src);
             assert!(
                 matches!(&r, Err(e) if e.contains("CapFault")),
@@ -985,7 +972,7 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
         handoff: false,
         ..RunConfig::default()
     };
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(
             run_detached_with(b, &src, 1 << 20, cfg()).expect("run"),
             1077,
@@ -999,16 +986,80 @@ fn a_page_fault_wakes_a_parked_pager_without_handoff() {
 /// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
 /// no-progress answer) so its `join` answers the child's `MEMORY_FAULT` — the run ends instead of
 /// hanging.
+///
+/// #2469 — a bulk op on the guard is fatal too: a `mem.copy` from it, a `mem.fill` of it. Their span
+/// check had no guard arm, so it recorded a recoverable fault, the pager was asked for the guard
+/// page, and its supply mapped the guard read-write.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
-    let src = detached_pager_program_at(0);
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in BACKENDS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            faulted,
-            "{b:?}: a NULL fault in a paged child is fatal to it"
+    for (what, access) in [
+        ("a load", None),
+        (
+            "a copy's source",
+            Some("  vd = i64.const 32768\n  vn = i64.const 4\n  mem.copy vd va vn\n  vb = i32.load8_u vd\n"),
+        ),
+        (
+            "a fill",
+            Some("  vf = i32.const 5\n  vn = i64.const 4\n  mem.fill va vf vn\n  vb = i32.load8_u va\n"),
+        ),
+    ] {
+        let mut src = detached_pager_program_at(0);
+        if let Some(access) = access {
+            src = src.replace("  vb = i32.load8_u va\n", access);
+            assert!(src.contains(access), "the rewrite must apply");
+        }
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                faulted,
+                "{b:?}: {what} of the NULL guard in a paged child is fatal to it"
+            );
+        }
+    }
+}
+
+/// #2469 — an access that crosses from a supplied page into one not yet supplied faults on the page
+/// it needs. The child touches 32765, which brings in the page below 32768 (a 16 KiB boundary, so a
+/// page boundary on any host), then reads a word across it: a scalar load, a `mem.copy` whose source
+/// crosses, a `mem.fill` whose destination does. The fault used to be recorded where the access
+/// starts, in the page already supplied: the pager supplied that page again, and the child faulted
+/// again. The root serves both faults and returns `child + 2 * 1000`. The child returns the byte it
+/// touched, 77, plus the word: the pager's 77 lands at 32768, the word's third byte.
+#[test]
+fn a_paged_access_that_crosses_into_an_unsupplied_page_faults_on_that_page() {
+    let read = "  vx = i64.const 32766\n  vw = i32.load vx\n";
+    let copy = "  vd = i64.const 32700\n  vsrc = i64.const 32760\n  vn = i64.const 16\n  \
+                mem.copy vd vsrc vn\n  vx = i64.const 32706\n  vw = i32.load vx\n";
+    let fill = "  vd = i64.const 32760\n  vf = i32.const 5\n  vn = i64.const 16\n  \
+                mem.fill vd vf vn\n  vx = i64.const 32766\n  vw = i32.load vx\n";
+    for (what, access, word) in [
+        ("a load", read, 77 << 16),
+        ("a copy's source", copy, 77 << 16),
+        ("a fill", fill, 0x0505_0505),
+    ] {
+        let src = detached_pager_program_at(32765)
+            .replace(
+                "  vs = svc.wait vz\n",
+                "  vs1 = svc.wait vz\n  vs2 = svc.wait vz\n  vs = i64.add vs1 vs2\n",
+            )
+            .replace(
+                "  return vbw\n",
+                &format!(
+                    "{access}  vw64 = i64.extend_i32_u vw\n  vr = i64.add vbw vw64\n  return vr\n"
+                ),
+            );
+        assert!(
+            src.contains("vs2 = svc.wait") && src.contains(access),
+            "the rewrites must apply"
         );
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                77 + word + 2000,
+                "{what} on {b:?}"
+            );
+        }
     }
 }
 
@@ -1020,7 +1071,7 @@ fn pager_child_that_never_faults_releases_the_parked_pager() {
     let src =
         detached_pager_program_at(0).replace("  vb = i32.load8_u va\n", "  vb = i32.const 5\n");
     assert!(src.contains("vb = i32.const 5\n"), "the rewrite must apply");
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
     }
 }
@@ -1039,7 +1090,7 @@ fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
         src.contains("vb = i32.const 5\n") && src.contains("(vch)\n  vs = svc.wait"),
         "the rewrites must apply"
     );
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(run_detached(b, &src).expect("run"), 5, "{b:?}");
     }
 }
@@ -1056,7 +1107,7 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
     );
     assert!(src.contains("return vbad"), "the rewrite must apply");
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000 + 1000;
-    for b in BACKENDS {
+    for b in DRIVERS {
         assert_eq!(
             run_detached(b, &src).expect("run"),
             faulted,
@@ -1095,7 +1146,7 @@ fn three_generations(child_ceiling: i64) -> String {
     let r1 = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -1117,12 +1168,12 @@ block 0 () {{
   all = i64.const -1
   cap = i64.const {child_ceiling}
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vroot (all, cap, all)
-  bf = i64.const 17436
+  bf = i64.const 17420
   i32.store bf vsub
   cp = i64.const 16448
   cl = i64.const 5
   vc1 = self.resolve cp cl
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vc1
   gp = i64.const 16456
   gl = i64.const 10
@@ -1142,12 +1193,12 @@ block 0 (va: i64) {{
   np = i64.const 16400
   nl = i64.const 6
   vb = self.resolve np nl
-  bf = i64.const 17532
+  bf = i64.const 17516
   i32.store bf vb
   gp = i64.const 16456
   gl = i64.const 10
   vg = self.resolve gp gl
-  mf = i64.const 17528
+  mf = i64.const 17512
   i32.store mf vg
   rp = i64.const 17504
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -1174,7 +1225,7 @@ block 0 (va: i64) {{
 }}
 ",
         r1 = rec::segment(17408, &r1),
-        r2 = rec::segment(17504, &SpawnRec::v1()),
+        r2 = rec::segment(17504, &SpawnRec::default()),
         grandchild_grant = rec::grant("g", 16640, 16456, 10, "vc2"),
     )
 }
@@ -1214,12 +1265,12 @@ block 0 () {{
   f = i64.const -1
   m = i64.const 131072
   vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vbud (f, m, f)
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vsub
   mp = i64.const 16448
   ml = i64.const 5
   vmod = self.resolve mp ml
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -1269,7 +1320,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1()),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 
@@ -1305,12 +1356,12 @@ block 0 () {{
   f = i64.const -1
   c = i64.const 65536
   vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i32) vbud (f, f, f, c)
-  rb = i64.const 17436
+  rb = i64.const 17420
   i32.store rb vsub
   mp = i64.const 16448
   ml = i64.const 5
   vmod = self.resolve mp ml
-  mf = i64.const 17432
+  mf = i64.const 17416
   i32.store mf vmod
   rp = i64.const 17408
   vch = call.cap 6 17 (i64) -> (i32) vinst (rp)
@@ -1345,7 +1396,7 @@ block 0 (vinst: i64, vas64: i64) {{
   }}
 }}
 ",
-        rec = rec::segment(17408, &SpawnRec::v1()),
+        rec = rec::segment(17408, &SpawnRec::default()),
     )
 }
 

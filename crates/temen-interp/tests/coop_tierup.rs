@@ -684,7 +684,7 @@ fn coop_tierup_live_futex_matches_pure_interp() {
 // to the eligible leaf both surface, and the run still matches the pure-interp oracle.
 //
 // func 0 (root; args = its Instantiator, a `Budget` and the child's `Module`): spawns a child
-// detached, by the v1 record appended at 17408 (a window of its own, the module's declared memory),
+// detached, by the spawn record appended at 17408 (a window of its own, the module's declared memory),
 // joins it, calls the eligible leaf f3 itself, and sums. The child runs func 1's child image
 // (#2248). func 1 (child entry): calls the leaf directly, thread.spawns f2 INSIDE the child env (the
 // thread-arm inheritance) and joins it. func 2 (child-env worker): calls the leaf. func 3: the pure
@@ -693,9 +693,9 @@ const SRC_CHILD_ENV: &str = r#"
 memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v1
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v2
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -852,7 +852,7 @@ fn coop_tierup_child_env_tasks_tier_up() {
     ] {
         let src = format!(
             "{SRC_CHILD_ENV}{}",
-            rec::segment(17408, &temen_ir::SpawnRec::v1())
+            rec::segment(17408, &temen_ir::SpawnRec::default())
         );
         let m = parse_module(&src).unwrap();
         temen_verify::verify_module(&m).expect("verify");
@@ -897,9 +897,9 @@ fn coop_tierup_offers_a_granted_module_once() {
 memory 17
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb v1
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm v2
   vrp = i64.const 17408
   vh1 = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -927,7 +927,10 @@ block 0 (vx: i64) {
   }
 }
 "#;
-    let src = format!("{SRC}{}", rec::segment(17408, &temen_ir::SpawnRec::v1()));
+    let src = format!(
+        "{SRC}{}",
+        rec::segment(17408, &temen_ir::SpawnRec::default())
+    );
     let m = parse_module(&src).unwrap();
     temen_verify::verify_module(&m).expect("verify");
     let image = temen_ir::child_image_at(&m, 1).expect("child image");
@@ -966,7 +969,7 @@ block 0 (vx: i64) {
 // #816 item 3 — a **fork twin** tiers up over its own private flat window. The guest topology is
 // the proven browser fork probe (`FORK_TWIN`, FORK.md §9): a manager (f0) spawns a server (f1,
 // handlers f2 = `clone_caller`, f3 = `reap`) and a guest (f4) as detached §14 children, through
-// the v1 records `fork_twin_src` lays at 17792 and 17664; the guest calls
+// the spawn records `fork_twin_src` lays at 17792 and 17664; the guest calls
 // `svc.fork`, the servicer duplicates it (`Mem::fork_private` + `Host::fork_powerbox`), and BOTH
 // copies — the original (reply 100) and the twin (reply 200) — call the eligible leaf f5 on their
 // reply before writing the result to the shared stdout; the original then `svc.wait`s the twin.
@@ -983,9 +986,9 @@ data 16694 "o"
 func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32, vsrv: i32) {
   q1a0 = i64.const 17792
-  q1b = i64.const 17820
+  q1b = i64.const 17804
   i32.store q1b vbud
-  q1m = i64.const 17816
+  q1m = i64.const 17800
   i32.store q1m vsrv
   vs = call.cap 6 17 (i64) -> (i32) v0 (q1a0)
   vz0 = i64.const 0
@@ -1007,9 +1010,9 @@ block 0 (v0: i32, vout: i32, vbud: i32, vmod: i32, vsrv: i32) {
   va5 = i64.const 16664
   i32.store va5 vout
   q2a0 = i64.const 17664
-  q2b = i64.const 17692
+  q2b = i64.const 17676
   i32.store q2b vbud
-  q2m = i64.const 17688
+  q2m = i64.const 17672
   i32.store q2m vmod
   vc = call.cap 6 17 (i64) -> (i32) v0 (q2a0)
   vjc_st, vjc = call.cap 6 1 (i32) -> (i64, i64) v0 (vc)
@@ -1104,14 +1107,14 @@ fn fork_twin_src() -> String {
         &temen_ir::SpawnRec {
             grants_ptr: 16640,
             grants_n: 2,
-            ..temen_ir::SpawnRec::v1()
+            ..temen_ir::SpawnRec::default()
         },
     );
     SRC_FORK_TWIN
         .replace("@S0@", "16896")
         .replace("@S8@", "16904")
         .replace("@S16@", "16912")
-        + &rec::segment(17792, &temen_ir::SpawnRec::v1())
+        + &rec::segment(17792, &temen_ir::SpawnRec::default())
         + &guest
 }
 
@@ -1391,11 +1394,11 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
     let fork: HostProcFork = Arc::new(move |_pid| {
         let exited = Arc::clone(&exited);
         let source: Arc<dyn SignalSource + Send + Sync> = Arc::new(ParkDoor::default());
-        ForkedProc {
+        Some(ForkedProc {
             signal: Some((source, Arc::default())),
             exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
             ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![ENOSYS])), CapState::Stateless)
-        }
+        })
     });
     host.set_signal_source(door, Arc::default());
     host.grant_host_proc_forkable(doors, fork, CapState::Stateless)

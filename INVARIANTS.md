@@ -81,8 +81,8 @@ spawn refused after its admission charges nothing (#1975). The bytecode drivers 
 fuel is charged up the chain like the window: a domain's vCPUs draw it in chunks from the node that
 pays for the domain (the run's root node, or the budget named in a detached spawn), each draw charged
 to every level, and a vCPU that ends or freezes refunds the unburned rest of its chunk. So no subtree
-burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (a nonzero
-one in a v1 record traps `CapFault`). The run's own node carries the embedder's fuel limit
+burns more than any ancestor's fuel ceiling, and a spawn's per-child fuel `quota` is retired (the
+spawn record has no field for one, #2091). The run's own node carries the embedder's fuel limit
 (`Limits.fuel`): it bounds every draw, but a guest's `read`, `split` and `transfer` bound fuel by the
 budgets below it, since what is left of it differs by engine (each draws on its own schedule). Every
 host grants it, the default fuel when it names none: the CLI, the C API, the browser, and the JIT's
@@ -121,11 +121,16 @@ region when it closes its handle (`SharedRegion.close`, #2358), and a domain a b
 of the rest when it ends, while a run's root keeps its own for its embedder (#2111).
 Host memory a guest grows through a capability (a file's bytes; a pipe's, socket's or captured
 stream's queue; a job's output; a process's environment, #2345; a table of names, descriptors,
-listings or mappings) is `channel` of
+listings or mappings; a POSIX process's heap records, arguments, working directory and `getenv`
+copies, #2373) is
+`channel` of
 the node of the domain the capability's state was granted to, and every ancestor, plus one `maps` for
 each buffer of 128 KiB or more: charged before it is allocated, refused with an errno past a ceiling
 (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed back as it shrinks or
-goes (#2306). A descriptor a guest causes holds one of the process's pool over its soft
+goes (#2306). A fork twin's copy of that state, or a spawned child's, is the guest's own act: it is
+charged with the fork, within every limit, and a provider with no room for it refuses the fork
+(`-EAGAIN`) or the re-grant, having registered nothing (#2373, #2428). A descriptor a guest causes
+holds one of the process's pool over its soft
 `RLIMIT_NOFILE` while it is open, and is refused with `-EMFILE` past it. A stack an engine keeps in
 host memory (the bytecode engine's register file) is `mem` of its vCPU's domain past the
 `FIBER_STACK` the vCPU's own charge pays for, plus its one `maps` from 128 KiB, and growing past a
@@ -349,18 +354,19 @@ detached window, and the carve path is deleted** — on every engine, with its s
 host-side machinery, and the docs that describe it. No live-aliasing fix is built for carves, and no
 new feature lands on the carve path. **It is gone (#1867, 2026-10-15):**
 
-- **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 and the version-0 record trap
-  `CapFault` on every engine (`carve_spawn_refused.rs`), so #1814's divergence cannot arise. The
-  nested freeze and thaw went with it (slice 3), so no artifact carries a carve child, and every
-  window starts at 0 of its own reservation.
-- **The one spawn form is the op-17 record at version 1** (owner, 2026-09-29, #1863): placed
-  detached, with the spawn-time args payload and the pre-mapped region as fields. The v0 carve record
-  is retired (it traps `CapFault`), and so is op 15's positional form (#2067): every engine traps it
-  `CapFault`, and no producer emits it. The version word, always 1 now, is that migration's
-  scaffolding (#2091). The window is always the child module's
-  declared memory; `size_log2 = 0` asks for exactly that (owner, 2026-09-29), so a spawner holding a
-  module it did not build need not know its size — any other value must equal it. A query for the
-  size is #1908; growth past it spends the same budget as the pages commit (#1909, ruling R2).
+- **The carve spawn is gone** (#1867 slice 2): ops 0, 5 and 13 trap `CapFault` on every engine
+  (`carve_spawn_refused.rs`), and the carve record went with the record's version word (#2091), so
+  #1814's divergence cannot arise. The nested freeze and thaw went with it (slice 3), so no artifact
+  carries a carve child, and every window starts at 0 of its own reservation.
+- **The one spawn form is the op-17 record** (owner, 2026-09-29, #1863): placed detached, with the
+  spawn-time args payload and the pre-mapped region as fields. The carve record is retired, and so
+  is op 15's positional form (#2067): every engine traps it `CapFault`, and no producer emits it.
+  The record carries no version word: the migration's tag was its scaffolding, and #2091 retired it
+  by repacking the record (owner, 2026-10-15), so a layout change moves every producer at once. The
+  window is always the child module's declared memory; `size_log2 = 0` asks for exactly that
+  (owner, 2026-09-29), so a spawner holding a module it did not build need not know its size — any
+  other value must equal it. A query for the size is #1908; growth past it spends the same budget as
+  the pages commit (#1909, ruling R2).
 - **A child runs a module, never a function of its spawner** (owner, 2026-10-08, #2219): the
   record's `module` is a `Module` handle the spawner holds, and the child starts at that module's
   function 0, its child bootstrap. `module = -1`, which once named the spawner's own program, is a

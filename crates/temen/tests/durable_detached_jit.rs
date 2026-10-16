@@ -1,5 +1,5 @@
 //! #1361 step 4 — a durable parent frozen on the **JIT** while its detached child (spawned through a
-//! v1 record) is live, through the embedder's path (`temen_run::jit_cap_run`) and the §12 codec: the
+//! spawn record) is live, through the embedder's path (`temen_run::jit_cap_run`) and the §12 codec: the
 //! freeze rings the child's own freeze word, the child unwinds in its own window, and the harvest
 //! puts its window and powerbox on the `Host` as a `CapturedDetached` — the interpreter's form, so
 //! one artifact serves both engines. The thaw re-launches the child at its join slot under
@@ -24,14 +24,14 @@ use temen_jit::{JitError, JitOutcome};
 const ARENA: ShadowArena = ShadowArena::new(16448, 65536);
 const PARENT_LOG2: u8 = 18;
 
-/// Spawn the child detached through the v1 record at 65536 ([`parent`] lays it), its module and
+/// Spawn the child detached through the spawn record at 65536 ([`parent`] lays it), its module and
 /// budget stored there, join it, return what it returns.
 const PARENT: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -41,12 +41,12 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 ";
 
-/// A v1 spawn record at `at` for a 128 KiB child, as a `data` line: the spawner stores the module and
+/// A spawn record at `at` for a 128 KiB child, as a `data` line: the spawner stores the module and
 /// the budget in it before the spawn.
 fn spawn_rec(at: u64) -> String {
     let spawn = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     rec::segment(at, &spawn)
 }
@@ -118,9 +118,9 @@ const SELF_SPAWN: &str = "memory 17 shadow 16448 65536
 export 0 func \"_child\" 1
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v2
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v1
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -373,7 +373,7 @@ fn an_interpreter_frozen_detached_child_thaws_on_the_jit() {
 /// `v2` a `Budget` whose `spawn` room falls to 2 once the tree has settled ([`nest_powerbox`]),
 /// `v3` freeze authority over detached progeny, `v4` a settle time in ms, `v5` its stdout, and
 /// `v6`, `v7` the programs of the child's own children ([`Nest`]). It spawns `NEST` detached through
-/// the v1 record at 70144 ([`nest_root`] lays it) with four named grants (#2018): the authority as
+/// the spawn record at 70144 ([`nest_root`] lays it) with four named grants (#2018): the authority as
 /// `"freeze"`, so the durable child may spawn in turn, `v6` and `v7` as `"nest"` and `"nest2"`, and
 /// its stdout as `"stdout"` (#2054). It
 /// waits until the budget's `spawn` room shows the tree settled, or the child has ended, parking
@@ -420,9 +420,9 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32, v6: i32, v7: i32)
   i32.store vr10 vl3
   vr11 = i64.const 70088
   i32.store vr11 v5
-  vrm = i64.const 70168
+  vrm = i64.const 70152
   i32.store vrm v1
-  vrb = i64.const 70172
+  vrb = i64.const 70156
   i32.store vrb v2
   vrp = i64.const 70144
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -476,7 +476,7 @@ fn nest_root() -> String {
         size_log2: 17,
         grants_ptr: 70032,
         grants_n: 4,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{NEST_ROOT}{}", rec::segment(70144, &spawn))
 }
@@ -497,9 +497,9 @@ block 0 (v0: i64, v1: i64) {
   vmp = i64.const 90120
   vml = i64.const 4
   vm = self.resolve vmp vml
-  vrm = i64.const 90264
+  vrm = i64.const 90248
   i32.store vrm vm
-  vrb = i64.const 90268
+  vrb = i64.const 90252
   i32.store vrb vb
   vrp = i64.const 90240
   vinst = i32.wrap_i64 v0
@@ -719,9 +719,9 @@ block 0 (v0: i64, v1: i64) {
   vgh = i64.const 90152
   vo64 = i64.extend_i32_u vo
   i64.store vgh vo64
-  vrm = i64.const 90264
+  vrm = i64.const 90248
   i32.store vrm vm
-  vrb = i64.const 90268
+  vrb = i64.const 90252
   i32.store vrb vb
   vrp = i64.const 90240
   vinst = i32.wrap_i64 v0
@@ -759,7 +759,7 @@ fn print_grand_nest() -> String {
         size_log2: 17,
         grants_ptr: 90144,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{PRINT_GRAND_NEST}{}", rec::segment(90240, &spawn))
 }
@@ -788,9 +788,9 @@ block 0 (v0: i64, v1: i64) {
   vsp = i64.const 90128
   vsl = i64.const 5
   vs = self.resolve vsp vsl
-  vqm = i64.const 90264
+  vqm = i64.const 90248
   i32.store vqm vm
-  vqb = i64.const 90268
+  vqb = i64.const 90252
   i32.store vqb vb
   vqr = i64.const 90240
   vinst = i32.wrap_i64 v0
@@ -808,9 +808,9 @@ block 1 (vi: i32, vb1: i32, vs1h: i32, vq1: i32) {
   br_if vended 2(vi, vb1, vs1h, vq1) 1(vi, vb1, vs1h, vq1)
 }
 block 2 (vi2: i32, vb2: i32, vs2h: i32, vq2: i32) {
-  vsm = i64.const 90360
+  vsm = i64.const 90344
   i32.store vsm vs2h
-  vsb = i64.const 90364
+  vsb = i64.const 90348
   i32.store vsb vb2
   vsr = i64.const 90336
   vs1 = call.cap 6 17 (i64) -> (i32) vi2 (vsr)

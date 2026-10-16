@@ -8,7 +8,7 @@
 //! - the interpreter loop a declined child runs on (`plan::drive_op13`) indexed its table with the
 //!   guest's handle, so an out-of-range handle panicked the host.
 //!
-//! The driver spawns detached (op 17 v1); the carve spawn this loop also served retired (#1289).
+//! The driver spawns detached (op 17); the carve spawn this loop also served retired (#1289).
 //!
 //! Both then resolved through `temen_interp::take_child`; now the engine does, for every `Vcpu`
 //! host (#1736): the loops keep no child table. The loop reports a trap as `OP13JIT_TRAP` without
