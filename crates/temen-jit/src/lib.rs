@@ -5693,13 +5693,14 @@ fn compile_verified(
     ctx.verify(isa)
         .map_err(|e| format!("CLIF verifier, after Cranelift's passes: {e}"))?;
     let code = isa
-        .compile_function(&ctx.func, &ctx.domtree, false, &mut ctrl)
+        .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
     Ok(code.apply_params(&ctx.func.params))
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
-/// Every function the JIT defines outside [`define_funcs`] (the trampolines) comes through here.
+/// Every function the JIT defines outside [`define_funcs`] (the trampolines, and `fuel`'s refill
+/// trampoline) comes through here.
 fn define_verified(
     module: &mut JITModule,
     id: FuncId,
