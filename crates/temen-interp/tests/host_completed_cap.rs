@@ -704,6 +704,7 @@ fn a_host_completed_call_in_a_tierup_region_declines() {
         root: ProgramEmit {
             eligible: Arc::from([false, true]),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

@@ -230,6 +230,7 @@ fn reserved_frame(m: &temen_ir::Module, emitted: Option<Emitted>, probe: i64) ->
         root: ProgramEmit {
             eligible: Arc::clone(eligible),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

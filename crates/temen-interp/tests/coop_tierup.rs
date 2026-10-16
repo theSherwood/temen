@@ -90,6 +90,7 @@ fn coop_tierup_run(
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -369,6 +370,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -485,6 +487,7 @@ fn a_bounce_polls_a_fiber_the_pump_parked() {
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -843,6 +846,7 @@ fn coop_tierup_child_env_tasks_tier_up() {
     let leaf = || ProgramEmit {
         eligible: std::sync::Arc::from(vec![false, false, false, true]),
         page_checked: false,
+        ..Default::default()
     };
     // `(child, the image's emit, the programs the tier-ups name)`. The child's two calls surface
     // first: the root is parked on the join.
@@ -945,6 +949,7 @@ block 0 (vx: i64) {
         let (modules, offered) = modules_emitter(Some(ProgramEmit {
             eligible: std::sync::Arc::from(eligible),
             page_checked: false,
+            ..Default::default()
         }));
         let tierup = TierUpConfig {
             root: ProgramEmit::default(),
@@ -1147,6 +1152,7 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     let leaf = ProgramEmit {
         eligible: std::sync::Arc::from(vec![false, false, false, false, false, true]),
         page_checked: false,
+        ..Default::default()
     };
     let (modules, _) = modules_emitter(Some(leaf.clone()));
     let (got, got_out, mut events) = fork_twin_run(
@@ -1332,6 +1338,7 @@ fn root_fork_run(
         root: ProgramEmit {
             eligible: Arc::from(vec![false, true, false]),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -1479,6 +1486,7 @@ block 0 (vx: i64) {
                     root: ProgramEmit {
                         eligible: std::sync::Arc::clone(&eligible),
                         page_checked: false,
+                        ..Default::default()
                     },
                     leaf: None,
                     modules: None,

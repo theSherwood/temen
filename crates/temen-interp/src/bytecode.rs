@@ -1069,9 +1069,9 @@ mod frame_bound_tests {
         assert_eq!(v.open_frame(MAX_REG_SLOTS + 1), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs, "nothing allocated");
         assert_eq!(v.open_frame(regs + 1), Ok(()), "under both bounds");
-        v.stack.resize(MAX_FRAMES - 1, (0, 0, 0, 0, 0));
+        v.stack.resize(MAX_FRAMES - 1, (0, 0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 1), Ok(()), "the last frame opens");
-        v.stack.push((0, 0, 0, 0, 0));
+        v.stack.push((0, 0, 0, 0, 0, 0));
         assert_eq!(v.open_frame(regs + 2), Err(Trap::StackOverflow));
         assert_eq!(v.regs.len(), regs + 1, "nothing allocated");
         // A tail call pushes no frame, so only the register file's bound applies (#2082).
@@ -3400,7 +3400,7 @@ fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     // Each suspended caller resumes at `call_pc + 1` (a call is an instruction, never a terminator),
     // so its call op sits at `resume_pc - 1`; report `inst + 1`, mirroring the tree-walker advancing a
     // caller's `inst` past the call before descending.
-    for &(module, prog, _base, resume_pc, _ret) in vm.stack.iter().rev() {
+    for &(module, prog, _base, resume_pc, ..) in vm.stack.iter().rev() {
         let call_pc = resume_pc.wrapping_sub(1);
         let Some(cm) = source.get(module) else {
             continue;
@@ -6564,7 +6564,7 @@ impl<'a> FrameReader<'a> {
             return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
         }
         let n = self.vm.stack.len();
-        let &(module, f, base, resume_pc, _) = self.vm.stack.get(n.checked_sub(depth)?)?;
+        let &(module, f, base, resume_pc, ..) = self.vm.stack.get(n.checked_sub(depth)?)?;
         let cm = self.source.get(module)?;
         let (block, inst) = cm
             .progs
@@ -11431,7 +11431,7 @@ fn freeze_drive(
 /// host data out by construction.
 fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64)) {
     let frames = std::iter::once((vm.module, vm.cur, vm.base))
-        .chain(vm.stack.iter().map(|&(m, p, b, _, _)| (m, p, b)));
+        .chain(vm.stack.iter().map(|&(m, p, b, ..)| (m, p, b)));
     for (module, prog, base) in frames {
         let Some(c) = source.get(module) else {
             continue;
@@ -14854,8 +14854,7 @@ impl SchedCore {
                     if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
                         || !child_runs_emit(program, &twin_host)
                     {
-                        twin_vt.active.jit_eligible = None;
-                        twin_vt.active.jit_page_checked = false;
+                        twin_vt.active.tier_down();
                     }
                     // The twin is its own domain: a fresh env over the private window + duplicated
                     // powerbox, its own dispatch table seeded with the caller's installs (#1297),
@@ -15149,8 +15148,7 @@ impl SchedCore {
                         if !tierup_servable(twin_mem.as_ref(), mem.as_ref())
                             || !child_runs_emit(program, &twin_host)
                         {
-                            twin_vt.active.jit_eligible = None;
-                            twin_vt.active.jit_page_checked = false;
+                            twin_vt.active.tier_down();
                         }
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
@@ -15526,11 +15524,25 @@ pub struct TierUpConfig {
 /// What the host emitted of a program for its tasks to tier up into (#926 slice 2).
 #[derive(Clone, Default)]
 pub struct ProgramEmit {
-    /// Per-function eligibility (index = function). `true` ⇒ a direct call tiers up.
+    /// Per-function eligibility (index = function). `true` ⇒ a direct call may tier up, once
+    /// [`Self::hot`] says it is worth the crossing.
     pub eligible: std::sync::Arc<[bool]>,
     /// #750 paged tier-up: the emitted region carries a per-access page check, so an
     /// unrepresentable window surfaces with the reserved size instead of declining.
     pub page_checked: bool,
+    /// #2474 — when an eligible function's calls start to tier up.
+    pub hot: Hotness,
+}
+
+/// #2474 — when a task's calls to an eligible function tier up: once its interpreted calls have
+/// done `per_call` work on average over `window` calls in a row. A crossing into emitted code costs
+/// a fixed amount, which only a call doing enough work repays. Work is the fuel a call burns, its
+/// taken back edges and calls, its callees' included ([`Vm::work`]). Each task keeps its own count.
+/// The default, `per_call` 0, tiers up every eligible call, the first included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hotness {
+    pub per_call: u64,
+    pub window: u32,
 }
 
 /// The host's emitter for granted modules ([`TierUpConfig::modules`]). Offered one
@@ -16653,13 +16665,11 @@ impl ThreadPlatform {
 /// wasm.
 #[derive(Clone)]
 pub struct ThreadTier {
-    /// Per-module-0-function eligibility, as the pump's root emit ([`ProgramEmit::eligible`]): a
-    /// module-0 task's direct call to an eligible function runs on the emitted tier.
-    pub eligible: std::sync::Arc<[bool]>,
-    /// The emitted code checks each access against a page-state table (#750), as the pump's
-    /// ([`TierUpConfig::page_checked`]): each call carries its thread's
+    /// The run's own program's emit, as the pump's ([`TierUpConfig::root`]): a module-0 task's
+    /// direct call to a function it tiers up runs on the emitted tier. Where its code checks each
+    /// access against a page-state table (#750), each call carries its thread's
     /// ([`EmittedCall::pagestate`]).
-    pub page_checked: bool,
+    pub root: ProgramEmit,
     /// The words of the spill stack each thread keeps for its emitted frames to push their live words
     /// to (#1627), as the coop driver's spilling emit does; `0` when the emit does not spill. A bounce
     /// under a tier-up hands the interpreter's `gc.roots` what the frames beneath it pushed.
@@ -16916,10 +16926,7 @@ fn drive_threads(
     // The platform's tier emits the run's own program, and each granted module a child runs
     // (#1414 ED-2).
     let programs = ProgramEmits {
-        root: platform.tier.as_ref().map(|t| ProgramEmit {
-            eligible: std::sync::Arc::clone(&t.eligible),
-            page_checked: t.page_checked,
-        }),
+        root: platform.tier.as_ref().map(|t| t.root.clone()),
         modules: platform.tier.as_ref().and_then(|t| t.modules.clone()),
         granted: Vec::new(),
     };
@@ -17266,7 +17273,7 @@ impl ThreadRun {
             results: &inv.results,
         };
         let mut cell = fibers.cell();
-        let at = (inv.mapped, tier.page_checked);
+        let at = (inv.mapped, tier.root.page_checked);
         let vals = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
@@ -18381,10 +18388,10 @@ struct Vm {
     regs: Vec<Reg>,
     /// #2336 — what [`Self::regs`]' room holds of its vCPU's domain's node.
     room: RegsRoom,
-    /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot)`.
-    /// `module` is carried so a cross-module `call.dyn` (into an installed §22 unit) returns to
-    /// the caller's module.
-    stack: Vec<(usize, usize, usize, usize, usize)>,
+    /// Suspended caller activations: `(module, prog, base, resume pc, absolute first result slot,
+    /// the caller's `entered`)`. `module` is carried so a cross-module `call.dyn` (into an installed
+    /// §22 unit) returns to the caller's module.
+    stack: Vec<(usize, usize, usize, usize, usize, u64)>,
     /// The running activation's module (index into `Domain::mods`; 0 = primary), function index,
     /// window base, and op cursor.
     module: usize,
@@ -18418,6 +18425,14 @@ struct Vm {
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
     /// a table-admitted page). Set by [`Vm::tier_up`] from the emit it arms.
     jit_page_checked: bool,
+    /// #2474 — what this task has seen of program `jit_module`'s calls, where its emit tiers a call
+    /// up on observed work ([`Hotness`]). `None`: every eligible call tiers up.
+    profile: Option<Box<Profile>>,
+    /// #2474 — the safepoints this `Vm` has run, one per taken back edge and per call: the fuel it
+    /// burned. It only grows, so the difference of two readings is the work done between them.
+    work: u64,
+    /// #2474 — [`Self::work`] when the running activation was entered.
+    entered: u64,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
     /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
@@ -18468,6 +18483,50 @@ struct VmRare {
 }
 
 const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
+
+/// #2474 — a task's count of its interpreted calls into a program its emit tiers up on observed
+/// work ([`Hotness`]): per function, the calls and their work since its last decision, and whether
+/// its calls tier up.
+#[derive(Clone)]
+struct Profile {
+    rule: Hotness,
+    fns: Box<[FnCount]>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FnCount {
+    calls: u32,
+    hot: bool,
+    work: u64,
+}
+
+impl Profile {
+    fn new(rule: Hotness, funcs: usize) -> Profile {
+        Profile {
+            rule,
+            fns: vec![FnCount::default(); funcs].into(),
+        }
+    }
+
+    fn hot(&self, f: usize) -> bool {
+        self.fns.get(f).is_some_and(|c| c.hot)
+    }
+
+    /// An interpreted call of `f` that did `work` returned. With `window` calls in, `f` is hot if
+    /// they averaged `per_call` work, and the count starts again.
+    fn returned(&mut self, f: usize, work: u64) {
+        let Some(c) = self.fns.get_mut(f) else {
+            return;
+        };
+        c.calls += 1;
+        c.work = c.work.saturating_add(work);
+        if c.calls >= self.rule.window.max(1) {
+            c.hot = c.work >= self.rule.per_call.saturating_mul(c.calls.into());
+            c.calls = 0;
+            c.work = 0;
+        }
+    }
+}
 
 /// #1958 — the deepest one `Vm`'s calls may nest (its return stack), past which a call traps
 /// `StackOverflow`: the engine's own ceiling, as wasm traps on stack exhaustion. Above the depth the
@@ -18565,9 +18624,35 @@ impl Vm {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
         self.jit_module = module as usize;
-        self.jit_entry = entry
-            && self.module == self.jit_module
-            && emit.eligible.get(self.cur).copied().unwrap_or(false);
+        self.profile =
+            (emit.hot.per_call > 0).then(|| Box::new(Profile::new(emit.hot, emit.eligible.len())));
+        self.jit_entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
+    }
+
+    /// Undo [`Self::tier_up`]: every call interprets.
+    fn tier_down(&mut self) {
+        self.jit_eligible = None;
+        self.jit_page_checked = false;
+        self.profile = None;
+    }
+
+    /// Whether a direct call to function `f` of program `jit_module` tiers up: `f` is eligible,
+    /// and hot where the emit tiers calls up on observed work (#2474).
+    fn tiers_up(&self, f: usize) -> bool {
+        self.jit_eligible
+            .as_ref()
+            .is_some_and(|e| e.get(f).copied().unwrap_or(false))
+            && self.profile.as_ref().is_none_or(|p| p.hot(f))
+    }
+
+    /// #2474 — the running activation of program `module` returns, or tail-calls out: count its
+    /// work where calls tier up on observed work.
+    fn count_call(&mut self, module: usize, f: usize) {
+        if module == self.jit_module {
+            if let Some(p) = &mut self.profile {
+                p.returned(f, self.work - self.entered);
+            }
+        }
     }
 
     /// The `"mapped"` extent a tier-up surfaces with over `mem` (#717 host sync), or `None` where
@@ -18661,6 +18746,9 @@ impl Vm {
             jit_module: 0,
             jit_entry: false,
             jit_page_checked: false,
+            profile: None,
+            work: 0,
+            entered: 0,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
@@ -18881,6 +18969,13 @@ impl Vm {
                 }
             }};
         }
+        // #2474 — a safepoint burns a fuel and counts as the work [`Vm::work`] measures calls by.
+        macro_rules! safepoint {
+            () => {{
+                step(fuel, None)?;
+                self.work += 1;
+            }};
+        }
         // Fuel unification: fuel is metered at **IR safepoints** — a taken back-edge and each function
         // entry — not per op. A back-edge is a *backward* jump in the flat op array: blocks are laid
         // out in index order, so a terminator (the last op of its block, at index `pc`) taking a target
@@ -18891,7 +18986,7 @@ impl Vm {
         macro_rules! backedge {
             ($t:expr) => {
                 if ($t as usize) <= pc {
-                    step(fuel, None)?;
+                    safepoint!();
                 }
             };
         }
@@ -18954,7 +19049,8 @@ impl Vm {
                                     // Return linkage resumes at the SAME `pc` so the interrupted op
                                     // re-runs; the void handler writes no results (`ret_abs` unused —
                                     // `base` is a harmless placeholder).
-                                    self.stack.push((module, cur, base, pc, base));
+                                    self.stack.push((module, cur, base, pc, base, self.entered));
+                                    self.entered = self.work;
                                     if tmod != module {
                                         module = tmod;
                                         c = tm;
@@ -19285,6 +19381,9 @@ impl Vm {
                     if point.depth > self.stack.len() {
                         return Err(Trap::Malformed); // the setjmp activation already returned
                     }
+                    if let Some(&(.., entered)) = self.stack.get(point.depth) {
+                        self.entered = entered;
+                    }
                     self.stack.truncate(point.depth);
                     // #1146 — a longjmp OUT of an injected signal handler leaves it exactly like a
                     // return: pop each crossed guard and fire `handler_returned()` so the personality
@@ -19311,7 +19410,7 @@ impl Vm {
                     self.regs[base + point.dst as usize] = Reg::from_i32(resume);
                 }
                 Op::Call { callee, args, dst } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
                     if module == 0 {
@@ -19323,9 +19422,7 @@ impl Vm {
                     // per the callee's signature. Suspension-free by construction (`mixed_ok`), so
                     // this is a plain "fast call": spill past the op and resume with the results in
                     // `dst` (`deliver_tierup`), exactly like an interp call.
-                    if self.jit_eligible.as_ref().is_some_and(|e| {
-                        module == self.jit_module && e.get(callee).copied().unwrap_or(false)
-                    }) {
+                    if module == self.jit_module && self.tiers_up(callee) {
                         // A window the emitted code cannot bound declines: the call below
                         // interprets ([`Vm::tierup_extent`]).
                         if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
@@ -19355,8 +19452,15 @@ impl Vm {
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
-                    self.stack
-                        .push((module, cur, base, pc + 1, base + *dst as usize));
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
                     cur = callee;
                     base = nb;
                     pc = 0;
@@ -19368,10 +19472,11 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
-                                       // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
-                                       // padding slot or a signature mismatch is an inert IndirectCallType trap. The
-                                       // target may be an installed §22 unit (a different module) — a cross-module call.
+                    safepoint!(); // fuel unification: function-entry safepoint
+
+                    // Resolve through the **runtime dispatch table** (slot ⇒ (module, func)); an empty
+                    // padding slot or a signature mismatch is an inert IndirectCallType trap. The
+                    // target may be an installed §22 unit (a different module) — a cross-module call.
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {
@@ -19389,8 +19494,15 @@ impl Vm {
                     for (i, a) in args.iter().enumerate() {
                         self.regs[nb + i] = self.regs[base + *a as usize];
                     }
-                    self.stack
-                        .push((module, cur, base, pc + 1, base + *dst as usize));
+                    self.stack.push((
+                        module,
+                        cur,
+                        base,
+                        pc + 1,
+                        base + *dst as usize,
+                        self.entered,
+                    ));
+                    self.entered = self.work;
                     if tmod != module {
                         module = tmod;
                         c = tm;
@@ -19422,7 +19534,9 @@ impl Vm {
                                     .collect(),
                             ));
                         }
-                        Some((cmod, cprog, cbase, cpc, ret_abs)) => {
+                        Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
+                            self.count_call(module, cur);
+                            self.entered = centered;
                             for (i, s) in srcs.iter().enumerate() {
                                 self.regs[ret_abs + i] = self.regs[base + *s as usize];
                             }
@@ -19440,12 +19554,14 @@ impl Vm {
                 // return entry, so the callee returns to this activation's caller. Args may alias the
                 // destination prefix, so gather into `scratch` then scatter (like edge copies).
                 Op::TailCall { callee, args } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let callee = *callee as usize;
                     #[cfg(feature = "callprof")]
                     if module == 0 {
                         callprof::hit(callee);
                     }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
                     self.grow_regs(base + c.progs[callee].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -19463,7 +19579,7 @@ impl Vm {
                     want_params,
                     want_results,
                 } => {
-                    step(fuel, None)?; // fuel unification: function-entry safepoint
+                    safepoint!(); // fuel unification: function-entry safepoint
                     let slot = (r!(*idx).i32() as u32 as usize) & (table.len() - 1);
                     let ts = table.slot(slot);
                     if ts.module == super::TABLE_EMPTY {
@@ -19475,6 +19591,8 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
+                    self.count_call(module, cur);
+                    self.entered = self.work;
                     self.grow_regs(base + tm.progs[tfunc].nslots as usize)?;
                     self.scratch.clear();
                     for a in args.iter() {
@@ -19951,8 +20069,15 @@ impl Vm {
                         }
                         let depth = self.stack.len();
                         self.rare().serve_ticket = Some((d.ticket, depth));
-                        self.stack
-                            .push((module, cur, base, pc, base + *dst as usize));
+                        self.stack.push((
+                            module,
+                            cur,
+                            base,
+                            pc,
+                            base + *dst as usize,
+                            self.entered,
+                        ));
+                        self.entered = self.work;
                         cur = fidx;
                         base = nb;
                         pc = 0;
@@ -20022,7 +20147,7 @@ impl Vm {
                     // Fuel unification: charge one fuel per `cont.resume` op — the tree-walker charges
                     // the same at its `Inst::ContResume` arm. Resuming a fiber is a control transfer
                     // per-op fuel used to meter; without this, a long fiber-resume chain runs unmetered.
-                    step(fuel, None)?;
+                    safepoint!();
                     let kh = r!(*k).i32();
                     let arg = r!(*arg).i64();
                     let dst = *dst;

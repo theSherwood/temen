@@ -60,6 +60,7 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
         root: ProgramEmit {
             eligible: std::sync::Arc::from(vec![false, true, false]),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

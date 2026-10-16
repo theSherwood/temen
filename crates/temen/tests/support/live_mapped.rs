@@ -315,6 +315,7 @@ fn frame(g: &Guest, tail: &[i64], tier: bool) -> (Outcome, Vec<u8>, u32) {
         root: ProgramEmit {
             eligible: Arc::clone(&g.eligible),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

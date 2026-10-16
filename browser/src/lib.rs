@@ -1843,8 +1843,11 @@ pub extern "C" fn temen_x2_start(
         let programs = (tierup != 0).then(Programs::default);
         *X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()) = programs.clone();
         platform.tier = Some(bytecode::ThreadTier {
-            eligible: eligible.into(),
-            page_checked: paged,
+            root: bytecode::ProgramEmit {
+                eligible: eligible.into(),
+                page_checked: paged,
+                ..Default::default()
+            },
             // Each thread's spill stack is the size of the coop run's.
             spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
             modules: programs.map(|p| module_emitter(p, true, true)),
@@ -5918,6 +5921,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         root: bytecode::ProgramEmit {
             eligible: std::sync::Arc::clone(&r.eligible),
             page_checked: r.paged,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -11453,6 +11457,7 @@ fn emit_module(
         let emit = bytecode::ProgramEmit {
             eligible: eligible.into(),
             page_checked: paged,
+            ..Default::default()
         };
         (wasm.into(), emit)
     })
@@ -11687,6 +11692,7 @@ pub extern "C" fn temen_coop_open(
             // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
             // carries the fidelity `scalar_extent` cannot, as on the pump.
             page_checked: paged,
+            ..Default::default()
         },
         leaf: None,
         modules: Some(module_emitter(programs.clone(), shared != 0, false)),
