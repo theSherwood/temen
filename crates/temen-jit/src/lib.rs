@@ -5597,9 +5597,10 @@ pub struct SharedCode(CompiledModule);
 
 // SAFETY: the wrapped module is never run and never mutated — `instance` only reads it. Its code
 // pointers name finalized, read-execute memory its `Arc<OwnedJit>` keeps alive, and every instance holds
-// a clone of that `Arc`, so the arena outlives the last run of it. `share` admits only code that names
-// no per-instance runtime. So any thread may hold it, and any number may make instances of it at once —
-// the argument above for a §14 child's code.
+// a clone of that `Arc`, so the arena outlives the last run of it. The code names no per-instance
+// runtime: the runtimes the kept module holds are its own, never run, and `instance` reads only which
+// of them it has, to stand up its own (temen#2389). So any thread may hold it, and any number may make
+// instances of it at once — the argument above for a §14 child's code.
 unsafe impl Send for SharedCode {}
 unsafe impl Sync for SharedCode {}
 
