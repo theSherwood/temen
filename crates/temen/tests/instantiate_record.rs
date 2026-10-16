@@ -1127,17 +1127,32 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
 /// #2164 — a paged child's access past its declared window is fatal, on every driver: the tail
 /// `[mapped, reserved)` is the child's growth room (`vm_map`), never its pager's to supply. The child
 /// loads at 140000, past its 2^17-byte window, on a page no `vm_map` committed. The interpreters
-/// asked the pager for it and sized its page as `mapped - page`, which underflows there.
+/// asked the pager for it and sized its page as `mapped - page`, which underflows there. Then a word
+/// at 131070, across the window's end: its first page is served (the pager replies 64 KiB down, in
+/// its own window), and its second, the tail's, is fatal. The Cranelift JIT's inline check passes an
+/// access past the window to the hardware, so only one across its end reaches its miss thunk.
 #[test]
 fn a_paged_childs_access_past_its_window_is_fatal() {
-    let src = detached_pager_program_at(140_000);
+    let past = detached_pager_program_at(140_000);
+    let across = detached_pager_program_at(131_070)
+        .replace(
+            "  voff = i64.const 40000\n  vsrc = i64.add vaddr voff\n",
+            "  voff = i64.const 65536\n  vsrc = i64.sub vaddr voff\n",
+        )
+        .replace("  vb = i32.load8_u va\n", "  vb = i32.load va\n");
+    assert!(
+        across.contains("i64.sub vaddr voff") && across.contains("i32.load va"),
+        "the rewrites must apply"
+    );
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in DRIVERS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            faulted,
-            "{b:?}: the tail is not the pager's"
-        );
+    for (src, want) in [(past, faulted), (across, faulted + 1000)] {
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                want,
+                "{b:?}: the tail is not the pager's"
+            );
+        }
     }
 }
 
@@ -1180,33 +1195,41 @@ fn a_paged_childs_store_to_a_read_only_alias_is_fatal() {
 /// order the interpreters check a `mem.copy`'s spans in: the child maps the top 64 KiB of its window
 /// read-only over a region (as [`a_paged_childs_store_to_a_read_only_alias_is_fatal`] does), then
 /// copies 4 bytes from 20000, a page nothing has touched, into it. The source is served, then the
-/// destination faults: one serve, then the fault.
+/// destination faults: one serve, then the fault. The length is a constant, which the Cranelift JIT
+/// copies inline, then the map's answer plus 4, which it copies through its libcall.
 #[test]
 fn a_paged_childs_copy_pages_its_source_before_it_checks_its_destination() {
-    let src = detached_pager_program_at(20000)
-        .replace(
-            "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
-            "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
-        )
-        .replace(
-            "  vb = i32.load8_u va\n",
-            "  vas = i32.wrap_i64 vas64\n  vlen = i64.const 65536\n  \
-             vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)\n  vr = i32.wrap_i64 vrh\n  \
-             vz = i64.const 0\n  vro = i64.const 1\n  vdst = i64.const 65536\n  \
-             vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (vdst, vz, vlen, vro)\n  \
-             vn = i64.const 4\n  mem.copy vdst va vn\n  vb = i32.load8_u va\n",
-        );
-    assert!(
-        src.contains("(v0: i64, vas64: i64)") && src.contains("mem.copy vdst va vn"),
-        "the rewrites must apply"
-    );
     let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
-    for b in DRIVERS {
-        assert_eq!(
-            run_detached(b, &src).expect("run"),
-            faulted + 1000,
-            "{b:?}: the source is served first"
+    for len in [
+        "  vn = i64.const 4\n",
+        "  vfour = i64.const 4\n  vn = i64.add vm vfour\n",
+    ] {
+        let src = detached_pager_program_at(20000)
+            .replace(
+                "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
+                "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
+            )
+            .replace(
+                "  vb = i32.load8_u va\n",
+                &format!(
+                    "  vas = i32.wrap_i64 vas64\n  vlen = i64.const 65536\n  \
+                     vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)\n  vr = i32.wrap_i64 vrh\n  \
+                     vz = i64.const 0\n  vro = i64.const 1\n  vdst = i64.const 65536\n  \
+                     vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (vdst, vz, vlen, vro)\n\
+                     {len}  mem.copy vdst va vn\n  vb = i32.load8_u va\n"
+                ),
+            );
+        assert!(
+            src.contains("(v0: i64, vas64: i64)") && src.contains("mem.copy vdst va vn"),
+            "the rewrites must apply"
         );
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                faulted + 1000,
+                "{b:?}, {len:?}: the source is served first"
+            );
+        }
     }
 }
 
