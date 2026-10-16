@@ -4285,9 +4285,8 @@ fn coop_tierup_serves_a_parents_children() {
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
 /// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
-/// as the interpreter oracle does. This is the emitted-execution twin of `temen-wasm-jit`'s
-/// `nested_paged.rs` (which drives the same trap with a hand-rolled harness), carried here through the
-/// real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting + code-origin axes).
+/// as the interpreter oracle does, through the real coop FFI over a confined child's own window
+/// (#1151, INVARIANTS #14 nesting + code-origin axes).
 fn coop_child_paged_guest_text() -> String {
     let name = b"instantiator";
     let mut w0 = [0u8; 8];

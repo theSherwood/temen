@@ -8941,11 +8941,10 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // continue: the driver's own join is serviced without yielding to JS
             }
             // The op-13 driver is a root that only spawns detached children and joins them: no carve
-            // child (#1289), no threads, no tier-up of its own, no §22 units, no cap or stdin park.
+            // child (#1289), no threads, no §22 units, no cap or stdin park.
             // Named rather than `_` (see `VcpuEvent`) so a new event fails to build here instead of
             // trapping the driver.
-            bytecode::VcpuEvent::TierUp { .. }
-            | bytecode::VcpuEvent::Spawn { .. }
+            bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
             | bytecode::VcpuEvent::JitInstall { .. }
@@ -11665,8 +11664,7 @@ pub extern "C" fn temen_coop_open(
         root: bytecode::ProgramEmit {
             eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
             // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
-            // carries the fidelity `scalar_extent` cannot (matching the pump's
-            // `with_jit_page_checked`).
+            // carries the fidelity `scalar_extent` cannot, as on the pump.
             page_checked: paged,
         },
         leaf: None,
