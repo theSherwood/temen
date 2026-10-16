@@ -49,6 +49,7 @@ fn recording_host(recorded: &Recorded) -> (Host, i32) {
             let rec = Arc::clone(&rec);
             OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     (host, h)

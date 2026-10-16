@@ -181,9 +181,10 @@ fn a_vcpu_parked_at_a_decline_site_declines() {
     let SchedRef::Real(rs) = &f.sched else {
         unreachable!()
     };
+    let dom = f.root.lock_unpoisoned().domain_id();
     rs.lock()
         .completion_waiters
-        .insert(2, Waiter::VCpu(parked_vcpu(&f, 5)));
+        .insert((dom, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
     assert_eq!(
         f.census(&f.root_seat()),
         Some(DeclineCause::Parked(ParkSite::Completion))
@@ -307,11 +308,12 @@ fn a_freeze_on_quiesce_with_a_decline_site_park_declines() {
     let SchedRef::Real(rs) = &f.sched else {
         unreachable!()
     };
+    let dom = f.root.lock_unpoisoned().domain_id();
     {
         let mut s = rs.lock();
         park_on_futex(&mut s, &f, 4);
         s.completion_waiters
-            .insert(2, Waiter::VCpu(parked_vcpu(&f, 5)));
+            .insert((dom, 2), Waiter::VCpu(parked_vcpu(&f, 5)));
         s.freeze_on_quiesce = Some(Arc::clone(&f.root));
     }
     let (s, acted) = freeze_step(rs, rs.lock());

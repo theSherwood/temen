@@ -112,8 +112,9 @@ mod os_thread_rt;
 // only; the loom futex model has no regions (`futex_key_of` is `Anon`-only there).
 #[cfg(not(loom))]
 pub use os_thread_rt::{
-    park_host_call, region_canon_forget_window, region_canon_lookup, region_canon_new_owner,
-    region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in, HostPark,
+    outside_waker, park_host_call, region_canon_forget_window, region_canon_lookup,
+    region_canon_new_owner, region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in,
+    HostPark,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -163,19 +164,19 @@ mod reentry {
     }
 }
 
-/// F3 (FIBER_PARK.md) — park the current fiber once: unwinds `FIBER_PARKED` to the resumer
-/// (the suspend the guest didn't write) and returns when a `cont.resume` polls this fiber
-/// again. The host thunk's event-park seam — exactly what the futex thunk's wait loop does
-/// between polls, minus the futex cell.
+/// F3 (FIBER_PARK.md) — park the current fiber once on a host call's answer from outside the run
+/// (a punted job): unwinds `FIBER_PARKED` to the resumer (the suspend the guest didn't write) and
+/// returns when a `cont.resume` polls this fiber again. The host thunk's event-park seam — exactly
+/// what the futex thunk's wait loop does between polls, minus the futex cell. A §14 child's task
+/// parked here (#2424) is not counted blocked, as an OS vCPU in [`wait_outside`] is not: the answer
+/// may yet end a peer's wait. [`outside_waker`] re-offers it once the answer is in.
 ///
 /// # Safety
 /// Must be called from a host thunk on a thread currently running a guest fiber
 /// ([`fiber_active`] is `true`) — the same contract as the futex thunk's event park.
-pub unsafe fn fiber_park_current() {
-    let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
-    // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
-    // counts as parked.
-    fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Event);
+pub unsafe fn fiber_park_outside() {
+    let slot = fiber_rt::current_fiber_slot().expect("fiber_park_outside outside a fiber");
+    fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Outside);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled

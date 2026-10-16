@@ -363,6 +363,11 @@ pub(crate) enum ParkOn {
     Thread,
     /// #2010 — an `Instantiator.join`: the joined child's end re-offers it.
     Child,
+    /// #2424 — a host call's answer from outside the run (a job on the embedder's offload pool,
+    /// which may wait on the world): never counted blocked, as an OS vCPU waiting outside is not
+    /// ([`crate::wait_outside`]), since it may yet end a peer's wait. The answer re-offers it
+    /// ([`crate::outside_waker`]).
+    Outside,
 }
 
 impl ParkOn {
@@ -1517,6 +1522,18 @@ pub(crate) unsafe fn park_cell(handle: i64) -> Option<Arc<crate::os_thread_rt::W
             ParkOn::Futex(cell) => Some(cell),
             _ => None,
         })
+}
+
+/// #2424 — whether `handle`'s fiber is event-parked on an answer from outside the run
+/// ([`ParkOn::Outside`]): what it waits for may come although no vCPU of the run is live.
+///
+/// # Safety
+/// As [`park_deadline`].
+pub(crate) unsafe fn parked_outside(handle: i64) -> bool {
+    let rt = &*current();
+    rt.table
+        .resolve(handle)
+        .is_some_and(|(_, slot)| matches!(slot.parked_on(), ParkOn::Outside))
 }
 
 /// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?

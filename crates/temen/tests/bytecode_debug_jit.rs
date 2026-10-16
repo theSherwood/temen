@@ -599,6 +599,7 @@ block 0 (vh: i64) {
         let (mut host, jit, codes) = compiled(m, &[unit]);
         let proc = host.grant_host_proc_offloadable(
             Box::new(|_, _| temen_interp::OffloadOutcome::Host(Box::new(|_| ()))),
+            None,
             temen_interp::CapState::Stateless,
         );
         let args = vec![Value::I32(jit), Value::I32(codes[0]), Value::I32(proc)];

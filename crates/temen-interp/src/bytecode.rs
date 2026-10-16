@@ -7969,32 +7969,48 @@ fn dbg_pick_runnable(
     }
 }
 
-/// #2047 — with nothing runnable and no timer left, the lowest-index thread parked on a punted call
-/// takes the offload pool's answer: wait for it, deliver it and re-admit the thread, counting the
-/// turn as [`ScheduledDebugRun::deliver_cap`] counts the embedder's. Taken only here, where nothing
-/// else could run meanwhile, so when it comes changes nothing a replay sees. `false` when no thread
-/// is parked, or the lowest-index park is host-completed (the embedder's to answer).
+/// #2047 — with nothing runnable and no timer left, a thread parked on a punted call takes the
+/// offload pool's answer, counting the turn as [`ScheduledDebugRun::deliver_cap`] counts the
+/// embedder's: the lowest-index one whose answer has come, or, with none come yet, the first to
+/// come (#2424 — one thread's answer never waits on another's call, which may wait on what that
+/// thread does). Taken only here, where nothing else could run meanwhile, so when it comes changes
+/// nothing a replay sees. `false` when no thread is parked, or the lowest-index park is
+/// host-completed (the embedder's to answer).
 fn dbg_take_pool_answer(
     tasks: &mut [TaskSlot],
     extra_envs: &[DbgEnv],
     host: &Host,
     turn: &mut u64,
 ) -> bool {
-    let Some((p, id, dst)) = tasks.iter().enumerate().find_map(|(i, t)| match t.state {
-        TaskState::BlockedHostCap { id, dst, .. } => Some((i, id, dst)),
-        _ => None,
-    }) else {
-        return false;
-    };
-    let comps = dbg_completions(tasks[p].env, extra_envs, host);
-    if comps.is_host_owned(id) {
-        return false;
+    let parked: Vec<_> = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| match t.state {
+            TaskState::BlockedHostCap { id, dst, .. } => {
+                Some((i, dst, dbg_completions(t.env, extra_envs, host), id))
+            }
+            _ => None,
+        })
+        .collect();
+    match parked.first() {
+        Some((_, _, comps, id)) if !comps.is_host_owned(*id) => {}
+        _ => return false,
     }
-    let r = comps.wait(id);
-    tasks[p].deliver(dst, Reg::from_i64(r));
-    tasks[p].state = TaskState::Runnable;
-    *turn += 1;
-    true
+    let calls: Vec<_> = parked
+        .iter()
+        .map(|(_, _, comps, id)| (std::sync::Arc::clone(comps), *id))
+        .collect();
+    loop {
+        for (p, dst, comps, id) in &parked {
+            if let Some(r) = comps.try_take(*id) {
+                tasks[*p].deliver(*dst, Reg::from_i64(r));
+                tasks[*p].state = TaskState::Runnable;
+                *turn += 1;
+                return true;
+            }
+        }
+        super::Completions::wait_any(&calls, None);
+    }
 }
 
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
@@ -9061,7 +9077,10 @@ impl ScheduledDebugRun {
             .iter()
             .enumerate()
             .find_map(|(i, t)| match t.state {
-                TaskState::BlockedHostCap { id: pid, dst, .. } if pid == id => Some((i, dst)),
+                // Only the root's store mints a host-completed id; a child's ids are its own (#2424).
+                TaskState::BlockedHostCap { id: pid, dst, .. } if pid == id && t.env.is_none() => {
+                    Some((i, dst))
+                }
                 _ => None,
             })
         else {
@@ -11086,24 +11105,72 @@ fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> bo
 
 /// #2047 — wake each task parked on a punted call whose answer has come, once a round: no one polls
 /// a parked task, as a resumer polls a parked fiber ([`drain_cap_parked`]). A task is a vCPU of its
-/// own, so between tasks the order is whatever the world's is, as on the oracle. The store is the
-/// root's, so only its domain's tasks are looked at (a child's ids are its own host's), and only
-/// while one is parked.
-fn drain_task_completions(tasks: &mut [TaskSlot], root: &DomainCell) {
-    let parked =
-        |t: &TaskSlot| t.env.is_none() && matches!(t.state, TaskState::BlockedHostCap { .. });
-    if !tasks.iter().any(parked) {
-        return;
-    }
-    let comps = root.lock_unpoisoned().completions();
-    for t in tasks.iter_mut().filter(|t| parked(t)) {
+/// own, so between tasks the order is whatever the world's is, as on the oracle. Each task's call is
+/// in its own domain's store, a child's as the root's (#2424).
+fn drain_task_completions(tasks: &mut [TaskSlot], extra_envs: &[ChildEnv], root: &DomainCell) {
+    for t in tasks.iter_mut() {
         if let TaskState::BlockedHostCap { id, dst, .. } = t.state {
+            let comps = task_host(root, extra_envs, t.env)
+                .lock_unpoisoned()
+                .completions();
             if let Some(r) = comps.try_take(id) {
                 t.deliver(dst, Reg::from_i64(r));
                 t.state = TaskState::Runnable;
             }
         }
     }
+}
+
+/// #2424 — [`drain_cap_parked`] over every domain's fiber registry, each against its own store:
+/// the root's (`fibers`) and each child's. Whether anything was claimed.
+fn drain_fiber_completions(
+    fibers: &mut [FiberState],
+    extra_envs: &mut [ChildEnv],
+    root: &DomainCell,
+) -> bool {
+    let regs = std::iter::once((fibers, root)).chain(
+        extra_envs
+            .iter_mut()
+            .map(|e| (&mut e.fibers.fibers[..], &e.host)),
+    );
+    let mut claimed = false;
+    for (reg, host) in regs {
+        if reg
+            .iter()
+            .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
+        {
+            claimed |= drain_cap_parked(reg, &host.lock_unpoisoned().completions());
+        }
+    }
+    claimed
+}
+
+/// The punted calls the run's parked callers wait on, each with the domain it was made in (`None`
+/// the root): a fiber's `CapParked` in any domain's registry, a task's `BlockedHostCap`.
+fn outstanding_calls(
+    tasks: &[TaskSlot],
+    fibers: &[FiberState],
+    extra_envs: &[ChildEnv],
+) -> Vec<(Option<usize>, u64)> {
+    let regs = std::iter::once((None, fibers)).chain(
+        extra_envs
+            .iter()
+            .enumerate()
+            .map(|(k, e)| (Some(k), &e.fibers.fibers[..])),
+    );
+    let fiber_calls = regs.flat_map(|(env, reg)| {
+        reg.iter().filter_map(move |f| match f {
+            FiberState::CapParked {
+                id, woken: None, ..
+            } => Some((env, *id)),
+            _ => None,
+        })
+    });
+    let task_calls = tasks.iter().filter_map(|t| match t.state {
+        TaskState::BlockedHostCap { id, .. } => Some((t.env, id)),
+        _ => None,
+    });
+    fiber_calls.chain(task_calls).collect()
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -14092,7 +14159,7 @@ impl CoopSched {
                 // trap stays `Err(trap)` (the run's fatal trap), exactly as `drive` returned it.
                 return res.map(CoopStep::Done);
             }
-            drain_task_completions(tasks, root);
+            drain_task_completions(tasks, extra_envs, root);
             settle_wakes(
                 tasks,
                 extra_envs,
@@ -14135,29 +14202,26 @@ impl CoopSched {
                 ) {
                     continue;
                 }
-                // The punted calls outstanding (F2, FIBER_PARK.md): a fiber's `CapParked`, a task's
-                // `BlockedHostCap`. #1953 — when the smallest is host-completed, it is the
-                // embedder's to finish: surface it.
-                let min_cap = fibers
-                    .iter()
-                    .filter_map(|f| match f {
-                        FiberState::CapParked {
-                            id, woken: None, ..
-                        } => Some(*id),
-                        _ => None,
-                    })
-                    .chain(tasks.iter().filter_map(|t| match t.state {
-                        TaskState::BlockedHostCap { id, .. } => Some(id),
-                        _ => None,
-                    }))
-                    .min();
-                if let Some(id) = min_cap {
+                // The punted calls outstanding (F2, FIBER_PARK.md), each in its domain's store
+                // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953 — when the
+                // root's smallest is host-completed, it is the embedder's to finish: surface it.
+                // (Only the root's store admits one.)
+                let calls = outstanding_calls(tasks, fibers, extra_envs);
+                let root_min = calls.iter().filter(|c| c.0.is_none()).map(|c| c.1).min();
+                if let Some(id) = root_min {
                     if root.lock_unpoisoned().completions().is_host_owned(id) {
                         return Ok(CoopStep::CapPark { id });
                     }
                 }
+                let calls: Vec<_> = calls
+                    .into_iter()
+                    .map(|(env, id)| {
+                        let h = task_host(root, extra_envs, env).lock_unpoisoned();
+                        (h.completions(), id)
+                    })
+                    .collect();
                 // #1979 — on the native driver the time to the earliest deadline passes first.
-                if *wall && wait_out(tasks, fibers, extra_envs, clock, root, min_cap, bell_gen) {
+                if *wall && wait_out(tasks, fibers, extra_envs, clock, root, &calls, bell_gen) {
                     continue;
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
@@ -14167,15 +14231,14 @@ impl CoopSched {
                     .collect();
                 if !fire_next_timeout(tasks, &mut regs, clock) {
                     // #2047 — no timer is left, but a punted call is outstanding: work in flight
-                    // on the offload pool, never a deadlock. Block until the smallest outstanding
-                    // id (submission order) arrives, and deliver it: a fiber's through the ordered
+                    // on the offload pool, never a deadlock. Block until one arrives, in any
+                    // domain (#2424), and deliver it: a fiber's through its domain's ordered
                     // drain, a task's at the next round's. Only after the timers, as a call may
                     // wait on the world, or on what a timed waiter will do: it must not hold the
                     // clock back.
-                    if let Some(id) = min_cap {
-                        let comps = root.lock_unpoisoned().completions();
-                        comps.wait_ready(id, None);
-                        drain_cap_parked(fibers, &comps);
+                    if !calls.is_empty() {
+                        super::Completions::wait_any(&calls, None);
+                        drain_fiber_completions(fibers, extra_envs, root);
                         continue;
                     }
                     // #1146 slice 2 — before blocking, interrupt the parks a deliverable signal
@@ -14668,19 +14731,33 @@ impl SchedCore {
             Ok(VcpuStop::CapPending { id, dst }) => {
                 // F2 (FIBER_PARK.md), #2047 — a punted dispatch, cooperative form: what made the
                 // call parks, and the rest of the run goes on, as the oracle parks the vCPU. The
-                // call may wait on the world, or on what another task does. A FIBER parks
-                // (`CapParked` — the slice-5a contract; the ordered drain right after the park is
-                // the register-then-recheck closing the completion-raced-the-park window). A task's
-                // own call parks the task (`BlockedHostCap`), and a round's drain wakes it
-                // ([`drain_task_completions`]); a host-completed one waits for the embedder,
-                // which only a `CoopRun` admits (#1953). Two inline cases, both mirroring the
-                // oracle's predicate: a durable run (`freeze_drive` has no cap-park re-derivation
-                // — the freeze must never meet one) and a confined `instantiate` child (its
-                // completions live on ITS host; keeping the child inline keeps the drain
-                // single-store — recorded FIBER_PARK.md residue).
+                // call may wait on the world, or on what another task does. The call is in its
+                // domain's store, a child's as the root's (#2424). A FIBER parks (`CapParked` — the
+                // slice-5a contract; the ordered drain right after the park is the
+                // register-then-recheck closing the completion-raced-the-park window). A task's own
+                // call parks the task (`BlockedHostCap`), and a round's drain wakes it
+                // ([`drain_task_completions`]); a host-completed one waits for the embedder, which
+                // only a `CoopRun` admits (#1953). A durable run waits inline, as the oracle's:
+                // `freeze_drive` has no cap-park re-derivation, so the freeze must never meet one.
+                let env = tasks[ti].env;
+                let comps = task_host(root, extra_envs, env)
+                    .lock_unpoisoned()
+                    .completions();
                 let durable = root.lock_unpoisoned().is_durable();
-                if tasks[ti].vm.vt.active_id != ROOT_FIBER && !durable && tasks[ti].env.is_none() {
-                    let comps = root.lock_unpoisoned().completions();
+                if durable {
+                    // #1366: a host-completed punt no one here can surface — decline.
+                    match comps.wait_unless_host_owned(id) {
+                        Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
+                        None => complete(tasks, ti, Err(Trap::CapFault)),
+                    }
+                } else if tasks[ti].vm.vt.active_id != ROOT_FIBER {
+                    let (fibers, fiber_sp, mem) = match env {
+                        None => (fibers, fiber_sp, mem),
+                        Some(e) => {
+                            let e = &mut extra_envs[e];
+                            (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
+                        }
+                    };
                     let k = tasks[ti].vm.vt.active_id;
                     // The drain right after the park is the register-then-recheck: a completion
                     // that raced the park wakes the fiber at once.
@@ -14707,19 +14784,8 @@ impl SchedCore {
                     ) {
                         tasks[ti].state = TaskState::BlockedOnFiber { fiber: k };
                     }
-                } else if tasks[ti].env.is_none() && !durable {
-                    tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                 } else {
-                    let comps = task_host(root, extra_envs, tasks[ti].env)
-                        .lock_unpoisoned()
-                        .completions();
-                    // #1366: a host-completed punt no one here can surface — decline. (A
-                    // confined child's host never admits one; a durable run's freeze cannot
-                    // meet a park.)
-                    match comps.wait_unless_host_owned(id) {
-                        Some(r) => tasks[ti].deliver(dst, Reg::from_i64(r)),
-                        None => complete(tasks, ti, Err(Trap::CapFault)),
-                    }
+                    tasks[ti].state = TaskState::BlockedHostCap { id, dst, at: None };
                 }
             }
             // #2220 — grant into a running child: the spawner's cell and the child's, locked
@@ -15946,9 +16012,11 @@ impl CoopRun {
         if !settle_host_cap(&mut self.host.lock_unpoisoned(), id, value) {
             return false;
         }
-        let parked = self.sched.core.tasks.iter().position(
-            |t| matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id),
-        );
+        // Only the root's store mints a host-completed id; a child's ids are its own (#2424).
+        let parked = self.sched.core.tasks.iter().position(|t| {
+            t.env.is_none()
+                && matches!(t.state, TaskState::BlockedHostCap { id: pid, .. } if pid == id)
+        });
         if let Some(ti) = parked {
             let _ = self.host.lock_unpoisoned().completions().try_take(id);
             let t = &mut self.sched.core.tasks[ti];
@@ -17544,14 +17612,10 @@ impl ThreadRun {
             .chain(core.extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
             .collect();
         time_out_due(&mut core.tasks, &mut regs, core.clock);
-        // F2: a fiber parked on a punted call wakes once the call completes (only the root domain's
-        // fibers park on one); #2047: a task too.
-        let cap_parked = |f: &FiberState| matches!(f, FiberState::CapParked { woken: None, .. });
-        if core.fibers.iter().any(cap_parked) {
-            let comps = self.root.lock_unpoisoned().completions();
-            drain_cap_parked(&mut core.fibers, &comps);
-        }
-        drain_task_completions(&mut core.tasks, &self.root);
+        // F2: a fiber parked on a punted call wakes once the call completes; #2047: a task too.
+        // #2424: in any domain.
+        drain_fiber_completions(&mut core.fibers, &mut core.extra_envs, &self.root);
+        drain_task_completions(&mut core.tasks, &core.extra_envs, &self.root);
         settle_wakes(
             &mut core.tasks,
             &mut core.extra_envs,
@@ -18045,18 +18109,18 @@ fn next_timeout<'a>(
 }
 
 /// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
-/// other engines' waits do, instead of jumping its `clock` there. The answer to outstanding call
-/// `call` ends the wait early, or with none a ring of the embedder's bell past generation `seen`.
-/// The clock moves by the time that passed, so the schedule is still the clock's (#2224). Whether
-/// something came first: the pump then runs a round, the fibers' answers drained.
+/// other engines' waits do, instead of jumping its `clock` there. The answer to any of the
+/// outstanding `calls` ends the wait early, or with none a ring of the embedder's bell past
+/// generation `seen`. The clock moves by the time that passed, so the schedule is still the clock's
+/// (#2224). Whether something came first: the pump then runs a round, the fibers' answers drained.
 #[cold]
 fn wait_out(
     tasks: &[TaskSlot],
     fibers: &mut [FiberState],
-    extra_envs: &[ChildEnv],
+    extra_envs: &mut [ChildEnv],
     clock: &mut u64,
     root: &DomainCell,
-    call: Option<u64>,
+    calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
 ) -> bool {
     let regs = std::iter::once(&*fibers).chain(extra_envs.iter().map(|e| &e.fibers.fibers[..]));
@@ -18068,22 +18132,26 @@ fn wait_out(
         return false;
     };
     let began = sched_wall_now();
-    let woke = idle_wait(root, call, seen, left);
+    let woke = idle_wait(root, calls, seen, left);
     *clock += sched_wall_now().saturating_sub(began).min(left);
     if woke {
-        drain_cap_parked(fibers, &root.lock_unpoisoned().completions());
+        drain_fiber_completions(fibers, extra_envs, root);
     }
     woke
 }
 
-/// [`wait_out`]'s wait: `ns` of real time, on the answer to `call` when one is outstanding, else on
-/// the embedder's bell when one is armed, else asleep. Whether something came before the time was
-/// up. No lock is held while it waits.
-fn idle_wait(root: &DomainCell, call: Option<u64>, seen: u64, ns: u64) -> bool {
+/// [`wait_out`]'s wait: `ns` of real time, on the answers to `calls` when any is outstanding, else
+/// on the embedder's bell when one is armed, else asleep. Whether something came before the time
+/// was up. No lock is held while it waits.
+fn idle_wait(
+    root: &DomainCell,
+    calls: &[(std::sync::Arc<super::Completions>, u64)],
+    seen: u64,
+    ns: u64,
+) -> bool {
     let d = std::time::Duration::from_nanos(ns);
-    if let Some(id) = call {
-        let comps = root.lock_unpoisoned().completions();
-        return comps.wait_ready(id, Some(d));
+    if !calls.is_empty() {
+        return super::Completions::wait_any(calls, Some(d));
     }
     let bell = root.lock_unpoisoned().external_wake();
     match bell {
