@@ -294,7 +294,6 @@ fn drive<'s, 'e>(
             // These kernels use only spawn/join + JIT; wait/notify/§14 never arise here.
             bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
-            | bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::StdinPark
             | bytecode::VcpuEvent::CapPending { .. }
             | bytecode::VcpuEvent::InstantiateDetached { .. } => {

@@ -422,14 +422,17 @@ fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, 
         let forked = Arc::clone(&ticks);
         let tick = h.grant_host_proc_forkable(
             tick_proc(&ticks),
-            Arc::new(move |_pid| ForkedProc::shared(tick_proc(&forked), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(tick_proc(&forked), CapState::Stateless))),
             CapState::Stateless,
         );
         let forked = Arc::clone(&ticks);
         let wait = h.grant_host_proc_offloadable(
             wait_proc(&ticks),
             Some(Arc::new(move |_pid| {
-                ForkedProc::offloadable(wait_proc(&forked), CapState::Stateless)
+                Some(ForkedProc::offloadable(
+                    wait_proc(&forked),
+                    CapState::Stateless,
+                ))
             })),
             CapState::Stateless,
         );

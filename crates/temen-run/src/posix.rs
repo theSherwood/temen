@@ -82,5 +82,5 @@ fn posix_cap_inner(
 pub fn net_cap(posix: &Posix) -> HostCap {
     // The memnet's queues are the personality's, paid for by the domain its posix cap is granted to.
     let make = temen_posix::net_cap_factory(posix);
-    HostCap::host_proc(0, move |_| make())
+    HostCap::host_proc(0, move |_, _| Some(make()))
 }

@@ -731,7 +731,7 @@ pub fn fuzz_one_pagestate(data: &[u8]) -> Cat {
     let kinds = b[1];
     // Three page-aligned ranges, each a non-empty whole number of pages kept **inside the window** (the
     // ops are interp-serviced on both tiers; the emitted access is what is under test — a range past
-    // the window is the #1191 decline-class shape `nested_paged` also keeps out of scope).
+    // the window is the #1191 decline-class shape).
     let mut tail = Vec::with_capacity(8);
     for i in 0..3 {
         let rpage = (b[2 + 2 * i] as u64) % npages;

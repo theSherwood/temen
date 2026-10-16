@@ -361,6 +361,9 @@ property, so in practice:
   (`ParDomain` is gone, #1414 3e): a parked member is finalized there, and a running one ends at its
   next stop (its next event or the 1M-op quantum); on Workers a root-domain vCPU's trap ends the run.
   A §14 confined child stays its own domain.
+  *Superseded (#1414 B6-4):* `par_onramp.rs`, the `#capio` item and `SharedFibers` went with the
+  per-Worker driver. Executor 2 keeps a run's fibers in its `SchedCore`, and the `#x2` item runs
+  these fixtures.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
   interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
   editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/

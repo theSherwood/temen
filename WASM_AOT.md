@@ -115,7 +115,7 @@ Against the JACL doc's ranked hypotheses:
   `MemoryFault → unreachable` mid-body, before any `env.call_interp`, that the spike saw. The JACL
   spike called `compile_module_tierup` directly, bypassing `compile_jit`'s gate.
 
-**Fix (landed).** `compile_module_tierup_caps` now self-applies the page-op gate: a page-op module
+**Fix (landed).** `compile_module_tierup`'s one assembly point now self-applies the page-op gate: a page-op module
 emits nothing (all-`false` bitmap, valid imports-only wasm), identical to `compile_interp_only` and
 to `compile_jit(Threaded)`. The gate now holds regardless of which public entry a host calls.
 Pinned by `tierup_page_op_module_emits_nothing` (red→green: was `[false, true]`, now `[false,

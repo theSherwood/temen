@@ -422,11 +422,10 @@ pub(crate) fn drive_op13<'p>(
                 vcpu.deliver_jit_invoke(unit);
             }
             // The children this loop drives are single-threaded and non-interactive: no threads, no
-            // tier-up (this is the interpreter path), no cap or stdin park. The driver's decline — a
+            // cap or stdin park. The driver's decline — a
             // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
             // Named rather than `_` (see `VcpuEvent`).
-            bytecode::VcpuEvent::TierUp { .. }
-            | bytecode::VcpuEvent::Spawn { .. }
+            bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
             | bytecode::VcpuEvent::CapPending { .. }

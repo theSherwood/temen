@@ -111,7 +111,12 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
     let mut host = Host::new();
     let fork: HostProcFork = {
         let mint = mint.clone();
-        Arc::new(move |_pid| ForkedProc::shared(mint(), temen_interp::CapState::Stateless))
+        Arc::new(move |_pid| {
+            Some(ForkedProc::shared(
+                mint(),
+                temen_interp::CapState::Stateless,
+            ))
+        })
     };
     let tally = host.grant_host_proc_forkable(mint(), fork, temen_interp::CapState::Stateless);
     let (a, b) = (tally_node(1), tally_node(2));

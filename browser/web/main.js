@@ -129,6 +129,10 @@ async function main() {
     // #1414 ED-1: a thread whose entry is eligible runs it whole on its Worker's emitted tier, and
     // its results end the thread: each of the 8 counters' entries is one region.
     const te = await runPath('/corpus/threads_entry_tierup.temenc', emit);
+    // #2443: a fork-join whose spawner runs emitted. Its spawns, its wait for the first thread's
+    // done flag and its joins each stop its task from inside a bounce, as each thread's notify
+    // does: the spawner's call and the 4 threads' entries are 5 regions.
+    const fj = await runPath('/corpus/fork_join_in_a_call.temenc', emit);
     // #1414 B6-3b-4b: paged regions. An on-ramp guest protects a page read-only, and each of its 5
     // tasks reads it through the emitted leaf, checked against its thread's page-state table; the
     // twin's leaf stores there and traps. The run reports where, as it does interpreted (#2275).
@@ -157,7 +161,7 @@ async function main() {
       r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n && ct.includes('DivByZero') &&
       fibers.every((f) => f.ok) && dl.includes('ThreadFault') && sv.value === 142n &&
       tu.value === 4000n && tu.tierups === 8 && sp.value === 42n && sp.tierups === 1 &&
-      te.value === 4000n && te.tierups === 8 &&
+      te.value === 4000n && te.tierups === 8 && fj.value === 1001500n && fj.tierups === 5 &&
       pg.value === 35n && pg.tierups === 5 && pgt.why.includes('MemoryFault') && pgt.at === 65536n &&
       pgi.why.includes('MemoryFault') && pgi.at === 65536n &&
       gs.value === 55n && gs.tierups === 5 &&
@@ -173,6 +177,8 @@ async function main() {
       `· tier-up ${tu.value} (want 4000), ${tu.tierups} regions on emitted wasm (want 8) · ` +
       `stopped spinner ${sp.value} (want 42), ${sp.tierups} region (want 1) · ` +
       `thread entries ${te.value} (want 4000), ${te.tierups} on emitted wasm (want 8) · ` +
+      `fork-join ${fj.value} (want 1001500), ${fj.tierups} regions with spawns, waits and joins in their ` +
+      `bounces (want 5) · ` +
       `paged ${pg.value} (want 35), ${pg.tierups} regions (want 5), its store ${JSON.stringify(pgt.why)} ` +
       `at ${pgt.at} (want MemoryFault at 65536), interpreted ${JSON.stringify(pgi.why)} at ${pgi.at} · ` +
       `collector over spilled words ${gs.value} (want 55), ${gs.tierups} regions (want 5) · ` +
@@ -403,9 +409,9 @@ block 0 (v0: i64) {
   // The detached root, granting each child the unit itself as `"unit"`, and the granted unit's entry
   // SPAWNS: it reads its "K"=75, spawns `"unit"` DETACHED with a payload that makes it a pure grandchild
   // (→ 9) — an op-17 record paid from its own `budget`, the node that paid for its window (#1944) —
-  // joins it, returns 84 → 8 × 84 = 672, each grandchild in its own `Memory` (17 Workers). The entry
-  // spawns and joins, which a region tier-up cannot serve, so under `tierup` it interprets in every
-  // child and grandchild (#2443 runs it emitted). Both runs must agree.
+  // joins it, returns 84 → 8 × 84 = 672, each grandchild in its own `Memory` (17 Workers). Under
+  // `tierup` the entry runs emitted in every child and grandchild, its spawn and join each stopping
+  // its task from inside a bounce (#2443). Both runs must agree.
   try {
     const guest = await fetchBytes('/corpus/threads_inst_nested.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_nested_detached_unit.temenc');
@@ -414,10 +420,10 @@ block 0 (v0: i64) {
     const interp = await run(guest, opt);
     const emitted = await run(guest, { ...opt, ...emit });
     const ms = (performance.now() - t0).toFixed(0);
-    const ok = interp.value === 672n && emitted.value === 672n;
+    const ok = interp.value === 672n && emitted.value === 672n && emitted.tierups === 16;
     set('instnested', ok ? 'pass' : 'fail',
       `instnested: ${interp.started} Workers · interp → ${interp.value} · under tierup → ${emitted.value} ` +
-      `(want 672) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 672), ${emitted.tierups} entries on emitted wasm (want 16) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instnested → interp ${interp.value} / under tierup ${emitted.value} across ${interp.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instnested', 'fail', `instnested: error ${e}`);
@@ -457,9 +463,9 @@ block 0 (v0: i64) {
   // --- 7) §11 **threads inside a granted unit** (CONSOLIDATION.md §11 slice 3; detached, #1865) -------
   // The granted unit's entry thread.spawns its OWN f1 (→7), joins it, and does a mismatching
   // i32.atomic.wait (→1) → 71; 8 detached children → 568, each unit thread on a Worker of its own over
-  // its child's Memory. The entry spawns threads, so under `tierup` it interprets, and so do the
-  // threads: a child's memory holds one context, its root task's (#2443 runs them emitted). Both runs
-  // must agree.
+  // its child's Memory. Under `tierup` the entry runs emitted, its spawn, join and wait each stopping
+  // its task from inside a bounce (#2443). Its threads interpret: a child's memory holds one context,
+  // its root task's. Both runs must agree.
   try {
     const guest = await fetchBytes('/corpus/threads_inst_detached.temenc');
     const unit = await fetchBytes('/corpus/threads_inst_threads_unit.temenc');
@@ -468,10 +474,10 @@ block 0 (v0: i64) {
     const interp = await run(guest, opt);
     const emitted = await run(guest, { ...opt, ...emit });
     const ms = (performance.now() - t0).toFixed(0);
-    const ok = interp.value === 568n && emitted.value === 568n;
+    const ok = interp.value === 568n && emitted.value === 568n && emitted.tierups === 8;
     set('instthreads', ok ? 'pass' : 'fail',
       `instthreads: ${interp.started} Workers · interp → ${interp.value} · under tierup → ${emitted.value} ` +
-      `(want 568) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 568), ${emitted.tierups} entries on emitted wasm (want 8) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`instthreads → interp ${interp.value} / under tierup ${emitted.value} across ${interp.started} Workers in ${ms}ms`);
   } catch (e) {
     set('instthreads', 'fail', `instthreads: error ${e}`);

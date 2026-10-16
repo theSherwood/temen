@@ -2128,3 +2128,59 @@ fn the_release_session_serves_declared_caps_as_the_debug_session_does() {
         "release, sliced"
     );
 }
+
+/// #1722 — a program that calls, as an ordinary C function with an `int` reply, a capability its
+/// embedder grants as a host cap.
+const ASK_SRC: &str = r#"
+int ask(int x);
+int main() { return ask(5); }
+"#;
+
+/// #1722 — the debug session's messages after `continue` on [`ASK_SRC`] with `ask` granted as a host
+/// cap, on its own thread for at most 30 s: a call waiting on an answer nothing could give would hang
+/// the test rather than fail it (the single-threaded wasm build panicked in that wait).
+fn ask_session(ir: String) -> Vec<Json> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let out = s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(&ir)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("powerbox", Json::s("onramp")),
+                ("hostCaps", Json::Arr(vec![Json::s("ask")])),
+            ]),
+        ));
+        assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+        s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+        let _ = tx.send(s.handle(&req(4, "continue", Json::obj(vec![]))));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the session waited on a host cap call that cannot park")
+}
+
+/// **A host cap called as an `int` function ends the run with `CapFault`** (#1722): a parked call is
+/// delivered into one `i64` slot, so this one cannot park, and only the embedder could answer it.
+#[test]
+fn a_host_cap_called_as_an_int_function_ends_the_run_with_cap_fault() {
+    let Some(bytes) = chibicc_temen() else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&bytes).expect("decode chibicc.temen");
+    let out = ask_session(compile_g(&chibicc, ASK_SRC));
+    let exited = out
+        .iter()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("exited"))
+        .and_then(|m| m.get("body"))
+        .expect("the run exited");
+    assert_eq!(
+        exited.get("trap").and_then(|t| t.as_str()),
+        Some("CapFault")
+    );
+}

@@ -5750,10 +5750,11 @@ fn module_nests(m: &temen_ir::Module) -> bool {
 /// CONSOLIDATION.md §2.2/§3, #744: the module could build a **pager** record — it uses the §3
 /// config-record spawn (op 17) and declares a pager-shaped export ([`Module::declares_pager`], the
 /// one predicate spawn validation checks too). The record's `pager` field is runtime data, so such a
-/// module folds: the JIT has no native arm for the fault seam (native paging is #2164), and its
-/// op-17 thunk `CapFault`s any pager. A module with no pager-shaped export cannot build a valid pager
-/// record — every engine refuses one identically — so it runs natively through the
-/// `instantiate_rec` thunk, serving its own children if it serves (#744).
+/// module folds: the JIT has no native arm for the fault seam (#2164), and its op-17 thunk
+/// `CapFault`s any pager. It folds to the bytecode engine, which pages a child itself. A module with
+/// no pager-shaped export cannot build a valid pager record — every engine refuses one identically —
+/// so it runs natively through the `instantiate_rec` thunk, serving its own children if it serves
+/// (#744).
 fn module_demand_spawns(m: &temen_ir::Module) -> bool {
     m.declares_pager()
         && m.funcs.iter().any(|f| {
@@ -5960,6 +5961,11 @@ pub struct ExecGrants<'a> {
 /// across runs ([`RunConfig::jit_code`], #2145) — a toolchain run once per phase or per build then
 /// compiles each program once.
 ///
+/// `cpus`: how many CPUs the guest sees (`sysconf`, the `self.parallelism` it answers), when not the
+/// driver's workers ([`temen_interp::Host::set_workers`]); every process the run starts inherits it.
+/// A build whose output is committed runs with one: nifmake then runs one job at a time, so the build
+/// writes its files in the same order every time (#2442).
+///
 /// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
@@ -5972,6 +5978,7 @@ pub struct ExecGrants<'a> {
 ///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
+#[allow(clippy::too_many_arguments)]
 pub fn nim_noc_run(
     module: Module,
     posix: &temen_posix::Posix,
@@ -5982,6 +5989,7 @@ pub fn nim_noc_run(
     exec: &ExecGrants,
     backend: Backend,
     jit_code: Option<&JitCodeCache>,
+    cpus: Option<usize>,
 ) -> Result<Outcome, String> {
     if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits(&module) {
         return Err(
@@ -6029,6 +6037,9 @@ pub fn nim_noc_run(
         }
         if exec.built {
             grant_module_loader(host);
+        }
+        if let Some(n) = cpus {
+            host.set_workers(n);
         }
     };
     inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))
@@ -6299,6 +6310,99 @@ pub fn nim_program_units(
         ));
     }
     Ok(units)
+}
+
+/// The files of a nimony tree as a build in it reads them, keyed by where the build has the tree,
+/// `at`: all of them but those under its `bin/` (the toolchain, which a guest has as commands) and its
+/// `nimcache/` (what a build writes), in path order. A guest build is seeded with them before
+/// anything is derived from them, so everything a phase derives is newer: the memfs stamps write
+/// order into `st_mtim`, which is what the freshness checks in `deps.nim` and nifmake read. The
+/// self-hosted lane seeds its tree with them (`examples/nim_selfhost_lane.rs`), and so does the
+/// card's build (`examples/nim_card_bundle.rs`).
+pub fn nim_tree_files(tree: &std::path::Path, at: &str) -> Vec<(String, Vec<u8>)> {
+    fn walk(path: &std::path::Path, name: String, top: bool, out: &mut Vec<(String, Vec<u8>)>) {
+        if !path.is_dir() {
+            let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            out.push((name, bytes));
+            return;
+        }
+        let mut entries: Vec<String> = std::fs::read_dir(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|e| !(top && (e == "bin" || e == "nimcache")))
+            .collect();
+        entries.sort();
+        for e in entries {
+            walk(&path.join(&e), format!("{name}/{e}"), false, out);
+        }
+    }
+    let mut files = Vec::new();
+    walk(tree, at.trim_end_matches('/').to_string(), true, &mut files);
+    files
+}
+
+/// The **library pack** of a build run in `at`: every file it wrote under `<at>/nimcache/` for a
+/// library module, in the order it wrote them, and nimony's memos of the options it was built with
+/// ([`OPTIONS_MEMO`]). A library module is one whose `.p.nif` records a source in nimony's tree:
+/// under `lib/`, or under `src/`, which the library imports (#2033). Its files include what the
+/// Temen backend wrote for it under `t/` (nim-lang/nimony#2616): its `.x.nif`, and what a build of
+/// it as a program wrote (`t/<stem>/…`), such as the helper compile-time evaluation runs. So do the
+/// plugins the library declares (#2049): their executables, which nimony links into the cache's
+/// root (`deps.nim`'s `pluginExe`). Seeded into a later build in the same directory, after the
+/// library's sources and in this order, they are newer than everything they were made from, so that
+/// build compiles only its own modules (#958). `examples/nim_card_bundle.rs` ships the card's.
+pub fn nim_library_pack(posix: &temen_posix::Posix, at: &str) -> Vec<(String, Vec<u8>)> {
+    let cache = format!("{at}/nimcache/");
+    let mut library = std::collections::HashMap::new();
+    let mut pack = Vec::new();
+    for name in posix.file_names_by_write() {
+        let Some(rest) = name.strip_prefix(&cache) else {
+            continue;
+        };
+        let Some(bytes) = posix.read_file(&name) else {
+            continue;
+        };
+        let in_backend = rest.strip_prefix("t/").unwrap_or(rest);
+        let stem = in_backend
+            .split(['.', '/'])
+            .next()
+            .unwrap_or(in_backend)
+            .to_string();
+        let keep = rest.rsplit('/').next() == Some(OPTIONS_MEMO)
+            || (!rest.contains('/') && temen_encode::wire::is_module_blob(&bytes))
+            || *library.entry(stem).or_insert_with_key(|stem| {
+                posix
+                    .read_file(&format!("{cache}{stem}.p.nif"))
+                    .is_some_and(|nif| {
+                        nif_source(&nif)
+                            .is_some_and(|src| src.starts_with("lib/") || src.starts_with("src/"))
+                    })
+            });
+        if keep {
+            pack.push((name, bytes));
+        }
+    }
+    pack
+}
+
+/// nimony's memo of the options a stage's artifacts were made with (`deps.nim`'s `memoDiffers`,
+/// nim-lang/nimony#2616): the frontend's at the cache's root, and each program's backend one in its
+/// build directory (`t/<main>/`). A build that finds its stage's missing or different reruns every
+/// step of the stage, so a pack without them would be rebuilt from its sources. A card build reads
+/// the backend memo of `prog.nim`, the program the pack is built as (`scripts/rebuild-assets.sh`).
+const OPTIONS_MEMO: &str = "config.nif";
+
+/// The source file a `.p.nif` was parsed from: the file of its top `stmts` node's line info
+/// (`(stmts@<col>,<line>,<file>`).
+fn nif_source(nif: &[u8]) -> Option<&str> {
+    const TOP: &[u8] = b"(stmts@";
+    let at = nif.windows(TOP.len()).position(|w| w == TOP)? + TOP.len();
+    let info = nif[at..]
+        .split(|b| b.is_ascii_whitespace() || *b == b')')
+        .next()?;
+    let file = info.splitn(3, |&b| b == b',').nth(2)?;
+    core::str::from_utf8(file).ok()
 }
 
 /// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
@@ -6785,6 +6889,18 @@ type GrantFn = Arc<dyn Fn(&mut Host, u64) -> i32 + Send + Sync>;
 /// consumer→native op remap, and the requirement set (names + sigs) retained for `import.attach`.
 type GroupedSlot = (usize, Arc<[u32]>, Vec<String>, Vec<FuncType>);
 
+/// #2428 — what a [`HostCap::host_proc`]'s `make` mints a handler for, which decides how the state it
+/// makes is charged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mint {
+    /// The embedder's grant: state it chose to hand over, the grantee's from now on past any ceiling.
+    Grant,
+    /// A process the guest makes (a `fork()` twin, a spawned child re-granted the capability): its
+    /// copy of the state is the guest's own act, charged within every limit and refused when there
+    /// is no room, which fails that fork or re-grant.
+    Inherit,
+}
+
 #[derive(Clone)]
 pub struct HostCap {
     type_id: u32,
@@ -7017,10 +7133,14 @@ impl HostCap {
     /// [`CapState`](temen_interp::CapState) for it (#1699): the handler's host-side state, stated
     /// where the handler is made. `make` is handed the node of the domain the capability is granted
     /// to (#2306), which pays for the host memory a guest grows that state by
-    /// ([`temen_interp::HostCharge`]).
+    /// ([`temen_interp::HostCharge`]), and what it mints for ([`Mint`]): `None` refuses an
+    /// [`Mint::Inherit`] with no room for its state, and is never returned for a [`Mint::Grant`].
     pub fn host_proc(
         op: u32,
-        make: impl Fn(&NodeRef) -> (HostProc, temen_interp::CapState) + Send + Sync + 'static,
+        make: impl Fn(&NodeRef, Mint) -> Option<(HostProc, temen_interp::CapState)>
+            + Send
+            + Sync
+            + 'static,
     ) -> HostCap {
         let make = Arc::new(make);
         HostCap {
@@ -7032,16 +7152,17 @@ impl HostCap {
                 // state (`ForkedProc::shared`), the right default for an arbitrary host cap whose
                 // state the runtime cannot split. A personality with real per-process state supplies
                 // its own factory via [`HostCap::host_proc_forkable`] (e.g. `posix_cap`). What a twin
-                // mints is paid for by the grantee, as a child's re-grant is (#2306).
+                // mints is paid for by the grantee, as a child's re-grant is (#2306), within its
+                // limits (#2428).
                 let payer = h.own_node();
                 let fork: temen_interp::HostProcFork = Arc::new({
                     let (make, payer) = (Arc::clone(&make), payer.clone());
                     move |_pid| {
-                        let (h, state) = make(&payer);
-                        temen_interp::ForkedProc::shared(h, state)
+                        let (h, state) = make(&payer, Mint::Inherit)?;
+                        Some(temen_interp::ForkedProc::shared(h, state))
                     }
                 });
-                let (f, state) = make(&payer);
+                let (f, state) = make(&payer, Mint::Grant).expect("a grant always mints");
                 h.grant_host_proc_forkable(f, fork, state)
             }),
             unbound: false,

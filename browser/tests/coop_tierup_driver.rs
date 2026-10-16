@@ -2180,15 +2180,16 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
     // Non-vacuity: the unit ran emitted (invoke), and — post-#889 outlining (#1026 slice 1: this
     // driver now outlines cap sites exactly like the pump) — the helper `f1` itself **emits** (its
     // cap sites hoist to wrappers), so BOTH program slots dispatch natively and the live-window
-    // bounces are f1's outlined wrappers 8/9 (append order: f0's map/compile/invoke/write = 4–7,
-    // f1's grow/write = 8/9). The mid-invoke growth now happens inside wrapper 8's bounce — same
-    // contract, the pump's `linked_unit_bounces` shape on the cooperative driver.
+    // bounces are f1's outlined wrappers 10/11 (append order: f0's spawn/map/compile/invoke/join/
+    // write = 4–9, the spawn and join since #2443; f1's grow/write = 10/11). The mid-invoke growth
+    // now happens inside wrapper 10's bounce — same contract, the pump's `linked_unit_bounces`
+    // shape on the cooperative driver.
     assert!(
         invokes >= 1,
         "the linked unit must run emitted (invoke non-vacuity)"
     );
     assert!(
-        d.bounces().contains(&8) && d.bounces().contains(&9),
+        d.bounces().contains(&10) && d.bounces().contains(&11),
         "the helper's outlined wrappers must bounce during the invoke: {:?}",
         d.bounces()
     );
@@ -2926,6 +2927,98 @@ export 0 func "_start" 0
         want.value,
         "value parity — the bounce-created fiber persisted into the run registry"
     );
+    temen_coop_close();
+}
+
+/// #2443: a fiber resumed inside a bounce cannot stop its task, so where the module holds a
+/// scheduler op a resume is a seed. Here f2 resumes a fiber whose `atomic.notify` is a scheduler
+/// stop. Were f2 a cross-tier leaf, f1 would emit and the notify would fault inside f2's bounce;
+/// as a seed it keeps f1 interpreted, and the run matches the oracle. f4 is the run's emitted
+/// region, which the open needs.
+#[test]
+fn coop_a_fiber_that_stops_keeps_its_resumers_callers_interpreted() {
+    let _g = ffi_guard();
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 500
+  vr1 = call 1 (vx)
+  vr4 = call 4 (vx)
+  vr = i64.add vr1 vr4
+  vsl = i64.const {SLOT}
+  i64.store vsl vr
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vf = ref.func 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs, vv = cont.resume vk v0
+  return vv
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vaddr = i64.const 16384
+  vc = i32.const 1
+  vn = atomic.notify vaddr vc
+  vk = i64.const 7
+  vr = i64.add varg vk
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 3
+  vr = i64.mul v0 vk
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        (500 + 100 + 7) + 500 * 3,
+        "oracle: the fiber notifies and returns"
+    );
+
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open must admit (status {})", temen_status());
+    let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+    assert!(tierups >= 1, "f4 must tier up");
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(temen_coop_value(), want.value, "value parity");
     temen_coop_close();
 }
 
@@ -4285,9 +4378,8 @@ fn coop_tierup_serves_a_parents_children() {
 /// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
 /// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
 /// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
-/// as the interpreter oracle does. This is the emitted-execution twin of `temen-wasm-jit`'s
-/// `nested_paged.rs` (which drives the same trap with a hand-rolled harness), carried here through the
-/// real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting + code-origin axes).
+/// as the interpreter oracle does, through the real coop FFI over a confined child's own window
+/// (#1151, INVARIANTS #14 nesting + code-origin axes).
 fn coop_child_paged_guest_text() -> String {
     let name = b"instantiator";
     let mut w0 = [0u8; 8];

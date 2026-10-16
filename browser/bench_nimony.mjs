@@ -13,7 +13,7 @@
 //
 // `NIM_LANE_DIR` holds the toolchain as `scripts/nim-toolchain.sh` writes it and `src/nimbuild.rs`
 // reads it (`nimony.temen`, …, `sh.ir`, `libc.temeno`); `NIM_TREE` is a lane program tree, seeded and
-// built at `NIM_AT` (by default its host path). `NIM_LIB` is a library pack (`nimbuild --pack`, from a
+// built at `NIM_AT` (by default its host path). `NIM_LIB` is a library pack (`nim_card_bundle --pack`, from a
 // build at the same `NIM_AT`), seeded after the tree so the build compiles only the program's own
 // modules. The page receives them over routed URLs.
 import { startServer } from './serve.mjs';

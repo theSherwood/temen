@@ -623,7 +623,11 @@ its parent, the twin's with the growth its copy holds, before the process exists
 room refuses the `fork` or `posix_spawn` with `-EAGAIN`, and no personality has registered it. The
 charge goes back when the process ends; an exec moves it to its image's window, the image's declared
 memory, charging what that needs past the caller's window first and handing back what the caller's
-held past it (#2332). A root's processes pay from the run's own node.
+held past it (#2332). A root's processes pay from the run's own node. What a capability holds for
+the parent is copied for the twin by its provider, charged within every limit too: a provider with no
+room for its copy (a POSIX process's tables and directory streams, a seeded store) refuses the fork
+with `-EAGAIN`, and every twin the providers before it minted is abandoned, so none stays registered
+(#2373, #2428).
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
@@ -638,14 +642,19 @@ held past it (#2332). A root's processes pay from the run's own node.
 >
 > **The pager is typed (#744, 2026-10-07):** a record's `pager` must name an impl export of exactly
 > `{ page: (i64) -> (i64) }` (`Module::is_pager_export`), the one shape the fault's dispatch serves;
-> naming any other export fails the spawn closed. Demand paging runs on the tree-walker only: the
-> native tiers refuse a pager record and fold a module that could build one to the oracle (native
-> paging is #2164).
+> naming any other export fails the spawn closed. Demand paging runs on both interpreters: the
+> tree-walker, and the bytecode engine's drivers that serve their children, the cooperative pump
+> and the parallel driver (#2164). There a fault is a `page(addr)` request into the spawner's
+> serve loop, and the faulting op re-executes once the page is in place. The bytecode engine's
+> debug scheduler and `Vcpu` serve no child, so they decline a module that could page one, to the
+> oracle. The Cranelift JIT refuses a pager record, and a module that could build one leaves it
+> for the bytecode engine (#2164).
 >
 > **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
 > a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
 > pages only: a durable window's control words and declared shadow arena are the runtime's, and stay
-> mapped.
+> mapped. A freeze holds a pager at `NORMAL`, serving, until the children it pages have unwound,
+> so a child that faults during the freeze is served (leaves first, #2455).
 
 Two different things surface as "SIGSEGV" and the design splits them:
 
@@ -655,7 +664,7 @@ Two different things surface as "SIGSEGV" and the design splits them:
   tree, for the benefit of a guest probing its confinement. Post-mortem observation is
   covered (trap kind + backtrace to the parent — `jit_trap_backtrace`).
 - **In-window memory-management faults (unmapped / protected page)** — a *resumable
-  event* (on the tree-walker; #2164 for the native tiers): a demand-paged child's fault
+  event* (on the interpreters; #2164 for the Cranelift JIT): a demand-paged child's fault
   suspends it with the fault address, the pager supplies the page, and **resume retries
   the access**. Retry-on-resume is the trick:
   precise fault handling with no per-access deoptimization metadata — the tax that

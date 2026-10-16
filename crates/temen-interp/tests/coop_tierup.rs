@@ -326,7 +326,7 @@ fn a_task_tiers_up_once_per_call() {
 // by calling `CoopRun::bounce` — emulating the emitted `f1` reaching `call_interp` for func 2 — then
 // delivers `C`'s result as `L`'s. Proves the cross-tier bounce dispatches through the tiering-up task's
 // env (masked table → `(module 0, func 2)`), marshals args/results, and threads the run-shared fiber
-// registry — the `CoopSched` analogue of `Vcpu::bounce_call`. The dispatch-table slot for a module-0
+// registry. The dispatch-table slot for a module-0
 // function `c` is just `c` (`SharedSlots::new` packs slot i ↦ `(0, i)`), so the bounce target is `2`.
 const SRC_BOUNCE: &str = r#"
 func () -> (i64) {
@@ -1394,11 +1394,11 @@ fn grant_proc_doors(host: &mut Host) -> i32 {
     let fork: HostProcFork = Arc::new(move |_pid| {
         let exited = Arc::clone(&exited);
         let source: Arc<dyn SignalSource + Send + Sync> = Arc::new(ParkDoor::default());
-        ForkedProc {
+        Some(ForkedProc {
             signal: Some((source, Arc::default())),
             exit: Some(Arc::new(move |s| *exited.lock().unwrap() = Some(s))),
             ..ForkedProc::shared(Box::new(|_, _, _, _| Ok(vec![ENOSYS])), CapState::Stateless)
-        }
+        })
     });
     host.set_signal_source(door, Arc::default());
     host.grant_host_proc_forkable(doors, fork, CapState::Stateless)

@@ -900,3 +900,87 @@ fn a_root_calling_a_host_capability_inline_is_offered_when_none_can_park() {
         "an offloadable capability's call can punt"
     );
 }
+
+// --- #1722: a host-completed call whose reply cannot park -----------------------------------------
+
+/// One host-completed call (op 1) declared with a reply that is not a single `i64`: C's `int`, as a
+/// program declares an extern its embedder grants as a host cap, or no reply at all. A parked call
+/// is delivered into one `i64` slot, so neither can park; each declines, never waiting on an answer
+/// only the host could give.
+fn narrow_call(reply: &str) -> temen_ir::Module {
+    let (ret, sig) = match reply {
+        "i32" => ("  vr64 = i64.extend_i32_s vr\n  return vr64\n", "(i32)"),
+        _ => ("  vz = i64.const 0\n  return vz\n", "()"),
+    };
+    let call = if reply == "i32" {
+        format!("  vr = call.cap 13 1 (i64) -> {sig} vh (vseven)\n")
+    } else {
+        format!("  call.cap 13 1 (i64) -> {sig} vh (vseven)\n")
+    };
+    parse(&format!(
+        "memory 16\nfunc (i32) -> (i64) {{\nblock 0 (vh: i32) {{\n  vseven = i64.const 7\n{call}{ret}  }}\n}}\n"
+    ))
+}
+
+/// Run `f` on its own thread, for at most 30 s: a call that waits on a completion only its host could
+/// give would hang the test rather than fail it.
+fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the run waited on a host-completed call that cannot park")
+}
+
+/// The trap each driver that parks host-completed calls ends a run of `m` with.
+fn on_each_parking_driver(m: &temen_ir::Module) -> Vec<(&'static str, Option<Trap>)> {
+    ["vcpu", "coop", "debug"]
+        .into_iter()
+        .map(|driver| {
+            let m = m.clone();
+            let end = bounded(move || {
+                let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+                let (host, h) = host_completed(&recorded);
+                match driver {
+                    "vcpu" => match vcpu(&program(&m), host, h).run() {
+                        VcpuEvent::Trapped(t) => Some(t),
+                        _ => None,
+                    },
+                    "coop" => match coop(&m, host, h).run() {
+                        CoopEvent::Trapped(t) => Some(t),
+                        _ => None,
+                    },
+                    _ => {
+                        let args = [Value::I32(h)];
+                        let mut run =
+                            bytecode::ScheduledDebugRun::new_with_host(&m, 0, &args, host)
+                                .expect("in subset");
+                        match run.run_until_stop(&mut 2_000_000) {
+                            bytecode::SchedStop::Finished(Err(t)) => Some(t),
+                            _ => None,
+                        }
+                    }
+                }
+            });
+            (driver, end)
+        })
+        .collect()
+}
+
+/// A host-completed call declared with an `int` reply declines with `CapFault` on every driver
+/// that parks host-completed calls.
+#[test]
+fn a_host_completed_call_with_an_int_reply_declines() {
+    for (driver, end) in on_each_parking_driver(&narrow_call("i32")) {
+        assert_eq!(end, Some(Trap::CapFault), "{driver}");
+    }
+}
+
+/// The same, declared with no reply.
+#[test]
+fn a_host_completed_call_with_no_reply_declines() {
+    for (driver, end) in on_each_parking_driver(&narrow_call("none")) {
+        assert_eq!(end, Some(Trap::CapFault), "{driver}");
+    }
+}

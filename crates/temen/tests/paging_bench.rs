@@ -262,21 +262,21 @@ fn fault_service_latency() {
 }
 
 /// The **fourth backend** — the wasm-JIT tier (`temen-wasm-jit`) — pinned so it is never silently
-/// forgotten in this comparison. Today the pager parent sits outside the emitter's nested
-/// subset (`svc.wait` serve loops have no bounce arms), so the tier **fails closed**
-/// and the entry folds to the bytecode interpreter: the wasm-JIT row of the fault-service table
-/// *is* the Bytecode row. This test asserts exactly that state.
+/// forgotten in this comparison. Today the pager parent sits outside the emitter's subset
+/// (`svc.wait` serve loops have no bounce arms), so its entry does not tier up and runs on the
+/// bytecode interpreter: the wasm-JIT row of the fault-service table *is* the Bytecode row. This
+/// test asserts exactly that state.
 /// When the emitter grows the arms, the assert flips — replace it with a real timed lane
-/// (emit + run under `wasmi`, the `nested_vm.rs` harness shape) instead of deleting the test.
+/// (emit + run under `wasmi`) instead of deleting the test.
 #[test]
 fn wasm_jit_lane_folds_closed_today() {
     let src = offer_paging_program(1, 1);
     let m = parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let r = temen_wasm_jit::compile_module_nested(&m, false);
+    let (_, emitted) = temen_wasm_jit::compile_module_tierup(&m, false).expect("tier-up emit");
     assert!(
-        r.is_err(),
-        "wasm-jit: the emitter now accepts the pager shape — add the timed wasmi lane to the \
+        !emitted[0],
+        "wasm-jit: the emitter now takes the pager's entry — add the timed wasmi lane to the \
          probe (and to the fault-service table) instead of relying on the fold"
     );
 }
