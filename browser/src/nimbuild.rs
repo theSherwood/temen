@@ -146,13 +146,7 @@ fn main() {
 
     // No `validator` ships with the toolchain, so the build says so up front instead of nimony
     // warning about it at every plugin it builds (the card passes the same).
-    let argv: [&[u8]; 5] = [
-        b"bin/nimony",
-        b"t",
-        b"--novalidate",
-        b"--isMain",
-        prog.as_bytes(),
-    ];
+    let argv: [&[u8]; 5] = [b"bin/nimony", b"t", b"--novalidate", b"--isMain", prog.as_bytes()];
     let t0 = Instant::now();
     let b = temen_browser::nim_build(&modules[0], &commands, None, &files, &argv, &dir, leaves)
         .expect("the interpreter tier runs nimony");

@@ -315,11 +315,7 @@ fn the_committed_toolchain_decodes_and_holds_what_a_build_needs() {
         "the frontend's options memo, without which a build checks every module again"
     );
     assert!(
-        at(&format!(
-            "{cache}t/{}/config.nif",
-            module_suffix("prog.nim")
-        ))
-        .is_some(),
+        at(&format!("{cache}t/{}/config.nif", module_suffix("prog.nim"))).is_some(),
         "the card program's backend memo, without which its build lowers every module again"
     );
     // The plugins the library declares, built: `std/macros`' grammar declares parsegen and regex

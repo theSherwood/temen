@@ -1352,10 +1352,7 @@ static X2_PROGRAMS: std::sync::Mutex<Option<Programs>> = std::sync::Mutex::new(N
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
-    let programs = X2_PROGRAMS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let programs = X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let wasm = programs.and_then(|p| {
         let p = p.lock().unwrap_or_else(|e| e.into_inner());
         p.get(&module).cloned().flatten().map(|e| e.wasm)
@@ -11445,8 +11442,8 @@ fn emit_module(
     parks: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
-    let paged =
-        m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let paged = m.data.iter().any(|d| d.readonly)
+        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let page_log2 = paged.then_some(page_log2);
     let (wasm, emit) =
