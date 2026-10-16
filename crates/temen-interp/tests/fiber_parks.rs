@@ -265,6 +265,7 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -499,6 +500,7 @@ fn root_return_abandons_a_cap_parked_fiber() {
                 a + 100
             }))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -532,6 +534,7 @@ fn a_durable_caller_never_fiber_parks_on_a_punt() {
             let a = *args.first().unwrap_or(&0);
             OffloadOutcome::Offload(Box::new(move || a + 100))
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();
@@ -586,6 +589,7 @@ fn ordered_delivery_holds_a_ready_later_completion_for_an_earlier_park() {
                 OffloadOutcome::Offload(Box::new(move || 222))
             }
         }),
+        None,
         temen_interp::CapState::Stateless,
     );
     let comps = host.completions();

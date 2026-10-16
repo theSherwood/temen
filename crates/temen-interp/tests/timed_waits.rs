@@ -244,6 +244,7 @@ fn naps_keep_real_time_while_the_root_waits_on_the_world() {
                     0
                 }))
             }),
+            None,
             CapState::Stateless,
         );
         (h, vec![Value::I32(call)])

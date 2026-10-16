@@ -815,9 +815,12 @@ impl ChildExec {
                 Outcome::Retiring if !task.threads_live() => Outcome::Finished,
                 o => o,
             };
-            // #1820 — a join counts itself through its completion cell, so it is not counted here.
-            let self_counted =
-                matches!(outcome, Outcome::Parked { .. }) && task.slot.parked_on().counts_itself();
+            // #1820 — a join counts itself through its completion cell, so it is not counted here;
+            // #2424 — nor is a wait on an answer from outside the run, which is not blocked.
+            let uncounted = matches!(outcome, Outcome::Parked { .. }) && {
+                let on = task.slot.parked_on();
+                on.counts_itself() || matches!(on, fiber_rt::ParkOn::Outside)
+            };
             let mut task = Some(task);
             let mut g = lock(&self.state);
             match outcome {
@@ -852,7 +855,7 @@ impl ChildExec {
                         // #1631 — a park that wakes on its own deadline is a potential notifier, so
                         // it stays out of the deadlock predicate's count. It is still `parked` for
                         // the cadence sweep, which is what fires that deadline.
-                        if deadline.is_none() && !self_counted {
+                        if deadline.is_none() && !uncounted {
                             e.counted = true;
                             if let Some(d) = self.domain() {
                                 d.task_parked();

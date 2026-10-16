@@ -2491,8 +2491,8 @@ fn drive_arc(
 /// the live cell (their mutations land in the instance directly, exactly as an eval-loop
 /// animation's do), so concurrent eval-loop animations keep working while the sub-run is in
 /// flight — where the by-value take would gut the cell under them. The cell persists after the
-/// run (no unwrap-back); the sub-run's transient `completion_notify` hook is cleared by the core's
-/// teardown. Durable providers are refused upstream (a durable world can't be sub-run over a
+/// run (no unwrap-back); the completion-wake hook a sub-run's park installs on it holds the
+/// sub-run's scheduler weakly, so it pins nothing once the run ends. Durable providers are refused upstream (a durable world can't be sub-run over a
 /// live shared cell — the freeze/thaw seeds assume exclusive ownership), so the thaw seeds are
 /// empty by construction.
 fn drive_arc_shared(
@@ -3083,19 +3083,6 @@ fn drive_over_cell(
         s.handoff = handoff;
         Arc::new(s)
     };
-    // §9/§12 async ring: wire the completion `notify` hook to this run's M:N scheduler, so an offload
-    // worker waking a vCPU parked in `wait` is a `Scheduler::notify` on the confined counter key.
-    // §12 — the completion-wake hook: a pool worker posting a punted dispatch's result
-    // triggers the scheduler's ordered drain, finishing vCPUs parked in `Blocked::CapPending`.
-    // Cleared at teardown (it captures the run's scheduler — cycle discipline).
-    {
-        let sched_for_comp = Arc::clone(&sched);
-        let mut hg = host_shared.lock_unpoisoned();
-        let comps = hg.completions();
-        hg.set_completion_notify(Arc::new(move || {
-            sched_for_comp.completion_drain(&comps);
-        }));
-    }
     // #799 L1 (embedder `^C`) / #863 slice 3 — hand the signal source a scheduler-wake closure so an
     // embedder raise (`Posix::raise_signal`) can interrupt a parked blocking syscall even when every
     // fiber is parked and no safepoint fires. The personality invokes it only for a *deliverable*
@@ -3251,15 +3238,11 @@ fn drive_over_cell(
         let _ = h.join();
     }
     // Drain any in-flight async-ring offload jobs (they hold the window's `Arc<Region>` and may still
-    // be writing the futex counter) and drop the `notify` hook's `Arc<Scheduler>` before reading the
-    // final window back. Safe to lock: all vCPUs are gone, so the shared host is otherwise idle.
-    {
-        let mut h = host_shared.lock_unpoisoned();
-        h.quiesce_pool();
-        h.clear_completion_notify();
-        // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
-        // source kept alive past the run pins nothing and a post-run raise is a no-op.
-    }
+    // be writing the futex counter) before reading the final window back. Safe to lock: all vCPUs are
+    // gone, so the shared host is otherwise idle. Nothing to unwire: the completion-wake hooks
+    // (#2424) and the signal-wake closure (#863 slice 3) hold the scheduler *weakly*, so a store or
+    // source kept alive past the run pins nothing, and a late completion or raise is a no-op.
+    host_shared.lock_unpoisoned().quiesce_pool();
     // #1361 step 3 — harvest each live detached child the freeze rang the doorbell for. By here
     // `worker_loop` has run until every vCPU finished, so a child that took the bell has unwound and
     // delivered its window through the ordinary result channel; claim it and pair it with the
@@ -5233,10 +5216,11 @@ enum Blocked {
     /// re-executes from the top and either writes into the freed room or fails `-EPIPE`.
     PipeWrite { pipe: u32 },
     /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
-    /// by its completion id. The offload pool posts the scalar result to [`Completions`]; the
-    /// run's `completion_notify` hook drains `completion_waiters` smallest-id-first (ids are
-    /// minted monotonically, so this is **submission order** — the §18 ordered-delivery pin) and
-    /// finishes the call via [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
+    /// by its completion id. The offload pool posts the scalar result to the domain's
+    /// [`Completions`]; the wake hook the park installed there drains the domain's
+    /// `completion_waiters` smallest-id-first (each domain mints its ids monotonically, so this is
+    /// its **submission order** — the §18 ordered-delivery pin) and finishes the call via
+    /// [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
     /// call just takes time), so a backend that blocks inline instead stays byte-identical.
     CapPending { id: u64 },
     /// §3.6 slice 3 — parked inside a call to a **live callee** awaiting its reply, keyed by
@@ -6255,15 +6239,15 @@ struct Sched {
     /// drain the entry into `runnable` and the write re-issues.
     pipe_write_waiters: BTreeMap<u32, Vec<Waiter>>,
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
-    /// keyed by **completion id** (unique: [`Completions`] mints monotonically per host, and one
-    /// cell runs at most one sub-run at a time — the `busy` gate). Per host is per run: only the
-    /// run's root host can punt, because the punting caps (offloadable host procs, `Blocking`) are
-    /// neither re-grantable nor forkable, so no child, twin or instance powerbox ever holds one
-    /// (#1817), and only the root host carries the drain hook. Drained smallest-id-first by
-    /// [`Scheduler::completion_drain`], which stops at the first waiter whose result has not
-    /// arrived — so delivery is in submission order (§18) and a later completion never overtakes
-    /// an earlier parked caller.
-    completion_waiters: BTreeMap<u64, Waiter>,
+    /// keyed by **`(domain id, completion id)`**: each domain mints its ids in its own
+    /// [`Completions`] store, from 0, so a child's, twin's or instance's punt (#2424) never meets
+    /// another domain's id. Drained by [`Scheduler::completion_drain`], each domain's waiters
+    /// smallest-id-first, stopping at the first whose result has not arrived — so a domain's
+    /// results are delivered in its submission order (§18), and one domain's outstanding call never
+    /// holds back another's.
+    completion_waiters: BTreeMap<(u64, u64), Waiter>,
+    /// #2424 — the store each domain in `completion_waiters` parks on, by domain id.
+    completion_stores: BTreeMap<u64, Arc<Completions>>,
     /// §3.6 slice 3 — callers parked awaiting a live-callee **reply**, keyed by
     /// `(callee domain id, dispatch ticket)` (exactly one caller per key; woken by
     /// [`Scheduler::cap_reply_or_stash`] with the result). The **callee** must be part of the key:
@@ -6869,44 +6853,67 @@ impl Scheduler {
     }
 
     /// §12 parking-on-blocking (slice 2) — deliver ready punt completions to parked callers **in
-    /// submission order**: drain `completion_waiters` smallest-id-first and stop at the first
-    /// waiter whose result has not arrived, so a later completion never overtakes an earlier
-    /// parked caller (the §18 ordered-delivery pin; latency stays timing-dependent, order does
-    /// not). Called by the run's `completion_notify` hook after each completion posts, and by the
-    /// [`Blocked::CapPending`] park handler right after registering — the register-then-recheck
-    /// TOCTOU close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park
-    /// is delivered here instead of stranding the caller. Unclaimed results simply stay in
+    /// submission order**: drain each domain's `completion_waiters` smallest-id-first and stop at the
+    /// first waiter whose result has not arrived, so a later completion never overtakes an earlier
+    /// parked caller of its domain (the §18 ordered-delivery pin; latency stays timing-dependent,
+    /// order does not). Domains are drained independently (#2424): one's outstanding call never
+    /// holds back another's result. Called by each store's wake hook after a completion posts
+    /// ([`Scheduler::wake_on`]), and right after a park registers — the register-then-recheck TOCTOU
+    /// close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park is
+    /// delivered here instead of stranding the caller. Unclaimed results simply stay in
     /// [`Completions::ready`] for their (not-yet-registered or blocking-wait) caller — the stash
     /// **is** the store, so there is no lost-wakeup window. Lock order sched → completions; the
     /// completions lock is never held while taking the scheduler's.
-    fn completion_drain(&self, comps: &Completions) {
+    fn completion_drain(&self) {
         let mut s = self.lock();
         let mut woke = false;
-        while let Some((&id, _)) = s.completion_waiters.first_key_value() {
-            let Some(r) = comps.try_take(id) else {
-                break;
-            };
-            match s.completion_waiters.remove(&id) {
-                Some(Waiter::VCpu(mut v)) => {
-                    v.pending = Some(Pending::CapResult(r));
-                    s.runnable.push_back(v);
-                    woke = true;
+        let doms: Vec<u64> = s.completion_stores.keys().copied().collect();
+        for dom in doms {
+            let comps = Arc::clone(&s.completion_stores[&dom]);
+            let of_dom = (dom, 0)..=(dom, u64::MAX);
+            while let Some((&key, _)) = s.completion_waiters.range(of_dom.clone()).next() {
+                let Some(r) = comps.try_take(key.1) else {
+                    break;
+                };
+                match s.completion_waiters.remove(&key) {
+                    Some(Waiter::VCpu(mut v)) => {
+                        v.pending = Some(Pending::CapResult(r));
+                        s.runnable.push_back(v);
+                        woke = true;
+                    }
+                    // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
+                    // rides the same ordered drain. The wake pair is the established one: the
+                    // result lands on the parked frame, and the domain's `svc.wait` consumers are
+                    // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
+                    Some(Waiter::Fiber { reg, slot, svc, .. }) => {
+                        reg.wake_blocked(slot, Reg::from_i64(r));
+                        svc_wake_locked(&mut s, svc);
+                        woke = true;
+                    }
+                    None => unreachable!("range then remove under one lock"),
                 }
-                // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
-                // rides the same ordered drain. The wake pair is the established one: the
-                // result lands on the parked frame, and the domain's `svc.wait` consumers are
-                // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
-                Some(Waiter::Fiber { reg, slot, svc, .. }) => {
-                    reg.wake_blocked(slot, Reg::from_i64(r));
-                    svc_wake_locked(&mut s, svc);
-                    woke = true;
-                }
-                None => unreachable!("first_key_value then remove under one lock"),
+            }
+            if s.completion_waiters.range(of_dom).next().is_none() {
+                s.completion_stores.remove(&dom);
             }
         }
         if woke {
             self.work.notify_all();
         }
+    }
+
+    /// #2424 — make this scheduler's drain the wake hook of `comps`, the store a caller is about to
+    /// park on: the root's, or a child's, twin's or instance's. Installed at every park, not once
+    /// per run, so a domain created after the run started is covered, and a store that outlives
+    /// its run (a reactor's) answers to the scheduler now parking on it. The hook holds the
+    /// scheduler weakly: a store keeps no run alive, and a late completion after the run is a no-op.
+    fn wake_on(self: &Arc<Self>, comps: &Completions) {
+        let sched = Arc::downgrade(self);
+        comps.set_notify(Some(Arc::new(move || {
+            if let Some(s) = sched.upgrade() {
+                s.completion_drain();
+            }
+        })));
     }
 
     /// #1677 — where fiber `slot` of `reg` is parked ([`Sched::fiber_park`]). Probe only.
@@ -9412,7 +9419,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // that landed before the insert is delivered right here instead of stranding the
                 // caller. (The host guard below is released before the scheduler lock is taken —
                 // lock order sched → host is never crossed.)
-                let comps = v.host.lock_unpoisoned().completions();
+                let (comps, dom) = {
+                    let h = v.host.lock_unpoisoned();
+                    (h.completions(), h.domain_id())
+                };
+                sched.wake_on(&comps);
                 {
                     let mut s = sched.lock();
                     // §12 domain-lifetime park gate (owner 2026-07-24): never park into a
@@ -9421,9 +9432,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         sched.work.notify_all();
                         return;
                     };
-                    s.completion_waiters.insert(id, Waiter::VCpu(v));
+                    s.completion_waiters.insert((dom, id), Waiter::VCpu(v));
+                    s.completion_stores.insert(dom, comps);
                 }
-                sched.completion_drain(&comps);
+                sched.completion_drain();
             }
             Step::Park(Blocked::CapReply { ticket, callee }) => {
                 v.reply_ticket = Some(ticket);
@@ -15476,11 +15488,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             if let SchedRef::Real(sr) = sched {
                                 let regc = Arc::clone(registry);
                                 fiber_park!(|slot: usize| {
+                                    sr.wake_on(&comps);
                                     let mut sg = sr.lock();
-                                    sg.completion_waiters
-                                        .insert(id, Waiter::fiber(Arc::clone(&regc), slot, svck));
+                                    sg.completion_waiters.insert(
+                                        (svck as u64, id),
+                                        Waiter::fiber(Arc::clone(&regc), slot, svck),
+                                    );
+                                    sg.completion_stores.insert(svck as u64, Arc::clone(&comps));
                                     drop(sg);
-                                    sr.completion_drain(&comps);
+                                    sr.completion_drain();
                                 });
                             }
                         }
@@ -21461,6 +21477,11 @@ impl Drop for OffloadPool {
 pub struct Completions {
     mx: Mutex<CompletionState>,
     cv: Condvar,
+    /// §12 slice 2 — the **completion wake** hook: called after each result posts, so the driver
+    /// whose callers park on this store can deliver it ([`Completions::set_notify`]). On the store,
+    /// not the `Host`, so a pool job reads the hook installed when it finishes, not when it was
+    /// punted, and a driver can install it on any domain's store a caller parks on (#2424).
+    notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// #1366 — whether a driver that **surfaces** cap parks to the embedder is running this host
     /// (set by [`bytecode::Vcpu::run`]). A host-completed punt is admitted only then; every other
     /// driver could only wait inline on it, so the dispatch declines *before* the submit hook runs
@@ -21518,8 +21539,16 @@ impl Completions {
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
+            notify: Mutex::new(None),
             host_ok: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// §12 — install (`Some`) or remove the hook each posted result calls
+    /// ([`Completions::notify`]). Called before the caller parks: a result posted before it was
+    /// installed is found by the driver's recheck after the park, one posted after rings it.
+    pub fn set_notify(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.notify.lock_unpoisoned() = f;
     }
 
     /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
@@ -21587,6 +21616,12 @@ impl Completions {
         Self::fiber_drain_locked(&mut g);
         drop(g);
         self.cv.notify_all();
+        // The result post happens-before the wake hook, so a drain the hook runs always finds the
+        // result it is delivering (no lost wakeup). Called with no lock held: the hook drains.
+        let hook = self.notify.lock_unpoisoned().clone();
+        if let Some(h) = hook {
+            h();
+        }
     }
 
     /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
@@ -21669,23 +21704,42 @@ impl Completions {
         g.ready.remove(&id)
     }
 
-    /// Block until completion `id` has arrived, or for at most `within`, and leave it for the drain
-    /// to take: the cooperative pump's idle wait (#2047), which then delivers it the way every
-    /// round does, and its wait for its next deadline (#1979). Whether it has arrived.
-    pub fn wait_ready(&self, id: u64, within: Option<std::time::Duration>) -> bool {
-        let g = self.mx.lock_unpoisoned();
-        let not_yet = |s: &mut CompletionState| !s.ready.contains_key(&id);
+    /// Block until one of `calls` (each a store and an id minted there) has arrived, or for at most
+    /// `within`, and leave it for its drain to take: a cooperative driver's idle wait (#2047) and
+    /// its wait for its next deadline (#1979), while callers in any number of domains are parked,
+    /// each domain's calls in its own store (#2424). Whether a store rang. Each rings this wait's
+    /// bell when a result posts ([`Completions::set_notify`]), hung before any is looked at, so a
+    /// result posted meanwhile is not missed. The hook outlives the wait as a no-op.
+    pub fn wait_any(
+        calls: &[(Arc<Completions>, u64)],
+        within: Option<std::time::Duration>,
+    ) -> bool {
+        let bell = Arc::new((Mutex::new(false), Condvar::new()));
+        for (comps, _) in calls {
+            let bell = Arc::downgrade(&bell);
+            comps.set_notify(Some(Arc::new(move || {
+                if let Some(bell) = bell.upgrade() {
+                    *bell.0.lock_unpoisoned() = true;
+                    bell.1.notify_all();
+                }
+            })));
+        }
+        let arrived = |(comps, id): &(Arc<Completions>, u64)| {
+            comps.mx.lock_unpoisoned().ready.contains_key(id)
+        };
+        if calls.iter().any(arrived) {
+            return true;
+        }
+        let (rung, cv) = &*bell;
+        let g = rung.lock_unpoisoned();
         let g = match within {
-            None => self
-                .cv
-                .wait_while(g, not_yet)
-                .unwrap_or_else(|e| e.into_inner()),
+            None => cv.wait_while(g, |r| !*r).unwrap_or_else(|e| e.into_inner()),
             Some(d) => {
-                let waited = self.cv.wait_timeout_while(g, d, not_yet);
+                let waited = cv.wait_timeout_while(g, d, |r| !*r);
                 waited.unwrap_or_else(|e| e.into_inner()).0
             }
         };
-        g.ready.contains_key(&id)
+        *g
     }
 
     /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered
@@ -21757,8 +21811,9 @@ pub type HostProcFork = Arc<dyn Fn(u64) -> Option<ForkedProc> + Send + Sync>;
 pub type ExecRemapHook = Arc<dyn Fn(&[(i32, i32)]) + Send + Sync>;
 
 pub struct ForkedProc {
-    /// The new domain's handler closure over the provider's (duplicated or shared) state.
-    pub handler: HostProc,
+    /// The new domain's handler over the provider's (duplicated or shared) state: synchronous, or
+    /// offloadable (#2424), as the provider mints it.
+    pub handler: ProcHandler,
     /// A signal door over the **new process's own** signal state, installed on the new domain's
     /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
     /// pre-split behavior, right for providers whose state is fully shared).
@@ -21805,6 +21860,15 @@ impl ForkedProc {
     /// fork-of-fork through the same factory. The pre-#863 contract, right for providers whose
     /// state is deliberately global (a scripted table, a shared service shim).
     pub fn shared(handler: HostProc, state: CapState) -> Self {
+        Self::of(ProcHandler::Sync(handler), state)
+    }
+
+    /// [`Self::shared`] for an offloadable handler ([`Host::grant_host_proc_offloadable`], #2424).
+    pub fn offloadable(handler: OffloadHostProc, state: CapState) -> Self {
+        Self::of(ProcHandler::Offloadable(handler), state)
+    }
+
+    fn of(handler: ProcHandler, state: CapState) -> Self {
         Self {
             handler,
             signal: None,
@@ -21888,8 +21952,9 @@ pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
 /// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
-/// the right to punt to the offload pool.
-enum ProcHandler {
+/// the right to punt to the offload pool. A fork factory mints either ([`ForkedProc::handler`]),
+/// so a spawned child or a fork twin inherits a handler of the shape its parent was granted (#2424).
+pub enum ProcHandler {
     Sync(HostProc),
     Offloadable(OffloadHostProc),
 }
@@ -23398,23 +23463,15 @@ pub struct Host {
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
     pending_inherited: Vec<(u32, StreamRole)>,
-    /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
-    /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
-    /// workers ([`OffloadPool`]'s `Drop`).
+    /// The §12 bounded blocking-offload pool, created lazily on the first punted call
+    /// ([`Host::punt_or_inline`]), so a `Host` that never offloads spawns no threads. Dropping it
+    /// joins the workers ([`OffloadPool`]'s `Drop`).
     pool: Option<OffloadPool>,
     /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
     /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
     /// without the host lock. Shared out by [`Host::completions`] before the wait. Untouched
     /// (nothing minted) unless an offloadable handler punts on the parking-aware face.
     completions: Arc<Completions>,
-    /// §12 parking-on-blocking (slice 2) — the **completion wake** hook: a pool worker calls this
-    /// after posting a punted job's result, so the run's scheduler can drain
-    /// `completion_waiters` (deliver to parked vCPUs in submission order). Installed per run by
-    /// the executor that owns the wake mechanism (`drive_over_cell` wires it to
-    /// `Scheduler::completion_drain`), cleared at run teardown (it captures the `Arc<Scheduler>`
-    /// — same reference-cycle discipline as `async_notify`); `None` ⇒ parked callers don't exist
-    /// (every waiter is a blocking `Completions::wait`), so no wake is needed.
-    completion_notify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// #796 L2 async signals — a **cheap per-op armed flag** the running vCPU polls (like `kill`): a
     /// [`SignalSource`] sets it when a caught, unmasked signal becomes pending. A relaxed atomic load per
     /// op when a source is installed, and free (no source ⇒ never consulted) otherwise.
@@ -24205,7 +24262,6 @@ impl Host {
             pending_inherited: Vec::new(),
             pool: None,
             completions: Arc::new(Completions::new()),
-            completion_notify: None,
             sig_armed: Arc::new(AtomicBool::new(false)),
             multi_door: AtomicBool::new(false),
             sig_source: None,
@@ -24336,8 +24392,10 @@ impl Host {
         //   * In-flight run state, not a capability — cloning it into a *second* live domain would
         //     double-drive it, so fork refuses even though a snapshot (which resumes the SAME domain,
         //     not a duplicate) serializes some of it: the serve queue/results (a twin re-serving the
-        //     same dispatches would double-execute — snapshot carries them to resume one domain), the
-        //     offload pool, §13.4 replay recording, and freeze residue (a freeze in progress).
+        //     same dispatches would double-execute — snapshot carries them to resume one domain),
+        //     §13.4 replay recording, and freeze residue (a freeze in progress). Not the offload
+        //     pool (#2424): its jobs are punted calls, which never touch the window and answer into
+        //     this domain's own store, so the twin, with a fresh store and pool, shares none of them.
         //   * `self_instance` is the run's own §3.5 reflection surface, re-registered by the embedder.
         // Fork is MORE capable than snapshot for: forkable host procs (a provider fork factory carries
         // them; snapshot cannot), and — carried in the twin below, not gated — shared regions, module
@@ -24351,12 +24409,10 @@ impl Host {
             && self.svc_queue.is_empty()
             && self.svc_results.is_empty()
             && self.self_instance.is_none()
-            && self.pool.is_none()
-            // `completion_notify` is deliberately NOT gated (#799): it is per-run executor
-            // wiring (the §12 completion-wake hook, installed on every root host at run start),
-            // not a capability — a root-domain personality `fork` must not fail on it. The twin
-            // starts unwired (`Host::new`), so its offloadable ops degrade to inline — the
-            // decline-never-diverge default every twin already had.
+            // The §12 completion store is deliberately NOT gated (#799): its wake hook is per-run
+            // executor wiring, not a capability — a root-domain personality `fork` must not fail
+            // on it. The twin gets a fresh store (`Host::new`); its first park wires it to the
+            // scheduler running the twin (#2424).
             && self.cap_record.is_none()
             && self.cap_replay.is_none()
             && self.cap_pages.is_none()
@@ -24473,7 +24529,7 @@ impl Host {
                 twin_exec_remap.push(x);
             }
             twin.host_procs.push(HostProcEntry {
-                handler: ProcHandler::Sync(forked.handler),
+                handler: forked.handler,
                 fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
                 mints: e.mints,
                 // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
@@ -26078,18 +26134,10 @@ impl Host {
             Some(slot) => {
                 let id = self.completions.mint();
                 let comps = Arc::clone(&self.completions);
-                // The result post happens-before the wake hook, so a drain triggered by the
-                // hook always finds the result it is delivering (no lost wakeup).
-                let hook = self.completion_notify.clone();
                 let pool = self
                     .pool
                     .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-                pool.dispatch(vec![Box::new(move || {
-                    comps.complete(id, job());
-                    if let Some(h) = &hook {
-                        h();
-                    }
-                })]);
+                pool.dispatch(vec![Box::new(move || comps.complete(id, job()))]);
                 *slot = Some(id);
                 Ok(Vec::new())
             }
@@ -26141,19 +26189,6 @@ impl Host {
             r.push(rec);
             self.cap_consumed += 1;
         }
-    }
-
-    /// §12 slice 2 — install the per-run completion-wake hook (see the `completion_notify`
-    /// field). The executor that owns the wake mechanism wires it to its scheduler's ordered
-    /// drain and clears it at teardown.
-    pub fn set_completion_notify(&mut self, f: Arc<dyn Fn() + Send + Sync>) {
-        self.completion_notify = Some(f);
-    }
-
-    /// §12 slice 2 — drop the completion-wake hook at run teardown (it captures the run's
-    /// `Arc<Scheduler>`; leaving it would cycle Host → Scheduler → Host).
-    pub fn clear_completion_notify(&mut self) {
-        self.completion_notify = None;
     }
 
     /// #796 L2 — install the async-signal source (a personality) and the shared **armed** flag it sets.
@@ -28078,12 +28113,22 @@ impl Host {
     /// parking-aware eval loop the punting call returns `Pending` and the caller waits **without
     /// the host lock**; everywhere else the job runs inline, byte-identical to a synchronous
     /// handler. Compared to [`Host::grant_host_proc`] this face *loses* powers — no window, no
-    /// minter, no fork factory — the pool must never touch the window (the ring's discipline,
-    /// kept), and a punted call's declared signature carries at most one result (invariant 8).
-    pub fn grant_host_proc_offloadable(&mut self, f: OffloadHostProc, state: CapState) -> i32 {
+    /// minter — the pool must never touch the window (the ring's discipline, kept), and a punted
+    /// call's declared signature carries at most one result (invariant 8).
+    ///
+    /// #2424 — with a `fork` factory, as [`Host::grant_host_proc_forkable`]'s, a spawn can re-grant
+    /// it to a §14 child and a fork twin carries it: the factory mints the new domain's handler
+    /// (typically [`ForkedProc::offloadable`]), whose punts park the new domain's caller as this
+    /// domain's park its own. Without one it stays with this domain, as before.
+    pub fn grant_host_proc_offloadable(
+        &mut self,
+        f: OffloadHostProc,
+        fork: Option<HostProcFork>,
+        state: CapState,
+    ) -> i32 {
         self.grant_host_proc_entry(HostProcEntry {
             handler: ProcHandler::Offloadable(f),
-            fork: None,
+            fork,
             mints: false,
             vtable: None,
             state,
@@ -28123,6 +28168,7 @@ impl Host {
                             .insert(id, CapRequest { id, name, args });
                     }))
                 }),
+                None,
                 // Each call is answered afresh by the embedder; nothing is held between calls.
                 CapState::Stateless,
             );
@@ -30690,11 +30736,16 @@ impl Host {
                     if let Some(x) = forked.exec_remap {
                         child.exec_remap_hooks.push(x);
                     }
-                    let h = child.grant_host_proc_forkable(
-                        forked.handler,
-                        forked.refork.unwrap_or_else(|| Arc::clone(&factory)),
-                        forked.state,
-                    );
+                    // #2424 — the handler the factory minted, of whichever shape: an offloadable
+                    // one parks the child's caller as the parent's parks its own.
+                    let h = child.grant_host_proc_entry(HostProcEntry {
+                        handler: forked.handler,
+                        fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(&factory))),
+                        mints: false,
+                        vtable: None,
+                        state: forked.state,
+                        on_host: false,
+                    });
                     // #801 — the vtable rides the re-grant, and its op names enter the child's
                     // directory: a spawned `__px_`-linked child binds its manifest in-loop, same
                     // as an exec'd one.
@@ -32110,9 +32161,9 @@ impl Host {
                         // window and clones of the cell), while the shared sub-run coexists with
                         // them. `busy` serves here as a **host-side-only gate**: one sub-run per
                         // instance at a time (a second host-side caller answers `-EAGAIN`,
-                        // probeable) because the sub-run wires transient run hooks
-                        // (`completion_notify`) onto the cell that two concurrent sub-runs would
-                        // clobber. The eval-loop threaded arm ignores `busy` entirely, so
+                        // probeable) because a sub-run's park wires the cell's completion store
+                        // to the sub-run's scheduler (`Completions::set_notify`), a hook that two
+                        // concurrent sub-runs would clobber. The eval-loop threaded arm ignores `busy` entirely, so
                         // eval-loop admission stays unbounded alongside one host-side sub-run —
                         // exactly the tier split §10.1 orders (gate = the provider's declaration,
                         // never the runtime's convenience).
@@ -38121,6 +38172,59 @@ mod fork_powerbox_tests {
             "no room for the child's copy fails the re-grant closed"
         );
     }
+
+    /// #2424 — an offloadable host proc whose provider gave it a fork factory goes with a spawned
+    /// child and a fork twin, even after its domain has called it, and each new domain's call
+    /// punts into its own completion store.
+    #[test]
+    fn an_offloadable_host_proc_goes_with_a_child_and_a_twin() {
+        let offload = || -> OffloadHostProc {
+            Box::new(|_op, args| {
+                let x = args[0];
+                OffloadOutcome::Offload(Box::new(move || x + 1))
+            })
+        };
+        let mut parent = Host::new();
+        let h = parent.grant_host_proc_offloadable(
+            offload(),
+            Some(Arc::new(move |_pid| {
+                Some(ForkedProc::offloadable(offload(), CapState::Stateless))
+            })),
+            CapState::Stateless,
+        );
+        let call = |host: &mut Host, handle: i32, x: i64| {
+            let mut id = None;
+            let r =
+                host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, handle, &[x], None, &mut id);
+            assert_eq!(r, Ok(vec![]), "a punted call answers later");
+            host.completions().wait(id.expect("the call punts"))
+        };
+        assert_eq!(call(&mut parent, h, 1), 2, "the parent's own call");
+        let mut child = Host::new();
+        let ch = parent
+            .regrant_into_child(h, &mut child)
+            .expect("an offloadable proc with a fork factory re-grants into a child");
+        let mut twin = parent
+            .fork_powerbox(7, 0)
+            .expect("a domain that has punted still forks");
+        assert_eq!(call(&mut child, ch, 10), 11, "the child's call");
+        assert_eq!(call(&mut twin, h, 20), 21, "the twin's call");
+        assert_eq!(
+            parent.completions().minted(),
+            1,
+            "the parent's store has only its own call"
+        );
+        assert_eq!(
+            child.completions().minted(),
+            1,
+            "the child's store has its call"
+        );
+        assert_eq!(
+            twin.completions().minted(),
+            1,
+            "the twin's store has its call"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -39931,7 +40035,7 @@ mod signal_door_claim_tests {
         Arc::new(move |_pid| {
             calls.fetch_add(1, Ordering::SeqCst);
             Some(ForkedProc {
-                handler: Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
+                handler: ProcHandler::Sync(Box::new(|_op, _args, _mem, _reg| Ok(vec![0]))),
                 signal: claims_door.then(|| {
                     let door: Arc<dyn SignalSource + Send + Sync> = Arc::new(NoSignals);
                     (door, Arc::new(AtomicBool::new(false)))

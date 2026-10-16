@@ -329,7 +329,7 @@ unsafe fn cap_wait(
 /// could observe the placeholder scalar.
 ///
 /// # Safety
-/// Same fiber-context contract as [`temen_jit::fiber_park_current`]; `trap_out` is the live trap
+/// Same fiber-context contract as [`temen_jit::fiber_park_outside`]; `trap_out` is the live trap
 /// cell.
 unsafe fn fiber_cap_wait(
     comps: &std::sync::Arc<temen_interp::Completions>,
@@ -337,8 +337,14 @@ unsafe fn fiber_cap_wait(
     trap_out: *mut i64,
 ) -> i64 {
     let cell = comps.fiber_register(id);
+    // #2424 — a §14 child's task parked here is re-offered as soon as its answer is in. Installed
+    // before the park: an answer that comes first finds the task running, and the wake it latches
+    // re-offers the task once it parks.
+    if let Some(wake) = temen_jit::outside_waker(trap_out) {
+        comps.set_notify(Some(wake));
+    }
     loop {
-        temen_jit::fiber_park_current();
+        temen_jit::fiber_park_outside();
         if let Some(r) = cell.take() {
             return r;
         }
