@@ -15,9 +15,11 @@ mod detached_thaw;
 #[path = "support/paged_detached.rs"]
 mod paged_detached;
 
-use detached_thaw::{child_module, run, Engine, Out};
+use detached_thaw::{child_module, run, Engine, Out, ARENA, PARENT_LOG2};
 use paged_detached::*;
-use temen_durable::{arm_freeze_after_backedges, read_state, write_state, STATE_UNWINDING};
+use temen_durable::{
+    arm_freeze_after_backedges, init_durable_window, read_state, write_state, STATE_UNWINDING,
+};
 
 #[test]
 fn a_paged_child_runs_to_its_answer_with_only_its_own_pages_served() {
@@ -242,4 +244,40 @@ fn the_jit_refuses_to_thaw_a_paged_child() {
         arm_freeze_after_backedges(w, 2000)
     });
     assert_eq!(thaw_on(Engine::Jit, &art, &parent, &[&child], &args), None);
+}
+
+/// #2164 — a paged child's shadow arena is never demand-paged, in a run that is not durable too, on
+/// the tree-walker and on the Cranelift JIT, which pages a child only outside a durable run. The child
+/// reads a byte of its arena, which its window holds (0), then a page past it (100000), which its
+/// pager supplies (24): one page served. Were the arena paged, the pager would refuse it, as below
+/// 65536, and the child would fault.
+#[test]
+fn a_paged_childs_shadow_arena_is_its_own_outside_a_durable_run() {
+    let child = child_module(
+        "memory 17 shadow 16448 65536
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vr = i64.const 20000
+  vrb = i32.load8_u vr
+  va = i64.const 100000
+  vab = i32.load8_u va
+  vr64 = i64.extend_i32_u vrb
+  v8 = i64.const 8
+  vsh = i64.shl vr64 v8
+  va64 = i64.extend_i32_u vab
+  vout = i64.or vsh va64
+  return vout
+  }
+}
+",
+    );
+    let parent = parent(PARENT_SRC, &[17]);
+    for engine in [Engine::Interp, Engine::Jit] {
+        let (mut h, args) = host(&parent, &[&child]);
+        h.set_durable(false);
+        let win = init_durable_window(1 << PARENT_LOG2, ARENA);
+        let (out, _) =
+            run(engine, &parent, &args, &win, &mut h).unwrap_or_else(|| panic!("{engine:?} runs"));
+        assert_eq!(out, Out::Ret((1 << 48) | 24), "{engine:?}");
+    }
 }

@@ -3712,15 +3712,11 @@ unsafe fn window_aliases(
         wm.seed_readonly(ro);
         // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
         // seeded, then demand-paged, then pre-mapped.
-        let paged = wm.table.is_some();
-        if paged {
+        if wm.table.is_some() {
             wm.demand_page();
         }
         if host.apply_premap(&mut wm) < 0 {
             return 0;
-        }
-        if paged {
-            wm.sync_table();
         }
         host.start_window(wm.window_runs());
         1
@@ -4139,27 +4135,21 @@ impl MprotectWindow {
         }
     }
 
-    /// #2164 — write every declared-window page's access into the table, from the map: a demand-paged
-    /// child's table as its window starts ([`window_aliases`]).
-    fn sync_table(&self) {
-        let pages = self.table.as_ref().map_or(0, |t| t.len() - 1) as u64;
-        for page in 0..pages {
-            let access = match self.page_access(page) {
-                None => 0,
-                Some(false) => temen_ir::PAGE_READ,
-                Some(true) => temen_ir::PAGE_READ | temen_ir::PAGE_WRITE,
-            };
-            self.mirror(page, access);
-        }
-    }
-
     /// §2.2 / #2164 — mark the declared window's pages unmapped, demand-paging it, as the
     /// interpreters' `Mem::demand_page` does: every one but those the runtime keeps its words on
-    /// (#2438), which are never the pager's to supply.
+    /// (#2438), which are never the pager's to supply and keep their state. The table, all unmapped
+    /// until now, takes every page's.
     fn demand_page(&self) {
         let pages = self.mapped.div_ceil(self.page).max(1);
-        for page in (0..pages).filter(|&p| !self.shadow.fences(p, p, self.page)) {
-            self.prot_set(page, PageState::Unmapped);
+        let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        for page in 0..pages {
+            let st = if self.shadow.fences(page, page, self.page) {
+                map.get(&page).copied().unwrap_or(PageState::Rw)
+            } else {
+                map.insert(page, PageState::Unmapped);
+                PageState::Unmapped
+            };
+            self.mirror(page, st.access());
         }
     }
 
