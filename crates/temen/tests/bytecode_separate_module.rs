@@ -81,7 +81,7 @@ fn check(parent_src: &str, child_src: &str, want: Result<Vec<Value>, Trap>) {
     assert_eq!(bc, want, "instantiate_module result\n{parent_src}");
 }
 
-/// A forged module handle is an inert `CapFault` on both engines: the parent's v1 record at 17408
+/// A forged module handle is an inert `CapFault` on both engines: the parent's spawn record at 17408
 /// names module 999, which was never granted.
 const PARENT_FORGED: &str = r#"memory 17
 func (i32, i32) -> (i64) {
@@ -98,7 +98,7 @@ block 0 (v0: i32, v1: i32) {
 fn forged_module_handle_faults_identically() {
     let forged = SpawnRec {
         modh: 999,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let parent = format!("{PARENT_FORGED}{}", rec::segment(17408, &forged));
     check(&parent, CHILD_SRC, Err(Trap::CapFault));

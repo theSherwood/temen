@@ -17,7 +17,7 @@ the "nested stays" / "opt-in" / "alias grant" passages below as the pre-2026-09-
 features (the §2.2 pager, the nested subtree freeze) onto it and deleting the rest of the carve path —
 tracked in #1289. The carve spawn itself is gone: every engine traps it `CapFault` (#1867).
 
-**Op 15 is retired too (owner, 2026-10-14, #2067).** Every spawn is the op-17 v1 record, which carries
+**Op 15 is retired too (owner, 2026-10-14, #2067).** Every spawn is the op-17 record, which carries
 op 15's operands as fields. Op 15 traps `CapFault` on every engine, and no producer emits it. This
 note was written while op 15 was the detached spawn: where it says op 15 or names one of its 7-, 9-
 or 11-arg forms, read the record (`size_log2`, `budget`, `module`, the grant list, the args payload,
@@ -72,7 +72,7 @@ child in its own address space.** In temen that structure already has a name.
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
 | Native JIT (`temen-jit`) hosts op 15 (#1287): `instantiate_detached` thunk → `compile_child_windowed` (declared committed inside a root-sized lazy reservation) → `run_detached_child_then` (no carve, no copy-in/copy-back); powerbox via `Host::spawn_detached_child` (`window_exposed = false`, caps over the reservation); minter admission via the `minter_take` hook | `instantiator_rt.rs`; `temen-run` `grant_detached_child_build`/`minter_take`; `detached_child_jit.rs` | **Built** — differential vs the tree-walker |
-| wasm-JIT (`temen-wasm-jit`) nested emit lowers INSTANTIATOR ops **1 and 17 only** (0 and 13 until the carve spawn retired, #1867) | `crates/temen-wasm-jit/src/lib.rs` `is_nested_cap` | **op 15 not lowered** |
+| wasm-JIT (`temen-wasm-jit`) nested emit lowered INSTANTIATOR ops **1 and 17 only** (0 and 13 until the carve spawn retired, #1867) | `crates/temen-wasm-jit/src/lib.rs` (history) | **Deleted** (#1414 B6-4b): a spawning function interprets; #2443 serves the ops through the region emit's bounce |
 | JIT children are **position-independent** (base is a runtime arg; the carve compile cache reused code across offsets) | PROCESS.md §4 S1 | **Built** — the emit needs no change to run in a different memory; the carve cache is retired with the carve spawn (#1867), and a run compiles each detached child once (`ChildCodeCache`, temen#2168) |
 | Native JIT nested children **ran in their own window**: `compile_child` lowered with `sub_base = 0` and the runners allocated a fresh `GuestWindow`, copying the carve in before and back out after (S1c: "own guarded window", parent-domain shared futex) | `crates/temen-jit/src/lib.rs` (history) | **Deleted** with the carve spawn (#1867); the detached path above is what runs |
 
@@ -418,7 +418,7 @@ on the JIT tiers, nested path untouched. **Decision B** = detached becomes the d
 | Demand pager (op 16) | n/a (nested-only op) | **pager ⇒ nested** (a pager child is parent-writes-child by definition); else `supply_page` needs a byte-transfer leg | — / — |
 | Escape oracle (`run_capture_sub`, `compile_and_run_capture_sub`, `fuzz/mask`) | unchanged — the nested path stays and stays its subject | unchanged (the oracle is the alias grant's) | — / — |
 | Docs | PROCESS.md §5 (this as §5a), DESIGN.md §14, BROWSER.md op-13 section, INVARIANTS (#14 satisfied, not renegotiated) | ~75 sentences / 20 files; three *arguments* re-derived; D19 amended | S / M |
-| Tests | detached-on-wasm-JIT differential vs the interpreter's detached child; attest on JIT; quota on JIT; concurrent detached children in Workers; `Foreign` micro-benchmark; futex-collision regression | isolated twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk`; `grant_marshal_fuzz` re-plumbed | M / M |
+| Tests | detached-on-wasm-JIT differential vs the interpreter's detached child; attest on JIT; quota on JIT; concurrent detached children in Workers; `Foreign` micro-benchmark; futex-collision regression | isolated twins of `pagestate`/`live_mapped`/`paged_walk`; `grant_marshal_fuzz` re-plumbed | M / M |
 
 ### 6.1 Interpreter core (60 sites; classes: (a) untouched · (b) parallel path · (c) rewrite)
 
@@ -520,7 +520,7 @@ stdout discarded) is the pattern to standardize on.
 ### 6.4 Emitters and browser JS
 
 **`temen-wasm-jit` codegen — unchanged.** `win` is param 0; `mapped` and `pagestate` are
-mutable globals; `env.memory` imports with min 0; `compile_module_nested*`, `emit_confine`,
+mutable globals; `env.memory` imports with min 0; `emit_confine`,
 `emit_span_check`, `emit_page_check_one`, `emit_null_guard`, `emit_win_addr` all run unchanged
 with any `win`. The carve gates (`check_child_carve`, `child_carve_fits`) had zero production
 callers and are deleted with the carve spawn (#1867). The
@@ -578,7 +578,7 @@ detached children in Workers with independent growth; a `Region::Foreign` micro-
 must not rendezvous — fails today on the interpreter). Existing nested suites, `fuzz/mask`,
 `confined_child_null_guard.rs`, `parallel_instantiate_miri.rs`, `vcpu_instantiate_miri.rs`,
 the escape oracle: untouched — they remain the alias grant's evidence. Decision B adds isolated
-twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
+twins of `pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 `grant_marshal_fuzz`'s source window (authority half verbatim).
 
 ## 7. Slicing plan
@@ -617,7 +617,9 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    child are the natural follow-up (a `temen_par_child` over the same foreign id). *(Since #1414's
    E2 the admitted child crosses to its Worker whole, as a ticket: the engine seeds the window, the
    event carries no segment blob, and a spawn with re-grants or a pre-mapped region runs rather than
-   trapping, on both arms.)*
+   trapping, on both arms. Since #1414 B6-4a the parallel Worker driver is executor 2, which mints a
+   detached child's `Memory` through its thread platform and hands it to each of the child's
+   threads' Workers (B6-3c-1, ED-2); the per-Worker `temen_par_*` driver is deleted.)*
 4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
    decoupled-window child compile, the copy-free detached runner, the `build_detached` /
    `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.
@@ -626,7 +628,7 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    `phase_window_log2` and the 2× buddy parent are deleted; the driver window is 64 KiB of grant
    records; the native `drive_op13` hosts the detached child over a root-sized lazy reservation.
    The interim cap-and-reserve (`5d19eca`) is thereby retired.
-6. **Fuzz**: `nested_paged` gets an isolated twin; `pagestate`/`live_mapped`/`paged_walk` are
+6. **Fuzz**: `pagestate`/`live_mapped`/`paged_walk` are
    parameterized over an isolated window; `grant_marshal_fuzz` keeps its authority half verbatim
    and re-plumbs its source window. `mask.rs` needs **no** twin (base-0 = `with_mapped`, already
    fuzzed). Open the missing nested-durability fuzz coverage DURABILITY.md already asks for.

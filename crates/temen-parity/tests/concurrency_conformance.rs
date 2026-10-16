@@ -4,8 +4,8 @@
 //! multiplex driver and the genuinely-parallel driver". Natively this drives `bytecode::drive` (one
 //! thread multiplexing every vCPU) and the parallel driver (a real OS thread per task) with the same
 //! generated call, and fails when the manifest disagrees with what they do. Since #1414 3e the
-//! parallel driver runs the pump's own scheduling rules, so it no longer stands in for the
-//! `temen_par_*` per-Worker driver; #2230 is pointing the column at the engine that driver runs.
+//! parallel driver runs the pump's own scheduling rules, and since #1414 B6-4a it is the browser's
+//! only parallel driver too, each thread on a Worker: the per-Worker `Vcpu` driver is gone (#2230).
 //!
 //! ## What the predicate is, and why it is not "does it trap"
 //!

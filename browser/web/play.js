@@ -326,7 +326,7 @@ block 0 (vsp: i64, vp: i64) {
     desc: '§14 sandboxing: the root spawns 8 **detached** copies of itself — each on its OWN Web Worker, ' +
       'in a fresh 64 KiB window of its own `WebAssembly.Memory`, paid from the budget the root was ' +
       'granted — joins them and sums 8 × 5 = 40. A copy starts at the program’s `_child` export: the ' +
-      'host grants the program its **child image** as `child`, and one op-17 v1 spawn record serves all eight.',
+      'host grants the program its **child image** as `child`, and one op-17 spawn record serves all eight.',
     src: `memory 16
 data 16384 "child"
 export 0 func "_child" 1   ; where a copy of this program starts: the host grants its image as "child"
@@ -336,22 +336,19 @@ block 0 (v0: i32, vbud: i32) {
   vcn = i64.const 16384
   vcl = i64.const 5
   vchild = self.resolve vcn vcl         ; this program's child image, by name
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
-  ; 0, size_log2 0 (the declared window) | pager none, the child image | budget, region -1 (none).
-  ; Everything else — offset, quota, grants, args, child_off — stays zero.
+  ; the op-17 spawn record at 17408 (temen_ir::SpawnRec, 64 bytes): size_log2 0 (the declared
+  ; window) | pager none, the child image | budget, region -1 (none). Everything else — grants, args,
+  ; child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, reserved 0
+  vf0 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
   i64.store vr0 vf0
-  vr2 = i64.const 17424
-  vf2 = i64.const -4294967296           ; size_log2 0, pager u32::MAX
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild                  ; module: the child image
-  vr3b = i64.const 17436
-  i32.store vr3b vbud                   ; budget
-  vr9 = i64.const 17480
+  vr1 = i64.const 17416
+  i32.store vr1 vchild                  ; module: the child image
+  vr1b = i64.const 17420
+  i32.store vr1b vbud                   ; budget
+  vr6 = i64.const 17456
   vnone = i32.const -1
-  i32.store vr9 vnone                   ; region -1 (none)
+  i32.store vr6 vnone                   ; region -1 (none)
   vi0 = i64.const 0
   br 1(vi0, v0)
 }
@@ -457,33 +454,30 @@ block 0 () {
   i32.store vg1 vln
   vg2 = i64.const 17544
   i32.store vg2 vout
-  ; the op-17 v1 spawn record at 17408 (temen_ir::SpawnRec, 88 bytes): version 1 (detached) | reserved
-  ; 0, size_log2 20 (the declared window) | pager none, the child image | budget, grants_ptr,
-  ; grants_n, region -1 (none). Everything else — offset, quota, args, child_off — stays zero.
+  ; the op-17 spawn record at 17408 (temen_ir::SpawnRec, 64 bytes): size_log2 20 (the declared
+  ; window) | pager none, the child image | budget, grants_ptr, grants_n, region -1 (none).
+  ; Everything else — args, child_off — stays zero.
   vr0 = i64.const 17408
-  vf0 = i64.const 1                     ; version 1, reserved 0
+  vf0 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
   i64.store vr0 vf0
+  vr1 = i64.const 17416
+  i32.store vr1 vchild                  ; module: the child image
+  vr1b = i64.const 17420
+  i32.store vr1b vbud                   ; budget
   vr2 = i64.const 17424
-  vf2 = i64.const -4294967276           ; size_log2 20, pager u32::MAX
-  i64.store vr2 vf2
-  vr3 = i64.const 17432
-  i32.store vr3 vchild                  ; module: the child image
-  vr3b = i64.const 17436
-  i32.store vr3b vbud                   ; budget
-  vr5 = i64.const 17448
-  i64.store vr5 vg0                     ; grants_ptr
-  vr9 = i64.const 17480
-  vnone = i32.const -1
-  i32.store vr9 vnone                   ; region -1 (none)
-  ; child A: one grant
+  i64.store vr2 vg0                     ; grants_ptr
   vr6 = i64.const 17456
+  vnone = i32.const -1
+  i32.store vr6 vnone                   ; region -1 (none)
+  ; child A: one grant
+  vr3 = i64.const 17432
   vn1 = i64.const 1
-  i64.store vr6 vn1
+  i64.store vr3 vn1
   vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
   vra_st, vra = call.cap 6 1 (i32) -> (i64, i64) vinst (vha)
   ; child B: no grants — A's window went back to the budget when A ended, so B fits
   vn0 = i64.const 0
-  i64.store vr6 vn0
+  i64.store vr3 vn0
   vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
   vrb_st, vrb = call.cap 6 1 (i32) -> (i64, i64) vinst (vhb)
   vten = i64.const 10
@@ -522,7 +516,7 @@ block 2 (vh2: i32) {
   detached: {
     mode: 'onramp',
     debug: true, // steppable: the debug scheduler services the spawn (#1528), under the on-ramp powerbox
-    bp: 44, // a breakpoint just past the join, where `vj` holds what the detached child returned
+    bp: 42, // a breakpoint just past the join, where `vj` holds what the detached child returned
     desc: '§5 detached child + a **pre-mapped SharedRegion**: the parent mints a ' +
       '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **a copy of itself** ' +
       '(its child image, which starts at its `_child` export) as a DETACHED child — a fresh 128 KiB window ' +
@@ -565,18 +559,16 @@ block 0 () {
   vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
   vin = i64.const 41
   i64.store vwo vin
-  ; the spawn record (op 17), 88 bytes at 20544; a field left 0 is none
+  ; the spawn record (op 17), 64 bytes at 20544; a field left 0 is none
   vrec = i64.const 20544
-  vver = i32.const 1
-  i32.store vrec vver ; @0 version 1
   vlog = i32.const 17
-  i32.store vrec vlog offset=16 ; @16 a 128 KiB window
+  i32.store vrec vlog ; @0 a 128 KiB window
   vnone = i32.const -1
-  i32.store vrec vnone offset=20 ; @20 no pager
-  i32.store vrec vchild offset=24 ; @24 the module: this program's child image
-  i32.store vrec vbud offset=28 ; @28 the Budget its window spends
-  i32.store vrec vrh offset=72 ; @72 the region, pre-mapped ...
-  i64.store vrec vwo offset=80 ; @80 ... at 65536 of the child's window
+  i32.store vrec vnone offset=4 ; @4 no pager
+  i32.store vrec vchild offset=8 ; @8 the module: this program's child image
+  i32.store vrec vbud offset=12 ; @12 the Budget its window spends
+  i32.store vrec vrh offset=48 ; @48 the region, pre-mapped ...
+  i64.store vrec vwo offset=56 ; @56 ... at 65536 of the child's window
   vc = call.cap 6 17 (i64) -> (i32) vinst (vrec)
   vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vc)
   vk = i64.const 1000
@@ -4913,7 +4905,7 @@ async function runText(c) {
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
-      // Workers were torn down mid-run; shared state (locks, the live-vCPU counter) may be wedged.
+      // Workers were torn down mid-run; shared state (locks) may be wedged.
       broken = true;
       setState(c, 'stopped', 'stopped — reload the page to run again');
       logTo(c, 'stopped by user');

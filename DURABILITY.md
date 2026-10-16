@@ -325,21 +325,22 @@ where it sits, not what kind it is:
   either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
   case that needs per-operation semantics.
 
-**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites (its
-waiter collections, with a reply and a page fault told apart in the one they share), each a `ParkSite`
-with one `FreezeRule`: **re-issue** (re-admit the vCPU under the
-freeze; its op is abandoned and the thaw re-issues it), **phase** (it stays parked and another
-vCPU's unwind wakes it), or **decline** (no rule yet: the census refuses the freeze up front,
+**One rule per park site (#1898).** The oracle's scheduler parks a vCPU at one of fourteen sites
+(its waiter collections, with a reply and a page fault told apart in the one they share), each a
+`ParkSite` with one `FreezeRule`: **re-issue** (re-admit the vCPU under the freeze; its op is
+abandoned and the thaw re-issues it), **phase** (it stays parked and another vCPU's unwind wakes
+it), or **decline** (no rule yet: the census refuses the freeze up front,
 `DeclineCause::Parked(site)`, rather than start one that would stall). Every list that walks the
-parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a new
-collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
-`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane.
-Decline: a fork-twin `wait(-1)` (#1688), a demand-paged child's page fault (#1940), a punted
-completion, which is a host call outside the cut (#1902), and an offer admission, which a durable
-caller never reaches (#1681). A fiber parked at a site follows the same rule: the freeze drive of
-whichever vCPU finishes first gives an unwoken fiber park the placeholder and re-issue word its
-site calls for, and a resumer that then claims the flattened fiber sees it still parked (#1677). A
-serve handler, parked or caught mid-run, rides the same way, with its reply linkage (#1676).
+parked vCPUs (teardown, the census, a freeze's re-admission) is a loop over `ParkSite::ALL`, so a
+new collection cannot be missed by one of them. Re-issue: `svc.wait`, futex, pipe read and write,
+`waitpid`, a job-control stop, a stream read, and a live call's reply. Phase: `thread.join`, a lane,
+and a demand-paged child's page fault, whose pager the freeze holds to serve it (#1940, #2455,
+below). Decline: a fork-twin `wait(-1)` (#1688), a punted completion, which is a host call outside
+the cut (#1902), and an offer admission, which a durable caller never reaches (#1681). A fiber
+parked at a site follows the same rule: the freeze drive of whichever vCPU finishes first gives an
+unwoken fiber park the placeholder and re-issue word its site calls for, and a resumer that then
+claims the flattened fiber sees it still parked (#1677). A serve handler, parked or caught mid-run,
+rides the same way, with its reply linkage (#1676).
 
 **A reply wait is a re-issue of the wait, not the call (#1901).** A caller parked on a live callee's
 reply has already issued its dispatch: it is queued on the callee, in the callee's handler, or
@@ -606,8 +607,9 @@ the tree is flattened into the root's `unreached_detached()`, which `freeze` ref
 **Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
 own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
 spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
-module digest, its lane and its import names (a child starts at its module's function 0 and binds its
-manifest strictly, so the record carried an entry and a same-module flag only until v43, #2219). Its
+module digest, its lane, its import names and, for a demand-paged child, its pager export
+(v47, #2438). A child starts at its module's function 0 and binds its manifest strictly, so the
+record carried an entry and a same-module flag only until v43 (#2219). Its
 fuel, `spawn` and `channel` bounds are its budget node's (Section 10, #1944 slice 3; the launch record
 carried them itself until v38). A thaw
 may narrow those bounds, never widen them. Restore rebuilds each child
@@ -623,6 +625,45 @@ depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A bi
 is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
 span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
 contained by the reservation, whose uncommitted tail faults inside the window.
+
+**A demand-paged child is durable too (#2438).** A child whose spawn record named a pager
+(§2.2, #1862) freezes like any detached child, and its pager rides its launch record: the
+codec refuses a record naming anything but a `{ page: (i64) -> (i64) }` export of the
+spawner's program, as op 17 does, and the thaw re-links the child's faults to that export on
+the re-created spawner. Nothing about faults rides the artifact. A page the pager never
+supplied is still unmapped in the child's image, so after the thaw it faults again and the
+pager supplies it then: the rewound access is the re-issue (INVARIANTS #7). The runtime's own
+words are never demand-paged: the pages a durable module's page ops may not touch
+(`ShadowArena::fences`, #2426), its control words and its declared shadow arena, stay mapped,
+because the runtime reads and writes them at every safepoint, freeze and thaw, and the pager,
+which cannot see the child's window, could only supply a stale copy (the cause of #2438's
+silent wrong results). The harvest captures only a child whose run ended by unwinding; one
+that trapped, that ran to its end, or that a deadlock teardown reaped keeps a window but has
+nothing to resume, and the freeze is refused (`DetachedUnreached`). A durable run pages on the
+tree-walker only: the bytecode engine's durable entry declines a module that spawns (§4), so a
+routed run of a pager-capable program freezes and thaws there, and the Cranelift JIT, which has
+no paging (#2164), refuses to thaw a paged child rather than run it with no pager.
+Pinned by `temen`'s `durable_paged_detached.rs` and `temen-snapshot`'s
+`detached_roundtrip.rs`.
+
+**Leaves first (#2455).** A paged child's pages arrive only through its pager's serve loop, so
+a child that faults on its way to a safepoint unwinds only once the fault is served. A freeze
+therefore never takes a pager down while a child it pages still runs. Wherever it reaches a
+domain (the domain's trigger, its doorbell, the admission of its parks, or a paged spawn in a
+domain already unwinding), a domain paging live detached children is **held** instead
+(`hold_for_paged`). Its phase stays `NORMAL`, so it runs on and serves. Each such child is rung
+at once and its parks are brought through the freeze: a fault park takes the freeze's phase and
+waits for its page, as a join waits for its child (#1940). The hold waits on those children,
+and when the last has ended it releases, and the domain unwinds after them.
+
+A held domain's guest is still running, so it can meet a child that unwound before it. Such a
+child is **withheld**: its outcome is kept from the domain until the release, so to `poll`,
+`join`, `grant` and `child_offer` it reads as running, which is how the domain's own cut records
+it. A `kill` of it ends it as a kill of a running child does. The cut is consistent because a
+withheld child unwound before its spawner's cut and nothing crosses back: the spawner's later
+calls into it wait on its queue or ride the cut as a running child's. A root that returns while
+held has completed the run, and nothing froze. A domain that keeps spawning paged children keeps
+its hold only as long as its budget lasts: a withheld child keeps its window's charge.
 
 **The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
 its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,

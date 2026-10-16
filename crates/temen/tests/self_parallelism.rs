@@ -40,7 +40,7 @@ block 0 (v0: i64) {
 ";
 
 /// The root (args `(instantiator, CHILD, budget)`): split a budget with a lane of 2 from `budget`,
-/// spawn `CHILD` detached on it through the v1 record at 17408 ([`spawn`] lays it), and return what
+/// spawn `CHILD` detached on it through the spawn record at 17408 ([`spawn`] lays it), and return what
 /// the child answers.
 const SPAWN: &str = "memory 16
 func (i32, i32, i32) -> (i64) {
@@ -51,9 +51,9 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
   vc = i64.const -1
   vl = i64.const 2
   vb = call.cap 14 0 (i64, i64, i64, i64, i64) -> (i32) vbud (vf, vm, vs, vc, vl)
-  vrm = i64.const 17432
+  vrm = i64.const 17416
   i32.store vrm vmod
-  vrb = i64.const 17436
+  vrb = i64.const 17420
   i32.store vrb vb
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -68,7 +68,7 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
 fn spawn() -> String {
     let spawn = SpawnRec {
         size_log2: 12,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{SPAWN}{}", rec::segment(17408, &spawn))
 }

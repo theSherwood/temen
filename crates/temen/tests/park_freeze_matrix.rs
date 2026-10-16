@@ -14,8 +14,12 @@
 //! ([`arm_freeze_after`]), which the rows that fire the freeze in a sibling use; the oracle and the
 //! bytecode engine keep freeze-on-quiesce ([`arm_freeze_on_quiesce`]), which the one-vCPU rows use.
 
-#[path = "../../temen-interp/tests/support/rec.rs"]
-mod rec;
+#[path = "support/detached_thaw.rs"]
+mod detached_thaw;
+#[path = "support/paged_detached.rs"]
+mod paged_detached;
+
+use detached_thaw::rec;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,7 +82,7 @@ fn interp_row(site: ParkSite) -> Row {
                   when it parks, so no lane is ever full",
         },
         ParkSite::Reply => Row::Case(reply),
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Case(page_fault),
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::ReapAny => Row::Unreachable {
             why: "`wait(-1)` needs a live fork twin, which declines the freeze first (#1688)",
@@ -120,16 +124,14 @@ fn jit_row(site: ParkSite) -> Row {
                 "the JIT's `live_impl_call` reply park: its re-park on thaw, and the re-link of a \
                   `LiveImpl` onto a re-launched detached child",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 2164,
+            why: "the engine has no demand paging: a pager-capable program runs on an interpreter",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
 }
-
-const PAGE_FAULT_PENDING: Row = Row::Pending {
-    issue: 1940,
-    why: "a faulting access is no call to re-issue, and cannot unwind until its page arrives",
-};
 
 const COMPLETION_PENDING: Row = Row::Pending {
     issue: 1902,
@@ -166,7 +168,11 @@ fn bytecode_row(site: ParkSite) -> Row {
             issue: 1904,
             why: "a live call's reply park: its re-park on thaw (#1901)",
         },
-        ParkSite::PageFault => PAGE_FAULT_PENDING,
+        ParkSite::PageFault => Row::Pending {
+            issue: 1893,
+            why: "only a detached child pages (#2164), and a durable run on this engine refuses a \
+                  detached spawn: its freeze cannot capture one",
+        },
         ParkSite::Completion => COMPLETION_PENDING,
         ParkSite::Admit => ADMIT_UNREACHABLE,
     }
@@ -512,6 +518,19 @@ block 2 (va2: i64) {{
     );
 }
 
+/// #1940 — a page fault. Only a demand-paged child faults, so this row is not the shared shape: the
+/// child parks on its page while its pager computes, the trigger fires in the pager, and the freeze
+/// holds the pager to serve the fault (#2455). The scenario is `support/paged_detached.rs`'s.
+fn page_fault(site: ParkSite, engine: Engine) {
+    assert_eq!(site.freeze_rule(), FreezeRule::Phase);
+    assert_eq!(
+        engine,
+        Engine::Interp,
+        "only the tree-walker freezes a paged child (#1893, #2164)"
+    );
+    paged_detached::fault_parked_at_the_trigger_thaws();
+}
+
 /// A pipe read — the root reads one byte from an empty pipe whose write end the sibling holds and
 /// writes `x` to after its loop: `1000·1 + 'x' + 7`.
 fn pipe_read(site: ParkSite, engine: Engine) {
@@ -823,7 +842,7 @@ block 0 (vx: i64) {
 }
 
 /// A live call's reply — thread `T` calls `bump(41)` on a detached child `C` that serves one
-/// dispatch (a v1 record spawning func 2's child image (#2219), then `child_offer`), while the root
+/// dispatch (a spawn record spawning func 2's child image (#2219), then `child_offer`), while the root
 /// resumes a fiber, where the countdown fires. The root unwinds and rings `C`, which unwinds in its
 /// `svc.wait` without serving; `T` then enqueues its call and parks on the reply, and the freeze
 /// re-admits it: its wait is abandoned, its dispatch stays queued on `C`, and the ticket rides the
@@ -895,9 +914,9 @@ export 0 interface "counter" 1 { bump: 3 }
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vz = i64.const 0
-  vrm = i64.const 65560
+  vrm = i64.const 65544
   i32.store vrm v1
-  vrb = i64.const 65564
+  vrb = i64.const 65548
   i32.store vrb v2
   vrp = i64.const 65536
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -948,7 +967,7 @@ block 0 (vx: i64) {
     // stored there.
     let spawn = SpawnRec {
         size_log2: 17,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let src = format!(
         "{src}{t}{server}{FIBER}{CALLING_FIBER}{}",

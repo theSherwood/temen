@@ -113,8 +113,8 @@ fn src(ticker: Ticker, paced: bool) -> String {
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
 ",
                 grant = rec::grant("g", 17600, 17700, 4, "vtick"),
-                module_at = 17408 + rec::MODULE_AT,
-                budget_at = 17408 + rec::BUDGET_AT,
+                module_at = 17408 + SpawnRec::MODULE_AT,
+                budget_at = 17408 + SpawnRec::BUDGET_AT,
             ),
             "  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)\n",
         ),
@@ -127,7 +127,7 @@ fn src(ticker: Ticker, paced: bool) -> String {
     let child = SpawnRec {
         grants_ptr: 17600,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "memory 17
@@ -177,7 +177,7 @@ fn setup(m: &Module, lanes: i64) -> impl Fn() -> (Host, Vec<Value>) + '_ {
         let forked = Arc::clone(&ticks);
         let tick = h.grant_host_proc_forkable(
             tick_proc(&ticks),
-            Arc::new(move |_pid| ForkedProc::shared(tick_proc(&forked), CapState::Stateless)),
+            Arc::new(move |_pid| Some(ForkedProc::shared(tick_proc(&forked), CapState::Stateless))),
             CapState::Stateless,
         );
         let wait = h.grant_host_proc_offloadable(

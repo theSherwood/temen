@@ -311,7 +311,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   differential, byte-for-byte) and wasm64 (`run_capture() == 1007`). Closes the last output channel —
   return value ✓, streams ✓, **memory image ✓**.
 - [x] **§14 nested child guests (`temen_run_nested`).** Function 0 gets an `Instantiator` (iface 6) and
-  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 v1 records) —
+  a `"budget"` by name, and spawns **detached child domains** of its own module (op-17 records) —
   each in a fresh window of its own paid from the budget, running on the cooperative executor and
   joinable through the §12 thread machinery. 5-case differential (all matching native): isolation — a
   child's store never reaches the parent's window (`42000`), depth-2 VM-in-VM (`77`: the child pays for
@@ -379,7 +379,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   `WebAssembly.Memory` are exposed, and `browser-test.mjs` drives the preinstalled Chromium against a
   page (`web/index.html` + `main.js` + `worker.js`) that (1) runs the **powerbox** (`temen_run_pb` →
   `"hello, powerbox!"`, single-threaded on the page) and (2) runs **one guest's `thread.spawn`ed vCPUs
-  across real Web Workers** over the shared memory — the browser twin of `threads-spawn.mjs`: the page
+  across real Web Workers** over the shared memory (since #1414 B6-4a on executor 2): the page
   creates every Worker and never blocks (a browser bans main-thread `Atomics.wait`); each Worker sets
   its own stack/TLS and services `thread.join` via `Atomics.wait` and the futex via
   `Atomics.wait`/`notify`. Verified: **crossOriginIsolated**, powerbox PASS, and the 8-vCPU counter
@@ -803,7 +803,7 @@ schedule/IO-shaped; the real-language playground tab is what makes this the high
 
 v86 JITs discovered x86 *machine code*: decode, self-modifying-code invalidation, lazy hot-block
 discovery. Temen has none of that. Code arrives as **complete, verified, immutable IR units at exactly
-three explicit points** — module load (`temen_par_compile`), §22 `jit_compile`/`install` (already
+three explicit points** — module load, §22 `jit_compile`/`install` (already
 literally the API for "compile this unit"), and a §14 spawn's granted module — and uninstall is drop, never
 patch. And Temen IR is deliberately wasm-flavored (`i64.mul`, `br_if`, `v128`, typed
 SSA blocks): the compute long tail translates ~1:1. What's left of v86's architecture is the easy
@@ -907,6 +907,18 @@ alongside the existing escape-TCB targets. The §22 guest-JIT path already has t
 subset" concept this tier generalizes: a unit outside the emitter's subset invokes on the interpreter.
 
 ### Slice plan (each its own PR, oracle-gated like everything above)
+
+> **Since #1414 B6-4a** the browser's parallel mode is executor 2 (THREADS.md §4c-wasm): one
+> in-Rust run on the root's Worker, each thread on a Worker of its own, its tier-ups, §22 units and
+> §14 children on emitted wasm through the shared emitted-tier host (`emittedTier`). The per-Worker
+> `Vcpu` driver the slices below built on (`temen_par_run`, the `instCodegen`/`jitB2` options, and
+> the Node harnesses `threads-spawn.mjs`, `tierup.mjs` and `jitcodegen*.mjs`) is deleted; the
+> slices record it as history. The Chromium `#x2` item and the `#inst*` items cover what its page
+> items did. Since B6-4b the nested emit its §14 codegen ran (`compile_nested*`,
+> `outline_nested_cap_calls`, the `env.join`/`env.instantiate_rec`/`env.thread_*` bounces) and the
+> `Vcpu` lanes only it used (`with_jit_eligible`, `VcpuEvent::TierUp`, `bounce_call`,
+> `with_shared_fibers`) are deleted too: a function that spawns, joins or waits interprets on executor
+> 2 until #2443.
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
@@ -1175,7 +1187,7 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
    sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
    the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
-   children now — the spawn is an op-17 v1 record, serviced from emitted code as `env.instantiate_rec`
+   children now — the spawn is an op-17 record, serviced from emitted code as `env.instantiate_rec`
    (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
    `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
    #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a

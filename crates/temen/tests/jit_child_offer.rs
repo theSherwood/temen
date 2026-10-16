@@ -20,7 +20,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// Parent (func 0, `(Instantiator, Budget)`): spawn a same-module child (entry 1) detached through
-/// a v1 record paid from the `Budget`, mint `child_offer(child, export 0)` via op 14, return the
+/// a spawn record paid from the `Budget`, mint `child_offer(child, export 0)` via op 14, return the
 /// minted handle widened to i64 (negative = the errno). Child (func 1): returns 0. Func 2 is the
 /// `add` handler behind `export 0 interface "adder"`.
 const MINT_SRC: &str = r#"memory 17
@@ -30,9 +30,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -65,9 +65,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -104,9 +104,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -133,7 +133,7 @@ block 0 (va: i64, vb: i64) {
 /// `src` with its spawn record (at 17536), and a host for it: the parent's three args, an
 /// `Instantiator`, the `Budget` that pays for the child, and the child, func 1's child image (#2219).
 fn setup(src: &str) -> (Arc<Module>, Host, [i32; 3]) {
-    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::v1()));
+    let src = format!("{src}{}", rec::segment(17536, &SpawnRec::default()));
     let m = parse_module(&src).expect("parse");
     verify_module(&m).expect("verify");
     let mut host = Host::new();
@@ -270,9 +270,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -322,9 +322,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
@@ -377,9 +377,9 @@ export 0 interface "adder" 1 { add: 2 }
 
 func (i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vbud: i32, vmod: i32) {
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vmod
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vbud
   vrp = i64.const 17536
   vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)

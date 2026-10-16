@@ -1,7 +1,7 @@
 //! FORK.md §8.5 slices 4+5 — **a chibicc-compiled C program calling `fork()`**, forking for real under
 //! the manager topology. This is the frontend capstone: the substrate (`fork_manager.rs`) and the
 //! named-import binding (`fork_import.rs`) are proven with hand-written IR; here the guest is *ordinary
-//! C*, compiled by the chibicc fork, spawned as its own module through a v1 spawn record (op 17).
+//! C*, compiled by the chibicc fork, spawned as its own module through a spawn record (op 17).
 //!
 //! The guest is a normal separate-module command (the `c_shell_exec.rs` `--child-entry` shape). Its libc
 //! shim is two externs — chibicc drops the leading "handle" arg of a cap-style call, so `write(1, &x, 8)`
@@ -42,11 +42,11 @@ use temen_ir::SpawnRec;
 fn spawning(src: &str) -> String {
     let guest = SpawnRec {
         grants_ptr: 16640,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         "{src}{}{}",
-        rec::segment(17536, &SpawnRec::v1()),
+        rec::segment(17536, &SpawnRec::default()),
         rec::segment(17664, &guest)
     )
 }
@@ -129,9 +129,9 @@ data 16684 "__fork"
 data 16694 "stdout"
 func (i32, i32, i64, i32, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -153,12 +153,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   va5 = i64.const 16664
   i32.store va5 vforkoff
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 2
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -240,9 +240,9 @@ data 16694 "stdout"
 data 16704 "__wait"
 func (i32, i32, i64, i32, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -273,12 +273,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vbud: i32, vsrv: i32) {
   va8 = i64.const 16680
   i32.store va8 vwaitoff
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 3
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -719,9 +719,9 @@ data 16814 "one"
 data 16824 "two"
 func (i32, i32, i64, i64, i64, i32, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -769,12 +769,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vmod1: i64, vmod2: i64, vbud: i32, v
   va14 = i64.const 16712
   i32.store va14 vmod2_32
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 5
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -1442,18 +1442,18 @@ fn a_shell_redirects_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1550,18 +1550,18 @@ fn a_shell_appends_a_command_output_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1662,18 +1662,18 @@ fn a_shell_redirects_a_file_into_a_command_stdin() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1768,18 +1768,18 @@ fn a_shell_redirects_a_command_stderr_to_a_file() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -1953,12 +1953,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32) {
   va5 = i64.const 16664
   i32.store va5 vcmod32
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 2
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -2100,12 +2100,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32) {
   va8 = i64.const 16680
   i32.store va8 vfs
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 3
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -2143,18 +2143,18 @@ fn a_nested_compiled_c_command_reads_a_file_through_a_granted_fs_cap() {
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -2257,9 +2257,9 @@ data 16804 "__wait"
 data 16814 "cmd"
 func (i32, i32, i64, i64, i32, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -2299,12 +2299,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vbud: i32, vsrv: i32) {
   va11 = i64.const 16696
   i32.store va11 vcmod32
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 4
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -2443,9 +2443,9 @@ data 16814 "cmd"
 data 16824 "vm_fs"
 func (i32, i32, i64, i64, i32, i32, i32) -> (i64) {
 block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32, vsrv: i32) {
-  q0m = i64.const 17560
+  q0m = i64.const 17544
   i32.store q0m vsrv
-  q0b = i64.const 17564
+  q0b = i64.const 17548
   i32.store q0b vbud
   q0p = i64.const 17536
   vs = call.cap 6 17 (i64) -> (i32) v0 (q0p)
@@ -2493,12 +2493,12 @@ block 0 (v0: i32, vstream: i32, vgmod: i64, vcmod: i64, vfs: i32, vbud: i32, vsr
   va14 = i64.const 16712
   i32.store va14 vfs
   vgm = i32.wrap_i64 vgmod
-  qgm = i64.const 17688
+  qgm = i64.const 17672
   i32.store qgm vgm
-  qgb = i64.const 17692
+  qgb = i64.const 17676
   i32.store qgb vbud
   vgn = i64.const 5
-  qgn = i64.const 17712
+  qgn = i64.const 17688
   i64.store qgn vgn
   qgp = i64.const 17664
   vg = call.cap 6 17 (i64) -> (i32) v0 (qgp)
@@ -2553,18 +2553,18 @@ fn a_compiled_c_program_forks_execs_a_real_command_that_reads_a_file_and_waits()
     let factory = std::sync::Arc::new(factory);
     let make: temen_interp::HostProcFork = {
         let factory = factory.clone();
-        std::sync::Arc::new(move |_pid| -> temen_interp::ForkedProc {
+        std::sync::Arc::new(move |_pid| -> Option<temen_interp::ForkedProc> {
             let (mut inner, state) = factory();
-            temen_interp::ForkedProc::shared(
+            Some(temen_interp::ForkedProc::shared(
                 Box::new(move |_slot_op, args, mem, minter| {
                     inner(args[0] as u32, &args[1..], mem, minter)
                 }),
                 state,
-            )
+            ))
         })
     };
     let fs_cap = {
-        let m = make(0);
+        let m = make(0).expect("a shared memfs always mints");
         host.grant_host_proc_forkable(m.handler, make.clone(), m.state)
     };
 
@@ -2693,9 +2693,9 @@ int main(int argc, char **argv) {
 /// and the replacement factory is re-wrapped so fork-of-fork keeps the shape.
 fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork {
     Arc::new(move |pid| {
-        let forked = base(pid);
+        let forked = base(pid)?;
         let mut inner = forked.handler;
-        temen_interp::ForkedProc {
+        Some(temen_interp::ForkedProc {
             handler: Box::new(move |_slot_op, args, mem, minter| {
                 inner(args[0] as u32, &args[1..], mem, minter)
             }),
@@ -2704,7 +2704,8 @@ fn opshift_fork(base: temen_interp::HostProcFork) -> temen_interp::HostProcFork 
             exit: forked.exit,
             exec_remap: None,
             state: forked.state,
-        }
+            abandon: forked.abandon,
+        })
     })
 }
 

@@ -2323,38 +2323,31 @@ default above still stands for every handle-gated capability.
   capability op and per *virtualized* fault — the best achievable, and the same
   shape as hardware nested virtualization (cheap steady state, cost on exits).
 
-### wasm-JIT tier coverage (the `compile_nested` front door)  [SETTLED — built]
-VM-in-VM runs correctly on **every** tier: fed to the general `compile_jit` front door a §14 unit
-runs interpreter-driven, the interpreter servicing the spawn and `join` via
-`VcpuStop::InstantiateDetached`. The wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md` "wasm-JIT tier") is
-a *performance* path that lowers a nesting parent's spawn (op 17)/`join`/`thread`/futex ops to host
-bounces (`env.instantiate_rec` / `env.join` / `env.thread_*`) so the parent runs on emitted wasm. (The
-carve spawns it once lowered, ops 0 and 13, are retired, #1867.) `compile_nested`
-is its single front door — the nesting analogue of `compile_jit` — deriving the drive mode from the
-IR, so a verified unit always yields a runnable artifact:
+### wasm-JIT tier coverage  [SETTLED — built]
+VM-in-VM runs correctly on **every** tier. On the wasm-JIT tier (`temen-wasm-jit`; `BROWSER.md`
+"wasm-JIT tier") a §14 unit is a region tier-up like any other program: the interpreter drives the
+spawn (op 17), `join`, `thread.*` and futex ops (`VcpuStop::InstantiateDetached` and its siblings),
+and a function that reaches none of them, by any call edge, tiers up onto emitted wasm
+(`bounce_serviceable` keeps every op a bounce cannot serve out of an emitted function's callee
+closure). A function that spawns, joins or waits therefore interprets; #2443 serves those ops from
+emitted code through the region emit's bounce on executor 2, whose bounces may block. Fibers are
+**never** emitted: a wasm frame cannot unwind for a stack switch. The emitted-function bitmap is a
+sound "safe to call `f{i}` directly" signal, and no emitted-code or window-access surface is added
+(INVARIANTS.md #2 untouched).
 
-- **No reachable fiber** → the nested emit: the host calls `f{entry}` directly and the §14/§11 ops
-  bounce to their imports (`WasmDriven`). Threads and the futex stay on this fast path — a spawned
-  vCPU runs on its own worker, so it never has to unwind the emitted frame.
-- **A reachable fiber** (`cont.*`/`suspend`) → an interpreter-driven, nested-cap-aware tier-up
-  (`InterpDriven`): the interpreter owns the top frame (a wasm frame can't unwind for a stack switch),
-  servicing the fibers and `instantiate`/`join` natively, while hot in-subset compute — including
-  instantiate/join/thread functions — still tiers up with its bounces intact. Fibers are **never**
-  emitted; a fiber reachable from the entry by call edges drops it from the emitted set, and a
-  `thread.spawn`ed fiber runs in its own spawned interpreter vCPU. Either way the emitted-function
-  bitmap is a sound "safe to call `f{i}` directly" signal (the browser's per-instance
-  `temen_par_inst_eligible` gate reads it), and no new emitted-code or window-access surface is added
-  (INVARIANTS.md #2 untouched). This is the wasm-tier counterpart of the §22 "fibers in a submitted
-  unit" allowance.
+Until #1414 B6-4b the tier had a second emit family for nesting parents, `compile_nested`, which
+lowered those ops to host-bounce imports (`env.instantiate_rec`, `env.join`, `env.thread_*`) so a
+spawning entry ran emitted. Only the browser's per-Worker driver used it, under an option no shipped
+card passed, and it went with that driver (B6-4a).
 
 **Cross-tier ABI.** A non-emittable function runs as a cross-tier interpreter leaf over the shared
 window via `env.call_interp`, which marshals each arg/result through the `env` cell's scratch slots at
 a **running offset** computed from the callee's signature: scalars take one 8-byte slot (`i32` widened,
 `f32`/`f64` written narrow, `i64` as-is), a `v128` takes **two** (16 raw little-endian bytes — the
 two-slot encoding, #749). Every servicer computes the same layout from the signature; only `ref`/`cap`
-values stay unmarshallable. The §22 slot-trampoline transport (`emit_slot_trampoline` → the vCPU's
-`bounce_call`) still carries scalars only — its `&[i64]` decode and JS-crossing entry argv were not
-widened — so a `v128`-signature function in a *nested* unit still fails closed to whole-interpreter.
+values stay unmarshallable. The §22 slot-trampoline transport (`emit_slot_trampoline` →
+`CoopRun::bounce`) still carries scalars only — its `&[i64]` decode and JS-crossing entry argv were
+not widened.
 
 **Window-remapping ops fall to the interpreter (decision: fail-closed + scope-out).** The wasm tier's
 confinement is a mask plus **one live bound** — an emitted access is admitted in `[0, live_mapped)`
@@ -2419,24 +2412,12 @@ escape.
 straddle, unsynced-table divergence pin). The cost is ~1.5–3×+ on the random-access tail, paid only
 by the modules the flip selects.
 
-**Nested units (#1151).** `compile_nested_paged` is the paged §14 front door: `unmap`/`protect`
-`call.cap`s are outlined into `env.call_interp` wrappers (`outline_nested_cap_calls`, so the op runs
-interp-serviced and the driver re-syncs the table on return) and every emitted access carries the page
-check; `SharedRegion` aliasing and fiber-bearing units still fail closed to whole-interpreter. The
-nested emit's `env.call_interp` contract is a **powerbox-carrying servicer over the live window** —
-a leaf may store and `call.cap` (the op-13 grant seeder, a `map`-calling allocator helper). A host
-must never service these leaves on a throwaway window (the browser's `temen_wasmjit_call_interp`,
-which is faithful only for the tier-up analysis's pure leaves) — an impure helper run on the empty
-powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
-The browser's §14 codegen entry
-(`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
-`compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
-own detached `Memory`** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
-the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
-after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
-wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
-still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
-refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned in real Chromium by `browser-test`'s `instpaged` item. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+**Nested units (#1151).** A paged child on executor 2 runs its root task on its granted module's
+region emit, with the page-state table in the child memory's header (#1414 ED-2); `browser-test`'s
+`instpaged` item pins it in real Chromium. The page ops themselves are `call.cap`s, which no emit
+takes: they run interpreted, and the table is rebuilt from the task's page map when it moves. (Until
+#1414 B6-4b a second, nested emit, `compile_nested_paged`, outlined them into `env.call_interp`
+wrappers serviced on the child's own vCPU; it went with the per-Worker driver.) (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 
@@ -2551,7 +2532,11 @@ child's grants is exactly the party positioned to observe their use.
   mappings) is `channel` of the node of the domain the capability's state was
   granted to, and each buffer of 128 KiB or more is one `maps` too, the mapping
   the allocator gives it (`temen_interp::HostCharge`, `HostBuffer`). A child
-  re-granted the capability spends its grantor's. It is charged before it is
+  re-granted the capability spends its grantor's. A POSIX process's heap records,
+  descriptor slots, arguments, working directory and `getenv` copies count too
+  (#2373). What a
+  fork twin or a spawned child copies of it is charged with the fork, within every
+  limit, so a guest cannot fork past its grant (#2428). It is charged before it is
   allocated, refused past a ceiling with the errno a full device gives
   (`-ENOSPC` from a filesystem, `-ENOMEM` elsewhere), never an abort, and handed
   back as it shrinks or goes. File descriptors are the process's to share, as its

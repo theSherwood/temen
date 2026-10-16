@@ -24,7 +24,7 @@ use temen_text::parse_module;
 use temen_verify::verify_module;
 
 /// func 0 (parent, `(Instantiator, grant_handle, Budget, Module)`): spawn the child (the `Module`,
-/// func 1's child image, #2219) detached through the v1 record at 20544, paid from the `Budget` and
+/// func 1's child image, #2219) detached through the spawn record at 20544, paid from the `Budget` and
 /// re-granting the parent's `grant_handle` under
 /// the name `"g"` (name at 20480, grant record at 20488), then `join` and return the child's result.
 ///
@@ -48,9 +48,9 @@ block 0 (vinst: i32, vstream: i32, vbud: i32, vmod: i32) {\n\
   vgr3 = i64.const 20500\n\
   vz32 = i32.const 0\n\
   i32.store vgr3 vz32\n\
-  rrm = i64.const 20568\n\
+  rrm = i64.const 20552\n\
   i32.store rrm vmod\n\
-  rrb = i64.const 20572\n\
+  rrb = i64.const 20556\n\
   i32.store rrb vbud\n\
   rra0 = i64.const 20544\n\
   vch = call.cap 6 17 (i64) -> (i32) vinst (rra0)\n\
@@ -90,7 +90,7 @@ fn module() -> Module {
     let spawn = SpawnRec {
         grants_ptr: 20488,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     let m = parse_module(&format!("{SRC}{}", rec::segment(20544, &spawn))).expect("parse");
     verify_module(&m).expect("verify");

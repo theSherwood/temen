@@ -142,11 +142,12 @@ struct Copies {
 }
 impl Copies {
     /// Build from resolved `(src, dst)` pairs, classifying `aliasing` = some `dst` is also some `src`
-    /// (so a one-pass sequential copy could clobber a not-yet-read source). O(n²) over a tiny edge.
+    /// (so a one-pass sequential copy could clobber a not-yet-read source). An edge can carry
+    /// hundreds of copies (#2447), so the sources are sorted and each `dst` searched for.
     fn new(pairs: Box<[(u32, u32)]>) -> Copies {
-        let aliasing = pairs
-            .iter()
-            .any(|&(_, d)| pairs.iter().any(|&(s, _)| s == d));
+        let mut srcs: Vec<u32> = pairs.iter().map(|&(s, _)| s).collect();
+        srcs.sort_unstable();
+        let aliasing = pairs.iter().any(|&(_, d)| srcs.binary_search(&d).is_ok());
         Copies { pairs, aliasing }
     }
 }
@@ -616,12 +617,12 @@ enum Op {
     /// (op 18, #2066) and the other deleted ops #2065 lists, or a live op shaped otherwise.
     CapFault,
     /// Long-tail value/store ops (SIMD, `v128` load/store, fences) delegated to the reference
-    /// [`super::eval_inst`] — same semantics, no duplication. The original instruction keeps its
-    /// **block-local** operand indices, so it's run against the sub-window `regs[base + block_base
-    /// ..]`; `dst` is the frame-relative result slot (unused when `eval_inst` yields no value).
+    /// [`super::eval_inst`] — same semantics, no duplication. The instruction's operands are
+    /// rewritten to the **frame slots** every other op reads (an operand that names a forwarded
+    /// param reads its value's slot, #2448), so it's run against the frame `regs[base..]`; `dst`
+    /// is the frame-relative result slot (unused when `eval_inst` yields no value).
     Eval {
         inst: Box<Inst>,
-        block_base: u32,
         dst: u32,
     },
     /// §12.8 4A.5 durable-runtime-internal: push the active context's shadow-SP word address (the
@@ -1730,27 +1731,10 @@ pub fn serve_qualifies(funcs: &[Func]) -> bool {
 /// `serves_children`: the caller's driver serves the children a module spawns — the cooperative
 /// scheduler, `drive` and [`CoopRun`] alike, whose every domain sits in a cell its children can
 /// call back into (#744). The [`bytecode_serves_children`] escape applies to it alone; every other
-/// driver declines such a module to the tree-walk oracle.
-///
-/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
-/// pager-shaped export ([`Module::declares_pager`]) could build a pager record, which only the
-/// oracle serves (native paging is #2164), so it declines. A module with no such export builds no
-/// valid pager record — spawn validation refuses one identically on every tier — so the record
-/// spawn runs natively. The same key as temen-run's `module_demand_spawns` fold for the JIT.
+/// driver declines such a module to the tree-walk oracle, as it declines one that may page a child
+/// ([`may_page_a_child`]).
 fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
-    let uses_rec = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(
-                i,
-                Inst::CapCall {
-                    type_id: super::cap_id::INSTANTIATOR,
-                    op: 17,
-                    ..
-                }
-            )
-        })
-    });
-    if uses_rec && m.declares_pager() {
+    if !serves_children && may_page_a_child(m) {
         return None;
     }
     let escape = serves_children && bytecode_serves_children(m);
@@ -1764,6 +1748,30 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
     )?;
     c.serves_children = serves_children;
     Some(c)
+}
+
+/// CONSOLIDATION.md §3d, #744 — the **pager guard**: a record-spawn (op 17) module that declares a
+/// pager-shaped export ([`Module::declares_pager`]) could build a pager record. A driver that serves
+/// its children pages them (#2164): a paged child's fault is a call into its spawner's domain, which
+/// sits in a cell. Every other driver declines such a module to the oracle: `Vcpu` at its compile
+/// ([`compile_module_for`]), the debug scheduler when a session opens
+/// ([`ScheduledDebugRun::new_with_host`]). A module with no such export builds no valid pager record
+/// — spawn validation refuses one identically on every tier — so its record spawn runs natively. The
+/// same key as temen-run's `module_demand_spawns` fold for the JIT.
+fn may_page_a_child(m: &Module) -> bool {
+    m.declares_pager()
+        && m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: super::cap_id::INSTANTIATOR,
+                        op: 17,
+                        ..
+                    }
+                )
+            })
+        })
 }
 
 /// The §14 entry-shape rule and the starter handles each shape takes live in `temen-ir`, the one
@@ -1803,10 +1811,13 @@ struct DetachedSpawn {
     /// A `SharedRegion` of the spawner's, `(region, child_off)`, aliased into the child's window
     /// before it starts.
     premap: Option<(i32, u64)>,
+    /// §2.2 — the pager: an export of the spawner's program whose `page` op supplies the child's
+    /// demand-paged window (#2164). Admission checks it ([`admit_detached_child`]).
+    pager: Option<u32>,
 }
 
 impl DetachedSpawn {
-    /// A v1 (detached) op-17 record's spawn (#1863).
+    /// An op-17 record's spawn, always detached (#1863).
     fn of(sr: &SpawnRec) -> DetachedSpawn {
         DetachedSpawn {
             budget: sr.budget,
@@ -1815,6 +1826,7 @@ impl DetachedSpawn {
             grants: (sr.grants_n > 0).then_some((sr.grants_ptr, sr.grants_n)),
             args: (sr.args.1 > 0).then_some(sr.args),
             premap: (sr.region >= 0).then_some((sr.region, sr.child_off)),
+            pager: (sr.pager != u32::MAX).then_some(sr.pager),
         }
     }
 }
@@ -1983,6 +1995,8 @@ struct FreshWindow {
     /// The module the child runs: its data segments seed the window.
     module: std::sync::Arc<Module>,
     payload: Vec<u8>,
+    /// §2.2 — the window starts demand-paged: every page arrives through its pager's reply.
+    paged: bool,
 }
 
 impl FreshWindow {
@@ -2005,6 +2019,10 @@ impl FreshWindow {
         });
         if !self.payload.is_empty() {
             let _ = mem.write_bytes(temen_ir::module_args_base(), &self.payload);
+        }
+        // As the tree-walker builds a paged window: seeded, then demand-paged, then pre-mapped.
+        if self.paged {
+            mem.demand_page();
         }
         if host.apply_premap(&mut mem) < 0 {
             return Err(Trap::Malformed);
@@ -2047,6 +2065,20 @@ fn admit_detached_child(
     freezes_detached: bool,
     source: &ModuleSource,
 ) -> Result<Option<(AdmittedChild, FreshWindow)>, Trap> {
+    // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
+    // program, as on the tree-walker (#744, #1862). The record named the pager before anything else
+    // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
+    // others decline a module that could page a child ([`may_page_a_child`]), and a granted child
+    // that serves and spawns ([`bytecode_serves_children`]).
+    if let Some(export) = s.pager {
+        let pages = host
+            .self_module
+            .as_ref()
+            .is_some_and(|sm| sm.is_pager_export(export));
+        if !pages {
+            return Err(Trap::CapFault);
+        }
+    }
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
         let program = granted_program(host, source, g)?;
@@ -2117,7 +2149,8 @@ fn admit_detached_child(
     let mut child_host = host.child_host();
     // §4: a durable domain's child is durable too, so its own spawns re-apply the rule above.
     child_host.set_durable(durable);
-    child_host.set_attestation(host.detached_child_attestation(false));
+    child_host.set_attestation(host.detached_child_attestation(s.pager.is_some()));
+    child_host.pager = s.pager;
     // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
     // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
     child_host.set_lane_cap(lane);
@@ -2163,6 +2196,7 @@ fn admit_detached_child(
         shadow: cshadow,
         module: cmodule,
         payload,
+        paged: s.pager.is_some(),
     };
     Ok(Some((child, window)))
 }
@@ -2473,17 +2507,38 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
     // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
     // never single-stepped (debug/trace compile unfused), so no source location is lost there.
     let mut src: Vec<Option<(u32, u32)>> = Vec::new();
+    // #2448: in the fused compile, a block param that only forwards a value reads that value's
+    // slot, and no edge copies into it. The unfused compile (stepping, tracing, a debug run's
+    // frames, read by `(block, value)`) keeps every param in a slot of its own.
+    let forwards = fuse.then(|| f.forwards());
+    let forwarded = |b: usize, i: usize| forwards.as_ref().and_then(|w| w.source(b, i));
+    // The slots a forwarding param reads: read outside their block with no edge copy, so their
+    // values must be written (the `IntCmp` fusion below checks this).
+    let mut read_forwarded = vec![false; nslots as usize];
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for i in 0..blk.params.len() {
+            if let Some((sb, si)) = forwarded(b, i) {
+                read_forwarded[(base[sb as usize] + si) as usize] = true;
+            }
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
         block_pc[bi] = ops.len() as u32;
-        let g = |local: u32| base[bi] + local; // operand: block-local index -> frame slot
-        let mut local = b.params.len() as u32;
+        let params = b.params.len() as u32;
+        // operand: block-local index -> frame slot
+        let g = |local: u32| match local < params {
+            true => forwarded(bi, local as usize)
+                .map_or(base[bi] + local, |(sb, si)| base[sb as usize] + si),
+            false => base[bi] + local,
+        };
+        let mut local = params;
         for (i, inst) in b.insts.iter().enumerate() {
             let dst = match view.results(inst) {
                 0 => discard,
                 _ => base[bi] + local,
             };
             local += view.results(inst) as u32;
-            ops.push(compile_inst(inst, dst, base[bi], view, &g)?);
+            ops.push(compile_inst(inst, dst, view, &g)?);
             src.push(Some((bi as u32, i as u32)));
         }
         // Terminator -> edge copies (block-local src in this block -> first slots of target) + jump.
@@ -2497,6 +2552,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             let pairs: Box<[(u32, u32)]> = args
                 .iter()
                 .enumerate()
+                .filter(|&(i, _)| forwarded(bidx, i).is_none())
                 .map(|(i, a)| (g(*a), base[bidx] + i as u32))
                 .filter(|(src, dst)| src != dst)
                 .collect();
@@ -2519,9 +2575,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                 let cond_slot = g(*cond);
                 // Slice 5a: fuse a block-final `IntCmp` whose result is this branch's condition and
                 // is used nowhere else into a single `BrIfCmp`. Valid because the compare is pure and
-                // single-use *here*: it is the last instruction (so no later in-block reader) and the
-                // cond slot is not carried to any successor (not an edge-copy source). Fused compile
-                // only — `fuse == false` (debug/trace) keeps the compare as its own steppable op.
+                // single-use *here*: it is the last instruction (so no later in-block reader), the
+                // cond slot is not carried to any successor (not an edge-copy source), and no
+                // forwarding param reads it (#2448). Fused compile only — `fuse == false`
+                // (debug/trace) keeps the compare as its own steppable op.
                 let fused = if fuse && !b.insts.is_empty() {
                     match ops.last() {
                         Some(Op::IntCmp {
@@ -2531,6 +2588,7 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
                             ty,
                             op,
                         }) if *dst == cond_slot
+                            && !read_forwarded[cond_slot as usize]
                             && !then_copies.pairs.iter().any(|(s, _)| *s == cond_slot)
                             && !else_copies.pairs.iter().any(|(s, _)| *s == cond_slot) =>
                         {
@@ -2640,7 +2698,6 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
 fn compile_inst(
     inst: &Inst,
     dst: u32,
-    block_base: u32,
     view: &ModuleView<'_>,
     g: &impl Fn(u32) -> u32,
 ) -> Option<Op> {
@@ -3149,13 +3206,17 @@ fn compile_inst(
         Inst::VcpuTlsGet => Op::VcpuTlsGet { dst },
         Inst::VcpuTlsSet { val } => Op::VcpuTlsSet { val: g(*val) },
         // Everything else is a pure value op or a no-result store that the reference `eval_inst`
-        // already implements (the SIMD/`v128`/fence long tail): delegate to it against this block's
-        // sub-window, reusing the exact semantics rather than re-inlining ~30 lane ops.
-        other => Op::Eval {
-            inst: Box::new(other.clone()),
-            block_base,
-            dst,
-        },
+        // already implements (the SIMD/`v128`/fence long tail): delegate to it against the frame,
+        // its operands the frame slots `g` gives, reusing the exact semantics rather than
+        // re-inlining ~30 lane ops.
+        other => {
+            let mut inst = other.clone();
+            inst.for_each_operand_mut(&mut |v| *v = g(*v));
+            Op::Eval {
+                inst: Box::new(inst),
+                dst,
+            }
+        }
     })
 }
 
@@ -3791,9 +3852,6 @@ pub struct VcpuProgram {
     mem_size_log2: Option<u8>,
     /// The module compiled — see [`module`](VcpuProgram::module).
     module: std::sync::Arc<Module>,
-    /// The run's fiber registry (#1761) — run-level state, like `dom`'s §22 install slots: see
-    /// [`fibers`](VcpuProgram::fibers).
-    fibers: SharedFibers,
     /// The next dense vCPU id a `thread.spawn` hands out (root = 0), in spawn order across the run —
     /// see [`VcpuEvent::Spawn`]'s `vcpu`.
     next_vcpu: std::sync::atomic::AtomicU64,
@@ -3820,7 +3878,6 @@ impl VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
             module: std::sync::Arc::new(m.clone()),
-            fibers: SharedFibers::new(),
             next_vcpu: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -3835,20 +3892,6 @@ impl VcpuProgram {
     fn take_vcpu_id(&self) -> u64 {
         self.next_vcpu
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// The run's **shared fiber registry** (#1761), for [`Vcpu::with_shared_fibers`]: an embedder
-    /// that drives one run's vCPUs on separate threads or Workers (the browser's Worker driver)
-    /// attaches it to the root and every `thread.spawn` child, so a fiber migrates between them.
-    /// Like the domain's §22 install slots it is state of the run this program drives — compile a
-    /// fresh program per run.
-    pub fn fibers(&self) -> &SharedFibers {
-        &self.fibers
-    }
-
-    /// Number of functions (a `thread.spawn` target is bounds-checked against this).
-    pub fn func_count(&self) -> usize {
-        self.dom.source.primary().progs.len()
     }
 }
 
@@ -4013,19 +4056,6 @@ pub enum VcpuEvent {
     Done(Vec<Value>),
     /// The vCPU trapped (a joined thread's trap propagates here too; a §14 child's, its join answers).
     Trapped(Trap),
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): the interpreter reached a direct `Call`
-    /// to the eligible function `func` (see [`Vcpu::with_jit_eligible`]). The host runs the emitted
-    /// `f{func}(win, env, ...argv)` region on its Worker — a **top-level** call, so a guest trap is a
-    /// catchable `RuntimeError` and never corrupts the engine — then calls [`Vcpu::deliver_tierup`]
-    /// with the results, or [`Vcpu::deliver_tierup_trap`] if the region trapped. `argv` is the
-    /// marshalled arguments as raw i64 slots (the host reads them per `func`'s signature).
-    TierUp {
-        func: u32,
-        argv: Box<[i64]>,
-        /// The window's scalar committed extent at call entry ([`Mem::scalar_extent`]) — write it to
-        /// the emitted module's `"mapped"` global before invoking `f{func}` (#717 host sync).
-        mapped: u64,
-    },
     /// `thread.spawn`: start `func(sp, arg)` as a new vCPU, then call [`Vcpu::deliver_child`] with the
     /// host's token for it (the engine issues the handle the guest `join`s it by).
     /// `module` is the spawning frame's module (0 for plain guests; an installed §22 unit's index
@@ -4072,7 +4102,7 @@ pub enum VcpuEvent {
     /// A **codegen** host runs the unit on emitted wasm instead ([`Vcpu::deliver_jit_invoke_vals`]).
     /// `mapped` is the window's scalar committed extent at the invoke ([`Mem::scalar_extent`]):
     /// `Some(H)` MUST be written to the emitted unit's `"mapped"` global before running it (#717
-    /// host sync — same contract as [`VcpuEvent::TierUp`]); `None` means the window state is not
+    /// host sync); `None` means the window state is not
     /// representable by the single bound, so the host must **decline** emitted execution for this
     /// invoke and use the interpreted delivery — fail-closed, the interpreter honors the full page
     /// map. `Some(0)` for a memory-less module (nothing to bound).
@@ -4174,10 +4204,6 @@ pub struct Vcpu<'p> {
     /// (stream writes, clock) works from every vCPU of the run. `None` ⇒ the owned (default deny-all)
     /// host, as before.
     shared_host: Option<&'p std::sync::Mutex<Host>>,
-    /// The run's **shared fiber registry** (#1761, see [`with_shared_fibers`](Vcpu::with_shared_fibers)):
-    /// when set, `cont.*` go through it instead of this vCPU's own `fibers`, so a fiber created on one
-    /// vCPU of the run can be resumed on another. `None` ⇒ the owned tables, as before.
-    shared_fibers: Option<&'p SharedFibers>,
     /// A §14 **confined child**'s own domain (its natural table over the shared source — no parent
     /// §22 install slots); `None` for a root / `thread.spawn` child, which dispatch through
     /// [`VcpuProgram::dom`]'s table (`prog.dom`). The `source` `Arc` is the same either way.
@@ -4187,35 +4213,8 @@ pub struct Vcpu<'p> {
     /// A §22 JIT op awaiting its `deliver_jit_*` (carries the op's dst + parameters across the
     /// host round-trip). Distinct from `pending` because the reply payload is richer than one register.
     pending_jit: Option<PendingJit>,
-    /// #846 — the **emitted-invoke** fiber registry: while a codegen host services a
-    /// [`VcpuEvent::JitInvoke`] on emitted wasm, each cross-tier callback it bounces back here
-    /// ([`bounce_call`](Vcpu::bounce_call)) shares this registry, so a fiber parked by one callback
-    /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
-    /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
-    invoke_fibers: FiberTables,
-    /// The entry's initial arguments as the constructor built them — a §14 confined child's starter
-    /// cap handles (`[Instantiator, AddressSpace?]`, widened to `i64`), so a host that runs the
-    /// child's entry on emitted wasm (the browser's codegen path) passes exactly the handles the
-    /// interpreter would, and a bounced leaf's `call.cap` resolves them on this vCPU. Empty on the
-    /// other constructors.
-    entry_args: Vec<Value>,
     /// A trap to surface on the next `run` (a joined thread's trap propagates to the joiner).
     trap: Option<Trap>,
-    /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
-    /// means function `f`'s whole reachable region is JIT-compilable and suspension-free, so a direct
-    /// `Call` to it is surfaced as a [`VcpuEvent::TierUp`] — the host runs the emitted `f{f}` on the
-    /// Worker (top-level caller, so a guest trap is a catchable `RuntimeError`) and delivers the
-    /// result back via [`deliver_tierup`](Vcpu::deliver_tierup). `None` ⇒ everything interprets, as
-    /// before this seam existed. The engine stays wasm-agnostic: it consults only this bitmap; the
-    /// embedder computes it (e.g. from `temen_wasm_jit::analyze`).
-    jit_eligible: Option<std::sync::Arc<[bool]>>,
-    /// #750 paged tier-up: see the `Vm` field of the same name; mirrored here for the `JitInvoke`
-    /// surfacing (which reads the Vcpu, not the Vm).
-    jit_page_checked: bool,
-    /// A tier-up call awaiting its [`deliver_tierup`](Vcpu::deliver_tierup): the caller-frame-relative
-    /// dst slot the emitted region's results land in, and their types (to re-tag the delivered raw
-    /// slots — the caller's window base is the one the spill persisted).
-    pending_tierup: Option<(usize, Box<[ValType]>)>,
     /// The child the last [`VcpuEvent::InstantiateDetached`] announced — admitted, and waiting for
     /// the host to take it ([`take_child`](Self::take_child)).
     pending_child: Option<PendingChild>,
@@ -4501,17 +4500,11 @@ impl<'p> Vcpu<'p> {
             fuel: Fuel::fixed(u64::MAX),
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: None,
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: Vec::new(),
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
@@ -4555,17 +4548,11 @@ impl<'p> Vcpu<'p> {
             fuel,
             host,
             shared_host: None,
-            shared_fibers: None,
             own_dom: Some(own_dom),
             prog,
             pending: None,
             pending_jit: None,
-            invoke_fibers: FiberTables::default(),
-            entry_args: args,
             trap: None,
-            jit_eligible: None,
-            jit_page_checked: false,
-            pending_tierup: None,
             pending_child: None,
             children: Vec::new(),
             pending_lease: None,
@@ -4587,56 +4574,10 @@ impl<'p> Vcpu<'p> {
         self
     }
 
-    /// Set how many vCPUs the driver running this one can run at once ([`Host::set_workers`]) on the
-    /// host its `call.cap`s go through: the shared powerbox when it has one, else its own. The
-    /// browser's per-Worker driver gives each vCPU its own Worker, so it passes the page's core count.
-    pub fn with_workers(mut self, n: usize) -> Vcpu<'p> {
-        match self.shared_host {
-            Some(h) => h.lock_unpoisoned().set_workers(n),
-            None => self.host.set_workers(n),
-        }
-        self
-    }
-
-    /// Attach the run's **shared fiber registry** (#1761, builder-style, the fiber twin of
-    /// [`with_shared_host`](Vcpu::with_shared_host)): every `cont.new` / `cont.resume` / `suspend` of
-    /// this vCPU then goes through `fibers`, so a fiber created on one vCPU of the run can be resumed
-    /// on another — a language runtime's worker pool, whose jobs are fibers pinned to whichever
-    /// worker owns them. Attach one registry to the root and every `thread.spawn` child of a run;
-    /// never to a §14 confined child, whose fibers are its own process's. Every path that touches the
-    /// registry — `step_vcpu`, a tier-up bounce's nested drive, a `gc.roots` view beneath an invoke —
-    /// locks it per fiber transition or scan, never across execution.
-    pub fn with_shared_fibers(mut self, fibers: &'p SharedFibers) -> Vcpu<'p> {
-        self.shared_fibers = Some(fibers);
-        self
-    }
-
     /// Seed this vCPU's `vcpu.tls` word with its dense vCPU id (builder-style) — a `thread.spawn`
     /// child's, from its [`VcpuEvent::Spawn`]'s `vcpu`. A root is 0, the constructors' default.
     pub fn with_vcpu_id(mut self, id: u64) -> Vcpu<'p> {
         self.vt.active.tls = id as i64;
-        self
-    }
-
-    /// Attach the **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice, builder-style). A
-    /// direct `Call` to a function `f` with `eligible[f] == true` then surfaces as
-    /// [`VcpuEvent::TierUp`] instead of interpreting `f` — the host runs the emitted region and
-    /// `deliver_tierup`s the result. `eligible.len()` should cover the primary module's functions;
-    /// an out-of-range index is treated as not-eligible (interprets).
-    pub fn with_jit_eligible(mut self, eligible: std::sync::Arc<[bool]>) -> Vcpu<'p> {
-        self.vt.active.jit_eligible = Some(std::sync::Arc::clone(&eligible));
-        self.jit_eligible = Some(eligible);
-        self
-    }
-
-    /// #750 **paged tier-up**: mark the eligible set as emitted with the software page-check
-    /// (`compile_module_tierup_paged`). The dispatch then surfaces tier-up regardless of the
-    /// window's scalar representability — the event's `mapped` is the reserved window size, and the
-    /// driver's page-state table (refreshed per call from [`mem_map_info`](Vcpu::mem_map_info))
-    /// carries the per-page fidelity the scalar cannot.
-    pub fn with_jit_page_checked(mut self) -> Vcpu<'p> {
-        self.vt.active.jit_page_checked = true;
-        self.jit_page_checked = true;
         self
     }
 
@@ -4653,12 +4594,6 @@ impl<'p> Vcpu<'p> {
     /// access may be admitted. `0` for a memory-less module.
     pub fn win_flat_len(&self) -> u64 {
         self.mem.as_ref().map_or(0, |m| m.win_flat_len())
-    }
-
-    /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
-    /// confined child's starter cap handles, for a host that drives the entry on emitted wasm.
-    pub fn entry_args(&self) -> &[Value] {
-        &self.entry_args
     }
 
     /// #1009 paged tier-up: the window's page-map version — a cheap `O(1)` counter bumped on every
@@ -4817,14 +4752,10 @@ impl<'p> Vcpu<'p> {
                     None => HostCell::Excl(&mut self.host),
                 },
             };
-            // The run's shared fiber registry when attached (#1761), else this vCPU's own.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
+            let mut fibers = FiberCell::Excl {
+                fibers: &mut self.fibers,
+                sp: &mut self.fiber_sp,
+                meta: &mut self.fiber_meta,
             };
             let stop = step_vcpu(
                 &mut self.vt,
@@ -4898,6 +4829,9 @@ impl<'p> Vcpu<'p> {
                 | Ok(VcpuStop::ChildOffer { grant: true, .. }) => {
                     return VcpuEvent::Trapped(Trap::ThreadFault)
                 }
+                // #2164 — no child of this driver pages (its compile declines a module that could
+                // page one, [`may_page_a_child`]), so a fault here is a pagerless one.
+                Ok(VcpuStop::PageFault(_)) => return VcpuEvent::Trapped(Trap::MemoryFault),
                 Err(t) => return VcpuEvent::Trapped(t),
                 Ok(VcpuStop::Done(vals)) => {
                     let froze = durable
@@ -4917,22 +4851,9 @@ impl<'p> Vcpu<'p> {
                     }
                     return VcpuEvent::Done(vals);
                 }
-                Ok(VcpuStop::TierUp {
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                    ..
-                }) => {
-                    // A vCPU arms no entry (`with_jit_eligible` sets the bitmap alone), so each of
-                    // its tier-ups is a call.
-                    let TierUpDst::Frame(dst) = dst else {
-                        return VcpuEvent::Trapped(Trap::Malformed);
-                    };
-                    self.pending_tierup = Some((dst, results));
-                    return VcpuEvent::TierUp { func, argv, mapped };
-                }
+                // A vCPU's tasks carry no tier-up eligibility, so its VM never stops for one; a
+                // stop it did not ask for fails closed.
+                Ok(VcpuStop::TierUp { .. }) => return VcpuEvent::Trapped(Trap::Malformed),
                 Ok(VcpuStop::Spawn {
                     func,
                     sp,
@@ -5052,11 +4973,8 @@ impl<'p> Vcpu<'p> {
                     // host — `Some(H)` goes into the emitted unit's `"mapped"` global; `None`
                     // (unrepresentable page state) tells it to decline emitted execution and use
                     // the interpreted delivery instead. A memory-less module has nothing to bound.
-                    // #750: a page-checked run surfaces the reserved size instead (see the tier-up
-                    // dispatch), the table carrying per-page fidelity.
                     let mapped = match self.mem.as_ref() {
                         None => Some(0),
-                        Some(m) if self.jit_page_checked => Some(m.reserved_size()),
                         Some(m) => m.scalar_extent(),
                     };
                     return VcpuEvent::JitInvoke {
@@ -5145,10 +5063,9 @@ impl<'p> Vcpu<'p> {
     }
 
     /// File the host's `token` for a child this vCPU admitted under the next handle, with the
-    /// admission's window lease, and return the handle. What [`deliver_child`](Self::deliver_child)
-    /// does for an interpreted spawn, and what a host calls itself for a spawn its emitted code
-    /// issued ([`admit_record`](Self::admit_record)), whose handle goes back to that code.
-    pub fn file_child(&mut self, token: u64) -> i32 {
+    /// admission's window lease, and return the handle: [`deliver_child`](Self::deliver_child)'s
+    /// first step.
+    fn file_child(&mut self, token: u64) -> i32 {
         let handle = self.children.len() as i32;
         self.children.push(Some(VcpuChild {
             token,
@@ -5158,11 +5075,10 @@ impl<'p> Vcpu<'p> {
         handle
     }
 
-    /// A `join` this vCPU's **emitted** code issued (the browser's `env.join` bounce): resolve
-    /// `handle` by the oracle's child-table rule, as the interpreted join does, and return the host's
-    /// token for the child, once. The host waits on the child, then calls
-    /// [`end_join`](Self::end_join). `Err` is the trap the interpreted join raises.
-    pub fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
+    /// A `join`: resolve `handle` by the oracle's child-table rule and return the host's token for the
+    /// child, once. [`deliver_join`](Self::deliver_join) ends it ([`end_join`](Self::end_join)). `Err`
+    /// is the trap the join raises.
+    fn join_child(&mut self, handle: i32) -> Result<u64, Trap> {
         let child = super::take_child(&mut self.children, handle)?;
         let token = child.token;
         self.joining = Some(child);
@@ -5171,7 +5087,7 @@ impl<'p> Vcpu<'p> {
 
     /// The child a join resolved has ended: its window's bytes and its first vCPU, or a thread's
     /// `spawn`, go back to the budget that paid.
-    pub fn end_join(&mut self) {
+    fn end_join(&mut self) {
         let Some(VcpuChild { lease, live, .. }) = self.joining.take() else {
             return;
         };
@@ -5179,47 +5095,6 @@ impl<'p> Vcpu<'p> {
             self.release_detached(lease);
         }
         drop(live);
-    }
-
-    /// An op-17 record this vCPU's **emitted** code spawned (the browser's `env.instantiate_rec`
-    /// bounce, #1865), admitted as the interpreted op is: the `Instantiator` resolved in this vCPU's
-    /// powerbox, the record read from its window, and a v1 record through [`admit_detached_child`],
-    /// the one detached admission. A v0 (carve) record traps, as the interpreted op does on every
-    /// host that runs this vCPU over a window of its own. `Ok(Some((child, size_log2)))`: admitted —
-    /// the host starts it, then [`file_child`](Self::file_child)s its token; `Ok(None)`: refused
-    /// (`-EINVAL`); `Err`: a trap.
-    pub fn admit_record(
-        &mut self,
-        inst: i32,
-        rec: u64,
-    ) -> Result<Option<(PendingChild, u8)>, Trap> {
-        match self.shared_host {
-            Some(m) => m.lock_unpoisoned().resolve_instantiator(inst)?,
-            None => self.host.resolve_instantiator(inst)?,
-        };
-        let sr = read_spawn_rec(self.mem.as_ref().ok_or(Trap::Malformed)?, rec)?;
-        if sr.pager != u32::MAX {
-            return Err(Trap::CapFault);
-        }
-        let spawn = DetachedSpawn::of(&sr);
-        let source = &self.own_dom.as_ref().unwrap_or(&self.prog.dom).source;
-        let admitted = match self.shared_host {
-            Some(m) => admit_detached_child(
-                &mut m.lock_unpoisoned(),
-                self.mem.as_ref(),
-                spawn,
-                true,
-                source,
-            ),
-            None => admit_detached_child(&mut self.host, self.mem.as_ref(), spawn, true, source),
-        }?;
-        let Some((child, window)) = admitted else {
-            return Ok(None);
-        };
-        let (size_log2, lease) = (window.size_log2, child.lease);
-        let child = self.pending_child(child, window)?;
-        self.pending_lease = Some(lease);
-        Ok(Some((child, size_log2)))
     }
 
     /// Settle a detached child's window lease in this vCPU's powerbox ([`Host::release_detached`]).
@@ -5263,9 +5138,7 @@ impl<'p> Vcpu<'p> {
     /// Deliver the resolved unit for a `JitInstall` ([`Host::resolve_jit_unit`]) and install it into
     /// this vCPU's domain ([`jit_install`]): the **shared** [`Domain`] for a root, so every
     /// vCPU/Worker can `call.dyn` it, or a §14 child's own. An `Err` resolution traps, as does a unit
-    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst. A
-    /// wasm-tier host mirrors the table into a per-Worker `WebAssembly.Table` (§22 Model B2
-    /// cross-Worker: funcrefs can't cross Workers) from [`Vcpu::slot_unit`].
+    /// outside engine coverage (`Malformed`); a full table is `-ENOSPC` at the awaiting dst.
     pub fn deliver_jit_install(&mut self, unit: Result<super::ResolvedJitUnit, Trap>) {
         let Some(PendingJit::Install { dst }) = self.pending_jit.take() else {
             panic!("deliver_jit_install with no pending install");
@@ -5288,20 +5161,6 @@ impl<'p> Vcpu<'p> {
         if let Err(t) = jit_uninstall(authorized, &dom.source, &dom.table, slot, active, dst) {
             self.trap = Some(t);
         }
-    }
-
-    /// #1339 — the `(domain, unit)` installed at `slot` of this vCPU's dispatch table (`None` =
-    /// empty or one of the program's own functions): what a per-Worker `WebAssembly.Table` holds
-    /// there. The root's table is the one its threads share; a §14 child's is its own (#1296).
-    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        dom.table.slot_unit(slot as usize)
-    }
-
-    /// #1339 — the generation of this vCPU's dispatch table ([`Vcpu::slot_unit`]): it moves with
-    /// every install and uninstall, so a Worker rebuilds its mirror only when it changed.
-    pub fn table_gen(&self) -> u32 {
-        self.own_dom.as_ref().unwrap_or(&self.prog.dom).table.gen()
     }
 
     /// Deliver the resolved unit for a `JitInvoke` ([`Host::resolve_jit_unit`], as for
@@ -5329,12 +5188,8 @@ impl<'p> Vcpu<'p> {
             Some(m) => HostCell::Shared(m),
             None => HostCell::Excl(&mut self.host),
         };
-        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660): the run-shared
-        // registry when attached — locked only while such a scan reads it — else our own.
-        let parked = match self.shared_fibers {
-            Some(s) => FiberRegRef::Shared(s),
-            None => FiberRegRef::Owned(&self.fibers),
-        };
+        // The unit's `gc.roots` sees the run's parked fibers beneath it (#1660).
+        let parked = FiberRegRef::Owned(&self.fibers);
         let ran = jit_invoke_unit(unit, &dom.source, &dom.table, &argv, &params, &results)
             .and_then(|(umod, args)| {
                 run_invoke(
@@ -5367,7 +5222,6 @@ impl<'p> Vcpu<'p> {
     /// args)`) calls this with the emitted region's results; a host that interprets calls the other.
     /// Too few results is a `Malformed` trap (a mis-marshalled host reply).
     pub fn deliver_jit_invoke_vals(&mut self, vals: &[i64]) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         let Some(PendingJit::Invoke { results, dst, .. }) = self.pending_jit.take() else {
             panic!("deliver_jit_invoke_vals with no pending invoke");
         };
@@ -5378,162 +5232,12 @@ impl<'p> Vcpu<'p> {
         set_slot_results(&mut self.vt.active, dst, &results, vals.iter().copied());
     }
 
-    /// #846 slice 1 — service **one cross-tier bounce** out of an emitted §22 unit: the codegen host
-    /// is mid-way through running a [`VcpuEvent::JitInvoke`] on emitted wasm (this vCPU is parked on
-    /// the pending invoke), and the unit reached a call the emit routed to `env.call_interp` — a
-    /// trampoline'd `call.dyn` target or a cross-tier direct call. `target` resolves through
-    /// the **shared dispatch table** exactly as [`Op::CallIndirect`] does (the natural prefix maps a
-    /// program function's index to itself; an installed unit sits at its install slot; empty padding
-    /// is an `IndirectCallType` trap), and the resolved function runs on a nested interpretation
-    /// over this vCPU's **live** window/powerbox/fuel — observably identical to the same call inside
-    /// an interpreted invoke. Fibers are serviced against the persistent emitted-invoke registry
-    /// ([`invoke_fibers`](Vcpu::invoke_fibers)), so a fiber parked by one callback is resumable by a
-    /// later one within the same invoke.
-    ///
-    /// `io` carries the i64 arg slots in and the result slots out (the `env.call_interp` scratch
-    /// ABI — floats by bits, i32s in the low half). Returns the result count. `Err` is the
-    /// callback's trap — the host must unwind the emitted unit and deliver it via
-    /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
-    /// resolve the invoke as the interpreted path would, not be swallowed).
-    ///
-    /// A §22 `Jit.install`/`uninstall` the callback reaches (a guest whose *emitted* frame defines
-    /// and dispatches units) moves this vCPU's table, and so its generation ([`Vcpu::table_gen`]): a
-    /// driver mirroring the table rebuilds before the emitted frame resumes (#1339).
-    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
-        step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
-        let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
-        let slot = (target as usize) & (dom.table.len() - 1);
-        let ts = dom.table.slot(slot);
-        if ts.module == super::TABLE_EMPTY {
-            return Err(Trap::IndirectCallType);
-        }
-        let tm = dom.source.get(ts.module as usize).ok_or(Trap::Malformed)?;
-        let (cp, cr) = tm.sigs[ts.func as usize].clone();
-        if cp.len() > io.len() || cr.len() > io.len() {
-            return Err(Trap::Malformed); // scratch too small — a mis-marshalled host call
-        }
-        // The i64-slot transport carries scalars only; a v128-sig target can never have been given
-        // a trampoline (the host gates that at open) — a bounce naming one is a mis-wired host.
-        let scalar =
-            |t: &ValType| matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64);
-        if !cp.iter().all(scalar) || !cr.iter().all(scalar) {
-            return Err(Trap::Malformed);
-        }
-        let args: Vec<Value> = cp
-            .iter()
-            .zip(io.iter())
-            .map(|(ty, s)| slot_to_val(*ty, *s))
-            .collect();
-        let payer = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().own_node(),
-            None => self.host.own_node(),
-        };
-        let mut vm = Vm::new(&tm, ts.func as usize, &args, Some(payer))?;
-        vm.module = ts.module as usize;
-        vm.tls = self.vt.active.tls; // the callback runs on this vCPU: its `vcpu.tls` word
-        let mut cell = match self.shared_host {
-            Some(m) => HostCell::Shared(m),
-            None => HostCell::Excl(&mut self.host),
-        };
-        // Registry context (#880): during an emitted **invoke**, callbacks share the
-        // invoke-confined registry (`run_invoke` parity — fibers die with the invoke). During an
-        // emitted **TIERUP region**, the callback is interpreted-inline-call territory: its fibers
-        // register in the vCPU's *run-level* registry (parallel arrays mirrored), so one created
-        // here persists for the run to resume later — exactly as the same call inline would.
-        let vals = if self.pending_jit.is_some() {
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                // Invoke fibers live as long as the invoke, across its bounces.
-                &mut self.invoke_fibers.cell(),
-                None,
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        } else {
-            // The run-level registry: the run-shared one when attached (#1761), else this vCPU's.
-            let mut fibers = match self.shared_fibers {
-                Some(s) => FiberCell::Shared(s),
-                None => FiberCell::Excl {
-                    fibers: &mut self.fibers,
-                    sp: &mut self.fiber_sp,
-                    meta: &mut self.fiber_meta,
-                },
-            };
-            drive_nested(
-                &dom.source,
-                &dom.table,
-                VTask::of(vm, 0),
-                &mut self.fuel,
-                &mut self.mem,
-                &mut cell,
-                &mut fibers,
-                Some(BounceRunCtx { park: None }),
-                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
-                false,
-            )?
-            .done()
-        };
-        for (i, v) in vals.iter().enumerate() {
-            io[i] = val_to_slot(*v);
-        }
-        Ok(cr.len())
-    }
-
-    /// The window's committed **scalar extent** right now ([`Mem::scalar_extent`]) — the #717 value
-    /// the codegen host re-syncs to every live instance's `"mapped"` global after a
-    /// [`bounce_call`](Vcpu::bounce_call) (a bounced callback may have `vm_map`-grown the window
-    /// mid-invoke; the fan-out makes the growth visible to the emitted tier exactly when the
-    /// interpreted path would see it — after the call returns). `0` when the window state is no
-    /// longer scalar-representable — deny-everything, the diverge-toward-refusal posture
-    /// (INVARIANTS.md #9), or when there is no window.
-    pub fn window_scalar_extent(&self) -> u64 {
-        self.mem
-            .as_ref()
-            .and_then(|m| m.scalar_extent())
-            .unwrap_or(0)
-    }
-
     /// Deliver a **trap** from a host-run [`VcpuEvent::JitInvoke`] unit (the emitted region hit a
     /// guest `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a
     /// catchable `RuntimeError`). The vCPU traps on its next `run`, exactly as an interpreted invoke
     /// trap would (`deliver_jit_invoke` sets `self.trap` on the unit's `Err`).
     pub fn deliver_jit_invoke_trap(&mut self, trap: Trap) {
-        self.invoke_fibers = FiberTables::default(); // the emitted invoke resolved — its bounce registry dies with it
         self.pending_jit = None;
-        self.trap = Some(trap);
-    }
-
-    /// Deliver the results of a [`VcpuEvent::TierUp`]: the emitted region returned `vals` (raw i64
-    /// result slots, one per the callee's result type). Re-tag each into the awaiting `dst` slot(s) of
-    /// the caller's window and resume — the tier-up call then looks exactly like an interpreted call
-    /// that returned. Too few results is a `Malformed` trap (a mis-marshalled host reply).
-    pub fn deliver_tierup(&mut self, vals: &[i64]) {
-        let Some((dst, results)) = self.pending_tierup.take() else {
-            panic!("deliver_tierup with no pending tier-up");
-        };
-        if vals.len() < results.len() {
-            self.trap = Some(Trap::Malformed);
-            return;
-        }
-        for (i, ty) in results.iter().enumerate() {
-            self.vt.active.set(
-                dst as u32 + i as u32,
-                Reg::from_value(slot_to_val(*ty, vals[i])),
-            );
-        }
-    }
-
-    /// Deliver a **trap** from a [`VcpuEvent::TierUp`] region (the emitted `f{func}` hit a guest
-    /// `unreachable` / memory fault / div-by-zero / out-of-fuel, surfaced to the host as a catchable
-    /// `RuntimeError`). The vCPU traps on its next `run`, exactly as if the interpreted call had.
-    pub fn deliver_tierup_trap(&mut self, trap: Trap) {
-        self.pending_tierup = None;
         self.trap = Some(trap);
     }
 
@@ -7472,6 +7176,7 @@ fn trace_tags(tasks: &[TaskSlot]) -> Vec<(u8, u64)> {
             TaskState::BlockedHostCap { id, .. } => (5, id),
             TaskState::BlockedSvc
             | TaskState::BlockedTicket { .. }
+            | TaskState::BlockedPage { .. }
             | TaskState::BlockedReap { .. }
             | TaskState::BlockedReapPersonality { .. }
             | TaskState::BlockedPipeRead { .. }
@@ -7837,6 +7542,11 @@ fn service_advance(
             | Outcome::SvcWait
             | Outcome::ChildOffer { grant: false, .. }
             | Outcome::CloneCaller { .. } => return Serviced::Declined,
+
+            // Paging: a page comes from its pager's serve loop, which this engine runs for no
+            // child; it declines a root that could page one when a session opens
+            // ([`may_page_a_child`]).
+            Outcome::PageFault(_) => return Serviced::Declined,
 
             // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
             // run harness rather than the debug scheduler.
@@ -8313,9 +8023,10 @@ fn dbg_completions(
 
 impl ScheduledDebugRun {
     /// Open a multithreaded debug session on `m`'s `func(args)`. `None` if the module is outside the
-    /// bytecode engine's subset (`compile_module` declines it). The powerbox is empty; use
-    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted capability
-    /// (e.g. a §14 `Instantiator` for `instantiate`).
+    /// bytecode engine's subset (`compile_module` declines it), or may page a child, which this
+    /// scheduler cannot serve and the oracle's debugger can (#2164). The powerbox is empty; use
+    /// [`new_with_host`](ScheduledDebugRun::new_with_host) to debug a guest needing a granted
+    /// capability (e.g. a §14 `Instantiator` for `instantiate`).
     pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<ScheduledDebugRun> {
         ScheduledDebugRun::new_with_host(m, func, args, Host::new())
     }
@@ -8330,6 +8041,11 @@ impl ScheduledDebugRun {
         host: Host,
     ) -> Option<ScheduledDebugRun> {
         m.funcs.get(func as usize)?;
+        // #2164 — this scheduler's domains sit in no cell, so it serves no child, as `Vcpu` serves
+        // none.
+        if may_page_a_child(m) {
+            return None;
+        }
         let root_md = std::sync::Arc::new(ModuleDebug::build(m));
         // Unfused: debug stepping (Slice 5a).
         let mut c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?;
@@ -10199,23 +9915,28 @@ fn fork_bare<T>(children: &[Option<T>], vt: &VTask) -> bool {
 }
 
 /// What a fork twin takes from its parent's process (the oracle's `fork_vcpu`): one `spawn` of the
-/// node they share while it lives (#2001), a private copy of its window `mem`, and its powerbox
-/// `host` duplicated as process `pid`, which pays the node for the copy (#2106). `None` refuses the
-/// fork, with nothing left charged: a full ceiling, or a window or powerbox that cannot be duplicated.
-/// The window is copied outside the powerbox's lock.
+/// node they share while it lives (#2001), its task ([`twin_task`]: the `parent` frame answered
+/// `reply` at `dst`), a private copy of its window `mem`, and its powerbox `host` duplicated as
+/// process `pid`, which pays the node for the copy (#2106). `None` refuses the fork, with nothing
+/// left charged: a full ceiling, or a window or powerbox that cannot be duplicated. The powerbox
+/// comes last: its providers register the process as they copy it, so nothing after may refuse the
+/// fork (#2373). The window is copied outside the powerbox's lock.
 fn fork_process(
     host: &std::sync::Mutex<Host>,
     mem: Option<&Mem>,
     pid: u64,
-) -> Option<(Option<Mem>, Host, LiveVcpu)> {
-    let live = LiveVcpu::charge(host.lock_unpoisoned().own_node())?;
+    (parent, dst, reply): (&Vm, u32, i64),
+) -> Option<(Option<Mem>, Host, LiveVcpu, VTask)> {
+    let payer = host.lock_unpoisoned().own_node();
+    let live = LiveVcpu::charge(payer.clone())?;
+    let task = twin_task(parent, dst, reply, payer)?;
     let twin_mem = match mem {
         Some(m) => Some(m.fork_private()?),
         None => None,
     };
     let window = mem.map_or(0, Mem::mapped_size);
     let twin_host = host.lock_unpoisoned().fork_powerbox(pid, window)?;
-    Some((twin_mem, twin_host, live))
+    Some((twin_mem, twin_host, live, task))
 }
 
 /// Wire a new process's powerbox as the root's is: its own park door, which its personality's
@@ -10250,9 +9971,9 @@ fn wire_kill(host: &Host) {
 
 /// A fork twin's task: its parent's frame (`parent`, a bare root's, so no resume chain or invoke) at
 /// the post-fork resume point, answered `reply` at `dst` — the return-twice value. #2336 — its copy
-/// of its parent's register file is its own, charged to `payer`, its node, as its window is: `None`,
-/// with nothing charged, when there is no room for it, which fails the fork as no room for the
-/// window does.
+/// of its parent's register file is its own, charged to `payer`, the node it shares with its parent,
+/// as its window is: `None`, with nothing charged, when there is no room for it, which fails the
+/// fork as no room for the window does.
 fn twin_task(parent: &Vm, dst: u32, reply: i64, payer: NodeRef) -> Option<VTask> {
     let mut active = parent.clone();
     active.room = RegsRoom::new(Some(payer));
@@ -10341,7 +10062,7 @@ fn exec_image_build(
     let win = m.exec_window(
         back,
         img.child_size,
-        &img.module.data,
+        &img.module,
         temen_ir::module_null_guard(),
         args.as_deref(),
     );
@@ -10436,6 +10157,10 @@ impl DispatchParks {
 enum Outcome {
     Done(Vec<Value>),
     Suspended,
+    /// §2.2 / #2164 — a demand-paged child's recoverable fault at this window address: its pager
+    /// must supply the page. The cursor sits AT the faulting op, which re-executes once the page is
+    /// in place. Only a child the driver pages raises it ([`Host::pager`]).
+    PageFault(u64),
     /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
     /// function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
     /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
@@ -10860,55 +10585,30 @@ struct FiberMeta {
     charge: LiveFiber,
 }
 
-/// A **run-shared** §12 fiber registry for vCPUs on separate OS threads or Web Workers (#1761): one
-/// handle namespace for the root and all its `thread.spawn` children, so a fiber created on one vCPU
-/// can be resumed on another (D57 migration) — the cooperative driver's single registry, and the
-/// tree-walker's `FiberRegistry`, made shareable. Attach with [`Vcpu::with_shared_fibers`]. The
-/// lock is a leaf, held only for a fiber state transition
-/// (`cont.new`, the `cont.resume` claim, `suspend`, a fiber's return) or a `gc.roots` scan, never
-/// across execution. The claim is the arbiter: `cont.resume` swaps a parked fiber for a `Running`
-/// marker under the lock, so exactly one resumer wins and any other gets `FiberFault`.
-#[derive(Default)]
-pub struct SharedFibers(std::sync::Mutex<FiberTables>);
-
-impl SharedFibers {
-    pub fn new() -> SharedFibers {
-        SharedFibers::default()
-    }
-}
-
 /// How [`step_vcpu`] reaches the run's fiber registry — the fiber twin of [`HostCell`]: exclusively
-/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu` with no shared registry), or a
-/// [`SharedFibers`] locked per transition (the parallel driver, the browser's Worker driver).
+/// owned tables (the cooperative driver, the freeze unwind, a `Vcpu`), or a registry inside
+/// executor 2's scheduling core, locked per transition.
 enum FiberCell<'a> {
     Excl {
         fibers: &'a mut Vec<FiberState>,
         sp: &'a mut Vec<u64>,
         meta: &'a mut Vec<FiberMeta>,
     },
-    Shared(&'a SharedFibers),
     /// Executor 2 ([`drive_threads`]): a domain's registry inside the run's scheduling core, under
     /// the core's lock — the root domain's (`None`) or child env `k`'s (`Some(k)`).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
 
 impl FiberCell<'_> {
-    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Shared`,
-    /// `Core`). `f` is called in one place, so each use inlines one copy of it.
+    /// Run `f` over the three tables: directly (`Excl`) or under the registry's lock (`Core`). `f` is called in one place, so each use inlines one copy of it.
     #[inline]
     fn with<R>(
         &mut self,
         f: impl FnOnce(&mut Vec<FiberState>, &mut Vec<u64>, &mut Vec<FiberMeta>) -> R,
     ) -> R {
-        let mut shared;
         let mut core;
         let (fibers, sp, meta) = match self {
             FiberCell::Excl { fibers, sp, meta } => (&mut **fibers, &mut **sp, &mut **meta),
-            FiberCell::Shared(s) => {
-                shared = s.0.lock_unpoisoned();
-                let t = &mut *shared;
-                (&mut t.fibers, &mut t.sp, &mut t.meta)
-            }
             FiberCell::Core(m, env) => {
                 core = m.lock_unpoisoned();
                 let c = &mut core.core;
@@ -10928,7 +10628,6 @@ impl FiberCell<'_> {
     fn view(&self) -> FiberRegRef<'_> {
         match self {
             FiberCell::Excl { fibers, .. } => FiberRegRef::Owned(fibers),
-            FiberCell::Shared(s) => FiberRegRef::Shared(s),
             FiberCell::Core(m, env) => FiberRegRef::Core(m, *env),
         }
     }
@@ -10951,13 +10650,12 @@ impl FiberCell<'_> {
     }
 }
 
-/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or a run-shared
-/// registry locked only while the scan reads it (#1761) — so a drive paused beneath a nested one
-/// never holds the lock across the nested one's execution.
+/// A fiber registry as a `gc.roots` view ([`Beneath`]) holds it: borrowed tables, or executor 2's
+/// registry locked only while the scan reads it — so a drive paused beneath a nested one never
+/// holds the lock across the nested one's execution.
 #[derive(Clone, Copy)]
 enum FiberRegRef<'a> {
     Owned(&'a [FiberState]),
-    Shared(&'a SharedFibers),
     /// A registry inside executor 2's core ([`FiberCell::Core`]).
     Core(&'a std::sync::Mutex<Threads>, Option<usize>),
 }
@@ -10989,7 +10687,8 @@ fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
 
 /// #1538 — whether a durable freeze is in progress (the global freeze word reads `UNWINDING`): a park
 /// under it is **fresh** (the resumer's trailing poll unwinds before it observes the value), one under
-/// `NORMAL` is consumed by the resumer that runs on.
+/// `NORMAL` is consumed by the resumer that runs on. Callers ask only for a durable run: any other
+/// keeps its own data at the guard base (#2101).
 fn is_unwinding(mem: &Option<Mem>) -> bool {
     mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
 }
@@ -11255,7 +10954,7 @@ fn suspend_fiber(
     // `vcpu.tls` goes back to the resumer with execution (the fiber may have set it).
     resumer.tls = vt.active.tls;
     let suspended = std::mem::replace(&mut vt.active, resumer);
-    let consumed = !is_unwinding(mem);
+    let consumed = !(durable && is_unwinding(mem));
     fibers.with(|f, _, _| {
         f[id] = FiberState::Parked {
             vm: suspended,
@@ -11543,11 +11242,13 @@ fn shadow_switch(
     // cannot keep it refuse durable hosts (#1694).
     let arena = m.shadow_arena();
     let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
-    let sp = m.durable_get_sp(region_of(out_ctx));
-    if out_ctx == ROOT_FIBER {
-        *root_shadow_sp = sp;
-    } else {
-        fiber_sp[out_ctx] = sp;
+    // The host-side slot stands when the word cannot be read: it is what was written.
+    if let Some(sp) = m.durable_get_sp(region_of(out_ctx)) {
+        if out_ctx == ROOT_FIBER {
+            *root_shadow_sp = sp;
+        } else {
+            fiber_sp[out_ctx] = sp;
+        }
     }
     let in_sp = if in_ctx == ROOT_FIBER {
         *root_shadow_sp
@@ -11605,7 +11306,7 @@ fn freeze_drive(
     let root_sp = ctx
         .mem
         .as_ref()
-        .map(|m| m.durable_get_sp(root_word))
+        .and_then(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
     // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
     // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
@@ -11700,7 +11401,7 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(arena.region_base(slot + 1)))
+            .and_then(|m| m.durable_get_sp(arena.region_base(slot + 1)))
             .unwrap_or(arena.frame_base(slot + 1));
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
@@ -11863,8 +11564,6 @@ fn gc_scan_beneath(
         for r in &view.fibers {
             match *r {
                 FiberRegRef::Owned(f) => scan(f),
-                // A run-shared registry is locked only for the scan (#1761).
-                FiberRegRef::Shared(s) => scan(&s.0.lock_unpoisoned().fibers),
                 FiberRegRef::Core(m, env) => {
                     let g = m.lock_unpoisoned();
                     scan(match env {
@@ -11918,8 +11617,7 @@ fn run_invoke(
     host: &mut HostCell,
     beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
-    // The interpreted invoke completes synchronously, so its fiber registry is loop-local; the
-    // emitted-invoke bounce path threads the vCPU's persistent registry instead (`bounce_call`).
+    // The interpreted invoke completes synchronously, so its fiber registry is loop-local.
     drive_nested(
         source,
         table,
@@ -11980,7 +11678,7 @@ impl Nested {
     }
 }
 
-/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`Vcpu::bounce_call`]
+/// The nested drive under [`run_invoke`] (an interpreted `Jit.invoke`) and [`CoopRun::bounce`]
 /// (#846 — one cross-tier callback out of an *emitted* unit): run `vt` — the unit's entry or the
 /// callback, and the fibers it resumes — to its end over the shared window, powerbox and dispatch
 /// table, servicing fibers against `fibers`. The registry is caller-owned so the bounce path can
@@ -12219,6 +11917,8 @@ fn drive_nested(
             {
                 return Err(Trap::CapFault)
             }
+            // An unserviced seam. Among them a fault on a paged child's unsupplied page: a nested
+            // drive cannot park on its pager yet, where the oracle's invoke pages (#2472).
             _ => return Err(Trap::CapFault),
         }
     }
@@ -12228,6 +11928,9 @@ fn drive_nested(
 /// (`thread.*` / `memory.*`) event the scheduler must service. Fiber switches never reach here —
 /// `step_vcpu` handles them against the run's fiber registry ([`FiberCell`]).
 enum VcpuStop {
+    /// §2.2 / #2164 — a demand-paged child's fault at this window address ([`Outcome::PageFault`]):
+    /// park the task on its `page` request to its pager.
+    PageFault(u64),
     /// I48 — a `cont.resume.block` whose target fiber is still event-parked: idle this task on the
     /// fiber (`TaskState::BlockedOnFiber`). `step_vcpu` already rewound the resumer's cursor to the
     /// resume op, so the wake re-executes it.
@@ -12618,6 +12321,7 @@ fn step_vcpu(
                 })
             }
             Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
+            Outcome::PageFault(addr) => return Ok(VcpuStop::PageFault(addr)),
             Outcome::ChildCtl { child, dst, ctl } => {
                 return Ok(VcpuStop::ChildCtl { child, dst, ctl })
             }
@@ -13055,6 +12759,14 @@ enum TaskState {
         callee: std::sync::Arc<std::sync::Mutex<Host>>,
         dst: u32,
     },
+    /// §2.2 / #2164 — parked on a page fault: `ticket` is its `page(addr)` request on `pager`, its
+    /// spawner's domain. The settle-wake scan claims the reply as it claims a live call's: the page
+    /// is in place, so the task runs again and its faulting op re-executes; or the pager refused
+    /// it (`< 0`), and the task ends with `MemoryFault`, as a pagerless fault does.
+    BlockedPage {
+        ticket: u64,
+        pager: std::sync::Arc<std::sync::Mutex<Host>>,
+    },
     /// FORK.md §9.2 — parked in `reap` (`wait(pid)`) until fork twin `pid` (a task index) finishes;
     /// the settle scan delivers its exit status ([`super::reap_status`]) to `dst` and wakes. A
     /// trapped twin reaps as a nonzero crash status, never a propagated trap (reap ≠ join).
@@ -13269,6 +12981,7 @@ impl TaskState {
             // A `cont.resume.block` resumer idles beside the serve loop, as on the oracle.
             TaskState::BlockedSvc | TaskState::BlockedOnFiber { .. } => Some(ParkSite::Svc),
             TaskState::BlockedTicket { .. } => Some(ParkSite::Reply),
+            TaskState::BlockedPage { .. } => Some(ParkSite::PageFault),
             TaskState::BlockedReapPersonality { .. } => Some(ParkSite::Reap),
             TaskState::BlockedPipeRead { .. } => Some(ParkSite::PipeRead),
             TaskState::BlockedPipeWrite { .. } => Some(ParkSite::PipeWrite),
@@ -13330,12 +13043,15 @@ fn freeze_step(
     host.is_durable() && is_unwinding(mem) && admit_parks(tasks)
 }
 
-/// The rule this engine applies at `site`: the oracle's, but for a reply wait. The oracle re-issues the
-/// wait and the thaw re-parks the call on its ticket (#1901); this engine has no re-park yet, so a
-/// re-admitted call would be issued twice, and it declines instead (#1904).
+/// The rule this engine applies at `site`: the oracle's, but for a reply wait and a page fault. The
+/// oracle re-issues the wait and the thaw re-parks the call on its ticket (#1901); this engine has no
+/// re-park yet, so a re-admitted call would be issued twice, and it declines instead (#1904). The
+/// oracle holds a pager until its paged children have unwound (#2455), so a fault waits for its page;
+/// this engine has no hold, so it declines. No fault parks in a freeze yet: a durable run on this
+/// engine refuses a detached spawn (#1893), and only a detached child pages.
 fn freeze_rule_here(site: super::ParkSite) -> super::FreezeRule {
     match site {
-        super::ParkSite::Reply => super::FreezeRule::Decline,
+        super::ParkSite::Reply | super::ParkSite::PageFault => super::FreezeRule::Decline,
         s => s.freeze_rule(),
     }
 }
@@ -13832,24 +13548,34 @@ fn settle_wakes(
 ) {
     // §3.6 (I36 slice 2) — settle wakes: a task parked on a live-call ticket wakes when the
     // callee's serve loop completed its dispatch; claiming the completion cell delivers the
-    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell).
-    for t in tasks.iter_mut() {
-        let hit = match &t.state {
-            TaskState::BlockedTicket {
-                ticket,
-                callee,
-                dst,
-            } => callee
-                .lock_unpoisoned()
-                .svc_results
-                .remove(ticket)
-                .map(|v| (v, *dst)),
-            _ => None,
+    // reply (the tree-walker's cap_reply preference — a parked caller beats the cell). A task
+    // parked on a page request claims its reply the same way (#2164): the page is in place and
+    // the faulting op re-executes, or the pager refused it and the fault is fatal.
+    let mut refused = Vec::new();
+    for (i, t) in tasks.iter_mut().enumerate() {
+        let (TaskState::BlockedTicket { ticket, callee, .. }
+        | TaskState::BlockedPage {
+            ticket,
+            pager: callee,
+        }) = &t.state
+        else {
+            continue;
         };
-        if let Some((v, dst)) = hit {
-            t.deliver(dst, Reg::from_i64(v));
-            t.state = TaskState::Runnable;
+        let Some(v) = callee.lock_unpoisoned().svc_results.remove(ticket) else {
+            continue;
+        };
+        match t.state {
+            TaskState::BlockedTicket { dst, .. } => t.deliver(dst, Reg::from_i64(v)),
+            _ if v < 0 => {
+                refused.push(i);
+                continue;
+            }
+            _ => {}
         }
+        t.state = TaskState::Runnable;
+    }
+    for i in refused {
+        complete(tasks, i, Err(Trap::MemoryFault));
     }
     // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
     // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
@@ -13895,14 +13621,19 @@ fn settle_wakes(
             let mut h = extra_envs[k].host.lock_unpoisoned();
             h.release_memory();
             h.release_pipe_ends();
-            // #1217 — a §14 child's end releases every service it held a live offer to: it
-            // can no longer call one, so a `svc.wait` there answers `0` instead of waiting
-            // for it (a token, when no serve loop is parked yet), as on the oracle.
-            let services = if extra_envs[k].nested {
+            // #1217 — a §14 child's end releases every service it held a live offer to, and the
+            // pager its faults called (#2164): it can no longer call one, so a `svc.wait` there
+            // answers `0` instead of waiting for it (a token, when no serve loop is parked yet),
+            // as on the oracle (`client_gone_targets`).
+            let mut services = if extra_envs[k].nested {
                 h.live_offer_providers()
             } else {
                 Vec::new()
             };
+            if h.pager.is_some() {
+                let pager = task_host(root, extra_envs, extra_envs[k].spawner);
+                services.push(std::sync::Arc::clone(pager));
+            }
             drop(h);
             for service in services {
                 service.lock_unpoisoned().set_client_gone();
@@ -14707,7 +14438,7 @@ impl CoopSched {
     /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
     /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
     /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
-    /// slots per the recorded result types (mirroring [`Vcpu::deliver_tierup`]). A short reply is a
+    /// slots per the recorded result types. A short reply is a
     /// malformed host reply, which traps the task (its domain tears down, surfacing as the run result).
     fn deliver_tierup(&mut self, vals: &[i64]) {
         let (ti, dst, results) = self
@@ -14736,7 +14467,7 @@ impl CoopSched {
     }
 
     /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
-    /// would by trapping the paused task (mirroring [`Vcpu::deliver_tierup_trap`]).
+    /// would by trapping the paused task.
     fn deliver_tierup_trap(&mut self, trap: Trap) {
         let (ti, _dst, _results) = self
             .emit
@@ -14908,6 +14639,36 @@ impl SchedCore {
                     dst,
                 };
             }
+            // §2.2 / #2164 — a demand-paged child's fault, the oracle's `Step::PageFault` in
+            // cooperative form: a `page(addr)` request to the pager export on its spawner's domain,
+            // with the sink its reply lands in, and the task parks on the reply as a live caller
+            // parks on its ticket. A full queue is backpressure: the task stays runnable, and its
+            // re-executed op faults and asks again.
+            Ok(VcpuStop::PageFault(addr)) => {
+                let paged = tasks[ti].env.and_then(|k| {
+                    let e = &extra_envs[k];
+                    let export = e.host.lock_unpoisoned().pager?;
+                    Some((
+                        e.spawner,
+                        export,
+                        super::PageSink::at(e.mem.as_ref()?, addr),
+                    ))
+                });
+                // Only a paged child's window raises a fault, and a pager that is gone can never
+                // reply: either way it is a pagerless fault.
+                let Some((pager_env, export, sink)) =
+                    paged.filter(|&(p, ..)| !p.is_some_and(|p| dead_envs.contains(&p)))
+                else {
+                    complete(tasks, ti, Err(Trap::MemoryFault));
+                    return None;
+                };
+                let pager = std::sync::Arc::clone(task_host(root, extra_envs, pager_env));
+                let ticket = pager.lock_unpoisoned().request_page(export, sink);
+                wake_serve_loops(tasks, pager_env);
+                if let Some(ticket) = ticket {
+                    tasks[ti].state = TaskState::BlockedPage { ticket, pager };
+                }
+            }
             Ok(VcpuStop::CapPending { id, dst }) => {
                 // F2 (FIBER_PARK.md), #2047 — a punted dispatch, cooperative form: what made the
                 // call parks, and the rest of the run goes on, as the oracle parks the vCPU. The
@@ -15072,25 +14833,20 @@ impl SchedCore {
                     // here and that push, so the fork factories learn it up front (#863 slice 2).
                     let twin_pid = tasks.len() as u64;
                     // The run's live cap, as the oracle's `fork_vcpu` checks it (#2006).
+                    // The twin's continuation is the caller's, with `reply_twin` injected at the
+                    // caller's reply slot.
                     let forked = if bare && live_tasks(tasks) < super::MAX_VCPUS {
                         caller_env.and_then(|ck| {
                             let env = &extra_envs[ck];
-                            let (twin_mem, twin_host, live) =
-                                fork_process(&env.host, env.mem.as_ref(), twin_pid)?;
-                            Some((ck, twin_mem, twin_host, live))
+                            let at = (&tasks[caller_ti].vm.vt.active, caller_dst, reply_twin);
+                            let (twin_mem, twin_host, live, twin_vt) =
+                                fork_process(&env.host, env.mem.as_ref(), twin_pid, at)?;
+                            Some((ck, twin_mem, twin_host, live, twin_vt))
                         })
                     } else {
                         None
                     };
-                    let Some((ck, twin_mem, twin_host, live)) = forked else {
-                        break 'fork degrade(tasks, Some(caller_ti));
-                    };
-                    // The twin's continuation is the caller's, with `reply_twin` injected at the
-                    // caller's reply slot.
-                    let active = &tasks[caller_ti].vm.vt.active;
-                    let Some(mut twin_vt) =
-                        twin_task(active, caller_dst, reply_twin, twin_host.own_node())
-                    else {
+                    let Some((ck, twin_mem, twin_host, live, mut twin_vt)) = forked else {
                         break 'fork degrade(tasks, Some(caller_ti));
                     };
                     // #816 env-routed tier-up: same rule as the `ForkSelf` twin — the clone may
@@ -15361,15 +15117,12 @@ impl SchedCore {
                         Some(k) => extra_envs[k].mem.as_ref(),
                         None => mem.as_ref(),
                     };
-                    fork_process(task_host(root, extra_envs, env), win, twin_pid)
+                    // The return-twice `0`; the parent keeps the twin's pid, set below.
+                    let at = (&tasks[ti].vm.vt.active, dst, 0);
+                    fork_process(task_host(root, extra_envs, env), win, twin_pid, at)
                 } else {
                     None
                 };
-                // The return-twice `0`; the parent keeps the twin's pid, set below.
-                let forked = forked.and_then(|(twin_mem, twin_host, live)| {
-                    let twin_vt = twin_task(&tasks[ti].vm.vt.active, dst, 0, twin_host.own_node())?;
-                    Some((twin_mem, twin_host, live, twin_vt))
-                });
                 match forked {
                     None => {
                         tasks[ti].deliver(dst, Reg::from_i64(super::EAGAIN));
@@ -16373,7 +16126,7 @@ impl CoopRun {
     /// to *that task's* env — a §14 confined child steps its own window/powerbox/dispatch table
     /// (`env == Some`), the root and its `thread.spawn` threads the shared ones (`env == None`) — so a
     /// confined leaf's callback can never reach outside its window (the confinement hinge). The fiber
-    /// registry is picked by which round-trip is outstanding (#926 slice 2g, `Vcpu::bounce_call` parity):
+    /// registry is picked by which round-trip is outstanding (#926 slice 2g):
     /// a tier-up region uses the **run-level** registry (a parked fiber persists for the run to resume),
     /// while a surfaced `Jit.invoke` uses the **invoke-confined** registry (`invoke_fibers` — its fibers
     /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
@@ -16558,10 +16311,9 @@ fn child_runs_emit(module: u32, host: &Host) -> bool {
 /// region**'s callbacks run against the **run-level** registry (`fiber_meta = Some(shadow-SP/freeze
 /// halves)` — a parked fiber persists for the run, the same registry `step_vcpu` mirrors its parallel
 /// arrays into), while a surfaced **`Jit.invoke`** unit's callbacks run against an **invoke-confined**
-/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` and `Vcpu::bounce_call`'s
-/// invoke branch use — its fibers die when the invoke resolves). The multi-task analogue of
-/// [`Vcpu::bounce_call`], differing only in that the window/powerbox/table come from the *paused task's*
-/// env (resolved by [`CoopRun::bounce`]).
+/// registry (`fiber_meta = None`, the transient loop-local scope `run_invoke` uses — its fibers die
+/// when the invoke resolves). The window/powerbox/table come from the *paused task's* env (resolved
+/// by [`CoopRun::bounce`]).
 #[allow(clippy::too_many_arguments)] // an inherently many-input dispatch shim; a config struct would obscure it
 fn coop_bounce(
     source: &ModuleSource,
@@ -18429,18 +18181,33 @@ fn teardown_domains(
         // The dying child's undelivered dispatches: wake every caller parked on a ticket
         // against its host with the probeable errno (queued or admitted — no reply will ever
         // come), and drop the queue. Later calls are refused at the LiveCall arm (`dead_envs`).
+        // A fault parked on a page it was to supply is a pagerless one (#2164), and its sink goes.
         if let Some(k) = env {
             let dying = &extra_envs[k].host;
-            for t in tasks.iter_mut() {
-                if let TaskState::BlockedTicket { callee, dst, .. } = &t.state {
-                    if std::sync::Arc::ptr_eq(callee, dying) {
+            let mut stranded = Vec::new();
+            for (i, t) in tasks.iter_mut().enumerate() {
+                match &t.state {
+                    TaskState::BlockedTicket { callee, dst, .. }
+                        if std::sync::Arc::ptr_eq(callee, dying) =>
+                    {
                         let dst = *dst;
                         t.deliver(dst, Reg::from_i64(super::CAP_REVOKED));
                         t.state = TaskState::Runnable;
                     }
+                    TaskState::BlockedPage { pager, .. }
+                        if std::sync::Arc::ptr_eq(pager, dying) =>
+                    {
+                        stranded.push(i)
+                    }
+                    _ => {}
                 }
             }
-            dying.lock_unpoisoned().svc_queue.clear();
+            for i in stranded {
+                complete(tasks, i, Err(Trap::MemoryFault));
+            }
+            let mut h = dying.lock_unpoisoned();
+            h.svc_queue.clear();
+            h.page_sinks.clear();
         }
     }
 }
@@ -18513,8 +18280,8 @@ struct Vm {
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
     /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for program `jit_module`'s
-    /// functions only. Set on the root Vm via [`Vcpu::with_jit_eligible`], and on a cooperative
-    /// task running a program with an emit ([`ProgramEmits`]); a direct `Call` in that program to
+    /// functions only. Set by [`Vm::tier_up`] on a task running a program with an emit
+    /// ([`ProgramEmits`]); a direct `Call` in that program to
     /// an eligible function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
     /// invoked units, non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never
     /// a correctness gate.
@@ -18530,7 +18297,7 @@ struct Vm {
     /// (`compile_module_tierup_paged`), so the dispatch must NOT decline tier-up on a
     /// scalar-unrepresentable window — the host-maintained page table carries per-page fidelity,
     /// and the event's `mapped` becomes the reserved window size (the bound must never under-admit
-    /// a table-admitted page). Set only via [`Vcpu::with_jit_page_checked`].
+    /// a table-admitted page). Set by [`Vm::tier_up`] from the emit it arms.
     jit_page_checked: bool,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
@@ -18771,7 +18538,7 @@ impl Vm {
             pc: 0,
             scratch: Vec::new(),
             durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
-            jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
+            jit_eligible: None, // set by `Vm::tier_up`
             jit_module: 0,
             jit_entry: false,
             jit_page_checked: false,
@@ -18812,6 +18579,29 @@ impl Vm {
         }
     }
 
+    /// §2.2 / #2164 — the fault arm of [`paged!`](Self::run_ops) in a demand-paged child: a
+    /// recoverable fault becomes [`Outcome::PageFault`] with the cursor left at the op, `at`; any
+    /// other trap stands. Out of line and cold, so the memory ops keep only their branch on the
+    /// error in the op loop.
+    #[cold]
+    #[inline(never)]
+    fn page_fault_or_trap(
+        &mut self,
+        trap: Trap,
+        mem: &Option<Mem>,
+        (module, cur, base, pc): (usize, usize, usize, usize),
+    ) -> Result<Outcome, Trap> {
+        if trap != Trap::MemoryFault {
+            return Err(trap);
+        }
+        let addr = mem.as_ref().and_then(Mem::take_fault).ok_or(trap)?;
+        self.module = module;
+        self.cur = cur;
+        self.base = base;
+        self.pc = pc;
+        Ok(Outcome::PageFault(addr))
+    }
+
     /// #1904 — under a landing freeze a durable domain never parks (the oracle's `decide`, #1672):
     /// an op that would park took no effect, so it is **abandoned**. `true` when it is: the running
     /// context's re-issue word is set, the op's placeholder results stand, and the call's trailing
@@ -18836,6 +18626,11 @@ impl Vm {
     /// surfaced as a call to it would be, and the results end the task ([`Vm::jit_entry`]). A window
     /// the emitted code cannot bound interprets it. The check sits here, outside the op loop's
     /// function ([`Vm::run_ops`]): at the loop's head it slowed the interpreter's calls by a tenth.
+    ///
+    /// #2164: a demand-paged child's vCPU (its powerbox holds a pager, [`Host::pager`]) runs the op
+    /// loop with the arms that fetch a page on a recoverable fault. Every other vCPU runs it without
+    /// them: in the one loop, they slowed the interpreter's kernels by 2 to 5%, by how they moved its
+    /// register allocation, not by any work they do.
     fn resume(
         &mut self,
         source: &ModuleSource,
@@ -18864,14 +18659,19 @@ impl Vm {
                 });
             }
         }
-        self.run_ops(source, table, fuel, mem, host, budget)
+        if host.with(|p| p.pager.is_some()) {
+            self.run_ops::<true>(source, table, fuel, mem, host, budget)
+        } else {
+            self.run_ops::<false>(source, table, fuel, mem, host, budget)
+        }
     }
 
     /// [`Vm::resume`]'s op loop. The cursor (`cur`/`base`/`pc`) lives in locals for the duration of
     /// the loop so the optimizer keeps it in registers; it is written back to `self` only when the
     /// loop exits (suspend), which is also what a future blocking-op / debug-stop seam will do
-    /// before yielding.
-    fn run_ops(
+    /// before yielding. `PAGED`: a recoverable memory fault fetches a page ([`Vm::resume`] says why
+    /// it is a parameter).
+    fn run_ops<const PAGED: bool>(
         &mut self,
         source: &ModuleSource,
         table: &SharedSlots,
@@ -18922,6 +18722,20 @@ impl Vm {
         macro_rules! r {
             ($i:expr) => {
                 self.regs[base + $i as usize]
+            };
+        }
+        // §2.2 / #2164 — a memory op's result. In a demand-paged child (`PAGED`), a recoverable
+        // fault is a page to fetch, not a trap: the cursor is left AT the op, which re-executes once
+        // the page is in place, and the fault goes to the driver. The oracle's `handle_mem`.
+        macro_rules! paged {
+            ($access:expr) => {
+                match $access {
+                    Ok(v) => v,
+                    Err(t) if PAGED => {
+                        return self.page_fault_or_trap(t, mem, (module, cur, base, pc))
+                    }
+                    Err(t) => return Err(t),
+                }
             };
         }
         // Apply edge copies parallel-safely (a self-loop can alias src/dst): gather then scatter.
@@ -19143,7 +18957,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = m.load_scalar(a, *offset, *op)?;
+                    r!(*dst) = paged!(m.load_scalar(a, *offset, *op));
                     pc += 1;
                 }
                 Op::Store {
@@ -19154,9 +18968,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let lo = r!(*value).i64() as u64;
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .store_scalar(a, *offset, *op, lo)?;
+                        .store_scalar(a, *offset, *op, lo));
                     pc += 1;
                 }
                 // Bulk-memory ops (D62): both `MemCopy` and `MemMove` use the overlap-safe fast path
@@ -19166,18 +18981,14 @@ impl Vm {
                     let d = r!(*dst).i64() as u64;
                     let s = r!(*src).i64() as u64;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_copy_fast(d, s, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_copy_fast(d, s, n));
                     pc += 1;
                 }
                 Op::MemFill { dst, val, len } => {
                     let d = r!(*dst).i64() as u64;
                     let v = r!(*val).i32() as u8;
                     let n = r!(*len).i64() as u64;
-                    mem.as_mut()
-                        .ok_or(Trap::Malformed)?
-                        .mem_fill_fast(d, v, n)?;
+                    paged!(mem.as_mut().ok_or(Trap::Malformed)?.mem_fill_fast(d, v, n));
                     pc += 1;
                 }
                 Op::AtomicLoad {
@@ -19188,7 +18999,7 @@ impl Vm {
                 } => {
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let a = r!(*addr).i64() as u64;
-                    r!(*dst) = Reg::from_value(m.atomic_load(a, *offset, *ty)?);
+                    r!(*dst) = Reg::from_value(paged!(m.atomic_load(a, *offset, *ty)));
                     pc += 1;
                 }
                 Op::AtomicStore {
@@ -19199,9 +19010,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    mem.as_mut()
+                    paged!(mem
+                        .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_store(a, *offset, *ty, v)?;
+                        .atomic_store(a, *offset, *ty, v));
                     pc += 1;
                 }
                 Op::AtomicRmw {
@@ -19214,10 +19026,10 @@ impl Vm {
                 } => {
                     let a = r!(*addr).i64() as u64;
                     let v = Value::I64(r!(*value).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_rmw(a, *offset, *ty, *op, v)?;
+                        .atomic_rmw(a, *offset, *ty, *op, v));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19232,10 +19044,10 @@ impl Vm {
                     let a = r!(*addr).i64() as u64;
                     let exp = Value::I64(r!(*expected).i64());
                     let rep = Value::I64(r!(*replacement).i64());
-                    let res = mem
+                    let res = paged!(mem
                         .as_mut()
                         .ok_or(Trap::Malformed)?
-                        .atomic_cmpxchg(a, *offset, *ty, exp, rep)?;
+                        .atomic_cmpxchg(a, *offset, *ty, exp, rep));
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
@@ -19743,8 +19555,11 @@ impl Vm {
                             self.pc = pc + 1;
                             return Ok(Outcome::CapPending { id, dst: *dst });
                         }
+                        // #1722 — no other reply shape parks, so a host-completed punt, which only
+                        // its embedder can finish, declines as the oracle's does: waiting for it
+                        // would never return (the single-threaded build's wait panics).
                         let comps = host.with(|p| p.completions());
-                        let r = comps.wait(id);
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
                         if let Some(ty) = results.first() {
                             self.regs[base + *dst as usize] = Reg::from_value(slot_to_val(*ty, r));
                         }
@@ -19964,7 +19779,12 @@ impl Vm {
                     }
                     if let Some((t, _)) = self.rare.as_mut().and_then(|r| r.serve_ticket.take()) {
                         let v = self.regs[base + *dst as usize].i64();
-                        host.with(|p| p.svc_results.insert(t, v));
+                        // #1862, #2164: a page request's bytes move now, from this serving vCPU's
+                        // window, before its child can claim the reply.
+                        host.with(|p| {
+                            let v = p.settle_page(t, v, mem.as_ref());
+                            p.svc_results.insert(t, v)
+                        });
                         self.rare().serve_count += 1;
                     }
                     // DURABILITY.md §13.4 slice 4b, the oracle's rule: under `UNWINDING` a serve op
@@ -19998,7 +19818,10 @@ impl Vm {
                         }
                         let (params, _) = c.sigs.get(fidx).ok_or(Trap::CapFault)?;
                         if d.args.len() != params.len() {
-                            host.with(|p| p.svc_results.insert(d.ticket, super::EINVAL));
+                            host.with(|p| {
+                                let v = p.settle_page(d.ticket, super::EINVAL, None);
+                                p.svc_results.insert(d.ticket, v)
+                            });
                             continue;
                         }
                         let nb = base + c.progs[cur].nslots as usize;
@@ -20255,24 +20078,18 @@ impl Vm {
                 // confined window and fail closed exactly as the tree-walker's arm does (bad version
                 // or reserved field → `CapFault`). The outcome is served by every driver's detached
                 // arm, where the budget's take and the module resolve happen at the driver's commit
-                // site (`admit_detached_child`). This tier never natively
-                // demand-pages: the module-level entries decline any op-17 module with a pager-shaped
-                // export ([`compile_module_for`]), so a surviving pager field can only come from a
-                // module without one — which `CapFault`s identically on the tree-walker.
+                // site (`admit_detached_child`), and its pager is checked first (#2164).
                 Op::InstantiateRec { handle, rec, dst } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
                     let rp = r!(*rec).i64() as u64;
                     let sr = read_spawn_rec(mem.as_ref().ok_or(Trap::Malformed)?, rp)?;
-                    if sr.pager != u32::MAX {
-                        return Err(Trap::CapFault);
-                    }
+                    let spawn = DetachedSpawn::of(&sr);
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
                     self.base = base;
                     self.pc = pc + 1;
-                    let spawn = DetachedSpawn::of(&sr);
                     return Ok(Outcome::InstantiateDetached { spawn, dst });
                 }
                 // §14 `join` — check the Instantiator authority, then reuse the thread join machinery
@@ -20437,17 +20254,12 @@ impl Vm {
                     return Err(Trap::Unreachable);
                 }
                 Op::CapFault => return Err(Trap::CapFault),
-                Op::Eval {
-                    inst,
-                    block_base,
-                    dst,
-                } => {
-                    // Run the op against this block's sub-window with its original block-local operand
-                    // indices; reuse the reference semantics. `eval_inst` borrows the window immutably
-                    // and `mem` mutably (disjoint), so we read the result before writing it back.
-                    let win_lo = base + *block_base as usize;
+                Op::Eval { inst, dst } => {
+                    // Run the op against the frame, its operands frame slots; reuse the reference
+                    // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
+                    // (disjoint), so we read the result before writing it back.
                     let win_hi = base + c.progs[cur].nslots as usize;
-                    let r = super::eval_inst(inst, &self.regs[win_lo..win_hi], mem)?;
+                    let r = super::eval_inst(inst, &self.regs[base..win_hi], mem)?;
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }

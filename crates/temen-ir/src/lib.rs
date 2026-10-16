@@ -644,86 +644,103 @@ pub mod durable_abi {
 /// layout has **one** definition instead of three hand-decoded copies (#911). Only the *field
 /// extraction* is shared: each tier keeps its own pager / budget / grant handling and error order.
 ///
-/// The record is the one spawn form (INVARIANTS #13): op 15, which took the same fields as
-/// positional operands, is retired (#2067). The version word is a fixed tag (#1867 decision 2): it
-/// must be 1, so a record written for the retired carve placement (version 0) fails closed; #2091
-/// retires the tag. A child runs a module the spawner holds, from its function 0, the module's child
-/// bootstrap (#2219): the word at 4, once the entry function, must be 0 until the record is next
-/// revised, as must the word at 32, once a fuel quota (#1944 slice 3: the budget caps the child's
-/// fuel).
+/// The record is the one spawn form (INVARIANTS #13). It carries no version word: the layout
+/// changes only with every producer, in one change (#2091). A child runs a module the spawner holds,
+/// from its function 0, the module's child bootstrap (#2219).
 ///
 /// | off | field | |
 /// |---|---|---|
-/// | 0 | `u32` version | 1 |
-/// | 4 | `u32` | reserved, must be 0 (was the entry function) |
-/// | 8 | `u64` | reserved, must be 0 |
-/// | 16 | `u32` size_log2 | the child's own window |
-/// | 20 | `u32` pager | impl export / `u32::MAX` |
-/// | 24 | `i32` module | the `Module` handle the child runs |
-/// | 28 | `i32` budget | `Budget` handle whose `mem` the window spends |
-/// | 32 | `u64` | reserved, must be 0 (was the fuel quota) |
-/// | 40, 48 | `u64` grants ptr, count | named-grant list |
-/// | 56, 64 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
-/// | 72 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
-/// | 76 | `u32` | reserved, must be 0 |
-/// | 80 | `u64` child_off | where the region maps in the child |
+/// | 0 | `u32` size_log2 | the child's own window |
+/// | 4 | `u32` pager | impl export / `u32::MAX` |
+/// | 8 | `i32` module | the `Module` handle the child runs |
+/// | 12 | `i32` budget | `Budget` handle whose `mem` the window spends |
+/// | 16, 24 | `u64` grants ptr, count | named-grant list |
+/// | 32, 40 | `u64` args ptr, len | spawn-time args payload (len 0 = none) |
+/// | 48 | `i32` region | pre-mapped `SharedRegion` (−1 = none) |
+/// | 52 | `u32` | padding, must be 0 |
+/// | 56 | `u64` child_off | where the region maps in the child |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SpawnRec {
-    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 16).
+    /// Window size as a power-of-two shift count; the driver validates it against `0..64` (offset 0).
     pub size_log2: i64,
-    /// Pager impl-export index, or `u32::MAX` for none (offset 20).
+    /// Pager impl-export index, or `u32::MAX` for none (offset 4).
     pub pager: u32,
-    /// The `Module` handle the child runs (offset 24).
+    /// The `Module` handle the child runs ([`Self::MODULE_AT`]).
     pub modh: i32,
-    /// `Budget` handle, or `0` for none (offset 28).
+    /// `Budget` handle, or `0` for none ([`Self::BUDGET_AT`]).
     pub budget: i32,
-    /// Named-grant list pointer (offset 40).
+    /// Named-grant list pointer (offset 16).
     pub grants_ptr: u64,
-    /// Named-grant list count (offset 48).
+    /// Named-grant list count (offset 24).
     pub grants_n: u64,
-    /// The spawn-time args payload `(ptr, len)` (offsets 56, 64).
+    /// The spawn-time args payload `(ptr, len)` (offsets 32, 40).
     pub args: (u64, u64),
-    /// The pre-mapped region handle (offset 72), `-1` for none.
+    /// The pre-mapped region handle ([`Self::REGION_AT`]), `-1` for none.
     pub region: i32,
-    /// The region's offset in the child's window (offset 80).
+    /// The region's offset in the child's window (offset 56).
     pub child_off: u64,
 }
 
 /// The byte length of a [`SpawnRec`].
-pub const SPAWN_REC_LEN: usize = 88;
+pub const SPAWN_REC_LEN: usize = 64;
 
 impl SpawnRec {
-    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length, a version
-    /// word other than 1, or a nonzero reserved field (offsets 4, 8, 32, 76) — every driver fails
-    /// that closed. Pure layout decode: no handle/window/geometry validation, all of which stays
-    /// tier-local.
+    /// Where the `module` handle sits in the record. A spawner learns its handles at run time, so
+    /// it lays the rest of the record as data and stores these three fields before the spawn.
+    pub const MODULE_AT: u64 = 8;
+    /// Where the `budget` handle sits in the record.
+    pub const BUDGET_AT: u64 = 12;
+    /// Where the pre-mapped `region` handle sits in the record.
+    pub const REGION_AT: u64 = 48;
+
+    /// Decode a record of exactly [`SPAWN_REC_LEN`] bytes. `None` on any other length or a nonzero
+    /// padding word (offset 52) — every driver fails that closed. Pure layout decode: no
+    /// handle/window/geometry validation, all of which stays tier-local.
     pub fn parse(rec: &[u8]) -> Option<SpawnRec> {
         if rec.len() != SPAWN_REC_LEN {
             return None;
         }
         let u32_at = |o: usize| u32::from_le_bytes([rec[o], rec[o + 1], rec[o + 2], rec[o + 3]]);
         let u64_at = |o: usize| u64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
-        if u32_at(0) != 1 || u32_at(4) != 0 || u64_at(8) != 0 || u64_at(32) != 0 || u32_at(76) != 0
-        {
+        if u32_at(52) != 0 {
             return None;
         }
         Some(SpawnRec {
-            size_log2: u32_at(16) as i64,
-            pager: u32_at(20),
-            modh: u32_at(24) as i32,
-            budget: u32_at(28) as i32,
-            grants_ptr: u64_at(40),
-            grants_n: u64_at(48),
-            args: (u64_at(56), u64_at(64)),
-            region: u32_at(72) as i32,
-            child_off: u64_at(80),
+            size_log2: u32_at(0) as i64,
+            pager: u32_at(4),
+            modh: u32_at(8) as i32,
+            budget: u32_at(12) as i32,
+            grants_ptr: u64_at(16),
+            grants_n: u64_at(24),
+            args: (u64_at(32), u64_at(40)),
+            region: u32_at(48) as i32,
+            child_off: u64_at(56),
         })
     }
 
-    /// A record with every field at its "none" value: the module's declared window (`size_log2`
-    /// 0), no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no
-    /// args, no region. Producers set the fields they use.
-    pub fn v1() -> SpawnRec {
+    /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(SPAWN_REC_LEN);
+        b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
+        b.extend_from_slice(&self.pager.to_le_bytes());
+        b.extend_from_slice(&self.modh.to_le_bytes());
+        b.extend_from_slice(&self.budget.to_le_bytes());
+        b.extend_from_slice(&self.grants_ptr.to_le_bytes());
+        b.extend_from_slice(&self.grants_n.to_le_bytes());
+        b.extend_from_slice(&self.args.0.to_le_bytes());
+        b.extend_from_slice(&self.args.1.to_le_bytes());
+        b.extend_from_slice(&self.region.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&self.child_off.to_le_bytes());
+        b
+    }
+}
+
+/// A record with every field at its "none" value: the module's declared window (`size_log2` 0),
+/// no pager, no module (`0` names none, so a spawner sets `modh`), no budget, no grants, no args,
+/// no region. Producers set the fields they use.
+impl Default for SpawnRec {
+    fn default() -> SpawnRec {
         SpawnRec {
             size_log2: 0,
             pager: u32::MAX,
@@ -735,27 +752,6 @@ impl SpawnRec {
             region: -1,
             child_off: 0,
         }
-    }
-
-    /// The record's [`SPAWN_REC_LEN`] bytes, the inverse of [`Self::parse`].
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(SPAWN_REC_LEN);
-        b.extend_from_slice(&1u32.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&(self.size_log2 as u32).to_le_bytes());
-        b.extend_from_slice(&self.pager.to_le_bytes());
-        b.extend_from_slice(&self.modh.to_le_bytes());
-        b.extend_from_slice(&self.budget.to_le_bytes());
-        b.extend_from_slice(&0u64.to_le_bytes());
-        b.extend_from_slice(&self.grants_ptr.to_le_bytes());
-        b.extend_from_slice(&self.grants_n.to_le_bytes());
-        b.extend_from_slice(&self.args.0.to_le_bytes());
-        b.extend_from_slice(&self.args.1.to_le_bytes());
-        b.extend_from_slice(&self.region.to_le_bytes());
-        b.extend_from_slice(&0u32.to_le_bytes());
-        b.extend_from_slice(&self.child_off.to_le_bytes());
-        b
     }
 }
 
@@ -3846,6 +3842,183 @@ impl Func {
         self.blocks
             .iter()
             .any(|b| b.insts.iter().any(|i| matches!(i, Inst::GcRoots { .. })))
+    }
+}
+
+/// The block params of a function that only forward a value (#2448).
+///
+/// Block-local SSA (D1, D32) makes every value live across a block one of its params, so most of a
+/// large function's params only pass on a value that a block dominating theirs defined: every edge
+/// into such a param passes it that value, or the param itself. A backend may take the param as the
+/// value, with no phi and no copy. That is sound for the reason trivial-phi removal is: the value's
+/// block dominates the param's. Cranelift's `remove_constant_phis` finds the same set. Only edges
+/// from reachable blocks count. A param of the entry block, or of a block nothing reaches, is its own.
+pub struct Forwards {
+    /// Each block's first param's place in `src`, then one past the last block's last.
+    first: Vec<u32>,
+    /// Per param, the value it forwards (`block << 32 | index`), or [`Forwards::OWN`].
+    src: Vec<u64>,
+}
+
+impl Forwards {
+    /// A param that is its own value.
+    const OWN: u64 = u64::MAX;
+    /// A param no edge has spoken for yet (only while [`Func::forwards`] runs).
+    const UNKNOWN: u64 = u64::MAX - 1;
+    /// Passes over a function before the analysis gives up and calls every param its own. A pass
+    /// costs one look at each edge argument; real code settles in a few.
+    const PASSES: usize = 32;
+
+    /// The value block `b`'s param `i` forwards, as its block and its index there (a param of
+    /// that block that is its own, or a result in it), or `None` for a param that is its own or
+    /// that the block does not have (an edge's extra argument stays an argument).
+    pub fn source(&self, b: usize, i: usize) -> Option<(BlockIdx, ValIdx)> {
+        let (lo, hi) = (
+            *self.first.get(b)? as usize,
+            *self.first.get(b + 1)? as usize,
+        );
+        match *self.src[lo..hi].get(i)? {
+            Self::OWN => None,
+            v => Some(((v >> 32) as BlockIdx, v as ValIdx)),
+        }
+    }
+}
+
+impl Func {
+    /// This function's block params that only forward a value ([`Forwards`]).
+    ///
+    /// A fixpoint over the edges from reachable blocks, in reverse postorder. A value is
+    /// `block << 32 | index`. An argument that names a param stands for what that param forwards,
+    /// or for the param once it is its own. A param whose arguments, its own aside, all stand for
+    /// one value forwards it; two values make it its own.
+    pub fn forwards(&self) -> Forwards {
+        let n = self.blocks.len();
+        let mut first = Vec::with_capacity(n + 1);
+        let mut total = 0usize;
+        for b in &self.blocks {
+            first.push(total as u32);
+            total += b.params.len();
+        }
+        first.push(total as u32);
+        let edges: Vec<Vec<(BlockIdx, &[ValIdx])>> =
+            self.blocks.iter().map(|b| b.term.edges()).collect();
+        // The blocks reachable from the entry, in reverse postorder.
+        let mut reach = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        if n > 0 {
+            reach[0] = true;
+            stack.push((0, 0));
+        }
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            match edges[b].get(k) {
+                Some(&(t, _)) => {
+                    top.1 += 1;
+                    let t = t as usize;
+                    if t < n && !reach[t] {
+                        reach[t] = true;
+                        stack.push((t, 0));
+                    }
+                }
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        let order: Vec<usize> = post.into_iter().rev().filter(|&b| b != 0).collect();
+        // An edge into a block from a reachable one: its source block (a value's high half), where
+        // that block's params start in `src`, how many it has, and the arguments.
+        #[derive(Clone, Copy)]
+        struct In<'a> {
+            from: u64,
+            at: usize,
+            np: usize,
+            args: &'a [ValIdx],
+        }
+        let mut into: Vec<Vec<In>> = vec![Vec::new(); n];
+        for (u, es) in edges.iter().enumerate().filter(|&(u, _)| reach[u]) {
+            for &(t, args) in es {
+                if let Some(e) = into.get_mut(t as usize) {
+                    e.push(In {
+                        from: (u as u64) << 32,
+                        at: first[u] as usize,
+                        np: self.blocks[u].params.len(),
+                        args,
+                    });
+                }
+            }
+        }
+        let mut src = vec![Forwards::UNKNOWN; total];
+        for (b, blk) in self.blocks.iter().enumerate() {
+            if b == 0 || !reach[b] {
+                let at = first[b] as usize;
+                src[at..at + blk.params.len()].fill(Forwards::OWN);
+            }
+        }
+        let mut settled = false;
+        for _ in 0..Forwards::PASSES {
+            let mut changed = false;
+            for &t in &order {
+                for i in 0..self.blocks[t].params.len() {
+                    let at = first[t] as usize + i;
+                    if src[at] == Forwards::OWN {
+                        continue;
+                    }
+                    let me = (t as u64) << 32 | i as u64;
+                    let mut val = Forwards::UNKNOWN;
+                    for e in &into[t] {
+                        let Some(&a) = e.args.get(i) else {
+                            val = Forwards::OWN;
+                            break;
+                        };
+                        let mut v = e.from | a as u64;
+                        if (a as usize) < e.np {
+                            v = match src[e.at + a as usize] {
+                                Forwards::OWN => v,
+                                Forwards::UNKNOWN => continue,
+                                w => w,
+                            };
+                        }
+                        if v == me || v == val {
+                            continue;
+                        }
+                        if val != Forwards::UNKNOWN {
+                            val = Forwards::OWN;
+                            break;
+                        }
+                        val = v;
+                    }
+                    if val != src[at] {
+                        src[at] = val;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                // A param no edge spoke for (a cycle of params that never meets a value) is its
+                // own, and whatever counted on it looks again.
+                let mut forced = false;
+                for &t in &order {
+                    let at = first[t] as usize;
+                    for s in &mut src[at..at + self.blocks[t].params.len()] {
+                        if *s == Forwards::UNKNOWN {
+                            *s = Forwards::OWN;
+                            forced = true;
+                        }
+                    }
+                }
+                if !forced {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        if !settled {
+            src.fill(Forwards::OWN);
+        }
+        Forwards { first, src }
     }
 }
 
@@ -8124,55 +8297,380 @@ mod effects_tests {
 mod spawn_rec_tests {
     use super::*;
 
-    #[test]
-    fn encode_is_the_inverse_of_parse() {
-        let mut v1 = SpawnRec::v1();
-        v1.modh = 5;
-        v1.budget = 9;
-        v1.grants_ptr = 17536;
-        v1.grants_n = 2;
-        v1.args = (18432, 24);
-        v1.region = 7;
-        v1.child_off = 65536;
-        let b = v1.encode();
-        assert_eq!(b.len(), SPAWN_REC_LEN);
-        assert_eq!(SpawnRec::parse(&b), Some(v1));
+    fn every_field() -> SpawnRec {
+        SpawnRec {
+            size_log2: 17,
+            pager: 3,
+            modh: 5,
+            budget: 9,
+            grants_ptr: 17536,
+            grants_n: 2,
+            args: (18432, 24),
+            region: 7,
+            child_off: 65536,
+        }
     }
 
-    /// The version word is a fixed tag (#1867 decision 2): a version-0 record — the retired carve
-    /// placement — and any other version fail closed, as do the reserved words (the word at 4 is
-    /// the retired entry, #2219, and the word at 32 the retired fuel quota), a short record (a v0
-    /// record was 56 bytes) and a long one.
     #[test]
-    fn only_a_version_1_record_parses() {
-        let b = SpawnRec::v1().encode();
-        let with = |o: usize, v: u32| {
-            let mut r = b.clone();
-            r[o..o + 4].copy_from_slice(&v.to_le_bytes());
-            r
-        };
-        for v in [0, 2, u32::MAX] {
-            assert_eq!(SpawnRec::parse(&with(0, v)), None, "version {v}");
-        }
-        assert_eq!(SpawnRec::parse(&with(4, 1)), None, "the word at 4");
-        assert_eq!(SpawnRec::parse(&with(32, 1)), None, "the word at 32");
+    fn encode_is_the_inverse_of_parse() {
+        let rec = every_field();
+        let b = rec.encode();
+        assert_eq!(b.len(), SPAWN_REC_LEN);
+        assert_eq!(SpawnRec::parse(&b), Some(rec));
         assert_eq!(
-            SpawnRec::parse(&with(36, 1)),
-            None,
-            "the word at 32, high half"
+            SpawnRec::parse(&SpawnRec::default().encode()),
+            Some(SpawnRec::default())
         );
-        assert_eq!(SpawnRec::parse(&with(8, 1)), None, "the word at 8");
+    }
+
+    /// The handles a spawner stores at run time sit where the constants say.
+    #[test]
+    fn the_run_time_handles_sit_at_their_offsets() {
+        let b = every_field().encode();
+        let at = |o: u64| i32::from_le_bytes(b[o as usize..o as usize + 4].try_into().unwrap());
+        assert_eq!(at(SpawnRec::MODULE_AT), 5);
+        assert_eq!(at(SpawnRec::BUDGET_AT), 9);
+        assert_eq!(at(SpawnRec::REGION_AT), 7);
+    }
+
+    /// The padding word fails closed, as does a record of any other length: a short one (a
+    /// retired 56-byte carve record) or a long one (a retired 88-byte versioned record).
+    #[test]
+    fn only_a_whole_record_with_zero_padding_parses() {
+        let b = SpawnRec::default().encode();
+        let mut padded = b.clone();
+        padded[52] = 1;
+        assert_eq!(SpawnRec::parse(&padded), None, "the padding word");
+        assert_eq!(SpawnRec::parse(&b[..56]), None, "a 56-byte record");
         assert_eq!(
-            SpawnRec::parse(&with(12, 1)),
+            SpawnRec::parse(&[b.as_slice(), &[0; 24]].concat()),
             None,
-            "the word at 8, high half"
+            "an 88-byte record"
         );
-        assert_eq!(SpawnRec::parse(&with(76, 1)), None, "the word at 76");
-        assert_eq!(SpawnRec::parse(&b[..56]), None, "a v0-length record");
         assert_eq!(
             SpawnRec::parse(&[b.as_slice(), &[0]].concat()),
             None,
             "one byte long"
+        );
+    }
+}
+
+#[cfg(test)]
+mod forwards_tests {
+    use super::*;
+
+    fn blk(params: usize, consts: usize, term: Terminator) -> Block {
+        Block {
+            params: vec![ValType::I32; params],
+            insts: (0..consts).map(|_| Inst::ConstI32(0)).collect(),
+            term,
+        }
+    }
+
+    fn br(target: BlockIdx, args: &[ValIdx]) -> Terminator {
+        Terminator::Br {
+            target,
+            args: args.to_vec(),
+        }
+    }
+
+    fn br_if(cond: ValIdx, t: (BlockIdx, &[ValIdx]), e: (BlockIdx, &[ValIdx])) -> Terminator {
+        Terminator::BrIf {
+            cond,
+            then_blk: t.0,
+            then_args: t.1.to_vec(),
+            else_blk: e.0,
+            else_args: e.1.to_vec(),
+        }
+    }
+
+    fn func(blocks: Vec<Block>) -> Func {
+        Func {
+            params: blocks[0].params.clone(),
+            results: Vec::new(),
+            blocks,
+        }
+    }
+
+    #[test]
+    fn a_chain_forwards_to_the_value_and_the_entry_param() {
+        // b0(x): c; br b1(c, x) — b1(p, q): br b2(p, q) — b2(r, s): return
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br(2, &[0, 1])),
+            blk(2, 0, Terminator::Return(Vec::new())),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None, "an entry param is its own");
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), Some((0, 0)));
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((0, 0)));
+        assert_eq!(w.source(1, 2), None, "a param the block does not have");
+        assert_eq!(w.source(3, 0), None, "a block the function does not have");
+    }
+
+    #[test]
+    fn a_loop_forwards_its_invariant_and_keeps_its_counter() {
+        // b0(x): c; br b1(c, x)
+        // b1(inv, n): br_if n b2(inv, n) b3(inv)
+        // b2(inv, n): m; br b1(inv, m)
+        // b3(inv): return inv
+        let f = func(vec![
+            blk(1, 1, br(1, &[1, 0])),
+            blk(2, 0, br_if(1, (2, &[0, 1]), (3, &[0]))),
+            blk(2, 1, br(1, &[0, 2])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(1, 1), None, "the counter is a phi");
+        assert_eq!(w.source(2, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 1), Some((1, 1)), "the counter forwards the phi");
+        assert_eq!(w.source(3, 0), Some((0, 1)));
+    }
+
+    #[test]
+    fn a_join_of_two_values_is_its_own_and_is_forwarded_on() {
+        // b0(x): c1 c2; br_if x b1(c1) b2(c2) — b1(a): br b3(a) — b2(b): br b3(b)
+        // b3(m): br b4(m) — b4(k): return k
+        let f = func(vec![
+            blk(1, 2, br_if(0, (1, &[1]), (2, &[2]))),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(3, &[0])),
+            blk(1, 0, br(4, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 1)));
+        assert_eq!(w.source(2, 0), Some((0, 2)));
+        assert_eq!(w.source(3, 0), None);
+        assert_eq!(w.source(4, 0), Some((3, 0)));
+    }
+
+    #[test]
+    fn edges_from_unreachable_blocks_do_not_count() {
+        // b0(x): br b1(x) — b1(y): return y — b2(z) (unreachable): c; br b1(c)
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, Terminator::Return(vec![0])),
+            blk(1, 1, br(1, &[1])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+        assert_eq!(
+            w.source(2, 0),
+            None,
+            "a param of an unreachable block is its own"
+        );
+    }
+
+    #[test]
+    fn self_loops_and_cycles_of_params_forward_what_enters_them() {
+        // b0(x): br b1(x)
+        // b1(p): br_if p b1(p) b2(p) — b2(q): br_if q b1(q) b3(q) — b3(r): return r
+        let f = func(vec![
+            blk(1, 0, br(1, &[0])),
+            blk(1, 0, br_if(0, (1, &[0]), (2, &[0]))),
+            blk(1, 0, br_if(0, (1, &[0]), (3, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        for b in 1..4 {
+            assert_eq!(w.source(b, 0), Some((0, 0)), "block {b}");
+        }
+    }
+
+    #[test]
+    fn a_branch_back_to_the_entry_keeps_its_params() {
+        // b0(x): c; br_if x b0(c) b1(x) — b1(y): return y
+        let f = func(vec![
+            blk(1, 1, br_if(0, (0, &[1]), (1, &[0]))),
+            blk(1, 0, Terminator::Return(vec![0])),
+        ]);
+        let w = f.forwards();
+        assert_eq!(w.source(0, 0), None);
+        assert_eq!(w.source(1, 0), Some((0, 0)));
+    }
+
+    /// A small deterministic generator (xorshift), so the test needs no crate.
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// A random function: blocks with random params and constants, each ending in a branch to
+    /// random blocks with random arguments from its own values, or a return.
+    fn random_func(r: &mut Rng) -> Func {
+        let n = 2 + r.below(10);
+        let params: Vec<usize> = (0..n)
+            .map(|b| if b == 0 { 1 } else { r.below(5) })
+            .collect();
+        let blocks = (0..n)
+            .map(|b| {
+                let consts = r.below(3);
+                let locals = params[b] + consts;
+                let args = |r: &mut Rng, t: usize| -> Vec<ValIdx> {
+                    (0..params[t])
+                        .map(|_| {
+                            if locals == 0 {
+                                0
+                            } else {
+                                r.below(locals) as ValIdx
+                            }
+                        })
+                        .collect()
+                };
+                // A block with no values has nothing to pass or test: it returns.
+                let term = match (locals, r.below(4)) {
+                    (0, _) | (_, 0) => Terminator::Return(Vec::new()),
+                    (_, 1) => {
+                        let t = r.below(n);
+                        let a = args(r, t);
+                        Terminator::Br {
+                            target: t as BlockIdx,
+                            args: a,
+                        }
+                    }
+                    _ => {
+                        let (t, e) = (r.below(n), r.below(n));
+                        let (ta, ea) = (args(r, t), args(r, e));
+                        Terminator::BrIf {
+                            cond: 0,
+                            then_blk: t as BlockIdx,
+                            then_args: ta,
+                            else_blk: e as BlockIdx,
+                            else_args: ea,
+                        }
+                    }
+                };
+                // A target with params needs a block that has values to pass.
+                let term = match &term {
+                    Terminator::Br { target, .. }
+                        if locals == 0 && params[*target as usize] > 0 =>
+                    {
+                        Terminator::Return(Vec::new())
+                    }
+                    _ => term,
+                };
+                blk(params[b], consts, term)
+            })
+            .collect();
+        func(blocks)
+    }
+
+    /// Each block's dominators among the reachable blocks (the iterative definition).
+    fn dominators(f: &Func) -> Vec<Option<Vec<bool>>> {
+        let n = f.blocks.len();
+        let mut reach = vec![false; n];
+        let mut stack = vec![0];
+        reach[0] = true;
+        while let Some(b) = stack.pop() {
+            for (t, _) in f.blocks[b].term.edges() {
+                if !reach[t as usize] {
+                    reach[t as usize] = true;
+                    stack.push(t as usize);
+                }
+            }
+        }
+        let mut dom: Vec<Option<Vec<bool>>> = (0..n)
+            .map(|b| reach[b].then(|| (0..n).map(|d| b != 0 || d == 0).collect()))
+            .collect();
+        loop {
+            let mut changed = false;
+            for b in 1..n {
+                if !reach[b] {
+                    continue;
+                }
+                let mut meet = vec![true; n];
+                for (u, blk) in f.blocks.iter().enumerate() {
+                    if reach[u] && blk.term.edges().iter().any(|&(t, _)| t as usize == b) {
+                        let du = dom[u].as_ref().unwrap();
+                        for d in 0..n {
+                            meet[d] &= du[d];
+                        }
+                    }
+                }
+                meet[b] = true;
+                if dom[b].as_ref() != Some(&meet) {
+                    dom[b] = Some(meet);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return dom;
+            }
+        }
+    }
+
+    #[test]
+    fn a_forwarded_value_dominates_its_param_and_is_its_value_on_every_path() {
+        let mut r = Rng(0x2448_5eed);
+        let (mut forwarded, mut checked) = (0, 0);
+        for _ in 0..3000 {
+            let f = random_func(&mut r);
+            let w = f.forwards();
+            let dom = dominators(&f);
+            for (b, blk) in f.blocks.iter().enumerate() {
+                for i in 0..blk.params.len() {
+                    let Some((sb, si)) = w.source(b, i) else {
+                        continue;
+                    };
+                    let (sb, si) = (sb as usize, si as usize);
+                    forwarded += 1;
+                    assert!(dom[b].as_ref().is_some_and(|d| d[sb]), "{f:?}: ({b}, {i})");
+                    assert!(sb != b, "{f:?}: ({b}, {i}) forwards its own block's value");
+                    let own = si >= f.blocks[sb].params.len() || w.source(sb, si).is_none();
+                    assert!(own, "{f:?}: ({b}, {i}) forwards a param that forwards");
+                }
+            }
+            // Walk random paths: every value an instruction defines is fresh each time it runs, a
+            // param takes its argument's value, and a forwarded param must hold its value's
+            // latest definition whenever its block is entered.
+            let mut next = 0u64;
+            for _ in 0..8 {
+                let mut cur: Vec<Vec<Option<u64>>> = f
+                    .blocks
+                    .iter()
+                    .map(|b| vec![None; b.params.len() + b.insts.len()])
+                    .collect();
+                let (mut b, mut incoming) = (0usize, vec![Some(u64::MAX)]);
+                for _ in 0..64 {
+                    let blk = &f.blocks[b];
+                    for (i, v) in incoming.iter().enumerate() {
+                        cur[b][i] = *v;
+                    }
+                    for i in 0..blk.params.len() {
+                        if let Some((sb, si)) = w.source(b, i) {
+                            checked += 1;
+                            assert_eq!(
+                                cur[b][i], cur[sb as usize][si as usize],
+                                "{f:?}: ({b}, {i})"
+                            );
+                        }
+                    }
+                    for k in 0..blk.insts.len() {
+                        next += 1;
+                        cur[b][blk.params.len() + k] = Some(next);
+                    }
+                    let edges = blk.term.edges();
+                    if edges.is_empty() {
+                        break;
+                    }
+                    let (t, args) = edges[r.below(edges.len())];
+                    incoming = args.iter().map(|a| cur[b][*a as usize]).collect();
+                    b = t as usize;
+                }
+            }
+        }
+        assert!(
+            forwarded > 1000 && checked > 1000,
+            "{forwarded} forwarded, {checked} checked"
         );
     }
 }

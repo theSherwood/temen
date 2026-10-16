@@ -305,8 +305,7 @@ jobs:
       # (oracle⇄bytecode fork), wasm_diff (interp⇄wasm-JIT, the third confinement lowering), onramp_diff
       # (LLVM on-ramp source oracle), wasm_transpile, spec_ops, roundtrip (format identity), opt_*
       # (SSA round-trip / SCCP), coverage_walk, paged_walk (interp⇄wasm-JIT paged bulk-mem per-page walk,
-      # #1081 — the fourth confinement lowering, which wasm_diff can't reach), nested_paged (interp⇄wasm-JIT
-      # nested paged scalar page check with the page-op bounce serviced on a real vCPU, #1151), live_mapped
+      # #1081 — the fourth confinement lowering, which wasm_diff can't reach), live_mapped
       # (interp⇄wasm-JIT mask-only tier over a guest-shaped window: the emitted bound reads the driver-synced
       # live "mapped" global, #810) and pagestate (interp⇄wasm-JIT paged tier over randomized multi-run page
       # tables, #810), trap_walk (the trap-time backtrace walk's own fault recovery, #1487 — its input is the
@@ -331,7 +330,6 @@ jobs:
             opt_ssa_roundtrip,
             coverage_walk,
             paged_walk,
-            nested_paged,
             live_mapped,
             pagestate,
             durable,
@@ -878,7 +876,7 @@ jobs:
         # -j 2 caps concurrent test-binary links (the OOM peak — ISSUES.md I30).
         run: |
           cargo test -j 2 --lib --test exports_abi \
-            --test coop_tierup_driver --test par_tierup_driver \
+            --test coop_tierup_driver \
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \

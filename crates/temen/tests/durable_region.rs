@@ -482,7 +482,7 @@ fn a_freeze_without_a_page_map_declines_a_region() {
 }
 
 /// Step 2 — the parent `(Instantiator, child module, Budget, region)` spawns the child detached, with
-/// the region pre-mapped at the child's 128 KiB, through the v1 record at 65536 ([`with_spawn_rec`]
+/// the region pre-mapped at the child's 128 KiB, through the spawn record at 65536 ([`with_spawn_rec`]
 /// lays it), then maps it at its own 128 KiB (a freeze requested from the start lands there, the
 /// first call that can suspend), joins, and returns `child + 2·(what the child stored)`, read back
 /// through its own mapping.
@@ -491,11 +491,11 @@ func (i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vrh: i32) {
   vwin = i64.const 131072
   gz = i64.const 0
-  vsm = i64.const 65560
+  vsm = i64.const 65544
   i32.store vsm vmod
-  vsb = i64.const 65564
+  vsb = i64.const 65548
   i32.store vsb vbud
-  vsr = i64.const 65608
+  vsr = i64.const 65584
   i32.store vsr vrh
   vsp = i64.const 65536
   ch = call.cap 6 17 (i64) -> (i32) vinst (vsp)
@@ -552,7 +552,7 @@ fn with_spawn_rec(src: &str) -> String {
     let spawn = SpawnRec {
         size_log2: 18,
         child_off: AT as u64,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{src}{}", rec::segment(65536, &spawn))
 }
@@ -795,7 +795,7 @@ fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
 }
 
 /// #2220 — the parent `(Instantiator, child module, Budget, mailbox, region)` spawns the child
-/// detached with the mailbox pre-mapped at the child's 128 KiB, through the v1 record at 65536 as
+/// detached with the mailbox pre-mapped at the child's 128 KiB, through the spawn record at 65536 as
 /// [`SHARING_PARENT`] does, then grants the running child `region` (`Instantiator.grant`, op 19).
 /// `FLIP` requests the freeze just before the grant, so the freeze lands at it, once the grant has
 /// taken effect. The parent then maps the mailbox at its own 128 KiB, posts the child's index of the
@@ -807,11 +807,11 @@ func (i32, i32, i32, i32, i32) -> (i64) {
 block 0 (vinst: i32, vmod: i32, vbud: i32, vmb: i32, vgr: i32) {
   vwin = i64.const 131072
   gz = i64.const 0
-  vsm = i64.const 65560
+  vsm = i64.const 65544
   i32.store vsm vmod
-  vsb = i64.const 65564
+  vsb = i64.const 65548
   i32.store vsb vbud
-  vsr = i64.const 65608
+  vsr = i64.const 65584
   i32.store vsr vmb
   vsp = i64.const 65536
   ch = call.cap 6 17 (i64) -> (i32) vinst (vsp)

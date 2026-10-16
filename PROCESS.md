@@ -14,7 +14,7 @@
 > **The carve placement is retired (owner, 2026-09-29 — INVARIANTS.md #13 ruling; #1814, #1289;
 > deleted in #1867).** Every §14 child gets a **detached** window (§5). The nested carve — a child in
 > a sub-range of its parent's window, and with it the "parent sees the child's memory" superset — is
-> gone from every engine: ops 0, 5 and 13 and the version-0 record trap `CapFault`. Where this doc
+> gone from every engine: ops 0, 5 and 13 trap `CapFault`. Where this doc
 > builds on the nested superset (argv seeding, parent-as-pager, parent↔child futex through carve
 > addresses, nested subtree freeze), it is history, and the detached replacement is: the spawn
 > record's args payload, a pager that supplies bytes, a pre-mapped `SharedRegion` + canonical-key
@@ -32,7 +32,7 @@ never learns about.
 ## 0. Orientation — what already exists (verified against the tree)
 
 - **Domains-as-processes.** §14 `Instantiator` (iface 6). Its live ops on every engine (#2065):
-  spawn (17, a v1 record), `join` (1), `poll` (9), `detach` (10), `kill` (12), `child_offer` (14)
+  spawn (17, a spawn record), `join` (1), `poll` (9), `detach` (10), `kill` (12), `child_offer` (14)
   and `grant` (19). Every other op number is retired and traps `CapFault`: the carve spawns (0/5/13,
   #1867), the coroutines (2/3/4/6/7), the positional and named grants (8/11), the positional
   detached spawn (15, #2067) and the demand pager (16), all four folded into op 17's record, and
@@ -407,7 +407,7 @@ per-child nursery made the code un-shareable; deleted with the nested freeze, #1
 This also *helps* async children: cached code is read-only executable, so the same blob
 can back N concurrent OS-thread children.
 
-**Detached children, one compile per run (temen#2168).** A detached spawn (the op-17 v1 record)
+**Detached children, one compile per run (temen#2168).** A detached spawn (the op-17 record)
 recompiled its child's whole module every time, the spawner's own program included.
 The child's code now loads its nursery from its vmctx, as it loads its powerbox, cells and
 thread domain, so it bakes nothing of one spawn: a run compiles each child once per shape
@@ -623,7 +623,11 @@ its parent, the twin's with the growth its copy holds, before the process exists
 room refuses the `fork` or `posix_spawn` with `-EAGAIN`, and no personality has registered it. The
 charge goes back when the process ends; an exec moves it to its image's window, the image's declared
 memory, charging what that needs past the caller's window first and handing back what the caller's
-held past it (#2332). A root's processes pay from the run's own node.
+held past it (#2332). A root's processes pay from the run's own node. What a capability holds for
+the parent is copied for the twin by its provider, charged within every limit too: a provider with no
+room for its copy (a POSIX process's tables and directory streams, a seeded store) refuses the fork
+with `-EAGAIN`, and every twin the providers before it minted is abandoned, so none stays registered
+(#2373, #2428).
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
@@ -638,9 +642,19 @@ held past it (#2332). A root's processes pay from the run's own node.
 >
 > **The pager is typed (#744, 2026-10-07):** a record's `pager` must name an impl export of exactly
 > `{ page: (i64) -> (i64) }` (`Module::is_pager_export`), the one shape the fault's dispatch serves;
-> naming any other export fails the spawn closed. Demand paging runs on the tree-walker only: the
-> native tiers refuse a pager record and fold a module that could build one to the oracle (native
-> paging is #2164).
+> naming any other export fails the spawn closed. Demand paging runs on both interpreters: the
+> tree-walker, and the bytecode engine's drivers that serve their children, the cooperative pump
+> and the parallel driver (#2164). There a fault is a `page(addr)` request into the spawner's
+> serve loop, and the faulting op re-executes once the page is in place. The bytecode engine's
+> debug scheduler and `Vcpu` serve no child, so they decline a module that could page one, to the
+> oracle. The Cranelift JIT refuses a pager record, and a module that could build one leaves it
+> for the bytecode engine (#2164).
+>
+> **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
+> a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
+> pages only: a durable window's control words and declared shadow arena are the runtime's, and stay
+> mapped. A freeze holds a pager at `NORMAL`, serving, until the children it pages have unwound,
+> so a child that faults during the freeze is served (leaves first, #2455).
 
 Two different things surface as "SIGSEGV" and the design splits them:
 
@@ -650,7 +664,7 @@ Two different things surface as "SIGSEGV" and the design splits them:
   tree, for the benefit of a guest probing its confinement. Post-mortem observation is
   covered (trap kind + backtrace to the parent — `jit_trap_backtrace`).
 - **In-window memory-management faults (unmapped / protected page)** — a *resumable
-  event* (on the tree-walker; #2164 for the native tiers): a demand-paged child's fault
+  event* (on the interpreters; #2164 for the Cranelift JIT): a demand-paged child's fault
   suspends it with the fault address, the pager supplies the page, and **resume retries
   the access**. Retry-on-resume is the trick:
   precise fault handling with no per-access deoptimization metadata — the tax that

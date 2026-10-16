@@ -216,7 +216,7 @@ fn window() -> Arc<Region> {
 type ResolvedUnit = (temen_interp::ResolvedJitUnit, Option<Arc<[u8]>>);
 
 /// Resolve a `JitInvoke` event's authority against the vCPU's own host (compile minted the handle
-/// there) — mirroring the browser's `par_resolve_unit` — and hand back the unit + its emitted wasm.
+/// there) and hand back the unit + its emitted wasm.
 fn resolve(h: &mut Host, handle: i32, code: i32) -> Result<ResolvedUnit, Trap> {
     let unit = h.resolve_jit_unit(handle, code)?;
     let (cd, cu) = unit.2;
@@ -454,7 +454,7 @@ fn runtime_compile_invoke_trap_parity() {
 
 /// Like [`run_guest`], but the `Jit` grant + emitter live in a shared `Mutex<Host>` the vCPU
 /// dispatches through (`with_shared_host`), and the invoke resolves against that shared host —
-/// mirroring the browser's `temen_par_powerbox_jit_runtime` + `par_resolve_unit_rt`.
+/// mirroring the browser's `temen_par_powerbox_jit_runtime`.
 fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
     let unit_m = parse_module(unit_src).unwrap();
     verify_module(&unit_m).expect("verify unit");
@@ -509,7 +509,7 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
             bytecode::VcpuEvent::JitInvoke {
                 handle, code, argv, ..
             } => {
-                // Resolve against the shared host (browser `par_resolve_unit_rt`); drop the lock before
+                // Resolve against the shared host; drop the lock before
                 // delivering — the interpreter path re-locks it to run the unit.
                 let resolved = {
                     let mut g = shared.lock().unwrap();

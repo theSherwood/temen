@@ -58,7 +58,7 @@ const SPIN: i64 = 100_000;
 /// What a resumer multiplies its count of `FIBER_PARKED` resumes by.
 const PARKED: i64 = 1_000_000_000_000;
 
-/// The program: the root (func 0) spawns func 1 detached through the v1 record at [`CHILD_REC`] (its
+/// The program: the root (func 0) spawns func 1 detached through the spawn record at [`CHILD_REC`] (its
 /// args: an `Instantiator`, the `Budget` that pays, and the child image of func 1), granting it the
 /// child images of funcs 3–6 as `"g3"`–`"g6"` ([`GRANTS`]), and joins it. The
 /// child drives `fiber` (func 2) on a fiber ([`drive`]), passing it the child's `Instantiator` — or,
@@ -129,10 +129,10 @@ block 0 (vsp: i64, vi: i64) {{
 {drive_from_fiber}
 }}
 {child_rec}{grandchild_rec}",
-        rec_module = CHILD_REC + rec::MODULE_AT,
-        rec_budget = CHILD_REC + rec::BUDGET_AT,
-        gc_budget = GRANDCHILD_REC + rec::BUDGET_AT,
-        gc_module = GRANDCHILD_REC + rec::MODULE_AT,
+        rec_module = CHILD_REC + SpawnRec::MODULE_AT,
+        rec_budget = CHILD_REC + SpawnRec::BUDGET_AT,
+        gc_budget = GRANDCHILD_REC + SpawnRec::BUDGET_AT,
+        gc_module = GRANDCHILD_REC + SpawnRec::MODULE_AT,
         drive_from_root = drive(if outer { 7 } else { 2 }),
         drive_from_fiber = drive(2),
         spin_42 = spinner(42),
@@ -142,10 +142,10 @@ block 0 (vsp: i64, vi: i64) {{
             &SpawnRec {
                 grants_ptr: GRANTS,
                 grants_n: 4,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
-        grandchild_rec = rec::segment(GRANDCHILD_REC, &SpawnRec::v1()),
+        grandchild_rec = rec::segment(GRANDCHILD_REC, &SpawnRec::default()),
     );
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");

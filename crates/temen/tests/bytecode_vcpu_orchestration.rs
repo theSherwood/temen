@@ -284,7 +284,6 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::JitInstall { .. }
             | bytecode::VcpuEvent::JitUninstall { .. }
             | bytecode::VcpuEvent::JitInvoke { .. }
-            | bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::StdinPark
             | bytecode::VcpuEvent::CapPending { .. }
             | bytecode::VcpuEvent::InstantiateDetached { .. } => {

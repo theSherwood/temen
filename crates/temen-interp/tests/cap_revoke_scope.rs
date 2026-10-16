@@ -34,9 +34,9 @@ block 0 (v0: i32, vin: i32, vout: i32, vbud: i32, vmod: i32) {
   i32.store va1 vnl
   va2 = i64.const 16648
   i32.store va2 vout
-  vrm = i64.const 17880
+  vrm = i64.const 17864
   i32.store vrm vmod
-  vrb = i64.const 17884
+  vrb = i64.const 17868
   i32.store vrb vbud
   vrp = i64.const 17856
   vc = call.cap 6 17 (i64) -> (i32) v0 (vrp)
@@ -91,7 +91,7 @@ fn src() -> String {
     let child = SpawnRec {
         grants_ptr: 16640,
         grants_n: 1,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!("{SRC}{}", rec::segment(17856, &child))
 }

@@ -1,7 +1,7 @@
 //! **A Rust guest drives a §14 spawn.** The on-ramp lowers `__vm_instantiate_rec`/`__vm_join` (§14
 //! Instantiator ops 17 and 1) to a `call.cap` on a name-resolved handle, so a real Rust guest — not a
 //! hand-written shell — can issue the spawn, through the guest-side helper `support/guest_vm_spawn.rs`
-//! (an op-17 v1 record, the child in a window of its own). The C precedent is
+//! (an op-17 record, the child in a window of its own). The C precedent is
 //! `temen/tests/c_shell_exec.rs`. This was first light for the nim driver guest of #1011 slice 3c,
 //! which nimony's own driver has since replaced.
 //!
@@ -162,14 +162,14 @@ fn grant_fs(host: &mut Host, counter: &Arc<Mutex<i64>>) -> i32 {
     let c2 = Arc::clone(counter);
     let fork = Arc::new(move |_pid: u64| {
         let c = Arc::clone(&c2);
-        ForkedProc::shared(
+        Some(ForkedProc::shared(
             Box::new(move |_op, _args, _mem, _| {
                 let mut c = c.lock().unwrap();
                 *c += 1;
                 Ok(vec![*c])
             }),
             temen_interp::CapState::Stateless,
-        )
+        ))
     });
     host.grant_host_proc_forkable(handler, fork, temen_interp::CapState::Stateless)
 }

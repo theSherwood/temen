@@ -43,9 +43,13 @@ fn module(src: &str) -> Module {
 pub fn root() -> Module {
     let rec = SpawnRec {
         child_off: 65536,
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
-    let (m, b, r) = (rec::MODULE_AT, rec::BUDGET_AT, rec::REGION_AT);
+    let (m, b, r) = (
+        SpawnRec::MODULE_AT,
+        SpawnRec::BUDGET_AT,
+        SpawnRec::REGION_AT,
+    );
     module(&format!(
         r#"memory 18
 func (i32, i32, i32, i32) -> (i64) {{

@@ -30,7 +30,7 @@ fn root() -> String {
         grants_ptr: 20064,
         grants_n: 1,
         args: (18432, 8),
-        ..SpawnRec::v1()
+        ..SpawnRec::default()
     };
     format!(
         r#"memory 17
@@ -94,8 +94,8 @@ block 6 (vs6: i64, vi6: i64, vbud: i32) {{
 }}
 {rec}"#,
         grant = rec::grant("g", 20064, 20016, 6, "vnest"),
-        module_at = 17408 + rec::MODULE_AT,
-        budget_at = 17408 + rec::BUDGET_AT,
+        module_at = 17408 + SpawnRec::MODULE_AT,
+        budget_at = 17408 + SpawnRec::BUDGET_AT,
         rec = rec::segment(17408, &child),
     )
 }

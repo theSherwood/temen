@@ -77,7 +77,7 @@ const SPAWN_C: &str = include_str!("../../temen-run/demos/posix_libc/spawn.c");
 
 /// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]` as
 /// the spawn's args payload (the §3e buffer the command's `main(argc, argv)` reads). The command runs
-/// in a window of its own (the v1 detached record, #1863), so nothing is written into its memory.
+/// in a window of its own (the detached spawn record, #1863), so nothing is written into its memory.
 /// Names link via imports (see [`link_shim`]); handles come from the guest's own cap.self reflection
 /// (`vm_cap_of`).
 ///

@@ -26,7 +26,7 @@ use temen_interp::{CapState, GuestMem, HostBuffer, HostProc, NodeRef, Value};
 pub fn scripted_exec(table: Vec<ScriptedEntry>) -> HostCap {
     let make = temen_exec::scripted_exec_handler(table);
     // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move |payer| (make(payer), CapState::Uncaptured))
+    HostCap::host_proc(0, move |payer, _| Some((make(payer), CapState::Uncaptured)))
 }
 
 /// The **real subprocess** backend: spawn via the host, attenuated by an explicit program
@@ -39,7 +39,7 @@ pub fn host_exec(allowlist: &[&str]) -> HostCap {
     let allow: Arc<Vec<String>> = Arc::new(allowlist.iter().map(|s| s.to_string()).collect());
     let make = host_exec_handler(allow);
     // Each handler keeps a job table the guest drains output from: `Uncaptured` (#1699).
-    HostCap::host_proc(0, move |payer| (make(payer), CapState::Uncaptured))
+    HostCap::host_proc(0, move |payer, _| Some((make(payer), CapState::Uncaptured)))
 }
 
 /// One program in a [`domain_exec`] registry: the name a `run`'s `argv[0]` selects (exact
@@ -85,7 +85,7 @@ pub fn domain_exec_with_fs(programs: Vec<DomainProgram>, child_fs: HostCap) -> H
 fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) -> HostCap {
     let programs = Arc::new(programs);
     let child_fs = Arc::new(child_fs);
-    HostCap::host_proc(0, move |payer| {
+    HostCap::host_proc(0, move |payer, _| {
         let programs = Arc::clone(&programs);
         let child_fs = Arc::clone(&child_fs);
         let mut jobs = JobTable::new(payer);
@@ -105,7 +105,7 @@ fn domain_exec_inner(programs: Vec<DomainProgram>, child_fs: Option<HostCap>) ->
             },
         ) as HostProc;
         // A job table the guest drains output from: `Uncaptured` (#1699).
-        (h, CapState::Uncaptured)
+        Some((h, CapState::Uncaptured))
     })
 }
 

@@ -1,10 +1,10 @@
-; #152 — a threaded on-ramp guest (the manifest `_start` shape) for the parallel Worker driver's
-; on-ramp recipe (`temen_par_powerbox_onramp`). `_start` spawns 4 threads, parks on a futex until
+; #152 — a threaded on-ramp guest (the manifest `_start` shape) for executor 2's on-ramp recipe
+; (`temen_par_powerbox_onramp`). `_start` spawns 4 threads, parks on a futex until
 ; every one has checked in, joins them, writes the 8-byte total through its `write` import and
 ; `exit`s 7. Each thread bumps a shared counter 2000 times, writes its own letter ('a' + arg)
 ; through the same `write` import and returns arg * 10. Total = 4 * 2000 + 10 * (0+1+2+3) = 8060.
-; stdout = the four letters in schedule order, then the total. Shared by `tests/par_onramp.rs`
-; (native, real OS threads) and `gencorpus` (the `capio` item, real Web Workers).
+; stdout = the four letters in schedule order, then the total. Run by `gencorpus` (the `x2` item,
+; real Web Workers).
 memory 16
 import 0 "write" (i64, i64) -> (i64)
 import 1 "exit" (i32) -> ()

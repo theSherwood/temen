@@ -3,7 +3,7 @@
 //!   cargo test -p temen --release --test paging_bench -- --ignored --nocapture
 //!
 //! **What it measures and why.** The fault-service round-trip on the unified offer transport —
-//! a detached demand child (a v1 record naming the parent's pager export) touches an unsupplied
+//! a detached demand child (a spawn record naming the parent's pager export) touches an unsupplied
 //! page, the fault becomes a `page(addr)` call on the parent's pager export (direct handoff runs the
 //! handler inline on the child's thread), the handler stores the page's bytes, the substrate supplies
 //! the page, and the rewound access re-executes — timed per-fault across the backends. Until §2.3
@@ -47,7 +47,7 @@ const FAULT_MARK: i64 = 1000;
 
 /// CONSOLIDATION.md §2.2 — the **offer-transport twin**: the same S x P shape, driven the
 /// collapsed way. The parent spawns its `"child"`, func 1's child image (#2219), as a **detached
-/// demand child**, through a v1 record paid from its `"budget"` that names its own impl export 0 as
+/// demand child**, through a spawn record paid from its `"budget"` that names its own impl export 0 as
 /// the pager and leaves the child's `exit` import empty; the child walks
 /// the strides of its own window concurrently, each first touch faulting into a `page(addr)` call
 /// the parent serves from `svc.wait` (direct handoff runs the handler inline on the child's thread);
@@ -75,12 +75,12 @@ block 0 () {{
   vbp = i64.const 16400
   vbl = i64.const 6
   vb = self.resolve vbp vbl
-  vrb = i64.const 17564
+  vrb = i64.const 17548
   i32.store vrb vb
   vcp = i64.const 16416
   vcl = i64.const 5
   vcm = self.resolve vcp vcl
-  vrm = i64.const 17560
+  vrm = i64.const 17544
   i32.store vrm vcm
   vs0 = i64.const 0
   vacc0 = i64.const 0
@@ -160,7 +160,7 @@ block 0 (vaddr: i64) {{
                 pager: 0,
                 grants_ptr: 16448,
                 grants_n: 1,
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             }
         ),
         exit = rec::empty_grant(16448, 16432, "exit"),
@@ -262,21 +262,21 @@ fn fault_service_latency() {
 }
 
 /// The **fourth backend** — the wasm-JIT tier (`temen-wasm-jit`) — pinned so it is never silently
-/// forgotten in this comparison. Today the pager parent sits outside the emitter's nested
-/// subset (`svc.wait` serve loops have no bounce arms), so the tier **fails closed**
-/// and the entry folds to the bytecode interpreter: the wasm-JIT row of the fault-service table
-/// *is* the Bytecode row. This test asserts exactly that state.
+/// forgotten in this comparison. Today the pager parent sits outside the emitter's subset
+/// (`svc.wait` serve loops have no bounce arms), so its entry does not tier up and runs on the
+/// bytecode interpreter: the wasm-JIT row of the fault-service table *is* the Bytecode row. This
+/// test asserts exactly that state.
 /// When the emitter grows the arms, the assert flips — replace it with a real timed lane
-/// (emit + run under `wasmi`, the `nested_vm.rs` harness shape) instead of deleting the test.
+/// (emit + run under `wasmi`) instead of deleting the test.
 #[test]
 fn wasm_jit_lane_folds_closed_today() {
     let src = offer_paging_program(1, 1);
     let m = parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let r = temen_wasm_jit::compile_module_nested(&m, false);
+    let (_, emitted) = temen_wasm_jit::compile_module_tierup(&m, false).expect("tier-up emit");
     assert!(
-        r.is_err(),
-        "wasm-jit: the emitter now accepts the pager shape — add the timed wasmi lane to the \
+        !emitted[0],
+        "wasm-jit: the emitter now takes the pager's entry — add the timed wasmi lane to the \
          probe (and to the fault-service table) instead of relying on the fold"
     );
 }

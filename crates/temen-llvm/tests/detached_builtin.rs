@@ -15,7 +15,7 @@ define i64 @spawn(i32 %inst, i64 %rec) {
 }
 "#;
 
-/// `__vm_instantiate_rec` — the one spawn form (the op-17 v1 record) — lowers to `call.cap
+/// `__vm_instantiate_rec` — the one spawn form (the op-17 record) — lowers to `call.cap
 /// INSTANTIATOR 17` with the record pointer as its one argument, as chibicc's builtin of that name.
 #[test]
 fn the_record_spawn_lowers_to_instantiator_op_17() {
@@ -46,7 +46,7 @@ define i64 @spawn(i32 %inst, i32 %budget, ptr %rec) {
   %st = alloca i64
   %node = call i64 @__vm_budget_split(i32 %budget, i64 1000, i64 -1, i64 -1)
   %room = call i64 @__vm_budget_read(i32 %budget, i64 0)
-  %at = getelementptr i8, ptr %rec, i64 28
+  %at = getelementptr i8, ptr %rec, i64 12
   %n32 = trunc i64 %node to i32
   store i32 %n32, ptr %at
   %ri = ptrtoint ptr %rec to i64

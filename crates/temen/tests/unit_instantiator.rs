@@ -9,7 +9,7 @@
 //! would outlive the synchronous call over code nothing keeps (an invoked unit is never installed),
 //! and no one could join it.
 //!
-//! The unit spawns detached, through a v1 record the guest carries at 17408, paid from the guest's
+//! The unit spawns detached, through a spawn record the guest carries at 17408, paid from the guest's
 //! `"budget"`, running the module the host granted as `"kid"`, whose function 0 returns 42.
 //!
 //! Before #1578 the invoke route spawned on the oracle and Cranelift and `CapFault`ed on bytecode.
@@ -80,9 +80,9 @@ block 0 (vi64: i64) {{
   vnp = i64.const 16400
   vnl = i64.const 6
   vb = self.resolve vnp vnl
-  vbp = i64.const 17436
+  vbp = i64.const 17420
   i32.store vbp vb
-{module}  vmp = i64.const 17432
+{module}  vmp = i64.const 17416
   i32.store vmp vm
   vrp = i64.const 17408
   vh = call.cap 6 17 (i64) -> (i32) vi (vrp)
@@ -104,7 +104,7 @@ enum Outcome {
 
 /// The guest: `route`, the `"budget"` and `"kid"` names and the unit's spawn record.
 fn guest(route: &str) -> temen_ir::Module {
-    let rec = rec::segment(17408, &SpawnRec::v1());
+    let rec = rec::segment(17408, &SpawnRec::default());
     let m = parse_module(&format!(
         "{route}data 16400 \"budget\"\ndata 16416 \"kid\"\n{rec}"
     ))

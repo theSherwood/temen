@@ -69,7 +69,7 @@ data {PAYLOAD} \"*\"
     ))
 }
 
-/// A parent spawning by a version-1 record whose payload is `(ptr, len)`, naming the granted module
+/// A parent spawning by a record whose payload is `(ptr, len)`, naming the granted module
 /// (or the forged handle 999) and the `Budget`.
 fn by_record(ptr: u64, len: u64, forged: bool) -> Module {
     let modh = if forged { "vm999" } else { "vmod" };
@@ -81,14 +81,14 @@ fn by_record(ptr: u64, len: u64, forged: bool) -> Module {
   vba = i64.const {}
   i32.store vba vb
   vh = call.cap 6 17 (i64) -> (i32) vi (vp)",
-            REC + rec::MODULE_AT,
-            REC + rec::BUDGET_AT,
+            REC + SpawnRec::MODULE_AT,
+            REC + SpawnRec::BUDGET_AT,
         ),
         &rec::segment(
             REC,
             &SpawnRec {
                 args: (ptr, len),
-                ..SpawnRec::v1()
+                ..SpawnRec::default()
             },
         ),
     )

@@ -175,7 +175,7 @@ fn run_unit_over_live_window(
         .start(&mut store)
         .unwrap();
     if let Some(mapped) = sync {
-        // The #717 host-sync contract (worker.js: `unit.mapped.value = ex.temen_par_ev_b(v)`).
+        // The #717 host-sync contract: the invoke's `mapped` goes into the unit's `"mapped"` global.
         instance
             .get_global(&store, "mapped")
             .expect("emitted unit exports the live-mapped global")

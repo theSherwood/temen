@@ -838,141 +838,8 @@ fn vextadd_sub(shape: VShape, signed: bool) -> Option<u32> {
 /// The types of one block's value list: params first, then each instruction's results in order.
 /// Only the v1 subset is typed; anything else is `Unsupported` (fail-closed — the module was
 /// verified, so no `unwrap` here can be reached by a malformed operand index).
-/// The §14 capability ops the wasm tier lowers to a **host-driver bounce** (instead of failing
-/// out-of-subset): INSTANTIATOR (iface 6) `join` (op 1) and the config-record `instantiate_rec`
-/// (op 17) — the VM-in-VM primitive (`DESIGN.md` §14; `temen_ir::cap_id::INSTANTIATOR`). The child
-/// vCPU spawn/join happens host-side (as the interpreter surfaces `VcpuStop::InstantiateDetached`), so
-/// the emitted code just marshals the args to an `env.instantiate_rec`/`env.join` import. The
-/// bounce passes operands and results through unconverted, so a call is lowered only when it is
-/// declared with its import's exact widths: `join: (i32 child) -> (i64 status, i64 value)`,
-/// `instantiate_rec: (i64 record) -> i32`. Every other Instantiator call stays out-of-subset
-/// (fail-closed), interpreted, where the shared contract (`temen_ir::served_contract`)
-/// answers it: the retired carve spawns (ops 0 and 13, #1867) trap `CapFault` there.
-fn is_nested_cap(type_id: u32, op: u32, sig: &FuncType) -> bool {
-    use ValType::{I32, I64};
-    type_id == cap_id::INSTANTIATOR
-        && match op {
-            1 => sig.params == [I32] && sig.results == [I64, I64],
-            17 => sig.params == [I64] && sig.results == [I32],
-            _ => false,
-        }
-}
-
-/// CONSOLIDATION.md §3c.3 — does the module use the config-record spawn (`Instantiator` op 17)?
-/// When it does (and only then), nested mode appends the `env.instantiate_rec` import as func
-/// import 7, shifting the emitted-function base to 8 for that module alone: existing modules
-/// keep their exact import set, so no driver (wasmi harness or browser JS) changes until it
-/// actually loads an op-17 module.
-fn module_uses_rec(m: &Module) -> bool {
-    m.funcs.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.insts.iter().any(|i| {
-                matches!(
-                    i,
-                    Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
-                        op: 17,
-                        ..
-                    }
-                )
-            })
-        })
-    })
-}
-
-/// The §14 ADDRESS_SPACE (iface 5) ops a nested unit may reach as **outlined cross-tier leaves**
-/// (via the one existing `env.call_interp` transport — no new imports, per the CONSOLIDATION.md §0
-/// yardstick): `unmap` (1), `protect` (2), `page_size` (3, a pure query) and `sub` (4,
-/// attenuation-minting — it carves a child window handle without changing any page state).
-///
-/// `unmap`/`protect` change page state that *subsequent emitted accesses* must honor. They ride
-/// this transport only when the unit is compiled **paged** (#1151): the page-op runs interp-serviced
-/// through `env.call_interp` (never emitted, exactly like `page_size`/`sub`), the driver re-syncs the
-/// host page-state table on return, and every emitted access consults it — so an access to a page the
-/// op unmapped/`Ro`-protected traps exactly where the interpreter's `check_prot` does. Under mask-only
-/// (non-paged) compilation the containing unit still fails closed via the [`module_uses_page_ops`]
-/// gate; outlining them here is harmless there (the wrapper is still page-op-bearing, so the gate
-/// keeps the unit interpreter-tier). This closes the D40/§13 page-enforcement question on the nested
-/// axis (INVARIANTS #14) — the paged whole-program path already carries it (`module_uses_unmap_protect`).
-///
-/// `map` (0, a guest *grow*) is outlined too (#1151 Slice 2c): its effect reaches the emitted tier
-/// through the same post-bounce refresh as `unmap`/`protect` — the driver rebuilds the page-state
-/// table from the live map and re-points `"pagestate"`/`"mapped"` (the table's coverage grows with a
-/// `map` past the mapped prefix, `build_pagestate_table`), so a grow-using nested entry emits paged
-/// instead of falling to the interpreter.
-fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::ADDRESS_SPACE && op <= 4
-}
-
-/// Outline each [`is_nested_leaf_cap`] `call.cap` into an appended int-signature wrapper (exactly
-/// [`outline_cap_calls`]'s rewrite, restricted to that allowlist) so a §14 unit's entry that carves
-/// its window (`sub`) or queries `page_size` becomes emittable: the wrapper stays a cross-tier leaf
-/// [`compile_module_nested`] routes through `env.call_interp`. The host's `call_interp` callback must
-/// carry the run's **powerbox** (the reactor-path contract, not the throwaway-window one), so the
-/// wrapper's `call.cap` resolves against the same live `Host` the oracle uses — `sub`'s minted handle
-/// then encodes identically on both tiers. INSTANTIATOR ops stay **inline** (the dedicated
-/// `env.instantiate_rec`/`env.join` bounce); all other cap ops are left inline and fail closed.
-pub fn outline_nested_cap_calls(m: &mut Module) {
-    let base = m.funcs.len() as u32;
-    let mut wrappers: Vec<Func> = Vec::new();
-    // #922: snapshot the type section so interned call sigs resolve while `m.funcs` is borrowed mut.
-    let types = m.types.clone();
-    for f in &mut m.funcs {
-        for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                if let Inst::CapCall {
-                    type_id,
-                    op,
-                    sig,
-                    handle,
-                    args,
-                } = inst
-                {
-                    if !is_nested_leaf_cap(*type_id, *op) {
-                        continue;
-                    }
-                    let g = base + wrappers.len() as u32;
-                    let ft = sig_of(&types, *sig); // #922: resolve interned call type index
-                                                   // Wrapper signature: (handle: i32, ...sig.params) -> sig.results.
-                    let mut params = Vec::with_capacity(1 + ft.params.len());
-                    params.push(ValType::I32);
-                    params.extend(ft.params.iter().copied());
-                    let nparams = params.len() as u32;
-                    let wrapper_args: Vec<u32> = (1..nparams).collect();
-                    let ret: Vec<u32> = (nparams..nparams + ft.results.len() as u32).collect();
-                    let results = ft.results.clone();
-                    let block = Block {
-                        params: params.clone(),
-                        insts: vec![Inst::CapCall {
-                            type_id: *type_id,
-                            op: *op,
-                            sig: *sig,
-                            handle: 0,
-                            args: wrapper_args,
-                        }],
-                        term: Terminator::Return(ret),
-                    };
-                    wrappers.push(Func {
-                        params,
-                        results,
-                        blocks: vec![block],
-                    });
-                    let mut call_args = Vec::with_capacity(1 + args.len());
-                    call_args.push(*handle);
-                    call_args.extend(args.iter().copied());
-                    *inst = Inst::Call {
-                        func: g,
-                        args: call_args,
-                    };
-                }
-            }
-        }
-    }
-    m.funcs.extend(wrappers);
-}
-
-fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<ValType>, Error> {
-    block_value_types_with(m, b, nested_caps, |_| {})
+fn block_value_types(m: &Module, b: &Block) -> Result<Vec<ValType>, Error> {
+    block_value_types_with(m, b, |_| {})
 }
 
 /// [`block_value_types`], telling `defined` after each instruction how many values the block has
@@ -981,28 +848,11 @@ fn block_value_types(m: &Module, b: &Block, nested_caps: bool) -> Result<Vec<Val
 fn block_value_types_with(
     m: &Module,
     b: &Block,
-    nested_caps: bool,
     mut defined: impl FnMut(usize),
 ) -> Result<Vec<ValType>, Error> {
     let mut tys: Vec<ValType> = b.params.clone();
     for inst in &b.insts {
         match inst {
-            // §14 instantiator bounce (opt-in): typed by the cap-call's declared results so the entry
-            // that spawns a nested VM is in-subset. Gated to the lowerable ops; any other cap-call
-            // still hits the catch-all below (out-of-subset).
-            Inst::CapCall { type_id, op, sig, .. }
-                if nested_caps && is_nested_cap(*type_id, *op, sig_of(&m.types, *sig)) =>
-            {
-                for r in &sig_of(&m.types, *sig).results {
-                    tys.push(*r);
-                }
-            }
-            // §11 slice 3: thread/futex ops in a nested unit lower to host bounces (below) —
-            // typed here so a spawning unit is in-subset. Gated on `nested_caps` like the cap arm.
-            Inst::ThreadSpawn { .. } if nested_caps => tys.push(ValType::I32),
-            Inst::ThreadJoin { .. } if nested_caps => tys.push(ValType::I64),
-            Inst::MemoryWait { .. } if nested_caps => tys.push(ValType::I32),
-            Inst::MemoryNotify { .. } if nested_caps => tys.push(ValType::I32),
             Inst::ConstI32(_) => tys.push(ValType::I32),
             Inst::ConstI64(_) => tys.push(ValType::I64),
             Inst::IntBin { ty, .. } => tys.push(ty.val()),
@@ -1117,12 +967,11 @@ fn block_value_types_with(
 fn block_slots(
     m: &Module,
     b: &Block,
-    nested_caps: bool,
     scratch: &mut SlotScratch,
 ) -> Result<(Vec<ValType>, Vec<u32>), Error> {
     let SlotScratch { ends, free } = scratch;
     ends.clear();
-    let tys = block_value_types_with(m, b, nested_caps, |n| ends.push(n))?;
+    let tys = block_value_types_with(m, b, |n| ends.push(n))?;
     free.iter_mut().for_each(Vec::clear);
     let mut next = [0u32; NTYPES];
     let mut slot = vec![u32::MAX; tys.len()];
@@ -1225,13 +1074,6 @@ fn term_in_subset(t: &Terminator) -> bool {
 /// subset — reusing [`block_value_types`] (which errors on any out-of-subset instruction) as the
 /// single source of truth, plus a type check (all values i32/i64) and the terminator check.
 fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
-    func_in_subset_caps(m, f, atomics_ok, false)
-}
-
-/// [`func_in_subset`] with the `nested_caps` typing switch threaded through: when `true`, the §14
-/// instantiator bounce and §11 thread/futex ops type as in-subset (they lower to host bounces), so a
-/// nesting/threading function counts as emittable. `false` is the plain integer-compute subset.
-fn func_in_subset_caps(m: &Module, f: &Func, atomics_ok: bool, nested_caps: bool) -> bool {
     // §12 atomics lower to a **single-threaded** load/(rmw)/store sequence (see the
     // `block_value_types` note): correct only when no contention is possible. `atomics_ok` is the
     // module-level guarantee of that (no reachable concurrency op ⇒ no second thread) — when it does
@@ -1241,8 +1083,7 @@ fn func_in_subset_caps(m: &Module, f: &Func, atomics_ok: bool, nested_caps: bool
         return false;
     }
     f.blocks.iter().all(|b| {
-        block_value_types(m, b, nested_caps)
-            .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
+        block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
     })
 }
@@ -1275,13 +1116,12 @@ fn module_atomics_ok(m: &Module) -> bool {
 /// run*. Two ifaces do this:
 /// - **ADDRESS_SPACE** (iface 5): `unmap` (1), `protect` (2). `map` (0) does **not** count (#717):
 ///   it only *adds* committed pages, and the emitted tier confines against the live `"mapped"`
-///   global ([`MAPPED_GLOBAL_IDX`]) the driver re-syncs from the `VcpuEvent::TierUp` entry snapshot
+///   global ([`MAPPED_GLOBAL_IDX`]) the driver re-syncs from the tier-up event's entry snapshot
 ///   (`Mem::scalar_extent`) before every emitted call — a grow the scalar can't represent (sparse,
 ///   non-`Rw` prot) makes the driver *decline* tier-up for that call, so the emitted tier never
 ///   over- or under-admits relative to the interpreter. The `map`-containing function itself is
 ///   still never emitted (a remapping `call.cap` is not in-subset); only its pure siblings are.
-///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either
-///   (the emittable [`is_nested_leaf_cap`] set).
+///   `page_size` (3) / `sub` (4) are a pure query / attenuation-mint and do **not** count either.
 /// - **SHARED_REGION** (iface 4): `map` (0) aliases host backing into window pages (the emitted
 ///   tier would read the window's stale bytes, not the region's), `unmap` (1) drops it.
 ///
@@ -1840,23 +1680,6 @@ pub fn compile_module(m: &Module) -> Result<Vec<u8>, Error> {
 /// Two imported functions precede every emitted function, so a defined function's wasm index is
 /// `IMPORTED_FUNCS + its position among the emitted functions`.
 const IMPORTED_FUNCS: u32 = 2;
-/// In §14 `nested_caps` mode `env.join` follows `env.call_interp` as func import 2. These indices
-/// are valid only in that mode (the caller sizes `wasm_of` with the matching base).
-const JOIN_IMPORT_IDX: u32 = 2;
-/// §11 thread/futex host bounces (CONSOLIDATION.md §11 slice 3): func imports 3-6 in nested mode.
-/// The servicer supplies the unit's module context (it knows which module it instantiated), so the
-/// imports carry none. `thread_join`/`mem_wait` block the calling thread — legal on the par tiers,
-/// where every vCPU is a real thread (the Worker model; `worker.js` already blocks in `Atomics.wait`).
-const THREAD_SPAWN_IMPORT_IDX: u32 = 3;
-const THREAD_JOIN_IMPORT_IDX: u32 = 4;
-const MEM_WAIT_IMPORT_IDX: u32 = 5;
-const MEM_NOTIFY_IMPORT_IDX: u32 = 6;
-/// Imported-func count in `nested_caps` mode (`env.trap`, `env.call_interp`, `env.join`,
-/// `env.thread_spawn`, `env.thread_join`, `env.mem_wait`, `env.mem_notify`).
-const NESTED_IMPORTED_FUNCS: u32 = 7;
-/// §3c.3 — `env.instantiate_rec` (the config-record spawn bounce), emitted **conditionally** as
-/// func import 7 only when [`module_uses_rec`]; the emitted-function base is then 8.
-const INSTANTIATE_REC_IMPORT_IDX: u32 = 7;
 /// `env.call_interp` scratch: the cross-tier call marshals its arg/result slots starting at
 /// this byte offset in the `env` cell (past the `i64` fuel counter at 0). The host must allocate the
 /// `env` cell at least [`ENV_CELL_BYTES`] large.
@@ -1923,7 +1746,6 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         &wasm_of,
         &a.interp_leaf,
         None,
-        false,
         None,
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
@@ -1970,250 +1792,12 @@ pub fn compile_module_with_split(
         &wasm_of,
         &a.interp_leaf,
         None,
-        false,
         None,
         Some(temen_ir::module_null_guard()),
         &[],
         &split_plan,
         &[],
     )
-}
-
-/// Emit a **§14 VM-in-VM** unit: like [`compile_module_with`], but a `call.cap` to INSTANTIATOR
-/// `instantiate_rec` (op 17) / `join` (op 1) is lowered to a host-driver bounce
-/// (`env.instantiate_rec` / `env.join`) instead of failing out-of-subset — so a unit whose entry
-/// spawns a child runs on the wasm tier, the child spawn/join happening host-side exactly as the
-/// interpreter surfaces `VcpuStop::InstantiateDetached`. The nested func imports precede the emitted
-/// functions, so their wasm indices start at `NESTED_IMPORTED_FUNCS` (one more with
-/// `env.instantiate_rec`). A function outside the nested subset is kept as a **cross-tier
-/// leaf** via `env.call_interp` iff its signature is all-integer — the [`outline_nested_cap_calls`]
-/// ADDRESS_SPACE wrappers ride this (run them with a powerbox-carrying callback) — else `Err`; the
-/// entry (func 0) must itself be emittable.
-/// [`compile_module_nested`] plus the per-function emit map (like [`compile_module_tierup`]'s
-/// `emitted`): `eligible[i]` iff `f{i}` is an emitted export a host may call directly — the browser's
-/// per-entry `temen_par_inst_eligible` gate. A cross-tier leaf (an outlined wrapper) is `false`.
-fn compile_module_nested_inner(
-    m: &Module,
-    shared_memory: bool,
-    paged: Option<u8>,
-) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    let n = m.funcs.len();
-    // Track 3 (c)+(a): a window-remapping op anywhere in the module makes *every* emitted mask-only
-    // access unsound (see [`module_uses_page_ops`]). Fail closed so a direct caller (the browser's
-    // per-instance nested codegen) falls back to its interpreter path — [`compile_nested`] gates this
-    // up front instead.
-    //
-    // #1151: paged mode narrows the gate to `SharedRegion` aliasing only — `unmap`/`protect` are
-    // carried by the emitted per-access page check (the nested twin of `compile_module_tierup_inner`),
-    // so a self-page-managing nested unit tiers up instead of module-gating to emit-nothing. The
-    // page-op cap-calls themselves ride the [`is_nested_leaf_cap`] outlined-leaf bounce (interp-
-    // serviced), and the driver re-syncs the page-state table on return.
-    let gated = match paged {
-        None => module_uses_page_ops(m),
-        Some(_) => m.funcs.iter().any(func_uses_region_ops),
-    };
-    if gated {
-        return Err(Error::Unsupported(
-            "window-remapping op in a nested unit (needs the interpreter tier)",
-        ));
-    }
-    // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
-    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers, a
-    // spawn-record-seeding `call.cap` helper) reached via `env.call_interp` — whose host callback must
-    // therefore carry the run's powerbox over the **live window** (the reactor-path contract, not the
-    // throwaway-window one). A leaf may touch memory and caps under that contract — so a host must
-    // never service these leaves on a throwaway window; the browser's §14 codegen path services them
-    // on the child's own vCPU over its window (`bounce_call`, #1151 Slice 2c). Anything else fails closed.
-    let nested_ok = |f: &Func| {
-        f.blocks.iter().all(|b| {
-            block_value_types(m, b, true)
-                .is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
-        })
-    };
-    // #1004: a marked granted unit emits with the NULL guard, and its bulk-mem functions now carry
-    // the guard low bound in their span check ([`emit_span_check`]) — so they emit like any other
-    // in-subset function instead of falling to the cross-tier leaf path.
-    let null_guard = emit_null_guard_extent(m);
-    let mut wasm_of: Vec<Option<u32>> = vec![None; n];
-    let mut leaves = vec![false; n];
-    let mut emitted: Vec<usize> = Vec::new();
-    for (i, f) in m.funcs.iter().enumerate() {
-        if nested_ok(f) {
-            wasm_of[i] =
-                Some(NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32 + emitted.len() as u32);
-            emitted.push(i);
-        } else if f.uses_fibers() {
-            // A fiber (`cont.*`/`suspend`) can't be emitted (no wasm frame unwind) and must not become
-            // a cross-tier leaf: called synchronously from an emitted frame, a suspend across that seam
-            // can't unwind. Fail closed — [`compile_nested`] routes such a unit interpreter-driven,
-            // where the interpreter owns the frame and fibers run correctly.
-            return Err(Error::Unsupported(
-                "fiber op in a nested unit (needs the interp-driven tier)",
-            ));
-        } else if marshallable_sig(f)
-            && f.params
-                .iter()
-                .chain(&f.results)
-                .all(|t| !matches!(t, ValType::V128))
-        {
-            leaves[i] = true;
-        } else {
-            // Not nested-emittable and carries a `v128`/`ref`/`cap` in its signature. A nested
-            // unit's `env.call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot
-            // decode is scalar-only — `v128` marshals two-slot on the module-internal cross-tier
-            // ABI (#749) but NOT on this §22 transport — so it can be neither emitted nor run
-            // cross-tier here. Fail closed (the unit runs whole-interpreter instead).
-            return Err(Error::Unsupported(
-                "v128-signature function outside the nested subset",
-            ));
-        }
-    }
-    if wasm_of.first().copied().flatten().is_none() {
-        return Err(Error::Unsupported("nested entry outside the subset"));
-    }
-    let eligible: Vec<bool> = wasm_of.iter().map(|w| w.is_some()).collect();
-    let wasm = emit_module(
-        m,
-        shared_memory,
-        &emitted,
-        &wasm_of,
-        &leaves,
-        None,
-        true,
-        paged,
-        null_guard,
-        &[],
-        &[],
-        &[],
-    )?;
-    Ok((wasm, eligible))
-}
-
-/// [`compile_module_nested`] plus the per-function emit map (mask-only, non-paged) — the original
-/// signature. A window-remapping op (`unmap`/`protect`/`SharedRegion`) fails closed; use
-/// [`compile_module_nested_paged_with_eligibility`] to carry `unmap`/`protect` under the per-access
-/// page check.
-pub fn compile_module_nested_with_eligibility(
-    m: &Module,
-    shared_memory: bool,
-) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_nested_inner(m, shared_memory, None)
-}
-
-/// #1151 — the **paged** nested emit: like [`compile_module_nested_with_eligibility`], but every
-/// emitted access also consults the host-maintained byte-per-page state table (base in the exported
-/// `"pagestate"` i32 global; `page_log2` is the run's software page size) and traps `Ro`/`Unmapped`
-/// exactly where the interpreter's `check_prot` does. This narrows the fail-closed gate to
-/// `SharedRegion` aliasing only, so a nested unit that `unmap`s/`protect`s its own pages tiers up
-/// instead of running whole-interpreter. The page-op `call.cap`s ride the [`is_nested_leaf_cap`]
-/// outlined-leaf bounce ([`outline_nested_cap_calls`]) and stay interp-serviced; the driver contract
-/// extends the nested one with the paged refresh — before each emitted call, and again after any
-/// `env.call_interp` bounce that may have remapped, rebuild the page-state table from the live map
-/// (`Mem::map_info`) and re-point `"pagestate"` + set `"mapped"` to its coverage.
-pub fn compile_module_nested_paged_with_eligibility(
-    m: &Module,
-    shared_memory: bool,
-    page_log2: u8,
-) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_nested_inner(m, shared_memory, Some(page_log2))
-}
-
-/// The wasm-only front of [`compile_module_nested_with_eligibility`] (the original signature).
-pub fn compile_module_nested(m: &Module, shared_memory: bool) -> Result<Vec<u8>, Error> {
-    compile_module_nested_with_eligibility(m, shared_memory).map(|(w, _)| w)
-}
-
-/// The wasm-only front of [`compile_module_nested_paged_with_eligibility`] (#1151).
-pub fn compile_module_nested_paged(
-    m: &Module,
-    shared_memory: bool,
-    page_log2: u8,
-) -> Result<Vec<u8>, Error> {
-    compile_module_nested_paged_with_eligibility(m, shared_memory, page_log2).map(|(w, _)| w)
-}
-
-/// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
-/// from the IR so a nesting parent always yields a runnable [`Artifact`] (never `Err` for a verified
-/// module). Two modes, forced by wasm's inability to unwind a frame across a fiber stack switch:
-///
-/// - **Nothing reachable uses a fiber** → the [`compile_module_nested`] emit: the parent's
-///   `instantiate`/`join`/`thread`/`futex` ops lower to host bounces and the host calls `f{0}`
-///   directly ([`DriveMode::WasmDriven`]). Threads/futex stay on this fast path — only fibers force
-///   the fallback.
-/// - **A fiber is reachable** → an interpreter-driven, `nested_caps`-aware tier-up
-///   ([`compile_module_tierup_caps`]): the interpreter owns the top frame (running the fibers and
-///   servicing `instantiate`/`join` natively), while hot in-subset compute — including any
-///   instantiate/join/thread functions — still tiers up onto emitted wasm with its bounces intact
-///   ([`DriveMode::InterpDriven`]).
-///
-/// Both modes emit the **same** nested import set (`env.join`/`thread_spawn`/…), so a
-/// host driving this artifact provides that one import layout regardless of the chosen mode. This
-/// folds the browser's hand-rolled nested→threaded fallback into the library. Entry is func 0 (the
-/// unit entry the nested emit roots at). Outline §14 ADDRESS_SPACE `call.cap`s
-/// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
-/// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
-///
-/// A unit that `unmap`s/`protect`s its own pages emits **nothing** here and runs wholly on the
-/// interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
-/// [`module_uses_page_ops`]); [`compile_nested_paged`] is the entry that carries those.
-/// `page_size`/`sub` (queries/attenuation) are unaffected. A `WasmDriven` artifact's `env.call_interp`
-/// leaves may touch memory and caps (a `map`-calling allocator helper, a spawn-record seeder) — the
-/// servicer contract is the powerbox over the live window, never a throwaway one (#1151).
-pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
-    if module_uses_page_ops(m) || module_uses_gc_roots(m) {
-        return compile_interp_only(m, shared_memory, true);
-    }
-    if !reachable_fibers(m, 0) {
-        if let Ok((wasm, emitted)) = compile_module_nested_with_eligibility(m, shared_memory) {
-            return Ok(Artifact {
-                wasm,
-                emitted,
-                drive: DriveMode::WasmDriven { entry: 0 },
-            });
-        }
-    }
-    let (wasm, emitted) = compile_module_tierup_caps(m, shared_memory, true)?;
-    Ok(Artifact {
-        wasm,
-        emitted,
-        drive: DriveMode::InterpDriven,
-    })
-}
-
-/// #1151 — the **paged** §14 nested front door: like [`compile_nested`], but a unit that manages its
-/// own pages with `unmap`/`protect` emits **paged** (the per-access page check) instead of running
-/// wholly on the interpreter. The caller passes `page_log2` (its run's software page size) and must
-/// have already outlined the ADDRESS_SPACE `call.cap`s ([`outline_nested_cap_calls`]) so the page ops
-/// ride the `env.call_interp` leaf bounce — the driver services them over the run's powerbox and
-/// **re-syncs the page-state table on return** (the [`compile_module_nested_paged_with_eligibility`]
-/// contract). `SharedRegion` aliasing (which no trap check can honor) still fails closed to the
-/// interpreter, as does a fiber-bearing unit (the mask-only interp-driven fallback can't carry the
-/// page state either — deferred, like the whole-program paged tier's own fiber gate).
-///
-/// Preconditions the caller owns (mirroring [`compile_nested`]'s outline note): pass the **outlined**
-/// module here *and* to the driver, so the wrapper `func` indices the servicer runs match the emitted
-/// module's cross-tier leaves.
-pub fn compile_nested_paged(
-    m: &Module,
-    shared_memory: bool,
-    page_log2: u8,
-) -> Result<Artifact, Error> {
-    // SharedRegion aliasing can't be carried by any trap check (a `Backed` page's bytes live outside
-    // the window); a fiber-bearing unit needs the interp to own the frame, and the paged per-access
-    // check isn't wired into that interp-driven fallback yet. Both fail closed to whole-interpreter.
-    if m.funcs.iter().any(func_uses_region_ops) || reachable_fibers(m, 0) {
-        return compile_interp_only(m, shared_memory, true);
-    }
-    match compile_module_nested_paged_with_eligibility(m, shared_memory, page_log2) {
-        Ok((wasm, emitted)) => Ok(Artifact {
-            wasm,
-            emitted,
-            drive: DriveMode::WasmDriven { entry: 0 },
-        }),
-        // The entry wasn't emittable even paged (e.g. a v128-signature cross-tier function) — the
-        // safe whole-interpreter fallback, exactly as `compile_nested`'s tierup-caps arm degrades.
-        Err(_) => compile_interp_only(m, shared_memory, true),
-    }
 }
 
 /// Whole-module emit like [`compile_module_with`], but wired for **§22 Model B2**: instead of a
@@ -2253,7 +1837,6 @@ pub fn compile_module_b2(
         &wasm_of,
         &a.interp_leaf,
         Some(table_log2),
-        false,
         None,
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
@@ -2309,7 +1892,6 @@ pub fn compile_module_b2_split(
         &wasm_of,
         &a.interp_leaf,
         Some(table_log2),
-        false,
         None,
         Some(temen_ir::module_null_guard()),
         &[],
@@ -2378,7 +1960,6 @@ pub fn compile_module_split(
         &wasm_of,
         &a.interp_leaf,
         Some(table_log2),
-        false,
         None,
         emit_null_guard_extent(m),
         &cross_module,
@@ -2764,7 +2345,6 @@ fn compile_module_reactor_inner(
             &wasm_of,
             &cross,
             None,
-            false,
             paged,
             emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
@@ -2860,7 +2440,6 @@ pub fn compile_module_reactor_keep(
         &wasm_of,
         &cross,
         None,
-        false,
         None,
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
@@ -2889,24 +2468,9 @@ pub fn compile_module_tierup(
     m: &Module,
     shared_memory: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
-    compile_module_tierup_caps(m, shared_memory, false)
-}
-
-/// [`compile_module_tierup`] with the `nested_caps` switch: when `true`, the §14 instantiator bounce
-/// and §11 thread/futex ops count as in-subset (they lower to host bounces), and the emitted functions
-/// follow the nested import layout (`NESTED_IMPORTED_FUNCS`). This is the interpreter-driven fallback
-/// [`compile_nested`] uses for a fiber-bearing nested unit: the interpreter owns the frame (fibers and
-/// `instantiate`/`join` run there), and hot in-subset compute — including instantiate/join/thread
-/// functions — still tiers up onto the emitted region with its bounces intact.
-pub fn compile_module_tierup_caps(
-    m: &Module,
-    shared_memory: bool,
-    nested_caps: bool,
-) -> Result<(Vec<u8>, Vec<bool>), Error> {
     compile_module_tierup_inner(
         m,
         shared_memory,
-        nested_caps,
         None,
         None,
         None,
@@ -2954,7 +2518,6 @@ pub fn compile_module_tierup_b2(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         None,
         Some(table_log2),
         None,
@@ -2977,7 +2540,6 @@ pub fn compile_module_tierup_b2_budgeted(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         None,
         Some(table_log2),
         None,
@@ -3008,7 +2570,6 @@ pub fn compile_module_tierup_b2_paged(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         Some(page_log2),
         Some(table_log2),
         None,
@@ -3041,7 +2602,6 @@ pub fn compile_module_tierup_paged(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         Some(page_log2),
         None,
         None,
@@ -3074,7 +2634,6 @@ pub fn compile_module_tierup_nullguard(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         None,
         None,
         Some(guard),
@@ -3099,7 +2658,6 @@ pub fn compile_module_tierup_live(
     compile_module_tierup_inner(
         m,
         shared_memory,
-        false,
         page_log2,
         None,
         None,
@@ -3113,7 +2671,6 @@ pub fn compile_module_tierup_live(
 fn compile_module_tierup_inner(
     m: &Module,
     shared_memory: bool,
-    nested_caps: bool,
     paged: Option<u8>,
     reserved_table_log2: Option<u32>,
     null_guard: Option<u64>,
@@ -3129,7 +2686,7 @@ fn compile_module_tierup_inner(
     let n = m.funcs.len();
     // Track 3 (c)+(a): a page-op module (`map`/`unmap`/`protect`) can't be accelerated on the
     // mask-only tier — an emitted access ignores per-page state the interpreter would trap on
-    // (`NESTED_JIT.md`; see [`module_uses_page_ops`]). `compile_jit`/`compile_nested` gate this before
+    // (`NESTED_JIT.md`; see [`module_uses_page_ops`]). `compile_jit` gates this before
     // reaching here, but this is a **public entry** a host can call directly (the JACL browser tier-up
     // spike did — `jacl_impl/docs/TEMEN_BROWSER_TIERUP_FINDINGS.md`, where an emitted leaf over a
     // page-managed window trapped `MemoryFault` mid-body). Self-protect: emit nothing, exactly like
@@ -3151,7 +2708,6 @@ fn compile_module_tierup_inner(
             &wasm_of,
             &leaf,
             None,
-            nested_caps,
             paged,
             null_guard,
             &[],
@@ -3164,7 +2720,7 @@ fn compile_module_tierup_inner(
     let mut in_subset: Vec<bool> = m
         .funcs
         .iter()
-        .map(|f| func_in_subset_caps(m, f, atomics_ok, nested_caps))
+        .map(|f| func_in_subset(m, f, atomics_ok))
         .collect();
     // #1081: paged mode now emits a per-page walk for bulk-memory spans ([`emit_span_page_check`]), so
     // bulk-mem functions (Lua's `luaV_execute` among them) tier up under paged instead of staying on the
@@ -3197,7 +2753,7 @@ fn compile_module_tierup_inner(
     // #1627: unless the entry asked for spill mode (B2 only — its bounce is the one that can scan
     // spilled words), where every emitted frame that can sit beneath the op pushes its live values
     // instead. `gc_reach[i]` ⇔ a call to `i` can reach the op, and is empty when nothing spills.
-    debug_assert!(!gc_spill || (reserved_table_log2.is_some() && !nested_caps));
+    debug_assert!(!gc_spill || reserved_table_log2.is_some());
     let uses_gc = module_uses_gc_roots(m);
     let gc_veto = uses_gc && !gc_spill;
     let gc_reach = if uses_gc && gc_spill {
@@ -3235,12 +2791,8 @@ fn compile_module_tierup_inner(
         })
         .collect();
     let all_in_subset = in_subset.iter().all(|&s| s);
-    // Emitted functions follow the import block; the nested layout adds the §14/§11 bounce imports.
-    let base = if nested_caps {
-        NESTED_IMPORTED_FUNCS + module_uses_rec(m) as u32
-    } else {
-        IMPORTED_FUNCS
-    };
+    // Emitted functions follow the import block.
+    let base = IMPORTED_FUNCS;
 
     // Optimistic start: every in-subset function is a candidate. A `call.dyn` can dispatch to
     // any identity-table slot, so under the **local** table a function that uses one is only safe to
@@ -3295,7 +2847,6 @@ fn compile_module_tierup_inner(
         &wasm_of,
         &leaf,
         reserved_table_log2,
-        nested_caps,
         paged,
         null_guard,
         &[],
@@ -3377,26 +2928,12 @@ fn reachable_setjmp(m: &Module, entry: u32) -> bool {
     (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_setjmp())
 }
 
-/// Whether any function reachable from `entry` uses a **fiber** op (`cont.*`/`suspend`) — the one §12
-/// family the nested emitter cannot lower (a wasm frame can't unwind for a stack switch), unlike
-/// thread/futex ops, which the nested tier *does* emit as host bounces. This is the [`compile_nested`]
-/// two-mode gate: fibers force the interpreter to own the frame (see [`Func::uses_fibers`]).
-fn reachable_fibers(m: &Module, entry: u32) -> bool {
-    let a = analyze_from(m, entry);
-    (0..m.funcs.len()).any(|i| a.reachable[i] && m.funcs[i].uses_fibers())
-}
-
 /// Emit **nothing** — a valid wasm module of imports only, with an all-`false` `emitted` bitmap and
 /// [`DriveMode::InterpDriven`]. The whole guest runs on the bytecode interpreter (the oracle), which
 /// alone enforces per-page protection. This is the Track 3 (c)+(a) landing for a page-op module (see
 /// [`module_uses_page_ops`]): correct by construction, since nothing the mask-only tier could emit
-/// ever runs. `nested_caps` only selects the import layout (unused here, but kept uniform with the
-/// caller's other artifacts).
-fn compile_interp_only(
-    m: &Module,
-    shared_memory: bool,
-    nested_caps: bool,
-) -> Result<Artifact, Error> {
+/// ever runs.
+fn compile_interp_only(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
     let n = m.funcs.len();
     let wasm_of = vec![None; n];
     let leaf = vec![false; n];
@@ -3407,7 +2944,6 @@ fn compile_interp_only(
         &wasm_of,
         &leaf,
         None,
-        nested_caps,
         None,
         emit_null_guard_extent(m), // #964 (vacuous here — no bodies — but kept uniform)
         &[],
@@ -3447,7 +2983,7 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
     // #1546: a module that can reach `gc.roots` declines the same way and for the same reason — an
     // emitted frame is invisible to the op's scan (see [`module_uses_gc_roots`]).
     if module_uses_page_ops(m) || module_uses_gc_roots(m) {
-        return compile_interp_only(m, shared_memory, false);
+        return compile_interp_only(m, shared_memory);
     }
     match shape {
         // No single top-level frame the host can own → the interpreter drives, hot regions tier up.
@@ -3509,7 +3045,7 @@ pub fn compile_jit_page_checked(
     page_log2: u8,
 ) -> Result<Artifact, Error> {
     if m.funcs.iter().any(func_uses_region_ops) || module_uses_gc_roots(m) {
-        return compile_interp_only(m, shared_memory, false);
+        return compile_interp_only(m, shared_memory);
     }
     let interp_driven = |m: &Module| -> Result<Artifact, Error> {
         let (wasm, emitted) = compile_module_tierup_paged(m, shared_memory, page_log2)?;
@@ -3551,7 +3087,6 @@ fn emit_module(
     wasm_of: &[Option<u32>],
     interp_leaf: &[bool],
     reserved_table_log2: Option<u32>,
-    nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
     cross_module: &[bool],
@@ -3601,35 +3136,6 @@ fn emit_module(
     // Types: 0 = env.trap `(i32) -> ()`, 1 = env.call_interp `(i32 func, i32 args_ptr) -> ()`, then
     // one per emitted function (dedup'd).
     let mut types: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![0x7f], vec![]), (vec![0x7f, 0x7f], vec![])];
-    // §14 host-bounce import types (added up front so the import section can reference them):
-    //   env.join: (i32 inst, i32 child) -> (i64 status, i64 value)
-    let mut join_ty = 0u32;
-    let uses_rec = nested_caps && module_uses_rec(m);
-    let mut instantiate_rec_ty = 0u32;
-    let (mut thread_spawn_ty, mut thread_join_ty, mut mem_wait_ty, mut mem_notify_ty) =
-        (0u32, 0u32, 0u32, 0u32);
-    if nested_caps {
-        join_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7f], vec![0x7e, 0x7e]));
-        if uses_rec {
-            // §3c.3 env.instantiate_rec: (i32 win, i32 inst, i64 record_ptr) -> i32 child handle
-            instantiate_rec_ty = types.len() as u32;
-            types.push((vec![0x7f, 0x7f, 0x7e], vec![0x7f]));
-        }
-        // §11 thread/futex bounces:
-        //   env.thread_spawn: (i32 func, i64 sp, i64 arg) -> i32 handle
-        //   env.thread_join:  (i32 handle) -> i64 result
-        //   env.mem_wait:     (i32 win, i64 addr, i64 expected, i64 timeout, i32 is64) -> i32 status
-        //   env.mem_notify:   (i32 win, i64 addr, i32 count) -> i32 woken
-        thread_spawn_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7e, 0x7e], vec![0x7f]));
-        thread_join_ty = types.len() as u32;
-        types.push((vec![0x7f], vec![0x7e]));
-        mem_wait_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7e, 0x7e, 0x7e, 0x7f], vec![0x7f]));
-        mem_notify_ty = types.len() as u32;
-        types.push((vec![0x7f, 0x7e, 0x7f], vec![0x7f]));
-    }
     let mut fn_type_idx: Vec<u32> = Vec::with_capacity(emitted.len());
     for &fi in emitted {
         let f = &m.funcs[fi];
@@ -3748,11 +3254,7 @@ fn emit_module(
         // data-segment pointer hits a trap stub ("null function or function signature mismatch") the
         // interpreter would have dispatched. (Fixed a hang/trap ~frame 174 of Doom, when the first
         // monster thinker fires an `A_*` action loaded from `states[]`.)
-        let mut next_widx = if nested_caps {
-            NESTED_IMPORTED_FUNCS + uses_rec as u32
-        } else {
-            IMPORTED_FUNCS
-        } + emitted.len() as u32;
+        let mut next_widx = IMPORTED_FUNCS + emitted.len() as u32;
         for fi in 0..m.funcs.len() {
             if wasm_of[fi].is_none() && interp_leaf[fi] {
                 let f = &m.funcs[fi];
@@ -3795,11 +3297,7 @@ fn emit_module(
     // *after* all normal functions and the trampoline/trap-stub extras. A plan that fails validation is
     // dropped here (the function then emits whole — always correct). The group sig `(win,env,entry)->results`
     // is interned into `types` now, before the type section is written.
-    let first_widx = if nested_caps {
-        NESTED_IMPORTED_FUNCS + uses_rec as u32
-    } else {
-        IMPORTED_FUNCS
-    };
+    let first_widx = IMPORTED_FUNCS;
     let mut fn_splits: Vec<FnSplit> = Vec::new();
     let mut next_group_widx = first_widx + emitted.len() as u32 + extra_bodies.len() as u32;
     for &fi in emitted {
@@ -3843,7 +3341,6 @@ fn emit_module(
                 interp_leaf,
                 &types,
                 table_size,
-                nested_caps,
                 paged,
                 null_guard,
                 cross_module,
@@ -3872,7 +3369,6 @@ fn emit_module(
                 interp_leaf,
                 &types,
                 table_size,
-                nested_caps,
                 paged,
                 null_guard,
                 gc_reach,
@@ -3896,13 +3392,9 @@ fn emit_module(
     section(&mut out, 1, &sec);
 
     // Import section (2): env.memory, env.trap (type 0), env.call_interp (type 1); plus — in
-    // shared-reserved (B2) mode — the shared funcref table, and — in §14 `nested_caps` mode —
-    // env.join (the VM-in-VM host bounce) and the thread/futex bounces.
+    // shared-reserved (B2) mode — the shared funcref table.
     let mut sec = Vec::new();
-    let n_imports = 3
-        + reserved_table_log2.is_some() as u64
-        + if nested_caps { 5 } else { 0 }
-        + uses_rec as u64;
+    let n_imports = 3 + reserved_table_log2.is_some() as u64;
     uleb(&mut sec, n_imports);
     import_name(&mut sec, "env", "memory");
     sec.push(0x02); // memory
@@ -3924,30 +3416,6 @@ fn emit_module(
     import_name(&mut sec, "env", "call_interp");
     sec.push(0x00); // func
     uleb(&mut sec, 1); // type index 1
-    if nested_caps {
-        // §14 VM-in-VM host bounce (func import 2, see JOIN_IMPORT_IDX).
-        import_name(&mut sec, "env", "join");
-        sec.push(0x00); // func
-        uleb(&mut sec, join_ty as u64);
-        import_name(&mut sec, "env", "thread_spawn");
-        sec.push(0x00); // func
-        uleb(&mut sec, thread_spawn_ty as u64);
-        import_name(&mut sec, "env", "thread_join");
-        sec.push(0x00); // func
-        uleb(&mut sec, thread_join_ty as u64);
-        import_name(&mut sec, "env", "mem_wait");
-        sec.push(0x00); // func
-        uleb(&mut sec, mem_wait_ty as u64);
-        import_name(&mut sec, "env", "mem_notify");
-        sec.push(0x00); // func
-        uleb(&mut sec, mem_notify_ty as u64);
-        if uses_rec {
-            // §3c.3 — appended after the fixed seven (func import 7), so no existing import shifts.
-            import_name(&mut sec, "env", "instantiate_rec");
-            sec.push(0x00); // func
-            uleb(&mut sec, instantiate_rec_ty as u64);
-        }
-    }
     if reserved_table_log2.is_some() {
         // The shared reserved funcref table (§22 Model B2). Imported (not declared), so every
         // instance in the domain dispatches through the *same* table; the host sizes it to the
@@ -4290,7 +3758,7 @@ fn emit_trap_stub() -> Vec<u8> {
 /// the one import object a host builds serves emitted units and trampolines alike; the host's
 /// `call_interp` signals a trap by throwing (unwinding the emitted frames), exactly the
 /// cross-tier convention everywhere. Rejects non-scalar and over-arity signatures — this §22
-/// transport's `call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot decode is
+/// transport's `call_interp` lands in the run's `CoopRun::bounce`, whose `&[i64]` slot decode is
 /// scalar-only (unlike the module-internal cross-tier ABI, which marshals `v128` two-slot since
 /// #749) — so `v128` stays fail-closed here until that transport is widened too.
 pub fn emit_slot_trampoline(
@@ -4741,7 +4209,6 @@ fn emit_func(
     interp_leaf: &[bool],
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
-    nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
     cross_module: &[bool],
@@ -4767,7 +4234,7 @@ fn emit_func(
     let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
         .blocks
         .iter()
-        .map(|b| block_slots(m, b, nested_caps, &mut scratch))
+        .map(|b| block_slots(m, b, &mut scratch))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .unzip();
@@ -4927,7 +4394,6 @@ fn emit_func(
                     interp_leaf,
                     types,
                     table_size,
-                    nested_caps,
                     cross_module,
                     None, // monolithic emit: no block-group split
                     gc_reach,
@@ -4982,7 +4448,6 @@ fn emit_split_group(
     interp_leaf: &[bool],
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
-    nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
     gc_reach: &[bool],
@@ -4993,7 +4458,7 @@ fn emit_split_group(
     let (per_block_types, per_block_slots): (Vec<Vec<ValType>>, Vec<Vec<u32>>) = f
         .blocks
         .iter()
-        .map(|b| block_slots(m, b, nested_caps, &mut scratch))
+        .map(|b| block_slots(m, b, &mut scratch))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .unzip();
@@ -5176,7 +4641,6 @@ fn emit_split_group(
             interp_leaf,
             types,
             table_size,
-            nested_caps,
             &[],
             Some(split),
             gc_reach,
@@ -5490,7 +4954,6 @@ pub fn compile_split_fn(
                 &interp_leaf,
                 &dummy_types,
                 1,
-                false,
                 None,
                 null_guard,
                 &[],
@@ -5510,7 +4973,6 @@ pub fn compile_split_fn(
             &interp_leaf,
             &dummy_types,
             1,
-            false,
             None,
             null_guard,
             &[],
@@ -6617,7 +6079,6 @@ fn emit_block_body(
     interp_leaf: &[bool],
     types: &[(Vec<u8>, Vec<u8>)],
     table_size: u32,
-    nested_caps: bool,
     cross_module: &[bool],
     split: Option<&SplitCtx>,
     gc_reach: &[bool],
@@ -6958,102 +6419,6 @@ fn emit_block_body(
                 get(code, cx, *a);
                 code.push(cast_opcode(*op));
                 set_result(cx, code, k, &mut next_val);
-            }
-            // §11 thread/futex bounces (opt-in `nested_caps`, CONSOLIDATION.md §11 slice 3): the
-            // four ops marshal their operands to host imports; the servicer supplies the unit's
-            // module (it knows which module it instantiated), so a spawn from an emitted unit is the
-            // same module-aware spawn the interpreter does. `thread_join`/`mem_wait` block the
-            // calling thread — the Worker/par-tier model (each vCPU is a real thread).
-            Inst::ThreadSpawn { func, sp, arg } if nested_caps => {
-                code.push(OP_I32_CONST);
-                sleb32(code, *func as i32);
-                get(code, cx, *sp);
-                get(code, cx, *arg);
-                code.push(OP_CALL);
-                uleb(code, THREAD_SPAWN_IMPORT_IDX as u64);
-                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::ThreadJoin { handle } if nested_caps => {
-                get(code, cx, *handle);
-                code.push(OP_CALL);
-                uleb(code, THREAD_JOIN_IMPORT_IDX as u64);
-                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::MemoryWait {
-                ty,
-                addr,
-                expected,
-                timeout,
-            } if nested_caps => {
-                code.push(OP_LOCAL_GET);
-                uleb(code, 0); // win — the servicer confines addr into the window
-                get(code, cx, *addr);
-                get(code, cx, *expected);
-                if matches!(ty, IntTy::I32) {
-                    code.push(0xad); // i64.extend_i32_u — uniform i64 expected slot
-                }
-                get(code, cx, *timeout);
-                code.push(OP_I32_CONST);
-                sleb32(code, matches!(ty, IntTy::I64) as i32);
-                code.push(OP_CALL);
-                uleb(code, MEM_WAIT_IMPORT_IDX as u64);
-                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
-                set_result(cx, code, k, &mut next_val);
-            }
-            Inst::MemoryNotify { addr, count } if nested_caps => {
-                code.push(OP_LOCAL_GET);
-                uleb(code, 0); // win
-                get(code, cx, *addr);
-                get(code, cx, *count);
-                code.push(OP_CALL);
-                uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
-                emit_after_call(cx, code); // #1312: the servicer may have grown/relocated the window
-                set_result(cx, code, k, &mut next_val);
-            }
-            // §14 VM-in-VM bounce (opt-in `nested_caps`): a `call.cap` to INSTANTIATOR
-            // `instantiate_rec`/`join` marshals its operands to a host import (`env.instantiate_rec` /
-            // `env.join`, the funcref-table-free analog of `env.call_interp`) that spawns/joins the
-            // child vCPU host-side — exactly as the interpreter surfaces `VcpuStop::InstantiateDetached`
-            // to its driver. The child's window and powerbox are the host's job.
-            Inst::CapCall {
-                type_id,
-                op,
-                sig,
-                handle,
-                args,
-            } if nested_caps && is_nested_cap(*type_id, *op, sig_of(&m.types, *sig)) => {
-                let n_results = sig_of(&m.types, *sig).results.len(); // #922: interned index
-                if *op == 17 {
-                    // §3c.3 env.instantiate_rec(win, inst, record_ptr) -> i32 child handle — the
-                    // config-record spawn; the servicer reads + validates the record (`SpawnRec`) from
-                    // linear memory at win + record_ptr (window-relative, like every §14 pointer).
-                    code.push(OP_LOCAL_GET);
-                    uleb(code, 0); // win
-                    get(code, cx, *handle);
-                    for a in args {
-                        get(code, cx, *a); // record_ptr
-                    }
-                    code.push(OP_CALL);
-                    uleb(code, INSTANTIATE_REC_IMPORT_IDX as u64);
-                } else {
-                    // env.join(inst, child) -> (i64 status, i64 value) (#2066)
-                    get(code, cx, *handle); // the Instantiator handle
-                    for a in args {
-                        get(code, cx, *a); // the child handle
-                    }
-                    code.push(OP_CALL);
-                    uleb(code, JOIN_IMPORT_IDX as u64);
-                }
-                // #1312: every arm above bounced to the host, which may have grown (and so
-                // relocated) the window; reload before the results are popped and used.
-                emit_after_call(cx, code);
-                for i in (0..n_results).rev() {
-                    code.push(OP_LOCAL_SET);
-                    uleb(code, cx.local_of[k][next_val + i] as u64);
-                }
-                next_val += n_results;
             }
             Inst::Call { func, args } => {
                 let callee = &m.funcs[*func as usize];
