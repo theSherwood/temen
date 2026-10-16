@@ -483,6 +483,10 @@ pub(crate) struct Nursery {
     grant_budget_node: std::sync::atomic::AtomicUsize,
     /// #1854 — the installed child [`crate::HeldTail`] (0 = none).
     grant_held_tail: std::sync::atomic::AtomicUsize,
+    /// #2164 — the installed [`crate::PagerAdmit`] and [`crate::PageMissThunk`] (0 = none: a spawn
+    /// that names a pager is an inert `CapFault`).
+    grant_pager_admit: std::sync::atomic::AtomicUsize,
+    grant_page_miss: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
     grant_bind_imports: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.0 — the `child_offer` mint hook ([`crate::ChildOfferMint`] as usize; 0 = none).
@@ -578,6 +582,8 @@ impl Nursery {
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_node: std::sync::atomic::AtomicUsize::new(0),
             grant_held_tail: std::sync::atomic::AtomicUsize::new(0),
+            grant_pager_admit: std::sync::atomic::AtomicUsize::new(0),
+            grant_page_miss: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
             grant_parent_ctx: std::sync::atomic::AtomicUsize::new(0),
@@ -638,6 +644,12 @@ impl Nursery {
             hooks.map_or(0, |h| h.budget_node as usize),
             Ordering::Release,
         );
+        self.grant_pager_admit.store(
+            hooks.map_or(0, |h| h.pager_admit as usize),
+            Ordering::Release,
+        );
+        self.grant_page_miss
+            .store(hooks.map_or(0, |h| h.page_miss as usize), Ordering::Release);
         self.grant_as_parent
             .store(hooks.map_or(0, |h| h.as_parent as usize), Ordering::Release);
         self.grant_register_serve.store(rs, Ordering::Release);
@@ -696,6 +708,7 @@ impl Nursery {
             nursery: kid.map_or(core::ptr::null(), |k| {
                 k as *const Nursery as *const core::ffi::c_void
             }),
+            pages: gc.pages,
             ..crate::InstanceAddrs::NONE
         }
     }
@@ -1091,6 +1104,8 @@ impl Nursery {
             impl_exports: &impl_exports,
             table_reserve_log2: gc.jit_table_log2,
             shadow,
+            // A thaw never re-launches a demand-paged child on this engine (#2438).
+            page_miss: None,
         }) else {
             release(gc.ctx);
             release(gc.retained_ctx);
@@ -1231,13 +1246,14 @@ fn temen_ir_iface_instantiator() -> u32 {
 /// CONSOLIDATION.md §3c — the **config-record spawn** (`Instantiator` op 17,
 /// `instantiate_rec(record_ptr)`), the one spawn form (#1863), on the native JIT tier: parse +
 /// validate the record ([`SpawnRec`]) from the guest window, then spawn it ([`spawn_detached`]).
-/// Field handling mirrors the tree-walker's op-17 arm:
+/// Field handling mirrors the interpreters' op-17 arms:
 ///
-/// - a version other than 1, or a nonzero reserved field (the word at 4 was the entry, #2219, and
-///   the word at 32 the fuel quota) → `CapFault` (fail closed).
-/// - `pager != u32::MAX` → `CapFault`. Sound, not a divergence: `temen-run` folds op-17 modules
-///   **with** impl exports to the oracle, so a natively-running module has none — and the
-///   interpreter fails its pager validation (`Module::is_pager_export`) identically.
+/// - a nonzero padding word → `CapFault` (fail closed, [`SpawnRec::parse`]).
+/// - a pager (`pager != u32::MAX`, §2.2, #2164): the child is demand-paged, its faults served by
+///   that export of the spawner's program, which [`spawn_detached`] checks before the rest of the
+///   record. Except in a durable run, where it is `CapFault` until #2489: a freeze of a paged child
+///   needs the interpreters' hold (#2455), and a thaw of one their pager edge (#2438), so a durable
+///   paging program is the tree-walker's.
 ///
 /// # Safety
 /// Called from JITted code on the spawning vCPU's thread with the run's live nursery, window
@@ -1273,8 +1289,8 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     };
-    // No pager on this tier (above).
-    if sr.pager != u32::MAX {
+    // No paged child in a durable run on this tier (above).
+    if sr.pager != u32::MAX && (*rt).durable.load(Ordering::Acquire) {
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
@@ -1337,6 +1353,7 @@ unsafe fn spawn_detached_child(
     let teardown = granted_teardown(rt, release, gc.ctx, gc.lane_cap, Some(lease), fuel);
     let premap_ctx = SendRaw(gc.ctx);
     let shadow = code.shadow;
+    let paged = !gc.pages.is_null();
     // The segments that fit the window, and of them the read-only ranges its window-ready hook hands
     // the child's page map (#2268).
     let len = 1usize << mapped_log2;
@@ -1361,7 +1378,9 @@ unsafe fn spawn_detached_child(
         // The window image: the module's data segments, then the payload at the args base; a durable
         // child's window also starts durable (`temen_durable::init_durable_window`'s one word). Then
         // the `readonly` segments go RO, as in a root's window (#1730): a detached child is
-        // root-shaped, so a write to its const data faults.
+        // root-shaped, so a write to its const data faults. Not in a demand-paged child: every page
+        // of its window starts unmapped and arrives read-write from its pager, as on the
+        // interpreters, and its access table, not the hardware, gates its accesses (#2164).
         |w| {
             let rw = w.rw_mut();
             for s in &seeds {
@@ -1371,10 +1390,11 @@ unsafe fn spawn_detached_child(
             if let Some(a) = durable {
                 init_durable_words(rw, a, freezing);
             }
-            seeds
-                .iter()
-                .filter(|s| s.readonly)
-                .all(|s| w.protect(s.offset, s.bytes.len() as u64, crate::mem::Prot::Ro))
+            paged
+                || seeds
+                    .iter()
+                    .filter(|s| s.readonly)
+                    .all(|s| w.protect(s.offset, s.bytes.len() as u64, crate::mem::Prot::Ro))
         },
         // The child's page map takes its read-only pages, and the spawn's pre-mapped region, if any,
         // is aliased onto the fresh window (the child powerbox's own `map` path), by the host hook.
@@ -1472,8 +1492,8 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, free
 /// transparency), the payload fits the args region, and the budget quota covers the window (a forged /
 /// exhausted budget refuses, charging nothing). The child powerbox is the by-name grant list plus
 /// starter caps spanning the **reservation** (a root's shape, so its `vm_map` grows the window);
-/// it attests `window_exposed = false`. Data segments + the payload are seeded into the child's own
-/// window before it starts. A durable run refuses outright (multi-window freeze is O6).
+/// it attests `window_exposed = false`, or true when the record names a pager, which pages it
+/// (#2164). Data segments + the payload are seeded into the child's own window before it starts.
 ///
 /// # Safety
 /// `rt`/`mem_base`/`mem_size`/`trap_out` are the instance's nursery, live parent window base,
@@ -1515,6 +1535,20 @@ unsafe fn spawn_detached(
     // The Instantiator is the authority (a forged handle is a CapFault).
     if !rt.resolve(mem_base, handle, trap_out) {
         return 0;
+    }
+    // §2.2 — a record's pager must be a `{ page: (i64) -> (i64) }` export of the spawner's own
+    // program, checked before anything else of the record, as on the interpreters (#744, #2164).
+    let paged = sr.pager != u32::MAX;
+    if paged {
+        let admit_addr = rt.grant_pager_admit.load(Ordering::Acquire);
+        let admitted = admit_addr != 0 && {
+            let admit: crate::PagerAdmit = core::mem::transmute(admit_addr);
+            admit(rt.grant_ctx(), sr.pager) != 0
+        };
+        if !admitted || rt.grant_page_miss.load(Ordering::Acquire) == 0 {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
     }
     let Some((child, mod_mem, child_shadow, digest)) = rt.resolve_granted(module, trap_out) else {
         return 0;
@@ -1615,6 +1649,7 @@ unsafe fn spawn_detached(
         lane_cap: -1,
         parent_domain: 0,
         parent_lane_cap: -1,
+        pages: core::ptr::null(),
     };
     if build(
         rt.grant_ctx(),
@@ -1626,12 +1661,22 @@ unsafe fn spawn_detached(
         lease.0,     // the lease `take` just charged: its budget the child's `"budget"`
         lease.1,
         lease.2,
-        lane, // and the lane it reserved
+        lane,     // and the lane it reserved
+        sr.pager, // §2.2 — and the pager its faults go to, if any (checked above)
         &mut gc,
         trap_out,
     ) == 0
     {
         undo_admission(rt, lease, lane);
+        return 0;
+    }
+    // #2164 — a paged child runs only with its access table: without one its code would check
+    // nothing, and read the pages its pager never supplied.
+    if paged && gc.pages.is_null() {
+        release(gc.ctx);
+        release(gc.retained_ctx);
+        undo_admission(rt, lease, lane);
+        *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
     // #1975 — every exit from here that files no child hands back what the admission took, as the
@@ -1679,6 +1724,12 @@ unsafe fn spawn_detached(
         // #1296: slots for the units a `Jit`-holding child installs.
         table_reserve_log2: gc.jit_table_log2,
         shadow: child_shadow,
+        // #2164 — a demand-paged child's code checks the access table its builder made.
+        page_miss: (!gc.pages.is_null()).then(|| {
+            core::mem::transmute::<usize, crate::PageMissThunk>(
+                rt.grant_page_miss.load(Ordering::Acquire),
+            )
+        }),
     };
     // temen#2168 — an instance of the run's one compile of this child, unless the child holds a
     // `Jit`: it extends its own code, so it compiles its own.

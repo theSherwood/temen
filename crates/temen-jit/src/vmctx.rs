@@ -28,7 +28,7 @@
 //! error; the comment at each site says which instance.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
 
 /// The per-instance context (see the module docs). `#[repr(C)]`: compiled code addresses the fields
 /// at the fixed offsets below.
@@ -64,6 +64,9 @@ pub struct VmCtx {
     /// temen#2168 — the §14 `Nursery` (`instantiator_rt::Nursery`) the instance's `Instantiator`
     /// sites spawn and join through: its own, which holds its children. Null when it has none.
     pub nursery: *const c_void,
+    /// #2164 — a demand-paged child's **access table** (`temen_ir::PAGE_READ`), which a paged
+    /// compile tests before each access. Null when the instance is not paged.
+    pub pages: *const AtomicU8,
 }
 
 /// The per-instance addresses a [`VmCtx`] is filled from — everything but the trap cell, which each
@@ -79,11 +82,12 @@ pub struct InstanceAddrs {
     pub embedder: *mut c_void,
     pub sched: *const c_void,
     pub nursery: *const c_void,
+    pub pages: *const AtomicU8,
 }
 
 impl InstanceAddrs {
     /// No powerbox, no kill-path, no fuel, no signals, no embedder state, no thread domain, no
-    /// nursery.
+    /// nursery, no paging.
     pub const NONE: InstanceAddrs = InstanceAddrs {
         cap_ctx: core::ptr::null_mut(),
         epoch: core::ptr::null(),
@@ -93,6 +97,7 @@ impl InstanceAddrs {
         embedder: core::ptr::null_mut(),
         sched: core::ptr::null(),
         nursery: core::ptr::null(),
+        pages: core::ptr::null(),
     };
 }
 
@@ -110,6 +115,7 @@ impl VmCtx {
             sched: a.sched,
             stop: AtomicI64::new(0),
             nursery: a.nursery,
+            pages: a.pages,
         }
     }
 
@@ -146,6 +152,7 @@ pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
 pub(crate) const STOP: i32 = core::mem::offset_of!(VmCtx, stop) as i32;
 pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
+pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);

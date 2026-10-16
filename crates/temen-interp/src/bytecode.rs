@@ -1756,8 +1756,7 @@ fn compile_module_for(m: &Module, serves_children: bool) -> Option<Compiled> {
 /// sits in a cell. Every other driver declines such a module to the oracle: `Vcpu` at its compile
 /// ([`compile_module_for`]), the debug scheduler when a session opens
 /// ([`ScheduledDebugRun::new_with_host`]). A module with no such export builds no valid pager record
-/// — spawn validation refuses one identically on every tier — so its record spawn runs natively. The
-/// same key as temen-run's `module_demand_spawns` fold for the JIT.
+/// — spawn validation refuses one identically on every tier — so its record spawn runs natively.
 fn may_page_a_child(m: &Module) -> bool {
     m.declares_pager()
         && m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
@@ -2070,14 +2069,8 @@ fn admit_detached_child(
     // was checked, so it fails first (#2164). Only a driver that serves its children pages one: the
     // others decline a module that could page a child ([`may_page_a_child`]), and a granted child
     // that serves and spawns ([`bytecode_serves_children`]).
-    if let Some(export) = s.pager {
-        let pages = host
-            .self_module
-            .as_ref()
-            .is_some_and(|sm| sm.is_pager_export(export));
-        if !pages {
-            return Err(Trap::CapFault);
-        }
+    if s.pager.is_some_and(|export| !host.has_pager_export(export)) {
+        return Err(Trap::CapFault);
     }
     let (program, cmem_log2, cmodule, cshadow, cdurable) = {
         let g = host.resolve_module(s.module)?;
@@ -19969,7 +19962,7 @@ impl Vm {
                         // #1862, #2164: a page request's bytes move now, from this serving vCPU's
                         // window, before its child can claim the reply.
                         host.with(|p| {
-                            let v = p.settle_page(t, v, mem.as_ref());
+                            let v = p.settle_page(t, v, mem.as_ref().map(|m| m as _));
                             p.svc_results.insert(t, v)
                         });
                         self.rare().serve_count += 1;
@@ -20444,9 +20437,10 @@ impl Vm {
                 Op::Eval { inst, dst } => {
                     // Run the op against the frame, its operands frame slots; reuse the reference
                     // semantics. `eval_inst` borrows the frame immutably and `mem` mutably
-                    // (disjoint), so we read the result before writing it back.
+                    // (disjoint), so we read the result before writing it back. A `v128` access
+                    // pages as the oracle's `eval_inst` fallback does (its `handle_mem`).
                     let win_hi = base + c.progs[cur].nslots as usize;
-                    let r = super::eval_inst(inst, &self.regs[base..win_hi], mem)?;
+                    let r = paged!(super::eval_inst(inst, &self.regs[base..win_hi], mem));
                     if let Some(v) = r {
                         self.regs[base + *dst as usize] = v;
                     }

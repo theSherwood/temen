@@ -398,7 +398,7 @@ fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
             bytes: 1 << 16,
             runs: WINDOW_RUNS,
         };
-        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, lease, -1);
+        let child = b.spawn_detached_child(&[("display".into(), h)], 1 << 16, lease, -1, false);
         assert_eq!(
             child.is_some(),
             forkable,

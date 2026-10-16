@@ -12683,7 +12683,7 @@ block 0 () {
             runs: WINDOW_RUNS,
         };
         let (child_host, _i, _a) = parent
-            .spawn_detached_child(&grants, 1 << 12, lease, -1)
+            .spawn_detached_child(&grants, 1 << 12, lease, -1, false)
             .expect("marshal a two-cap grant list");
         let (back, _) = mint_detached_backing(1 << 12).expect("a native child window");
         let mut run = JitOnrampRun::open_detached_run(
