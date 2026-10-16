@@ -1,8 +1,9 @@
 //! **The self-hosted nimony lane** (#1609, #763): nimony's own toolchain, compiled to Temen with
 //! **no C compiler anywhere**, builds a nim program on Temen, and the program runs.
 //!
-//! Every tool is a `.temen` module built by `build_nim_temen --posix` (nimony → Leng →
-//! `temen-leng`), bound to one shared `temen_posix` personality, so they all see one memfs.
+//! Every tool is a `.temen` module that `scripts/nim-toolchain.sh` builds with nimony's Temen
+//! backend (`nimony t` → Leng → `temen-link`), bound to one shared `temen_posix` personality, so
+//! they all see one memfs.
 //!
 //! ```text
 //! nim_selfhost_lane --sh <sh.ir> --nimony <nimony.temen> --nifmake <nifmake.temen>
@@ -183,6 +184,7 @@ fn relower(
             &temen_run::ExecGrants::default(),
             engine,
             Some(jit_code),
+            None,
         )
         .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
         assert!(
@@ -260,6 +262,7 @@ fn run_program(
         &temen_run::ExecGrants::default(),
         engine,
         Some(jit_code),
+        None,
     )
     .unwrap_or_else(|e| panic!("the program failed on {engine:?}: {e}"));
     run.stdout()
@@ -283,7 +286,7 @@ fn run_program(
 /// directory, `lib/` in it — so both record the same paths, relative and absolute alike (nimony
 /// writes a compile-time evaluation program's imports and output file absolute). And native's
 /// phases are the ones **nimony** built natively from the same sources as these Temen builds
-/// (`build_nim_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
+/// (`scripts/nim-toolchain.sh`, step 1): the same compiler, only the target differs. `nimony/bin`'s
 /// own phases are built by classic Nim, a different compiler whose hash tables iterate in a
 /// different order, and hexer's output shows it (#1753).
 fn expect_native(posix: &temen_posix::Posix, cache: &str) {
@@ -372,7 +375,8 @@ fn main() {
     let shoggoth_p = need(flag("--shoggoth"), "--shoggoth");
     let link_p = need(flag("--temen-link"), "--temen-link");
     // The prebuilt guest libc (`snprintf`, `strtod`, libm): what `temen-link` links a program
-    // against, found where `build_nim_temen` finds it.
+    // against. `--libc`, else `$TEMEN_PG_LIBC`, as the toolchain's host `temen-link` reads it, else
+    // the committed one.
     let libc_p = flag("--libc")
         .or_else(|| std::env::var("TEMEN_PG_LIBC").ok())
         .unwrap_or_else(|| "browser/web/assets/pg_libc.temeno".to_string());
@@ -446,26 +450,8 @@ fn main() {
     posix.set_cwd(&dir);
 
     // Seed the tree, where native nimony has it, and the guest libc where `temen-link` looks for it
-    // (`/lib/temen/libc.temeno`): every artifact is derived in-guest. The tree's `bin/` is the
-    // toolchain, which the guest has as commands, and its `nimcache/` is what a build writes, so
-    // neither is seeded. Sources go in first so everything a phase derives from them is genuinely
-    // newer — the memfs stamps write order into `st_mtim`, which is what the freshness checks in
-    // `deps.nim` and nifmake read.
-    let mut seed: Vec<(String, Vec<u8>)> = Vec::new();
-    for e in std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{dir}: {e}"))
-        .flatten()
-    {
-        let name = e.file_name().to_string_lossy().into_owned();
-        match (name.as_str(), e.path().is_dir()) {
-            ("bin" | "nimcache", _) => {}
-            (_, true) => collect(&e.path(), &format!("{dir}/{name}/"), &mut seed),
-            (_, false) => seed.push((
-                format!("{dir}/{name}"),
-                std::fs::read(e.path()).unwrap_or_else(|e| panic!("read {name}: {e}")),
-            )),
-        }
-    }
+    // (`/lib/temen/libc.temeno`): every artifact is derived in-guest.
+    let mut seed = temen_run::nim_tree_files(Path::new(&dir), &dir);
     assert!(
         seed.iter().any(|(k, _)| *k == format!("{dir}/{prog}")),
         "{prog} is not a file of {dir}"
@@ -503,6 +489,7 @@ fn main() {
         },
         engine,
         Some(&jit_code),
+        None,
     );
     // The driver quits with `FAILURE: <cmd>` on any failed step; that is an ordinary exit, so ask
     // the memfs what was built: `nimcache/t/<main>/<prog>.temen`, `<main>` named by the path

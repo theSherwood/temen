@@ -5,7 +5,7 @@
 //! evaluation's is, and `temen-link` is there without being given. The real driver is measured by
 //! `src/nimbuild.rs`.
 
-use temen_browser::{blob_entries, library_pack, module_suffix, nim_build, STATUS_EXIT};
+use temen_browser::{blob_entries, module_suffix, nim_build, STATUS_EXIT};
 
 /// Returns 7: exec'd, the process exits 7.
 const SEVEN: &str = "memory 17\n\
@@ -244,75 +244,7 @@ fn temen_link_is_served_natively_at_its_paths() {
     );
 }
 
-/// A build's library pack is what it wrote under its `nimcache/` for library modules — each module
-/// told by the source its `.p.nif` records, in nimony's `lib/` or `src/` — the plugins it built
-/// into the cache's root, and nimony's memos of the options it was built with, the program's too, in
-/// the order they were written, which is the order that keeps them newer than their sources when
-/// seeded.
-#[test]
-fn a_library_pack_is_the_librarys_cache_in_write_order() {
-    let mut host = temen_interp::Host::new();
-    let (_px, posix) = temen_posix::grant(&mut host, 0, 0, Vec::new());
-    let executable = temen_encode::encode_module(&module(SEVEN));
-    let files: [(&str, &[u8]); 16] = [
-        ("/w/lib/std/sys.nim", b"proc x() = discard"),
-        ("/w/src/lib/nifcore.nim", b"proc y() = discard"),
-        ("/w/prog.nim", b"echo 1"),
-        // nimony's options memos (nim-lang/nimony#2616): the frontend's, and each program's backend one.
-        ("/w/nimcache/config.nif", b"(.nif24)\n(config (frontend))"),
-        (
-            "/w/nimcache/sys1.p.nif",
-            b"(.nif24)\n(stmts@,1,lib/std/sys.nim (proc))",
-        ),
-        (
-            "/w/nimcache/nif3.p.nif",
-            b"(.nif24)\n(stmts@,1,src/lib/nifcore.nim (proc))",
-        ),
-        (
-            "/w/nimcache/pro2.p.nif",
-            b"(.nif24)\n(stmts@,1,prog.nim (call))",
-        ),
-        ("/w/nimcache/sys1.s.nif", b"sem"),
-        ("/w/nimcache/nif3.s.nif", b"sem"),
-        ("/w/nimcache/pro2.s.nif", b"sem"),
-        // A plugin the library declares, which nimony links into the cache's root.
-        ("/w/nimcache/regex", &executable),
-        // The Temen backend's directory (nim-lang/nimony#2616): every module's `.x.nif`, and a
-        // directory for each program built.
-        ("/w/nimcache/t/sys1.x.nif", b"lowered"),
-        ("/w/nimcache/t/sys1/sys1.c.nif", b"lowered for sys1"),
-        ("/w/nimcache/t/pro2/sys1.c.nif", b"lowered for pro2"),
-        // The program: an executable too, but in its own directory.
-        ("/w/nimcache/t/pro2/prog.temen", &executable),
-        ("/w/nimcache/t/pro2/config.nif", b"(.nif24)\n(config (frontend) (backend))"),
-    ];
-    for (path, bytes) in files {
-        posix.write_file(path, bytes);
-    }
-    // Rewritten last: it goes where its latest write puts it.
-    posix.write_file("/w/nimcache/sys1.p.nif", files[4].1);
-    let pack = library_pack(&posix, "/w");
-    let names: Vec<&str> = pack.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(
-        names,
-        [
-            "/w/nimcache/config.nif",
-            "/w/nimcache/nif3.p.nif",
-            "/w/nimcache/sys1.s.nif",
-            "/w/nimcache/nif3.s.nif",
-            "/w/nimcache/regex",
-            "/w/nimcache/t/sys1.x.nif",
-            "/w/nimcache/t/sys1/sys1.c.nif",
-            "/w/nimcache/t/pro2/config.nif",
-            "/w/nimcache/sys1.p.nif",
-        ]
-    );
-    assert!(pack
-        .iter()
-        .all(|(n, b)| posix.read_file(n).as_ref() == Some(b)));
-}
-
-/// The committed toolchain the nim card ships (`web/assets/nimony.blob.gz`, `nimbuild --bundle`), inflated
+/// The committed toolchain the nim card ships (`web/assets/nimony.blob.gz`, temen-run's `nim_card_bundle`), inflated
 /// by `gzip` as the page's `DecompressionStream` does. `None` when `gzip` is missing.
 fn committed_toolchain() -> Option<Vec<u8>> {
     use std::io::Write;

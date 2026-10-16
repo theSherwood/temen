@@ -1410,7 +1410,8 @@ int main(void) {
     lang: 'nim',
     mode: 'io',
     // nimony's own toolchain, each tool built by nimony with no C compiler (`scripts/nim-toolchain.sh`),
-    // with nimony's library and that library prebuilt: one gzipped registry blob (`nimbuild --bundle`).
+    // with nimony's library and that library prebuilt: one gzipped registry blob (temen-run's
+    // `nim_card_bundle`).
     url: './assets/nimony.blob.gz',
     // The dropdown (`nim-programs.js`): picking one loads it into the editor (#2374).
     programs: NIM_PROGRAMS,

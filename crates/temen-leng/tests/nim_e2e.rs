@@ -968,6 +968,7 @@ fn run_io_capture(
         &temen_run::ExecGrants::default(),
         backend,
         None,
+        None,
     ) {
         // A guest that wrote before it died names its own problem — the plain `?` dropped that with
         // the personality. Print what it managed to say, then fail.
@@ -2141,6 +2142,7 @@ fn run_on_edge(
             &temen_run::ExecGrants::default(),
             engine,
             None,
+            None,
         )?;
         return Ok(Ran {
             outcome,
@@ -2785,6 +2787,7 @@ fn nim_shells_out_through_the_posix_sh() {
             },
             engine,
             None,
+            None,
         );
         // The tree-walker and the JIT record twin traps (#1665); a bytecode crash shows in the output.
         let crashed = temen_interp::last_twin_traps();
@@ -2878,6 +2881,7 @@ fn a_nim_process_that_polls_its_child_sleeps() {
                 built: false,
             },
             engine,
+            None,
             None,
         );
         assert!(
@@ -2973,6 +2977,7 @@ fn an_execd_nim_programs_heap_grows_past_its_window() {
             },
             engine,
             None,
+            None,
         );
         let crashed = temen_interp::last_twin_traps();
         assert!(
@@ -3045,6 +3050,7 @@ fn nim_reads_a_commands_output_through_execcmdex() {
                 built: false,
             },
             engine,
+            None,
             None,
         );
         assert!(
@@ -3120,6 +3126,7 @@ fn nim_forks_and_execs_a_nim_program() {
                 built: false,
             },
             engine,
+            None,
             None,
         );
         assert!(

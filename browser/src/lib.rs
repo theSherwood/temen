@@ -30,7 +30,7 @@ use temen_interp::{bytecode, Host, PreparedModule, StreamRole, Trap, Value, DEFA
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimony;
-pub use nimony::{library_pack, module_suffix, nim_build, NimBuild};
+pub use nimony::{module_suffix, nim_build, NimBuild};
 pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;

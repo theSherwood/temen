@@ -60,9 +60,13 @@ if [ -x "$REPO/nimony/bin/nimony" ]; then
 fi
 
 # --- shared build products --------------------------------------------------------------------------
-echo "=== building temen-llvm-translate + prep_temen (shared by every step) ==="
-( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
-cargo build --release -p temen-run --example prep_temen || true
+# Every step but nim_card uses the translator or prep_temen. The builders build the translator only
+# when it is missing, so it is built fresh here, unless nim_card is all this run rebuilds (#2442).
+if [ "$ONLY" != nim_card ]; then
+  echo "=== building temen-llvm-translate + prep_temen (shared by every step but nim_card) ==="
+  ( cd "$REPO/crates/temen-llvm" && cargo build --release --bin temen-llvm-translate ) || true
+  cargo build --release -p temen-run --example prep_temen || true
+fi
 PREP="$REPO/target/release/examples/prep_temen"
 
 # Validate that a produced .temen decodes+verifies (prep_temen exits non-zero / panics otherwise).
@@ -193,11 +197,13 @@ fi
 
 # --- 6) nimony.blob.gz (the nim card's toolchain, #958): nimony's own tools, each built by nimony with
 # no C compiler (scripts/nim-toolchain.sh — the self-hosted lane's), with nimony's library and that
-# library prebuilt. `nimbuild --bundle` builds the program below with them at `/nim`, where the card
-# builds, and writes what it ran with plus the library pack the build left. Nothing in the blob is
-# wire-coupled but the tools, and all of it is rebuilt together, so the pack always matches them. -----
+# library prebuilt. temen-run's `nim_card_bundle` builds the program below with them at `/nim`, where
+# the card builds, in-guest on the JIT with one guest CPU, so the pack comes out the same from every
+# build of the same inputs (#2442). It writes what the build ran with plus the library pack it left.
+# Nothing in the blob is wire-coupled but the tools, and all of it is rebuilt together, so the pack
+# always matches them. -----
 if want nim_card; then
-  echo "=== [nim_card] scripts/nim-toolchain.sh + nimbuild --bundle → web/assets/nimony.blob.gz ==="
+  echo "=== [nim_card] scripts/nim-toolchain.sh + nim_card_bundle → web/assets/nimony.blob.gz ==="
   T="$(mktemp -d)"
   mkdir -p "$T/card"
   # The library a playground program reaches for, compiled once so a build compiles only its own
@@ -234,8 +240,8 @@ NIM
   # library's relative imports resolve.
   if [ -n "${NIMONY_BIN:-}" ] && [ -n "${NIM_BIN:-}" ] && bash scripts/nim-toolchain.sh "$T" \
      && ln -s "$T/nimony/lib" "$T/card/lib" && ln -s "$T/nimony/src" "$T/card/src" \
-     && ( cd browser && cargo build --release -q --bin nimbuild ) \
-     && browser/target/release/nimbuild "$T" "$T/card" prog.nim --at /nim --leaves --bundle "$T/nimony.blob" \
+     && cargo build --release -q -p temen-run --example nim_card_bundle \
+     && target/release/examples/nim_card_bundle "$T" "$T/card" prog.nim --at /nim --bundle "$T/nimony.blob" \
      && gzip -9 -n -c "$T/nimony.blob" > browser/web/assets/nimony.blob.gz; then
     note "nim_card ✓ (nimony.blob.gz — gated by browser/tests/nimony.rs)"
   else
