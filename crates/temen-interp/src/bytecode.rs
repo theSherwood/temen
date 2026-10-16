@@ -11651,10 +11651,26 @@ fn invoke_entry(
 /// run's (#880 — a `cont.new` then keeps the registry's shadow-SP / freeze-metadata tables
 /// index-aligned).
 struct BounceRunCtx<'a> {
-    /// #1896 — where a bounce out of a leaf whose host suspends its emitted frames
-    /// ([`LeafOffer::parks`]) leaves a call that stops: its continuation, and what it stopped for.
-    /// `None` for any other bounce, in which a park faults.
-    park: Option<&'a mut Option<(Vm, Handoff)>>,
+    /// #1896, #2443 — where a bounce whose host can wait for its task leaves a call that stops for
+    /// the task's scheduler: its continuation, and the stop. The pump's leaf host suspends its
+    /// emitted frames ([`LeafOffer::parks`]); executor 2's thread waits with them on its stack
+    /// ([`ThreadRun::bounce_park`]). `None` for any other bounce, in which such a stop faults.
+    park: Option<&'a mut Option<(Vm, VcpuStop)>>,
+}
+
+/// Where a nested drive hands back a stop for its task's scheduler ([`BounceRunCtx::park`]): only
+/// in a bounce whose host can wait for the task, and only from the bounce's own call. A fiber the
+/// call resumed would park alone and let its resumer run on, which a drive that stops cannot do.
+/// Anywhere else the stop faults: nothing beneath could wait.
+fn park_slot<'s>(
+    run_meta: &'s mut Option<BounceRunCtx<'_>>,
+    vt: &VTask,
+) -> Result<&'s mut Option<(Vm, VcpuStop)>, Trap> {
+    run_meta
+        .as_mut()
+        .and_then(|c| c.park.as_deref_mut())
+        .filter(|_| vt.chain.is_empty())
+        .ok_or(Trap::CapFault)
 }
 
 /// What a nested drive ([`drive_nested`]) came back with.
@@ -11730,28 +11746,23 @@ fn drive_nested(
             // completes inline, an invoke fiber is never `CapParked` — no drain arm needed.
             //
             // #1954 — a **host-completed** call is the exception: only the embedder finishes it, so
-            // waiting here would never return. In a bounce out of a leaf whose host suspends its
-            // emitted frames it parks, as a pipe read does below — but not rewound: the task waits in
-            // `BlockedHostCap` with the call's continuation, and `deliver_cap` writes its result
-            // into it. Anywhere else it declines, fail-closed, rather than hang.
+            // waiting here would never return. In a bounce whose host can wait for its task it
+            // stops, as a pipe read does below — but not rewound: the task waits in `BlockedHostCap`
+            // with the call's continuation, and `deliver_cap` writes its result into it. Anywhere
+            // else it declines, fail-closed, rather than hang.
             Outcome::CapPending { id, dst } => {
                 let comps = host.with(|p| p.completions());
                 if comps.is_host_owned(id) {
-                    let slot = run_meta
-                        .as_mut()
-                        .and_then(|c| c.park.as_deref_mut())
-                        .filter(|_| vt.chain.is_empty())
-                        .ok_or(Trap::CapFault)?;
-                    let state = TaskState::BlockedHostCap { id, dst, at: None };
-                    *slot = Some((vt.active, Handoff::Park(state)));
+                    let slot = park_slot(&mut run_meta, &vt)?;
+                    *slot = Some((vt.active, VcpuStop::CapPending { id, dst }));
                     return Ok(Nested::Done(Vec::new()));
                 }
                 let r = comps.wait(id);
                 vt.active.set(dst, Reg::from_i64(r));
             }
-            // #2050 — a futex wait in a bounce out of a leaf whose host suspends its emitted frames
-            // parks as an interpreted task's does (the pump's `VcpuStop::Wait` arm): the value is
-            // re-read here, so a word that changed answers not-equal at once; else the task waits in
+            // #2050 — a futex wait in a bounce whose host can wait for its task parks as an
+            // interpreted task's does (the `VcpuStop::Wait` rule): the value is read here first, so
+            // a word that changed answers not-equal at once, with no stop; else the task waits in
             // `BlockedWait` with the call's continuation, not rewound, and the wake writes the status
             // into it. Anywhere else it faults, as ever: nothing beneath could wait.
             Outcome::MemoryWait {
@@ -11761,25 +11772,20 @@ fn drive_nested(
                 timeout,
                 dst,
             } => {
-                let slot = run_meta
-                    .as_mut()
-                    .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| vt.chain.is_empty())
-                    .ok_or(Trap::CapFault)?;
+                let slot = park_slot(&mut run_meta, &vt)?;
                 let w = mem.as_ref().ok_or(Trap::CapFault)?;
                 if w.atomic_value(base, width) != expected {
                     vt.active.set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
                     continue;
                 }
-                *slot = Some((
-                    vt.active,
-                    Handoff::Wait {
-                        addr: base,
-                        site: w.futex_site(base),
-                        timeout,
-                        dst,
-                    },
-                ));
+                let stop = VcpuStop::Wait {
+                    base,
+                    expected,
+                    width,
+                    timeout,
+                    dst,
+                };
+                *slot = Some((vt.active, stop));
                 return Ok(Nested::Done(Vec::new()));
             }
             Outcome::ContNew { funcref, sp, dst } => {
@@ -11871,39 +11877,6 @@ fn drive_nested(
                 let total = gc_write(mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }
-            // #1896 — a call parks, or asks for a process, in a bounce out of a leaf whose host
-            // suspends the emitted frames beneath this drive. The drive stops here and hands back its
-            // continuation: a park with its op rewound to re-execute and the state the task parks in,
-            // which the pump runs on once the park clears; a spawn past its op, which the pump starts
-            // first ([`spawn_task`]). Anywhere else these fault, as ever: nothing beneath could wait.
-            stop @ (Outcome::PipeRead { .. }
-            | Outcome::PipeWrite { .. }
-            | Outcome::StdinPark
-            | Outcome::ReapWait { .. }
-            | Outcome::SpawnSelf { .. }) => {
-                let slot = run_meta
-                    .as_mut()
-                    .and_then(|c| c.park.as_deref_mut())
-                    .filter(|_| vt.chain.is_empty())
-                    .ok_or(Trap::CapFault)?;
-                let handoff = match stop {
-                    Outcome::PipeRead { pipe } => {
-                        Handoff::Park(TaskState::BlockedPipeRead { pipe })
-                    }
-                    Outcome::PipeWrite { pipe } => {
-                        Handoff::Park(TaskState::BlockedPipeWrite { pipe })
-                    }
-                    Outcome::ReapWait { child } => {
-                        Handoff::Park(TaskState::BlockedReapPersonality { child })
-                    }
-                    Outcome::SpawnSelf { cmd, plan, dst } => {
-                        Handoff::Spawn(Box::new(SpawnAsk { cmd, plan, dst }))
-                    }
-                    _ => Handoff::Park(TaskState::BlockedStdin),
-                };
-                *slot = Some((vt.active, handoff));
-                return Ok(Nested::Done(Vec::new()));
-            }
             // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
             // whole `Instantiator` is unavailable inside it — named here rather than left to the
             // catch-all, because it is the contract, not an unserviced seam. The tree-walker refuses
@@ -11916,6 +11889,27 @@ fn drive_nested(
                 if run_meta.is_none() =>
             {
                 return Err(Trap::CapFault)
+            }
+            // #1896, #2443 — an op that stops for its task's scheduler, in a bounce whose host can
+            // wait for the task: a thread, futex or child op, a stream read or write, a reap, a
+            // process spawn. The drive stops here and hands back its continuation and the stop, which
+            // the host applies to the task as an interpreted op's (`SchedCore::on_stop`): a park with
+            // its op rewound to re-execute, or an answer delivered into the continuation. Anywhere
+            // else these fault, as ever: nothing beneath could wait.
+            o @ (Outcome::ThreadSpawn { .. }
+            | Outcome::ThreadJoin { .. }
+            | Outcome::MemoryNotify { .. }
+            | Outcome::InstantiateDetached { .. }
+            | Outcome::ChildOffer { .. }
+            | Outcome::ChildCtl { .. }
+            | Outcome::PipeRead { .. }
+            | Outcome::PipeWrite { .. }
+            | Outcome::StdinPark
+            | Outcome::ReapWait { .. }
+            | Outcome::SpawnSelf { .. }) => {
+                let slot = park_slot(&mut run_meta, &vt)?;
+                *slot = Some((vt.active, o.into_stop().map_err(|_| Trap::Malformed)?));
+                return Ok(Nested::Done(Vec::new()));
             }
             // An unserviced seam. Among them a fault on a paged child's unsupplied page: a nested
             // drive cannot park on its pager yet, where the oracle's invoke pages (#2472).
@@ -12094,6 +12088,153 @@ enum VcpuStop {
     StdinPark,
 }
 
+impl Outcome {
+    /// The stop an op makes for its executor ([`step_vcpu`]), or, for what a drive serves itself (its
+    /// end, a spent quantum, a fiber op, `gc.roots`), the outcome back. A nested drive hands back the
+    /// same stops ([`BounceRunCtx::park`]), so both reach the one rule set ([`SchedCore::on_stop`]).
+    fn into_stop(self) -> Result<VcpuStop, Outcome> {
+        Ok(match self {
+            Outcome::TierUp {
+                module,
+                func,
+                argv,
+                dst,
+                results,
+                mapped,
+            } => VcpuStop::TierUp {
+                module,
+                func,
+                argv,
+                dst,
+                results,
+                mapped,
+            },
+            Outcome::ThreadSpawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module,
+            } => VcpuStop::Spawn {
+                func,
+                sp,
+                arg,
+                dst,
+                module: module as u32,
+            },
+            Outcome::ThreadJoin {
+                handle,
+                dst,
+                status,
+            } => VcpuStop::Join {
+                handle,
+                dst,
+                status,
+            },
+            // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
+            // qualification veto keeps them out of fiber contexts, so no registry state is live.
+            Outcome::LiveCall {
+                ticket,
+                callee,
+                dst,
+            } => VcpuStop::LiveCall {
+                ticket,
+                callee,
+                dst,
+            },
+            Outcome::SvcWait => VcpuStop::SvcWait,
+            Outcome::ChildCtl { child, dst, ctl } => VcpuStop::ChildCtl { child, dst, ctl },
+            Outcome::ChildOffer {
+                child,
+                arg,
+                dst,
+                grant,
+            } => VcpuStop::ChildOffer {
+                child,
+                arg,
+                dst,
+                grant,
+            },
+            Outcome::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+            } => VcpuStop::CloneCaller {
+                reply_orig,
+                reply_twin,
+                dst,
+            },
+            Outcome::Reap { pid, dst } => VcpuStop::Reap { pid, dst },
+            Outcome::Exec {
+                cmd,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+                personality,
+            } => VcpuStop::Exec {
+                cmd,
+                grants_ptr,
+                grants_n,
+                entry,
+                size_log2,
+                dst,
+                personality,
+            },
+            Outcome::ForkSelf { dst } => VcpuStop::ForkSelf { dst },
+            Outcome::SpawnSelf { cmd, plan, dst } => VcpuStop::SpawnSelf { cmd, plan, dst },
+            Outcome::PipeRead { pipe } => VcpuStop::PipeRead { pipe },
+            Outcome::PipeWrite { pipe } => VcpuStop::PipeWrite { pipe },
+            Outcome::ReapWait { child } => VcpuStop::ReapWait { child },
+            Outcome::InstantiateDetached { spawn, dst } => {
+                VcpuStop::InstantiateDetached { spawn, dst }
+            }
+            Outcome::CapPending { id, dst } => VcpuStop::CapPending { id, dst },
+            Outcome::PageFault(addr) => VcpuStop::PageFault(addr),
+            Outcome::MemoryWait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            } => VcpuStop::Wait {
+                base,
+                expected,
+                width,
+                timeout,
+                dst,
+            },
+            // Blocking-stdin park (owned-host session): surface it for the `Vcpu` driver to pump.
+            Outcome::StdinPark => VcpuStop::StdinPark,
+            Outcome::MemoryNotify { base, count, dst } => VcpuStop::Notify { base, count, dst },
+            Outcome::JitInstall { h, code, dst } => VcpuStop::JitInstall { h, code, dst },
+            Outcome::JitUninstall { h, slot, dst } => VcpuStop::JitUninstall { h, slot, dst },
+            Outcome::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            } => VcpuStop::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            },
+            o @ (Outcome::Done(_)
+            | Outcome::Suspended
+            | Outcome::ContNew { .. }
+            | Outcome::ContResume { .. }
+            | Outcome::FiberSuspend { .. }
+            | Outcome::GcRoots { .. }) => return Err(o),
+        })
+    }
+}
+
 /// How the eval loop reaches the powerbox (THREADS.md 4c-host). The cooperative `drive` locks a task's
 /// domain cell for the task's step and hands it over exclusively (`&mut Host`); the **parallel**
 /// driver shares one `Arc<Mutex<Host>>` across vCPU threads and takes the lock only for the duration
@@ -12264,165 +12405,6 @@ fn step_vcpu(
                 dst,
                 Trap::FiberFault,
             )?,
-            Outcome::TierUp {
-                module,
-                func,
-                argv,
-                dst,
-                results,
-                mapped,
-            } => {
-                return Ok(VcpuStop::TierUp {
-                    module,
-                    func,
-                    argv,
-                    dst,
-                    results,
-                    mapped,
-                })
-            }
-            Outcome::ThreadSpawn {
-                func,
-                sp,
-                arg,
-                dst,
-                module,
-            } => {
-                return Ok(VcpuStop::Spawn {
-                    func,
-                    sp,
-                    arg,
-                    dst,
-                    module: module as u32,
-                })
-            }
-            Outcome::ThreadJoin {
-                handle,
-                dst,
-                status,
-            } => {
-                return Ok(VcpuStop::Join {
-                    handle,
-                    dst,
-                    status,
-                })
-            }
-            // §3.6 (I36 slice 2): the serve/call/offer trio surface straight to the driver. The
-            // qualification veto keeps them out of fiber contexts, so no registry state is live.
-            Outcome::LiveCall {
-                ticket,
-                callee,
-                dst,
-            } => {
-                return Ok(VcpuStop::LiveCall {
-                    ticket,
-                    callee,
-                    dst,
-                })
-            }
-            Outcome::SvcWait => return Ok(VcpuStop::SvcWait),
-            Outcome::PageFault(addr) => return Ok(VcpuStop::PageFault(addr)),
-            Outcome::ChildCtl { child, dst, ctl } => {
-                return Ok(VcpuStop::ChildCtl { child, dst, ctl })
-            }
-            Outcome::ChildOffer {
-                child,
-                arg,
-                dst,
-                grant,
-            } => {
-                return Ok(VcpuStop::ChildOffer {
-                    child,
-                    arg,
-                    dst,
-                    grant,
-                })
-            }
-            Outcome::CloneCaller {
-                reply_orig,
-                reply_twin,
-                dst,
-            } => {
-                return Ok(VcpuStop::CloneCaller {
-                    reply_orig,
-                    reply_twin,
-                    dst,
-                })
-            }
-            Outcome::Reap { pid, dst } => return Ok(VcpuStop::Reap { pid, dst }),
-            Outcome::Exec {
-                cmd,
-                grants_ptr,
-                grants_n,
-                entry,
-                size_log2,
-                dst,
-                personality,
-            } => {
-                return Ok(VcpuStop::Exec {
-                    cmd,
-                    grants_ptr,
-                    grants_n,
-                    entry,
-                    size_log2,
-                    dst,
-                    personality,
-                })
-            }
-            Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
-            Outcome::SpawnSelf { cmd, plan, dst } => {
-                return Ok(VcpuStop::SpawnSelf { cmd, plan, dst })
-            }
-            Outcome::PipeRead { pipe } => return Ok(VcpuStop::PipeRead { pipe }),
-            Outcome::PipeWrite { pipe } => return Ok(VcpuStop::PipeWrite { pipe }),
-            Outcome::ReapWait { child } => return Ok(VcpuStop::ReapWait { child }),
-            Outcome::InstantiateDetached { spawn, dst } => {
-                return Ok(VcpuStop::InstantiateDetached { spawn, dst })
-            }
-            Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
-            Outcome::MemoryWait {
-                base,
-                expected,
-                width,
-                timeout,
-                dst,
-            } => {
-                return Ok(VcpuStop::Wait {
-                    base,
-                    expected,
-                    width,
-                    timeout,
-                    dst,
-                })
-            }
-            // Blocking-stdin park (owned-host session): surface it for the `Vcpu` driver to pump.
-            Outcome::StdinPark => return Ok(VcpuStop::StdinPark),
-            Outcome::MemoryNotify { base, count, dst } => {
-                return Ok(VcpuStop::Notify { base, count, dst })
-            }
-            Outcome::JitInstall { h, code, dst } => {
-                return Ok(VcpuStop::JitInstall { h, code, dst })
-            }
-            Outcome::JitUninstall { h, slot, dst } => {
-                return Ok(VcpuStop::JitUninstall { h, slot, dst })
-            }
-            Outcome::JitInvoke {
-                h,
-                code,
-                argv,
-                dst,
-                params,
-                results,
-            } => {
-                return Ok(VcpuStop::JitInvoke {
-                    h,
-                    code,
-                    argv,
-                    dst,
-                    params,
-                    results,
-                })
-            }
             // §GC `gc.roots`: scan the whole vCPU continuation — the active window, its call stack
             // (covered by `scan_vm_roots`), every resume-chain ancestor, every parked fiber, and every
             // suspended coroutine — for words that (masked) land in `[lo, hi)`. A **sound superset**
@@ -12439,6 +12421,8 @@ fn step_vcpu(
                 let total = gc_write(ctx.mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }
+            // Every other outcome is a stop for the executor's rules.
+            o => return o.into_stop().map_err(|_| Trap::Malformed),
         }
     }
 }
@@ -12681,9 +12665,9 @@ struct TaskVm {
 }
 
 impl TaskVm {
-    /// Where the result of this task's parked call lands: the continuation of a call that parked in
-    /// a bounce out of the task's emitted leaf ([`Suspended`], #1896), which the pump runs next, or
-    /// else the task's own frame.
+    /// Where the result of this task's parked call lands: the continuation of a call that stopped in
+    /// a bounce out of the task's emitted code ([`Suspended`], #1896, #2443), or else the task's own
+    /// frame.
     fn parked_frame(&mut self) -> &mut Vm {
         match self.suspended.as_mut() {
             Some(s) => &mut s.vm,
@@ -13220,17 +13204,25 @@ enum TierUpDst {
     Entry { parks: bool },
 }
 
-/// #1896 — a leaf running emitted whose call parked in a bounce ([`LeafOffer::parks`]): its host
-/// holds the emitted frames, suspended, and this is the rest of the call, which the pump runs once
-/// the park clears ([`CoopStep::Resume`]).
+/// #1896, #2443 — the rest of a call out of a task's emitted code that stopped in a bounce for the
+/// task's scheduler ([`BounceRunCtx::park`]). The emitted frames beneath it wait for it: the pump's
+/// leaf host holds them suspended until [`CoopStep::Resume`], and executor 2's thread holds them on
+/// its stack ([`ThreadRun::bounce_park`]).
 struct Suspended {
     /// The call's interpreted continuation, its parked op rewound.
     vm: Vm,
+    /// The pump's leaf call ([`LeafOffer::parks`]); `None` on executor 2, whose thread runs the
+    /// continuation on itself.
+    leaf: Option<LeafCall>,
+}
+
+/// #1896 — what the pump keeps for a leaf's call that stopped in a bounce ([`Suspended::leaf`]).
+struct LeafCall {
     /// Where the leaf's results land, and their types ([`EmitTier::pending_tierup`]).
     dst: TierUpDst,
     results: Box<[ValType]>,
-    /// A process the call asked for ([`Handoff::Spawn`]), which the pump starts before the call runs
-    /// on.
+    /// A process the call asked for ([`VcpuStop::SpawnSelf`]), which the pump starts before the
+    /// call runs on.
     spawn: Option<Box<SpawnAsk>>,
 }
 
@@ -13242,60 +13234,47 @@ struct SpawnAsk {
     dst: u32,
 }
 
-/// #1896 — what a leaf's call hands back when it stops in a bounce ([`BounceRunCtx::park`]).
-enum Handoff {
-    /// It parked: the state its task waits in.
-    Park(TaskState),
-    /// #2050 — it waits on a futex word whose value it found unchanged: [`hand_off`] parks the task
-    /// in [`TaskState::BlockedWait`], its deadline taken on the pump's clock.
-    Wait {
-        addr: u64,
-        site: super::FutexSite,
-        timeout: Option<u64>,
-        dst: u32,
-    },
-    /// It asked for a process, which only the pump can start.
-    Spawn(Box<SpawnAsk>),
-}
-
-/// Leave task `ti`, whose leaf's call stopped in a bounce ([`Handoff`]): parked in the state the call
-/// waits in, or runnable with the spawn it asked for. Answers the spawn, for the call's
-/// [`Suspended`].
+/// #1896 — leave task `ti`, whose leaf's call stopped in a bounce, as the stop leaves an
+/// interpreted task: parked in the state the call waits in, or runnable with the process it asked
+/// for, which this answers for the call's [`LeafCall`]. The pump cannot pause for its host inside a
+/// bounce, so only these stops can wait in a leaf's; any other refuses, as a bounce that cannot wait
+/// does. `win` is the task's window, which a futex wait's site is taken on.
 fn hand_off(
     tasks: &mut [TaskSlot],
     forked_twins: &mut std::collections::BTreeSet<usize>,
     hooked_twins: &std::collections::BTreeSet<usize>,
     ti: usize,
-    handoff: Handoff,
+    stop: VcpuStop,
+    win: Option<&Mem>,
     clock: u64,
-) -> Option<Box<SpawnAsk>> {
-    match handoff {
-        Handoff::Park(state) => {
-            park_task(tasks, forked_twins, hooked_twins, ti, state);
-            None
-        }
-        Handoff::Wait {
-            addr,
-            site,
-            timeout,
-            dst,
+) -> Result<Option<Box<SpawnAsk>>, Trap> {
+    let state = match stop {
+        VcpuStop::PipeRead { pipe } => TaskState::BlockedPipeRead { pipe },
+        VcpuStop::PipeWrite { pipe } => TaskState::BlockedPipeWrite { pipe },
+        VcpuStop::StdinPark => TaskState::BlockedStdin,
+        VcpuStop::ReapWait { child } => TaskState::BlockedReapPersonality { child },
+        VcpuStop::CapPending { id, dst } => TaskState::BlockedHostCap { id, dst, at: None },
+        // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an infinite wait
+        // (#1638).
+        VcpuStop::Wait {
+            base, timeout, dst, ..
         } => {
-            // The interpreted wait's park (the pump's `VcpuStop::Wait` arm): `None` for an
-            // infinite wait (#1638).
-            let deadline = timeout.map(|t| clock.saturating_add(t));
             tasks[ti].state = TaskState::BlockedWait {
-                addr,
-                site,
-                deadline,
+                addr: base,
+                site: win.ok_or(Trap::CapFault)?.futex_site(base),
+                deadline: timeout.map(|t| clock.saturating_add(t)),
                 dst,
             };
-            None
+            return Ok(None);
         }
-        Handoff::Spawn(ask) => {
+        VcpuStop::SpawnSelf { cmd, plan, dst } => {
             tasks[ti].state = TaskState::Runnable;
-            Some(ask)
+            return Ok(Some(Box::new(SpawnAsk { cmd, plan, dst })));
         }
-    }
+        _ => return Err(Trap::CapFault),
+    };
+    park_task(tasks, forked_twins, hooked_twins, ti, state);
+    Ok(None)
 }
 
 /// Park task `ti` in `state`, whichever tier its call parked from.
@@ -14241,7 +14220,12 @@ impl CoopSched {
             last_pick = ti;
             // #1896 — a leaf's call that asked for a process in its bounce: start it, as the spawn
             // arm starts one for an interpreted caller, before the call runs on (below).
-            if let Some(ask) = tasks[ti].vm.suspended.as_mut().and_then(|s| s.spawn.take()) {
+            let leaf_call = tasks[ti]
+                .vm
+                .suspended
+                .as_mut()
+                .and_then(|s| s.leaf.as_mut());
+            if let Some(ask) = leaf_call.and_then(|l| l.spawn.take()) {
                 let SpawnAsk { cmd, plan, dst } = *ask;
                 let (r, step) = spawn_task(
                     tasks,
@@ -14346,9 +14330,15 @@ impl CoopSched {
             // it parks again, the task waits again. A trap ends the process, whose frames the host
             // never resumes.
             if let Some(s) = tasks[ti].vm.suspended.take() {
+                // Only the pump's leaf leaves a call here ([`CoopRun::bounce`]).
                 let Suspended {
-                    vm, dst, results, ..
-                } = *s;
+                    vm,
+                    leaf: Some(LeafCall { dst, results, .. }),
+                } = *s
+                else {
+                    complete(tasks, ti, Err(Trap::Malformed));
+                    continue;
+                };
                 let mut parked = None;
                 let meta = BounceRunCtx {
                     park: Some(&mut parked),
@@ -14369,15 +14359,21 @@ impl CoopSched {
                 charge_slice(slice_left, ctx.fuel.can_burn());
                 match (done, parked) {
                     (Err(trap), _) => complete(tasks, ti, Err(trap)),
-                    (Ok(_), Some((vm, handoff))) => {
-                        let spawn =
-                            hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
-                        tasks[ti].vm.suspended = Some(Box::new(Suspended {
-                            vm,
-                            dst,
-                            results,
-                            spawn,
-                        }));
+                    (Ok(_), Some((vm, stop))) => {
+                        let win = ctx.mem.as_ref();
+                        match hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock) {
+                            Ok(spawn) => {
+                                tasks[ti].vm.suspended = Some(Box::new(Suspended {
+                                    vm,
+                                    leaf: Some(LeafCall {
+                                        dst,
+                                        results,
+                                        spawn,
+                                    }),
+                                }))
+                            }
+                            Err(trap) => complete(tasks, ti, Err(trap)),
+                        }
                     }
                     (Ok(vals), None) => {
                         *pending_tierup = Some((ti, dst, results));
@@ -16252,18 +16248,24 @@ impl CoopRun {
             }
         }?;
         drop(beneath);
-        let Some((vm, handoff)) = parked else {
+        let Some((vm, stop)) = parked else {
             return Ok(Some(n));
         };
         // #1896: the call stopped. Its task waits with the rest of the call, and its host with the
-        // emitted frames.
+        // emitted frames. A stop the leaf cannot wait on refuses, before the round-trip ends.
+        let win = match tasks[ti].env {
+            None => mem.as_ref(),
+            Some(k) => extra_envs[k].mem.as_ref(),
+        };
+        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, stop, win, *clock)?;
         let (ti, dst, results) = pending_tierup.take().expect("a leaf's call parked");
-        let spawn = hand_off(tasks, forked_twins, hooked_twins, ti, handoff, *clock);
         tasks[ti].vm.suspended = Some(Box::new(Suspended {
             vm,
-            dst,
-            results,
-            spawn,
+            leaf: Some(LeafCall {
+                dst,
+                results,
+                spawn,
+            }),
         }));
         Ok(None)
     }
@@ -17012,19 +17014,11 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
     // tier before it steps the task on.
     let mut invoke = None;
     let mut tier = TierState::default();
-    'run: loop {
-        loop {
-            if g.over.is_some() {
-                break 'run;
-            }
-            match g.core.tasks[ti].state {
-                TaskState::Runnable if !(look && run.stopped(&g.core, ti)) => break,
-                TaskState::Done(_) => break 'run,
-                _ => {
-                    g = run.park(g, ti, &park);
-                    look = true;
-                }
-            }
+    loop {
+        let runs;
+        (g, runs) = run.await_runnable(g, ti, &park, look);
+        if !runs {
+            break;
         }
         if exec || g.core.tasks[ti].env != env {
             env = g.core.tasks[ti].env;
@@ -17032,7 +17026,7 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
             tier.pages = PageTable::default();
         }
         std::mem::swap(&mut g.core.tasks[ti].vm, &mut vm);
-        let exits = g.core.hooked_twins.len();
+        let mut exits = g.core.hooked_twins.len();
         let host = std::sync::Arc::clone(task_host(&run.root, &g.core.extra_envs, env));
         let table = env.map(|k| std::sync::Arc::clone(&g.core.extra_envs[k].table));
         release(g);
@@ -17046,8 +17040,8 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         let stop = match invoke.take() {
             Some(inv) => run
                 .invoke(&mut vm, &mut ctx, &mut tier, inv)
-                .and_then(|()| run.step(&mut vm, env, &mut ctx, &mut tier)),
-            None => run.step(&mut vm, env, &mut ctx, &mut tier),
+                .and_then(|()| run.step(ti, &mut exits, &mut vm, env, &mut ctx, &mut tier)),
+            None => run.step(ti, &mut exits, &mut vm, env, &mut ctx, &mut tier),
         };
         let fault = match &stop {
             Err(Trap::MemoryFault) => ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()),
@@ -17066,17 +17060,80 @@ fn run_task_thread(run: std::sync::Arc<ThreadRun>, ti: usize, mem: Option<Mem>, 
         look = matches!(stop, Ok(VcpuStop::Preempted));
         let (made, surfaced) = run.apply(&mut g, ti, stop, exits);
         invoke = surfaced;
-        if !made.is_empty() {
-            release(g);
-            for (j, mem, fuel) in made {
-                let r = std::sync::Arc::clone(&run);
-                let window = mem.as_ref().and_then(Mem::foreign_id);
-                run.start_thread(move || run_task_thread(r, j, mem, fuel), window);
-            }
-            g = run.state.lock_unpoisoned();
-        }
+        g = start_tasks(&run, g, made);
     }
     release(g);
+}
+
+/// Start the threads of the tasks a rule made ([`ThreadRun::apply`]), with the lock let go meanwhile.
+fn start_tasks<'g>(
+    run: &'g std::sync::Arc<ThreadRun>,
+    g: std::sync::MutexGuard<'g, Threads>,
+    made: Vec<NewTask>,
+) -> std::sync::MutexGuard<'g, Threads> {
+    if made.is_empty() {
+        return g;
+    }
+    release(g);
+    for (j, mem, fuel) in made {
+        let r = std::sync::Arc::clone(run);
+        let window = mem.as_ref().and_then(Mem::foreign_id);
+        run.start_thread(move || run_task_thread(r, j, mem, fuel), window);
+    }
+    run.state.lock_unpoisoned()
+}
+
+/// #2443 — the task a tier-up's bounces can stop ([`BounceTask::park`]): its run and index, its VM,
+/// and how many children had ended when it last left the table ([`ThreadRun::missed_wake`]).
+struct BounceTask<'a> {
+    run: &'a std::sync::Arc<ThreadRun>,
+    ti: usize,
+    vm: &'a mut TaskVm,
+    exits: &'a mut usize,
+}
+
+impl BounceTask<'_> {
+    /// What a `gc.roots` in the task's bounce scans beneath it (#1627): the task's paused VMs, and
+    /// the `words` its emitted frames pushed to the thread's spill stack.
+    fn beneath<'b>(&'b self, words: &'b [u64]) -> Beneath<'b> {
+        let mut b = Beneath::task(&self.vm.vt, FiberRegRef::Owned(&[]));
+        b.words.push(words);
+        b
+    }
+
+    /// #2443 — the call the task's bounce made stopped for its scheduler: a thread, futex or child op
+    /// ([`BounceRunCtx::park`]). The task stops with it. Its VM goes back to the table with the
+    /// call's continuation ([`TaskVm::suspended`]), where the rules write a parked task's registers,
+    /// and the stop is applied as an interpreted op's ([`ThreadRun::apply`]). The thread waits, the
+    /// emitted frames on its stack, until the task can run, and takes the continuation back to run
+    /// on. If the task ended or the run is over meanwhile, the bounce traps: the emitted frames
+    /// unwind, and the thread leaves as it does after a step that ended mid-way.
+    fn park(&mut self, cont: Vm, stop: VcpuStop) -> Result<Vm, Trap> {
+        let (run, ti) = (self.run, self.ti);
+        let mut g = run.state.lock_unpoisoned();
+        if g.over.is_some() || matches!(g.core.tasks[ti].state, TaskState::Done(_)) {
+            return Err(Trap::ThreadFault);
+        }
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        let call = Suspended {
+            vm: cont,
+            leaf: None,
+        };
+        g.core.tasks[ti].vm.suspended = Some(Box::new(call));
+        // A §22 invoke in the call is served in the bounce (`drive_nested`): none surfaces here.
+        let (made, _) = run.apply(&mut g, ti, Ok(stop), *self.exits);
+        g = start_tasks(run, g, made);
+        let park = std::sync::Arc::clone(&g.parks[ti]);
+        let runs;
+        (g, runs) = run.await_runnable(g, ti, &park, false);
+        std::mem::swap(&mut *g.core.tasks[ti].vm, self.vm);
+        *self.exits = g.core.hooked_twins.len();
+        release(g);
+        match self.vm.suspended.take() {
+            Some(call) if runs => Ok(call.vm),
+            _ => Err(Trap::ThreadFault),
+        }
+    }
 }
 
 /// Let go of executor 2's lock, then signal the threads its holder woke ([`ThreadRun::wake`]).
@@ -17093,8 +17150,11 @@ impl ThreadRun {
     /// thread, on the platform's emitted tier ([`ThreadTier`]), and the step goes on; after
     /// [`TIERUP_LOOK`] of them in a row the thread stops to look at the run, as a preemption makes
     /// it.
+    #[allow(clippy::too_many_arguments)]
     fn step(
-        &self,
+        self: &std::sync::Arc<Self>,
+        ti: usize,
+        exits: &mut usize,
         vm: &mut TaskVm,
         env: Option<usize>,
         ctx: &mut RunCtx,
@@ -17124,11 +17184,16 @@ impl ThreadRun {
                     let tier = self.platform.tier.as_ref().ok_or(Trap::Malformed)?;
                     let paged = vm.vt.active.jit_page_checked;
                     let target = EmittedTarget::Region { module, func };
-                    let task = Some(&vm.vt);
+                    let task = BounceTask {
+                        run: self,
+                        ti,
+                        vm: &mut *vm,
+                        exits: &mut *exits,
+                    };
                     let vals = self.emitted(
                         tier,
                         &mut fibers,
-                        task,
+                        Some(task),
                         ctx,
                         state,
                         target,
@@ -17154,6 +17219,31 @@ impl ThreadRun {
             }
         }
         Ok(VcpuStop::Preempted)
+    }
+
+    /// Wait until task `ti` can run, or has ended, or the run is over, parking its thread meanwhile
+    /// ([`Self::park`]); returns whether it runs. `look`: whether its process may have stopped since
+    /// its thread last looked (#1198), after a park or a preemption.
+    fn await_runnable<'g>(
+        &self,
+        mut g: std::sync::MutexGuard<'g, Threads>,
+        ti: usize,
+        park: &std::sync::Condvar,
+        mut look: bool,
+    ) -> (std::sync::MutexGuard<'g, Threads>, bool) {
+        loop {
+            if g.over.is_some() {
+                return (g, false);
+            }
+            match g.core.tasks[ti].state {
+                TaskState::Runnable if !(look && self.stopped(&g.core, ti)) => return (g, true),
+                TaskState::Done(_) => return (g, false),
+                _ => {
+                    g = self.park(g, ti, park);
+                    look = true;
+                }
+            }
+        }
     }
 
     /// Run the §22 invoke `inv` the rules surfaced at the task's last stop on this thread's emitted
@@ -17191,15 +17281,17 @@ impl ThreadRun {
     /// window, powerbox and table, with their fibers in `fibers`: the run's registry for a tier-up,
     /// as the pump's are, or an invoke's own. A tier-up's `task` is what a `gc.roots` in a bounce
     /// scans beneath it, with what its emitted frames pushed to the thread's spill stack (#1627),
-    /// as the pump's bounce does. `at` is the extent the stop surfaced with, and whether the code
-    /// is page-checked: then the call reads the thread's page-state table, brought up to the task's
-    /// page map, and is bounded by its coverage instead (#750).
+    /// as the pump's bounce does, and what a call in a bounce stops for its scheduler (#2443,
+    /// [`BounceTask::park`]); an invoked unit's calls never stop (#1578). `at` is the extent the
+    /// stop surfaced with, and whether the code is page-checked: then the call reads the thread's
+    /// page-state table, brought up to the task's page map, and is bounded by its coverage instead
+    /// (#750).
     #[allow(clippy::too_many_arguments)]
     fn emitted(
         &self,
         tier: &ThreadTier,
         fibers: &mut FiberCell,
-        task: Option<&VTask>,
+        mut task: Option<BounceTask<'_>>,
         ctx: &mut RunCtx,
         state: &mut TierState,
         target: EmittedTarget<'_>,
@@ -17241,23 +17333,50 @@ impl ThreadRun {
             // A tier that does not spill, or a count past its stack, leaves `gc.roots` refused: a
             // scan that cannot see the emitted frames' words would miss roots.
             let words = (!spill.is_empty()).then(|| spill.get(..pushed)).flatten();
-            let beneath = task.zip(words).map(|(vt, words)| {
-                let mut b = Beneath::task(vt, FiberRegRef::Owned(&[]));
-                b.words.push(words);
-                b
-            });
-            let ran = coop_bounce(
+            let mut parked = None;
+            let first = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+            let mut ran = coop_bounce(
                 &self.dom.source,
                 table,
                 fuel,
                 mem,
                 &mut HostCell::Shared(host),
                 fibers,
-                task.map(|_| BounceRunCtx { park: None }),
+                task.as_ref().map(|_| BounceRunCtx {
+                    park: Some(&mut parked),
+                }),
                 target,
                 io,
-                beneath.as_ref(),
+                first.as_ref(),
             );
+            drop(first);
+            // #2443 — the call stopped for its task's scheduler: the task stops with it, and the
+            // call runs on once the task can, until it returns.
+            while let Some((cont, stop)) = parked.take() {
+                let cont = task.as_mut().ok_or(Trap::Malformed)?.park(cont, stop)?;
+                let under = task.as_ref().zip(words).map(|(t, w)| t.beneath(w));
+                ran = drive_nested(
+                    &self.dom.source,
+                    table,
+                    VTask::of(cont, 0),
+                    fuel,
+                    mem,
+                    &mut HostCell::Shared(host),
+                    fibers,
+                    Some(BounceRunCtx {
+                        park: Some(&mut parked),
+                    }),
+                    under.as_ref(),
+                    false,
+                )
+                .map(|ran| {
+                    let vals = ran.done();
+                    for (slot, v) in io.iter_mut().zip(&vals) {
+                        *slot = val_to_slot(*v);
+                    }
+                    vals.len()
+                });
+            }
             // The bounce may have grown the window or moved its page map, which the emitted code
             // reads again after it.
             match mem.as_ref() {

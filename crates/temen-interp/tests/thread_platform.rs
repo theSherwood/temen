@@ -886,7 +886,22 @@ block 0 (vsp: i64, varg: i64) {
 /// Run [`spawn_and_join`] under `platform`, granting it `child` (its program) and a budget of `mem`
 /// bytes.
 fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<Value>, Trap> {
-    let m = module(&spawn_and_join());
+    run_detached_root(&spawn_and_join(), platform, mem, child)
+}
+
+/// Run the root `root`, given `(instantiator, child module, budget)`, under `platform`, granting
+/// it `child` (its program) and a budget of `mem` bytes. The root's window is flat, as executor 2's
+/// is in a browser: a tier-up over a window without a flat span runs interpreted (#1414 B6-3a), and
+/// the driver's own reservation is flat only where it is an `mmap`.
+fn run_detached_root(
+    root: &str,
+    platform: ThreadPlatform,
+    mem: i64,
+    child: &str,
+) -> Result<Vec<Value>, Trap> {
+    let m = module(root);
+    let size = 1 << m.memory.expect("the root has a window").size_log2;
+    let back = Region::owned_zeroed(size, temen_interp::host_page_size()).expect("a flat window");
     let mut host = Host::new();
     host.set_thread_platform(platform);
     let inst = host.grant_instantiator();
@@ -904,7 +919,7 @@ fn run_detached(platform: ThreadPlatform, mem: i64, child: &str) -> Result<Vec<V
         &args,
         &mut fuel,
         &[],
-        None,
+        Some(Arc::new(back)),
         &mut host,
     )
     .expect("the parallel driver runs the module")
@@ -1151,5 +1166,333 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
         (fake_word(id, 16384 + 8 * 7), fake_word(id, 16384 + 8 * 35)),
         (7, 35),
         "both calls stored into the child's memory"
+    );
+}
+
+// ----- a scheduler op in a tier-up's bounce (#2443) -------------------------------------------
+
+/// The root calls function 1, which spawns three threads of function 2, joins them, and returns the
+/// cell at 16384 that each thread adds 1 to.
+const SPAWN_IN_A_CALL: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vr = call 1 ()
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  t0 = thread.spawn 2 vz vz
+  t1 = thread.spawn 2 vz vz
+  t2 = thread.spawn 2 vz vz
+  j0 = thread.join t0
+  j1 = thread.join t1
+  j2 = thread.join t2
+  va = i64.const 16384
+  vr = i64.atomic.load va
+  return vr
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  va = i64.const 16384
+  v1 = i64.const 1
+  vo = i64.atomic.rmw.add va v1
+  return vo
+  }
+}
+";
+
+static SPAWNERS: AtomicUsize = AtomicUsize::new(0);
+
+fn spawner_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    SPAWNERS.fetch_add(1, Ordering::SeqCst);
+    bounce_whole_call(call)
+}
+
+/// #2443 — a tier-up whose bounce spawns and joins threads. Each spawn and join stops the task from
+/// inside the bounce, as the same op stops it interpreted, and the call runs on to its end.
+#[test]
+fn a_bounce_spawns_and_joins_threads() {
+    let m = module(SPAWN_IN_A_CALL);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(3)]));
+    let spawner = tier(Arc::from([false, true, false]), spawner_bounce);
+    assert_eq!(run_over(&m, spawner, flat_window()), interpreted);
+    assert_eq!(
+        SPAWNERS.load(Ordering::SeqCst),
+        1,
+        "the root's call to the spawner ran emitted"
+    );
+}
+
+/// The root spawns a thread of function 2, calls function 1, which waits until the word at 16384 is
+/// set and returns it, and joins the thread. The thread sets the word to 5 and wakes a waiter.
+const SIGNAL_ACROSS_BOUNCES: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  t = thread.spawn 2 vz vz
+  vr = call 1 ()
+  j = thread.join t
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  br 1()
+}
+block 1 () {
+  va = i64.const 16384
+  vv = i32.atomic.load va
+  vz = i32.const 0
+  vset = i32.ne vv vz
+  br_if vset 2(vv) 3()
+}
+block 2 (vr: i32) {
+  vr64 = i64.extend_i32_s vr
+  return vr64
+}
+block 3 () {
+  va2 = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait va2 vexp vto
+  br 1()
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  va = i64.const 16384
+  v5 = i32.const 5
+  i32.atomic.store va v5
+  vcnt = i32.const 1
+  vw = atomic.notify va vcnt
+  vz = i64.const 0
+  return vz
+  }
+}
+";
+
+static SIGNALS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn recording_signals(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { func, .. } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    SIGNALS.lock().unwrap().push(func);
+    bounce_whole_call(call)
+}
+
+/// #2443 — a wait in one task's bounce, woken by a notify in another's: the waiter's task parks from
+/// inside its bounce, and the notifier's bounce wakes it, as the interpreted ops do.
+#[test]
+fn a_wait_in_a_bounce_is_woken_by_a_notify_in_another() {
+    let m = module(SIGNAL_ACROSS_BOUNCES);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(5)]));
+    let both = tier(Arc::from([false, true, true]), recording_signals);
+    assert_eq!(run_over(&m, both, flat_window()), interpreted);
+    let mut ran = SIGNALS.lock().unwrap().clone();
+    ran.sort();
+    assert_eq!(
+        ran,
+        [1, 2],
+        "the waiter's call and the notifier's entry ran emitted"
+    );
+}
+
+/// [`spawn_and_join`], its spawn and join in function 1, which the root calls with its arguments.
+fn spawn_and_join_in_a_call() -> String {
+    spawn_and_join().replacen(
+        "memory 17\n",
+        "memory 17
+func (i32, i32, i64) -> (i64) {
+block 0 (vinst: i32, vmod: i32, vbud: i64) {
+  vr = call 1 (vinst, vmod, vbud)
+  return vr
+  }
+}
+",
+        1,
+    )
+}
+
+static CHILD_BOUNCES: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+
+fn recording_child_bounces(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { module, func } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    CHILD_BOUNCES.lock().unwrap().push((module, func));
+    bounce_whole_call(call)
+}
+
+/// #2443 — a tier-up whose bounce spawns a detached child and joins it, the child's entry running
+/// emitted too and spawning and joining a thread of its own: each op stops its task from inside its
+/// bounce.
+#[test]
+fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
+    let platform = ThreadPlatform {
+        tier: Some(ThreadTier {
+            eligible: Arc::from([false, true]),
+            page_checked: false,
+            spill: 0,
+            modules: Some(Arc::new(|_: &ModuleOffer| {
+                Some(ProgramEmit {
+                    eligible: Arc::from([true, false]),
+                    page_checked: false,
+                })
+            })),
+            run: recording_child_bounces,
+        }),
+        child_window: Some(fake_child_window),
+        ..ThreadPlatform::OS
+    };
+    let root = spawn_and_join_in_a_call();
+    let interpreted = run_detached_root(&root, ThreadPlatform::OS, 1 << 20, CHILD_AND_THREAD);
+    assert_eq!(interpreted, Ok(vec![Value::I64(42)]), "the oracle's 7 + 35");
+    assert_eq!(
+        run_detached_root(&root, platform, 1 << 20, CHILD_AND_THREAD),
+        interpreted
+    );
+    let mut ran = CHILD_BOUNCES.lock().unwrap().clone();
+    ran.sort();
+    assert_eq!(
+        ran,
+        [(0, 1), (1, 0)],
+        "the root's spawner and the child's entry ran emitted; the child's thread interpreted"
+    );
+}
+
+/// The root spawns a thread of function 1, waits until the thread has set the word at 16392, and
+/// returns 42 without joining it. The thread sets that word, wakes the root, and waits forever on
+/// the word at 16384, which nobody sets.
+const ROOT_LEAVES_A_WAITER: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  t = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  vb = i64.const 16392
+  vv = i32.atomic.load vb
+  vzero = i32.const 0
+  vset = i32.ne vv vzero
+  br_if vset 2() 3()
+}
+block 2 () {
+  v42 = i64.const 42
+  return v42
+}
+block 3 () {
+  vb2 = i64.const 16392
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait vb2 vexp vto
+  br 1()
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vb = i64.const 16392
+  v1 = i32.const 1
+  i32.atomic.store vb v1
+  vcnt = i32.const 1
+  vw = atomic.notify vb vcnt
+  va = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait va vexp vto
+  vr = i64.extend_i32_s vst
+  return vr
+  }
+}
+";
+
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+fn waiter_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    WAITERS.fetch_add(1, Ordering::SeqCst);
+    bounce_whole_call(call)
+}
+
+/// #2443 — the run ends while a task waits in its bounce: the task's thread wakes, its bounce traps
+/// so the emitted frames unwind, and the run returns its root's result rather than waiting for it.
+#[test]
+fn the_runs_end_unwinds_a_task_waiting_in_a_bounce() {
+    let m = module(ROOT_LEAVES_A_WAITER);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(42)]));
+    let waiter = tier(Arc::from([false, true]), waiter_bounce);
+    assert_eq!(run_over(&m, waiter, flat_window()), interpreted);
+    assert_eq!(
+        WAITERS.load(Ordering::SeqCst),
+        1,
+        "the waiter's entry ran emitted"
+    );
+}
+
+/// The root calls function 1, which waits forever on a word nobody sets.
+const WAIT_FOREVER_IN_A_CALL: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vr = call 1 ()
+  return vr
+  }
+}
+func () -> (i64) {
+block 0 () {
+  va = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const -1
+  vst = i32.atomic.wait va vexp vto
+  vr = i64.extend_i32_s vst
+  return vr
+  }
+}
+";
+
+/// #2443 — a task that waits in its bounce on what nothing can wake is part of the run's deadlock,
+/// as an interpreted waiter is: the run ends with the deadlock's verdict.
+#[test]
+fn a_wait_in_a_bounce_that_nothing_wakes_is_a_deadlock() {
+    let m = module(WAIT_FOREVER_IN_A_CALL);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Err(Trap::ThreadFault));
+    let waiter = tier(Arc::from([false, true]), bounce_whole_call);
+    assert_eq!(run_over(&m, waiter, flat_window()), interpreted);
+}
+
+/// The shared fork-join (the browser corpus runs it too, on real emitted code): the root calls
+/// function 1, which spawns four threads of function 2, sums `1000..1` itself, waits until a thread
+/// has set the word at 16384 and woken it, joins the four, and adds what each returned, its sum of
+/// `500..1`: 500500 + 4 × 125250.
+const FORK_JOIN_IN_A_CALL: &str = include_str!("fixtures/fork_join_in_a_call.temt");
+
+static FORK_JOINS: AtomicUsize = AtomicUsize::new(0);
+
+fn fork_join_bounce(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    FORK_JOINS.fetch_add(1, Ordering::SeqCst);
+    bounce_whole_call(call)
+}
+
+/// #2443 — the fork-join with its spawner and its threads' entries on the emitted tier: the
+/// spawner's spawns, wait and joins and each thread's notify stop their tasks from inside bounces,
+/// and the run matches the interpreted one. Nothing it emits uses an atomic: the emitter keeps
+/// those off the tier in a module with threads (#2468).
+#[test]
+fn a_fork_join_runs_with_its_spawner_and_threads_emitted() {
+    let m = module(FORK_JOIN_IN_A_CALL);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(1_001_500)]));
+    let emitted = tier(Arc::from([false, true, true]), fork_join_bounce);
+    assert_eq!(run_over(&m, emitted, flat_window()), interpreted);
+    assert_eq!(
+        FORK_JOINS.load(Ordering::SeqCst),
+        5,
+        "the root's call to the spawner and the four threads' entries ran emitted"
     );
 }

@@ -26,7 +26,12 @@ fn main() {
                     && f.params.len().max(f.results.len()) <= max_slots
             });
             let r = if all_shimmable {
-                temen_wasm_jit::compile_module_tierup_b2(&em, false, 10, false)
+                temen_wasm_jit::compile_module_tierup_b2(
+                    &em,
+                    false,
+                    10,
+                    temen_wasm_jit::BounceHost::default(),
+                )
             } else {
                 temen_wasm_jit::compile_module_tierup(&em, false)
             };

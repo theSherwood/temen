@@ -23,7 +23,7 @@ use std::sync::Arc;
 use temen_interp::bytecode::{CoopEvent, CoopRun, ProgramEmit, TierUpConfig};
 use temen_interp::{bytecode, host_page_size, Host, Region, Trap, Value};
 use temen_wasm_jit::{
-    compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged,
+    compile_module_tierup, compile_module_tierup_b2_paged, compile_module_tierup_paged, BounceHost,
     ENV_FAULT_OFF, TRAP_MEMORY_FAULT, TRAP_OUT_OF_FUEL,
 };
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
@@ -863,8 +863,8 @@ block 0 (v0: i64) {
 "#,
     );
     assert!(m.data.iter().any(|d| d.readonly), "guest carries rodata");
-    let (wasm, emit) =
-        compile_module_tierup_b2_paged(&m, false, 10, 16, false).expect("emit b2+paged");
+    let (wasm, emit) = compile_module_tierup_b2_paged(&m, false, 10, 16, BounceHost::default())
+        .expect("emit b2+paged");
     assert!(emit.iter().any(|&e| e), "some function tiers up");
 
     let engine = Engine::default();
