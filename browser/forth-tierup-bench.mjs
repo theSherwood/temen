@@ -90,7 +90,7 @@ const u8 = () => new Uint8Array(memory.buffer);
 const enc = new TextEncoder();
 const guest = readFileSync(asset);
 
-ex.temen_coop_set_tierup_floor(0);
+ex.temen_coop_set_hotness(0, 0, 0);
 
 // Validity check: the "coop" column is only meaningful if that run genuinely took the cooperative
 // path AND the emitted tier actually drove it. A silent fall-back inside `runJitModule` would make

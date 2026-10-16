@@ -130,9 +130,9 @@ const exCounted = Object.fromEntries(
     return [k, v];
   }));
 
-// `process` is small; pin the floor at 0 so the kernel's outer loop is admitted (the native pin runs
-// under the same floor), and say so rather than inheriting a default.
-ex.temen_coop_set_tierup_floor(0);
+// Tier up every eligible call at its start (#2474), so the kernel's outer loop is admitted (the
+// native pin runs under the same rule), and say so rather than inheriting a default.
+ex.temen_coop_set_hotness(0, 0, 0);
 
 const fail = (msg) => { console.error(`FAIL: ${msg}`); process.exitCode = 1; };
 

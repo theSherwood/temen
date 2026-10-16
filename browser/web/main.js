@@ -57,12 +57,12 @@ async function main() {
   // forever. So the run after one takes a fresh engine (`loadEngine(prev)`: a new memory over the
   // compiled module). Not every run: each engine's memory holds a large address-space reservation
   // until the page collects it, and a page of quick runs runs out of them. A run returns its engine,
-  // for reading its output back. `tierupFloor` sets the tier-up size floor (#1026), which is the
-  // engine's, so a run that sets it takes an engine of its own.
+  // for reading its output back. `hotness` sets when calls tier up (#2474), which is the engine's,
+  // so a run that sets it takes an engine of its own.
   let cur = eng;
-  const run = async (guest, { tierupFloor, ...opts } = {}) => {
-    const own = tierupFloor === undefined ? cur : await loadEngine(eng);
-    if (tierupFloor !== undefined) own.ex.temen_coop_set_tierup_floor(tierupFloor);
+  const run = async (guest, { hotness, ...opts } = {}) => {
+    const own = hotness === undefined ? cur : await loadEngine(eng);
+    if (hotness !== undefined) own.ex.temen_coop_set_hotness(...hotness);
     let returned = false;
     try {
       const r = await makeRunner(own)(guest, opts);
@@ -80,10 +80,10 @@ async function main() {
     }
     return run(await fetchBytes(guestPath), o);
   };
-  // The emitted tier: each thread runs its task's regions on its Worker. The guests' leaves and
-  // entries are small, so the tier-up size floor (#1026) is lowered on these runs' engines, as coop's
-  // own tests do.
-  const emit = { tierup: true, tierupFloor: 0 };
+  // The emitted tier: each thread runs its task's regions on its Worker. The guests' calls are
+  // short, so these runs' engines tier up every eligible call at its start (#2474), as coop's own
+  // tests do.
+  const emit = { tierup: true, hotness: [0, 0, 0] };
 
   // --- 2) one guest's threads across real Web Workers (executor 2, #1414 B6) ----------------------
   // The run is one in-Rust call on the root's Worker, and each of its threads a Worker the page

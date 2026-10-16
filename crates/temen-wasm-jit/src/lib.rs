@@ -1082,6 +1082,12 @@ fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
     if !atomics_ok && func_uses_atomics(f) {
         return false;
     }
+    // The JS API's limits on a wasm signature, which the emitted one meets with `win` and `env`
+    // ahead of the params: past them the module compiles nowhere. (#2474: an OSR entry takes a
+    // slot per param of its widest loop entry.)
+    if f.params.len() + 2 > 1000 || f.results.len() > 1000 {
+        return false;
+    }
     f.blocks.iter().all(|b| {
         block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
@@ -1271,18 +1277,6 @@ pub fn module_uses_addr_space_page_ops(m: &Module) -> bool {
 /// bulk-memory body (~7.75 MB) rejoins the subset under #1004 — kept on the interpreter here.
 const MAX_EST_EMITTED_FN_BYTES: usize = 6_500_000;
 
-/// #1026 slice 4 — the **lower** companion to [`MAX_EST_EMITTED_FN_BYTES`], for the *tier-up*
-/// eligibility decision only (not the emit subset). A leaf whose estimated emitted body is below
-/// this floor is not worth **tiering up** in the interpreter-drives-emitted-leaves model: the fixed
-/// interp↔wasm crossing per call (marshal argv, call the export, deliver results — measured ~2 µs on
-/// tcl's dispatch leaves, #1026) exceeds what so small an emitted body saves over interpreting it
-/// inline. The cooperative fallback driver (`temen_coop_open`, which consults [`est_emitted_size`]
-/// against this) keeps such leaves on the interpreter; a genuinely heavy leaf
-/// (real work per call) clears the floor and still tiers up. Whole-program emit is unaffected — it
-/// runs the whole module as one emitted unit, with no per-leaf crossing to amortize — as is the
-/// `Jit.invoke` unit path (a separate mechanism). Calibrated with `browser/bench_tierup_cards.mjs`.
-pub const MIN_TIERUP_EMITTED_FN_BYTES: usize = 4_096;
-
 /// A conservative upper-bound estimate of `f`'s emitted wasm body size. Memory ops carry the fat
 /// confine + NULL-guard sequence; every block is a `br_table` dispatch target whose edges shuffle
 /// the target block's params ([`emit_edge`]). Calibrated to over-estimate on the shipped cards
@@ -1373,6 +1367,20 @@ static MAX_EST_EMITTED_FN_BYTES_OVERRIDE: core::sync::atomic::AtomicUsize =
 /// headroom over the largest known-good emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
 /// decline/degrade only routes more code to the interpreter oracle, never an escape.
 const MAX_EST_EMITTED_MODULE_BYTES: usize = 104 << 20;
+
+/// #2474 — append `m`'s OSR entries ([`temen_ir::append_osr_entries`]) for a tier-up emit, where a
+/// call that has run long goes on emitted mid-call. All of them, or none when the module with them
+/// would estimate past [`MAX_EST_EMITTED_MODULE_BYTES`]: the degrade loop would otherwise drop
+/// functions of the guest's own to make room for copies of them. Returns whether it appended them.
+pub fn with_osr_entries(m: &mut Module) -> bool {
+    let n = m.funcs.len();
+    temen_ir::append_osr_entries(m);
+    let fits = m.funcs.iter().map(est_emitted_size).sum::<usize>() <= MAX_EST_EMITTED_MODULE_BYTES;
+    if !fits {
+        m.funcs.truncate(n);
+    }
+    fits
+}
 
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).
