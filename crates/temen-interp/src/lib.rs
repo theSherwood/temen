@@ -34110,11 +34110,23 @@ impl Mem {
     /// [`confine_checked`]), clearing it: the access's first byte in the page that refused it, the
     /// page to supply (#2469). `None` if the last `MemoryFault` was an out-of-window fault (a real
     /// trap), not a recoverable page fault.
+    ///
+    /// #2164 — `None` too when the refused page is not one a pager supplies: one at or past the
+    /// declared window, whose tail is the guest's growth room ([`Mem::demand_page`]), or a §13 alias,
+    /// whose bytes are its region's. Every engine's pager supplies only the window's own declared
+    /// pages, so a fault on any other is fatal, as it is in a window with no pager.
     fn take_fault(&self) -> Option<u64> {
-        match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
-            NO_FAULT => None,
-            _ => Some(self.refused_at.load(Ordering::Relaxed)),
+        if self.last_fault.swap(NO_FAULT, Ordering::Relaxed) == NO_FAULT {
+            return None;
         }
+        let at = self.refused_at.load(Ordering::Relaxed);
+        let page = at / self.page;
+        let own = page * self.page < self.window.mapped()
+            && !matches!(
+                self.space_read().prot.get(&page),
+                Some(PageProt::Backed { .. })
+            );
+        own.then_some(at)
     }
 
     /// The guest address of the run's last **fatal** memory fault (a NULL deref reads back as `0`), for

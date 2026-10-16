@@ -1116,6 +1116,56 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
     }
 }
 
+/// #2164 — a paged child's access past its declared window is fatal, on every driver: the tail
+/// `[mapped, reserved)` is the child's growth room (`vm_map`), never its pager's to supply. The child
+/// loads at 140000, past its 2^17-byte window, on a page no `vm_map` committed. The interpreters
+/// asked the pager for it and sized its page as `mapped - page`, which underflows there.
+#[test]
+fn a_paged_childs_access_past_its_window_is_fatal() {
+    let src = detached_pager_program_at(140_000);
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for b in DRIVERS {
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            faulted,
+            "{b:?}: the tail is not the pager's"
+        );
+    }
+}
+
+/// #2164 — a store to a read-only §13 alias in a paged child is fatal, on every driver: the page is
+/// its region's, never its pager's to supply. The child mints a region, maps it read-only over a page
+/// of its window, and stores into it. The interpreters asked the pager for that page, copied the reply
+/// into the region, and then made the page the window's own again, over bytes nobody supplied.
+#[test]
+fn a_paged_childs_store_to_a_read_only_alias_is_fatal() {
+    let src = detached_pager_program_at(32768)
+        .replace(
+            "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
+            "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
+        )
+        .replace(
+            "  vb = i32.load8_u va\n",
+            "  vas = i32.wrap_i64 vas64\n  vlen = i64.const 16384\n  \
+             vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)\n  vr = i32.wrap_i64 vrh\n  \
+             vz = i64.const 0\n  vro = i64.const 1\n  \
+             vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (va, vz, vlen, vro)\n  \
+             vnine = i32.const 9\n  i32.store8 va vnine\n  vb = i32.load8_u va\n",
+        );
+    assert!(
+        src.contains("(v0: i64, vas64: i64)") && src.contains("i32.store8 va vnine"),
+        "the rewrites must apply"
+    );
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for b in DRIVERS {
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            faulted,
+            "{b:?}: an alias is not the pager's"
+        );
+    }
+}
+
 /// Owner, 2026-09-29: `Budget.mem` accounts **live** windows — a detached child's window goes back to
 /// the budget that paid for it when the child ends. With a budget of exactly one window (2^17), the
 /// program spawns its child, joins, and spawns it again: both run (`142 + 142`). Before, the first
