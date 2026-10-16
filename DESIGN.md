@@ -1944,7 +1944,9 @@ first answer to come, lowest index first among those in: with two threads waitin
 first is the world's order, where lowest index first held a thread behind a call that might never
 answer, or wait on that thread. On the JIT a detached child is a task: one
 parked on an answer is not counted blocked (`ParkOn::Outside`, as an OS vCPU in `wait_outside` is
-not), and the answer re-offers it (`outside_waker`). A domain that has punted still forks: the offload
+not), and the answer re-offers it (`outside_waker`). Nor is a `cont.resume.block` of a fiber parked
+on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as deadlocked once the
+answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
 pool's jobs never touch the window and answer into their own domain's store.
 
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is

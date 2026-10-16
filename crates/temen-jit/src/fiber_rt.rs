@@ -1524,6 +1524,18 @@ pub(crate) unsafe fn park_cell(handle: i64) -> Option<Arc<crate::os_thread_rt::W
         })
 }
 
+/// #2424 — whether `handle`'s fiber is event-parked on an answer from outside the run
+/// ([`ParkOn::Outside`]): what it waits for may come although no vCPU of the run is live.
+///
+/// # Safety
+/// As [`park_deadline`].
+pub(crate) unsafe fn parked_outside(handle: i64) -> bool {
+    let rt = &*current();
+    rt.table
+        .resolve(handle)
+        .is_some_and(|(_, slot)| matches!(slot.parked_on(), ParkOn::Outside))
+}
+
 /// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?
 pub(crate) fn in_task() -> bool {
     let rt = current();

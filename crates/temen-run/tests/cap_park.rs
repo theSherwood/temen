@@ -15,7 +15,11 @@
 //! **A child waits** while its root ticks (#2424): the spawn grants it `wait` through the
 //! procedure's fork factory, and its call parks the child alone. The root first waits, in `wait`'s
 //! op 1, until the child's wait has begun, so the ticks always find it parked. Two children waiting
-//! at once each get their answer when it comes: one's never waits behind the other's call.
+//! at once each get their answer when it comes: one's never waits behind the other's call. A child
+//! may wait from a fiber of its own, resuming it, blocking, until it returns.
+//!
+//! And a root that resumes a fiber, blocking, through a slow answer is not deadlocked: the answer
+//! comes from outside the run, though nothing in the run is live meanwhile.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,6 +42,10 @@ const TICKS: u64 = 5;
 /// How long a wait waits before it gives up and returns `-1`: long enough for a loaded CI runner
 /// to schedule the ticker, and only spent when an engine stalls it.
 const GIVE_UP: Duration = Duration::from_secs(10);
+
+/// How long `wait`'s op 2 takes to answer: longer than the JIT's two 20 ms deadlock re-checks, so a
+/// resumer that counted itself blocked on it would read the run as deadlocked.
+const SLOW: Duration = Duration::from_millis(100);
 
 /// The ticks so far and the waits begun, and the bell both ring.
 #[derive(Default)]
@@ -193,12 +201,47 @@ func (i64, i64) -> (i64) {{
 
 /// The two children a waiting-child root spawns (#2424): func 1 waits for `2 * TICKS` ticks; func
 /// 2 waits for `TICKS` and then ticks `TICKS` times itself. Each finds `wait` and `tick` by name.
-fn waiting_children() -> String {
+/// With `in_fiber`, func 2 makes its wait from a fiber of its own (func 3), which it resumes until
+/// the fiber returns: the fiber parks, and the child with it only while it resumes the fiber.
+fn waiting_children(in_fiber: bool) -> String {
     let resolve = |name_at: u64, v: &str| {
         format!(
             "  {v}p = i64.const {name_at}\n  {v}l = i64.const 4\n  {v} = self.resolve {v}p {v}l\n"
         )
     };
+    let (wait, tick) = (resolve(17710, "vh"), resolve(17700, "vt"));
+    // Func 2's wait, which leaves its answer in `vw`, and the block its ticks start in.
+    let (func2_wait, ticks_at) = if in_fiber {
+        (
+            format!(
+                "{wait}  vf = ref.func 3
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vh
+  br 1(vk, vh64)
+}}
+block 1 (vk1: i64, varg: i64) {{
+  vs, vv = cont.resume.block vk1 varg
+  vthree = i32.const 3
+  vparked = i32.eq vs vthree
+  br_if vparked 1(vk1, varg) 2(vv)
+}}
+block 2 (vw: i64) {{
+"
+            ),
+            3,
+        )
+    } else {
+        (
+            format!(
+                "{wait}  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+"
+            ),
+            1,
+        )
+    };
+    let done_at = ticks_at + 1;
     format!(
         "func (i64) -> (i64) {{
 block 0 (v0: i64) {{
@@ -209,26 +252,30 @@ block 0 (v0: i64) {{
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-{wait}  vwant = i64.const {TICKS}
-  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
-{tick}  vn = i64.const {TICKS}
-  br 1(vt, vw, vn)
+{func2_wait}{tick}  vn = i64.const {TICKS}
+  br {ticks_at}(vt, vw, vn)
 }}
-block 1 (vt1: i32, vw1: i64, vleft: i64) {{
+block {ticks_at} (vt1: i32, vw1: i64, vleft: i64) {{
   vz = i64.const 0
   vtk = call.cap 13 0 (i64) -> (i64) vt1 (vz)
   vdec = i64.const 1
   vleft2 = i64.sub vleft vdec
   vmore = i64.ne vleft2 vz
-  br_if vmore 1(vt1, vw1, vleft2) 2(vw1)
+  br_if vmore {ticks_at}(vt1, vw1, vleft2) {done_at}(vw1)
 }}
-block 2 (vw2: i64) {{
+block {done_at} (vw2: i64) {{
   return vw2
 }}
 }}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+  return vw
+}}
+}}
 ",
-        wait = resolve(17710, "vh"),
-        tick = resolve(17700, "vt"),
         double = 2 * TICKS,
     )
 }
@@ -239,7 +286,7 @@ block 2 (vw2: i64) {{
 /// With two, it first spawns func 1, waiting until its wait has begun too: func 1's wait ends only
 /// if func 2's answer reaches func 2 while func 1 still waits, as only func 2's own ticks come
 /// after. A wait the root did not see begin costs 1000.
-fn child_waits_src(children: u64, paced: bool) -> String {
+fn child_waits_src(children: u64, paced: bool, in_fiber: bool) -> String {
     let grants = format!(
         "{}{}",
         rec::grant("gw", 17600, 17710, 4, "vwait"),
@@ -327,7 +374,7 @@ func (i32, i32, i32, i32, i32, i32) -> (i64) {{
 {root}
 }}
 {children}{first}{second}",
-        children = waiting_children(),
+        children = waiting_children(in_fiber),
         first = rec(17408),
         second = rec(17504),
     )
@@ -345,15 +392,19 @@ fn tick_proc(ticks: &Arc<Ticks>) -> temen_interp::HostProc {
     Box::new(move |_op, _args, _mem, _minter| Ok(vec![t.tick()]))
 }
 
-/// `wait`: op 0 `wait(n)` punts a wait for `n` ticks to the offload pool, and op 1 `started(k)` a
-/// wait for `k` waits to have begun. Forkable over the same ticks, so a spawn can grant it to a
-/// child (#2424).
+/// `wait`: op 0 `wait(n)` punts a wait for `n` ticks to the offload pool, op 1 `started(k)` a wait
+/// for `k` waits to have begun, and op 2 a wait of [`SLOW`] that answers `n`. Forkable over the
+/// same ticks, so a spawn can grant it to a child (#2424).
 fn wait_proc(ticks: &Arc<Ticks>) -> OffloadHostProc {
     let t = Arc::clone(ticks);
     Box::new(move |op, args| {
         let (t, n) = (Arc::clone(&t), args.first().copied().unwrap_or(0) as u64);
         OffloadOutcome::Offload(Box::new(move || match op {
             1 => t.started(n),
+            2 => {
+                std::thread::sleep(SLOW);
+                n as i64
+            }
             _ => t.wait_for(n),
         }))
     })
@@ -457,10 +508,14 @@ fn check(ticker: Ticker, paced: bool, lanes: i64) {
     check_on_every_engine(&what, &m, &[1], TICKS as i64, paced, lanes);
 }
 
-/// `children` children waiting while their root ticks (#2424).
-fn check_children(children: u64, paced: bool, lanes: i64) {
-    let what = format!("{children} waiting child(ren)");
-    let m = module_of(&child_waits_src(children, paced));
+/// `children` children waiting while their root ticks (#2424), the last from a fiber of its own
+/// when `in_fiber`.
+fn check_children(children: u64, in_fiber: bool, paced: bool, lanes: i64) {
+    let what = format!(
+        "{children} waiting child(ren){}",
+        if in_fiber { ", in a fiber" } else { "" }
+    );
+    let m = module_of(&child_waits_src(children, paced, in_fiber));
     check_on_every_engine(&what, &m, &[1, 2], (children * TICKS) as i64, paced, lanes);
 }
 
@@ -496,22 +551,65 @@ fn a_root_waiting_on_the_host_gives_its_lane_to_its_thread() {
 
 #[test]
 fn a_child_waiting_on_the_host_lets_its_root_run() {
-    check_children(1, false, -1);
+    check_children(1, false, false, -1);
 }
 
 #[test]
 fn a_child_waiting_on_the_host_lets_its_roots_timer_fire() {
-    check_children(1, true, -1);
+    check_children(1, false, true, -1);
 }
 
 #[test]
 fn a_child_waiting_on_the_host_gives_its_lane_to_its_root() {
-    check_children(1, false, 1);
+    check_children(1, false, false, 1);
 }
 
 #[test]
 fn a_childs_answer_waits_for_no_other_childs_call() {
-    check_children(2, false, -1);
+    check_children(2, false, false, -1);
+}
+
+/// The child's call is made from a fiber of the child's: the fiber parks in the child's registry,
+/// and its answer comes through the child's store.
+#[test]
+fn a_childs_fiber_waiting_on_the_host_lets_its_root_run() {
+    check_children(1, true, false, -1);
+}
+
+/// A root resumes a fiber of its own, blocking, until the fiber's slow host call answers: the
+/// resumer waits on the world through its fiber, and nothing else in the run is live. The JIT
+/// counted it blocked and, the run then reading as deadlocked, trapped `ThreadFault`.
+#[test]
+fn a_root_resuming_its_fiber_through_a_slow_answer_is_not_deadlocked() {
+    let m = module_of(
+        "func (i32, i32, i32, i32) -> (i64) {
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {
+  vf = ref.func 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vwait
+  br 1(vk, vh64)
+}
+block 1 (vk1: i64, varg: i64) {
+  vs, vv = cont.resume.block vk1 varg
+  vthree = i32.const 3
+  vparked = i32.eq vs vthree
+  br_if vparked 1(vk1, varg) 2(vv)
+}
+block 2 (vr: i64) {
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vn = i64.const 7
+  vr = call.cap 13 2 (i64) -> (i64) vh (vn)
+  return vr
+}
+}",
+    );
+    check_on_every_engine("a root resuming its slow fiber", &m, &[], 7, false, -1);
 }
 
 /// A JIT root killed while it waits on a host call that will not answer: the watchdog sets the

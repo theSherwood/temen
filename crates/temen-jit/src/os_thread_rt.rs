@@ -2853,19 +2853,23 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         if *status_out != FIBER_PARKED_STATUS || load_trap(trap_out as *mut i64) != 0 {
             return value;
         }
+        // #2424 — a fiber waiting on an answer from outside the run may be woken although no vCPU
+        // of the run is live, so its resumer idling on it is not blocked either.
+        let outside = fiber_rt::parked_outside(handle);
         // #1469 — inside a child-domain task the thread that would idle is an executor worker, not
         // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
-        // keeps. So the task root parks the *task* on the one event park (counted, woken by every
-        // notify, poisoned at teardown) and re-polls when woken. A guest fiber inside the task
-        // fails closed rather than block a worker.
+        // keeps. So the task root parks the *task* on the one event park (counted, unless the
+        // fiber waits on the outside, woken by every notify, poisoned at teardown) and re-polls
+        // when woken. A guest fiber inside the task fails closed rather than block a worker.
         if fiber_rt::in_task() {
             match fiber_rt::current_fiber_slot() {
                 Some(s) if s.is_platform() => {
-                    fiber_rt::fiber_event_park(
-                        &s,
-                        fiber_rt::park_deadline(handle),
-                        fiber_rt::ParkOn::Event,
-                    );
+                    let on = if outside {
+                        fiber_rt::ParkOn::Outside
+                    } else {
+                        fiber_rt::ParkOn::Event
+                    };
+                    fiber_rt::fiber_event_park(&s, fiber_rt::park_deadline(handle), on);
                     continue;
                 }
                 _ => {
@@ -2896,7 +2900,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // counting it let a *sibling*'s indefinite wait read `live == parked` and trap a
                 // correct program. Same rule as the OS park (#1625) and the task park, asked of the
                 // one park this vCPU is actually waiting on.
-                let self_resolving = fiber_rt::park_deadline(handle).is_some();
+                let self_resolving = fiber_rt::park_deadline(handle).is_some() || outside;
                 let cell = fiber_rt::park_cell(handle);
                 let g = lock(&hub.futex);
                 // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
