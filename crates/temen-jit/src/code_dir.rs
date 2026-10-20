@@ -555,6 +555,36 @@ mod tests {
         assert_eq!(EmittedCode::decode(&bytes), None, "a byte past its end");
     }
 
+    #[test]
+    fn code_fits_only_a_link_that_binds_all_it_names() {
+        let module = crate::new_jit_module(crate::Imports::NONE).expect("a module");
+        let ids: Vec<FuncId> = (0..2).map(FuncId::from_u32).collect();
+        let bound = crate::Imports {
+            cap_thunk: crate::INERT_CAP_THUNK as *const u8,
+            ..crate::Imports::NONE
+        };
+        assert!(sample().fits(&module, &ids, &bound));
+        assert!(
+            !sample().fits(&module, &ids, &crate::Imports::NONE),
+            "no `call.cap` thunk is bound"
+        );
+        assert!(
+            !sample().fits(&module, &ids[..1], &bound),
+            "code of more functions than the module's"
+        );
+        for name in ["temen.nothing", "temen.fast_cap.3.8.1.1"] {
+            let mut code = sample();
+            code.funcs[0].relocs[0].target = Target::Import(name.into());
+            assert!(
+                !code.fits(&module, &ids, &bound),
+                "{name}, which nothing binds"
+            );
+        }
+        let mut code = sample();
+        code.funcs[0].relocs[2].target = Target::LibCall("Nothing".into());
+        assert!(!code.fits(&module, &ids, &bound), "no such libcall");
+    }
+
     #[cfg(unix)]
     #[test]
     fn code_is_read_back_only_under_its_key_for_its_build() {
