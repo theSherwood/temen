@@ -18,14 +18,28 @@
 //! at once each get their answer when it comes: one's never waits behind the other's call. A child
 //! may wait from a fiber of its own, resuming it, blocking, until it returns.
 //!
+//! Within a domain too, each answer comes as it arrives (#2477): a root's call answers while a
+//! thread of its domain still waits on an earlier one.
+//!
 //! And a root that resumes a fiber, blocking, through a slow answer is not deadlocked: the answer
 //! comes from outside the run, though nothing in the run is live meanwhile.
+//!
+//! **Nothing waits for a call whose caller is gone** (#2493): a root that kills a child waiting on
+//! the host joins it at once, and a run whose root returns over a fiber still waiting ends at once.
+//! The calls go on running, and their answers land where no one waits.
+//!
+//! **Every case runs twice** (#2495): with `wait` answered by the domain's offload pool, and with
+//! `wait` answered by the embedder, through each call's [`Completer`], from a thread of its own.
+//! A host-answered call parks and wakes exactly as a pool call does, on every engine and in every
+//! domain.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::{CapState, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome, Value};
+use temen_interp::{
+    CapState, Completer, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome, Value,
+};
 use temen_ir::{Module, SpawnRec};
 use temen_jit::{JitOutcome, TrapKind};
 
@@ -392,28 +406,49 @@ fn tick_proc(ticks: &Arc<Ticks>) -> temen_interp::HostProc {
     Box::new(move |_op, _args, _mem, _minter| Ok(vec![t.tick()]))
 }
 
-/// `wait`: op 0 `wait(n)` punts a wait for `n` ticks to the offload pool, op 1 `started(k)` a wait
-/// for `k` waits to have begun, and op 2 a wait of [`SLOW`] that answers `n`. Forkable over the
-/// same ticks, so a spawn can grant it to a child (#2424).
-fn wait_proc(ticks: &Arc<Ticks>) -> OffloadHostProc {
+/// Who answers a `wait` call (#2495).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answer {
+    /// The domain's offload pool ([`OffloadOutcome::Offload`]).
+    Pool,
+    /// The embedder, through the call's [`Completer`] ([`OffloadOutcome::Host`]), from a thread of
+    /// its own.
+    Host,
+}
+
+/// `wait`: op 0 `wait(n)` waits for `n` ticks, op 1 `started(k)` for `k` waits to have begun, and
+/// op 2 for [`SLOW`], answering `n`; answered by `answer`. Forkable over the same ticks, so a spawn
+/// can grant it to a child (#2424).
+fn wait_proc(ticks: &Arc<Ticks>, answer: Answer) -> OffloadHostProc {
     let t = Arc::clone(ticks);
     Box::new(move |op, args| {
         let (t, n) = (Arc::clone(&t), args.first().copied().unwrap_or(0) as u64);
-        OffloadOutcome::Offload(Box::new(move || match op {
+        let wait = move || match op {
             1 => t.started(n),
             2 => {
                 std::thread::sleep(SLOW);
                 n as i64
             }
             _ => t.wait_for(n),
-        }))
+        };
+        match answer {
+            Answer::Pool => OffloadOutcome::Offload(Box::new(wait)),
+            Answer::Host => OffloadOutcome::Host(Box::new(move |c: Completer| {
+                std::thread::spawn(move || c.complete(wait()));
+            })),
+        }
     })
 }
 
-/// The root's powerbox: an `Instantiator` over its window, `tick`, `wait`, an unbounded `Budget`
-/// and a child image of each of `kids`, on `lanes` lanes (`-1`: as many as it likes). Fresh ticks
-/// for each run.
-fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, Vec<Value>) + 'a {
+/// The root's powerbox: an `Instantiator` over its window, `tick`, `wait` answered by `answer`, an
+/// unbounded `Budget` and a child image of each of `kids`, on `lanes` lanes (`-1`: as many as it
+/// likes). Fresh ticks for each run.
+fn setup<'a>(
+    m: &'a Module,
+    lanes: i64,
+    kids: &'a [u32],
+    answer: Answer,
+) -> impl Fn() -> (Host, Vec<Value>) + 'a {
     move || {
         let ticks = Arc::new(Ticks::default());
         let mut h = Host::new();
@@ -427,10 +462,10 @@ fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, 
         );
         let forked = Arc::clone(&ticks);
         let wait = h.grant_host_proc_offloadable(
-            wait_proc(&ticks),
+            wait_proc(&ticks, answer),
             Some(Arc::new(move |_pid| {
                 Some(ForkedProc::offloadable(
-                    wait_proc(&forked),
+                    wait_proc(&forked, answer),
                     CapState::Stateless,
                 ))
             })),
@@ -449,8 +484,14 @@ fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, 
 }
 
 /// What the root returned on `driver`, or why there is nothing to compare.
-fn on_driver(driver: Driver, m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
-    let ran = run_on(driver, m, &setup(m, lanes, kids)).ok_or("declined the module")?;
+fn on_driver(
+    driver: Driver,
+    m: &Module,
+    lanes: i64,
+    kids: &[u32],
+    answer: Answer,
+) -> Result<i64, String> {
+    let ran = run_on(driver, m, &setup(m, lanes, kids, answer)).ok_or("declined the module")?;
     match ran.result {
         Ok(v) if v.len() == 1 => match v[0] {
             Value::I64(r) => Ok(r),
@@ -461,8 +502,8 @@ fn on_driver(driver: Driver, m: &Module, lanes: i64, kids: &[u32]) -> Result<i64
 }
 
 /// What the root returned on the Cranelift JIT.
-fn on_the_jit(m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
-    let (mut host, args) = setup(m, lanes, kids)();
+fn on_the_jit(m: &Module, lanes: i64, kids: &[u32], answer: Answer) -> Result<i64, String> {
+    let (mut host, args) = setup(m, lanes, kids, answer)();
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -479,8 +520,8 @@ fn on_the_jit(m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
     }
 }
 
-/// `m` on every engine, and each that returned anything but `want`. `paced` leaves out the `Vcpu`
-/// harness, which orchestrates no futex `Wait`.
+/// `m` on every engine, `wait` answered each way, and each that returned anything but `want`.
+/// `paced` leaves out the `Vcpu` harness, which orchestrates no futex `Wait`.
 fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced: bool, lanes: i64) {
     let mut wrong = Vec::new();
     let mut each = |engine: String, got: Result<i64, String>| {
@@ -488,18 +529,56 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
             wrong.push(format!("  {engine}: {got:?}"));
         }
     };
-    for driver in drivers::ALL {
-        if paced && driver == Driver::Vcpu {
-            continue;
+    for answer in [Answer::Pool, Answer::Host] {
+        for driver in drivers::ALL {
+            if paced && driver == Driver::Vcpu {
+                continue;
+            }
+            let got = on_driver(driver, m, lanes, kids, answer);
+            each(format!("{driver:?}, {answer:?}-answered"), got);
         }
-        each(format!("{driver:?}"), on_driver(driver, m, lanes, kids));
+        let got = on_the_jit(m, lanes, kids, answer);
+        each(format!("JIT, {answer:?}-answered"), got);
     }
-    each("JIT".into(), on_the_jit(m, lanes, kids));
     assert!(
         wrong.is_empty(),
         "{what}{}{}: want {want} on every engine, but\n{}",
         if paced { ", paced" } else { "" },
         if lanes == 1 { ", one lane" } else { "" },
+        wrong.join("\n")
+    );
+}
+
+/// `m` on each of `drivers` and the JIT, `wait` answered each way, each run ending as `want` says
+/// in under half of [`GIVE_UP`]: well before the call it left waiting could have answered. `want`
+/// is what the root returns, or the trap the run ends with.
+fn check_prompt(what: &str, m: &Module, kids: &[u32], want: Result<i64, &str>, drivers: &[Driver]) {
+    let mut wrong = Vec::new();
+    let mut each = |engine: String, run: &dyn Fn() -> Result<i64, String>| {
+        let started = Instant::now();
+        let got = run();
+        let took = started.elapsed();
+        let right = match (&got, want) {
+            (Ok(r), Ok(w)) => *r == w,
+            (Err(ended), Err(trap)) => ended.contains(trap),
+            _ => false,
+        };
+        if !right || took >= GIVE_UP / 2 {
+            wrong.push(format!("  {engine}: {got:?} after {took:?}"));
+        }
+    };
+    for answer in [Answer::Pool, Answer::Host] {
+        for &driver in drivers {
+            let engine = format!("{driver:?}, {answer:?}-answered");
+            each(engine, &|| on_driver(driver, m, -1, kids, answer));
+        }
+        each(format!("JIT, {answer:?}-answered"), &|| {
+            on_the_jit(m, -1, kids, answer)
+        });
+    }
+    assert!(
+        wrong.is_empty(),
+        "{what}: want {want:?} on every engine, before its call could answer, but\n{}",
         wrong.join("\n")
     );
 }
@@ -579,6 +658,59 @@ fn a_childs_fiber_waiting_on_the_host_lets_its_root_run() {
     check_children(1, true, false, -1);
 }
 
+/// A thread waits on the host; the root, in `wait`'s op 1, waits until that wait has begun, then
+/// makes a slow call of its own (op 2, answering 0 after [`SLOW`]), ticks the thread's ticks and
+/// joins it. The slow call is its domain's later one: the oracle delivered a domain's answers in
+/// the order of its calls, so the root's waited for the thread's, which waited for the root's
+/// ticks, until it gave up (#2477). A wait the root did not see begin costs 1000.
+#[test]
+fn a_later_answer_waits_for_no_earlier_call_of_its_domain() {
+    let m = module_of(&format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {{
+  vsp = i64.const 0
+  vwa = i64.extend_i32_u vwait
+  vth = thread.spawn 1 vsp vwa
+  vone = i64.const 1
+  vs = call.cap 13 1 (i64) -> (i64) vwait (vone)
+  vzero = i64.const 0
+  vq = call.cap 13 2 (i64) -> (i64) vwait (vzero)
+  vsq = i64.add vs vq
+  vn = i64.const {TICKS}
+  br 1(vtick, vth, vsq, vn)
+}}
+block 1 (vh: i32, vt: i32, vs1: i64, vleft: i64) {{
+  vz = i64.const 0
+  vtk = call.cap 13 0 (i64) -> (i64) vh (vz)
+  vdec = i64.const 1
+  vleft2 = i64.sub vleft vdec
+  vmore = i64.ne vleft2 vz
+  br_if vmore 1(vh, vt, vs1, vleft2) 2(vt, vs1)
+}}
+block 2 (vt2: i32, vs2: i64) {{
+  vj = thread.join vt2
+  vone2 = i64.const 1
+  vlate = i64.sub vs2 vone2
+  vk = i64.const 1000
+  vmiss = i64.mul vlate vk
+  vr = i64.add vj vmiss
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+  return vw
+}}
+}}"
+    ));
+    let what = "a root's call while its thread waits";
+    check_on_every_engine(what, &m, &[], TICKS as i64, false, -1);
+}
+
 /// A root resumes a fiber of its own, blocking, until the fiber's slow host call answers: the
 /// resumer waits on the world through its fiber, and nothing else in the run is live. The JIT
 /// counted it blocked and, the run then reading as deadlocked, trapped `ThreadFault`.
@@ -613,6 +745,139 @@ block 0 (vsp: i64, varg: i64) {
 }",
     );
     check_on_every_engine("a root resuming its slow fiber", &m, &[], 7, false, -1);
+}
+
+/// A root kills a child that waits on a host call nobody will answer, and joins it (#2493). The
+/// root first waits, in `wait`'s op 1, until the child's wait has begun, and returns what that
+/// returned. The child's teardown used to wait for its call, through its pool, so the join did too.
+/// On every driver that schedules its children (the `Vcpu` harness cannot kill one yet, #2083).
+#[test]
+fn a_killed_child_joins_while_its_call_still_waits() {
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let m = module_of(&format!(
+        "memory 17
+data 17710 \"wait\"
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32, vmod: i32) {{
+{grant}{prelude}  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vone = i64.const 1
+  vs = call.cap 13 1 (i64) -> (i64) vwait (vone)
+  vk = call.cap 6 12 (i32) -> (i32) vinst (vch)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return vs
+}}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 17710
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+  return vw
+}}
+}}
+{rec}",
+        grant = rec::grant("gw", 17600, 17710, 4, "vwait"),
+        prelude = spawn_prelude(17408, "vmod", ""),
+        rec = rec::segment(17408, &child),
+    ));
+    let what = "a killed child waiting on the host";
+    check_prompt(what, &m, &[1], Ok(1), &drivers::SCHEDULING);
+}
+
+/// A root returns over a fiber of its own still waiting on a host call nobody will answer
+/// (#2493): the run ends at once, with the resume's `FIBER_PARKED` (3). The run's end used to wait
+/// for the call. On every driver that parks the fiber alone: the debugger parks its thread, to keep
+/// its schedule its own (#2047), and the `Vcpu` harness waits inline (I45).
+#[test]
+fn a_run_ends_while_its_fiber_waits_on_the_host() {
+    let m = module_of(&format!(
+        "func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {{
+  vf = ref.func 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vwait
+  vs, vv = cont.resume vk vh64
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const {TICKS}
+  vr = call.cap 13 0 (i64) -> (i64) vh (vn)
+  return vr
+}}
+}}"
+    ));
+    let fiber_parks = [Driver::Oracle, Driver::Coop, Driver::Parallel];
+    check_prompt("a run over a waiting fiber", &m, &[], Ok(3), &fiber_parks);
+}
+
+/// A child resumes a fiber of its own that waits on a host call nobody will answer, and returns over
+/// it; the root joins the child, then waits on a word nothing will ever notify (#2480). Nothing in
+/// the run can wake it, so the run ends in a `ThreadFault` at once. The child's fiber's call wakes no
+/// one, its domain having ended: the pump and the tree-walker still counted it, and waited for its
+/// answer before the verdict. On the engines that park the fiber alone, as above.
+#[test]
+fn a_run_deadlocks_at_once_over_an_ended_childs_waiting_fiber() {
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let m = module_of(&format!(
+        "memory 17
+data 17710 \"wait\"
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32, vmod: i32) {{
+{grant}{prelude}  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  va = i64.const 17800
+  ve = i32.const 0
+  vinf = i64.const -1
+  vs = i32.atomic.wait va ve vinf
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 17710
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vf = ref.func 2
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vh
+  vs, vv = cont.resume vk vh64
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const {TICKS}
+  vr = call.cap 13 0 (i64) -> (i64) vh (vn)
+  return vr
+}}
+}}
+{rec}",
+        grant = rec::grant("gw", 17600, 17710, 4, "vwait"),
+        prelude = spawn_prelude(17408, "vmod", ""),
+        rec = rec::segment(17408, &child),
+    ));
+    let fiber_parks = [Driver::Oracle, Driver::Coop, Driver::Parallel];
+    let what = "a run over an ended child's waiting fiber";
+    check_prompt(what, &m, &[1], Err("ThreadFault"), &fiber_parks);
 }
 
 /// A JIT root killed while it waits on a host call that will not answer: the watchdog sets the

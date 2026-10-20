@@ -475,7 +475,7 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
 /// one call on a rendezvous-4 `Blocking` handle. A punting vCPU dispatches its pool job *before*
 /// parking (`Blocked::CapPending`), so all four jobs reach the pool and meet the width-4 barrier
 /// even when the scheduler has fewer worker threads than vCPUs — under a block-the-worker regime
-/// this hangs whenever workers < 4. Completions re-queue the parked vCPUs in submission order
+/// this hangs whenever workers < 4. Each completion re-queues its parked vCPU as it arrives
 /// (`Pending::CapResult`).
 #[test]
 fn oracle_parked_vcpus_free_their_workers() {

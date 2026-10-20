@@ -58,6 +58,10 @@ impl Ran {
 /// The fuel each driver but `Vcpu` is handed; a `Vcpu` root opens its run with [`temen_interp::DEFAULT_FUEL`].
 pub const FUEL: u64 = 50_000_000;
 
+/// How often a driver its embedder pumps (the debug scheduler, `Vcpu`) is pumped again while it
+/// waits on a host-answered call (#2495) that a thread of the test answers.
+const ANSWER_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Run `m`'s function 0 on `driver`. `setup` builds a fresh powerbox and the entry's arguments (it
 /// is called once per run, so handles are minted in the same order on every driver). `None` means
 /// the driver declined the module — it does not compile on that engine, or the debug tier fell back.
@@ -104,6 +108,9 @@ pub fn run_on_then<R>(
                     SchedStop::Finished(r) => break r,
                     SchedStop::Break { .. } => continue,
                     SchedStop::Declined => return None,
+                    // #2495 — a host-answered call: this harness answers none itself; a thread of
+                    // the embedder's answers it, so look again shortly.
+                    SchedStop::CapPark { .. } => std::thread::sleep(ANSWER_POLL),
                     other => panic!("the debug scheduler stopped early: {other:?}"),
                 }
             };
@@ -270,7 +277,9 @@ fn drive<'s, 'e>(
             bytecode::VcpuEvent::Wait { .. } => unorchestrated("Wait"),
             bytecode::VcpuEvent::Notify { .. } => unorchestrated("Notify"),
             bytecode::VcpuEvent::JitUninstall { .. } => unorchestrated("JitUninstall"),
-            bytecode::VcpuEvent::CapPending { .. } => unorchestrated("CapPending"),
+            // #2495 — a host-answered call: this harness answers none itself; a thread of the
+            // embedder's answers it, and `run` goes on once it has.
+            bytecode::VcpuEvent::CapPending { .. } => std::thread::sleep(ANSWER_POLL),
             bytecode::VcpuEvent::StdinPark => unorchestrated("StdinPark"),
         }
     }

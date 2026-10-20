@@ -761,7 +761,8 @@ Consequences:
   - **Update — D45 now implemented (opt-in), and it cleared the TCB concern above.** An optional
     `temen_jit::FastCapResolver` lets the embedder hand the JIT a *specialized* host fn for a
     statically-known `(type_id, op)`; the JIT emits a register-to-register direct call to it
-    (resolved at compile time, baked), falling back to the generic thunk for any unclaimed op. The
+    (resolved at compile time, and bound when the code is linked, D70), falling back to the generic
+    thunk for any unclaimed op. The
     authority-TCB worry is sidestepped **by construction**: the specialized fns *delegate to the same
     `Host::cap_dispatch_slots`* the generic thunk uses, so the I2 `resolve` (mask + `type_id` +
     `generation`) is unchanged — devirtualization moves only the *boundary* (register args, no
@@ -1916,7 +1917,7 @@ numbers:
 3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
    (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
-   drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
+   each as it arrives, #2477); `cap_thunk_locked`
    (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
@@ -1936,8 +1937,8 @@ every engine in `temen-run/tests/cap_park.rs`.
 **A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
 procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
 lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
-domain's calls stay in its own `Completions`, ids minted from 0, and each domain's are delivered in
-its own submission order, so one domain's outstanding call never holds back another's answer. The
+domain's calls stay in its own `Completions`, ids unique in the process (#2495), and each answer is
+delivered as it arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
 oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
 (`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
 parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
@@ -1951,16 +1952,48 @@ on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as dea
 answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
 pool's jobs never touch the window and answer into their own domain's store.
 
+**A call its embedder answers (#2495, 2026-10-20).** An offloadable procedure's call may be answered
+by the embedder instead of a pool thread (`OffloadOutcome::Host`): its submit hook gets the call's
+`Completer`, which answers it from any thread, at any time, into the domain's store with the wake a
+pool answer rings. So the caller parks and wakes as on a pool call, on every engine and in every
+domain, and a call that waits on the world (a bell rung by outside input) holds no host thread while
+it waits — the pool keeps genuinely blocking host work. A completer dropped unanswered answers
+`CAP_REVOKED`, so a call its host can no longer answer never hangs; one whose domain is gone answers
+nothing. Where its caller cannot park the call declines with `CapFault`: before the embedder sees it
+on the sync face and in a durable run, else withdrawn (`Completions::withdraw`, so its completer
+answers nothing) — a reply that is not one `i64`, a tier-up region, a `Jit.invoke` unit, the
+explorer. A driver its embedder pumps (`Vcpu`, `CoopRun`, the debug scheduler) hands control back
+while such a call waits, the earliest in any domain, so a single-threaded embedder (the browser)
+answers between pumps; a driver nothing pumps (the tree-walker, the native pump, the parallel
+driver, the JIT) waits on the store as on the pool, and its embedder answers from a thread of its
+own. Ids are unique in the process, so one embedder serving several domains keys its requests by
+id. Under a recording host (W1) the bytecode drivers tape the delivered value where they deliver it
+(`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
+there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
+browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
+completer.
+
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
 run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
-the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call ends the
-wait early, or with none outstanding a ring of the embedder's bell, and the clock moves by the time
-that passed, so the schedule is the clock's as before. A run with no outside input keeps its
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call or a ring
+of the embedder's bell ends the wait early, and the clock moves by the time that passed, so the
+schedule is the clock's as before. A run with no outside input keeps its
 schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
 after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
 debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
 too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
+
+**One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
+answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
+kill went unseen until a call answered — and a call may wait on the world. Now every store a parked
+caller waits on rings the embedder's bell (a bell of the wait's own when none is armed), and the
+pump waits on that one bell, past the round's `bell_gen` snapshot (`Completions::wait_any`): each wake
+source ends the one wait, and the next round sees which. A call counts only while its answer would
+wake a task — a task's own, or that of a fiber a task resumes blocking — as the parallel driver
+already counted, so a fiber no one resumes holds no wait and no deadlock verdict; the tree-walker
+drops a domain's fiber waiters when the domain ends, as its teardown does a dying one's. Pinned in
+`bytecode_pump_kill.rs` and `cap_park.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -1990,15 +2023,15 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 — ISSUES.md I73, opened and closed on the arc):
 
 - *Oracle (F1):* the park predicate's fiber arm rides `fiber_park!` filing a `Waiter::Fiber` in
-  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so
-  delivery stays submission-ordered even on the register race, and an animated offer handler's
+  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
+  answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
   resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
-  ONE ordered drain per domain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the
-  first not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on
+  ONE drain per domain (`drain_cap_parked`, each answer as it arrives) at both wake sites, and
+  driver idle with unwoken cap parks **blocks on
   the stores** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
   first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
@@ -2484,8 +2517,9 @@ durable, or when emitted code can't address the root window flat. A third kind o
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
-the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and `CoopRun::deliver_cap`
-writes the answer into that continuation; the pump runs it and `Resume` hands the frames its results.
+the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and the next pump after
+the call's `Completer` answers writes the answer into that continuation; the pump runs it and
+`Resume` hands the frames its results.
 Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
 `CapFault`: no one could ever complete it there.
 
@@ -4071,3 +4105,6 @@ as open-ended, not a byproduct of the build.
 | D66 | **§14 child domains are platform-scheduled, M:N, migrating, over a bounded worker pool; threads *within* a domain stay 1:1; parallelism is a granted resource bounded at dispatch, ceiling with per-child lanes (§23 "Child-domain scheduling").** Amends D22/D56/D57 in *scope*, not direction: the no-scheduler rule is about a domain's own `thread.spawn` units (where the double-scheduler objection is real); where a *domain* runs is placement, like `Attestation.tier`, and no guest observes a sibling's. D57's guest-built M:N cannot reach a detached child (a fiber is in-window; a detached child owns its window), so on the JIT N detached children were N OS threads bounded by the OS (#1586/#1587) — a #3 break in the direction "a parent consumes what it was never granted". The migration unsafe is the one D57 already paid: same switch, same happens-before, plus an env swap of `Send` data; nothing a child owns is thread-affine. Migrating over affine because naive migrating is *one queue* (the oracle's shape, reproducible by `explore_all`) while affine is per-worker queues plus placement, a third scheduler shape, and cannot share the interpreter's scheduler. Sound under five rules (§23 R1–R5): every resume its own guard bracket over the child's fault range (a stale range misclassifies faults both ways); #1466 extended to task-level TLS; a dead domain never resumed; trap attribution by task identity; `mem_base` at first entry only. Buys, at once: conserved concurrency, no pool-starvation deadlock (a park never holds a worker), #1361's harvest as one implementation on all three engines, #1584 closed by construction, deterministic child-domain scheduling under the interp's seeded policy. Owner rulings 2026-09-21: C over B; dispatch-time parallelism over spawn-time count; ceiling with lanes over transfer (stranded capacity declined; a parent may absorb a child's lane). | Adopted (amends D22/D56/D57 in scope; staged) | The resource fix, the freeze fix (#1361) and the parked-child fix (#1584) were one decision; making them three would have built the JIT's harvest as a different shape and left "granted N threads" unrepresentable. Cost recorded in §23; slices in #1600 |
 | D67 | **Accesses near a checked base share its bounds check, within one CLIF block (D61 Scope A, straight-line; #2147).** A non-elided access tests its own address against `reserved` alone (`a ≥ reserved` → `select_spectre_guard` to the guard, D63) and becomes its block's **check point** for its *root*, the value its address adds constants to. A later access through the same root at a constant `d ≥ 0` past the check point, with `d + offset + width ≤ trailing_guard`, takes the checked base plus a constant and tests nothing. **Exact:** if the check point's `a < reserved`, the later address is `a + d` with no wrap, and whatever of the access lies past `reserved` faults on the guard page at that access, where `checked_reserved` faults it; if `a ≥ reserved`, the check point faulted first. **Speculative overshoot ≤ the guard:** a misspeculated check point's base is the guard's, so `trusted_reach ≤ guard_size` (D61) holds by construction, since the JIT's reach and the allocator's guard are one definition (`mem::trailing_guard`). **Stores share too:** a store that straddles `reserved` writes nothing before it faults only on hardware that never tears a faulting store (x86-64 guarantees it, Arm and RISC-V don't), the reliance D63 already has at `mapped` and at protected pages (#2162). A loads-only variant, stores keeping D63's exact check, was measured and rejected: a store's address is then a different value from a load's at the same address, which defeats Cranelift's store-to-load forwarding (`hexer d`: 5.34 G JIT instructions, against 5.08 G with no sharing at all). Applies only to windows with a page-aligned reservation whose guard starts at `reserved`; unaligned reservations and spans past the guard keep D63's exact check. Within one CLIF block only: a base computed before a call's trap check or a resume entry need not dominate the code after it. | Built (#2147) | The `confine` C kernels (temen-jit, median of 3 rounds): `edn` −30%, `fir` −12%, `bytes` −5%, `matmul`/`matmul_eb` unchanged. On nimony's `hexer d` (Cranelift), 33% of loads and stores share a check (static); clamp instructions −19% (0.53→0.43 G), all instructions −2.7%, execution −1.5%. Verification: an escape-oracle sweep in which each access in turn crosses the window's end and bases wrap below zero (it crashes or fails if negative distances share, or if the reach exceeds the guard), plus the §18 differential suites and the self-hosted lane. |
 | D68 | **Cranelift's verifier runs on every compile at two points: on the CLIF temen lowers, before Cranelift's passes, and on the CLIF those passes hand the backend. After each pass too, with debug assertions and under the fuzzers (#2449).** The verifier checks that CLIF is well formed (types, SSA dominance, arity, signatures), not confinement. The first point keeps Cranelift's passes from running on malformed CLIF, which they can turn into well-formed wrong code; the second keeps a pass that breaks the CLIF from reaching the backend. The checks between passes add only which pass broke it, a diagnosis the debug and fuzz builds keep. Wasmtime turns its verifier off by default (`Config::cranelift_debug_verifier`); temen keeps two points in release because its CLIF generation is escape-TCB. | Settled (owner, #2449) | On unir's store unit (2,192 functions, 4-vCPU VM), the verifier after every pass took 1.49 s of a 5.2 s one-thread compile, 0.27–0.32 s a run; the two points take 0.58 s. On four threads Cranelift's part drops from 1.42 to 1.15 s and the full compile from 1.86 to 1.56 s. Neither point sees the machine code the backend emits, where Cranelift's published escapes were (CVE-2021-32629, CVE-2023-26489): #2481. |
+| D69 | **Each instance of shared code stands up the runtimes its code runs on (temen#2389).** `SharedCode::instance` makes, for the instance and charged to its run's budget node, each runtime the compile made: the thread domain, the fiber table and the root vCPU's fiber runtime, the §14 nursery its `Instantiator` sites spawn through, and the `setjmp` table. The `SetJmp`/`LongJmp` sites now load the table from the `vmctx` (`VmCtx::setjmp`) instead of baking its address, so no compile names a per-instance object. A root that spawns, runs fibers or threads, or uses `setjmp` is shared like any other: a fork twin, an `execve` and a run handed a kept `JitCodeCache` instantiate one compile. Only a module a §22 hosting entry stood a runtime up on after its compile (`hosted`) or defined a unit into stays unshared. temen-run keys a program over the locked powerbox apart from a raw one's, since the code bakes the thunk for the powerbox's shape, and forks only a program over the raw powerbox. | Settled (#2389) | A thread domain, a fiber table, a nursery and a `setjmp` table are allocations; a nursery's executor starts its workers on the first spawn. The kept instance in `SharedCode` stands its own up, and never runs. |
+| D70 | **Compiled code calls the host by symbol, never by address (temen#2452).** Each host function the code calls (temen-jit's thunks, libc `_setjmp`/`_longjmp`, the stack-limit and trap-capture helpers, and the compile's own: the embedder's `call.cap` thunk, its signal-delivery thunks, a demand-paged child's page-miss thunk (#2164), and the D45 fast-path targets its resolver claims) the code names by a symbol (`HostFn`), through a relocation. Linking the code binds each symbol to the function's address in the process (`new_jit_module`): temen-jit's from a fixed table, the compile's from its `Imports`, a fast-path target by asking the resolver again. With the per-instance addresses in the `vmctx` (#1768, D69), the code a compile emits names no address in its process, so it links into any other: what an on-disk code cache stores. The symbols are not C identifiers, so no lookup in the process's own symbol table binds one. A submitted unit that uses `setjmp` is refused by a module with no `setjmp` table, where its sites used to call address 0. | Settled (#2452) | None at run time: Cranelift lowers a call to an imported symbol to the `movabs` and indirect `call` a baked address lowered to (a literal load and `blr` on AArch64). Linking patches one 8-byte address per call site. |
+| D71 | **A compile's code can be kept on disk, and a later process defines it instead of compiling (temen#2452).** A `CodeDir` keeps, per compile, each guest function's code as Cranelift emitted it with its relocations by name: a function of the module by index, a host function by its D70 symbol, a Cranelift libcall by name. A compile handed one (`CompiledModule::compile_kept`, `ChildCodeCache::kept_in`, temen-run's `JitCodeCache::kept_in`) looks for its key first: the module's content digest and every other input its code depends on (entry, kill-path and fuel checks, the D45 fast path, window and table geometry; for a §14 child, which cells it has and whether it is demand-paged, but not its `call.cap` or page-miss thunk, which only the link binds). A hit is defined through the same `define_function_bytes` and relocation step as fresh code, and its trampolines compile as ever. The code is input to the escape-TCB, so it is kept only where its owner alone can write: the directory and each file read must be this user's and writable by no one else, read without following a symlink, and each file carries its key, a stamp of this build of temen (the executable, by device, inode, size and modification time), the CPU (ISA and flags) and the host page size, and a checksum; any mismatch is a miss, and the compile that follows replaces the file. Before any function is defined, every relocation must name something the compile's link binds. An image that extends its own code (a root driving a `Jit`, a §14 child holding one) shares no compile, but starts from the code kept for it like any other; the units it adds are not kept. Not kept: a module with debug info, a signal-armed compile, a §22 unit. | Settled (#2452) | Unix only (`CodeDir::open` refuses elsewhere). A temen linked into a shared library would stamp the host executable's build, not its own, so it must not keep code. Identity is the module digest the in-memory caches already trust (`digest256`, not cryptographic), now across processes. One file per image and compile shape, so a new build overwrites rather than accumulates; what else the directory holds is its owner's to clear. |

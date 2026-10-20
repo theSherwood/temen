@@ -1,13 +1,13 @@
-//! #1366 slice (b) / #1517 slice 1 — the **host-completed cap posture on the debug run**
+//! #1366 slice (b) / #1517 slice 1 — the **host-answered cap posture on the debug run**
 //! (`ScheduledDebugRun`, the engine behind the DAP bytecode backend): a `call.cap` the embedder
-//! services asynchronously parks the thread (`cap_parked`), `deliver_cap` resumes it, and — the W4
-//! inertness pin generalized —
-//! the *delivered* value joins the cap tape as the call's record, so a rebuilt run that replays
-//! the tape (a reverse `seek`) serves the call from the tape and **never re-parks**.
+//! answers later parks the thread (`cap_parked`), the call's completer answers it, and — the W4
+//! inertness pin generalized — the *delivered* value joins the cap tape as the call's record, so a
+//! rebuilt run that replays the tape (a reverse `seek`) serves the call from the tape and **never
+//! re-parks**.
 
 use std::sync::{Arc, Mutex};
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
-use temen_interp::{Host, OffloadOutcome, Value};
+use temen_interp::{Completer, Host, OffloadOutcome, Value};
 
 /// Two `HOST_PROC` (iface 13) calls: op 0 answers inline, op 1 is host-completed; composite
 /// `r0 * 1000 + r1` = 105_107 when both answer `arg + 100`.
@@ -27,7 +27,20 @@ block 0 (vh: i32) {
 "#;
 const WANT: i64 = 105_107;
 
-type Recorded = Arc<Mutex<Vec<(u64, i64)>>>;
+/// The calls the submit hook filed and nobody has answered yet: each one's completer and argument.
+type Recorded = Arc<Mutex<Vec<(Completer, i64)>>>;
+
+/// The filed calls, as `(completion id, argument)`.
+fn filed(recorded: &Recorded) -> Vec<(u64, i64)> {
+    let g = recorded.lock().unwrap();
+    g.iter().map(|(c, a)| (c.id(), *a)).collect()
+}
+
+/// Answer the one filed call with `value`.
+fn answer(recorded: &Recorded, value: i64) {
+    let (c, _) = recorded.lock().unwrap().pop().expect("a filed call");
+    c.complete(value);
+}
 
 fn module() -> temen_ir::Module {
     let m = temen_text::parse_module(TWO_CALLS).expect("parse");
@@ -35,7 +48,7 @@ fn module() -> temen_ir::Module {
     m
 }
 
-/// A recording host (the DAP backend's shape: `record_caps` on) with the host-completed handler.
+/// A recording host (the DAP backend's shape: `record_caps` on) with the host-answered handler.
 fn recording_host(recorded: &Recorded) -> (Host, i32) {
     let mut host = Host::new();
     host.record_caps();
@@ -47,7 +60,7 @@ fn recording_host(recorded: &Recorded) -> (Host, i32) {
                 return OffloadOutcome::Done(Ok(vec![a + 100]));
             }
             let rec = Arc::clone(&rec);
-            OffloadOutcome::Host(Box::new(move |id| rec.lock().unwrap().push((id, a))))
+            OffloadOutcome::Host(Box::new(move |c| rec.lock().unwrap().push((c, a))))
         }),
         None,
         temen_interp::CapState::Stateless,
@@ -65,16 +78,16 @@ fn scheduled_run_parks_on_a_host_completed_cap_and_resumes() {
     let mut fuel = 2_000_000u64;
 
     let stop = run.run_until_stop(&mut fuel);
-    let id = run.cap_parked().expect("parked on the host-completed call");
+    let id = run.cap_parked().expect("parked on the host-answered call");
     assert!(
         matches!(stop, SchedStop::CapPark { id: sid, .. } if sid == id),
         "the drive reports a live CapPark stop on the parked thread"
     );
     assert!(run.result().is_none(), "parked, not finished");
     assert_eq!(
-        recorded.lock().unwrap().clone(),
+        filed(&recorded),
         vec![(id, 7)],
-        "the submit hook recorded the request under the surfaced id"
+        "the submit hook filed the request under the surfaced id"
     );
 
     // Advancing while parked refuses (nothing is runnable), and the park is stable.
@@ -87,10 +100,9 @@ fn scheduled_run_parks_on_a_host_completed_cap_and_resumes() {
         !run.tick(&mut fuel),
         "a raw tick cannot advance a parked run"
     );
-    assert!(!run.deliver_cap(id + 1, 0), "a foreign id is refused");
 
-    assert!(run.deliver_cap(id, 107));
-    assert_eq!(run.cap_parked(), None);
+    answer(&recorded, 107);
+    assert_eq!(run.cap_parked(), None, "answered, the call no longer waits");
     assert!(matches!(
         run.run_until_stop(&mut fuel),
         SchedStop::Finished(Ok(ref v)) if *v == vec![Value::I64(WANT)]
@@ -127,8 +139,8 @@ fn scheduled_replay_serves_the_delivered_value_without_re_parking() {
         run.run_until_stop(&mut fuel),
         SchedStop::CapPark { .. }
     ));
-    let id = run.cap_parked().expect("parked");
-    assert!(run.deliver_cap(id, 107));
+    run.cap_parked().expect("parked");
+    answer(&recorded, 107);
     assert!(matches!(
         run.run_until_stop(&mut fuel),
         SchedStop::Finished(_)
@@ -152,7 +164,7 @@ fn scheduled_replay_serves_the_delivered_value_without_re_parking() {
         "the replay reproduces the delivered value"
     );
     assert!(
-        replayed.lock().unwrap().is_empty(),
+        filed(&replayed).is_empty(),
         "the tape served the call — the handler's submit hook never ran on the replay"
     );
 }

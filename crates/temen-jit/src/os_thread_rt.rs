@@ -805,12 +805,6 @@ pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
 }
 
 impl Domain {
-    /// A new domain with nothing of this one's: what another instance of the same code runs on
-    /// (#1825). Shared code makes no thread or fiber, so it charges no node.
-    pub(crate) fn fresh(&self) -> Domain {
-        Domain::new(None)
-    }
-
     /// A run's own domain: its vCPUs (and a §14 child task's, through [`Self::new_child`]) are charged
     /// to `node` (#2001, #2113), and [`MAX_VCPUS`] bounds the run's live vCPUs.
     pub(crate) fn new(node: Option<std::sync::Arc<dyn crate::BudgetNode>>) -> Domain {
@@ -1517,10 +1511,10 @@ std::thread_local! {
 
 std::thread_local! {
     /// #1469 — the domain the code on this thread spawns into and joins from when it is not the
-    /// one baked into its thunks: a §14 child task's. Seeded on each of the child's vCPU threads
+    /// one its vmctx names (`sched`): a §14 child task's. Seeded on each of the child's vCPU threads
     /// ([`run_child`]) and around each residency of the task on an executor worker (`child_exec`);
-    /// null elsewhere, where the baked `sched` is the domain. Child code is shared across spawns
-    /// (`instantiator_rt`'s code cache), so the domain cannot be baked into it.
+    /// null elsewhere, where the vmctx's `sched` is the domain. Child code is shared across spawns
+    /// (`instantiator_rt`'s code cache), so no domain can be part of it.
     static CURRENT_DOMAIN: std::cell::Cell<*const Domain> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
@@ -1529,7 +1523,7 @@ pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
     CURRENT_DOMAIN.with(|c| c.replace(dom))
 }
 
-/// The domain a thread thunk acts in: this thread's current one, else the baked `sched`. Not
+/// The domain a thread thunk acts in: this thread's current one, else the vmctx's `sched`. Not
 /// inlined: a task can move to another worker across a park, so the thread-local is re-read on the
 /// thread that asks (R2, #1466).
 ///

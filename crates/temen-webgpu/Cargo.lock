@@ -1322,6 +1322,7 @@ dependencies = [
  "cranelift-native",
  "libc",
  "loom",
+ "temen-encode",
  "temen-fiber",
  "temen-ir",
  "windows-sys 0.59.0",

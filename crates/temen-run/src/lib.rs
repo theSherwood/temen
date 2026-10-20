@@ -216,7 +216,11 @@ pub unsafe extern "C" fn cap_thunk(
     // result slot (the wake delivers one scalar — invariant 8) and a non-durable run (the freeze
     // driver has no cap-park re-derivation). Sync ops never pay: nothing is minted unless a handler
     // punts. Either face, a would-block op parks the calling fiber and runs again (#1826, #1952).
-    let pending_face = n_results == 1 && !(*(ctx as *mut Host)).is_durable();
+    // #2495 — nor under a recording host: this engine tapes no host-answered call's delivered
+    // value, so one declines there before its embedder sees it (a pool job runs inline under a
+    // tape on either face).
+    let host = &*(ctx as *mut Host);
+    let pending_face = n_results == 1 && !host.is_durable() && !host.records_caps();
     loop {
         let (mut pending_id, mut park) = (None, None);
         cap_thunk_impl(
@@ -318,11 +322,10 @@ unsafe fn cap_wait(
     temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
-/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
-/// drain claims a completion that raced the park, in submission order — a ready LATER id is
-/// held behind an earlier outstanding park, the §18 pin), then park-poll: each `cont.resume`
-/// of this fiber re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the
-/// resumer) until the drain has delivered. Parking before the first check gives the one
+/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
+/// that raced the park fills it at once), then park-poll: each `cont.resume` of this fiber
+/// re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the resumer) until the
+/// call has answered, each call's answer as it comes (#2477). Parking before the first check gives the one
 /// transient `FIBER_PARKED` even on an insta-ready completion, matching the oracle's
 /// register-then-recheck. A trap raised meanwhile (teardown) abandons the wait — the result
 /// stays unclaimed for the sweep and the caller's trailing guards unwind before the guest
@@ -675,7 +678,7 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// threads make concurrent `call.cap`s (notably `Jit.compile`, which mutates the `Host` unit
 /// registry and the live `CompiledModule`) does not data-race. `ctx` is `*const Mutex<Host>`
 /// (vs `cap_thunk`'s raw `*mut Host`), so single-threaded guests keep the unlocked `cap_thunk`
-/// and pay nothing; only a concurrent guest's run bakes *this* thunk (see [`jit_cap_run`]).
+/// and pay nothing; only a concurrent guest's run links *this* thunk (see [`jit_cap_run`]).
 ///
 /// **Re-entrancy** (the "running units compile more" case): `Jit.invoke` runs guest code that may
 /// itself `call.cap` (e.g. compile more) on the same thread, so the lock must **not** be held
@@ -770,6 +773,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
         let mut park = None;
+        // #2495 — no parking face under a recording host, as in [`cap_thunk`].
+        let face = (!guard.records_caps()).then_some(&mut pending_id);
         cap_thunk_impl(
             host_ptr,
             mem_base,
@@ -783,7 +788,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             results,
             n_results,
             trap_out,
-            Some(&mut pending_id),
+            face,
             &mut park,
         );
         // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
@@ -804,7 +809,10 @@ pub unsafe extern "C" fn cap_thunk_locked(
             let comps = guard.completions();
             let durable = guard.is_durable();
             drop(guard);
-            if n_results > 1 {
+            // #2495 — a host-answered call without a one-scalar reply cannot park either, as on
+            // every engine: withdrawn, it declines.
+            let declined = n_results != 1 && comps.withdraw(id);
+            if n_results > 1 || declined {
                 *trap_out = TrapKind::CapFault as i64;
                 return;
             }
@@ -1963,10 +1971,10 @@ pub fn recompact_jit(
         !old.is_running(),
         "recompact_jit is quiescent-only: no run may be in flight on the old module"
     );
-    // Single-threaded path: the fresh module bakes the unlocked `cap_thunk` + raw `Host`. A
+    // Single-threaded path: the fresh module links the unlocked `cap_thunk` over a raw `Host`. A
     // *concurrent* guest must compact through [`JitSession`] (or replicate its pattern:
     // `cap_thunk_locked` over a stable `Mutex<Host>`, then [`recompact_into`]) — re-running a fresh
-    // module that baked the unlocked thunk under threads would race (DESIGN.md §22).
+    // module that links the unlocked thunk under threads would race (DESIGN.md §22).
     let mut fresh = CompiledModule::compile(
         base,
         entry,
@@ -1987,9 +1995,9 @@ pub fn recompact_jit(
 
 /// Rebuild the domain's **live unit set** into an already-compiled `fresh` module: carry every unit
 /// still reachable (held through a live `CompiledCode` handle, [`Host::jit_live_units`], **or**
-/// occupying a `call.dyn` slot of `old`), re-`define_extra` it, remap the `Host` unit→native
-/// record (so existing handles keep resolving), and reproduce occupied slots at their **exact**
-/// index. The thunk/ctx baked into `fresh` (locked vs raw) is the caller's choice — this is the
+/// occupying a `call.dyn` slot of `old`), re-`define_extra` it, remap the `Host` unit→native record
+/// (so existing handles keep resolving), and reproduce occupied slots at their **exact** index. The
+/// thunk/ctx `fresh` is compiled with (locked vs raw) is the caller's choice — this is the
 /// thunk-agnostic half of compaction, shared by [`recompact_jit`] (raw) and [`JitSession`] (locked,
 /// concurrency-capable). Quiescent-only.
 pub fn recompact_into(
@@ -6997,7 +7005,7 @@ fn jit_run(
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
                 jit_proc::with_cap_ctx(host, jit_proc::locked(m), |cc| {
-                    jit_proc::compile_image(cc, m, func, ip, jit, fuel)
+                    jit_proc::compile_image(cc, m, func, ip, jit, fuel, None)
                         .and_then(|cm| jit_proc::run_image(cc, cm, None, start))
                 })
             };

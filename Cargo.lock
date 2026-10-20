@@ -744,6 +744,7 @@ dependencies = [
  "cranelift-native",
  "libc",
  "loom",
+ "temen-encode",
  "temen-fiber",
  "temen-interp",
  "temen-ir",
