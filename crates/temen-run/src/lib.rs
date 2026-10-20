@@ -37,6 +37,9 @@ use temen_interp::{
 #[cfg(any(unix, windows))]
 use temen_interp::SharedBacking;
 use temen_ir::errno::{EAGAIN, EFAULT, EINVAL, ENOMEM, ENOSPC};
+/// D37 — the dead-callee errno: what a call through a live offer answers when its callee's serve
+/// loop is gone with the call unserved (death is revocation).
+const CAP_REVOKED: i64 = -9;
 use temen_ir::{FuncIdx, FuncType, Module, ValType};
 
 // Re-export the value type so embedders (and the CLI) need not also depend on `temen-interp`.
@@ -52,7 +55,7 @@ pub mod fs;
 mod jit_proc;
 pub use jit_proc::JitCodeCache;
 pub mod posix;
-use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind};
+use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, Parks, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
@@ -288,7 +291,7 @@ impl HostParkReq {
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
-        match temen_jit::park_host_call(trap_out, unwind_base, key, still_parked) {
+        match temen_jit::park_host_call(trap_out, unwind_base, key, Parks::Fiber, still_parked) {
             temen_jit::HostPark::Woken => true,
             temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
             temen_jit::HostPark::Deadlock => {
@@ -478,24 +481,7 @@ unsafe fn cap_thunk_impl(
     // **per-run** one from the `Host` (keyed by window base), so growth committed in an earlier
     // `call.cap` is still seen committed here — a borrow of a guest-grown page doesn't fail-closed.
     #[cfg(any(unix, windows))]
-    let pages = host.cap_window_pages(mem_base as usize);
-    #[cfg(any(unix, windows))]
-    let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
-    // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to page
-    // ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
-    // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
-    // #13: the guard is UNCONDITIONAL, a constant of the layout, not per-run state). It used to come
-    // from `Host::null_guard()`, which only became non-zero as a side effect of `set_self_module` —
-    // so an embedder that never registered a self module (nothing else about page ops needs one) ran
-    // the JIT with guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
-    // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is `-EINVAL` on
-    // the interpreter and `0` on the JIT, the two tiers disagreeing about an invariant that is
-    // supposed to hold on all of them.
-    #[cfg(any(unix, windows))]
-    wm.set_null_guard(temen_ir::module_null_guard());
-    // #2426: and the runtime-private pages of a durable module's window, as its start recorded them.
-    #[cfg(any(unix, windows))]
-    wm.set_shadow(host.cap_window_shadow());
+    let mut wm = MprotectWindow::of(host, mem_base, mem_size, mem_reserved);
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -742,6 +728,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             op == 10,
             n_args,
             mem_base,
+            mem_size,
             mem_reserved,
             results,
             n_results,
@@ -1655,8 +1642,10 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
         let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
         let mut trap = 0i64;
         // SAFETY: `gc`/`trap` are live out-cells for the call.
-        if unsafe { finish_child_build(host, Some((r.host, 0, 0)), gc.as_mut_ptr(), &mut trap) }
-            == 0
+        // A thaw never re-launches a demand-paged child on this engine (#2438).
+        if unsafe {
+            finish_child_build(host, Some((r.host, 0, 0)), None, gc.as_mut_ptr(), &mut trap)
+        } == 0
         {
             return Err(temen_jit::JitError::Unsupported(
                 "durable JIT thaw: child powerbox",
@@ -1711,8 +1700,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
 /// join table per spawning vCPU, so two children of different spawners can share a slot number; the
 /// JIT keeps one per domain, where both handles would name one child.
 ///
-/// #2438 — and none is demand-paged: the JIT has no fault seam to serve its pager (#2164). A routed
-/// run of a pager-capable program thaws on the interpreter ([`folds_to_oracle`]), as it runs there.
+/// #2438 — and none is demand-paged: a durable JIT run pages no child, so its relaunch re-links no
+/// pager (#2489). A paged artifact thaws on the interpreter, where it was frozen.
 fn jit_relaunches(host: &Host) -> bool {
     let mut slots: Vec<usize> = host
         .thawed_detached()
@@ -1797,7 +1786,8 @@ fn detached_left(
         let Some(module) = module else {
             continue;
         };
-        // A JIT child is never demand-paged: its op-17 thunk refuses a pager record (#2164).
+        // A durable JIT run's child is never demand-paged: its op-17 thunk refuses a pager record in
+        // a durable run (#2489).
         let spawn = temen_interp::DetachedSpawn {
             digest: temen_interp::module_digest(&module),
             module: std::sync::Arc::clone(&module),
@@ -2524,6 +2514,7 @@ locked_parent_hook!(
         bytes: u64,
         runs: u64,
         lane: i64,
+        pager: u32,
         out: *mut temen_jit::GrantChild,
         trap_out: *mut i64,
     ) -> i32
@@ -2539,6 +2530,7 @@ locked_parent_hook!(
     (child: *mut c_void, budget: i32, bytes: u64, runs: u64) -> ()
 );
 locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
+locked_parent_hook!(pager_admit_locked, pager_admit, (export: u32) -> i32);
 locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
@@ -2832,6 +2824,12 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         premap_apply,
         held_tail: cap_held_tail_locked,
         budget_node: child_budget_node,
+        pager_admit: if locked {
+            pager_admit_locked
+        } else {
+            pager_admit
+        },
+        page_miss,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
@@ -2891,7 +2889,10 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
             // #2173 — and the cell rings nothing more: its run may end before its last ref goes.
             g.set_park_hub(0);
             if ended {
-                g.live_offer_providers()
+                // #2164 — and the pager its faults called: it can no longer call one.
+                let mut providers = g.live_offer_providers();
+                providers.extend(g.take_jit_pager());
+                providers
             } else {
                 Vec::new()
             }
@@ -2960,11 +2961,11 @@ unsafe fn ring(g: &Host) {
 }
 
 /// #2173 — a parked-transport wait: park on the run's one host-call park
-/// ([`temen_jit::park_host_call`]) until the cell's `bell` moves past `seen`, the value read under
-/// the cell's lock together with the state that made the wait park. So it is counted for the run's
-/// deadlock verdict as every other park is, ends on a kill or the domain's teardown, and a task's
-/// wait parks the task rather than its worker thread. With no bell nothing can ring it: it ends
-/// only on the verdict, a kill or the teardown.
+/// ([`temen_jit::park_host_call`]), as `parks` says, until the cell's `bell` moves past `seen`, the
+/// value read under the cell's lock together with the state that made the wait park. So it is
+/// counted for the run's deadlock verdict as every other park is, ends on a kill or the domain's
+/// teardown, and a task's wait parks the task rather than its worker thread. With no bell nothing
+/// can ring it: it ends only on the verdict, a kill or the teardown.
 ///
 /// # Safety
 /// `trap_out` is the live call's trap cell, and the caller holds no lock.
@@ -2972,9 +2973,10 @@ unsafe fn park_on_bell(
     trap_out: *mut i64,
     bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
     seen: u64,
+    parks: Parks,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(trap_out, 0, key, || {
+    temen_jit::park_host_call(trap_out, 0, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -3003,6 +3005,7 @@ unsafe fn serve_locked(
     wait: bool,
     n_args: u64,
     mem_base: *mut u8,
+    mem_size: u64,
     mem_reserved: u64,
     results: *mut i64,
     n_results: u64,
@@ -3045,7 +3048,9 @@ unsafe fn serve_locked(
             // sees the same kill and releases, so until then re-check on a short sleep.
             let seen = bell_now(bell.as_ref());
             drop(guard);
-            if park_on_bell(trap_out, bell.as_ref(), seen) != temen_jit::HostPark::Woken {
+            if park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber)
+                != temen_jit::HostPark::Woken
+            {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -3063,7 +3068,8 @@ unsafe fn serve_locked(
                 return;
             };
             if args.len() != n_params {
-                guard.svc_settle(ticket, EINVAL);
+                let v = guard.settle_page(ticket, EINVAL, None); // a page request's sink goes too
+                guard.svc_settle(ticket, v);
                 ring(&guard);
                 continue;
             }
@@ -3087,7 +3093,15 @@ unsafe fn serve_locked(
                 return; // a handler trap or fault (incl. Exit) — terminal for the domain
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
-            guard.svc_settle(ticket, res.first().copied().unwrap_or(0));
+            // §2.2 / #2164 — a page request's bytes move now, out of this domain's window, the
+            // pager's, before the reply wakes the child and before the pager can reuse its buffer.
+            let v = res.first().copied().unwrap_or(0);
+            #[cfg(any(unix, windows))]
+            let v = {
+                let pager = MprotectWindow::of(&mut guard, mem_base, mem_size, mem_reserved);
+                guard.settle_page(ticket, v, Some(&pager))
+            };
+            guard.svc_settle(ticket, v);
             ring(&guard);
             count += 1;
         }
@@ -3108,7 +3122,7 @@ unsafe fn serve_locked(
         let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         drop(guard);
-        let parked = park_on_bell(trap_out, bell.as_ref(), seen);
+        let parked = park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber);
         guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
         // A claim taken during the park holds this domain until its release (the arm above).
@@ -3143,11 +3157,11 @@ fn crossing_depth_ok() -> bool {
 }
 
 /// CALLS.md 5c.1b — the **caller side** of the JIT parked transport: a cross-domain `call.cap`
-/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then
-/// **thread-block** on the cell's Condvar until the child's serve loop settles `t` — the §10.2
-/// arm-5 transport, caller half. Fail-closed edges: full callee queue ⇒ `-EAGAIN` (probeable
-/// backpressure, the interp's exact answer); a callee cell with no Condvar (not a shared JIT
-/// child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
+/// through a minted live-impl. Enqueue on the callee child's shared cell (ticket `t`), then park on
+/// the cell's bell until the child's serve loop settles `t` ([`await_settle`]: a task's fiber
+/// yields, an OS vCPU waits, #2173) — the §10.2 arm-5 transport, caller half. Fail-closed edges:
+/// full callee queue ⇒ `-EAGAIN` (probeable backpressure, the interp's exact answer); a callee cell
+/// with no bell (not a shared JIT child) ⇒ `-EINVAL` (the pre-5c.1 dispatch answer); a callee whose serve ctx cleared (child
 /// exited without serving) ⇒ `CAP_REVOKED` (-9, the D37 dead-callee errno); epoch/trap fire ⇒
 /// unwind via the trap cell. `callee`/`export` are the live-impl the handle resolved to and `fast`
 /// the caller's handoff knob, each read by the caller from its own powerbox before the call (a
@@ -3160,7 +3174,6 @@ unsafe fn live_impl_call(
     args: &[i64],
     trap_out: *mut i64,
 ) -> i64 {
-    const CAP_REVOKED: i64 = -9;
     // Only the callee cell is locked from here on: the caller holds no lock of its own.
     let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     // CALLS.md 5c.2 — the thunk fast path (§10.2 arm 4): the callee's serve loop is parked at an
@@ -3227,36 +3240,204 @@ unsafe fn live_impl_call(
         return EAGAIN; // full queue / unservable op: probeable backpressure
     };
     ring(&guard); // the callee's serve loop, parked on its empty queue
+    await_settle(callee, guard, &bell, ticket, Parks::Fiber, trap_out).unwrap_or(0)
+}
+
+/// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its
+/// serve loop to settle `ticket`. The result, `CAP_REVOKED` when the callee's serve loop is gone with
+/// it unserved (the dead-callee edge, probeable, never a hang: D37 death-is-revocation), or `None`
+/// when the wait ended without one: the deadlock verdict, a kill, or this domain's teardown, with the
+/// trap cell set to unwind the caller.
+unsafe fn await_settle<'a>(
+    callee: &'a Mutex<Host>,
+    mut guard: std::sync::MutexGuard<'a, Host>,
+    bell: &Arc<std::sync::atomic::AtomicU64>,
+    ticket: u64,
+    parks: Parks,
+    trap_out: *mut i64,
+) -> Option<i64> {
     loop {
         if let Some(r) = guard.svc_result(ticket) {
-            return r;
+            return Some(r);
         }
         if guard.serve_ctx() == 0 {
-            // The child exited (release cleared the ctx) with our dispatch unserved — the
-            // dead-callee edge, probeable, never a hang (D37 death-is-revocation).
-            return CAP_REVOKED;
+            return Some(CAP_REVOKED);
         }
-        // The arm-5 caller park, until the callee's settle (or its end) rings its bell.
-        let seen = bell_now(Some(&bell));
+        // Until the callee's settle (or its end) rings its bell.
+        let seen = bell_now(Some(bell));
         drop(guard);
-        match park_on_bell(trap_out, Some(&bell), seen) {
-            temen_jit::HostPark::Woken => {}
-            // Nothing live can serve it: the oracle's deadlock verdict.
-            temen_jit::HostPark::Deadlock => {
-                *trap_out = temen_jit::TrapKind::ThreadFault as i64;
-                return 0;
-            }
-            // A kill (the trap cell still clear) or this domain's teardown: the trap cell unwinds
-            // the caller, the value is unused.
-            _ => {
-                if *trap_out == 0 {
-                    *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
-                }
-                return 0;
-            }
+        if !park_until_rung(bell, seen, parks, trap_out) {
+            return None;
         }
         guard = callee.lock().unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// Park on `bell`, as `parks` says, until it rings past `seen`: `true`, or `false` with the trap
+/// cell set — nothing live can ring it (the oracle's deadlock verdict), a kill, or this domain's
+/// teardown.
+unsafe fn park_until_rung(
+    bell: &Arc<std::sync::atomic::AtomicU64>,
+    seen: u64,
+    parks: Parks,
+    trap_out: *mut i64,
+) -> bool {
+    match park_on_bell(trap_out, Some(bell), seen, parks) {
+        temen_jit::HostPark::Woken => true,
+        temen_jit::HostPark::Deadlock => {
+            *trap_out = temen_jit::TrapKind::ThreadFault as i64;
+            false
+        }
+        // A kill (the trap cell still clear) or this domain's teardown (it already holds why).
+        _ => {
+            if *trap_out == 0 {
+                *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
+            }
+            false
+        }
+    }
+}
+
+/// §2.2 / #2164 — a demand-paged JIT child's request for a page: file `page(addr)` on export `export`
+/// of its pager's cell, with the sink `sink` makes, where the reply's page lands, then park until the
+/// pager's serve loop settles it, which copies the page in — the parked transport a live-offer call
+/// takes ([`await_settle`]). A full queue is backpressure, as on the interpreters: wait for the pager
+/// to settle something, then ask again. The reply, or `None` with the trap cell set.
+///
+/// A sink writes into the child's window, which goes with the child, so a request the child stops
+/// waiting for (a kill, a teardown, a pager gone) is withdrawn before this returns. The settle and the
+/// withdrawal both run under the pager's lock, so no supply reaches the window once it has.
+unsafe fn request_page(
+    pager: &Mutex<Host>,
+    export: u32,
+    sink: impl Fn() -> temen_interp::PageSink,
+    trap_out: *mut i64,
+) -> Option<i64> {
+    let mut guard = pager.lock().unwrap_or_else(|e| e.into_inner());
+    // A pager is its spawner's domain, a JIT run's shared cell; without a bell no serve loop of it
+    // could ever answer.
+    let Some(bell) = guard.svc_bell().cloned() else {
+        return Some(EINVAL);
+    };
+    let ticket = loop {
+        if guard.serve_ctx() == 0 {
+            return Some(CAP_REVOKED);
+        }
+        if let Some(ticket) = guard.request_page(export, sink()) {
+            break ticket;
+        }
+        let seen = bell_now(Some(&bell));
+        drop(guard);
+        if !park_until_rung(&bell, seen, Parks::Vcpu, trap_out) {
+            return None;
+        }
+        guard = pager.lock().unwrap_or_else(|e| e.into_inner());
+    };
+    ring(&guard); // the pager's serve loop, parked on its empty queue
+    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, trap_out);
+    if reply.is_none_or(|r| r == CAP_REVOKED) {
+        pager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .abandon_page(ticket);
+    }
+    reply
+}
+
+/// §2.2 / #2164 — the [`temen_jit::PageMissThunk`]: a demand-paged JIT child's code calls it when an
+/// access's page check fails. It walks the access's pages in order, as the interpreters' protection
+/// check does, against the child's page map, the authority its access table mirrors:
+///
+/// - a page that admits the access passes;
+/// - a page that refuses it is fatal (`MemoryFault`) when its pager cannot supply it, as
+///   `Mem::take_fault` rules: below the NULL guard, past the declared window, or a §13 alias. So is
+///   any refused page of a `memory.wait` ([`temen_jit::PAGE_MISS_FATAL`]), which no engine pages;
+/// - any other is asked of the child's pager ([`request_page`]), then checked again. A refusal, or a
+///   pager that is gone, is fatal, as a pagerless fault is.
+///
+/// # Safety
+/// `vm` is the faulting instance's live context, whose powerbox is a JIT child's shared cell;
+/// `[off, off + len)`, `len > 0`, lies in the reservation of its window at `base`.
+#[cfg(any(unix, windows))]
+pub unsafe extern "C" fn page_miss(
+    vm: *mut temen_jit::VmCtx,
+    base: *mut u8,
+    off: u64,
+    len: u64,
+    flags: u64,
+) {
+    let trap_out = (*vm).trap_ptr();
+    let fault = || *trap_out = temen_jit::TrapKind::MemoryFault as i64;
+    let cell = &*((*vm).cap_ctx as *const Mutex<Host>);
+    let (win, mapped, pager) = {
+        let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(paging) = g.jit_paging() else {
+            return fault();
+        };
+        let reserved = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+        let win = MprotectWindow::of(&mut g, base, paging.mapped, reserved);
+        (win, paging.mapped, g.jit_pager())
+    };
+    let write = flags & temen_jit::PAGE_MISS_WRITE != 0;
+    let pageable = flags & temen_jit::PAGE_MISS_FATAL == 0;
+    let pg = win.page;
+    for page in off / pg..=(off + (len - 1)) / pg {
+        while !matches!(win.page_access(page), Some(w) if w || !write) {
+            let start = page * pg;
+            let own = start >= win.null_guard
+                && start < mapped
+                && !matches!(win.prot_get(page), Some(PageState::Backed { .. }));
+            let Some((pager, export)) = pager.as_ref().filter(|_| pageable && own) else {
+                return fault();
+            };
+            let sink = || {
+                temen_interp::PageSink::new(
+                    Box::new(PagedChild(win.clone())),
+                    start,
+                    pg.min(mapped - start),
+                    off.max(start) - start,
+                )
+            };
+            match request_page(pager, *export, sink, trap_out) {
+                None => return, // the trap cell unwinds the child
+                Some(r) if r < 0 => return fault(),
+                Some(_) => {} // supplied: check the page again
+            }
+        }
+    }
+}
+
+/// No window backend, so no paged child (the JIT does not build here anyway).
+#[cfg(not(any(unix, windows)))]
+pub unsafe extern "C" fn page_miss(vm: *mut temen_jit::VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {
+    *(*vm).trap_ptr() = temen_jit::TrapKind::MemoryFault as i64;
+}
+
+/// #2164 — a demand-paged JIT child's window as a page sink writes into it
+/// ([`temen_interp::ChildWindow`]): [`MprotectWindow::supply`].
+#[cfg(any(unix, windows))]
+struct PagedChild(MprotectWindow);
+
+// SAFETY: the window's base is only written by `supply`, at a settle of the request this sink was
+// filed with. Its child waits on that request until it is settled or withdrawn ([`request_page`]),
+// both under its pager's lock, so the window is live for every settle that reaches the sink.
+#[cfg(any(unix, windows))]
+unsafe impl Send for PagedChild {}
+
+#[cfg(any(unix, windows))]
+impl temen_interp::ChildWindow for PagedChild {
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool {
+        self.0.supply(page, bytes)
+    }
+}
+
+/// §2.2 / #2164 — the [`temen_jit::PagerAdmit`] hook: whether the spawner's program has a pager
+/// export `export` ([`Host::has_pager_export`]).
+///
+/// # Safety
+/// `ctx` is the live parent `*mut Host`.
+pub unsafe extern "C" fn pager_admit(ctx: *mut c_void, export: u32) -> i32 {
+    i32::from((*(ctx as *mut Host)).has_pager_export(export))
 }
 
 /// IMPORTS.md phase 3 / S2.1 — bind a spawned child module's import manifest against its freshly
@@ -3351,7 +3532,7 @@ pub unsafe extern "C" fn child_grant(
 /// build_detached`]): read `grants_n` 16-byte records `{name_off: u32, name_len: u32, handle: i32,
 /// flags: u32}` at window-relative `grants_ptr` and re-grant each record's copyable handle into a
 /// fresh child powerbox `Host` **under its name**, built through [`Host::spawn_detached_child`]: the
-/// child attests `window_exposed = false`, its starter caps span `child_size` = the window
+/// child attests `window_exposed = false` (unless paged, below), its starter caps span `child_size` = the window
 /// reservation (a root's shape; the JIT thunk passes it), and it gets what [`budget_mem_take`] just
 /// admitted it with: the lease's `budget` as its `"budget"`, the `runs` its window is paid for up
 /// to, and `lane`.
@@ -3360,6 +3541,10 @@ pub unsafe extern "C" fn child_grant(
 /// `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns `1` on
 /// success (`out` filled), `0` with `*trap_out` set otherwise. Frees nothing — the paired
 /// [`grant_child_release`] does.
+///
+/// §2.2 / #2164 — a `pager` export (not `u32::MAX`, checked by [`pager_admit`]) makes the child
+/// demand-paged: it attests its window exposed, its faults go to that export of this program, and
+/// its powerbox holds the access table its code checks (`out.pages`).
 ///
 /// # Safety
 /// `ctx` is the live parent `*mut Host`; `[mem_base, mem_base+mem_size)` is the parent's mapped window
@@ -3377,6 +3562,7 @@ pub unsafe extern "C" fn grant_detached_child_build(
     bytes: u64,
     runs: u64,
     lane: i64,
+    pager: u32,
     out: *mut temen_jit::GrantChild,
     trap_out: *mut i64,
 ) -> i32 {
@@ -3390,8 +3576,19 @@ pub unsafe extern "C" fn grant_detached_child_build(
         bytes,
         runs,
     };
-    let built = parent.spawn_detached_child(&grants, child_size, lease, lane);
-    finish_child_build(parent, built, out, trap_out)
+    let paged = pager != u32::MAX;
+    let built = parent.spawn_detached_child(&grants, child_size, lease, lane, paged);
+    // The pager is this program's export, served by this domain's own cell (a pager-capable program
+    // runs in one, `jit_proc::locked`); `bytes` is the declared window, which it supplies.
+    let paging = match paged.then(|| parent.own_cell()) {
+        None => None,
+        Some(Some(spawner)) => Some((spawner, pager, bytes)),
+        Some(None) => {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+    };
+    finish_child_build(parent, built, paging, out, trap_out)
 }
 
 /// PROCESS.md S1b/S1c — install the **canonical-key futex** region recorder on `host` over the window
@@ -3518,13 +3715,14 @@ unsafe fn window_aliases(
     #[cfg(any(unix, windows))]
     {
         install_region_hook(host, base, reserved);
-        let pages = host.start_window_pages(base as usize, shadow);
-        let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
-        // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
-        // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
-        wm.set_null_guard(temen_ir::module_null_guard());
-        wm.set_shadow(shadow);
+        host.start_window_pages(base as usize, shadow);
+        let mut wm = MprotectWindow::of(host, base, mapped, reserved);
         wm.seed_readonly(ro);
+        // §2.2 / #2164 — a demand-paged child's window starts unmapped, as on the interpreters:
+        // seeded, then demand-paged, then pre-mapped.
+        if wm.table.is_some() {
+            wm.demand_page();
+        }
         if host.apply_premap(&mut wm) < 0 {
             return 0;
         }
@@ -3634,10 +3832,12 @@ unsafe fn read_grant_records(
 
 /// Wrap a built child powerbox as the two counted shared refs the JIT expects: arm the wake signal,
 /// inherit the kill cell, fill `out`. `None` (a non-re-grantable handle) is the fail-closed
-/// `CapFault`.
+/// `CapFault`. `paging` makes it a demand-paged child (#2164): its spawner's cell, the pager export
+/// there, and the declared window's length.
 unsafe fn finish_child_build(
     parent: &Host,
     built: Option<(Host, i32, i32)>,
+    paging: Option<(Arc<Mutex<Host>>, u32, u64)>,
     out: *mut temen_jit::GrantChild,
     trap_out: *mut i64,
 ) -> i32 {
@@ -3660,6 +3860,28 @@ unsafe fn finish_child_build(
             // stamped) under the parent's.
             let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
             let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
+            // §2.2 / #2164 — a demand-paged child's access table: every page of its declared window
+            // unmapped until its window starts (`window_aliases`), and the page past it admitting
+            // everything, as the code that tests it expects.
+            let pages = paging.map(|(spawner, export, mapped)| {
+                use std::sync::atomic::AtomicU8;
+                let n = mapped.div_ceil(host_page_size()).max(1);
+                let table: Arc<[AtomicU8]> = (0..=n)
+                    .map(|p| {
+                        AtomicU8::new(if p == n {
+                            temen_ir::PAGE_READ | temen_ir::PAGE_WRITE
+                        } else {
+                            0
+                        })
+                    })
+                    .collect();
+                let paging = temen_interp::JitPaging {
+                    table: Arc::clone(&table),
+                    mapped,
+                };
+                child.set_jit_pager(spawner, export, paging);
+                table.as_ptr()
+            });
             let shared = child.into_cell();
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -3674,6 +3896,8 @@ unsafe fn finish_child_build(
                 lane_cap,
                 parent_domain,
                 parent_lane_cap,
+                // The child's powerbox holds the table, so the pointer lives as long as its code.
+                pages: pages.unwrap_or(core::ptr::null()),
             };
             1
         }
@@ -3721,6 +3945,7 @@ fn host_page_size() -> u64 {
 /// `base` must point at the JIT guest window: `[base, base+mapped)` initially RW and the whole
 /// `[base, base+reserved)` a live inaccessible/RW reservation owned for the call's duration.
 #[cfg(any(unix, windows))]
+#[derive(Clone)]
 pub struct MprotectWindow {
     base: *mut u8,
     mapped: u64,
@@ -3745,6 +3970,12 @@ pub struct MprotectWindow {
     /// interpreter's `prot_pages` refuses them. Empty, fencing nothing, until
     /// [`MprotectWindow::set_shadow`].
     shadow: temen_interp::ShadowArena,
+    /// #2164 — a demand-paged child's access table ([`temen_interp::JitPaging::table`]), which its
+    /// code tests before each access: every write of a declared-window page's state here writes its
+    /// byte too, so the two always agree. Its declared window is committed read-write (an unsupplied
+    /// page too), so the table, not the hardware, gates its accesses there; host code still trusts
+    /// this map. `None` for any other window.
+    table: Option<Arc<[std::sync::atomic::AtomicU8]>>,
 }
 
 #[cfg(any(unix, windows))]
@@ -3781,7 +4012,31 @@ impl MprotectWindow {
             prot,
             null_guard: 0,
             shadow: temen_interp::ShadowArena::EMPTY,
+            table: None,
         }
+    }
+
+    /// The view of `host`'s window `[base, base + mapped)`, in a `reserved` reservation, that every
+    /// host-side path takes: the per-run page map, the NULL guard (#964), the runtime-private pages
+    /// of its module (#2426), and a demand-paged child's access table (#2164).
+    fn of(host: &mut Host, base: *mut u8, mapped: u64, reserved: u64) -> MprotectWindow {
+        let pages = host.cap_window_pages(base as usize);
+        let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
+        // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to
+        // page ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
+        // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
+        // #13: the guard is UNCONDITIONAL, a constant of the layout, not per-run state). It used to
+        // come from `Host::null_guard()`, which only became non-zero as a side effect of
+        // `set_self_module` — so an embedder that never registered a self module ran the JIT with
+        // guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
+        // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is
+        // `-EINVAL` on the interpreter and `0` on the JIT.
+        wm.set_null_guard(temen_ir::module_null_guard());
+        // #2426: and the runtime-private pages of a durable module's window, as its start recorded
+        // them.
+        wm.set_shadow(host.cap_window_shadow());
+        wm.table = host.jit_paging().map(|p| p.table);
+        wm
     }
 
     /// #2426: install the shadow arena the window's module declared (see the `shadow` field).
@@ -3851,7 +4106,8 @@ impl MprotectWindow {
         let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
         for &[start, end] in ro.iter().filter(|r| r[1] > r[0]) {
             for page in (start / self.page).max(guard)..end.div_ceil(self.page).min(prefix) {
-                map.entry(page).or_insert(PageState::Ro);
+                let st = *map.entry(page).or_insert(PageState::Ro);
+                self.mirror(page, st.access());
             }
         }
     }
@@ -3863,10 +4119,63 @@ impl MprotectWindow {
     /// Set one page's explicit state in the shared map.
     fn prot_set(&self, page: u64, st: PageState) {
         self.prot.lock().unwrap().insert(page, st);
+        self.mirror(page, st.access());
     }
     /// Clear one page back to the region default (absent).
     fn prot_clear(&self, page: u64) {
         self.prot.lock().unwrap().remove(&page);
+        // The default is read-write in the declared window, the only pages the table holds.
+        self.mirror(page, temen_ir::PAGE_READ | temen_ir::PAGE_WRITE);
+    }
+
+    /// #2164 — write declared-window page `page`'s `access` into the access table, after its state in
+    /// the map: a supply's bytes, and a map's zeroes, are in place before a vCPU that reads the byte
+    /// can reach them.
+    fn mirror(&self, page: u64, access: u8) {
+        if let Some(t) = &self.table {
+            // The last byte is the page past the declared window, which admits every access.
+            if let Some(b) = t
+                .get(page as usize)
+                .filter(|_| (page as usize) < t.len() - 1)
+            {
+                b.store(access, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    /// §2.2 / #2164 — mark the declared window's pages unmapped, demand-paging it, as the
+    /// interpreters' `Mem::demand_page` does: every one but those the runtime keeps its words on
+    /// (#2438), which are never the pager's to supply and keep their state. The table, all unmapped
+    /// until now, takes every page's.
+    fn demand_page(&self) {
+        let pages = self.mapped.div_ceil(self.page).max(1);
+        let mut map = self.prot.lock().unwrap_or_else(|e| e.into_inner());
+        for page in 0..pages {
+            let st = if self.shadow.fences(page, page, self.page) {
+                map.get(&page).copied().unwrap_or(PageState::Rw)
+            } else {
+                map.insert(page, PageState::Unmapped);
+                PageState::Unmapped
+            };
+            self.mirror(page, st.access());
+        }
+    }
+
+    /// §2.2 / #2164 — supply a demand-paged page: commit it read-write, write `bytes` at its base
+    /// `page`, then make it the window's own read-write page, in that order (see [`Self::mirror`]).
+    /// Its hardware is read-write unless the guest narrowed it, and committing a committed page is a
+    /// no-op. `false` when the OS refused the commit (`vm.max_map_count`, #2268), and nothing changed.
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool {
+        if !self.hw_protect(page, self.page, 3) {
+            return false;
+        }
+        // SAFETY: `[page, page + bytes.len())` is one page of the declared window (the sink's
+        // length), inside the reservation `base` owns, and committed read-write just above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(page as usize), bytes.len())
+        };
+        self.prot_clear(page / self.page);
+        true
     }
 
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed — the
@@ -5755,32 +6064,6 @@ fn module_nests(m: &temen_ir::Module) -> bool {
     })
 }
 
-/// CONSOLIDATION.md §2.2/§3, #744: the module could build a **pager** record — it uses the §3
-/// config-record spawn (op 17) and declares a pager-shaped export ([`Module::declares_pager`], the
-/// one predicate spawn validation checks too). The record's `pager` field is runtime data, so such a
-/// module folds: the JIT has no native arm for the fault seam (#2164), and its op-17 thunk
-/// `CapFault`s any pager. It folds to the bytecode engine, which pages a child itself. A module with
-/// no pager-shaped export cannot build a valid pager record — every engine refuses one identically —
-/// so it runs natively through the `instantiate_rec` thunk, serving its own children if it serves
-/// (#744).
-fn module_demand_spawns(m: &temen_ir::Module) -> bool {
-    m.declares_pager()
-        && m.funcs.iter().any(|f| {
-            f.blocks.iter().any(|b| {
-                b.insts.iter().any(|i| {
-                    matches!(
-                        i,
-                        temen_ir::Inst::CapCall {
-                            type_id: 6,
-                            op: 17,
-                            ..
-                        }
-                    )
-                })
-            })
-        })
-}
-
 /// Whether `m` spawns a **detached** child (`Instantiator` op 17, the record): a spawn
 /// that may grant the child a live offer back into its spawner (#744, [`jit_proc::locked`]).
 fn spawns_detached(m: &Module) -> bool {
@@ -5849,11 +6132,10 @@ fn module_serves(m: &Module) -> bool {
 }
 
 /// The **one** definition of the JIT routing fold (INVARIANTS #9: a veto composition must not
-/// have per-site copies — #897 found the reactor path had silently dropped the
-/// `module_demand_spawns` clause). True when a `Backend::Jit` run must leave the Cranelift JIT:
-/// the module is pager-capable (`module_demand_spawns` — the JIT's op-17 thunk `CapFault`s any
-/// nonzero pager on the assumption this fold routed it away), or it statically serves without
-/// being serve-qualified or nesting (the oracle's serve arm has the fiber-park machinery).
+/// have per-site copies — #897 found the reactor path had silently dropped a clause). True when a
+/// `Backend::Jit` run must leave the Cranelift JIT: the module statically serves without being
+/// serve-qualified or nesting (the oracle's serve arm has the fiber-park machinery). A module that
+/// could page a child no longer folds: the JIT pages a child itself (#2164).
 ///
 /// Fold **down the ladder, not straight to the tree-walker** (owner decision 2026-08-13, #891):
 /// callers fold to [`Backend::Bytecode`], whose own compile gate decides the final landing —
@@ -5861,10 +6143,7 @@ fn module_serves(m: &Module) -> bool {
 /// back to the tree-walker for the rest, so a legitimate short-circuit (a shape bytecode also
 /// declines) collapses the ladder by construction rather than by caller assumption.
 fn folds_to_oracle(m: &temen_ir::Module) -> bool {
-    module_demand_spawns(m)
-        || (module_serves(m)
-            && !temen_interp::bytecode::serve_qualifies(&m.funcs)
-            && !module_nests(m))
+    module_serves(m) && !temen_interp::bytecode::serve_qualifies(&m.funcs) && !module_nests(m)
 }
 
 /// Fold an interpreter result (`TreeWalk`/`Bytecode`) into an [`Outcome`]: a clean return, an
@@ -7951,8 +8230,8 @@ impl Instance {
         // points, no park-capable seams — `bytecode::serve_qualifies`, the same predicate the
         // bytecode engine's compile veto applies) now runs its serve loop natively on the JIT
         // (the cap thunk's serve loop, #2166). Everything else `folds_to_oracle` catches — op-14
-        // offer mints, park-capable servers, pager-capable spawners — leaves the JIT down the
-        // ladder: bytecode first, whose compile gate falls the rest through to the tree-walker.
+        // offer mints, park-capable servers — leaves the JIT down the ladder: bytecode first, whose
+        // compile gate falls the rest through to the tree-walker.
         let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
             Backend::Bytecode
         } else {
@@ -8421,9 +8700,7 @@ fn run_capture_on(
 ) -> Result<(Outcome, Vec<u8>), String> {
     // §3.6 behavioral parity (reactor path): the same routing as `Instance::run_with_caps` —
     // now by construction (`folds_to_oracle`, one definition). This path once hand-copied the
-    // composition and silently dropped the `module_demand_spawns` clause (#897): a pager-capable
-    // module on a Jit `Session` hit the op-17 thunk's `CapFault` arm — whose soundness comment
-    // assumes this very fold routed it away — instead of the oracle's demand paging.
+    // composition and silently dropped a clause of it (#897).
     let backend = if matches!(backend, Backend::Jit) && folds_to_oracle(m) {
         Backend::Bytecode
     } else {
@@ -8788,24 +9065,15 @@ mod file_region_tests {
 mod routing_tests {
     //! #897 — the JIT routing fold is **one definition** (`folds_to_oracle`) consumed by the
     //! batch (`Instance::run_with_caps`), reactor (`run_capture_on`), and cache
-    //! (`PowerboxProgram::new`) paths alike. The reactor path once hand-copied the composition
-    //! minus the `module_demand_spawns` clause, so a pager-capable module on a Jit `Session` hit
-    //! the op-17 thunk's `CapFault` (`temen-jit/src/instantiator_rt.rs` documents that arm as sound
-    //! *because* this fold routes pager records off the JIT) instead of the oracle's demand paging.
-    //!
-    //! The regression is guarded here at the predicate: `folds_to_oracle` must fold a demand-spawn
-    //! module, and all three sites now call that one function, so a dropped clause fails this test.
-    //! End-to-end demand-pager execution across the three backends (the record actually serving a
-    //! fault and returning 1123) is covered separately by
-    //! `crates/temen/tests/instantiate_record.rs::record_spawn_carries_the_pager_binding`, through
-    //! the public `Instance::run_with_caps` grant path — reproducing a working pager host by hand
-    //! here would duplicate that coverage without adding routing-parity guard value.
+    //! (`PowerboxProgram::new`) paths alike: a clause one site dropped once (#897) cannot drift
+    //! between them. These pin what the predicate answers. End-to-end paging on every driver is
+    //! `crates/temen/tests/instantiate_record.rs`'s pager suite.
     use super::*;
 
-    /// A minimal module that `module_demand_spawns` classifies as pager-capable: an op-17
-    /// `Instantiator` record-spawn plus an impl export (the record's `pager` field is runtime
-    /// data, so any module that *could* name one of its exports as a pager folds off the JIT).
-    /// The body is never executed by this test — only the static routing predicate is checked.
+    /// A minimal module that could page a child: an op-17 `Instantiator` record-spawn plus a
+    /// pager-shaped export (the record's `pager` field is runtime data, so any module that *could*
+    /// name one of its exports as a pager). The body is never executed by this test — only the
+    /// static routing predicate is checked.
     fn demand_spawn_module() -> Module {
         let src = r#"memory 17
 type 0 func (i64) -> (i64)
@@ -8836,19 +9104,13 @@ block 0 (vaddr: i64) {
         m
     }
 
+    /// #2164 — a module that could page a child runs on the JIT, which pages a child itself. It
+    /// used to fold to the bytecode engine, and the JIT's op 17 refused a pager record.
     #[test]
-    fn demand_spawn_module_folds_off_the_jit() {
+    fn a_module_that_could_page_a_child_runs_on_the_jit() {
         let m = demand_spawn_module();
-        // The exact clause #897 restored: a pager-capable module is demand-spawn-classified,
-        // and the one shared routing predicate folds it off the JIT.
-        assert!(
-            module_demand_spawns(&m),
-            "op-17 + impl exports is pager-capable"
-        );
-        assert!(
-            folds_to_oracle(&m),
-            "the one routing predicate (all three call sites) folds it off the JIT"
-        );
+        assert!(m.declares_pager(), "the fixture declares a pager export");
+        assert!(!folds_to_oracle(&m), "the JIT pages its children itself");
     }
 
     /// #744 — a parent that serves its own children: an op-17 spawn and a `svc.wait`, with an export
@@ -8883,7 +9145,6 @@ block 0 (va: i64, vb: i64) {
         let m = temen_text::parse_module(src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         assert!(!m.declares_pager(), "an `exec` export is not a pager");
-        assert!(!module_demand_spawns(&m), "so the record cannot name one");
         assert!(!folds_to_oracle(&m), "and the JIT runs the parent itself");
     }
 

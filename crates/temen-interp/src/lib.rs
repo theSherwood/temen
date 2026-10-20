@@ -16,7 +16,7 @@ pub mod moment;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -5440,13 +5440,26 @@ struct PagerRef {
     export: u32,
 }
 
+/// #2164 — a demand-paged Cranelift JIT child's window, as its powerbox keeps it
+/// ([`Host::jit_paging`]): what its embedder's page sinks, page map and miss thunk need of it.
+#[derive(Clone)]
+pub struct JitPaging {
+    /// The **access table**: one byte per page of the declared window (`temen_ir::PAGE_READ`,
+    /// `temen_ir::PAGE_WRITE`), and one more for the page past it, which admits every access. The
+    /// child's code tests it before each access, and the window's page map, which it mirrors, writes
+    /// it.
+    pub table: Arc<[AtomicU8]>,
+    /// The declared window's length: the extent its pager supplies.
+    pub mapped: u64,
+}
+
 /// §2.2 / #1862 — where a pager's reply lands: a view of the faulting child's window and the page
 /// (child-relative) the reply supplies. The pager never addresses the child's memory; the runtime
-/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see. Both
-/// interpreters file and settle it through the pager's host ([`Host::request_page`],
-/// [`Host::settle_page`], #2164).
-struct PageSink {
-    child: Mem,
+/// copies its bytes here at the settle, so the child may sit in a window the pager cannot see. Every
+/// engine files and settles it through the pager's host ([`Host::request_page`],
+/// [`Host::settle_page`], #2164), whichever engine runs the pager and whichever runs the child.
+pub struct PageSink {
+    child: Box<dyn ChildWindow>,
     /// The page's child-relative base.
     page: u64,
     /// The page's length: one host page, or less when the window is smaller than a page.
@@ -5456,15 +5469,45 @@ struct PageSink {
     off: u64,
 }
 
+/// #2164 — the faulting child's window, as a [`PageSink`] writes a supplied page into it: an
+/// interpreter's [`Mem`], or the Cranelift JIT's window, which its embedder implements (temen-run).
+pub trait ChildWindow: Send {
+    /// Write `bytes` at the child-relative page base `page`, then make the page read-write, in that
+    /// order, so no vCPU of the child sees the page mapped before its bytes are in place. `false`
+    /// when the window could not take the page (its OS refused to commit it), and then the fault is
+    /// fatal.
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool;
+}
+
+impl ChildWindow for Mem {
+    fn supply(&self, page: u64, bytes: &[u8]) -> bool {
+        self.supply_page(page, bytes);
+        true
+    }
+}
+
 impl PageSink {
     /// The sink for a recoverable fault at `addr` in `child`'s window: the host page around it.
+    /// [`Mem::take_fault`] admits only a page of the declared window, so the page starts below
+    /// `mapped`.
     fn at(child: &Mem, addr: u64) -> PageSink {
         let page = addr / child.page * child.page;
-        PageSink {
-            child: child.fork_for_thread(),
+        PageSink::new(
+            Box::new(child.fork_for_thread()),
             page,
-            len: child.page.min(child.window.mapped() - page),
-            off: addr - page,
+            child.page.min(child.window.mapped() - page),
+            addr - page,
+        )
+    }
+
+    /// The sink for a recoverable fault in `child`: the page at child-relative `page`, `len` bytes of
+    /// it (one host page, or less when the window is smaller), with the fault address `off` into it.
+    pub fn new(child: Box<dyn ChildWindow>, page: u64, len: u64, off: u64) -> PageSink {
+        PageSink {
+            child,
+            page,
+            len,
+            off,
         }
     }
 
@@ -5474,19 +5517,16 @@ impl PageSink {
     /// `[value - off, value - off + len)`. Returns the value to deliver: unchanged, or `EFAULT`
     /// when the pager's window cannot supply that range (the child's fault is then fatal, as a
     /// pagerless one is).
-    fn supply(self, value: i64, pager_mem: Option<&Mem>) -> i64 {
+    fn supply(self, value: i64, pager_mem: Option<&dyn GuestMem>) -> i64 {
         if value < 0 {
             return value;
         }
         let bytes = (value as u64)
             .checked_sub(self.off)
-            .and_then(|src| pager_mem?.read_bytes_impl(src, self.len));
+            .and_then(|src| pager_mem?.read_bytes(src, self.len));
         match bytes {
-            Some(b) => {
-                self.child.supply_page(self.page, &b);
-                value
-            }
-            None => EFAULT,
+            Some(b) if self.child.supply(self.page, &b) => value,
+            _ => EFAULT,
         }
     }
 }
@@ -14474,12 +14514,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let pager_ref = if rec.pager == u32::MAX {
                                 None
                             } else {
-                                let ok = host
-                                    .lock_unpoisoned()
-                                    .self_module
-                                    .as_ref()
-                                    .is_some_and(|sm| sm.is_pager_export(rec.pager));
-                                if !ok {
+                                if !host.lock_unpoisoned().has_pager_export(rec.pager) {
                                     return Err(Trap::CapFault);
                                 }
                                 Some((Arc::clone(host), rec.pager))
@@ -14893,7 +14928,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let value = host.lock_unpoisoned().settle_page(
                                         run.ticket,
                                         value,
-                                        mem.as_ref(),
+                                        mem.as_ref().map(|m| m as _),
                                     );
                                     sched.cap_reply_or_stash(run.ticket, value, host);
                                 }
@@ -23424,11 +23459,18 @@ pub struct Host {
     /// a freeze holds a pager until its paged children have unwound, so no request is in flight
     /// at the cut (#2455).
     page_sinks: BTreeMap<u64, PageSink>,
-    /// §2.2 / #2164 — the bytecode engine's pager edge, on a demand-paged detached child's
-    /// powerbox: the export, on its spawner's program, whose `page` op supplies this domain's
-    /// window, served by its spawner's domain. A recoverable fault in the window is a request to it.
-    /// (The tree-walker keeps its edge on the vCPU, [`VCpu::pager`].)
+    /// §2.2 / #2164 — the pager edge of a demand-paged detached child's powerbox, on the bytecode
+    /// engine and the Cranelift JIT: the export, on its spawner's program, whose `page` op supplies
+    /// this domain's window, served by its spawner's domain. A recoverable fault in the window is a
+    /// request to it. (The tree-walker keeps its edge on the vCPU, [`VCpu::pager`].)
     pager: Option<u32>,
+    /// #2164 — a demand-paged Cranelift JIT child's spawner: the cell its faults' requests go to
+    /// ([`Host::jit_pager`]). The bytecode engine finds the spawner through its task tree instead.
+    /// Taken at the child's end, which releases the pager's `svc.wait` (#1217).
+    jit_pager: Option<Arc<Mutex<Host>>>,
+    /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]). It lives as long as the
+    /// powerbox, as the code that reads its access table does.
+    jit_paging: Option<JitPaging>,
     svc_next_ticket: u64,
     /// CALLS.md 4d — **direct-handoff** mode (the §10.2 arm-4 optimization). When set on the domain
     /// that becomes the root of a run, [`drive_arc`] copies it into the run-global
@@ -24288,6 +24330,8 @@ impl Host {
             svc_results: BTreeMap::new(),
             page_sinks: BTreeMap::new(),
             pager: None,
+            jit_pager: None,
+            jit_paging: None,
             reply_waits: BTreeMap::new(),
             frozen_handlers: BTreeMap::new(),
             svc_next_ticket: 0,
@@ -28553,7 +28597,7 @@ impl Host {
     /// fault address `sink`'s, and file `sink`, where its reply lands. One lock of this host covers
     /// both, so the pager cannot settle the request before its sink exists. `None` when the queue
     /// is full: backpressure, and the child re-faults.
-    fn request_page(&mut self, export: u32, sink: PageSink) -> Option<u64> {
+    pub fn request_page(&mut self, export: u32, sink: PageSink) -> Option<u64> {
         let addr = sink.page + sink.off;
         let ticket = self.svc_enqueue(export, 0, vec![addr as i64])?;
         self.page_sinks.insert(ticket, sink);
@@ -28564,15 +28608,63 @@ impl Host {
     /// request's page moves from the pager's window `pager_mem`, the serving vCPU's, into its
     /// child's ([`PageSink::supply`]). The settle runs before the reply is delivered, so the pager
     /// cannot reuse its buffer before the copy, and the child cannot run before its page is in
-    /// place. Returns the value to deliver; any other dispatch's passes through. Out of line: both
-    /// interpreters' serve loops call it at every settle, and its copy would otherwise grow their
-    /// op loops.
+    /// place. Returns the value to deliver; any other dispatch's passes through. Out of line: every
+    /// engine's serve loop calls it at every settle, and its copy would otherwise grow the
+    /// interpreters' op loops.
     #[inline(never)]
-    fn settle_page(&mut self, ticket: u64, value: i64, pager_mem: Option<&Mem>) -> i64 {
+    pub fn settle_page(
+        &mut self,
+        ticket: u64,
+        value: i64,
+        pager_mem: Option<&dyn GuestMem>,
+    ) -> i64 {
         match self.page_sinks.remove(&ticket) {
             Some(sink) => sink.supply(value, pager_mem),
             None => value,
         }
+    }
+
+    /// #2164 — withdraw page request `ticket`, whose child stopped waiting for it (a kill, or its
+    /// run's teardown): its dispatch, its sink and any reply. The Cranelift JIT's sink writes into
+    /// the child's window, which goes with the child, so no settle may reach it afterwards; this
+    /// host's lock orders the two.
+    pub fn abandon_page(&mut self, ticket: u64) {
+        self.svc_queue.retain(|d| d.ticket != ticket);
+        self.page_sinks.remove(&ticket);
+        self.svc_results.remove(&ticket);
+    }
+
+    /// §2.2 — whether this domain's program has a pager export `export`: a `{ page: (i64) -> (i64)
+    /// }` interface, the only one a spawn record may name to supply its child's pages (#744, #1862).
+    /// Every engine's op 17 checks a record's pager here, before anything else of the record.
+    pub fn has_pager_export(&self, export: u32) -> bool {
+        self.self_module
+            .as_ref()
+            .is_some_and(|sm| sm.is_pager_export(export))
+    }
+
+    /// #2164 — make this Cranelift JIT child's powerbox a demand-paged one: its faults go to export
+    /// `export` of `spawner`'s program, over the window `paging` describes.
+    pub fn set_jit_pager(&mut self, spawner: Arc<Mutex<Host>>, export: u32, paging: JitPaging) {
+        self.pager = Some(export);
+        self.jit_pager = Some(spawner);
+        self.jit_paging = Some(paging);
+    }
+
+    /// #2164 — a demand-paged Cranelift JIT child's pager: its spawner's cell and the export there,
+    /// until the child's end takes it ([`Host::take_jit_pager`]).
+    pub fn jit_pager(&self) -> Option<(Arc<Mutex<Host>>, u32)> {
+        Some((Arc::clone(self.jit_pager.as_ref()?), self.pager?))
+    }
+
+    /// #2164 — the child has ended: its pager, to release (#1217).
+    pub fn take_jit_pager(&mut self) -> Option<Arc<Mutex<Host>>> {
+        self.jit_pager.take()
+    }
+
+    /// #2164 — a demand-paged Cranelift JIT child's window ([`JitPaging`]).
+    pub fn jit_paging(&self) -> Option<JitPaging> {
+        self.jit_paging.clone()
     }
 
     /// Take a served dispatch's result (first result slot; `0` for a no-result handler).
@@ -30968,9 +31060,9 @@ impl Host {
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: each of `grants` (a list of
     /// `(name, handle)`) re-granted under its name, so the child discovers them by `self.resolve`
     /// (stdout/stderr grants share the spawner's sinks), or `None` if any handle is forged or not
-    /// re-grantable — the whole spawn fails closed. The child is never paged, so it attests
-    /// `window_exposed = false` (no ancestor below the platform holds rights over its minted window),
-    /// and its starter caps span `reservation` — the whole window reservation, a root's shape, so the
+    /// re-grantable — the whole spawn fails closed. It attests `window_exposed = false` (no ancestor
+    /// below the platform holds rights over its minted window) unless it is `paged`: its spawner pages
+    /// it (#2095, #2164). Its starter caps span `reservation` — the whole window reservation, a root's shape, so the
     /// child's `vm_map` grows it. The native JIT's op-17 thunk builds the child powerbox through this
     /// (`temen_run::grant_detached_child_build`), so both backends stamp the same attestation and caps. `lease` and `lane` are what the admission
     /// before this build ([`Self::admit_detached_spawn`]) charged and reserved for the child.
@@ -30980,9 +31072,10 @@ impl Host {
         reservation: u64,
         lease: Lease,
         lane: i64,
+        paged: bool,
     ) -> Option<(Host, i32, i32)> {
-        // A pager record reaches only the tree-walker's arm, so this child is never paged.
-        let attestation = self.detached_child_attestation(false);
+        // #2095 — a paged child's window is exposed to its spawner, which pages it.
+        let attestation = self.detached_child_attestation(paged);
         // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
         // op-17 arm sets it (this builder is the native path's twin of that arm).
         // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
@@ -34253,11 +34346,23 @@ impl Mem {
     /// [`confine_checked`]), clearing it: the access's first byte in the page that refused it, the
     /// page to supply (#2469). `None` if the last `MemoryFault` was an out-of-window fault (a real
     /// trap), not a recoverable page fault.
+    ///
+    /// #2164 — `None` too when the refused page is not one a pager supplies: one at or past the
+    /// declared window, whose tail is the guest's growth room ([`Mem::demand_page`]), or a §13 alias,
+    /// whose bytes are its region's. Every engine's pager supplies only the window's own declared
+    /// pages, so a fault on any other is fatal, as it is in a window with no pager.
     fn take_fault(&self) -> Option<u64> {
-        match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
-            NO_FAULT => None,
-            _ => Some(self.refused_at.load(Ordering::Relaxed)),
+        if self.last_fault.swap(NO_FAULT, Ordering::Relaxed) == NO_FAULT {
+            return None;
         }
+        let at = self.refused_at.load(Ordering::Relaxed);
+        let page = at / self.page;
+        let own = page * self.page < self.window.mapped()
+            && !matches!(
+                self.space_read().prot.get(&page),
+                Some(PageProt::Backed { .. })
+            );
+        own.then_some(at)
     }
 
     /// The guest address of the run's last **fatal** memory fault (a NULL deref reads back as `0`), for
@@ -40196,7 +40301,7 @@ mod signal_door_claim_tests {
         };
         let grants = [("first".to_string(), first), ("full".to_string(), full)];
         assert!(h
-            .spawn_detached_child(&grants, 1 << 16, lease, -1)
+            .spawn_detached_child(&grants, 1 << 16, lease, -1, false)
             .is_none());
         assert_eq!(
             abandoned.load(Ordering::SeqCst),

@@ -376,6 +376,28 @@ pub enum PageState {
     },
 }
 
+impl PageState {
+    /// The page's entry in a demand-paged JIT child's access table (#2164): [`PAGE_READ`] when
+    /// guest code may load from the page, with [`PAGE_WRITE`] when it may store to it too.
+    pub fn access(self) -> u8 {
+        match self {
+            PageState::Rw | PageState::Backed { writable: true, .. } => PAGE_READ | PAGE_WRITE,
+            PageState::Ro
+            | PageState::Backed {
+                writable: false, ..
+            } => PAGE_READ,
+            PageState::Unmapped => 0,
+        }
+    }
+}
+
+/// #2164 — a demand-paged Cranelift JIT child's **access table**: one byte per page of its declared
+/// window, which its code tests before each access, and which mirrors the window's page map. The
+/// bit a load needs.
+pub const PAGE_READ: u8 = 1;
+/// The bit a store needs (see [`PAGE_READ`]).
+pub const PAGE_WRITE: u8 = 2;
+
 /// The **trap wire code** (#1735): how every engine, thunk and embedder status says *which* trap
 /// ended a run. One numbering, here — the wire-IR crate every engine already depends on — as
 /// [`errno`] is for error values: the interpreters' `Trap::code`/`Trap::from_code`, the Cranelift

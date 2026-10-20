@@ -247,6 +247,56 @@ fn gc_roots_scans_suspended_fiber_stack_on_the_jit() {
     );
 }
 
+/// A roots buffer that runs off the top of the window is a `MemoryFault` on both backends: the
+/// interpreter's checked buffer write refuses it, and so does the JIT's bound check, which raised
+/// `FiberFault` instead. The program is [`gc_roots_scans_suspended_fiber_stack_on_the_jit`]'s, so
+/// each backend finds the fiber's root and writes, with the buffer at `-4`: confinement keeps its low
+/// bits, the last 4 bytes of the window, and the 8-byte root does not fit.
+#[cfg(any(
+    all(unix, target_arch = "x86_64"),
+    all(unix, target_arch = "aarch64"),
+    all(windows, target_arch = "x86_64")
+))]
+#[test]
+fn gc_roots_buffer_past_the_window_is_a_memory_fault() {
+    use temen_jit::{compile_and_run, JitOutcome, TrapKind};
+    let src = "memory 16\n\
+        func () -> (i64) {\n\
+        block 0 () {\n\
+        \x20 v0 = ref.func 1\n\
+        \x20 v1 = i64.const 4096\n\
+        \x20 v2 = cont.new v0 v1\n\
+        \x20 v3 = i64.const 28752\n\
+        \x20 v4, v5 = cont.resume v2 v3\n\
+        \x20 v6 = i64.const 28752\n\
+        \x20 v7 = i64.const 28753\n\
+        \x20 v8 = i64.const -4\n\
+        \x20 v9 = i64.const 8\n\
+        \x20 vmask = i64.const -1\n\
+        \x20 v10 = gc.roots v6 v7 vmask v8 v9\n\
+        \x20 return v10\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 0\n\
+        \x20 v3 = suspend v2\n\
+        \x20 return v1\n\
+          }\n\
+        }\n";
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).expect("verify");
+    let mut fuel = 1_000_000u64;
+    assert_eq!(
+        run(&m, 0, &[], &mut fuel),
+        Err(temen_interp::Trap::MemoryFault)
+    );
+    assert!(matches!(
+        compile_and_run(&m, 0, &[]).expect("jit compile/run"),
+        JitOutcome::Trapped(TrapKind::MemoryFault)
+    ));
+}
+
 /// **`gc.roots` captures caller roots parked in callee-saved registers** — the register-flush path
 /// (`fiber_rt::temen_gc_roots_flush`). The Tail ABI preserves the callee-saved registers, so under
 /// register pressure Cranelift keeps some values live-across-a-call in them rather than spilling. The

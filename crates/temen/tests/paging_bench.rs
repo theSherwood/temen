@@ -280,3 +280,212 @@ fn wasm_jit_lane_folds_closed_today() {
          probe (and to the fault-service table) instead of relying on the fold"
     );
 }
+
+/// #2164 — what a demand-paged child pays on the Cranelift JIT once its pages are in: the access
+/// table's check before each access. Its child sums the 8-byte words of a 256 KiB span `passes`
+/// times, in order or in a scattered order (`scatter`); spawned with a pager, its first pass pages
+/// the span in (64 faults on 4 KiB pages), and every access tests the table. A pager parent serves
+/// until its `svc.wait` answers 0 (its client is gone, #1217); either parent then exits the child's
+/// sum.
+fn steady_program(paged: bool, scatter: bool, passes: u64) -> String {
+    let words = 32_768u64; // 256 KiB
+                           // An unpaged child never calls its parent, so nothing would end the parent's `svc.wait`.
+    let serve = if paged {
+        "  vz = i32.const 0\n  vw = svc.wait vz\n  vz64 = i64.const 0\n  vgone = i64.eq vw vz64\n  \
+         br_if vgone 2(vh1, vch1) 1(vh1, vch1)\n"
+    } else {
+        "  br 2(vh1, vch1)\n"
+    };
+    let index = if scatter {
+        // An odd multiplier modulo a power of two: a permutation of the span's words.
+        "  vmul = i64.const 40503\n  vix = i64.mul vi vmul\n  vmsk = i64.const 32767\n  \
+         vj = i64.and vix vmsk\n"
+    } else {
+        "  vj = i64.add vi vzero\n"
+    };
+    format!(
+        "\
+memory 20
+data 16384 \"vm\"
+data 16400 \"budget\"
+data 16416 \"child\"
+{rec}{exit}type 0 func (i64) -> (i64)
+type 1 interface {{ page: 0 }}
+export 0 interface \"pager\" 1 {{ page: 2 }}
+import 0 \"exit\" (i32) -> ()
+
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vrb = i64.const 17548
+  i32.store vrb vb
+  vcp = i64.const 16416
+  vcl = i64.const 5
+  vcm = self.resolve vcp vcl
+  vrm = i64.const 17544
+  i32.store vrm vcm
+  vra = i64.const 17536
+  vch = call.cap 6 17 (i64) -> (i32) vh (vra)
+  br 1(vh, vch)
+}}
+block 1 (vh1: i32, vch1: i32) {{
+{serve}}}
+block 2 (vh2: i32, vch2: i32) {{
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh2 (vch2)
+  vc = i32.wrap_i64 vj
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vr0 = i64.const 0
+  vacc0 = i64.const 0
+  br 1(vr0, vacc0)
+}}
+block 1 (vr: i64, vacc: i64) {{
+  vi0 = i64.const 0
+  br 2(vr, vacc, vi0)
+}}
+block 2 (vr2: i64, vacc2: i64, vi: i64) {{
+  vzero = i64.const 0
+{index}  veight = i64.const 8
+  voff = i64.mul vj veight
+  vbase = i64.const 16384
+  vaddr = i64.add vbase voff
+  vw = i64.load vaddr
+  vacc3 = i64.add vacc2 vw
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vn = i64.const {words}
+  vmore = i64.lt_s vi2 vn
+  br_if vmore 2(vr2, vacc3, vi2) 3(vr2, vacc3)
+}}
+block 3 (vr3: i64, vacc4: i64) {{
+  vone3 = i64.const 1
+  vr4 = i64.add vr3 vone3
+  vpasses = i64.const {passes}
+  vagain = i64.lt_s vr4 vpasses
+  br_if vagain 1(vr4, vacc4) 4(vacc4)
+}}
+block 4 (vaccf: i64) {{
+  return vaccf
+  }}
+}}
+
+func 2 (i64) -> (i64) {{
+block 0 (vaddr: i64) {{
+  vbuf = i64.const 524288
+  vsrc = i64.add vaddr vbuf
+  vb = i32.const {byte}
+  i32.store8 vsrc vb
+  return vsrc
+  }}
+}}
+",
+        rec = rec::segment(
+            17536,
+            &SpawnRec {
+                pager: if paged { 0 } else { u32::MAX },
+                grants_ptr: 16448,
+                grants_n: 1,
+                ..SpawnRec::default()
+            }
+        ),
+        exit = rec::empty_grant(16448, 16432, "exit"),
+        byte = PAGE_BYTE,
+    )
+}
+
+/// [`run`] over a 1 MiB child window.
+fn run_steady(backend: Backend, src: &str) -> i32 {
+    let m = parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let child = temen_ir::child_image_at(&m, 1).expect("child image");
+    let registry = Imports::new().provide("exit", HostCap::exit());
+    let inst = instantiate_with_imports(m, registry).expect("instantiate");
+    let r = inst
+        .run_with_caps(
+            backend,
+            &RunConfig::default(),
+            &[
+                ("vm", HostCap::custom(6, 0, |h, _| h.grant_instantiator())),
+                ("budget", HostCap::detached_budget(1 << 21)),
+                (
+                    "child",
+                    HostCap::custom(temen_ir::cap_id::MODULE, 0, move |h, _| {
+                        h.grant_module(&child)
+                    }),
+                ),
+            ],
+        )
+        .unwrap_or_else(|e| panic!("{backend:?}: {e}"));
+    match r.outcome {
+        Outcome::Exited(code) => code,
+        other => panic!("{backend:?}: unexpected outcome {other:?}"),
+    }
+}
+
+/// #2164 — the steady-state probe: a paged child's accesses on the JIT, against the same child
+/// unpaged, best of 7 runs each. Ignored (timing is machine-dependent).
+#[test]
+#[ignore = "perf probe — run with --ignored --nocapture"]
+fn paged_access_overhead() {
+    let passes = 4000u64;
+    let accesses = (passes * 32_768) as f64;
+    println!(
+        "\npaged child's accesses on the JIT, once its pages are in — {passes} passes of 256 KiB"
+    );
+    for scatter in [false, true] {
+        let mut ns = [0f64; 2];
+        for (k, paged) in [false, true].into_iter().enumerate() {
+            let src = steady_program(paged, scatter, passes);
+            let want = run_steady(Backend::TreeWalk, &steady_program(paged, scatter, 2))
+                .wrapping_mul(2000); // the sum over `passes` = 2000 × the sum over 2
+            assert_eq!(
+                run_steady(Backend::Jit, &src),
+                want,
+                "checksum before timing"
+            );
+            let mut best = f64::INFINITY;
+            for _ in 0..7 {
+                let t = Instant::now();
+                assert_eq!(run_steady(Backend::Jit, &src), want);
+                best = best.min(t.elapsed().as_nanos() as f64);
+            }
+            ns[k] = best / accesses;
+        }
+        println!(
+            "  {}: unpaged {:.3} ns/access, paged {:.3} ns/access ({:+.1}%)",
+            if scatter { "scattered " } else { "sequential" },
+            ns[0],
+            ns[1],
+            100.0 * (ns[1] / ns[0] - 1.0)
+        );
+    }
+}
+
+/// #2164 — the steady-state probe's program is right on every backend at a size CI runs: the paged
+/// and unpaged child sum the same span, the paged one over its pager's bytes.
+#[test]
+fn steady_programs_agree_across_backends() {
+    for scatter in [false, true] {
+        for paged in [false, true] {
+            let src = steady_program(paged, scatter, 2);
+            let want = run_steady(Backend::TreeWalk, &src);
+            for b in [Backend::Bytecode, Backend::Jit] {
+                assert_eq!(
+                    run_steady(b, &src),
+                    want,
+                    "{b:?}: paged {paged}, scatter {scatter}"
+                );
+            }
+        }
+    }
+}

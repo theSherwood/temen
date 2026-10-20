@@ -89,7 +89,7 @@ fn the_nesting_column_matches_what_a_child_can_actually_be_granted() {
             runs: WINDOW_RUNS,
         };
         let crossed = host
-            .spawn_detached_child(&[("g".into(), h)], 1 << 16, lease, -1)
+            .spawn_detached_child(&[("g".into(), h)], 1 << 16, lease, -1, false)
             .is_some();
         let claimed = capability_axes(cap)[n].status;
         let expected = match claimed {

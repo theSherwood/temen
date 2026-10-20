@@ -139,11 +139,12 @@ void temen_install_trap_handler(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = temen_handler;
-    /* SA_NODEFER: don't block SIGSEGV/SIGBUS while the handler runs. A demand fault suspends to the
-     * parent *from inside this handler*, and the parent must keep its own fault recovery (its guard,
-     * or a further demand fault) while the child sits suspended in its handler frame — a blocked
-     * synchronous signal would kill the process instead. The handler never faults on its own
-     * (it touches only thread-locals), so unblocked re-entry is not a recursion hazard. */
+    /* SA_NODEFER: don't block SIGSEGV/SIGBUS while the handler runs. The backtrace walk it runs can
+     * itself fault (#1487), and that nested fault must reach the handler, which aborts the walk
+     * (`temen_walk_abort`): a blocked synchronous signal would kill the process instead. Nothing else
+     * in the handler faults (it touches only thread-locals), so re-entry is not a recursion hazard.
+     * (No demand fault is handled here: the Cranelift JIT pages a child by a software check before
+     * the access, never by a fault, #2164.) */
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, &g_old_segv);
