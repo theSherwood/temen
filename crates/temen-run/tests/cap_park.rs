@@ -20,6 +20,10 @@
 //!
 //! And a root that resumes a fiber, blocking, through a slow answer is not deadlocked: the answer
 //! comes from outside the run, though nothing in the run is live meanwhile.
+//!
+//! **Nothing waits for a call whose caller is gone** (#2493): a root that kills a child waiting on
+//! the host joins it at once, and a run whose root returns over a fiber still waiting ends at once.
+//! The calls go on running, and their answers land where no one waits.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -504,6 +508,29 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
     );
 }
 
+/// `m` on each of `drivers` and the JIT, each run returning `want` in under half of [`GIVE_UP`]:
+/// well before the call it left waiting could have answered.
+fn check_prompt(what: &str, m: &Module, kids: &[u32], want: i64, drivers: &[Driver]) {
+    let mut wrong = Vec::new();
+    let mut each = |engine: String, run: &dyn Fn() -> Result<i64, String>| {
+        let started = Instant::now();
+        let got = run();
+        let took = started.elapsed();
+        if got != Ok(want) || took >= GIVE_UP / 2 {
+            wrong.push(format!("  {engine}: {got:?} after {took:?}"));
+        }
+    };
+    for &driver in drivers {
+        each(format!("{driver:?}"), &|| on_driver(driver, m, -1, kids));
+    }
+    each("JIT".into(), &|| on_the_jit(m, -1, kids));
+    assert!(
+        wrong.is_empty(),
+        "{what}: want {want} on every engine, before its call could answer, but\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// A root waiting while `ticker` ticks.
 fn check(ticker: Ticker, paced: bool, lanes: i64) {
     let what = format!("a root waiting on a {ticker:?} ticker");
@@ -613,6 +640,80 @@ block 0 (vsp: i64, varg: i64) {
 }",
     );
     check_on_every_engine("a root resuming its slow fiber", &m, &[], 7, false, -1);
+}
+
+/// A root kills a child that waits on a host call nobody will answer, and joins it (#2493). The
+/// root first waits, in `wait`'s op 1, until the child's wait has begun, and returns what that
+/// returned. The child's teardown used to wait for its call, through its pool, so the join did too.
+/// On every driver that schedules its children (the `Vcpu` harness cannot kill one yet, #2083).
+#[test]
+fn a_killed_child_joins_while_its_call_still_waits() {
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let m = module_of(&format!(
+        "memory 17
+data 17710 \"wait\"
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32, vmod: i32) {{
+{grant}{prelude}  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vone = i64.const 1
+  vs = call.cap 13 1 (i64) -> (i64) vwait (vone)
+  vk = call.cap 6 12 (i32) -> (i32) vinst (vch)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  return vs
+}}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 17710
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+  return vw
+}}
+}}
+{rec}",
+        grant = rec::grant("gw", 17600, 17710, 4, "vwait"),
+        prelude = spawn_prelude(17408, "vmod", ""),
+        rec = rec::segment(17408, &child),
+    ));
+    let what = "a killed child waiting on the host";
+    check_prompt(what, &m, &[1], 1, &drivers::SCHEDULING);
+}
+
+/// A root returns over a fiber of its own still waiting on a host call nobody will answer
+/// (#2493): the run ends at once, with the resume's `FIBER_PARKED` (3). The run's end used to wait
+/// for the call. On every driver that parks the fiber alone: the debugger parks its thread, to keep
+/// its schedule its own (#2047), and the `Vcpu` harness waits inline (I45).
+#[test]
+fn a_run_ends_while_its_fiber_waits_on_the_host() {
+    let m = module_of(&format!(
+        "func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {{
+  vf = ref.func 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vwait
+  vs, vv = cont.resume vk vh64
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const {TICKS}
+  vr = call.cap 13 0 (i64) -> (i64) vh (vn)
+  return vr
+}}
+}}"
+    ));
+    let fiber_parks = [Driver::Oracle, Driver::Coop, Driver::Parallel];
+    check_prompt("a run over a waiting fiber", &m, &[], 3, &fiber_parks);
 }
 
 /// A JIT root killed while it waits on a host call that will not answer: the watchdog sets the

@@ -35,7 +35,7 @@ fn pin_both(m: &temen_ir::Module, mk_host: &dyn Fn() -> (Host, i32), want: i64, 
     let mut fuel = 2_000_000_000u64;
     let r = run_with_host(m, 0, &[Value::I32(h)], &mut fuel, &mut hi).expect("oracle: no trap");
     assert_eq!(r, vec![Value::I64(want)], "{label}: tree-walk composite");
-    hi.quiesce_pool(); // idempotent — the oracle's run teardown already drained
+    hi.quiesce_pool(); // the run waits for no call still in flight (#2493)
     assert_eq!(comps_i.outstanding(), 0, "{label}: oracle delivered all");
 
     // Bytecode cooperative driver. Its entry has no run-end pool quiesce (nothing needs one:
@@ -321,7 +321,7 @@ fn ordered_delivery_holds_identically_on_both_engines() {
 
 /// `fiber_parks.rs::RESUME_ONCE`, teardown face — the root returns over a still-parked punt:
 /// (FIBER_PARKED, 0) → 30_000 on both engines, promptly (the abandoned pool job is a bounded
-/// 100 ms sleep drained by the run-end pool quiesce).
+/// 100 ms sleep, which the run does not wait for, #2493).
 const RESUME_ONCE: &str = r#"
 memory 16
 func (i32) -> (i64) {

@@ -3237,12 +3237,10 @@ fn drive_over_cell(
     for h in handles {
         let _ = h.join();
     }
-    // Drain any in-flight async-ring offload jobs (they hold the window's `Arc<Region>` and may still
-    // be writing the futex counter) before reading the final window back. Safe to lock: all vCPUs are
-    // gone, so the shared host is otherwise idle. Nothing to unwire: the completion-wake hooks
-    // (#2424) and the signal-wake closure (#863 slice 3) hold the scheduler *weakly*, so a store or
-    // source kept alive past the run pins nothing, and a late completion or raise is a no-op.
-    host_shared.lock_unpoisoned().quiesce_pool();
+    // The run waits for no punted call still in flight (#2493): one never touches the window, and
+    // posts its answer into its store. Nothing to unwire: the completion-wake hooks (#2424) and the
+    // signal-wake closure (#863 slice 3) hold the scheduler *weakly*, so a store or source kept
+    // alive past the run pins nothing, and a late completion or raise is a no-op.
     // #1361 step 3 — harvest each live detached child the freeze rang the doorbell for. By here
     // `worker_loop` has run until every vCPU finished, so a child that took the bell has unwound and
     // delivered its window through the ordinary result channel; claim it and pair it with the
@@ -21277,11 +21275,9 @@ const fn handle_of(slot: u32, generation: u32) -> i32 {
     (((generation & GEN_MASK) << CAP_LOG2) | slot) as i32
 }
 
-/// Worker-thread count of the host **bounded blocking-offload pool** (§12 "Keeping cores busy under
-/// blocking", path 2 — the io_uring increment-2 path). At most this many *blocking* SQEs run
-/// concurrently; the `(K+1)`th queues — so the OS-thread cost of a `submit` batch is bounded by `K`,
-/// never by the number of deferred ops. The guest's own vCPU thread is **not** multiplied (it parks
-/// on the one `submit` while the pool absorbs the blocking) — the "0 blocked vCPU threads" win.
+/// How many workers a domain's offload pool runs (§12 path 2): at most this many of its punted calls
+/// run at once, and the next waits for a free worker. The guest's own threads are never multiplied:
+/// each parks while the pool runs its call.
 pub const OFFLOAD_POOL_THREADS: usize = 4;
 
 /// Shared, thread-safe state behind a [`cap_id::BLOCKING`] capability — a *mock* synchronous-only host
@@ -21338,92 +21334,72 @@ impl AsyncState {
     }
 }
 
-/// A job handed to the offload pool: a self-contained closure that writes its own result (it captures
-/// the destination), so completion *order* is irrelevant — the data it leaves is deterministic.
+/// A job handed to the offload pool: a punted call, wrapped to post its answer to its domain's store.
 type OffloadJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// The **bounded blocking-offload pool** (§12 path 2): [`OFFLOAD_POOL_THREADS`] long-lived workers
-/// that run window-independent blocking SQEs *off* the guest's vCPU thread. A `submit` of `n` blocking
-/// ops costs `K` OS threads regardless of `n` (waves of `K`). Each worker owns its **own** channel —
-/// a single shared `Mutex<Receiver>` would serialize the blocking `recv`s and defeat the overlap.
+/// A domain's **offload pool** (§12 path 2): [`OFFLOAD_POOL_THREADS`] workers that run its punted
+/// calls off the guest's threads.
+///
+/// The workers take jobs from one queue, so a call waits only while every worker is busy, never
+/// behind a long call while another worker idles (#2477). Each worker holds the queue's lock only
+/// while it waits for a job, never while it runs one.
+///
+/// Nothing waits for the workers (#2493). A punted call never touches the window, and posts its
+/// answer into its store, which outlives the pool. A call may wait on the world for as long as it
+/// likes, so dropping the pool closes the queue and lets each worker finish its call and exit on
+/// its own: a domain's teardown, its parent's `join`, or the run's end never waits for one.
 struct OffloadPool {
-    /// Per-worker job channels; a batch is round-robined across them.
-    txs: Vec<std::sync::mpsc::Sender<OffloadJob>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-    /// Jobs dispatched but not yet finished — `(count, condvar)`. [`OffloadPool::dispatch`] (the async
-    /// path) returns without waiting, so [`OffloadPool::quiesce`] uses this to drain in-flight work at
-    /// run end before the window's `Arc<Region>` (which a late job may still write) is read back.
+    queue: std::sync::mpsc::Sender<OffloadJob>,
+    /// Calls dispatched but not yet finished — `(count, condvar)`, for [`OffloadPool::quiesce`].
     inflight: Arc<(Mutex<usize>, Condvar)>,
-    next: usize,
 }
 
 impl OffloadPool {
     fn new(k: usize) -> OffloadPool {
-        let mut txs = Vec::with_capacity(k);
-        let mut workers = Vec::with_capacity(k);
+        let (queue, jobs) = std::sync::mpsc::channel::<OffloadJob>();
+        let jobs = Arc::new(Mutex::new(jobs));
         for _ in 0..k {
-            let (tx, rx) = std::sync::mpsc::channel::<OffloadJob>();
-            txs.push(tx);
-            workers.push(std::thread::spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job();
-                }
-            }));
-        }
-        OffloadPool {
-            txs,
-            workers,
-            inflight: Arc::new((Mutex::new(0), Condvar::new())),
-            next: 0,
-        }
-    }
-
-    /// **Async dispatch** (the increment-3 path): round-robin `jobs` to the workers and return
-    /// **immediately**. Each job is wrapped to decrement the in-flight count + notify on completion;
-    /// the job itself posts its own completion (host-side result + futex counter + `notify`). The
-    /// guest's vCPU parks via the futex `wait` rather than blocking here — the whole point of async.
-    fn dispatch(&mut self, jobs: Vec<OffloadJob>) {
-        if jobs.is_empty() {
-            return;
-        }
-        {
-            let (m, _) = &*self.inflight;
-            *m.lock().unwrap() += jobs.len();
-        }
-        for job in jobs {
-            let inflight = Arc::clone(&self.inflight);
-            let wrapped: OffloadJob = Box::new(move || {
-                job();
-                let (m, c) = &*inflight;
-                let mut g = m.lock().unwrap();
-                *g -= 1;
-                if *g == 0 {
-                    c.notify_all();
+            let jobs = Arc::clone(&jobs);
+            std::thread::spawn(move || loop {
+                let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                match job {
+                    Ok(job) => job(),
+                    // The pool is gone and the queue is empty.
+                    Err(_) => return,
                 }
             });
-            let w = self.next % self.txs.len();
-            self.next = self.next.wrapping_add(1);
-            self.txs[w].send(wrapped).expect("offload worker vanished");
+        }
+        OffloadPool {
+            queue,
+            inflight: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
 
-    /// Block until every dispatched async job has finished. Called at run end so no worker still holds
-    /// (and might still write) the window's `Arc<Region>` after the caller reads the final memory back.
+    /// Queue `job` for the next free worker and return at once: the caller parks, or waits on the
+    /// store, for its answer.
+    fn dispatch(&self, job: OffloadJob) {
+        *self.inflight.0.lock().unwrap() += 1;
+        let inflight = Arc::clone(&self.inflight);
+        let wrapped: OffloadJob = Box::new(move || {
+            job();
+            let (m, c) = &*inflight;
+            let mut g = m.lock().unwrap();
+            *g -= 1;
+            if *g == 0 {
+                c.notify_all();
+            }
+        });
+        self.queue
+            .send(wrapped)
+            .expect("offload workers outlive their pool");
+    }
+
+    /// Block until every dispatched call has finished.
     fn quiesce(&self) {
         let (m, c) = &*self.inflight;
         let mut g = m.lock().unwrap();
         while *g > 0 {
             g = c.wait(g).unwrap();
-        }
-    }
-}
-
-impl Drop for OffloadPool {
-    fn drop(&mut self) {
-        // Dropping the senders closes each worker's channel → its `recv` returns `Err` → it exits.
-        self.txs.clear();
-        for w in self.workers.drain(..) {
-            let _ = w.join();
         }
     }
 }
@@ -23421,9 +23397,8 @@ pub struct Host {
     /// [`Host::restore_durable_handles`] on this domain's own buffer until the relaunch aliases each
     /// to the spawner's cell ([`Host::prepare_detached_relaunch`]).
     pending_inherited: Vec<(u32, StreamRole)>,
-    /// The §12 bounded blocking-offload pool, created lazily on the first punted call
-    /// ([`Host::punt_or_inline`]), so a `Host` that never offloads spawns no threads. Dropping it
-    /// joins the workers ([`OffloadPool`]'s `Drop`).
+    /// The §12 offload pool, created lazily on the first punted call ([`Host::punt_or_inline`]), so
+    /// a `Host` that never offloads spawns no threads. Dropping it waits for no worker (#2493).
     pool: Option<OffloadPool>,
     /// §12 parking-on-blocking — the completion store behind `Pending` dispatches
     /// ([`Completions`]): pool workers post punted jobs' results here; the eval loop waits
@@ -26055,8 +26030,9 @@ impl Host {
         }
     }
 
-    /// Drain any in-flight offload-pool jobs (run end), so no worker still holds the window backing (or
-    /// the JIT's window/`Domain` pointers) when the caller frees them.
+    /// Wait until this domain's punted calls have all finished and posted their answers: for a test
+    /// or an embedder that reads [`Completions::outstanding`] after a run. No run waits for them
+    /// (#2493).
     pub fn quiesce_pool(&self) {
         if let Some(p) = &self.pool {
             p.quiesce();
@@ -26093,7 +26069,7 @@ impl Host {
                 let pool = self
                     .pool
                     .get_or_insert_with(|| OffloadPool::new(OFFLOAD_POOL_THREADS));
-                pool.dispatch(vec![Box::new(move || comps.complete(id, job()))]);
+                pool.dispatch(Box::new(move || comps.complete(id, job())));
                 *slot = Some(id);
                 Ok(Vec::new())
             }
@@ -40110,6 +40086,78 @@ mod signal_door_claim_tests {
             abandoned.load(Ordering::SeqCst),
             1,
             "the first grant is undone"
+        );
+    }
+}
+
+#[cfg(test)]
+mod offload_pool_tests {
+    //! #2477, #2493 — a domain's offload pool: a call waits only for a free worker, and nothing
+    //! waits for the workers.
+    use super::*;
+    use std::sync::mpsc;
+
+    /// A job that runs until the test lets it go (or for 10 s), and the sender whose drop does.
+    fn held() -> (OffloadJob, mpsc::Sender<()>) {
+        let (let_go, held) = mpsc::channel::<()>();
+        let job: OffloadJob = Box::new(move || {
+            let _ = held.recv_timeout(Duration::from_secs(10));
+        });
+        (job, let_go)
+    }
+
+    /// A long call, then as many quick ones as the pool has workers: each quick call finishes
+    /// while the long one runs. Rotating the calls over the workers queued the last behind the
+    /// long one.
+    #[test]
+    fn a_call_waits_only_for_a_free_worker() {
+        let pool = OffloadPool::new(OFFLOAD_POOL_THREADS);
+        let (long, let_go) = held();
+        pool.dispatch(long);
+        let (done, finished) = mpsc::channel();
+        for i in 0..OFFLOAD_POOL_THREADS {
+            let done = done.clone();
+            pool.dispatch(Box::new(move || done.send(i).unwrap()));
+        }
+        for _ in 0..OFFLOAD_POOL_THREADS {
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a quick call waited behind the long one");
+        }
+        drop(let_go);
+    }
+
+    /// A `Host` dropped while one of its punted calls still runs returns at once: the call finishes
+    /// on its own, its answer posted into a store no one waits on. The pool used to join its
+    /// workers, so the drop waited out the call: a domain's teardown, its parent's `join` and the
+    /// run's end with it.
+    #[test]
+    fn a_hosts_drop_waits_for_no_punted_call() {
+        let (long, let_go) = held();
+        let long = Mutex::new(Some(long));
+        let mut host = Host::new();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |_op, _args| {
+                let long = long.lock().unwrap().take().expect("one call");
+                OffloadOutcome::Offload(Box::new(move || {
+                    long();
+                    0
+                }))
+            }),
+            None,
+            CapState::Stateless,
+        );
+        let mut id = None;
+        let r = host.cap_dispatch_slots_pending(cap_id::HOST_PROC, 0, h, &[0], None, &mut id);
+        assert_eq!(r, Ok(vec![]), "the call punts");
+        assert!(id.is_some());
+        let started = std::time::Instant::now();
+        drop(host);
+        let took = started.elapsed();
+        drop(let_go);
+        assert!(
+            took < Duration::from_secs(1),
+            "the drop waited {took:?} for the call"
         );
     }
 }
