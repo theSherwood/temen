@@ -5216,8 +5216,7 @@ enum Blocked {
     /// §12 parking-on-blocking (slice 2) — parked inside a **punted offloadable dispatch**, keyed
     /// by its completion id. The offload pool posts the scalar result to the domain's
     /// [`Completions`]; the wake hook the park installed there drains the domain's
-    /// `completion_waiters` smallest-id-first (each domain mints its ids monotonically, so this is
-    /// its **submission order** — the §18 ordered-delivery pin) and finishes the call via
+    /// `completion_waiters`, each answered call as it comes (#2477), and finishes the call via
     /// [`Pending::CapResult`]. Whole-vCPU and guest-invisible (a blocking
     /// call just takes time), so a backend that blocks inline instead stays byte-identical.
     CapPending { id: u64 },
@@ -6199,10 +6198,8 @@ struct Sched {
     /// §12 parking-on-blocking (slice 2) — callers parked inside a punted offloadable dispatch,
     /// keyed by **`(domain id, completion id)`**: each domain mints its ids in its own
     /// [`Completions`] store, from 0, so a child's, twin's or instance's punt (#2424) never meets
-    /// another domain's id. Drained by [`Scheduler::completion_drain`], each domain's waiters
-    /// smallest-id-first, stopping at the first whose result has not arrived — so a domain's
-    /// results are delivered in its submission order (§18), and one domain's outstanding call never
-    /// holds back another's.
+    /// another domain's id. Drained by [`Scheduler::completion_drain`]: each call's answer as it
+    /// comes, so no outstanding call holds back another (#2477).
     completion_waiters: BTreeMap<(u64, u64), Waiter>,
     /// #2424 — the store each domain in `completion_waiters` parks on, by domain id.
     completion_stores: BTreeMap<u64, Arc<Completions>>,
@@ -6810,12 +6807,11 @@ impl Scheduler {
         }
     }
 
-    /// §12 parking-on-blocking (slice 2) — deliver ready punt completions to parked callers **in
-    /// submission order**: drain each domain's `completion_waiters` smallest-id-first and stop at the
-    /// first waiter whose result has not arrived, so a later completion never overtakes an earlier
-    /// parked caller of its domain (the §18 ordered-delivery pin; latency stays timing-dependent,
-    /// order does not). Domains are drained independently (#2424): one's outstanding call never
-    /// holds back another's result. Called by each store's wake hook after a completion posts
+    /// §12 parking-on-blocking (slice 2) — deliver each parked caller's punted call that has
+    /// answered, lowest id first among those in (#2477). A call that has not answered holds back no
+    /// other, in its domain or another (#2424): a call may wait on the world for as long as it
+    /// likes. When every answer is in, the order is the calls' order; otherwise it is the world's,
+    /// as real I/O's is. Called by each store's wake hook after a completion posts
     /// ([`Scheduler::wake_on`]), and right after a park registers — the register-then-recheck TOCTOU
     /// close (`cap_reply_or_stash`'s pattern, park side): a completion that raced the park is
     /// delivered here instead of stranding the caller. Unclaimed results simply stay in
@@ -6829,10 +6825,12 @@ impl Scheduler {
         for dom in doms {
             let comps = Arc::clone(&s.completion_stores[&dom]);
             let of_dom = (dom, 0)..=(dom, u64::MAX);
-            while let Some((&key, _)) = s.completion_waiters.range(of_dom.clone()).next() {
-                let Some(r) = comps.try_take(key.1) else {
-                    break;
-                };
+            let answered: Vec<((u64, u64), i64)> = s
+                .completion_waiters
+                .range(of_dom.clone())
+                .filter_map(|(&key, _)| comps.try_take(key.1).map(|r| (key, r)))
+                .collect();
+            for (key, r) in answered {
                 match s.completion_waiters.remove(&key) {
                     Some(Waiter::VCpu(mut v)) => {
                         v.pending = Some(Pending::CapResult(r));
@@ -6840,7 +6838,7 @@ impl Scheduler {
                         woke = true;
                     }
                     // F1 (FIBER_PARK.md) — a punt inside a fiber parks the FIBER; its completion
-                    // rides the same ordered drain. The wake pair is the established one: the
+                    // rides the same drain. The wake pair is the established one: the
                     // result lands on the parked frame, and the domain's `svc.wait` consumers are
                     // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
                     Some(Waiter::Fiber { reg, slot, svc, .. }) => {
@@ -9373,7 +9371,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             Step::Park(Blocked::CapPending { id }) => {
                 // §12 slice 2: park inside a punted offloadable dispatch, keyed by completion id.
                 // Register-then-recheck (the `cap_reply_or_stash` TOCTOU close, park side): insert
-                // the waiter under the scheduler lock, then run the ordered drain — a completion
+                // the waiter under the scheduler lock, then run the drain — a completion
                 // that landed before the insert is delivered right here instead of stranding the
                 // caller. (The host guard below is released before the scheduler lock is taken —
                 // lock order sched → host is never crossed.)
@@ -15429,7 +15427,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // vCPU: the §3.6 slice-5a contract (`FIBER_PARKED` unwinds to the
                         // resumer; the completion wakes the fiber; the next resume delivers the
                         // scalar). The waiter rides the same `completion_waiters` map as the
-                        // vCPU park, so submission-ordered delivery (§18) is one drain for both.
+                        // vCPU park, so one drain delivers both.
                         // Register-then-recheck is the drain itself: a completion that raced the
                         // park is delivered (in order) by the recheck, never stranded. Durable
                         // callers keep the degenerate wait below (`freeze_drive` fails closed on
@@ -21443,20 +21441,19 @@ struct CompletionState {
     host_pending: BTreeMap<u64, (u32, u32, i32, Vec<i64>)>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
-    /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
-    /// tier's ordered-delivery key, §18 determinism).
+    /// Next completion id. Monotonic per host, so among answers already in, the lowest id is the
+    /// earliest call (#2477).
     next_id: u64,
     /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
-    /// fiber registers here and its resumer's polls read the cell; the ordered drain moves
-    /// ready results into cells **smallest-id-first, stopping at the first not-yet-arrived**
-    /// (the §18 submission-order pin, JIT form — the tree-walk scheduler's `completion_drain`
-    /// and the bytecode `drain_cap_parked`, cell form). One lock with the store, so
-    /// register-then-recheck is atomic and a completion can never race past a registration.
+    /// fiber registers here and its resumer's polls read the cell. Each cell takes its answer as
+    /// it comes (#2477): [`complete`](Completions::complete) fills a registered cell, and a
+    /// registration takes an answer already in. One lock with the store, so a completion can
+    /// never race past a registration.
     fiber_cells: BTreeMap<u64, Arc<CapFiberCell>>,
 }
 
-/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until the ordered drain claims
-/// the completion; the parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
+/// F3 (FIBER_PARK.md) — a JIT fiber's per-punt wait cell: empty until its call answers; the
+/// parked fiber's resume-poll [`take`](CapFiberCell::take)s the scalar.
 pub struct CapFiberCell {
     result: Mutex<Option<i64>>,
 }
@@ -21504,16 +21501,17 @@ impl Completions {
         self.host_ok.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
-    /// the ordered drain under the same lock (register-then-recheck: a completion that raced
-    /// the park is claimed here, in submission order, never stranded).
+    /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, under the
+    /// store's lock: an answer already in fills the cell at once, so a completion that raced the
+    /// park is never stranded.
     pub fn fiber_register(&self, id: u64) -> Arc<CapFiberCell> {
         let mut g = self.mx.lock_unpoisoned();
         let cell = Arc::new(CapFiberCell {
-            result: Mutex::new(None),
+            result: Mutex::new(g.ready.remove(&id)),
         });
-        g.fiber_cells.insert(id, Arc::clone(&cell));
-        Self::fiber_drain_locked(&mut g);
+        if cell.result.lock_unpoisoned().is_none() {
+            g.fiber_cells.insert(id, Arc::clone(&cell));
+        }
         cell
     }
 
@@ -21525,19 +21523,6 @@ impl Completions {
         g.fiber_cells.remove(&id);
     }
 
-    /// The F3 ordered drain: claim ready results into registered fiber cells smallest-id-first,
-    /// stopping at the first not-yet-arrived id. Runs at registration and at every
-    /// [`complete`](Completions::complete), always under the one state lock.
-    fn fiber_drain_locked(g: &mut CompletionState) {
-        while let Some((&id, _)) = g.fiber_cells.first_key_value() {
-            let Some(r) = g.ready.remove(&id) else {
-                break;
-            };
-            let (_, cell) = g.fiber_cells.pop_first().expect("first_key_value above");
-            *cell.result.lock_unpoisoned() = Some(r);
-        }
-    }
-
     /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
     fn mint(&self) -> u64 {
         let mut g = self.mx.lock_unpoisoned();
@@ -21547,14 +21532,18 @@ impl Completions {
         id
     }
 
-    /// Post a punted job's scalar result (pool-worker side) and wake waiters — including the
-    /// F3 fiber cells, via the ordered drain (their resumers observe the wake at the next
-    /// `cont.resume` poll; no separate notify hook is needed on the JIT tier).
+    /// Post a punted job's scalar result (pool-worker side) and wake waiters. A JIT fiber's cell
+    /// registered for `id` takes it directly (F3): its resumer observes it at the next
+    /// `cont.resume` poll, so no separate notify hook is needed on the JIT tier.
     fn complete(&self, id: u64, result: i64) {
         let mut g = self.mx.lock_unpoisoned();
-        g.ready.insert(id, result);
         g.in_flight -= 1;
-        Self::fiber_drain_locked(&mut g);
+        match g.fiber_cells.remove(&id) {
+            Some(cell) => *cell.result.lock_unpoisoned() = Some(result),
+            None => {
+                g.ready.insert(id, result);
+            }
+        }
         drop(g);
         self.cv.notify_all();
         // The result post happens-before the wake hook, so a drain the hook runs always finds the

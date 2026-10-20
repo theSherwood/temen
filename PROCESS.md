@@ -51,7 +51,7 @@ never learns about.
 - **Memory-authority objects exist**: `AddressSpace` (iface 5, attenuable to sub-ranges,
   can mint a child's), `SharedRegion` (§13), demand paging (parent-as-pager).
 - **Async exists**: §12 parking-on-blocking — an offloadable host call punts to the offload
-  pool and parks the caller; completions deliver in submission order. (The `IoRing` prototype
+  pool and parks the caller; each completion is delivered as it arrives. (The `IoRing` prototype
   was retired by the §12 re-measure, 2026-08-07; iface id 9 stays reserved.)
 - **The capability seam is open by construction** (§7/D46): interfaces are data + host
   code, bound by name at instantiation; `self.*` reflection is an always-available,

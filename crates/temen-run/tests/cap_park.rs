@@ -18,6 +18,9 @@
 //! at once each get their answer when it comes: one's never waits behind the other's call. A child
 //! may wait from a fiber of its own, resuming it, blocking, until it returns.
 //!
+//! Within a domain too, each answer comes as it arrives (#2477): a root's call answers while a
+//! thread of its domain still waits on an earlier one.
+//!
 //! And a root that resumes a fiber, blocking, through a slow answer is not deadlocked: the answer
 //! comes from outside the run, though nothing in the run is live meanwhile.
 //!
@@ -604,6 +607,59 @@ fn a_childs_answer_waits_for_no_other_childs_call() {
 #[test]
 fn a_childs_fiber_waiting_on_the_host_lets_its_root_run() {
     check_children(1, true, false, -1);
+}
+
+/// A thread waits on the host; the root, in `wait`'s op 1, waits until that wait has begun, then
+/// makes a slow call of its own (op 2, answering 0 after [`SLOW`]), ticks the thread's ticks and
+/// joins it. The slow call is its domain's later one: the oracle delivered a domain's answers in
+/// the order of its calls, so the root's waited for the thread's, which waited for the root's
+/// ticks, until it gave up (#2477). A wait the root did not see begin costs 1000.
+#[test]
+fn a_later_answer_waits_for_no_earlier_call_of_its_domain() {
+    let m = module_of(&format!(
+        "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {{
+  vsp = i64.const 0
+  vwa = i64.extend_i32_u vwait
+  vth = thread.spawn 1 vsp vwa
+  vone = i64.const 1
+  vs = call.cap 13 1 (i64) -> (i64) vwait (vone)
+  vzero = i64.const 0
+  vq = call.cap 13 2 (i64) -> (i64) vwait (vzero)
+  vsq = i64.add vs vq
+  vn = i64.const {TICKS}
+  br 1(vtick, vth, vsq, vn)
+}}
+block 1 (vh: i32, vt: i32, vs1: i64, vleft: i64) {{
+  vz = i64.const 0
+  vtk = call.cap 13 0 (i64) -> (i64) vh (vz)
+  vdec = i64.const 1
+  vleft2 = i64.sub vleft vdec
+  vmore = i64.ne vleft2 vz
+  br_if vmore 1(vh, vt, vs1, vleft2) 2(vt, vs1)
+}}
+block 2 (vt2: i32, vs2: i64) {{
+  vj = thread.join vt2
+  vone2 = i64.const 1
+  vlate = i64.sub vs2 vone2
+  vk = i64.const 1000
+  vmiss = i64.mul vlate vk
+  vr = i64.add vj vmiss
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vwant = i64.const {TICKS}
+  vw = call.cap 13 0 (i64) -> (i64) vh (vwant)
+  return vw
+}}
+}}"
+    ));
+    let what = "a root's call while its thread waits";
+    check_on_every_engine(what, &m, &[], TICKS as i64, false, -1);
 }
 
 /// A root resumes a fiber of its own, blocking, until the fiber's slow host call answers: the

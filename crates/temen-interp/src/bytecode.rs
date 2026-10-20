@@ -10510,12 +10510,11 @@ enum FiberState {
     /// call punted to the offload pool (`Pending(completion_id)`) and parked the FIBER, not its
     /// vCPU (the oracle's `CapPending` fiber park, `fiber_parks.rs`). Not resumable until the
     /// completion is claimed into `woken`; a `cont.resume` meanwhile reports `FIBER_PARKED`
-    /// without switching (the cooperative poll). Claims happen ONLY through the ordered drain
-    /// (`drain_cap_parked` — smallest outstanding id first, stop at the first not-yet-arrived),
-    /// so a later completion never overtakes an earlier parked fiber: bit-exact with the
-    /// oracle's `completion_drain` (the §18 pin). The drain runs at each `cont.resume` poll of
-    /// a cap-parked fiber and at driver idle (which blocks on the completion store when only
-    /// cap parks remain — a pool completion is pending work, never a deadlock).
+    /// without switching (the cooperative poll). Claims happen ONLY through the drain
+    /// (`drain_cap_parked`), each call's answer as it comes (#2477), as the oracle's
+    /// `completion_drain` delivers them. The drain runs at each `cont.resume` poll of a cap-parked
+    /// fiber and at driver idle (which blocks on the completion store when only cap parks remain —
+    /// a pool completion is pending work, never a deadlock).
     CapParked {
         vm: Vm,
         /// The `call.cap`'s result register in `vm`; the waking resume writes the scalar here.
@@ -10782,10 +10781,9 @@ fn claim_fiber(
             _ => None,
         })
         .is_some_and(|on| host.with(|h| on.ready(h)));
-    // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the ordered drain first (so a busy
-    // resume-poll loop observes its completion without waiting for driver idle — the WaitParked
-    // `real_deadline` shape, completion form). The drain, not a direct `try_take`, so a poll of a
-    // LATER id never lets its ready result overtake an earlier outstanding park (the §18 pin).
+    // F2 (FIBER_PARK.md) — a poll of a cap-parked fiber runs the drain first, so a busy
+    // resume-poll loop observes its completion without waiting for driver idle (the WaitParked
+    // `real_deadline` shape, completion form).
     if fibers.with(|f, _, _| matches!(f.get(k), Some(FiberState::CapParked { woken: None, .. }))) {
         let comps = host.with(|p| p.completions());
         fibers.with(|f, _, _| drain_cap_parked(f, &comps));
@@ -11073,34 +11071,26 @@ impl HostWait {
     }
 }
 
-/// F2 (FIBER_PARK.md) — the ordered completion drain over the fiber registry: claim ready punt
-/// completions for [`FiberState::CapParked`] fibers **smallest-id-first, stopping at the first
-/// not-yet-arrived** — the bytecode mirror of the oracle scheduler's `completion_drain`
-/// (submission-ordered delivery, the §18 pin). Returns whether anything was claimed.
+/// F2 (FIBER_PARK.md) — the completion drain over the fiber registry: claim each
+/// [`FiberState::CapParked`] fiber's answer that has come (#2477), as the oracle scheduler's
+/// `completion_drain` does. A call that has not answered holds back no other. Returns whether
+/// anything was claimed.
 fn drain_cap_parked(fibers: &mut [FiberState], comps: &super::Completions) -> bool {
     let mut claimed = false;
-    loop {
-        let Some((fi, id)) = fibers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| match f {
-                FiberState::CapParked {
-                    id, woken: None, ..
-                } => Some((i, *id)),
-                _ => None,
-            })
-            .min_by_key(|&(_, id)| id)
-        else {
-            return claimed;
-        };
-        let Some(r) = comps.try_take(id) else {
-            return claimed;
-        };
-        if let FiberState::CapParked { woken, .. } = &mut fibers[fi] {
-            *woken = Some(r);
+    for f in fibers.iter_mut() {
+        if let FiberState::CapParked {
+            id,
+            woken: woken @ None,
+            ..
+        } = f
+        {
+            if let Some(r) = comps.try_take(*id) {
+                *woken = Some(r);
+                claimed = true;
+            }
         }
-        claimed = true;
     }
+    claimed
 }
 
 /// #2047 — wake each task parked on a punted call whose answer has come, once a round: no one polls
@@ -14733,7 +14723,7 @@ impl SchedCore {
                 // call parks, and the rest of the run goes on, as the oracle parks the vCPU. The
                 // call may wait on the world, or on what another task does. The call is in its
                 // domain's store, a child's as the root's (#2424). A FIBER parks (`CapParked` — the
-                // slice-5a contract; the ordered drain right after the park is the
+                // slice-5a contract; the drain right after the park is the
                 // register-then-recheck closing the completion-raced-the-park window). A task's own
                 // call parks the task (`BlockedHostCap`), and a round's drain wakes it
                 // ([`drain_task_completions`]); a host-completed one waits for the embedder, which
@@ -16007,7 +15997,7 @@ impl CoopRun {
 
     /// #1953 — answer the host-completed cap call a [`CoopEvent::CapPark`] surfaced: `value` is the
     /// call's result. A parked task gets it in its result slot and runs again; a parked fiber is
-    /// woken by the pump's ordered drain. `false` if no call is outstanding on `id`. Then pump again.
+    /// woken by the pump's drain. `false` if no call is outstanding on `id`. Then pump again.
     pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
         if !settle_host_cap(&mut self.host.lock_unpoisoned(), id, value) {
             return false;

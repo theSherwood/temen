@@ -1916,7 +1916,7 @@ numbers:
 3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
    (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
-   drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
+   each as it arrives, #2477); `cap_thunk_locked`
    (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
@@ -1936,8 +1936,8 @@ every engine in `temen-run/tests/cap_park.rs`.
 **A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
 procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
 lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
-domain's calls stay in its own `Completions`, ids minted from 0, and each domain's are delivered in
-its own submission order, so one domain's outstanding call never holds back another's answer. The
+domain's calls stay in its own `Completions`, ids minted from 0, and each answer is delivered as it
+arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
 oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
 (`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
 parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
@@ -1990,15 +1990,15 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 — ISSUES.md I73, opened and closed on the arc):
 
 - *Oracle (F1):* the park predicate's fiber arm rides `fiber_park!` filing a `Waiter::Fiber` in
-  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so
-  delivery stays submission-ordered even on the register race, and an animated offer handler's
+  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
+  answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
   resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
-  ONE ordered drain per domain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the
-  first not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on
+  ONE drain per domain (`drain_cap_parked`, each answer as it arrives) at both wake sites, and
+  driver idle with unwoken cap parks **blocks on
   the stores** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
   first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with

@@ -315,11 +315,10 @@ unsafe fn cap_wait(
     temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
-/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
-/// drain claims a completion that raced the park, in submission order — a ready LATER id is
-/// held behind an earlier outstanding park, the §18 pin), then park-poll: each `cont.resume`
-/// of this fiber re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the
-/// resumer) until the drain has delivered. Parking before the first check gives the one
+/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
+/// that raced the park fills it at once), then park-poll: each `cont.resume` of this fiber
+/// re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the resumer) until the
+/// call has answered, each call's answer as it comes (#2477). Parking before the first check gives the one
 /// transient `FIBER_PARKED` even on an insta-ready completion, matching the oracle's
 /// register-then-recheck. A trap raised meanwhile (teardown) abandons the wait — the result
 /// stays unclaimed for the sweep and the caller's trailing guards unwind before the guest
