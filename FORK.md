@@ -375,8 +375,10 @@ structure. Split into sub-slices by risk:
   re-granted by the embedder on thaw). Fork's own refusals are either the shared `NonDurableKind`s
   (live offers, pending live impls, blockings, window minters) or in-flight run state whose duplication
   into a *second live domain* would double-drive it (the serve queue/results — a snapshot carries these
-  to resume the SAME domain, but a twin re-serving them would double-execute — the offload pool, replay
-  recording, freeze residue). Pinned by `fork_carries_a_module_loader_and_its_validator`.
+  to resume the SAME domain, but a twin re-serving them would double-execute — replay recording, freeze
+  residue). Pinned by `fork_carries_a_module_loader_and_its_validator`. (The offload pool was on that
+  list until #2424: its jobs are punted calls, which never touch the window and answer into their own
+  domain's store, so a domain that has punted forks, and its twin carries its offloadable procs.)
 - **Increment 3b — wire the twin into `clone_caller`. NEXT.** The remaining sub-steps, each with a real
   primitive gap to fill:
   1. **Window deep-copy — a NEW `Mem` primitive is needed.** Both existing builders *share* the backing

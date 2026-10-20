@@ -134,8 +134,11 @@ fn a_punt_in_a_fiber_parks_identically_on_all_three_engines() {
         &m,
         &|| {
             let mut h = Host::new();
-            let hh =
-                h.grant_host_proc_offloadable(punting_handler(), temen_interp::CapState::Stateless);
+            let hh = h.grant_host_proc_offloadable(
+                punting_handler(),
+                None,
+                temen_interp::CapState::Stateless,
+            );
             (h, hh)
         },
         30_105,
@@ -327,8 +330,11 @@ fn ordered_delivery_holds_identically_on_all_three_engines() {
         &m,
         &|| {
             let mut h = Host::new();
-            let hh =
-                h.grant_host_proc_offloadable(gated_handler(), temen_interp::CapState::Stateless);
+            let hh = h.grant_host_proc_offloadable(
+                gated_handler(),
+                None,
+                temen_interp::CapState::Stateless,
+            );
             (h, hh)
         },
         50_111_222,
@@ -375,6 +381,7 @@ fn root_return_abandons_a_cap_parked_fiber_identically_on_all_three() {
                     a + 100
                 }))
             }),
+            None,
             temen_interp::CapState::Stateless,
         );
         (h, hh)

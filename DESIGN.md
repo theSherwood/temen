@@ -190,7 +190,9 @@ and the smallest. The true statement:
 
 The dominant escape-TCB component is the **JIT** (Cranelift + our trap-confinement lowering +
 our CLIF generation), not the verifier. Stating this is the point: it puts the risk
-where it actually lives (§18).
+where it actually lives (§18). Cranelift's verifier checks our CLIF, and the CLIF Cranelift's
+passes hand its backend, on every compile (D68); nothing yet checks the machine code the backend
+emits (#2481).
 
 ### What "escape-free" buys — the load-bearing theorem
 Even a guest with **arbitrary write access to its entire window** (conceded — §1
@@ -1929,7 +1931,25 @@ vCPU, under either thunk, waits outside the run with its D66 lane given back and
 re-checked (`temen_jit::wait_outside`) — the generic `cap_thunk` takes the pending face at root
 context too. A cooperative scheduler with nothing to run fires its next timer **before** it blocks
 on an outstanding call, so a call waiting on the world never holds back a timed waiter. Pinned on
-every engine in `temen-run/tests/root_cap_park.rs`.
+every engine in `temen-run/tests/cap_park.rs`.
+
+**A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
+procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
+lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
+domain's calls stay in its own `Completions`, ids minted from 0, and each domain's are delivered in
+its own submission order, so one domain's outstanding call never holds back another's answer. The
+oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
+(`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
+parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
+idle pump waits on all the stores at once (`Completions::wait_any`). The debug scheduler takes the
+first answer to come, lowest index first among those in: with two threads waiting, which runs on
+first is the world's order, where lowest index first held a thread behind a call that might never
+answer, or wait on that thread. On the JIT a detached child is a task: one
+parked on an answer is not counted blocked (`ParkOn::Outside`, as an OS vCPU in `wait_outside` is
+not), and the answer re-offers it (`outside_waker`). Nor is a `cont.resume.block` of a fiber parked
+on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as deadlocked once the
+answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
+pool's jobs never touch the window and answer into their own domain's store.
 
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
@@ -1977,13 +1997,13 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
-  ONE ordered drain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the first
-  not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on the
-  store** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
+  ONE ordered drain per domain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the
+  first not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on
+  the stores** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
   first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
-  the store, drain at registration + every pool-side `complete` — no notify hook; resumption is
-  poll-driven), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
+  the store, drain at registration + every pool-side `complete`; resumption is poll-driven, and a
+  §14 child's task is re-offered by the store's wake hook, #2424), and the thunks (`cap_thunk`, `cap_thunk_locked`) route a fiber's punt through
   the pending face and park via the `fiber_rt` event-park seam the futex thunk already used.
   Root context takes the pending face too since #2047 — "sync ops never pay" holds, as nothing is
   minted until a handler punts.
@@ -1995,9 +2015,7 @@ debt):** the browser-`Vcpu` driver (I45 — fiber delivery through the real cros
 its own slice; the native parallel driver takes the cooperative driver's postures since #1414 3e),
 the debug drivers' fibers (sanctioned whole-vCPU tiering; checkpointing excludes cap-parked fibers
 and pool-parked threads like futex-parked ones), the §22 invoke leaves
-(seam-free atomic), confined `instantiate` children on the cooperative driver (their
-completions live on their own host; no offloadable procedure reaches a child yet, #2424), durable
-runs everywhere (a punted completion has no freeze
+(seam-free atomic), durable runs everywhere (a punted completion has no freeze
 rule yet, #1902), and zero/multi-result punts (the degenerate wait). Residue: the
 animated-offer punt is exercised only by construction (`wire_offer_proc` seals the provider
 `Host`; pin it when a public wiring can grant a provider an offloadable cap). I48 (a blocking
@@ -4050,3 +4068,4 @@ as open-ended, not a byproduct of the build.
 | D65 | **The `rustbench` call-heavy gap to Wasmtime-w64 (`parse`/`bfs`, ~1.22× temen÷wt64) is diffuse — no single lever — after two hypotheses were measured and *rejected*.** On the six real-program `rustbench` workloads, temen-jit is **at parity-or-faster than wt64 on four** (hashmap 0.94×, vm 0.93×, sort 0.82×, base64 0.86×) and trails only on the two most **call/recursion-dense** (`parse` 14 call sites, `bfs` 13; the gap tracks call count). Two cheap env-gated A/Bs (throwaway, reverted) tested the obvious causes: **(1) the threaded-context ABI** — temen's natural CLIF ABI threads `(mem_base, fn_table_base, trap_out, stack_limit)` as explicit args through every call (vs Wasmtime's single pinned `vmctx` register), so a vmctx consolidation was the candidate fix. *Rejected*: doubling the threaded context to 8 args (`TEMEN_JIT_EXTRA_CTX`, verified in CLIF — 10-arg sigs, extras spilling to stack) produced **no systematic slowdown** on the call-heavy workloads (parse/bfs flat-to-faster, sign inconsistent = register-allocation noise), so arg marshalling is not the cost and a vmctx rewrite of the JIT ABI would not pay off. **(2) the per-entry checks** — temen emits `emit_epoch_check` (kill-poll) + `emit_stack_check` (`get_stack_pointer`+cmp+branch software stack guard) at every function entry, which wasm gets free via guard pages. *Minor*: skipping them (`TEMEN_JIT_SKIP_ENTRY_CHECKS`, measurement-only, drops a safety guard) recovered only **~6% on `parse`** (deepest recursion), ~3% on `vm`, and **~0% on `bfs`** — against a ±2% noise floor, a small diffuse cost, not the ~22% gap. | Settled (investigated; both fixes rejected on measurement — do not re-run without a new hypothesis) | The value is the **two negative results**: they cheaply pre-empted a risky JIT-ABI rewrite (vmctx) and a guard-disabling change, each of which measurement showed would deliver little. The residual gap is a handful of small per-call overheads (entry checks, call/ret, sp-threading) with no single dominant term — so per the prime directive (don't optimize the trusted core without a concrete measured win) the perf dig stops here. temen-jit is already "as fast as wasm" on real programs where it counts (4/6 workloads ahead). Method: `bench/rustbench` temen-jit ×native A/B under the two env flags; correctness cross-check stayed green throughout (the ABI perturbation was sound). |
 | D66 | **§14 child domains are platform-scheduled, M:N, migrating, over a bounded worker pool; threads *within* a domain stay 1:1; parallelism is a granted resource bounded at dispatch, ceiling with per-child lanes (§23 "Child-domain scheduling").** Amends D22/D56/D57 in *scope*, not direction: the no-scheduler rule is about a domain's own `thread.spawn` units (where the double-scheduler objection is real); where a *domain* runs is placement, like `Attestation.tier`, and no guest observes a sibling's. D57's guest-built M:N cannot reach a detached child (a fiber is in-window; a detached child owns its window), so on the JIT N detached children were N OS threads bounded by the OS (#1586/#1587) — a #3 break in the direction "a parent consumes what it was never granted". The migration unsafe is the one D57 already paid: same switch, same happens-before, plus an env swap of `Send` data; nothing a child owns is thread-affine. Migrating over affine because naive migrating is *one queue* (the oracle's shape, reproducible by `explore_all`) while affine is per-worker queues plus placement, a third scheduler shape, and cannot share the interpreter's scheduler. Sound under five rules (§23 R1–R5): every resume its own guard bracket over the child's fault range (a stale range misclassifies faults both ways); #1466 extended to task-level TLS; a dead domain never resumed; trap attribution by task identity; `mem_base` at first entry only. Buys, at once: conserved concurrency, no pool-starvation deadlock (a park never holds a worker), #1361's harvest as one implementation on all three engines, #1584 closed by construction, deterministic child-domain scheduling under the interp's seeded policy. Owner rulings 2026-09-21: C over B; dispatch-time parallelism over spawn-time count; ceiling with lanes over transfer (stranded capacity declined; a parent may absorb a child's lane). | Adopted (amends D22/D56/D57 in scope; staged) | The resource fix, the freeze fix (#1361) and the parked-child fix (#1584) were one decision; making them three would have built the JIT's harvest as a different shape and left "granted N threads" unrepresentable. Cost recorded in §23; slices in #1600 |
 | D67 | **Accesses near a checked base share its bounds check, within one CLIF block (D61 Scope A, straight-line; #2147).** A non-elided access tests its own address against `reserved` alone (`a ≥ reserved` → `select_spectre_guard` to the guard, D63) and becomes its block's **check point** for its *root*, the value its address adds constants to. A later access through the same root at a constant `d ≥ 0` past the check point, with `d + offset + width ≤ trailing_guard`, takes the checked base plus a constant and tests nothing. **Exact:** if the check point's `a < reserved`, the later address is `a + d` with no wrap, and whatever of the access lies past `reserved` faults on the guard page at that access, where `checked_reserved` faults it; if `a ≥ reserved`, the check point faulted first. **Speculative overshoot ≤ the guard:** a misspeculated check point's base is the guard's, so `trusted_reach ≤ guard_size` (D61) holds by construction, since the JIT's reach and the allocator's guard are one definition (`mem::trailing_guard`). **Stores share too:** a store that straddles `reserved` writes nothing before it faults only on hardware that never tears a faulting store (x86-64 guarantees it, Arm and RISC-V don't), the reliance D63 already has at `mapped` and at protected pages (#2162). A loads-only variant, stores keeping D63's exact check, was measured and rejected: a store's address is then a different value from a load's at the same address, which defeats Cranelift's store-to-load forwarding (`hexer d`: 5.34 G JIT instructions, against 5.08 G with no sharing at all). Applies only to windows with a page-aligned reservation whose guard starts at `reserved`; unaligned reservations and spans past the guard keep D63's exact check. Within one CLIF block only: a base computed before a call's trap check or a resume entry need not dominate the code after it. | Built (#2147) | The `confine` C kernels (temen-jit, median of 3 rounds): `edn` −30%, `fir` −12%, `bytes` −5%, `matmul`/`matmul_eb` unchanged. On nimony's `hexer d` (Cranelift), 33% of loads and stores share a check (static); clamp instructions −19% (0.53→0.43 G), all instructions −2.7%, execution −1.5%. Verification: an escape-oracle sweep in which each access in turn crosses the window's end and bases wrap below zero (it crashes or fails if negative distances share, or if the reach exceeds the guard), plus the §18 differential suites and the self-hosted lane. |
+| D68 | **Cranelift's verifier runs on every compile at two points: on the CLIF temen lowers, before Cranelift's passes, and on the CLIF those passes hand the backend. After each pass too, with debug assertions and under the fuzzers (#2449).** The verifier checks that CLIF is well formed (types, SSA dominance, arity, signatures), not confinement. The first point keeps Cranelift's passes from running on malformed CLIF, which they can turn into well-formed wrong code; the second keeps a pass that breaks the CLIF from reaching the backend. The checks between passes add only which pass broke it, a diagnosis the debug and fuzz builds keep. Wasmtime turns its verifier off by default (`Config::cranelift_debug_verifier`); temen keeps two points in release because its CLIF generation is escape-TCB. | Settled (owner, #2449) | On unir's store unit (2,192 functions, 4-vCPU VM), the verifier after every pass took 1.49 s of a 5.2 s one-thread compile, 0.27–0.32 s a run; the two points take 0.58 s. On four threads Cranelift's part drops from 1.42 to 1.15 s and the full compile from 1.86 to 1.56 s. Neither point sees the machine code the backend emits, where Cranelift's published escapes were (CVE-2021-32629, CVE-2023-26489): #2481. |

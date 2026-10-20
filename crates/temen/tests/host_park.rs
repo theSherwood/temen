@@ -96,7 +96,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
 
     // Tree-walk oracle — parking-aware (the pending face; punts wait without the lock).
     let mut hi = Host::new();
-    let h = hi.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
+    let h = hi.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
     let comps_i = hi.completions();
     let mut fuel = 1_000_000u64;
     let iv = run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut hi).expect("interp ok");
@@ -113,7 +113,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
     // Bytecode interpreter — parking-aware.
     let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let mut hb = Host::new();
-    let hbh = hb.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
+    let hbh = hb.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
     let comps_b = hb.completions();
     let mut vcpu =
         bytecode::Vcpu::new_root_reserved_with_powerbox(&prog, 0, &[Value::I32(hbh)], &[], hb, 20)
@@ -134,7 +134,7 @@ fn run_all_tiers(n: u64, handler: fn() -> OffloadHostProc) -> [(i64, u64); 3] {
     // Cranelift JIT — parking-aware too (#2047): the generic `cap_thunk` punts to the pool and
     // waits outside the run, as the locked thunk always did.
     let mut hj = Host::new();
-    let hjh = hj.grant_host_proc_offloadable(handler(), temen_interp::CapState::Stateless);
+    let hjh = hj.grant_host_proc_offloadable(handler(), None, temen_interp::CapState::Stateless);
     let comps_j = hj.completions();
     let jo = temen_jit::compile_and_run_with_host(
         &m,

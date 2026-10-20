@@ -204,7 +204,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     b.ins().call_indirect(inner, refill, &[cell]);
     b.ins().return_(&[]);
     b.finalize();
-    module.define_function(id, &mut ctx).map_err(backend)?;
+    crate::define_verified(&mut module, id, &mut ctx)?;
     module.finalize_definitions().map_err(backend)?;
     let code = module.get_finalized_function(id) as usize;
     Ok((crate::OwnedJit::new(module), code))
