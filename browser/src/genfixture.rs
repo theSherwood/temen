@@ -36,9 +36,9 @@ block 3 (v17: i64) {
 /// #1312 — the **growing-allocator** guest, the reduced `__temen_malloc` shape the JS coop driver is
 /// checked against by `browser-coop-grow-test.mjs`.
 ///
-/// `_start` calls a heavy leaf (heavy enough to clear the leaf tier-up size floor, so the run really
-/// does reach the emitted tier) which first bounces to a helper that `vm_map`s a page **past the 32
-/// MiB cooperative run window**, then stores through the freshly mapped address, reads it back, and
+/// `_start` calls a leaf (which the harness tiers up at its start, so the run really does reach the
+/// emitted tier) which first bounces to a helper that `vm_map`s a page **past the 32 MiB cooperative
+/// run window**, then stores through the freshly mapped address, reads it back, and
 /// folds it into a sum. The result is written to stdout so a harness can compare byte-for-byte with
 /// the plain bytecode path.
 ///
@@ -59,18 +59,6 @@ fn grow_past_window() -> String {
     const WIN: u64 = 1 << 25; // JIT_RUN_WIN_LOG2 — the cooperative run window
     const PROBE: u64 = WIN + 16;
     const SLOT: u64 = 32768 + 2048; // clear of the #1094 NULL guard and the args region
-                                    // The leaf's body is padded with a long arithmetic chain so its estimated emitted size clears
-                                    // `MIN_TIERUP_EMITTED_FN_BYTES`; without that the driver would keep it on the interpreter and the
-                                    // test would pass without ever exercising the emitted tier.
-    let mut chain = String::new();
-    for i in 0..400 {
-        chain.push_str(&format!(
-            "  vk{i} = i64.const {k}\n  vm{i} = i64.mul vacc{i} vk{i}\n  vx{i} = i64.xor vm{i} vk{i}\n  vacc{next} = i64.add vx{i} vk{i}\n",
-            i = i,
-            next = i + 1,
-            k = 3 + (i as u64 % 7),
-        ));
-    }
     const NAMES: u64 = 40960; // "stdout" then "memory", 8 bytes apart
     let mem_name = NAMES + 8;
     format!(
@@ -99,7 +87,7 @@ block 0 (vacc0: i64) {{
   vg = call 2 (vacc0)
   i64.store vg vacc0
   vld = i64.load vg
-{chain}  vsum = i64.add vacc400 vld
+  vsum = i64.add vacc0 vld
   return vsum
   }}
 }}

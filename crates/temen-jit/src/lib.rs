@@ -58,7 +58,7 @@
 //! buffer-ABI trampoline `fn(args: *const i64, results: *mut i64, mem_base: *mut u8,
 //! fn_table_base: *const FnEntry)` so [`compile_and_run`] can call any arity from Rust.
 
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
@@ -114,7 +114,7 @@ mod os_thread_rt;
 pub use os_thread_rt::{
     outside_waker, park_host_call, region_canon_forget_window, region_canon_lookup,
     region_canon_new_owner, region_canon_record, wait_outside, wake_host_parks, wake_host_parks_in,
-    HostPark,
+    HostPark, Parks,
 };
 
 /// F3 (FIBER_PARK.md): whether a guest fiber is the current continuation on this OS thread —
@@ -806,6 +806,9 @@ pub struct GrantChild {
     pub lane_cap: i64,
     pub parent_domain: u64,
     pub parent_lane_cap: i64,
+    /// #2164 — a demand-paged child's access table ([`VmCtx::pages`]), which the builder made for a
+    /// spawn that named a pager. Null for any other child. The child's powerbox owns it.
+    pub pages: *const AtomicU8,
 }
 
 /// The host callback for a **detached spawn** (Instantiator op 17, the record): build a
@@ -820,6 +823,10 @@ pub struct GrantChild {
 /// `out` on success; `0` with `*trap_out` set to a `MemoryFault` (out-of-window record/name) or
 /// `CapFault` (non-UTF-8 name / forged / non-copyable handle) — the whole spawn fails closed, as on
 /// the interpreter.
+///
+/// #2164 — `pager` is the record's pager export (`u32::MAX` for none), which [`PagerAdmit`] already
+/// checked: the child is demand-paged, its faults go to that export of the spawner's program, and
+/// `out.pages` is its access table.
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`); `[mem_base, mem_base+mem_size)` is the parent's
@@ -836,9 +843,36 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     bytes: u64,
     runs: u64,
     lane: i64,
+    pager: u32,
     out: *mut GrantChild,
     trap_out: *mut i64,
 ) -> i32;
+
+/// §2.2 / #2164 — whether the spawner's program has a pager export `export`, the one a spawn record
+/// may name to supply its child's pages (`temen_interp::Host::has_pager_export`): `1`, or `0` and the
+/// spawn traps `CapFault`, before any other check of the record, as on the interpreters.
+///
+/// # Safety
+/// `ctx` is the parent host pointer the hook family decodes ([`GrantChildHooks::parent_ctx`]).
+pub type PagerAdmit = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, export: u32) -> i32;
+
+/// §2.2 / #2164 — a demand-paged child's **miss thunk**: its code calls it when an access's page
+/// check fails ([`emit_page_check`]), with the access's `len` bytes at window offset `off` of the
+/// window at `mem_base`, and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in `flags`. It returns once
+/// every page of the access admits it, having asked the child's pager for each one that may be
+/// paged in, or with a trap in the instance's trap cell, which the code propagates.
+///
+/// # Safety
+/// `vmctx` is the faulting instance's live context; `[mem_base, mem_base + off + len)` lies in its
+/// window's reservation.
+pub type PageMissThunk =
+    unsafe extern "C" fn(vmctx: *mut VmCtx, mem_base: *mut u8, off: u64, len: u64, flags: u64);
+
+/// [`PageMissThunk`] flag: the access stores.
+pub const PAGE_MISS_WRITE: u64 = 1;
+/// [`PageMissThunk`] flag: no page of the access may be paged in, so a refused one is fatal — a
+/// `memory.wait`, which faults on an unsupplied page on every engine.
+pub const PAGE_MISS_FATAL: u64 = 2;
 
 /// Free a child `Host` built by a [`GrantDetachedChildBuilder`] — called once, after the child has run and its outcome is stashed for `join`. Deliberately paired with the
 /// builder (rather than, say, leaking the host for the run's lifetime like a `Module` grant) because a
@@ -954,7 +988,8 @@ pub type ChildBudgetNode =
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list, the
-    /// child attesting `window_exposed = false`, its starter caps spanning `child_size` = the window
+    /// child attesting `window_exposed = false` (true when it is paged, #2164), its starter caps
+    /// spanning `child_size` = the window
     /// **reservation** (a root's shape), and the budget that paid for its window its own (see
     /// [`GrantDetachedChildBuilder`]).
     pub build_detached: GrantDetachedChildBuilder,
@@ -976,6 +1011,10 @@ pub struct GrantChildHooks {
     pub held_tail: HeldTail,
     /// #1944 slice 3 — a **detached** child's own budget node (see [`ChildBudgetNode`]).
     pub budget_node: ChildBudgetNode,
+    /// #2164 — a spawn record's pager check (see [`PagerAdmit`]), and the miss thunk a paged child's
+    /// code calls (see [`PageMissThunk`]).
+    pub pager_admit: PagerAdmit,
+    pub page_miss: PageMissThunk,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
@@ -2628,6 +2667,9 @@ pub struct CompiledModule {
     /// / [`Lower::fuel`]) — the code's shape, which `define_extra` compiles new units to match.
     epoch: bool,
     fuel: bool,
+    /// #2164 — the page check a demand-paged child's code makes before each access (see
+    /// [`PageEnv`]), which `define_extra` compiles new units to match. [`PageEnv::NONE`] otherwise.
+    page: PageEnv,
     /// #1768 — the addresses this module's **own** instance fills its [`VmCtx`] from: the powerbox
     /// ctx, kill-path cell, fuel cell and signal arm the compile was handed. Nothing reads them from
     /// the code; each run mints its context from these ([`VmCtx::new`]), and a run of the same code
@@ -3443,6 +3485,7 @@ impl CompiledModule {
                     inst,
                     setjmp,
                     sig, // #932 async signal delivery arm (null unless a `SignalArm` was supplied)
+                    PageEnv::NONE, // #2164 — only a §14 child is demand-paged
                     &mut ctx.func,
                     &m.funcs[fi],
                     mask,
@@ -3709,6 +3752,7 @@ impl CompiledModule {
         Ok(CompiledModule {
             hosted: false,
             nests: cfg!(fiber_rt) && module_uses_instantiator(m),
+            page: PageEnv::NONE,
             fn_table,
             tramp_code,
             tramp_code_limited: core::ptr::null(), // a root is never a child-domain task
@@ -3907,6 +3951,7 @@ impl CompiledModule {
                     sched: core::ptr::null(),
                     nursery: core::ptr::null(),
                     setjmp: core::ptr::null(),
+                    pages: core::ptr::null(),
                     ..self.instance
                 },
                 None,
@@ -4012,6 +4057,7 @@ impl CompiledModule {
         CompiledModule {
             hosted: self.hosted,
             nests: self.nests,
+            page: self.page,
             fn_table: self
                 .fn_table
                 .iter()
@@ -5087,6 +5133,7 @@ impl CompiledModule {
                     inst,
                     self.setjmp,
                     SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
+                    self.page, // #2164 — a paged child's units check its access table, as its own code does
                     &mut ctx.func,
                     &funcs[fi],
                     self.mask,
@@ -5618,6 +5665,12 @@ impl SharedCode {
             !self.0.nests || self.0.makes_nursery(),
             "nursery"
         );
+        // A paged compile tests the access table it loads before each access (#2164).
+        assert_eq!(
+            addrs.pages.is_null(),
+            !self.0.page.is_paged(),
+            "access table"
+        );
         self.0.instance(addrs, node)
     }
 }
@@ -5938,6 +5991,9 @@ pub(crate) struct ChildCompile<'a> {
     pub(crate) table_reserve_log2: u8,
     /// The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
+    /// #2164 — the thunk a demand-paged child's page checks miss into: set exactly when its instance
+    /// has an access table (`addrs.pages`), which the code then tests before each access.
+    pub(crate) page_miss: Option<PageMissThunk>,
 }
 
 /// Compile a §14 child: every function confined to its own window — `mapped_log2` committed bytes
@@ -5971,6 +6027,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         impl_exports,
         table_reserve_log2,
         shadow,
+        page_miss,
     } = *c;
     let epoch_addr = addrs.epoch as usize;
     let fuel_addr = addrs.fuel as usize;
@@ -6030,6 +6087,16 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     let mapped = 1u64 << mapped_log2; // bounded ≤ MAX by the reject above (audit #3)
     let reserved = 1u64 << reserved_log2;
     let mask = reserved - 1;
+    // #2164 — a demand-paged child checks its instance's access table before each access.
+    let page = match (addrs.pages.is_null(), page_miss) {
+        (true, _) => PageEnv::NONE,
+        (false, Some(thunk)) => PageEnv::paged(thunk, mapped),
+        (false, None) => {
+            return Err(JitError::Unsupported(
+                "a demand-paged child needs a page-miss thunk",
+            ))
+        }
+    };
     // The `call.dyn` table, power-of-two padded and — like a root's (`CompiledModule::compile`) —
     // reserved larger than the module needs when the child holds a `Jit` grant, so `install` fills
     // padding slots without moving the mask constant baked into every call site.
@@ -6105,6 +6172,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                 inst_env, // a child that spawns loads its own nursery from its vmctx (temen#2168)
                 SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
                 SigEnv::null(),    // #932 — a §14 child is not signal-delivery armed (slice 1b)
+                page,              // #2164 — its access table's check, when it is demand-paged
                 &mut ctx.func,
                 &funcs[fi],
                 mask,
@@ -6256,6 +6324,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         // ([`ChildCodeCache`]).
         hosted: false,
         nests: inst_env.is_active() && funcs_use_instantiator(funcs),
+        page,
         fn_table,
         tramp_code: code,
         tramp_code_limited: code_limited,
@@ -6341,9 +6410,12 @@ struct ChildCodeKey {
     reserved_log2: u8,
     thunk: usize,
     /// Which cells the code's instances have, which decides the checks it emits
-    /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain, and the nursery.
+    /// ([`ChildCompile::addrs`]): the kill path, fuel, the futex domain and the nursery.
     cells: [bool; 4],
     table_reserve_log2: u8,
+    /// The miss thunk a paged compile calls, or `0`: a paged and an unpaged spawn of one module run
+    /// two compiles (#2164).
+    page_miss: usize,
 }
 
 impl ChildCodeKey {
@@ -6362,6 +6434,7 @@ impl ChildCodeKey {
                 !a.nursery.is_null(),
             ],
             table_reserve_log2: c.table_reserve_log2,
+            page_miss: c.page_miss.map_or(0, |t| t as usize),
         }
     }
 }
@@ -6747,6 +6820,40 @@ impl SigEnv {
     }
 }
 
+/// #2164 — a demand-paged child's page-check shape, baked into [`emit_page_check`]: the miss thunk
+/// (a process global, [`PageMissThunk`]), the host page's `log2`, and how many pages its declared
+/// window has, which its access table covers. The table itself is per-instance, read from its
+/// [`VmCtx`]. Null (`thunk == 0`) ⇒ an unpaged compile, which emits no check, so its code is the
+/// unpaged code.
+#[derive(Clone, Copy)]
+struct PageEnv {
+    thunk: i64,
+    shift: u8,
+    pages: u64,
+}
+
+impl PageEnv {
+    const NONE: PageEnv = PageEnv {
+        thunk: 0,
+        shift: 0,
+        pages: 0,
+    };
+
+    /// The shape for a child whose declared window is `mapped` bytes, missing into `thunk`.
+    fn paged(thunk: PageMissThunk, mapped: u64) -> PageEnv {
+        let page = mem::page_size() as u64;
+        PageEnv {
+            thunk: thunk as *const () as i64,
+            shift: page.trailing_zeros() as u8,
+            pages: mapped.div_ceil(page),
+        }
+    }
+
+    fn is_paged(&self) -> bool {
+        self.thunk != 0
+    }
+}
+
 /// The host `call.cap` thunk address, baked into each `call.cap` as a constant (a process global).
 /// The ctx it is handed — the instance's powerbox — is per-instance, read from its [`VmCtx`].
 #[derive(Clone, Copy)]
@@ -7027,6 +7134,10 @@ struct Lower<'a> {
     /// `-g` (the backtrace would be empty) or where the helper isn't linked (a target with no trap
     /// runtime), leaving the trap path byte-identical to before.
     trap_capture: Option<(SigRef, i64)>,
+    /// #2164 — a paged compile's page check ([`emit_page_check`]): its shape, the miss thunk's
+    /// imported signature, and the variable holding the instance's access table, loaded once at
+    /// entry. `None` for an unpaged compile.
+    page: Option<(PageEnv, SigRef, Variable)>,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
@@ -7069,6 +7180,7 @@ fn build_clif(
     inst: InstEnv,
     setjmp: SetjmpEnv,
     sig: SigEnv,
+    page: PageEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -7159,6 +7271,16 @@ fn build_clif(
         }
         _ => None,
     };
+    // #2164 — a paged compile loads its instance's access table once, here, and imports the miss
+    // thunk's host-C signature `(vmctx, mem_base, off, len, flags) -> ()` once.
+    let page = page.is_paged().then(|| {
+        let table = b.declare_var(I64);
+        let t = b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::PAGES);
+        b.def_var(table, t);
+        let mut sig = module.make_signature(); // host C ABI
+        sig.params.extend([AbiParam::new(I64); 5]);
+        (page, b.import_signature(sig), table)
+    });
     let lower = Lower {
         mem_var,
         fn_table_var,
@@ -7189,6 +7311,7 @@ fn build_clif(
         func_idx,
         var_labels,
         trap_capture,
+        page,
     };
 
     // Jump into IR block 0 passing the function parameters (entry params after the three context
@@ -7921,13 +8044,18 @@ fn lower_block(
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mappedv = b.ins().iconst(I64, win_reserved as i64);
             let trap_out = b.use_var(lower.vmctx_var);
-            // Marshal the nine args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
+            // #2164 — a demand-paged child's thunk checks the access table before it writes: the
+            // declared window's page count bounds it.
+            let pages = b
+                .ins()
+                .iconst(I64, lower.page.map_or(0, |(p, ..)| p.pages as i64));
+            // Marshal the ten args into one 8-byte-aligned stack slot (matching `GcRootsArgs`'s
             // `#[repr(C)]` field order) and pass a single pointer. The thunk is the register-flush
             // trampoline, which spills the callee-saved registers before the scan; a one-pointer ABI
             // lets it do so with no per-argument reshuffle (see `fiber_rt::temen_gc_roots_flush`).
             let slot = b.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
-                72, // 9 × 8 bytes
+                80, // 10 × 8 bytes
                 3,  // 8-byte aligned
             ));
             for (i, v) in [
@@ -7940,6 +8068,7 @@ fn lower_block(
                 maskv,
                 mappedv,
                 trap_out,
+                pages,
             ]
             .into_iter()
             .enumerate()
@@ -8025,6 +8154,9 @@ fn lower_block(
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
             guard_atomic_align(b, lower, phys, w); // misaligned wait traps (like the other atomics)
+                                                   // #2164 — a wait reads its word, and a word on an unsupplied page faults it: fatal on
+                                                   // every engine, never paged.
+            emit_page_check(b, lower, phys, w, PAGE_MISS_FATAL);
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let exp_raw = get(&vals, *expected)?;
             let exp = if w < 8 {
@@ -8204,6 +8336,7 @@ fn lower_block(
                 );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
+                emit_page_check(b, lower, phys, 16, 0);
                 b.ins().load(I8X16, mem_flags(), phys, 0)
             }
             Inst::V128Store {
@@ -8219,6 +8352,7 @@ fn lower_block(
                 );
                 let elide = in_window(ub_at(&ubs, *addr), *offset, 16, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, 16);
+                emit_page_check(b, lower, phys, 16, PAGE_MISS_WRITE);
                 b.ins().store(mem_flags(), get(&vals, *value)?, phys, 0);
                 continue; // store produces no value
             }
@@ -8724,6 +8858,7 @@ fn lower_block(
                 } else {
                     checked.confine(b, lower, *addr, a, *offset, op.info().2)
                 };
+                emit_page_check(b, lower, phys, op.info().2, 0);
                 lower_load(b, *op, phys)
             }
             Inst::Store {
@@ -8745,6 +8880,7 @@ fn lower_block(
                 } else {
                     checked.confine(b, lower, *addr, a, *offset, op.info().2)
                 };
+                emit_page_check(b, lower, phys, op.info().2, PAGE_MISS_WRITE);
                 lower_store(b, *op, phys, get(&vals, *value)?);
                 continue; // store produces no value
             }
@@ -8766,6 +8902,9 @@ fn lower_block(
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
                 let sphys = confine_span(b, lower, get(&vals, *src)?, n);
+                // #2164: the source's pages, then the destination's, as the interpreters check them.
+                emit_span_page_check(b, lower, sphys, n, 0);
+                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE);
                 // I21: fault an overrun before the libcall (no partial write; catches `dst==src`).
                 probe_span(b, dphys, n);
                 probe_span(b, sphys, n);
@@ -8779,6 +8918,7 @@ fn lower_block(
             Inst::MemFill { dst, val, len } => {
                 let n = get(&vals, *len)?;
                 let dphys = confine_span(b, lower, get(&vals, *dst)?, n);
+                emit_span_page_check(b, lower, dphys, n, PAGE_MISS_WRITE); // #2164
                 probe_span(b, dphys, n);
                 // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
                 let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
@@ -8802,6 +8942,7 @@ fn lower_block(
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
+                emit_page_check(b, lower, phys, w, 0);
                 b.ins().atomic_load(int_clif_ty(*ty), atomic_flags(), phys)
             }
             Inst::AtomicStore {
@@ -8820,6 +8961,7 @@ fn lower_block(
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
+                emit_page_check(b, lower, phys, w, PAGE_MISS_WRITE);
                 b.ins()
                     .atomic_store(atomic_flags(), get(&vals, *value)?, phys);
                 continue; // atomic store produces no value
@@ -8841,6 +8983,7 @@ fn lower_block(
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w);
+                emit_page_check(b, lower, phys, w, PAGE_MISS_WRITE);
                 b.ins().atomic_rmw(
                     int_clif_ty(*ty),
                     atomic_flags(),
@@ -8866,6 +9009,7 @@ fn lower_block(
                 let elide = in_window(ub_at(&ubs, *addr), *offset, w, size);
                 let phys = mask_addr(b, lower, get(&vals, *addr)?, *offset, elide, w);
                 guard_atomic_align(b, lower, phys, w); // type is inferred from the operands
+                emit_page_check(b, lower, phys, w, PAGE_MISS_WRITE);
                 b.ins().atomic_cas(
                     atomic_flags(),
                     phys,
@@ -10321,6 +10465,131 @@ fn mask_addr(
     b.ins().iadd(base, confined)
 }
 
+/// §2.2 / #2164 — a demand-paged child's **page check** of a `len`-byte access at `phys`, emitted after
+/// the access's confinement (and, for an atomic, its alignment check: the interpreters' order). An
+/// unpaged compile emits nothing, so its code is the unpaged code.
+///
+/// `phys` is `mem_base + off`, `off` the access's window offset, or the guard page's where confinement
+/// redirected an out-of-bounds access. The access table ([`VmCtx::pages`]) has a byte for each page of
+/// the declared window and one for the page past it, which admits every access: past the declared
+/// window the hardware decides, as in an unpaged child, and the pager supplies nothing there. So an
+/// access starting in the declared window tests the bytes of its first and last pages (`len` is never
+/// more than a page, so those are its only pages), and one starting past it tests nothing.
+///
+/// A miss calls the miss thunk ([`PageMissThunk`]): it returns once every page of the access admits
+/// it, its pager having supplied the rest, or with a trap set, which unwinds. The bytes load with
+/// acquire ordering: a supply writes a page's bytes before its table byte, so a vCPU that reads the
+/// byte reads the bytes.
+fn emit_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, len: u32, flags: u64) {
+    let Some((page, sig, table)) = lower.page else {
+        return;
+    };
+    let base = b.use_var(lower.mem_var);
+    let off = b.ins().isub(phys, base);
+    let check = b.create_block();
+    let miss = b.create_block();
+    let done = b.create_block();
+    let declared = (page.pages << page.shift) as i64;
+    let in_window = b.ins().icmp_imm(IntCC::UnsignedLessThan, off, declared);
+    b.ins().brif(in_window, check, &[], done, &[]);
+
+    b.switch_to_block(check);
+    b.seal_block(check);
+    let t = b.use_var(table);
+    let state = |b: &mut FunctionBuilder, at: Value| {
+        let index = b.ins().ushr_imm(at, i64::from(page.shift));
+        let byte = b.ins().iadd(t, index);
+        b.ins().atomic_load(I8, MemFlags::trusted(), byte)
+    };
+    let mut admits = state(b, off);
+    if len > 1 {
+        let last = b.ins().iadd_imm(off, i64::from(len - 1));
+        let last = state(b, last);
+        admits = b.ins().band(admits, last);
+    }
+    let need = if flags & PAGE_MISS_WRITE != 0 {
+        temen_ir::PAGE_WRITE
+    } else {
+        temen_ir::PAGE_READ
+    };
+    let ok = b.ins().band_imm(admits, i64::from(need));
+    b.ins().brif(ok, done, &[], miss, &[]);
+
+    b.set_cold_block(miss);
+    b.switch_to_block(miss);
+    b.seal_block(miss);
+    let len = b.ins().iconst(I64, i64::from(len));
+    emit_page_miss(b, lower, (page, sig), base, off, len, flags);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+    b.seal_block(done);
+}
+
+/// #2164 — a demand-paged child's page check of a bulk op's span `[phys, phys + n)`: the miss thunk
+/// walks every page of a non-empty one before the op touches any, as the interpreters check a span
+/// whole before they copy (a span may cover many pages, so no inline test). An unpaged compile emits
+/// nothing.
+fn emit_span_page_check(b: &mut FunctionBuilder, lower: &Lower, phys: Value, n: Value, flags: u64) {
+    let Some((page, sig, _)) = lower.page else {
+        return;
+    };
+    let base = b.use_var(lower.mem_var);
+    let off = b.ins().isub(phys, base);
+    let walk = b.create_block();
+    let done = b.create_block();
+    b.ins().brif(n, walk, &[], done, &[]);
+    b.switch_to_block(walk);
+    b.seal_block(walk);
+    emit_page_miss(b, lower, (page, sig), base, off, n, flags);
+    b.ins().jump(done, &[]);
+    b.switch_to_block(done);
+    b.seal_block(done);
+}
+
+/// #2164 — whether a demand-paged instance's access table `table` admits a `len`-byte access at
+/// window offset `off` that needs `need` ([`temen_ir::PAGE_READ`] or [`temen_ir::PAGE_WRITE`]): every
+/// page of it among the declared window's `pages` has the bit. Past the declared window the hardware
+/// decides. For a host thunk that touches the window itself, as [`emit_page_check`] is for the code.
+///
+/// # Safety
+/// `table` is the instance's live access table, `pages + 1` bytes.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn table_admits(
+    table: *const AtomicU8,
+    pages: u64,
+    off: u64,
+    len: u64,
+    need: u8,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let shift = (mem::page_size() as u64).trailing_zeros();
+    let (first, last) = (off >> shift, (off + (len - 1)) >> shift);
+    (first..=last.min(pages.saturating_sub(1)))
+        .all(|p| (*table.add(p as usize)).load(Ordering::Acquire) & need != 0)
+}
+
+/// Call the miss thunk on `len` bytes at window offset `off` of the window at `base`, and unwind if
+/// it set a trap.
+fn emit_page_miss(
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+    (page, sig): (PageEnv, SigRef),
+    base: Value,
+    off: Value,
+    len: Value,
+    flags: u64,
+) {
+    let vm = b.use_var(lower.vmctx_var);
+    let thunk = b.ins().iconst(I64, page.thunk);
+    let flags = b.ins().iconst(I64, flags as i64);
+    b.ins()
+        .call_indirect(sig, thunk, &[vm, base, off, len, flags]);
+    emit_trap_propagate(b, lower);
+}
+
 /// **Bulk-span backed-extent probe (ISSUES.md I21).** Fault a bulk span that overruns the
 /// currently-*backed* region **before** the libcall runs. [`confine_span`] only bounds the span
 /// against `reserved`, delegating the `[mapped, reserved)` guard hole to the libcall's own accesses
@@ -10404,6 +10673,9 @@ fn copy_inline(
     };
     let s = confine(b, src)?;
     let d = confine(b, dst)?;
+    // #2164: the source's pages, then the destination's, as the interpreters check a copy's spans.
+    emit_page_check(b, lower, s, n, 0);
+    emit_page_check(b, lower, d, n, PAGE_MISS_WRITE);
     // Widest words first: 8 bytes, then the 4/2/1-byte tail.
     let mut words = Vec::new();
     let mut off = 0;

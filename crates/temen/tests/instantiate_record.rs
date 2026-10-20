@@ -861,6 +861,18 @@ fn a_record_with_nonzero_padding_fails_closed() {
 /// (func 2) gets the fault address in the child's coordinates, stores 77 at `addr + 40000` in its
 /// own window, and replies with that address (#1862).
 fn detached_pager_program_at(fault: u64) -> String {
+    let src = detached_pager_src(fault);
+    assert!(
+        runs_on_bytecode(&src),
+        "the cooperative driver pages its child itself (#2164)"
+    );
+    src
+}
+
+/// [`detached_pager_program_at`], for a test that makes it a program the bytecode engine does not run
+/// itself (threads, fibers, `memory.wait`, `gc.roots`). Such a test runs on [`BACKENDS`]: the
+/// bytecode row declines it to the tree-walker, and the parallel driver refuses it.
+fn detached_pager_src(fault: u64) -> String {
     let src = detached_record_program()
         .replace(
             "export 0 func \"child\" 1\n",
@@ -894,10 +906,6 @@ block 0 (vaddr: i64) {
             && src.contains("svc.wait")
             && src.contains(&format!("va = i64.const {fault}\n")),
         "the rewrites must apply"
-    );
-    assert!(
-        runs_on_bytecode(&src),
-        "the cooperative driver pages its child itself (#2164)"
     );
     src
 }
@@ -1113,6 +1121,472 @@ fn a_pager_reply_outside_its_window_is_a_fatal_fault() {
             faulted,
             "{b:?}: an unsuppliable page is fatal to the child"
         );
+    }
+}
+
+/// #2164 — a paged child's access past its declared window is fatal, on every driver: the tail
+/// `[mapped, reserved)` is the child's growth room (`vm_map`), never its pager's to supply. The child
+/// loads at 140000, past its 2^17-byte window, on a page no `vm_map` committed. The interpreters
+/// asked the pager for it and sized its page as `mapped - page`, which underflows there. Then a word
+/// at 131070, across the window's end: its first page is served (the pager replies 64 KiB down, in
+/// its own window), and its second, the tail's, is fatal. The Cranelift JIT's inline check passes an
+/// access past the window to the hardware, so only one across its end reaches its miss thunk.
+#[test]
+fn a_paged_childs_access_past_its_window_is_fatal() {
+    let past = detached_pager_program_at(140_000);
+    let across = detached_pager_program_at(131_070)
+        .replace(
+            "  voff = i64.const 40000\n  vsrc = i64.add vaddr voff\n",
+            "  voff = i64.const 65536\n  vsrc = i64.sub vaddr voff\n",
+        )
+        .replace("  vb = i32.load8_u va\n", "  vb = i32.load va\n");
+    assert!(
+        across.contains("i64.sub vaddr voff") && across.contains("i32.load va"),
+        "the rewrites must apply"
+    );
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for (src, want) in [(past, faulted), (across, faulted + 1000)] {
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                want,
+                "{b:?}: the tail is not the pager's"
+            );
+        }
+    }
+}
+
+/// #2164 — a store to a read-only §13 alias in a paged child is fatal, on every driver: the page is
+/// its region's, never its pager's to supply. The child mints a region, maps it read-only over the top
+/// 64 KiB of its window, and stores into it. The interpreters asked the pager for that page, copied the
+/// reply into the region, and then made the page the window's own again, over bytes nobody supplied.
+/// The map is 64 KiB-aligned because a region map aligns to `region_page_size`, Windows' allocation
+/// granularity there: the JIT refuses a finer one on Windows, and the store is then the pager's.
+#[test]
+fn a_paged_childs_store_to_a_read_only_alias_is_fatal() {
+    let src = detached_pager_program_at(65536)
+        .replace(
+            "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
+            "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
+        )
+        .replace(
+            "  vb = i32.load8_u va\n",
+            "  vas = i32.wrap_i64 vas64\n  vlen = i64.const 65536\n  \
+             vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)\n  vr = i32.wrap_i64 vrh\n  \
+             vz = i64.const 0\n  vro = i64.const 1\n  \
+             vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (va, vz, vlen, vro)\n  \
+             vnine = i32.const 9\n  i32.store8 va vnine\n  vb = i32.load8_u va\n",
+        );
+    assert!(
+        src.contains("(v0: i64, vas64: i64)") && src.contains("i32.store8 va vnine"),
+        "the rewrites must apply"
+    );
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for b in DRIVERS {
+        assert_eq!(
+            run_detached(b, &src).expect("run"),
+            faulted,
+            "{b:?}: an alias is not the pager's"
+        );
+    }
+}
+
+/// #2164 — a bulk op pages its source in before it checks its destination, on every driver, the
+/// order the interpreters check a `mem.copy`'s spans in: the child maps the top 64 KiB of its window
+/// read-only over a region (as [`a_paged_childs_store_to_a_read_only_alias_is_fatal`] does), then
+/// copies 4 bytes from 20000, a page nothing has touched, into it. The source is served, then the
+/// destination faults: one serve, then the fault. The length is a constant, which the Cranelift JIT
+/// copies inline, then the map's answer plus 4, which it copies through its libcall.
+#[test]
+fn a_paged_childs_copy_pages_its_source_before_it_checks_its_destination() {
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for len in [
+        "  vn = i64.const 4\n",
+        "  vfour = i64.const 4\n  vn = i64.add vm vfour\n",
+    ] {
+        let src = detached_pager_program_at(20000)
+            .replace(
+                "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
+                "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
+            )
+            .replace(
+                "  vb = i32.load8_u va\n",
+                &format!(
+                    "  vas = i32.wrap_i64 vas64\n  vlen = i64.const 65536\n  \
+                     vrh = call.cap 5 5 (i64) -> (i64) vas (vlen)\n  vr = i32.wrap_i64 vrh\n  \
+                     vz = i64.const 0\n  vro = i64.const 1\n  vdst = i64.const 65536\n  \
+                     vm = call.cap 4 0 (i64, i64, i64, i64) -> (i64) vr (vdst, vz, vlen, vro)\n\
+                     {len}  mem.copy vdst va vn\n  vb = i32.load8_u va\n"
+                ),
+            );
+        assert!(
+            src.contains("(v0: i64, vas64: i64)") && src.contains("mem.copy vdst va vn"),
+            "the rewrites must apply"
+        );
+        for b in DRIVERS {
+            assert_eq!(
+                run_detached(b, &src).expect("run"),
+                faulted + 1000,
+                "{b:?}, {len:?}: the source is served first"
+            );
+        }
+    }
+}
+
+/// #2164 — an atomic on an unsupplied page is paged in, as a load is, on every driver: the
+/// read-modify-write checks its word's alignment, then pages the word in (the interpreters' order),
+/// then adds to the pager's 77. The child returns the old value.
+#[test]
+fn a_paged_childs_atomic_is_paged_in() {
+    let src = detached_pager_program_at(20000).replace(
+        "  vb = i32.load8_u va\n",
+        "  vone = i32.const 1\n  vb = i32.atomic.rmw.add va vone\n",
+    );
+    assert!(
+        src.contains("atomic.rmw.add va vone"),
+        "the rewrite must apply"
+    );
+    for b in DRIVERS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}
+
+/// #2164 — a `memory.wait` on an unsupplied page faults, fatally, on every backend: no engine pages a
+/// wait's word in. The parent's `svc.wait` answers 0 once the child has ended (#1217).
+#[test]
+fn a_paged_childs_wait_on_an_unsupplied_page_is_fatal() {
+    let src = detached_pager_src(20000).replace(
+        "  vb = i32.load8_u va\n",
+        "  vexp = i32.const 0\n  vto = i64.const 0\n  vb = i32.atomic.wait va vexp vto\n",
+    );
+    assert!(src.contains("atomic.wait va"), "the rewrite must apply");
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), faulted, "{b:?}");
+    }
+}
+
+/// #2164 — a v128 load from an unsupplied page is paged in, on every driver: the child reads lane 0
+/// of the 16 bytes at the fault address, the pager's 77. The bytecode engine runs it through the
+/// oracle's own `eval_inst`, so it pages as the oracle's fallback does.
+#[test]
+fn a_paged_childs_v128_load_is_paged_in() {
+    let src = detached_pager_program_at(20000).replace(
+        "  vb = i32.load8_u va\n",
+        "  vv = v128.load va\n  vb = i8x16.extract_lane_u 0 vv\n",
+    );
+    assert!(src.contains("v128.load va"), "the rewrite must apply");
+    for b in DRIVERS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}
+
+/// #2164 — `gc.roots` writing into an unsupplied page faults, fatally, on every backend: every engine
+/// writes the roots from the host, through its checked buffer write, which pages nothing in. The
+/// range takes every masked word, so the scan finds a root to write.
+#[test]
+fn a_paged_childs_gc_roots_into_an_unsupplied_page_is_fatal() {
+    let src = detached_pager_src(20000).replace(
+        "  vb = i32.load8_u va\n",
+        "  vlo = i64.const 0\n  vhi = i64.const 72057594037927935\n  \
+         vmask = i64.const 72057594037927935\n  vcap = i64.const 4\n  \
+         vn = gc.roots vlo vhi vmask va vcap\n  vb = i32.wrap_i64 vn\n",
+    );
+    assert!(src.contains("gc.roots vlo"), "the rewrite must apply");
+    let faulted = temen_ir::trap_code::MEMORY_FAULT as i32 * 1_000_000;
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), faulted, "{b:?}");
+    }
+}
+
+/// #2164 — `gc.roots` into a page its pager has supplied writes the roots, on every backend: the
+/// child first reads 20000 (the pager's 77), then scans into it. On the JIT the host's buffer check
+/// reads the access table, so the supply must have reached it. The scan's count is each engine's own
+/// (GC.md §3.2): the child returns `77 + 100` when it found any.
+#[test]
+fn a_paged_childs_gc_roots_into_a_supplied_page_writes() {
+    let src = detached_pager_src(20000).replace(
+        "  vb = i32.load8_u va\n",
+        "  vb0 = i32.load8_u va\n  vlo = i64.const 0\n  vhi = i64.const 72057594037927935\n  \
+         vmask = i64.const 72057594037927935\n  vcap = i64.const 4\n  \
+         vn = gc.roots vlo vhi vmask va vcap\n  vz0 = i64.const 0\n  vany = i64.ne vn vz0\n  \
+         vh = i32.const 100\n  vhit = i32.mul vany vh\n  vb = i32.add vb0 vhit\n",
+    );
+    assert!(src.contains("gc.roots vlo"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1177, "{b:?}");
+    }
+}
+
+/// #2164 — a page the child unmaps itself is paged in again at its next touch, on every driver: the
+/// pager supplies the child's declared pages, whatever took one away. The child reads 20000 (77),
+/// unmaps the 16 KiB around it through its own AddressSpace, and reads it again (77). The parent
+/// serves both faults.
+#[test]
+fn a_paged_childs_own_unmapped_page_is_paged_in_again() {
+    let src = detached_pager_program_at(20000)
+        .replace(
+            "func 1 (i64) -> (i64) {\nblock 0 (v0: i64) {\n",
+            "func 1 (i64, i64) -> (i64) {\nblock 0 (v0: i64, vas64: i64) {\n",
+        )
+        .replace(
+            "  vs = svc.wait vz\n",
+            "  vs1 = svc.wait vz\n  vs2 = svc.wait vz\n  vs = i64.add vs1 vs2\n",
+        )
+        .replace(
+            "  vb = i32.load8_u va\n",
+            "  vb1 = i32.load8_u va\n  vas = i32.wrap_i64 vas64\n  vpg = i64.const 16384\n  \
+             vu = call.cap 5 1 (i64, i64) -> (i64) vas (vpg, vpg)\n  vb2 = i32.load8_u va\n  \
+             vb = i32.add vb1 vb2\n",
+        );
+    assert!(
+        src.contains("vas64: i64") && src.contains("vs2 = svc.wait") && src.contains("vb2 ="),
+        "the rewrites must apply"
+    );
+    for b in DRIVERS {
+        assert_eq!(run_detached(b, &src).expect("run"), 154 + 2000, "{b:?}");
+    }
+}
+
+/// #2164 — a paged child's thread pages too, on every backend: the thread reads 32768 and the child
+/// then 49152, two pages nothing has touched, and the parent serves both.
+#[test]
+fn a_paged_childs_thread_is_paged_in() {
+    let src = detached_pager_src(32768)
+        .replace(
+            "  vs = svc.wait vz\n",
+            "  vs1 = svc.wait vz\n  vs2 = svc.wait vz\n  vs = i64.add vs1 vs2\n",
+        )
+        .replace(
+            "  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+            "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj = thread.join vth\n  \
+             vc = i64.const 49152\n  vb = i32.load8_u vc\n  vbw = i64.extend_i32_u vb\n  \
+             vr = i64.add vtj vbw\n  return vr\n",
+        )
+        + "
+func 3 (i64, i64) -> (i64) {
+block 0 (vsp: i64, vaddr: i64) {
+  vb = i32.load8_u vaddr
+  vbw = i64.extend_i32_u vb
+  return vbw
+  }
+}
+";
+    assert!(
+        src.contains("vs2 = svc.wait") && src.contains("thread.spawn 3"),
+        "the rewrites must apply"
+    );
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 154 + 2000, "{b:?}");
+    }
+}
+
+/// #2164 — a fault in a paged child's guest fiber blocks its whole vCPU, on every backend, as a fault
+/// in the child's own frames does: the fiber reads 20000, a page nothing has touched, and returns the
+/// pager's 77, so its `cont.resume` answers (1 = returned, 77), never `FIBER_PARKED` (3).
+#[test]
+fn a_fault_in_a_paged_childs_fiber_blocks_its_vcpu() {
+    let src = detached_pager_src(20000)
+        .replace(
+            "  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+            "  vf = ref.func 3\n  vstk = i64.const 4096\n  vk = cont.new vf vstk\n  \
+             vst, vval = cont.resume vk va\n  vst64 = i64.extend_i32_u vst\n  vthou = i64.const 1000\n  \
+             vs1 = i64.mul vst64 vthou\n  \
+             vr = i64.add vs1 vval\n  return vr\n",
+        )
+        + "
+func 3 (i64, i64) -> (i64) {
+block 0 (vk: i64, vaddr: i64) {
+  vb = i32.load8_u vaddr
+  vbw = i64.extend_i32_u vb
+  return vbw
+  }
+}
+";
+    assert!(src.contains("cont.resume vk va"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 2077, "{b:?}");
+    }
+}
+
+/// #2164 — [`a_fault_in_a_paged_childs_fiber_blocks_its_vcpu`] from a fiber in the child's thread, on
+/// every backend: on the JIT a child's root runs as a task and its thread on an OS thread of its own,
+/// which blocks in place. The thread answers (1 = returned, 77), and the child returns that.
+#[test]
+fn a_fault_in_a_paged_childs_thread_fiber_blocks_its_vcpu() {
+    let src = detached_pager_src(32768).replace(
+        "  vb = i32.load8_u va\n  vbw = i64.extend_i32_u vb\n  return vbw\n",
+        "  vsp = i64.const 0\n  vth = thread.spawn 3 vsp va\n  vtj = thread.join vth\n  \
+             return vtj\n",
+    ) + "
+func 3 (i64, i64) -> (i64) {
+block 0 (vsp: i64, vaddr: i64) {
+  vf = ref.func 4
+  vstk = i64.const 4096
+  vk = cont.new vf vstk
+  vst, vval = cont.resume vk vaddr
+  vst64 = i64.extend_i32_u vst
+  vthou = i64.const 1000
+  vs1 = i64.mul vst64 vthou
+  vr = i64.add vs1 vval
+  return vr
+  }
+}
+
+func 4 (i64, i64) -> (i64) {
+block 0 (vk: i64, vaddr: i64) {
+  vb = i32.load8_u vaddr
+  vbw = i64.extend_i32_u vb
+  return vbw
+  }
+}
+";
+    assert!(src.contains("thread.spawn 3"), "the rewrite must apply");
+    for b in BACKENDS {
+        assert_eq!(run_detached(b, &src).expect("run"), 2077, "{b:?}");
+    }
+}
+
+/// #2164 — one child spawned paged, then unpaged, in one run, on every driver. The paged spawn reads
+/// its pager's 77, the unpaged one its own window's 0. On the JIT each runs a compile of its own:
+/// the child-code cache keys on paging, and an instance of the other compile would check a table it
+/// does not have, or none it has.
+#[test]
+fn a_child_spawned_paged_then_unpaged_runs_each_compile() {
+    let src = detached_pager_program_at(20000).replace(
+        "  vc = i32.wrap_i64 vt2\n",
+        "  vr0u = i64.const -4294967279\n  i64.store vra0 vr0u\n  \
+         vch2 = call.cap 6 17 (i64) -> (i32) vh (vrp)\n  \
+         vj2_st, vj2 = call.cap 6 1 (i32) -> (i64, i64) vh (vch2)\n  \
+         vst2 = i64.mul vj2_st vk2\n  vt3 = i64.add vt2 vj2\n  vt4 = i64.add vt3 vst2\n  \
+         vc = i32.wrap_i64 vt4\n",
+    );
+    assert!(src.contains("vch2 ="), "the rewrite must apply");
+    for b in DRIVERS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
+    }
+}
+
+/// #2164 — a granted child pages its own grandchild, as a root pages a child, on every driver. The
+/// root declares a pager but spawns its child unpaged, granting it the grandchild's image as
+/// `"grand"`. The child (function 1) spawns the grandchild (function 3) through a record naming the
+/// program's pager export, serves its one fault, joins, and returns `grandchild + serves * 1000`.
+/// The grandchild returns the byte at 49152, the pager's 77. The root returns
+/// `status * 1_000_000 + child`.
+#[test]
+fn a_granted_child_pages_its_grandchild() {
+    let src = format!(
+        "\
+memory 17
+data 16384 \"vm\"
+data 16400 \"budget\"
+data 16448 \"child\"
+data 16456 \"grand\"
+{root_rec}{child_rec}type 0 func (i64) -> (i64)
+type 1 interface {{ page: 0 }}
+export 0 interface \"pager\" 1 {{ page: 2 }}
+export 0 func \"child\" 1
+export 1 func \"grand\" 3
+
+func 0 () -> (i32) {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  vh = self.resolve vp vl
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vcp = i64.const 16448
+  vcl = i64.const 5
+  vchild = self.resolve vcp vcl
+  vgp = i64.const 16456
+  vgl = i64.const 5
+  vgrand = self.resolve vgp vgl
+  vrm = i64.const 17416
+  i32.store vrm vchild
+  vrb = i64.const 17420
+  i32.store vrb vb
+{grant}  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vh (vrp)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vh (vch)
+  vk = i64.const 1000000
+  vst = i64.mul vj_st vk
+  vt = i64.add vst vj
+  vc = i32.wrap_i64 vt
+  return vc
+  }}
+}}
+
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vi = i32.wrap_i64 v0
+  vbp = i64.const 16400
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vgp = i64.const 16456
+  vgl = i64.const 5
+  vgrand = self.resolve vgp vgl
+  vrm = i64.const 17512
+  i32.store vrm vgrand
+  vrb = i64.const 17516
+  i32.store vrb vb
+  vrp = i64.const 17504
+  vgh = call.cap 6 17 (i64) -> (i32) vi (vrp)
+  vz = i32.const 0
+  vs = svc.wait vz
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vi (vgh)
+  vk = i64.const 1000
+  vsk = i64.mul vs vk
+  vt = i64.add vj vsk
+  vk2 = i64.const 1000000
+  vst = i64.mul vj_st vk2
+  vr = i64.add vt vst
+  return vr
+  }}
+}}
+
+func 2 (i64) -> (i64) {{
+block 0 (vaddr: i64) {{
+  voff = i64.const 40000
+  vsrc = i64.add vaddr voff
+  vb = i32.const 77
+  i32.store8 vsrc vb
+  return vsrc
+  }}
+}}
+
+func 3 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  va = i64.const 49152
+  vb = i32.load8_u va
+  vbw = i64.extend_i32_u vb
+  return vbw
+  }}
+}}
+",
+        root_rec = rec::segment(
+            17408,
+            &SpawnRec {
+                grants_ptr: 16640,
+                grants_n: 1,
+                ..SpawnRec::default()
+            }
+        ),
+        child_rec = rec::segment(
+            17504,
+            &SpawnRec {
+                pager: 0,
+                ..SpawnRec::default()
+            }
+        ),
+        grant = rec::grant("g", 16640, 16456, 5, "vgrand"),
+    );
+    assert!(
+        runs_on_bytecode(&src),
+        "the cooperative driver pages the grandchild itself"
+    );
+    for b in DRIVERS {
+        assert_eq!(run_detached(b, &src).expect("run"), 1077, "{b:?}");
     }
 }
 

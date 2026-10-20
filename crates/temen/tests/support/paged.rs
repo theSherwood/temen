@@ -208,6 +208,7 @@ fn run_guest_argv_bytes(guest_src: &str, tail: &[i64], mode: Mode) -> (Outcome, 
                 root: ProgramEmit {
                     eligible: Arc::from(eligible),
                     page_checked: true,
+                    ..Default::default()
                 },
                 leaf: None,
                 modules: None,

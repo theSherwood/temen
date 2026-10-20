@@ -84,9 +84,9 @@ const exCounted = Object.fromEntries(
     return [k, v];
   }));
 
-// The guest's leaf is padded to clear the production tier-up size floor, but pin the floor at its
-// default explicitly so this test states what it depends on rather than inheriting it.
-ex.temen_coop_set_tierup_floor(4096);
+// The guest calls its leaf once: tier up every eligible call at its start (#2474), so the leaf runs
+// emitted, and say so rather than inheriting the default.
+ex.temen_coop_set_hotness(0, 0);
 
 // The window's final size has to be read while the session is still open, so sample it at the last
 // bounce (the run closes its session before `runJitModule` returns).
@@ -302,8 +302,6 @@ const childWant = { status: ex.temen_status(), out: readStdout() };
 if (childWant.status !== 0 || childWant.out.length !== 8) {
   throw new Error(`child oracle sanity: status ${childWant.status}, ${childWant.out.length} bytes`);
 }
-// Its functions are tiny: let every emittable one tier up.
-ex.temen_coop_set_tierup_floor(0);
 const childOpened = ex.temen_coop_open(cp, childGuest.length, 0, 0, 1, 0, 0, 0);
 ex.temen_dealloc(cp, childGuest.length);
 // The program each tier-up names, each bounce's pending program, and each program whose own emit
@@ -346,7 +344,7 @@ if (childOpened !== 0) {
   }
   if (childGot.out !== childWant.out) fail('child: stdout differs from the oracle');
 }
-ex.temen_coop_set_tierup_floor(4096);
+ex.temen_coop_reset_hotness();
 
 if (process.exitCode) process.exit(process.exitCode);
 console.log(`ok — coop path, ${counts.tierups} tier-up(s), ${counts.bounces} bounce(s), `

@@ -2314,8 +2314,10 @@ default above still stands for every handle-gated capability.
   was deleted: INVARIANTS.md #13's 2026-09-29 ruling.)
 - **Lending memory to inner VMs** (the explicit ask): share a region into the child (§13). For
   *lazy* page supply the parent registers as the child's **pager** (userfaultfd-style): it supplies
-  each page's bytes at first touch, mapped access stays zero-overhead, and the parent is trapped
-  only on faults it chose to virtualize.
+  each page's bytes at first touch, and the parent is trapped only on faults it chose to
+  virtualize. On the Cranelift JIT a paged child's code tests a per-page access table before each
+  access, and calls into its pager on a miss (#2164): the paged child pays that check, and nothing
+  else does.
 - **Instantiation primitive:** an **`Instantiator`** capability lets a holder spawn a child domain
   with (a) a window paid from a `Budget` it holds, (b) an attenuated subset of its own
   capabilities, and (c) a resource/core quota from that budget. A parent can only sub-allocate

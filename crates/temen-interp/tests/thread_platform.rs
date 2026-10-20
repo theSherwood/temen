@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use temen_interp::bytecode::{
-    self, EmittedCall, EmittedTarget, ModuleOffer, ProgramEmit, ThreadPlatform, ThreadStart,
-    ThreadTier,
+    self, EmittedCall, EmittedTarget, Hotness, ModuleOffer, ProgramEmit, ThreadPlatform,
+    ThreadStart, ThreadTier,
 };
 use temen_interp::{ForeignOps, Host, JitValidated, Region, Trap, Value};
 use temen_ir::{Module, SpawnRec, ValType};
@@ -202,8 +202,11 @@ fn tier(
 ) -> ThreadPlatform {
     ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible,
-            page_checked: false,
+            root: ProgramEmit {
+                eligible,
+                page_checked: false,
+                ..Default::default()
+            },
             spill: 0,
             modules: None,
             run,
@@ -259,6 +262,110 @@ fn each_thread_runs_its_entry_on_its_emitted_tier() {
         ENTRIES.load(Ordering::SeqCst),
         4,
         "each thread's entry tiered up"
+    );
+}
+
+/// The root calls function 1 with 3 and function 2 with 200, 50 times each, and returns what they
+/// counted: 50 × (3 + 200) = 10150. Both count to their argument, a taken back edge a step.
+const LIGHT_AND_HEAVY_CALLS: &str = "memory 16
+func () -> (i64) {
+block 0 () {
+  vk = i64.const 50
+  vz = i64.const 0
+  br 1(vk, vz)
+}
+block 1 (vm: i64, vacc: i64) {
+  vzero = i64.const 0
+  vdone = i64.eq vm vzero
+  br_if vdone 3(vacc) 2(vm, vacc)
+}
+block 2 (vk2: i64, va: i64) {
+  v3 = i64.const 3
+  vl = call 1 (v3)
+  v200 = i64.const 200
+  vh = call 2 (v200)
+  vs1 = i64.add va vl
+  vs = i64.add vs1 vh
+  v1 = i64.const 1
+  vk1 = i64.sub vk2 v1
+  br 1(vk1, vs)
+}
+block 3 (vsum: i64) {
+  return vsum
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  br 1(v0, v1)
+}
+block 1 (v2: i64, v3: i64) {
+  v4 = i64.lt_s v3 v2
+  br_if v4 2(v2, v3) 3(v3)
+}
+block 2 (v5: i64, v6: i64) {
+  v7 = i64.const 1
+  v8 = i64.add v6 v7
+  br 1(v5, v8)
+}
+block 3 (v9: i64) {
+  return v9
+  }
+}
+";
+
+static HOT_CALLS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn recording_hot_calls(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
+    let EmittedTarget::Region { func, .. } = call.target else {
+        panic!("only tier-ups reach this tier");
+    };
+    HOT_CALLS.lock().unwrap().push(func);
+    // The work a host reports for the call, the fuel its emitted code burns: each callee here
+    // counts to its argument, a back edge a count.
+    call.work = call.argv[0] as u64;
+    bounce_whole_call(call)
+}
+
+/// #2474 — calls tier up on the work they do, on either tier: every function's calls tier up from
+/// the first, until 4 of them in a row average under 100 safepoints. The function counting to 200
+/// stays up, as the work its host reports keeps the average; the one counting to 3 backs off after
+/// its first four calls, and its interpreted calls keep it there.
+#[test]
+fn a_call_tiers_up_while_its_calls_do_enough_work() {
+    let m = module(LIGHT_AND_HEAVY_CALLS);
+    let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
+    assert_eq!(interpreted, Ok(vec![Value::I64(10150)]));
+    let mut platform = tier(Arc::from([false, true, true]), recording_hot_calls);
+    platform.tier.as_mut().expect("a tier").root.hot = Hotness {
+        per_call: 100,
+        window: 4,
+    };
+    assert_eq!(run_over(&m, platform, flat_window()), interpreted);
+    let ran = HOT_CALLS.lock().unwrap().clone();
+    let first_window = [1, 2].repeat(4);
+    assert_eq!(
+        ran,
+        [first_window, vec![2; 46]].concat(),
+        "both functions' first four calls, then function 2's other 46"
     );
 }
 
@@ -519,8 +626,11 @@ fn run_invokes(
 fn invoke_tier(run: fn(&mut EmittedCall<'_>) -> Result<(), Trap>) -> ThreadPlatform {
     ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: Arc::from([false, false]),
-            page_checked: false,
+            root: ProgramEmit {
+                eligible: Arc::from([false, false]),
+                page_checked: false,
+                ..Default::default()
+            },
             spill: 0,
             modules: None,
             run,
@@ -605,8 +715,11 @@ fn run_paged(
         .replace("{page}", &temen_interp::host_page_size().to_string());
     host.set_thread_platform(ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: count_eligible(),
-            page_checked: true,
+            root: ProgramEmit {
+                eligible: count_eligible(),
+                page_checked: true,
+                ..Default::default()
+            },
             spill: 0,
             modules: None,
             run,
@@ -803,8 +916,11 @@ fn a_collector_under_each_threads_emitted_frame_sees_its_spilled_words() {
     );
     let spilling = ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: Arc::from([false, true, false, false]),
-            page_checked: false,
+            root: ProgramEmit {
+                eligible: Arc::from([false, true, false, false]),
+                page_checked: false,
+                ..Default::default()
+            },
             spill: 64,
             modules: None,
             run: spill_then_collect,
@@ -1133,13 +1249,17 @@ fn a_childs_root_task_tiers_up_over_its_own_memory() {
     // nothing eligible.
     let platform = ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: Arc::from([false]),
-            page_checked: false,
+            root: ProgramEmit {
+                eligible: Arc::from([false]),
+                page_checked: false,
+                ..Default::default()
+            },
             spill: 0,
             modules: Some(Arc::new(|_: &ModuleOffer| {
                 Some(ProgramEmit {
                     eligible: Arc::from([false, false, true]),
                     page_checked: false,
+                    ..Default::default()
                 })
             })),
             run: recording_child_calls,
@@ -1336,13 +1456,17 @@ fn recording_child_bounces(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
 fn a_bounce_spawns_and_joins_a_child_whose_entry_spawns_a_thread() {
     let platform = ThreadPlatform {
         tier: Some(ThreadTier {
-            eligible: Arc::from([false, true]),
-            page_checked: false,
+            root: ProgramEmit {
+                eligible: Arc::from([false, true]),
+                page_checked: false,
+                ..Default::default()
+            },
             spill: 0,
             modules: Some(Arc::new(|_: &ModuleOffer| {
                 Some(ProgramEmit {
                     eligible: Arc::from([true, false]),
                     page_checked: false,
+                    ..Default::default()
                 })
             })),
             run: recording_child_bounces,
