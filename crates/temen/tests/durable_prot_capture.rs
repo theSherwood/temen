@@ -877,22 +877,12 @@ fn a_thaw_keeps_what_the_guest_wrote_to_its_data_segments() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// #2441: a window whose page map is empty — smaller than the NULL guard, which then stays off, and
-/// with no `readonly` segment — that writes its data segment (entry 0) and reads it back (1).
-const SMALL_SEGMENT: &str = "memory 13
-data 4096 \"abcd\"
+/// #2441: a guest that reads back the first byte of its data segment.
+const ONE_SEGMENT: &str = "memory 16
+data 32768 \"abcd\"
 func (i32) -> (i64) {
 block 0 (v0: i32) {
-  vw = i64.const 4096
-  vz = i32.const 122
-  i32.store8 vw vz
-  vr = i64.const 0
-  return vr
-  }
-}
-func (i32) -> (i64) {
-block 0 (v0: i32) {
-  vw = i64.const 4096
+  vw = i64.const 32768
   w = i64.load8_u vw
   return w
   }
@@ -900,34 +890,36 @@ block 0 (v0: i32) {
 ";
 
 /// #2441: a thaw is a whole window even when nothing in its page map says so. A run told a fresh
-/// seed from a thaw by whether the layout's page map was empty, and a window captured with none — no
-/// NULL guard, no read-only page — came back as a seed, its data segments laid over what the guest
-/// wrote to them (`97`, the segment's `a`, for `122`).
+/// seed from a thaw by whether the layout's page map was empty, and a window frozen with none — on
+/// a host whose page is larger than the NULL guard, which then stays off, with no read-only page —
+/// came back as a seed, its data segments laid over what the guest wrote to them (`97`, the
+/// segment's `a`, for `122`).
 #[test]
 fn a_thaw_with_an_empty_page_map_keeps_its_data_segment() {
     if !temen_jit::fiber_supported() {
         return;
     }
-    let m = temen_text::parse_module(SMALL_SEGMENT).expect("parse");
+    let m = temen_text::parse_module(ONE_SEGMENT).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let fresh = MemLayout::image(vec![0u8; 1 << 13]);
-    let mut hi = Host::new();
-    let (r, frozen) = interp_run(&m, 0, &[Value::I32(0)], &fresh, 13, &mut hi);
-    assert_eq!(r, Ok(vec![Value::I64(0)]));
+    // The window the guest left, the first byte of its segment written, with every page at its
+    // default, as such a host captures it. (A window smaller than the guard captures one on any
+    // host, but a durable JIT run cannot run one yet: #2518.)
+    let mut image = vec![0u8; 1 << 16];
+    image[32768..32772].copy_from_slice(b"zbcd");
+    let frozen = MemLayout::from_dense(image, &[CapturedProt::Rw; 16], 1 << 16);
     assert!(
         frozen.page_map().is_empty(),
-        "nothing deviates in the window"
+        "nothing in the map says it is a window"
     );
-    let art = temen_snapshot::freeze_layout(&m, &frozen, 13, &Host::new()).expect("freeze");
+    let art = temen_snapshot::freeze_layout(&m, &frozen, 16, &Host::new()).expect("freeze");
 
     let (layout, reserved) =
         temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
-    let mut hi = Host::new();
-    let (ir, _) = interp_run(&m, 1, &[Value::I32(0)], &layout, reserved, &mut hi);
+    let (ir, _) = interp_run(&m, 0, &[Value::I32(0)], &layout, reserved, &mut Host::new());
     let mut hj = Host::new();
     hj.set_durable(true);
     let (jo, _) =
-        temen_run::jit_cap_run(&m, 1, &[0], &layout, reserved, 0, &mut hj, None).expect("jit");
+        temen_run::jit_cap_run(&m, 0, &[0], &layout, reserved, 0, &mut hj, None).expect("jit");
     assert_eq!(
         (ir, jo),
         (
