@@ -21348,65 +21348,93 @@ type OffloadJob = Box<dyn FnOnce() + Send + 'static>;
 /// calls off the guest's threads.
 ///
 /// The workers take jobs from one queue, so a call waits only while every worker is busy, never
-/// behind a long call while another worker idles (#2477). Each worker holds the queue's lock only
-/// while it waits for a job, never while it runs one.
+/// behind a long call while another worker idles (#2477). A job wakes one idle worker, and a worker
+/// holds the queue's lock only to take a job or count one finished, never while it waits or runs.
 ///
 /// Nothing waits for the workers (#2493). A punted call never touches the window, and posts its
 /// answer into its store, which outlives the pool. A call may wait on the world for as long as it
-/// likes, so dropping the pool closes the queue and lets each worker finish its call and exit on
-/// its own: a domain's teardown, its parent's `join`, or the run's end never waits for one.
+/// likes, so dropping the pool closes the queue and lets each worker finish the calls queued and
+/// exit on its own: a domain's teardown, its parent's `join`, or the run's end never waits for one.
 struct OffloadPool {
-    queue: std::sync::mpsc::Sender<OffloadJob>,
-    /// Calls dispatched but not yet finished — `(count, condvar)`, for [`OffloadPool::quiesce`].
-    inflight: Arc<(Mutex<usize>, Condvar)>,
+    shared: Arc<PoolShared>,
+}
+
+/// What a pool shares with its workers.
+struct PoolShared {
+    state: Mutex<PoolState>,
+    /// A job came, or the pool is gone.
+    work: Condvar,
+    /// The last call in flight finished ([`OffloadPool::quiesce`]).
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Calls dispatched and not yet taken by a worker.
+    jobs: std::collections::VecDeque<OffloadJob>,
+    /// Calls dispatched and not yet finished.
+    inflight: usize,
+    /// The pool is gone: a worker that finds no job exits.
+    closed: bool,
 }
 
 impl OffloadPool {
     fn new(k: usize) -> OffloadPool {
-        let (queue, jobs) = std::sync::mpsc::channel::<OffloadJob>();
-        let jobs = Arc::new(Mutex::new(jobs));
+        let shared = Arc::new(PoolShared {
+            state: Mutex::default(),
+            work: Condvar::new(),
+            idle: Condvar::new(),
+        });
         for _ in 0..k {
-            let jobs = Arc::clone(&jobs);
-            std::thread::spawn(move || loop {
-                let job = jobs.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                match job {
-                    Ok(job) => job(),
-                    // The pool is gone and the queue is empty.
-                    Err(_) => return,
-                }
-            });
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.work());
         }
-        OffloadPool {
-            queue,
-            inflight: Arc::new((Mutex::new(0), Condvar::new())),
-        }
+        OffloadPool { shared }
     }
 
     /// Queue `job` for the next free worker and return at once: the caller parks, or waits on the
     /// store, for its answer.
     fn dispatch(&self, job: OffloadJob) {
-        *self.inflight.0.lock().unwrap() += 1;
-        let inflight = Arc::clone(&self.inflight);
-        let wrapped: OffloadJob = Box::new(move || {
-            job();
-            let (m, c) = &*inflight;
-            let mut g = m.lock().unwrap();
-            *g -= 1;
-            if *g == 0 {
-                c.notify_all();
-            }
-        });
-        self.queue
-            .send(wrapped)
-            .expect("offload workers outlive their pool");
+        let mut g = self.shared.state.lock_unpoisoned();
+        g.jobs.push_back(job);
+        g.inflight += 1;
+        drop(g);
+        self.shared.work.notify_one();
     }
 
     /// Block until every dispatched call has finished.
     fn quiesce(&self) {
-        let (m, c) = &*self.inflight;
-        let mut g = m.lock().unwrap();
-        while *g > 0 {
-            g = c.wait(g).unwrap();
+        let g = self.shared.state.lock_unpoisoned();
+        let idle = self.shared.idle.wait_while(g, |s| s.inflight > 0);
+        drop(idle.unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+impl Drop for OffloadPool {
+    fn drop(&mut self) {
+        self.shared.state.lock_unpoisoned().closed = true;
+        self.shared.work.notify_all();
+    }
+}
+
+impl PoolShared {
+    /// A worker: run the queued calls, one at a time, until the pool is gone and none is left.
+    fn work(&self) {
+        let mut g = self.state.lock_unpoisoned();
+        loop {
+            match g.jobs.pop_front() {
+                Some(job) => {
+                    drop(g);
+                    job();
+                    g = self.state.lock_unpoisoned();
+                    g.inflight -= 1;
+                    if g.inflight == 0 {
+                        self.idle.notify_all();
+                    }
+                }
+                None if g.closed => return,
+                None => g = self.work.wait(g).unwrap_or_else(|e| e.into_inner()),
+            }
         }
     }
 }
