@@ -365,7 +365,9 @@ impl Tree {
                     }
                 }
             }
-            _ => compile(cc, program, entry, jit, plan, interrupt, self, None)?,
+            // A `Jit`-driving image extends its own code, so it shares no compile; a directory can
+            // still keep the code it starts from (temen#2452).
+            _ => compile(cc, program, entry, jit, plan, interrupt, self, digest)?,
         };
         Ok(Loaded { cm, image })
     }

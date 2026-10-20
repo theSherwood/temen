@@ -7149,15 +7149,15 @@ impl ChildCodeCache {
 
     /// The code for a spawn of the child `c` describes, whose module `digest` names: an instance of
     /// the cache's compile of it. The first spawn makes the compile and runs it itself. Only for a
-    /// child that cannot extend its code: one holding a `Jit` ([`GrantChild::holds_jit`]) compiles
-    /// its own.
+    /// child that cannot extend its code: one holding a `Jit` ([`GrantChild::holds_jit`]) has code
+    /// of its own ([`Self::own`]).
     pub(crate) fn instance(
         &self,
         digest: [u8; 32],
         c: &ChildCompile<'_>,
     ) -> Result<CompiledModule, JitError> {
         let key = ChildCodeKey::of(digest, c);
-        let disk = self.dir.as_ref().map(|dir| (dir, key.kept()));
+        let disk = self.disk(&key);
         let slot = Arc::clone(
             self.slots
                 .lock()
@@ -7173,6 +7173,22 @@ impl ChildCodeCache {
         let first = compile_child_windowed(c, disk)?;
         *kept = first.share();
         Ok(first)
+    }
+
+    /// The code for a spawn of a child that extends its code, one holding a `Jit`: a compile no
+    /// other spawn shares, since the units it installs are its own. It starts from the code the
+    /// cache's directory kept, if any, as [`Self::instance`]'s compile does (temen#2452).
+    pub(crate) fn own(
+        &self,
+        digest: [u8; 32],
+        c: &ChildCompile<'_>,
+    ) -> Result<CompiledModule, JitError> {
+        compile_child_windowed(c, self.disk(&ChildCodeKey::of(digest, c)))
+    }
+
+    /// Where the code for `key` is kept, and under what key, when the cache keeps code on disk.
+    fn disk(&self, key: &ChildCodeKey) -> Option<(&CodeDir, [u8; 32])> {
+        self.dir.as_ref().map(|dir| (dir, key.kept()))
     }
 }
 

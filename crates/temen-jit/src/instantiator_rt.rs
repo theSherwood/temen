@@ -1685,9 +1685,9 @@ unsafe fn spawn_detached(
         shadow: child_shadow,
     };
     // temen#2168 — an instance of the run's one compile of this child, unless the child holds a
-    // `Jit`: it extends its own code, so it compiles its own.
+    // `Jit`: it extends its own code, so it has a compile of its own.
     let compiled = if gc.holds_jit {
-        crate::compile_child_windowed(&cc, None)
+        rt.child_code().own(digest, &cc)
     } else {
         rt.child_code().instance(digest, &cc)
     };
