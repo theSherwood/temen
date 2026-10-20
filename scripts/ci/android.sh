@@ -14,8 +14,9 @@
 # order; GitHub's ubuntu image sets the last two, so CI fetches nothing. API level 30 is the lowest
 # with `memfd_create`, which shared regions are made from (Bionic has no `shm_open`).
 #
-# Test binaries (`test`, `nextest`) link statically (`crt-static`), so they need no Android
-# userspace: x86-64 ones run natively on a Linux host, and aarch64 ones under qemu-user
+# Test binaries (`test`, `nextest`) link statically (`crt-static`) and keep their scratch files in
+# the host's temp dir, so they need no Android userspace: x86-64 ones run natively on a Linux host,
+# and aarch64 ones under qemu-user
 # (`CARGO_TARGET_AARCH64_LINUX_ANDROID_RUNNER=qemu-aarch64-static`). They exercise Bionic and
 # temen's Android code paths, not an Android device: ART's signal chaining and the app sandbox stay
 # untested here (#2514). Every other subcommand links as an embedder does, dynamically, so a
@@ -68,6 +69,9 @@ export "CARGO_TARGET_${triple}_LINKER=$clang"
 case "$subcommand" in
   test | nextest)
     export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C link-arg=-Wno-unused-command-line-argument"
+    # With TMPDIR unset, std's `temp_dir` on Android is the device's `/data/local/tmp`, which a Linux
+    # host doesn't have, so the tests' scratch files go to the host's.
+    export TMPDIR="${TMPDIR:-/tmp}"
     ;;
 esac
 
