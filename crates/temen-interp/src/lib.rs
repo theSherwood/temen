@@ -33984,10 +33984,15 @@ impl Mem {
     /// undo compares to decline across a `map`/`unmap` that moved an alias, which the journal's
     /// pre-images do not record.
     pub(crate) fn alias_version(&self) -> u64 {
-        match self.has_regions.load(Ordering::Relaxed) {
+        match self.has_aliased() {
             true => self.map_version(),
             false => 0,
         }
+    }
+
+    /// Whether this window has ever aliased a §13 region: a page whose bytes are the region's.
+    pub(crate) fn has_aliased(&self) -> bool {
+        self.has_regions.load(Ordering::Relaxed)
     }
 
     /// Build the memory view a spawned vCPU (`thread.spawn`) starts with (§12): it shares the **same**

@@ -539,14 +539,16 @@ object, and *who holds authority over its backing* is the whole visibility story
   declared window) and refuses `-EINVAL` before the quota take; a wrong-kind handle traps `CapFault`.
   Tree-walk, bytecode, and Cranelift JIT (a real `MAP_SHARED` view) carry it. On the wasm-JIT tier
   two `WebAssembly.Memory`s cannot alias, and the parent and child interleave, so a pre-mapped child
-  runs interpreted: its module uses a `SharedRegion`, which keeps it off the emitted tier, and a
-  region page in an emitted window's page-state table is fail-closed. The browser's parallel driver
-  refuses a pre-map. (Until #1414 S4-5b, the op-13 servicer, which ran a child to completion before
-  its parent resumed, copied the region in before an emitted child started and back after it
-  returned, #1527.) This is the bulk data plane for a child whose memory the parent cannot address
-  (§13), and the spawn-time args payload's big sibling: the payload copies ≤ 16 KiB in once, the
-  pre-map aliases any size both ways for the child's lifetime. Pinned by
-  `temen-interp/tests/detached_premap.rs` and `temen-run/tests/detached_child_jit.rs`.
+  reads its region interpreted: emitted code addresses the window's own bytes, so a call over a
+  window holding a region declines to the interpreter on the flat and the page-checked tier alike
+  (#2516). The browser's parallel driver refuses a pre-map. (Until #1414 S4-5b, the op-13
+  servicer, which ran a child to completion before its parent resumed, copied the region in before
+  an emitted child started and back after it returned, #1527.) This is the bulk data plane for a
+  child whose memory the parent cannot address (§13), and the spawn-time args payload's big
+  sibling: the payload copies ≤ 16 KiB in once, the pre-map aliases any size both ways for the
+  child's lifetime. Pinned by `temen-interp/tests/detached_premap.rs`,
+  `temen-run/tests/detached_child_jit.rs` and, on the pump's emitted tier, `coop_tierup_driver.rs`'s
+  `coop_tierup_premapped_child_reads_its_region_interpreted`.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.

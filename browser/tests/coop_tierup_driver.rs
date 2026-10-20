@@ -4779,6 +4779,145 @@ block 0 (vx: i64) {
     temen_coop_close();
 }
 
+/// #2516 — a page-checked child whose parent pre-maps a region into its window reads the region as
+/// the interpreter does. The root mints a 64 KiB region and spawns `"worker"` with it pre-mapped at
+/// 65536 of the worker's window. The worker `protect`s a page of its own, which makes its code
+/// page-checked, and its leaf stores 5 into the region and loads it back. Emitted code cannot reach
+/// a region's bytes (its page-state table marks them unmapped), so the leaf declines and runs
+/// interpreted. The root's leaf adds 100 to the join's status × 1000 plus the worker's value: 105,
+/// where an emitted leaf traps on the region page (8100).
+#[test]
+fn coop_tierup_premapped_child_reads_its_region_interpreted() {
+    let _g = instantiator_guard();
+    let (_, mem_h) = onramp_out_mem_handles();
+    let root = temen_text::parse_module(&format!(
+        r#"memory 18
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "worker"
+func () -> (i64) {{
+block 0 () {{
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vwp = i64.const 40984
+  vwl = i64.const 6
+  vw = self.resolve vwp vwl
+  vas = i32.const {mem_h}
+  vrlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) vas (vrlen)
+  vrh = i32.wrap_i64 vrh64
+  vrec = i64.const 34816
+  vw0 = i64.const -4294967296
+  i64.store vrec vw0
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  i32.store vrec vrh offset=48
+  vco = i64.const 65536
+  i64.store vrec vco offset=56
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vk = i64.const 1000
+  vstk = i64.mul vj_st vk
+  vsum = i64.add vstk vj
+  vr = call 1 (vsum)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v100 = i64.const 100
+  va = i64.add vx v100
+  return va
+  }}
+}}
+export 0 func "_start" 0
+"#
+    ))
+    .expect("parse");
+    let worker = temen_text::parse_module(
+        r#"memory 17
+func (i64, i64) -> (i64) {
+block 0 (vinst: i64, vas: i64) {
+  vasi = i32.wrap_i64 vas
+  voff = i64.const 16384
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vu = call.cap 5 2 (i64, i64, i32) -> (i64) vasi (voff, vlen, vrw)
+  v5 = i64.const 5
+  vr = call 1 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vaddr = i64.const 65544
+  i64.store vaddr vx
+  vld = i64.load vaddr
+  return vld
+  }
+}
+"#,
+    )
+    .expect("parse");
+    temen_verify::verify_module(&root).expect("verify");
+    temen_verify::verify_module(&worker).expect("verify");
+    let bytes = temen_encode::encode_module(&root);
+
+    // Each run takes the staged program, so stage it before each.
+    stage_child_program("worker", worker.clone());
+    let want = onramp_exec_root(&root, b"");
+    assert_eq!(
+        (want.status, want.value),
+        (STATUS_OK, 105),
+        "oracle: the worker reads back the 5 it stored in the region"
+    );
+
+    stage_child_program("worker", worker);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let mut calls = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The worker is program 1: its leaf declines over the window holding the region, and only the
+    // root's leaf tiers up.
+    assert_eq!(
+        calls,
+        vec![(0, 1)],
+        "the root's leaf alone, (program, function)"
+    );
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the interpreter oracle over the worker's pre-mapped region"
+    );
+    temen_coop_close();
+}
+
 // ============================================================================================
 // #816 item 4: the **warm-coop** tier — a warm session evaluates on the cooperative tier-up
 // drive, including a page-managing eval (the QuickJS shape: the warmup `vm_map`-grows the heap

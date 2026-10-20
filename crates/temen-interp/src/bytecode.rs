@@ -5918,7 +5918,8 @@ pub type MemMapInfo = (u64, u64, u64, Vec<(u64, u8)>);
 /// entries above) faults, and the page states refine within. Returning the coverage alongside the
 /// table is what makes the contract hard to get wrong. A `Backed` (§13 region-aliased) page is
 /// marked `Unmapped` — fail-closed (the emitted tier cannot read a region's bytes), and
-/// unreachable for a paged module anyway (SharedRegion gates the whole module off the paged tier).
+/// unreachable from emitted code anyway: SharedRegion gates the whole module off the paged tier,
+/// and a call over a window holding a pre-mapped region declines ([`Vm::tierup_extent`]).
 pub fn build_pagestate_table(info: &MemMapInfo, backed: u64) -> (Vec<u8>, u64) {
     let (page, mapped, _reserved, entries) = info;
     let top = entries
@@ -18686,7 +18687,10 @@ impl Vm {
     ///
     /// #750 paged tier: the emitted code carries a per-access page check, so an unrepresentable
     /// window must NOT decline: it surfaces with the reserved size (the bound must never
-    /// under-admit a page the driver's table admits).
+    /// under-admit a page the driver's table admits). The exception is a window that has aliased a
+    /// §13 region, as a child's pre-mapped one is: emitted code cannot reach a region's bytes, so
+    /// its table marks those pages unmapped ([`build_pagestate_table`]), and the call declines to
+    /// read them interpreted.
     ///
     /// #1414 B6-3: the emitted code addresses the window as one flat span (`win + addr`), so a
     /// window backed without one (`Sparse`, `Paged`) declines whatever its page state. A memory of
@@ -18695,7 +18699,7 @@ impl Vm {
         match mem {
             None => Some(0),
             Some(m) if m.flat_win_base().is_none() && m.foreign_id().is_none() => None,
-            Some(m) if self.jit_page_checked => Some(m.reserved_size()),
+            Some(m) if self.jit_page_checked => (!m.has_aliased()).then(|| m.reserved_size()),
             Some(m) => m.scalar_extent(),
         }
     }
