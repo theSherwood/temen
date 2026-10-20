@@ -20,13 +20,13 @@ use temen_browser::{
     temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_open_fs, temen_coop_paged, temen_coop_pagestate_len,
-    temen_coop_pagestate_ptr, temen_coop_reset_hotness, temen_coop_run,
-    temen_coop_set_emitted_work, temen_coop_set_hotness, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr, temen_coop_table_gen,
-    temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
-    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
-    temen_framebuffer_height, temen_framebuffer_len, temen_framebuffer_ptr,
-    temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
+    temen_coop_pagestate_ptr, temen_coop_region_emits, temen_coop_reset_hotness, temen_coop_run,
+    temen_coop_set_emit_cap, temen_coop_set_emitted_work, temen_coop_set_hotness,
+    temen_coop_shim_ptr, temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes,
+    temen_coop_spill_ptr, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
+    temen_coop_win_len, temen_coop_win_ptr, temen_framebuffer_height, temen_framebuffer_len,
+    temen_framebuffer_ptr, temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
     temen_onramp_frame_begin, temen_onramp_freeze, temen_onramp_key, temen_onramp_moment_free,
     temen_onramp_moment_restore, temen_onramp_moment_take, temen_onramp_open, temen_onramp_open_fs,
     temen_onramp_set_grant_instantiator, temen_onramp_thaw, temen_onramp_timeline_begin_tick,
@@ -791,6 +791,51 @@ export 0 func "_start" 0
     )
 }
 
+/// Open `src` on the coop driver and drive it to completion on wasmi, returning the functions its
+/// tier-ups named. Parity with the oracle is asserted: the tier-up rule changes which tier runs,
+/// never the result. The caller holds [`FFI_LOCK`].
+fn drive_coop(src: &str, what: &str) -> Vec<i32> {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity ({what})");
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open ({what}) status {}", temen_status());
+    let mut tierups = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                tierups.push(temen_coop_func());
+                assert!(tierups.len() < 50, "runaway tier-ups ({what})");
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!("unexpected event {ev} ({what}, status {})", temen_status()),
+        }
+    }
+    assert_eq!(temen_status(), want.status, "status parity ({what})");
+    assert_eq!(temen_coop_value(), want.value, "value parity ({what})");
+    // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity ({what})");
+    temen_coop_close();
+    tierups
+}
+
 /// #2474 — a coop run's calls tier up on the work they do ([`temen_coop_set_hotness`]), with
 /// **identical** guest-observable results whichever tier runs them (INVARIANTS.md #9):
 /// - At the production default every eligible function starts tiering up: each of
@@ -803,50 +848,7 @@ export 0 func "_start" 0
 fn calls_tier_up_on_the_work_they_do() {
     // The guard restores the production default on drop.
     let _g = ffi_guard();
-    // Drive `src` to completion, returning the functions its tier-ups named. Parity with the oracle
-    // is asserted on every arm: the rule changes which tier runs, never the result.
-    let drive = |src: &str, what: &str| -> Vec<i32> {
-        let m = temen_text::parse_module(src).expect("parse");
-        temen_verify::verify_module(&m).expect("verify");
-        let bytes = temen_encode::encode_module(&m);
-        let want = onramp_exec_root(&m, b"");
-        assert_eq!(want.status, STATUS_OK, "oracle sanity ({what})");
-        let opened = temen_coop_open(
-            bytes.as_ptr(),
-            bytes.len(),
-            core::ptr::null(),
-            0,
-            0,
-            core::ptr::null(),
-            0,
-            0,
-        );
-        assert_eq!(opened, 0, "open ({what}) status {}", temen_status());
-        let mut tierups = Vec::new();
-        loop {
-            match temen_coop_run() {
-                COOP_RUN_TIERUP => {
-                    tierups.push(temen_coop_func());
-                    assert!(tierups.len() < 50, "runaway tier-ups ({what})");
-                    match service_coop_on_wasmi(1) {
-                        Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
-                        Err(code) => temen_coop_deliver_trap(code),
-                    }
-                }
-                COOP_RUN_DONE => break,
-                ev => panic!("unexpected event {ev} ({what}, status {})", temen_status()),
-            }
-        }
-        assert_eq!(temen_status(), want.status, "status parity ({what})");
-        assert_eq!(temen_coop_value(), want.value, "value parity ({what})");
-        // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
-        let got_out =
-            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
-        assert_eq!(got_out, want.stdout, "stdout parity ({what})");
-        temen_coop_close();
-        tierups
-    };
-
+    let drive = drive_coop;
     let light = coop_guest_text();
     temen_coop_reset_hotness();
     let mut first = drive(&light, "light calls, the default");
@@ -876,6 +878,45 @@ fn calls_tier_up_on_the_work_they_do() {
         drive(&many_calls_text(2), "many light calls, every call"),
         [1; 40],
         "every call tiers up"
+    );
+}
+
+/// #2503 — a Run of the program the last open ran reuses its region emit ([`temen_coop_region_emits`]
+/// counts the ones made): another program, or another emitter cap, is emitted anew. A reused emit
+/// tiers up by the rule as it is at its open, with the same results.
+#[test]
+fn a_reopened_program_reuses_its_region_emit() {
+    let _g = ffi_guard();
+    temen_coop_reset_hotness();
+    // Programs no other test opens, so what an earlier test left in the cache is not one of them.
+    let (a, b) = (many_calls_text(5), many_calls_text(6));
+    let made = temen_coop_region_emits;
+    let before = made();
+    assert_eq!(drive_coop(&a, "a, first"), [1; 8]);
+    assert_eq!(made(), before + 1, "the first open of a program emits it");
+    temen_coop_set_hotness(0, 0);
+    assert_eq!(
+        drive_coop(&a, "a, again"),
+        [1; 40],
+        "the reused emit tiers up by the rule its open reads"
+    );
+    assert_eq!(made(), before + 1, "the next open of it reuses the emit");
+    temen_coop_reset_hotness();
+    assert_eq!(drive_coop(&b, "b"), [1; 8]);
+    assert_eq!(made(), before + 2, "another program is emitted");
+    assert_eq!(drive_coop(&a, "a, after b"), [1; 8]);
+    assert_eq!(
+        made(),
+        before + 3,
+        "only the program the last open ran is kept"
+    );
+    temen_coop_set_emit_cap(1 << 20);
+    assert_eq!(drive_coop(&a, "a, another cap"), [1; 8]);
+    temen_coop_set_emit_cap(0);
+    assert_eq!(
+        made(),
+        before + 4,
+        "the emitter's cap is part of what an emit is made from"
     );
 }
 
