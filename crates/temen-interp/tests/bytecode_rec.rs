@@ -9,8 +9,7 @@
 //! Tier boundaries pinned here:
 //! - a **pager-capable** module (op 17 + a pager-shaped export) runs on a driver that serves its
 //!   children, which pages them (#2164), and declines to the oracle on one that does not
-//!   (`compile_module_for`'s veto; temen-run's `module_demand_spawns` folds it off the Cranelift
-//!   tier, which has no paging);
+//!   (`compile_module_for`'s veto);
 //! - a **budget** funds the child natively, and a dangling one refuses the spawn probeably. What a
 //!   budget bounds is pinned on every driver by `spawn_every_driver.rs`.
 

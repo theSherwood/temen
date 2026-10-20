@@ -72,6 +72,7 @@ fn freeze_authority_is_handed_down_by_grant() {
             1 << 16,
             window(budget),
             -1,
+            false,
         )
         .expect("freeze authority re-grants");
     assert!(child.holds_freeze_authority());
@@ -85,7 +86,7 @@ fn freeze_authority_is_handed_down_by_grant() {
     );
 
     let (mut bare, _, _) = parent
-        .spawn_detached_child(&[], 1 << 16, window(budget), -1)
+        .spawn_detached_child(&[], 1 << 16, window(budget), -1, false)
         .expect("spawn");
     let own = bare.resolve_cap_name("budget").expect("the child's budget");
     assert!(
