@@ -216,7 +216,11 @@ pub unsafe extern "C" fn cap_thunk(
     // result slot (the wake delivers one scalar — invariant 8) and a non-durable run (the freeze
     // driver has no cap-park re-derivation). Sync ops never pay: nothing is minted unless a handler
     // punts. Either face, a would-block op parks the calling fiber and runs again (#1826, #1952).
-    let pending_face = n_results == 1 && !(*(ctx as *mut Host)).is_durable();
+    // #2495 — nor under a recording host: this engine tapes no host-answered call's delivered
+    // value, so one declines there before its embedder sees it (a pool job runs inline under a
+    // tape on either face).
+    let host = &*(ctx as *mut Host);
+    let pending_face = n_results == 1 && !host.is_durable() && !host.records_caps();
     loop {
         let (mut pending_id, mut park) = (None, None);
         cap_thunk_impl(
@@ -318,11 +322,10 @@ unsafe fn cap_wait(
     temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
-/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
-/// drain claims a completion that raced the park, in submission order — a ready LATER id is
-/// held behind an earlier outstanding park, the §18 pin), then park-poll: each `cont.resume`
-/// of this fiber re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the
-/// resumer) until the drain has delivered. Parking before the first check gives the one
+/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
+/// that raced the park fills it at once), then park-poll: each `cont.resume` of this fiber
+/// re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the resumer) until the
+/// call has answered, each call's answer as it comes (#2477). Parking before the first check gives the one
 /// transient `FIBER_PARKED` even on an insta-ready completion, matching the oracle's
 /// register-then-recheck. A trap raised meanwhile (teardown) abandons the wait — the result
 /// stays unclaimed for the sweep and the caller's trailing guards unwind before the guest
@@ -770,6 +773,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
         let mut park = None;
+        // #2495 — no parking face under a recording host, as in [`cap_thunk`].
+        let face = (!guard.records_caps()).then_some(&mut pending_id);
         cap_thunk_impl(
             host_ptr,
             mem_base,
@@ -783,7 +788,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             results,
             n_results,
             trap_out,
-            Some(&mut pending_id),
+            face,
             &mut park,
         );
         // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
@@ -804,7 +809,10 @@ pub unsafe extern "C" fn cap_thunk_locked(
             let comps = guard.completions();
             let durable = guard.is_durable();
             drop(guard);
-            if n_results > 1 {
+            // #2495 — a host-answered call without a one-scalar reply cannot park either, as on
+            // every engine: withdrawn, it declines.
+            let declined = n_results != 1 && comps.withdraw(id);
+            if n_results > 1 || declined {
                 *trap_out = TrapKind::CapFault as i64;
                 return;
             }

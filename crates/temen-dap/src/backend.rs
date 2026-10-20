@@ -1555,16 +1555,15 @@ impl Debuggee for BytecodeBackend {
         self.run.provide_stdin(bytes);
         true
     }
-    /// #1366 — deliver the value for the host-completed cap call the session is parked on.
+    /// #1366 — answer the host-answered cap call `id` the session filed: the next resume takes the
+    /// answer. `false` if no such call is outstanding.
     fn provide_cap(&mut self, id: u64, value: i64) -> bool {
-        let ok = self.run.deliver_cap(id, value);
-        if ok {
-            self.parked_cap
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-        }
-        ok
+        let request = self
+            .parked_cap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        request.map(|r| r.completer.complete(value)).is_some()
     }
     fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
         let parked = self.run.cap_parked()?;

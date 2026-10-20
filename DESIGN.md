@@ -1917,7 +1917,7 @@ numbers:
 3. *Eval loops release the lock before waiting*: the interp tiers drop the host lock then
    `Completions::wait` (single-fiber degenerate wait); the tree-walk scheduler parks the **vCPU**
    (`Blocked::CapPending`, freeing its M:N worker; completions re-queue via `Pending::CapResult`,
-   drained smallest-id-first = submission order — the §18 determinism pin); `cap_thunk_locked`
+   each as it arrives, #2477); `cap_thunk_locked`
    (the JIT threaded tier) releases the domain lock before its completion wait. Root-context
    parks are whole-vCPU and guest-invisible; a punt **inside a fiber** parks the *fiber* — see
    fiber-park promotion below.
@@ -1937,8 +1937,8 @@ every engine in `temen-run/tests/cap_park.rs`.
 **A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
 procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
 lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
-domain's calls stay in its own `Completions`, ids minted from 0, and each domain's are delivered in
-its own submission order, so one domain's outstanding call never holds back another's answer. The
+domain's calls stay in its own `Completions`, ids unique in the process (#2495), and each answer is
+delivered as it arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
 oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
 (`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
 parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
@@ -1952,16 +1952,48 @@ on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as dea
 answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
 pool's jobs never touch the window and answer into their own domain's store.
 
+**A call its embedder answers (#2495, 2026-10-20).** An offloadable procedure's call may be answered
+by the embedder instead of a pool thread (`OffloadOutcome::Host`): its submit hook gets the call's
+`Completer`, which answers it from any thread, at any time, into the domain's store with the wake a
+pool answer rings. So the caller parks and wakes as on a pool call, on every engine and in every
+domain, and a call that waits on the world (a bell rung by outside input) holds no host thread while
+it waits — the pool keeps genuinely blocking host work. A completer dropped unanswered answers
+`CAP_REVOKED`, so a call its host can no longer answer never hangs; one whose domain is gone answers
+nothing. Where its caller cannot park the call declines with `CapFault`: before the embedder sees it
+on the sync face and in a durable run, else withdrawn (`Completions::withdraw`, so its completer
+answers nothing) — a reply that is not one `i64`, a tier-up region, a `Jit.invoke` unit, the
+explorer. A driver its embedder pumps (`Vcpu`, `CoopRun`, the debug scheduler) hands control back
+while such a call waits, the earliest in any domain, so a single-threaded embedder (the browser)
+answers between pumps; a driver nothing pumps (the tree-walker, the native pump, the parallel
+driver, the JIT) waits on the store as on the pool, and its embedder answers from a thread of its
+own. Ids are unique in the process, so one embedder serving several domains keys its requests by
+id. Under a recording host (W1) the bytecode drivers tape the delivered value where they deliver it
+(`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
+there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
+browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
+completer.
+
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
 run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
-the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call ends the
-wait early, or with none outstanding a ring of the embedder's bell, and the clock moves by the time
-that passed, so the schedule is the clock's as before. A run with no outside input keeps its
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call or a ring
+of the embedder's bell ends the wait early, and the clock moves by the time that passed, so the
+schedule is the clock's as before. A run with no outside input keeps its
 schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
 after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
 debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
 too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
+
+**One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
+answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
+kill went unseen until a call answered — and a call may wait on the world. Now every store a parked
+caller waits on rings the embedder's bell (a bell of the wait's own when none is armed), and the
+pump waits on that one bell, past the round's `bell_gen` snapshot (`Completions::wait_any`): each wake
+source ends the one wait, and the next round sees which. A call counts only while its answer would
+wake a task — a task's own, or that of a fiber a task resumes blocking — as the parallel driver
+already counted, so a fiber no one resumes holds no wait and no deadlock verdict; the tree-walker
+drops a domain's fiber waiters when the domain ends, as its teardown does a dying one's. Pinned in
+`bytecode_pump_kill.rs` and `cap_park.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'
@@ -1991,15 +2023,15 @@ the async-first paragraph above, delivered. Identical on all three engines (inva
 — ISSUES.md I73, opened and closed on the arc):
 
 - *Oracle (F1):* the park predicate's fiber arm rides `fiber_park!` filing a `Waiter::Fiber` in
-  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so
-  delivery stays submission-ordered even on the register race, and an animated offer handler's
+  `completion_waiters`; the recheck is `completion_drain` itself (insert-then-drain), so an
+  answer that raced the park is delivered, and an animated offer handler's
   punt rides the CALLS-4b promotion branch by construction (its wake key IS `OfferPark`'s
   resume key). Gates: exactly-one-`i64` reply (the wake pushes one reg — invariant 8),
   non-durable, `SchedRef::Real`.
 - *Bytecode (F2):* the punt surfaces as `Outcome::CapPending` (the `MemoryWait` channel) so
   each driver states its posture; the cooperative `drive` parks `FiberState::CapParked` with
-  ONE ordered drain per domain (`drain_cap_parked` — smallest-outstanding-id-first, stop at the
-  first not-yet-arrived) at both wake sites, and driver idle with unwoken cap parks **blocks on
+  ONE drain per domain (`drain_cap_parked`, each answer as it arrives) at both wake sites, and
+  driver idle with unwoken cap parks **blocks on
   the stores** once no timer is left (pending pool work is never a deadlock; #2047 put the timers
   first). GC root scans cover cap-parked frames.
 - *Cranelift JIT (F3):* per-fiber completion cells live on `Completions` itself (one lock with
@@ -2485,8 +2517,9 @@ durable, or when emitted code can't address the root window flat. A third kind o
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
-the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and `CoopRun::deliver_cap`
-writes the answer into that continuation; the pump runs it and `Resume` hands the frames its results.
+the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and the next pump after
+the call's `Completer` answers writes the answer into that continuation; the pump runs it and
+`Resume` hands the frames its results.
 Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
 `CapFault`: no one could ever complete it there.
 

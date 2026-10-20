@@ -10864,14 +10864,11 @@ fn cap_park_words(
     requests: &temen_interp::CapRequests,
     id: u64,
 ) -> Option<Vec<i64>> {
-    let req = requests
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id)
-        .cloned()?;
+    let requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+    let req = requests.get(&id)?;
     let index = caps.iter().position(|n| *n == req.name).unwrap_or(0) as i64;
     let mut words = vec![id as i64, index];
-    words.extend(req.args);
+    words.extend(&req.args);
     Some(words)
 }
 
@@ -11908,7 +11905,7 @@ pub extern "C" fn temen_coop_cap_ptr() -> *const i64 {
     unsafe { (*core::ptr::addr_of!(CAP_REQUEST)).as_ptr() }
 }
 
-/// #1954: answer the host-completed cap call the run is parked on: `value` is the call's result.
+/// #1954: answer the host-answered cap call `id` the run filed: `value` is the call's result.
 /// Returns `1`, or `0` if no call is outstanding on `id` (or no session is open). Then pump again —
 /// a leaf whose call parked comes back as [`COOP_RUN_RESUME`].
 #[no_mangle]
@@ -11917,13 +11914,15 @@ pub extern "C" fn temen_coop_deliver_cap(id: u64, value: i64) -> i32 {
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 0;
     };
-    if !s.run.deliver_cap(id, value) {
-        return 0;
-    }
-    s.requests
+    let request = s
+        .requests
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+    let Some(request) = request else {
+        return 0;
+    };
+    request.completer.complete(value);
     // SAFETY: as above.
     unsafe { (*core::ptr::addr_of_mut!(CAP_REQUEST)).clear() };
     1
@@ -13191,7 +13190,7 @@ int main(void) {
                 bytecode::CoopEvent::CapPark { id } => {
                     parks += 1;
                     let req = requests.lock().unwrap().remove(&id).expect("filed");
-                    assert!(run.deliver_cap(id, 2 * req.args[0] + 1));
+                    req.completer.complete(2 * req.args[0] + 1);
                 }
                 bytecode::CoopEvent::Done(v) => break Ok(v),
                 bytecode::CoopEvent::Trapped(t) => break Err(t),
