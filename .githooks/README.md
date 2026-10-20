@@ -28,6 +28,9 @@ and prints the exact `rustup` command; `TEMEN_GATE_INSTALL=1` installs it instea
 - the `x86_64-pc-windows-gnu` cross-check of both — compile-only, so it catches a Windows-only build
   break on Linux, without a Windows runner. Skipped with a notice when no mingw cross-compiler is
   installed (`bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64`), or with `TEMEN_GATE_SKIP_CROSS=1`.
+- the `aarch64-linux-android` cross-check of the workspace, through `scripts/ci/android.sh` (#2514).
+  Skipped with a notice when no Android NDK is found (`ANDROID_NDK_HOME`), or with
+  `TEMEN_GATE_SKIP_CROSS=1`.
 
 It is **fast feedback, not the gate.** The authoritative gate is still CI on the PR —
 the cross-platform matrix (Windows/macOS), the sanitizer/model lanes (miri, asan, tsan,
@@ -52,7 +55,7 @@ Disable again with `git config --unset core.hooksPath`.
 ```sh
 TEMEN_HOOK_SKIP=1 git push        # skip the hook entirely (same as `git push --no-verify`)
 TEMEN_HOOK_SKIP_TESTS=1 git push  # run the lint/compile gate + build, skip the slower test step
-TEMEN_GATE_SKIP_CROSS=1 git push  # skip the windows-gnu cross-check inside the gate
+TEMEN_GATE_SKIP_CROSS=1 git push  # skip the windows-gnu and Android cross-checks inside the gate
 TEMEN_GATE_INSTALL=1 git push     # let the gate install a missing toolchain/component/target
 ```
 

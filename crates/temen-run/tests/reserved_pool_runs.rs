@@ -1,4 +1,4 @@
-//! #2305 — what the process's pool of address space ([`temen_interp::RESERVED_POOL`]) cannot hold is
+//! #2305 — what the process's pool of address space ([`temen_interp::reserved_pool`]) cannot hold is
 //! refused at its admission, on every engine alike, before any window is built: a run ends with
 //! `ThreadFault` before its first instruction, its main vCPU refused, and a detached spawn answers
 //! `-EINVAL`, its budget charged nothing. Once the runs that held the pool end, both go through. Its
@@ -9,7 +9,7 @@ mod detached;
 
 use detached::{host, interp_on_reserved, jit_on_reserved, module, parent_room_after_refusal};
 use temen_interp::{
-    maps_pool, Host, RootWindow, Value, MAPS_PER_DOMAIN, MAPS_PER_VCPU, RESERVED_POOL,
+    maps_pool, reserved_pool, Host, RootWindow, Value, MAPS_PER_DOMAIN, MAPS_PER_VCPU,
 };
 use temen_jit::JitOutcome;
 use temen_run::{instantiate, Backend, Outcome, RunConfig};
@@ -83,9 +83,16 @@ fn spawn_detached(backend: Backend) -> i64 {
 
 #[test]
 fn what_the_pool_cannot_hold_is_refused_at_its_admission_on_every_engine() {
-    let slots = RESERVED_POOL / WINDOW;
-    if RESERVED_POOL == u64::MAX || maps_pool() < 2 * slots * (MAPS_PER_DOMAIN + MAPS_PER_VCPU) {
-        eprintln!("skipped: no address-space pool, or a pool of mappings too small to fill it");
+    let pool = reserved_pool();
+    let slots = pool / WINDOW;
+    if pool == u64::MAX
+        || pool < WINDOW + (1 << PARENT_LOG2)
+        || maps_pool() < 2 * slots * (MAPS_PER_DOMAIN + MAPS_PER_VCPU)
+    {
+        eprintln!(
+            "skipped: no address-space pool, one that cannot hold a child's window beside its \
+             parent's, or a pool of mappings too small to fill it"
+        );
         return;
     }
     // Runs that hold the pool: a window's worth at a time until it is full, then one handed back and

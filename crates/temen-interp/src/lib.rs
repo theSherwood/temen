@@ -21,11 +21,11 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use temen_ir::{
-    AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp,
-    FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy, IntUnOp, LoadOp, Memory, Module, SsaLoc,
-    StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp,
-    VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp, VShape, VShiftOp, VWidenOp, ValIdx, ValType,
-    VarInfo, VarLoc, DEFAULT_RESERVED_LOG2,
+    default_reserved_log2, window_reserved_log2, AtomicRmwOp, BinOp, CastOp, CmpOp, ConvOp, Data,
+    DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, FuncType, IToF, Inst, IntTy,
+    IntUnOp, LoadOp, Memory, Module, SsaLoc, StoreOp, Terminator, VBitBinOp, VCvtOp, VFCmpOp,
+    VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp, VSatBinOp,
+    VShape, VShiftOp, VWidenOp, ValIdx, ValType, VarInfo, VarLoc,
 };
 use temen_mask::Window;
 use temen_mem::RmwOp;
@@ -1272,7 +1272,7 @@ impl Inspector {
         // guard).
         let mem = memory.map(|mc| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: mc.size_log2,
                 shadow: mc.shadow,
                 data,
@@ -1429,7 +1429,7 @@ impl Inspector {
         // a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
         let mem = memory.map(|mc| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: mc.size_log2,
                 shadow: mc.shadow,
                 data,
@@ -2286,7 +2286,7 @@ pub fn run_with_host_traced(
     // One linear-memory window per run, zero-initialized and lazily paged. The whole module
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host)
 }
 
@@ -3389,7 +3389,7 @@ pub fn run_capture(
     init_mem: &[u8],
 ) -> (Result<Vec<Value>, Trap>, Vec<u8>) {
     // Default reservation policy (§4): a large reserved range, only `mapped` backed.
-    run_capture_reserved(m, func, args, fuel, init_mem, DEFAULT_RESERVED_LOG2)
+    run_capture_reserved(m, func, args, fuel, init_mem, default_reserved_log2())
 }
 
 /// Like [`run_capture`], but with a host **reservation policy**: only the declared `1 << size_log2`
@@ -3646,7 +3646,7 @@ pub fn run_scheduled(
     }
     let funcs: Arc<[Func]> = m.funcs.clone().into();
     let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
-    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let det = Arc::new(DetSched::new(seed, MAX_VCPUS));
     let root_id = {
         let mut s = det.lock();
@@ -4430,7 +4430,7 @@ fn run_one_schedule(
     // `fresh_single_root`).
     let mem = memory.map(|mc| {
         Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: default_reserved_log2(),
             mapped_log2: mc.size_log2,
             shadow: mc.shadow,
             data,
@@ -14626,7 +14626,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
                                 let mut fm = Mem::from_spec(WindowSpec {
-                                    reserved_log2: DEFAULT_RESERVED_LOG2,
+                                    reserved_log2: window_reserved_log2(size_log2 as u8),
                                     mapped_log2: size_log2 as u8,
                                     shadow: cm.shadow(),
                                     data: &cm.module.data,
@@ -14660,7 +14660,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // refuse every `vm_map` past it (the growth a detached window exists
                                 // for). The minter quota governs *minting*; growth is bounded by the
                                 // reservation (and, on wasm, the minted memory's `maximum`).
-                                let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                                let reservation = 1u64 << window_reserved_log2(size_log2 as u8);
                                 let (cinst, cas) = ch.grant_starter_caps(reservation);
                                 // #1944 — the budget that paid for the window is the child's own.
                                 host.lock_unpoisoned().give_child_budget(lease, &mut ch);
@@ -17453,13 +17453,16 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
             FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
         },
+        // The `libm` crate's correctly-rounded fused FMA, the one temen-opt folds with (#2519): its
+        // results are Cranelift's `fma`'s but for which NaN, which the JIT differential ignores.
         Inst::Fma { ty, a, b, c } => match ty {
-            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
             FloatTy::F32 => {
-                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+                let (x, y, z) = (get_f32(vals, *a)?, get_f32(vals, *b)?, get_f32(vals, *c)?);
+                Reg::from_f32(libm::fmaf(x, y, z))
             }
             FloatTy::F64 => {
-                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+                let (x, y, z) = (get_f64(vals, *a)?, get_f64(vals, *b)?, get_f64(vals, *c)?);
+                Reg::from_f64(libm::fma(x, y, z))
             }
         },
         Inst::FCmp { ty, op, a, b } => {
@@ -18220,9 +18223,9 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
     o
 }
 
-/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
-/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
-/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding, by the
+/// scalar `Fma`'s `libm` function (#2519), so the interp↔JIT differential holds as it does there.
+/// `neg` negates the product (the `nmadd` form, `−a·b + c`).
 fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
     let mut o = [0u8; 16];
     match shape {
@@ -18232,7 +18235,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f32::from_bits(lane_read(&b, i, 4) as u32);
                 let z = f32::from_bits(lane_read(&c, i, 4) as u32);
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+                lane_write(&mut o, i, 4, libm::fmaf(x, y, z).to_bits() as u64);
             }
         }
         VShape::F64x2 => {
@@ -18241,7 +18244,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 let z = f64::from_bits(lane_read(&c, i, 8));
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+                lane_write(&mut o, i, 8, libm::fma(x, y, z).to_bits());
             }
         }
         _ => {}
@@ -18966,7 +18969,7 @@ struct ChargedRegion {
 
 /// #2111, #2268 — what a region the run's domains made costs its node: `bytes` of `channel` (what the
 /// host keeps of it in memory: `0` for a file's), and the one mapping the host holds of it, whose
-/// `size` (#2306) is address space the process's pool of it counts ([`RESERVED_POOL`]).
+/// `size` (#2306) is address space the process's pool of it counts ([`reserved_pool`]).
 fn region_cost(bytes: u64, size: u64) -> [(usize, u64); 3] {
     [(BUDGET_CHANNEL, bytes), (BUDGET_MAPS, 1), (RESERVED, size)]
 }
@@ -19638,7 +19641,7 @@ const BUDGET_LANE: usize = 4;
 /// The `maps` dimension's index: the OS mappings a subtree causes (#2268, [`BudgetState::maps`]).
 const BUDGET_MAPS: usize = 5;
 /// #2305 — no budget's dimension: the address space a use's windows reserve, which rides the charge
-/// set that admits them, so the process's pool of it ([`RESERVED_POOL`]) refuses all of the charge or
+/// set that admits them, so the process's pool of it ([`reserved_pool`]) refuses all of the charge or
 /// none. No ceiling bounds it and no guest reads it: an embedder bounds a run's windows with its
 /// `maps` grant, a domain's [`MAPS_PER_DOMAIN`] each. The tree counts it per node
 /// ([`BudgetNode::reserved`]) only so that a run's end, or a debugger's restore, settles the pool.
@@ -19663,18 +19666,18 @@ pub const MAPS_PER_DOMAIN: u64 = WINDOW_RUNS + 5 + OFFLOAD_POOL_THREADS as u64 *
 /// #2268 — Linux's default `vm.max_map_count`, for a host that cannot read its own.
 const MAPS_LINUX_DEFAULT: u64 = 65530;
 
-/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's
-/// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
-/// mapping past the OS limit fails an `mmap` or `mprotect` anywhere in the process, the host's own
-/// allocations included, which aborts it; so every `maps` charge, on every engine and in every run,
-/// is held against this as well as its own chain, and refused past it as past a ceiling, even one no
-/// grant refuses (a run's activation, [`Fits::Pool`]). A charge forced past every limit
-/// ([`Fits::Forced`]: a use that exists already, accounted again) counts here too, unrefused. Other
-/// hosts have no such limit: unbounded.
+/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's (and so
+/// Android's) per-process `vm.max_map_count` less what the host keeps for itself
+/// ([`MAPS_HOST_RESERVE`]). One mapping past the OS limit fails an `mmap` or `mprotect` anywhere in
+/// the process, the host's own allocations included, which aborts it; so every `maps` charge, on
+/// every engine and in every run, is held against this as well as its own chain, and refused past it
+/// as past a ceiling, even one no grant refuses (a run's activation, [`Fits::Pool`]). A charge
+/// forced past every limit ([`Fits::Forced`]: a use that exists already, accounted again) counts
+/// here too, unrefused. Other hosts have no such limit: unbounded.
 pub fn maps_pool() -> u64 {
     static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
             std::fs::read_to_string("/proc/sys/vm/max_map_count")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -19686,29 +19689,36 @@ pub fn maps_pool() -> u64 {
     })
 }
 
-/// #2305 — how much address space the windows of this process's guests may reserve between them,
-/// and (#2306) the host's mappings of their regions: 64 TiB, half of what a 47-bit host gives a
-/// process, so the host's own mappings keep the other half. Every window reserves its whole mask
-/// domain up front, 128 GiB by default ([`DEFAULT_RESERVED_LOG2`]), so 512 such windows fill it. Past what the OS can give, a window could
-/// only be refused where it is built, which differs by engine (the interpreter falls back to a
-/// heap-backed window, the JIT cannot); so every domain's window is held against this at its
-/// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings refuses
-/// ([`maps_pool`]). A host without a 64-bit address space has no such pool: unbounded.
-pub const RESERVED_POOL: u64 = if cfg!(target_pointer_width = "64") {
-    64 << 40
-} else {
-    u64::MAX
-};
+/// #2305, #2517 — how much address space the windows of this process's guests may reserve between
+/// them, and (#2306) the host's mappings of their regions: half of what the host gives a process
+/// ([`temen_mem::user_address_bits`]; 47 bits where it cannot be read), so the host's own mappings
+/// keep the other half. That is 64 TiB on a 47-bit host and 256 GiB on a 39-bit phone. Every window
+/// reserves its whole mask domain up front ([`default_reserved_log2`]), so 512 windows of the default
+/// 128 GiB fill a 47-bit host's pool, and two fill a phone's. Past what the OS can give, a window
+/// could only be refused where it is built, which differs by engine (the interpreter falls back to
+/// a heap-backed window, the JIT cannot); so every domain's window is held against this at its
+/// admission ([`RESERVED`]), on every engine alike, and refused there as the pool of mappings
+/// refuses ([`maps_pool`]). A host without a 64-bit address space has no such pool: unbounded.
+pub fn reserved_pool() -> u64 {
+    static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *POOL.get_or_init(|| {
+        if cfg!(target_pointer_width = "64") {
+            1 << (temen_mem::user_address_bits().unwrap_or(47) - 1)
+        } else {
+            u64::MAX
+        }
+    })
+}
 
 /// #2268, #2305 — what every run in this process holds between them of a resource the process has a
-/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`RESERVED_POOL`]), or
+/// fixed amount of: its OS mappings ([`maps_pool`]), its address space ([`reserved_pool`]), or
 /// (#2306, `temen-run`'s) its file descriptors.
 #[derive(Debug, Default)]
 pub struct Pool(AtomicU64);
 
 /// #2268 — what every run holds of [`maps_pool`].
 static MAPS_IN_USE: Pool = Pool::new();
-/// #2305 — what every run's windows and regions hold of [`RESERVED_POOL`].
+/// #2305 — what every run's windows and regions hold of [`reserved_pool`].
 static RESERVED_IN_USE: Pool = Pool::new();
 
 impl Pool {
@@ -19760,7 +19770,7 @@ impl Pool {
 /// #2268 — the limits a charge to the budget tree must fit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Fits {
-    /// Every bounded level's ceiling, and the process's pools ([`maps_pool`], [`RESERVED_POOL`]).
+    /// Every bounded level's ceiling, and the process's pools ([`maps_pool`], [`reserved_pool`]).
     All,
     /// The pools alone: a use its embedder chose (a run's activation), which no grant refuses but the
     /// process must still have room for.
@@ -19841,7 +19851,7 @@ impl Lease {
     /// #2305 — the address space its window reserves: the default mask domain, raised to its size, as
     /// every engine builds a detached window.
     fn reserved(&self) -> u64 {
-        reservation(self.bytes, DEFAULT_RESERVED_LOG2)
+        reservation(self.bytes, default_reserved_log2())
     }
 }
 
@@ -19960,7 +19970,7 @@ impl BudgetTree {
     }
 
     /// #2268, #2305 — what `nodes` hold of the process's pools, of [`maps_pool`] and of
-    /// [`RESERVED_POOL`]: what each tree root has charged, since every charge reaches its root.
+    /// [`reserved_pool`]: what each tree root has charged, since every charge reaches its root.
     fn pooled(nodes: &[BudgetNode]) -> (u64, u64) {
         nodes
             .iter()
@@ -20068,7 +20078,7 @@ impl BudgetTree {
         if !MAPS_IN_USE.take(maps, maps_pool(), check) {
             return false;
         }
-        if !RESERVED_IN_USE.take(reserved, RESERVED_POOL, check) {
+        if !RESERVED_IN_USE.take(reserved, reserved_pool(), check) {
             MAPS_IN_USE.give(maps);
             return false;
         }
@@ -24443,13 +24453,13 @@ impl Host {
     /// powerbox cannot be duplicated.
     ///
     /// #2305 — and the address space its window reserves, held against the process's pool
-    /// ([`RESERVED_POOL`]). A fork copies this domain's window and a spawn builds one of its geometry,
+    /// ([`reserved_pool`]). A fork copies this domain's window and a spawn builds one of its geometry,
     /// so it reserves what this domain's does: [`Self::reserved`], or for a detached child, whose
     /// lease holds its own, the default mask domain raised to its size ([`Lease::reserved`]).
     fn process_powerbox(&self, pid: u64, window: u64, grown: u64, runs: u64) -> Option<Host> {
         let maps = runs.saturating_sub(WINDOW_RUNS);
         let reserved = match self.reserved {
-            0 => reservation(window, DEFAULT_RESERVED_LOG2),
+            0 => reservation(window, default_reserved_log2()),
             own => own,
         };
         let cost = [
@@ -27675,7 +27685,7 @@ impl Host {
     /// back first. Then the root's window and its main vCPU are its own node's, as a child's are its
     /// budget's, charged past any ceiling, since they are what its embedder chose to run: a grant they
     /// exceed leaves the run room for nothing more. #2268, #2305 — but never past the process's pools
-    /// of mappings ([`maps_pool`]) and of address space ([`RESERVED_POOL`]): with the domain's own
+    /// of mappings ([`maps_pool`]) and of address space ([`reserved_pool`]): with the domain's own
     /// mappings, its window's runs and its reservation, they are one charge, and `None`, with nothing
     /// charged, is a run the process has no room for, which every engine ends with
     /// [`Trap::ThreadFault`] before it starts, its main vCPU refused. Otherwise the domain the last
@@ -28521,7 +28531,7 @@ impl Host {
             .collect();
         // The provider's window, exactly as a run of `m` would build it (§3a data segments
         // included) — the exporter's own memory, not the wirer's and not any caller's.
-        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+        let mem = Mem::root(m, default_reserved_log2(), None, &[]);
         // A bare fn-list wire carries no op names — the anonymous-shape family (#1109).
         let type_id = self.intern_interface(&[], &sigs);
         let idx = self.offers.len() as u32;
@@ -29206,7 +29216,7 @@ impl Host {
         let state = self
             .self_instance
             .get_or_insert_with(|| {
-                let mem = Mem::root(&m, DEFAULT_RESERVED_LOG2, None, &[]);
+                let mem = Mem::root(&m, default_reserved_log2(), None, &[]);
                 Arc::new(Mutex::new(ProviderState {
                     mem,
                     host: Arc::new(Mutex::new(Host::new())),
@@ -33911,7 +33921,7 @@ impl Mem {
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
     ///
     /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
-    /// 128 GiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// default reservation, [`default_reserved_log2`], over a window-sized backing). A `map`/`protect` past the backing
     /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
     /// would over the engine's own reservation right up to the first access, which the emitted tier's
     /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
@@ -35541,7 +35551,7 @@ impl Mem {
 
     /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to
     /// what the backing holds. This is what a codegen host mirrors or bounds its view to, and it is
-    /// *not* the reservation: a cooperative run reserves `DEFAULT_RESERVED_LOG2` (the oracle's, so a
+    /// *not* the reservation: a cooperative run reserves [`default_reserved_log2`] (the oracle's, so a
     /// guest `vm_map` past the declared window is admitted rather than `-EINVAL`) over a backing that
     /// starts at the declared size and grows on demand. Reporting the reservation there would tell a
     /// driver to mirror a terabyte.
@@ -38449,7 +38459,7 @@ mod mem_fork_tests {
     fn a_twin_of_a_window_that_grows_in_place_grows_in_place() {
         let page = host_page_size();
         let m = Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
+            temen_ir::DEFAULT_RESERVED_LOG2,
             16,
             Arc::new(Region::growable(1 << 16, page).expect("64 KiB allocates")),
             None,
@@ -38923,7 +38933,7 @@ mod prot_tests {
     /// is bounded by that, not by the span it names. Over a 128 GiB reservation's 2^25 pages, a walk
     /// of the span took seconds per op; this one costs microseconds. Measured in this thread's CPU
     /// time, which a loaded machine does not stretch.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
         let cpu_ns = || -> u64 {

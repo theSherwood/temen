@@ -16062,7 +16062,7 @@ fn lower_mem_intrinsic(ctx: &mut BlockCtx, c: &crate::ll::ast::Call) -> Result<b
 
 /// Lower a float math intrinsic call to inline float ops, returning its result index. `llvm.fma`
 /// (IEEE-required fused) lowers to the shared fused-FMA op (`Inst::Fma`/`VFma`, the same op the wasm
-/// `relaxed_madd` emits — interp `mul_add` == JIT `fma`, and bit-equal to native libm `fma()`);
+/// `relaxed_madd` emits — interp `libm` `fma` == JIT `fma`, and bit-equal to native libm `fma()`);
 /// `llvm.fmuladd` (contractible) stays unfused `fmul`+`fadd`, bit-equal to baseline native (no HW FMA).
 /// Returns `Ok(None)` if the call is not a recognized float intrinsic.
 fn lower_float_intrinsic(
@@ -16124,7 +16124,7 @@ fn lower_float_intrinsic(
             "llvm.minnum" | "llvm.minimum" => bin(ctx, VB::Min)?,
             "llvm.maxnum" | "llvm.maximum" => bin(ctx, VB::Max)?,
             // `llvm.fma` is IEEE-required fused → the shared fused-FMA primitive (`Inst::VFma`; the
-            // same op the wasm frontend's `relaxed_madd` emits, interp `mul_add` == JIT `fma`). This
+            // same op the wasm frontend's `relaxed_madd` emits, interp `libm` `fma` == JIT `fma`). This
             // also matches native's libm `fma()`. `llvm.fmuladd` is *contractible*: on a baseline
             // target (no hardware FMA) native lowers it to mul+add, so we keep it unfused to stay
             // bit-equal to the native oracle.

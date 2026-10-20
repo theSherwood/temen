@@ -1,5 +1,5 @@
 //! #2306 — the process's file descriptors, a pool every run's guests share, as they share its OS
-//! mappings ([`temen_interp::maps_pool`]) and its address space ([`temen_interp::RESERVED_POOL`]).
+//! mappings ([`temen_interp::maps_pool`]) and its address space ([`temen_interp::reserved_pool`]).
 //! One descriptor past the process's limit fails the next `open`, `memfd_create` or `pipe` anywhere
 //! in it, the host's own included; so each descriptor a guest causes holds one of the pool's
 //! ([`Descriptor`]) for as long as it is open, and one the pool has no room for is refused with

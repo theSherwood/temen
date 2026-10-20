@@ -252,8 +252,9 @@ programs), **🟡 fail-closed feature** (clean `Unsupported`; widen on demand), 
   realization: each op lowers to *one* spec-allowed behavior computed identically in both backends, so
   the interp↔JIT differential holds (no value-insensitive exclusion needed yet):
   - `relaxed_madd`/`relaxed_nmadd` (f32x4/f64x2) → a genuine **fused FMA** (`Inst::VFma`; Cranelift
-    `fma`, interp `f*::mul_add` — both correctly-rounded, so bit-identical). This is the *one op that
-    gets a real speedup* (the usual reason to reach for `-mrelaxed-simd`), and it stays differentiable.
+    `fma`, interp the `libm` crate's `fma` (#2519) — both correctly-rounded, so bit-identical but for
+    which NaN). This is the *one op that gets a real speedup* (the usual reason to reach for
+    `-mrelaxed-simd`), and it stays differentiable.
   - `relaxed_min`/`max` → the deterministic `fmin`/`fmax`; `relaxed_trunc_*` (4) → `trunc_sat`;
     `relaxed_laneselect` (4) → `bitselect` (exact for a valid all-0/all-1 mask); `relaxed_swizzle` →
     `swizzle`; `relaxed_q15mulr_s` → `q15mulr_sat`. All alias existing deterministic ops — transpiler

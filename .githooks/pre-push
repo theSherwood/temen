@@ -19,7 +19,7 @@
 # Escape hatches:
 #   TEMEN_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
 #   TEMEN_HOOK_SKIP_TESTS=1  git push   # run the lint/compile gate, skip the (slower) test step
-#   TEMEN_GATE_SKIP_CROSS=1  git push   # skip the windows-gnu cross-check inside the gate
+#   TEMEN_GATE_SKIP_CROSS=1  git push   # skip the windows-gnu and Android cross-checks inside the gate
 #   TEMEN_GATE_INSTALL=1     git push   # let the gate install a missing toolchain/component/target
 set -euo pipefail
 
@@ -54,8 +54,8 @@ run() {
 
 echo "pre-push: running the fast CI subset (set TEMEN_HOOK_SKIP=1 to bypass)…"
 
-# fmt · clippy (workspace + the stack-check lane) · excluded crates · windows-gnu cross-check,
-# all on the toolchain CI pins.
+# fmt · clippy (workspace + the stack-check lane) · excluded crates · windows-gnu and Android
+# cross-checks, all on the toolchain CI pins.
 run bash scripts/ci/local-gate.sh
 
 # Build and test on that same toolchain, so a pass here means what it means on CI. `--workspace`

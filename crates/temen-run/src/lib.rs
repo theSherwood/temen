@@ -3373,7 +3373,8 @@ pub unsafe extern "C" fn page_miss(
         let Some(paging) = g.jit_paging() else {
             return fault();
         };
-        let reserved = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+        // The reservation the child's window was built with: the default, raised to the window.
+        let reserved = (1u64 << temen_ir::default_reserved_log2()).max(paging.mapped);
         let win = MprotectWindow::of(&mut g, base, paging.mapped, reserved);
         (win, paging.mapped, g.jit_pager())
     };
@@ -4399,15 +4400,15 @@ impl MprotectWindow {
     #[cfg(windows)]
     fn hw_release_hint(&self, _off: u64, _len: u64) {}
 
-    /// Make the window's own (non-§13) pages `[off, off+len)` read zero (#2267). On Linux they are
-    /// **dropped** with `MADV_DONTNEED`, which is exact on this private anonymous reservation whatever
-    /// the pages' protection (zero-fill on demand), so a fresh commit stays non-resident until the
-    /// guest touches it. Elsewhere — Darwin treats `MADV_DONTNEED` as advisory, windows keeps
-    /// committed pages — zeros are written, and `release` then hints their backing away. `false` if
-    /// the OS refused to make the range writable, so nothing was zeroed. Never call it over a §13
-    /// alias: dropping a shared page re-reads the region instead of zeroing.
+    /// Make the window's own (non-§13) pages `[off, off+len)` read zero (#2267). On Linux, Android's
+    /// kernel included, they are **dropped** with `MADV_DONTNEED`, which is exact on this private
+    /// anonymous reservation whatever the pages' protection (zero-fill on demand), so a fresh commit
+    /// stays non-resident until the guest touches it. Elsewhere — Darwin treats `MADV_DONTNEED` as
+    /// advisory, windows keeps committed pages — zeros are written, and `release` then hints their
+    /// backing away. `false` if the OS refused to make the range writable, so nothing was zeroed.
+    /// Never call it over a §13 alias: dropping a shared page re-reads the region instead of zeroing.
     fn zero_private(&self, off: u64, len: u64, release: bool) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             // SAFETY: page-aligned, within the reserved mapping (validated), and private anonymous.
             let rc = unsafe {
@@ -4879,17 +4880,18 @@ fn last_error_win() -> i64 {
     unsafe { GetLastError() as i64 }
 }
 
-/// Create a fresh anonymous, `cap`-byte OS shared-memory fd: `memfd_create` on Linux, an immediately-
-/// `shm_unlink`ed POSIX `shm_open` object on other unix (macOS). The fd keeps the (unlinked) object
-/// alive; closing it reclaims the memory. Sized with `ftruncate` so a window `mmap` of whole pages
+/// Create a fresh anonymous, `cap`-byte OS shared-memory fd: `memfd_create` on Linux and Android
+/// (Bionic has no `shm_open`, and has `memfd_create` from API level 30), an immediately-`shm_unlink`ed
+/// POSIX `shm_open` object on other unix (macOS). The fd keeps the (unlinked) object alive; closing
+/// it reclaims the memory. Sized with `ftruncate` so a window `mmap` of whole pages
 /// never faults past EOF.
 #[cfg(unix)]
 fn create_region_fd(cap: usize) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{FromRawFd, OwnedFd};
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: a valid NUL-terminated name; returns a fresh owned fd or -1.
     let raw = unsafe { libc::memfd_create(c"temen_region".as_ptr(), libc::MFD_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let raw = {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -5691,7 +5693,7 @@ impl PowerboxProgram {
                 0,
                 cc.thunk(),
                 cc.ptr(),
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 // §14 module children (ops 5/13/15) resolve their `Module` grant through the
                 // powerbox host — the ctx is that host's box (`cc.ptr()`), as `cap_thunk`'s.
                 Some(module_resolver),
@@ -5737,7 +5739,7 @@ impl PowerboxProgram {
         self.inst.grant_caps(&mut self.host, self.win);
         // #2113 — the run's window and main vCPU, charged to its node, and the default fuel its code
         // draws from it, as `run_powerbox`'s.
-        let window = RootWindow::fresh(&self.inst.module, temen_ir::DEFAULT_RESERVED_LOG2);
+        let window = RootWindow::fresh(&self.inst.module, temen_ir::default_reserved_log2());
         let Some(node) = self
             .host
             .begin_activation(temen_interp::DEFAULT_FUEL, window)
@@ -6969,7 +6971,7 @@ fn jit_run(
     // which pays for its window and main vCPU as an interpreter's does. A chain unbounded at every
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
-    let window = RootWindow::fresh(m, temen_ir::DEFAULT_RESERVED_LOG2);
+    let window = RootWindow::fresh(m, temen_ir::default_reserved_log2());
     let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());
     };
@@ -7118,7 +7120,7 @@ fn run_interp_untraced(
                 args,
                 fuel,
                 mem,
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 host,
             )
             .0
@@ -7135,7 +7137,7 @@ fn run_interp_untraced(
                     args,
                     fuel,
                     mem,
-                    temen_ir::DEFAULT_RESERVED_LOG2,
+                    temen_ir::default_reserved_log2(),
                     host,
                 )
                 .map(|(r, _snap)| r)
@@ -7153,7 +7155,7 @@ fn run_interp_untraced(
                         args,
                         fuel,
                         mem,
-                        temen_ir::DEFAULT_RESERVED_LOG2,
+                        temen_ir::default_reserved_log2(),
                         host,
                     )
                     .0
@@ -8191,7 +8193,7 @@ impl Instance {
             host,
             None,
             init_mem.as_deref().unwrap_or(&[]),
-            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_ir::default_reserved_log2(),
         )
         .ok_or_else(|| {
             "module outside the bytecode engine's subset (no session driver)".to_string()
@@ -8715,7 +8717,7 @@ fn run_capture_on(
             args,
             &mut fuel,
             init_mem,
-            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_ir::default_reserved_log2(),
             host,
         )
     };
@@ -8732,7 +8734,7 @@ fn run_capture_on(
                 args,
                 &mut fuel,
                 init_mem,
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 host,
             ) {
                 Some((r, snap)) => Ok((outcome_from_interp(r)?, snap)),
