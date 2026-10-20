@@ -3611,7 +3611,9 @@ pub fn run_capture_reserved_with_host_layout(
     if m.funcs.get(func as usize).is_none() {
         return (Err(Trap::Malformed), None);
     }
-    let mut mem = Mem::root(m, reserved_log2, None, init.bytes());
+    // A thaw's image is written once, by its restore below.
+    let seed = if init.is_seed() { init.bytes() } else { &[] };
+    let mut mem = Mem::root(m, reserved_log2, None, seed);
     if let Some(mm) = mem.as_mut() {
         // A thaw's window is the layout's: its bytes over what instantiation laid, and its page map
         // in place of the one the data segments made.
