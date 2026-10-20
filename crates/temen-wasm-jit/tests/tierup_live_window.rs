@@ -180,6 +180,7 @@ fn tiered_frame(
         root: ProgramEmit {
             eligible: Arc::from(eligible),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

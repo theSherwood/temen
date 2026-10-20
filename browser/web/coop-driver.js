@@ -753,8 +753,12 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
         }
         continue;
       }
+      const fuel = program.fuel, armed = fuel?.value;
       try {
-        deliver(program['f' + func](eventWin(), envCell, ...args));
+        const ret = program['f' + func](eventWin(), envCell, ...args);
+        // #2474: the work the call did, for the run's tier-up profile.
+        if (fuel && armed > fuel.value) ex.temen_coop_set_emitted_work(armed - fuel.value);
+        deliver(ret);
       } catch (e) {
         ex.temen_coop_deliver_trap(trapOf(e));
       }

@@ -308,8 +308,9 @@ pub(crate) fn root_key(
     temen_encode::digest256(&k)
 }
 
-/// The key a §14 child's code is kept under: what its in-memory key names but the `call.cap`
-/// thunk, which only the code's link binds ([`crate::ChildCodeCache`]).
+/// The key a §14 child's code is kept under: what its in-memory key names but the `call.cap` and
+/// page-miss thunks, which only the code's link binds, so of the miss thunk only whether the child
+/// is demand-paged (#2164; [`crate::ChildCodeCache`]).
 pub(crate) fn child_key(
     digest: &[u8; 32],
     entry: u32,
@@ -317,12 +318,14 @@ pub(crate) fn child_key(
     reserved_log2: u8,
     cells: [bool; 4],
     table_reserve_log2: u8,
+    paged: bool,
 ) -> [u8; 32] {
     let mut k = b"temen-jit child\0".to_vec();
     k.extend(digest);
     k.extend(entry.to_le_bytes());
     k.extend([mapped_log2, reserved_log2, table_reserve_log2]);
     k.extend(cells.map(u8::from));
+    k.push(u8::from(paged));
     temen_encode::digest256(&k)
 }
 
@@ -488,7 +491,8 @@ fn create_owned(_: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// What code this process keeps is valid for: this build of temen (the executable it runs in) on
-/// this CPU (the ISA the JIT compiles for, with its flags).
+/// this CPU (the ISA the JIT compiles for, with its flags) and this host page size, which a window's
+/// guard offset and a demand-paged child's page check bake in (#2164).
 #[cfg(unix)]
 fn stamp() -> std::io::Result<[u8; 32]> {
     use std::os::unix::fs::MetadataExt;
@@ -500,6 +504,7 @@ fn stamp() -> std::io::Result<[u8; 32]> {
     }
     s.extend(exe.mtime().to_le_bytes());
     s.extend(exe.mtime_nsec().to_le_bytes());
+    s.extend((crate::mem::page_size() as u64).to_le_bytes());
     s.extend(format!("{}\n{}\n", isa.triple(), isa.flags()).as_bytes());
     for flag in isa.isa_flags() {
         s.extend(format!("{flag}\n").as_bytes());

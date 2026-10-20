@@ -214,7 +214,7 @@ fn a_childs_inherited_stdout_rides_its_artifact_as_inherited() {
     spawner.set_durable(true);
     let out = spawner.grant_stream(StreamRole::Out);
     let (chost, _, _) = spawner
-        .spawn_detached_child(&[("stdout".to_string(), out)], 1 << 17, lease(-1), 2)
+        .spawn_detached_child(&[("stdout".to_string(), out)], 1 << 17, lease(-1), 2, false)
         .expect("the child's powerbox");
     let inherited = DurableBinding::Stream {
         role: StreamRole::Out,
