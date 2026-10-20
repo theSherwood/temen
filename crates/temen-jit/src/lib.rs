@@ -7594,7 +7594,7 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
                 // Q15 rounding multiply → native `sqmul_round_sat`.
                 Inst::VQ15MulrSat { .. } => {}
                 // Fused multiply-add (relaxed_madd/nmadd) → vector `fma` (one rounding; the same
-                // correctly-rounded result the interp's `mul_add` gives, so the differential holds).
+                // correctly-rounded result as the interp's `libm` `fma`, so the differential holds).
                 Inst::VFma { .. } => {}
                 // Boolean reductions → a scalar `i32` (`vany_true`/`vall_true`/`vhigh_bits`).
                 Inst::VAnyTrue { .. } | Inst::VAllTrue { .. } | Inst::VBitmask { .. } => {}
@@ -8851,7 +8851,7 @@ fn lower_block(
                 float_un(b, *op, x)
             }
             Inst::Fma { a, b: rb, c, .. } => {
-                // Scalar fused multiply-add — `a·b + c`, one rounding (matches the interp's `mul_add`).
+                // Scalar fused multiply-add — `a·b + c`, one rounding, as the interp's `libm` `fma`.
                 let (x, y, z) = (get(&vals, *a)?, get(&vals, *rb)?, get(&vals, *c)?);
                 b.ins().fma(x, y, z)
             }

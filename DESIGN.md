@@ -521,8 +521,9 @@ security — UB in a sandbox IR would void the escape guarantee.
 - **Float arithmetic** (f32/f64, IEEE 754, no traps): `add sub mul div sqrt min max
   abs neg ceil floor trunc nearest copysign fma` (`min`/`max` are wasm-identical:
   NaN-propagating, with `-0 < +0` — *not* IEEE minNum; `nearest` rounds ties to
-  even; `fma` is the correctly-rounded fused multiply-add; `abs`/`neg`/`copysign`
-  are pure sign-bit ops, defined on NaN too — all pinned by `temen-spec`).
+  even; `fma` is the correctly-rounded fused multiply-add, which the interpreters compute with the
+  `libm` crate's function, the one temen-opt folds with, never the C library's (#2519);
+  `abs`/`neg`/`copysign` are pure sign-bit ops, defined on NaN too — all pinned by `temen-spec`).
 - **Float compare** (→ i32): `eq ne lt le gt ge`.
 - **Conversions:** `i64.extend_i32_s/u`, `i32.wrap_i64`, `extend8_s/extend16_s/
   extend32_s` (the narrow sign-extends — *defined here + in `temen-ir`, the interpreter, **and the JIT**

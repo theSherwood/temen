@@ -17453,13 +17453,16 @@ fn eval_inst(inst: &Inst, vals: &[Reg], mem: &mut Option<Mem>) -> Result<Option<
             FloatTy::F32 => Reg::from_f32(fun32(*op, get_f32(vals, *a)?)),
             FloatTy::F64 => Reg::from_f64(fun64(*op, get_f64(vals, *a)?)),
         },
+        // The `libm` crate's correctly-rounded fused FMA, the one temen-opt folds with (#2519): its
+        // results are Cranelift's `fma`'s but for which NaN, which the JIT differential ignores.
         Inst::Fma { ty, a, b, c } => match ty {
-            // `mul_add` is the correctly-rounded fused FMA — bit-identical to Cranelift's `fma`.
             FloatTy::F32 => {
-                Reg::from_f32(get_f32(vals, *a)?.mul_add(get_f32(vals, *b)?, get_f32(vals, *c)?))
+                let (x, y, z) = (get_f32(vals, *a)?, get_f32(vals, *b)?, get_f32(vals, *c)?);
+                Reg::from_f32(libm::fmaf(x, y, z))
             }
             FloatTy::F64 => {
-                Reg::from_f64(get_f64(vals, *a)?.mul_add(get_f64(vals, *b)?, get_f64(vals, *c)?))
+                let (x, y, z) = (get_f64(vals, *a)?, get_f64(vals, *b)?, get_f64(vals, *c)?);
+                Reg::from_f64(libm::fma(x, y, z))
             }
         },
         Inst::FCmp { ty, op, a, b } => {
@@ -18220,9 +18223,9 @@ fn simd_vfloat_bin(shape: VShape, op: VFloatBinOp, a: [u8; 16], b: [u8; 16]) -> 
     o
 }
 
-/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding.
-/// `f*::mul_add` is the correctly-rounded IEEE-754 FMA — bit-identical to Cranelift's `fma`, so the
-/// interp↔JIT differential holds. `neg` negates the product (the `nmadd` form, `−a·b + c`).
+/// Lane-wise fused multiply-add (`relaxed_madd`/`nmadd`): `±a·b + c` with a single rounding, by the
+/// scalar `Fma`'s `libm` function (#2519), so the interp↔JIT differential holds as it does there.
+/// `neg` negates the product (the `nmadd` form, `−a·b + c`).
 fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> [u8; 16] {
     let mut o = [0u8; 16];
     match shape {
@@ -18232,7 +18235,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f32::from_bits(lane_read(&b, i, 4) as u32);
                 let z = f32::from_bits(lane_read(&c, i, 4) as u32);
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 4, x.mul_add(y, z).to_bits() as u64);
+                lane_write(&mut o, i, 4, libm::fmaf(x, y, z).to_bits() as u64);
             }
         }
         VShape::F64x2 => {
@@ -18241,7 +18244,7 @@ fn simd_fma(shape: VShape, neg: bool, a: [u8; 16], b: [u8; 16], c: [u8; 16]) -> 
                 let y = f64::from_bits(lane_read(&b, i, 8));
                 let z = f64::from_bits(lane_read(&c, i, 8));
                 let x = if neg { -x } else { x };
-                lane_write(&mut o, i, 8, x.mul_add(y, z).to_bits());
+                lane_write(&mut o, i, 8, libm::fma(x, y, z).to_bits());
             }
         }
         _ => {}

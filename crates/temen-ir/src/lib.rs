@@ -2280,8 +2280,9 @@ pub enum Inst {
         a: ValIdx,
     },
     /// Scalar **fused multiply-add** `a·b + c` with a single rounding (IEEE-754 FMA) — the scalar
-    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` / Rust
-    /// `f*::mul_add` are both correctly-rounded, so interp and JIT agree. Operands/result are `ty`.
+    /// sibling of [`Inst::VFma`], emitted for `llvm.fma`/`fmuladd`. Cranelift `fma` and the `libm`
+    /// crate's, which the interpreters compute with (#2519), are both correctly-rounded, so interp
+    /// and JIT agree. Operands/result are `ty`.
     Fma {
         ty: FloatTy,
         a: ValIdx,
@@ -2953,7 +2954,8 @@ pub enum Inst {
     /// is `a·b + c` (`neg == false`) or `−a·b + c` (`neg == true`), computed with a **single rounding**
     /// (IEEE-754 FMA). Float shapes (`f32x4`/`f64x2`); `a`/`b`/`c`/result are `v128`. Temen picks the
     /// fused behavior (one of the two the relaxed proposal permits) consistently in both backends —
-    /// Cranelift `fma` and Rust `f*::mul_add` are both correctly-rounded, so the differential holds.
+    /// Cranelift `fma` and the interpreters' `libm` `fma` are both correctly-rounded, so the
+    /// differential holds.
     VFma {
         shape: VShape,
         neg: bool,

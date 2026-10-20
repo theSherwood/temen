@@ -1430,6 +1430,7 @@ dependencies = [
 name = "temen-interp"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "page_size",
  "temen-encode",
  "temen-ir",

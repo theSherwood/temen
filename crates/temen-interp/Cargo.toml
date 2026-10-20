@@ -24,6 +24,10 @@ temen-mem.workspace = true
 # interpreter value slot its source-level type — slots are untyped on the hot path (§ the `Reg`
 # value model), so typed reads (`backtrace`/`read_ir_value`/`read_var`) reconstruct via this.
 temen-verify.workspace = true
+# The fused multiply-add the interpreters compute (#2519): the same correctly-rounded `fma` temen-opt
+# folds with, so the oracle, the bytecode engine and the folder answer alike on every host. `mul_add`
+# would call the C library's, whose NaN for `fma(±0, ∞, NaN)` differs on Bionic.
+libm = "0.2"
 # Host page size for the protection model — a tiny *safe* wrapper (keeps `#![forbid(unsafe_code)]`),
 # so the interpreter's RO/unmap granularity matches the JIT's real `mprotect` on the same host
 # (§4 "pin page size" → host-page default; both backends query the same value, so they agree
