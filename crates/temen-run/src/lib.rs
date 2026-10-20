@@ -216,7 +216,11 @@ pub unsafe extern "C" fn cap_thunk(
     // result slot (the wake delivers one scalar — invariant 8) and a non-durable run (the freeze
     // driver has no cap-park re-derivation). Sync ops never pay: nothing is minted unless a handler
     // punts. Either face, a would-block op parks the calling fiber and runs again (#1826, #1952).
-    let pending_face = n_results == 1 && !(*(ctx as *mut Host)).is_durable();
+    // #2495 — nor under a recording host: this engine tapes no host-answered call's delivered
+    // value, so one declines there before its embedder sees it (a pool job runs inline under a
+    // tape on either face).
+    let host = &*(ctx as *mut Host);
+    let pending_face = n_results == 1 && !host.is_durable() && !host.records_caps();
     loop {
         let (mut pending_id, mut park) = (None, None);
         cap_thunk_impl(
@@ -318,11 +322,10 @@ unsafe fn cap_wait(
     temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
-/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (the ordered
-/// drain claims a completion that raced the park, in submission order — a ready LATER id is
-/// held behind an earlier outstanding park, the §18 pin), then park-poll: each `cont.resume`
-/// of this fiber re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the
-/// resumer) until the drain has delivered. Parking before the first check gives the one
+/// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
+/// that raced the park fills it at once), then park-poll: each `cont.resume` of this fiber
+/// re-enters here once, checks the cell, and re-parks (`FIBER_PARKED` to the resumer) until the
+/// call has answered, each call's answer as it comes (#2477). Parking before the first check gives the one
 /// transient `FIBER_PARKED` even on an insta-ready completion, matching the oracle's
 /// register-then-recheck. A trap raised meanwhile (teardown) abandons the wait — the result
 /// stays unclaimed for the sweep and the caller's trailing guards unwind before the guest
@@ -770,6 +773,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
         let host_ptr = &mut *guard as *mut Host as *mut c_void;
         let mut pending_id = None;
         let mut park = None;
+        // #2495 — no parking face under a recording host, as in [`cap_thunk`].
+        let face = (!guard.records_caps()).then_some(&mut pending_id);
         cap_thunk_impl(
             host_ptr,
             mem_base,
@@ -783,7 +788,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             results,
             n_results,
             trap_out,
-            Some(&mut pending_id),
+            face,
             &mut park,
         );
         // #1826 — a would-block op parks with the domain lock released, so a sibling's write gets in,
@@ -804,7 +809,10 @@ pub unsafe extern "C" fn cap_thunk_locked(
             let comps = guard.completions();
             let durable = guard.is_durable();
             drop(guard);
-            if n_results > 1 {
+            // #2495 — a host-answered call without a one-scalar reply cannot park either, as on
+            // every engine: withdrawn, it declines.
+            let declined = n_results != 1 && comps.withdraw(id);
+            if n_results > 1 || declined {
                 *trap_out = TrapKind::CapFault as i64;
                 return;
             }
@@ -1405,7 +1413,7 @@ pub fn jit_cap_run(
     let fuel = root_fuel
         .as_deref_mut()
         .map(|c| c as *mut temen_jit::FuelCell);
-    let (restore, restore_tail) = jit_restore(init);
+    let restore = jit_restore(init);
     let init_mem = init.bytes();
     // #1810, #2427: a durable run's capture is its freeze image, so it carries each page the guest
     // holds past its declared window.
@@ -1450,7 +1458,7 @@ pub fn jit_cap_run(
             cm.set_held_tail(Some(cc.held_tail()));
         }
         cm.set_window_ready(Some(cc.window_ready()));
-        cm.set_restore_prots(restore, restore_tail);
+        cm.set_restore(restore);
         cm.set_freeze_controller(freeze);
         if hosts_fibers {
             cm.enable_fiber_hosting()?;
@@ -1510,7 +1518,7 @@ pub fn jit_cap_run(
         cm.set_held_tail(Some(cc.held_tail()));
     }
     cm.set_window_ready(Some(cc.window_ready()));
-    cm.set_restore_prots(restore, restore_tail);
+    cm.set_restore(restore);
     cm.set_freeze_controller(freeze);
     if hosts_fibers {
         cm.enable_fiber_hosting()?;
@@ -1622,7 +1630,8 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             continue;
         };
         let children = detached_seeds(&mut r.host)?;
-        let (prots, tail) = jit_restore(&window);
+        // A thawed child's window is always a whole window, never a seed.
+        let temen_jit::WindowRestore { prots, tail } = jit_restore(&window).unwrap_or_default();
         // Its root is task 0 in its domain, as in a JIT capture: re-parent the vCPUs it spawned
         // from the id an interpreter capture gave it.
         let mut residue = take_residue(&mut r.host);
@@ -2716,15 +2725,14 @@ unsafe fn child_budget_node(ctx: *mut c_void) -> Option<Arc<dyn temen_jit::Budge
     Some(Arc::new(HostNode(node)))
 }
 
-/// #1834, #2427 — the page map a window seeded with `init`'s bytes is built under, as the JIT
-/// re-applies it ([`temen_jit::CompiledModule::set_restore_prots`]): one protection per codec page
-/// of those bytes, and each page `init` holds past them with its own. Empty for an `init` that
-/// deviates nowhere: the fresh window.
-fn jit_restore(
-    init: &temen_interp::MemLayout,
-) -> (Vec<temen_jit::WindowProt>, Vec<temen_jit::TailPage>) {
-    if init.page_map().is_empty() {
-        return (Vec::new(), Vec::new());
+/// #1834, #2427, #2441 — the window a run started from `init` restores, as the JIT re-establishes it
+/// ([`temen_jit::CompiledModule::set_restore`]): `None` for a fresh run's seed
+/// ([`temen_interp::MemLayout::is_seed`]), whose window lays the module's data segments; else `init`
+/// as a thaw's whole window, under its page map — one protection per codec page of its bytes — with
+/// each page it holds past them.
+fn jit_restore(init: &temen_interp::MemLayout) -> Option<temen_jit::WindowRestore> {
+    if init.is_seed() {
+        return None;
     }
     let prots = init.dense_prots().into_iter().map(window_prot).collect();
     let tail = init
@@ -2736,7 +2744,7 @@ fn jit_restore(
             bytes: bytes.map(<[u8]>::to_vec),
         })
         .collect();
-    (prots, tail)
+    Some(temen_jit::WindowRestore { prots, tail })
 }
 
 /// A captured page's protection as the JIT window re-applies it.
@@ -2752,8 +2760,7 @@ fn window_prot(p: temen_interp::CapturedProt) -> temen_jit::WindowProt {
 }
 
 /// #1810 — a JIT run's window image in the interpreter's capture form: its bytes, each page it holds
-/// past them (#2427: a durable run's `tail`), and the page map the host rebuilds from the module's
-/// `readonly` segments, the NULL guard, and the guest's own Memory-capability changes
+/// past them (#2427: a durable run's `tail`), and the window's page map, the NULL guard added
 /// ([`Host::capture_window_layout`]). One form for both engines; an embedder freezes it with
 /// `temen_snapshot::freeze_layout`, which keeps the page map.
 fn jit_layout(
@@ -2763,7 +2770,7 @@ fn jit_layout(
     tail: Vec<(u64, Vec<u8>)>,
 ) -> temen_interp::MemLayout {
     let mapped = m.memory.as_ref().map_or(0, |mc| 1u64 << mc.size_log2);
-    host.capture_window_layout(&m.data, mapped, temen_ir::module_null_guard(), bytes, tail)
+    host.capture_window_layout(mapped, temen_ir::module_null_guard(), bytes, tail)
 }
 
 /// The production §14 child hooks for a run with this cap ctx: the family that decodes `ctx`'s shape
@@ -4091,7 +4098,8 @@ impl MprotectWindow {
     /// #2268 — record the pages the window's `readonly` data segments made read-only, `ro` (byte
     /// ranges), as the interpreter's `init_data` records them in its own page map: whole pages, in
     /// the backed prefix, and none the NULL guard covers, which is protected after them on every
-    /// engine. A page the map already names keeps its entry — a thaw's map is the window's.
+    /// engine. A fresh window's alone: a thaw's window lays no segment, so its map is the artifact's
+    /// (#2307). A page the map already names keeps its entry.
     pub fn seed_readonly(&mut self, ro: &[[u64; 2]]) {
         let guard = self.null_guard / self.page;
         let prefix = self.mapped.div_ceil(self.page);

@@ -182,7 +182,7 @@ impl GuestWindow {
     /// window holds — grown, or protected to nothing with its contents kept (#1909) — so it is
     /// committed and seeded with its bytes (#1834). A thawed guest then faults on a restored
     /// `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
-    /// `apply_layout`. The root's thaw and a detached child's (#1733) both apply theirs here. `false`
+    /// `restore_layout`. The root's thaw and a detached child's (#1733) both apply theirs here. `false`
     /// when the OS refuses a commit or a protection (#2318): the thaw is refused then, as the window
     /// cannot hold the page map it captured.
     #[must_use]

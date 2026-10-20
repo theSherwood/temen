@@ -1607,24 +1607,30 @@ non-durable freeze refusal. The **cross-backend** property (`crates/temen/tests/
 backend's freeze and asserts a **byte-identical artifact** across interp/JIT, checks the
 canonical re-serialize invariant, and thaws the **restored** interpreter artifact on the JIT.
 **Capture + re-establish** landed for the interpreter: `run_capture_reserved_with_host_layout`
-both **seeds** an initial window layout (restore) and **returns** the post-run one (freeze) — a
+both **starts** from a window layout (restore) and **returns** the post-run one (freeze) — a
 `MemLayout`: the head's bytes, each page held past it (#2427), and the page map, read in the codec's
 form as `CapturedProt` (`Rw`/`Ro`/`Unmapped`/`Backed`) at the fixed `DURABLE_SNAPSHOT_PAGE`
-(= codec `PAGE`) granularity. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
+(= codec `PAGE`) granularity. A fresh run's seed (`MemLayout::image`) is the low bytes the module's
+data segments are laid over; any other layout is a thaw's whole window, which the run starts from as
+it is, its page map in place of the one the segments made, so what the guest wrote to its data
+segments and which of their pages it made writable survive the thaw (#2441, #2307) — on either
+engine, frozen on either. `crates/temen/tests/durable_prot_capture.rs` shows a D40 `readonly`
 data segment captured as `Ro` and surviving freeze→restore through the codec (where Phase-1's
 flat all-`Rw` image would have lost it), **and** that re-establishing the map on a thawed run
 makes a write to a restored `Ro` page fault — while the same window without it writes through. A
 `Backed` page rides as a region reference and is re-aliased on thaw (D-region, §12.3). **JIT re-establish parity** also landed:
-`temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map and applies
-it to the freshly-seeded window (`protect_ro` / new `protect_none` via real
-`mprotect`/`VirtualProtect`) before the run, so a thawed `Ro`/`Unmapped` page faults on the JIT
-exactly as on the interpreter (`durable_prot_capture.rs` asserts both). Note module-defined
-`readonly` segments already re-apply on every JIT instantiation; this adds the *runtime*-captured
-map. **JIT-side capture** also landed: `Host::capture_window_layout` reconstructs the window's
-protection map from the two host-side sources — the NULL guard and the module's `readonly` data
-segments merged with the runtime page-state map (`cap_pages`, populated by Memory-cap
-`map`/`unmap`/`protect`) — mirroring the interpreter's `layout_snapshot`, and reads the pages held
-past the declared window apart (`Host::cap_held_tail`, #2427). `durable_prot_capture.rs`
+`temen_jit::compile_and_run_capture_reserved_with_host_prots` takes a `WindowProt` map — a thaw's
+(`WindowRestore`, as `jit_cap_run` passes one for any layout but a seed) — and applies it to the
+thaw's image (`protect_ro` / new `protect_none` via real `mprotect`/`VirtualProtect`) before the run,
+so a thawed `Ro`/`Unmapped` page faults on the JIT exactly as on the interpreter
+(`durable_prot_capture.rs` asserts both). A thaw's window lays no data segment and protects none
+read-only but as its map says (#2441, #2307); a fresh window lays them. **JIT-side capture** also
+landed: `Host::capture_window_layout` reads the window's page map (`cap_pages`), which starts with
+the read-only pages a fresh window's data segments made (#2268) or a thaw's artifact's, and records
+every Memory-cap `map`/`unmap`/`protect` since, plus the NULL guard no page op can change —
+mirroring the interpreter's `layout_snapshot`, a `readonly` page the guest made writable unrecorded
+in both (#2307) — and reads the pages held past the declared window apart (`Host::cap_held_tail`,
+#2427). A fork twin's window is built from the same map (FORK.md §9.5). `durable_prot_capture.rs`
 asserts interp and JIT capture the **same** map for a readonly-segment module, and that a runtime
 `cap_pages` entry overrides the default. So page protections now round-trip on **both** backends,
 both directions. The page-protection story is complete.

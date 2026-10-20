@@ -208,6 +208,8 @@ impl Image {
                     .map(|(&off, page)| (off, page.to_vec()))
                     .collect(),
                 map: map.clone(),
+                // A paged image is a moment's window, never a fresh run's seed.
+                seed: false,
             }),
         }
     }
@@ -225,7 +227,10 @@ impl Image {
     /// agree, its head's and (#2427) those it holds past the head alike. An image already paged is
     /// left as it is.
     fn paged(self, below: Option<&Image>) -> Image {
-        let Image::Flat(MemLayout { bytes, tail, map }) = self else {
+        let Image::Flat(MemLayout {
+            bytes, tail, map, ..
+        }) = self
+        else {
             return self;
         };
         let (below, below_tail) = below.map_or((None, None), Image::parts);

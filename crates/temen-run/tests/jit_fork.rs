@@ -44,7 +44,8 @@ fn run_on(src: &str, head: bool, backend: Backend) -> Outcome {
             "wait4",
             HostCap::host_proc_shared(temen_posix::OP_WAIT4, &slot),
         )
-        .provide("exit", HostCap::exit());
+        .provide("exit", HostCap::exit())
+        .provide("vm_protect", HostCap::memory(2));
     let inst = instantiate_with_imports(module, imports).expect("instantiate");
     let p = posix.clone();
     let mut setup = move |host: &mut temen_interp::Host| {
@@ -333,6 +334,62 @@ fn a_crashing_twin_reaps_as_128_identically_on_every_engine() {
                 "{backend:?}"
             );
         }
+    }
+}
+
+/// #2307 — a twin's window keeps its parent's page protections, a page of a `readonly` data segment
+/// the parent made writable included. The parent `protect`s the segment's page read-write, writes
+/// it, and forks; the child writes the page and exits with the byte it reads back (`120`), and the
+/// parent exits with the child's status. The JIT built the twin's protections from the segment under
+/// its page map, which has no entry for a page made writable, so the child's store faulted (`128`).
+const FORK_RO_SEGMENT: &str = "memory 17 shadow 65536 69632\n\
+import 0 \"fork\" () -> (i64)\n\
+import 1 \"wait4\" (i64, i64, i64, i64) -> (i64)\n\
+import 2 \"exit\" (i32) -> ()\n\
+import 3 \"vm_protect\" (i64, i64, i32) -> (i64)\n\
+data ro 98304 \"efgh\"\n\
+func () -> () {
+block 0 () {
+  va = i64.const 98304
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vr = call.import 3 (va, vlen, vrw)
+  vy = i32.const 121
+  i32.store8 va vy
+  p = call.import 0 ()
+  z = i64.const 0
+  child = i64.eq p z
+  br_if child 1() 2(p)
+  }
+block 1 () {
+  vc = i64.const 98304
+  vx = i32.const 120
+  i32.store8 vc vx
+  vb = i32.load8_u vc
+  call.import 2 (vb)
+  unreachable
+  }
+block 2 (pp: i64) {
+  pst = i64.const 41000
+  pz = i64.const 0
+  pw = call.import 1 (pp, pst, pz, pz)
+  phi = i64.const 41001
+  pcode8 = i32.load8_u phi
+  call.import 2 (pcode8)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_twin_keeps_a_readonly_segment_page_its_parent_made_writable_on_every_engine() {
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        assert_eq!(
+            run_on(FORK_RO_SEGMENT, false, backend),
+            Outcome::Exited(120),
+            "{backend:?}"
+        );
     }
 }
 
