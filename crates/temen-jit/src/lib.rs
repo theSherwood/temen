@@ -6106,13 +6106,16 @@ fn host_import(
 /// no guard page). Pinning it here locks that assumption against a future Cranelift default flip.
 ///
 /// It binds every symbol the code calls the host by ([`HostFn`]): temen-jit's functions, and the
-/// compile's `imports`.
+/// compile's `imports`; and Cranelift's libcalls ([`libcalls`]).
 fn new_jit_module(imports: Imports) -> Result<JITModule, JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
     for f in HostFn::ALL {
         if let Some(addr) = f.addr(&imports) {
             builder.symbol(f.symbol(), addr);
         }
+    }
+    for (name, addr) in libcalls() {
+        builder.symbol(name, addr);
     }
     if let Some(resolver) = imports.fast_resolver {
         builder.symbol_lookup_fn(Box::new(move |name| fast_cap_addr(resolver, name)));
@@ -6126,6 +6129,48 @@ fn new_jit_module(imports: Imports) -> Result<JITModule, JitError> {
         builder.memory_provider(Box::new(arena));
     }
     Ok(JITModule::new(builder))
+}
+
+/// Cranelift's libcalls that name a C runtime function, by the names
+/// [`cranelift_module::default_libcall_names`] gives them, with that function's address.
+/// [`new_jit_module`] binds them as it binds each [`HostFn`], so the JIT never looks a name up in the
+/// process's dynamic symbol table, which a statically linked host doesn't have: there, a
+/// `memory.copy` could not link (#2514). The others (`Probestack`, which is off, and the TLS and x86
+/// shuffle helpers) name nothing a C runtime has.
+fn libcalls() -> [(&'static str, *const u8); 14] {
+    use core::ffi::{c_int, c_void};
+    extern "C" {
+        fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+        fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+        fn memset(dst: *mut c_void, c: c_int, n: usize) -> *mut c_void;
+        fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int;
+        fn ceilf(x: f32) -> f32;
+        fn ceil(x: f64) -> f64;
+        fn floorf(x: f32) -> f32;
+        fn floor(x: f64) -> f64;
+        fn truncf(x: f32) -> f32;
+        fn trunc(x: f64) -> f64;
+        fn nearbyintf(x: f32) -> f32;
+        fn nearbyint(x: f64) -> f64;
+        fn fmaf(a: f32, b: f32, c: f32) -> f32;
+        fn fma(a: f64, b: f64, c: f64) -> f64;
+    }
+    [
+        ("memcpy", memcpy as *const u8),
+        ("memmove", memmove as *const u8),
+        ("memset", memset as *const u8),
+        ("memcmp", memcmp as *const u8),
+        ("ceilf", ceilf as *const u8),
+        ("ceil", ceil as *const u8),
+        ("floorf", floorf as *const u8),
+        ("floor", floor as *const u8),
+        ("truncf", truncf as *const u8),
+        ("trunc", trunc as *const u8),
+        ("nearbyintf", nearbyintf as *const u8),
+        ("nearbyint", nearbyint as *const u8),
+        ("fmaf", fmaf as *const u8),
+        ("fma", fma as *const u8),
+    ]
 }
 
 /// The ISA every compile uses: [`new_jit_module`]'s, and the one [`define_funcs`]'s workers compile
@@ -6568,6 +6613,13 @@ block 2 (v7: i32) {
     }
 
     #[test]
+    // A static Android executable is never position-independent (rustc links it `-no-pie`), so two
+    // processes place the host functions alike, and this test can't tell an address from a symbol.
+    // `scripts/ci/android.sh` links its test binaries that way (#2514).
+    #[cfg_attr(
+        all(target_os = "android", target_feature = "crt-static"),
+        ignore = "needs ASLR, which a static Android executable lacks"
+    )]
     fn two_processes_emit_the_same_code() {
         let exe = std::env::current_exe().expect("this test binary");
         let run = |name: &str| {
@@ -6623,6 +6675,33 @@ block 2 (v7: i32) {
             a.len(),
             b.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod libcall_tests {
+    use super::*;
+    use cranelift_codegen::ir::LibCall;
+
+    /// #2514 — every libcall that names a C runtime function is bound, so a Cranelift bump that adds
+    /// one fails here, not at a statically linked host's first call of it.
+    #[test]
+    fn every_c_runtime_libcall_is_bound() {
+        let name = cranelift_module::default_libcall_names();
+        let bound: Vec<&str> = libcalls().iter().map(|&(n, _)| n).collect();
+        for &lc in LibCall::all_libcalls() {
+            let runtime = !matches!(
+                lc,
+                LibCall::Probestack
+                    | LibCall::ElfTlsGetAddr
+                    | LibCall::ElfTlsGetOffset
+                    | LibCall::X86Pshufb
+            );
+            let n = name(lc);
+            assert_eq!(bound.contains(&n.as_str()), runtime, "{lc:?} ({n})");
+        }
+        assert_eq!(bound.len(), LibCall::all_libcalls().len() - 4);
+        assert!(libcalls().iter().all(|&(_, addr)| !addr.is_null()));
     }
 }
 

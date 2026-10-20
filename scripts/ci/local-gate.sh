@@ -19,6 +19,8 @@
 #                                                            feature, so nothing else compiles it)
 #   * `scripts/ci/check-excluded.sh`                        (excluded-crates job)
 #   * the same two under `--target x86_64-pc-windows-gnu`   (check + fiber-scaling cross-checks)
+#   * the workspace's clippy under `--target aarch64-linux-android`, through
+#     `scripts/ci/android.sh`                               (android job)
 #
 # It deliberately does NOT cover: the test matrix, miri/asan/tsan/loom, fuzz, the differential and
 # browser jobs, or anything needing a real Windows/macOS runtime. Those stay CI's. This is the
@@ -29,7 +31,7 @@
 #   scripts/ci/local-gate.sh --print-toolchain   # just echo the rust version CI pins
 #   TEMEN_GATE_INSTALL=1 …                # install the pinned toolchain/components/target if missing
 #                                         # (otherwise a missing one fails with the exact command)
-#   TEMEN_GATE_SKIP_CROSS=1 …             # skip the windows-gnu cross-check
+#   TEMEN_GATE_SKIP_CROSS=1 …             # skip the windows-gnu and Android cross-checks
 #
 # The pre-push hook (`.githooks/pre-push`) calls this, so the hook and a manual run are the same
 # gate rather than two drifting lists.
@@ -116,32 +118,50 @@ cargo_pinned clippy -p temen-jit --features stack-check --all-targets -- -D warn
 # Same script CI runs; it reads the exclude list from `Cargo.toml`, so it cannot miss a crate.
 TEMEN_CHECK_TOOLCHAIN="$toolchain" run bash scripts/ci/check-excluded.sh
 
-# --- windows-gnu cross-check ------------------------------------------------------------------
-# CI cross-checks both the workspace and the stack-check lane against x86_64-pc-windows-gnu. It is a
-# compile-only gate, so it runs anywhere the target and a mingw linker are available — which is the
-# cheapest way to catch a Windows-only build break without a Windows runner. The §5 trap-capture C
-# shim (`trap_capture.c`) is what needs the cross gcc.
-cross_target=x86_64-pc-windows-gnu
-if [ "${TEMEN_GATE_SKIP_CROSS:-0}" = "1" ]; then
-  echo "local-gate: SKIP windows-gnu cross-check (TEMEN_GATE_SKIP_CROSS=1)"
-elif ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
-  echo "local-gate: SKIP windows-gnu cross-check — no mingw cross-compiler."
-  echo "  install it with: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64"
-  echo "  (CI still runs this gate; set TEMEN_GATE_SKIP_CROSS=1 to silence this notice)"
-else
-  if ! rustup target list --toolchain "$toolchain" --installed | grep -qx "$cross_target"; then
+# --- cross-checks -----------------------------------------------------------------------------
+# Compile-only gates for platforms without a runner here: each runs anywhere its rustup target and a C
+# cross-compiler are installed, which is the cheapest way to catch a platform-only build break. The §5
+# trap-capture C shim (`trap_capture.c`) is what needs the cross compiler. A missing compiler skips
+# the check with a notice (CI still runs it); a missing target stops the gate with the command.
+ensure_target() {
+  if ! rustup target list --toolchain "$toolchain" --installed | grep -qx "$1"; then
     if [ "${TEMEN_GATE_INSTALL:-0}" = "1" ]; then
-      run rustup target add --toolchain "$toolchain" "$cross_target"
+      run rustup target add --toolchain "$toolchain" "$1"
     else
-      echo "local-gate: rust $toolchain has no $cross_target target." >&2
-      echo "  rustup target add --toolchain $toolchain $cross_target" >&2
+      echo "local-gate: rust $toolchain has no $1 target." >&2
+      echo "  rustup target add --toolchain $toolchain $1" >&2
       echo "  (or re-run with TEMEN_GATE_INSTALL=1, or TEMEN_GATE_SKIP_CROSS=1 to skip)" >&2
       exit 1
     fi
   fi
-  cargo_pinned check --workspace --all-targets --target "$cross_target"
-  cargo_pinned clippy --workspace --all-targets --target "$cross_target" -- -D warnings
-  cargo_pinned clippy -p temen-jit --features stack-check --all-targets --target "$cross_target" -- -D warnings
+}
+
+if [ "${TEMEN_GATE_SKIP_CROSS:-0}" = "1" ]; then
+  echo "local-gate: SKIP the cross-checks (TEMEN_GATE_SKIP_CROSS=1)"
+else
+  # windows-gnu: the workspace and the stack-check lane, as CI cross-checks them. mingw's gcc is the
+  # cross compiler.
+  if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+    echo "local-gate: SKIP windows-gnu cross-check — no mingw cross-compiler."
+    echo "  install it with: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64"
+    echo "  (CI still runs this gate; set TEMEN_GATE_SKIP_CROSS=1 to silence this notice)"
+  else
+    cross_target=x86_64-pc-windows-gnu
+    ensure_target "$cross_target"
+    cargo_pinned check --workspace --all-targets --target "$cross_target"
+    cargo_pinned clippy --workspace --all-targets --target "$cross_target" -- -D warnings
+    cargo_pinned clippy -p temen-jit --features stack-check --all-targets --target "$cross_target" -- -D warnings
+  fi
+  # Android (#2514): the workspace, as CI's android job lints it. The NDK's clang is the cross
+  # compiler, and `android.sh` is where it is wired up, for CI and here alike.
+  if ! bash scripts/ci/android.sh --ndk >/dev/null 2>&1; then
+    echo "local-gate: SKIP Android cross-check — no NDK (set ANDROID_NDK_HOME to one, r27 or later)."
+    echo "  (CI still runs this gate; set TEMEN_GATE_SKIP_CROSS=1 to silence this notice)"
+  else
+    ensure_target aarch64-linux-android
+    TEMEN_CHECK_TOOLCHAIN="$toolchain" run bash scripts/ci/android.sh aarch64-linux-android \
+      clippy --workspace --all-targets -- -D warnings
+  fi
 fi
 
 echo "local-gate: OK — lints and compiles clean on CI's toolchain ($toolchain)."

@@ -6,7 +6,7 @@
 //! `ThreadFault` before it starts, and a detached spawn answers `-EINVAL`, its budget charged
 //! nothing. Once the address space is handed back, both go through. Its own binary: the address
 //! space is the process's.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 #[path = "support/detached.rs"]
 mod detached;

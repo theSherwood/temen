@@ -1022,8 +1022,8 @@ mod mapped {
         pub(super) raw: Shared,
         map_len: usize,
         /// The page the mapping was rounded to — the alignment [`zero`](Mapped::zero) drops at. Only
-        /// Linux drops pages, so only Linux keeps it.
-        #[cfg(all(target_os = "linux", not(miri)))]
+        /// Linux (Android's kernel too) drops pages, so only there is it kept.
+        #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
         page: usize,
     }
 
@@ -1073,20 +1073,21 @@ mod mapped {
             Some(Mapped {
                 raw: Shared::new(base, size),
                 map_len,
-                #[cfg(all(target_os = "linux", not(miri)))]
+                #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
                 page,
             })
         }
 
         /// Zero `[off, off+len)` (already clamped to `[0, size)`) — the same contract as `Paged`'s
         /// and `Sparse`'s `zero`: a **whole page is dropped**, a partial one is cleared in place. On
-        /// Linux the whole pages go back to the kernel with `MADV_DONTNEED`, which on this private
-        /// anonymous mapping guarantees they read zero (zero-fill on demand). So a `map`/`unmap` of a
-        /// large range costs no residency: a page is only backed once the guest touches it (#2267).
+        /// Linux, Android's kernel included, the whole pages go back to the kernel with
+        /// `MADV_DONTNEED`, which on this private anonymous mapping guarantees they read zero
+        /// (zero-fill on demand). So a `map`/`unmap` of a large range costs no residency: a page is
+        /// only backed once the guest touches it (#2267).
         /// Elsewhere — Darwin treats `MADV_DONTNEED` as advisory, and miri has a heap backing — or if
         /// the call fails, zeros are written.
         pub(super) fn zero(&self, off: u64, len: u64) {
-            #[cfg(all(target_os = "linux", not(miri)))]
+            #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
             {
                 let page = self.page as u64;
                 let (lo, hi) = (off.next_multiple_of(page), (off + len) / page * page);
@@ -2150,7 +2151,7 @@ mod tests {
     /// dirty one, while partial edge pages are cleared in place. Checked per page with `mincore`,
     /// which reads only this mapping, so parallel tests cannot perturb it (unlike process RSS).
     /// Residency is read before any byte is: a read of a dropped page maps the zero page back in.
-    #[cfg(all(target_os = "linux", not(miri)))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
     #[test]
     fn mapped_zero_drops_whole_pages() {
         // SAFETY: `sysconf` has no preconditions.

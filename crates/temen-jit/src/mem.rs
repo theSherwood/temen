@@ -1364,7 +1364,7 @@ mod tests {
     use super::*;
 
     /// `vm.max_map_count`, when it is small enough to fill in a test (#2286).
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn max_map_count() -> Option<usize> {
         let max: usize = std::fs::read_to_string("/proc/sys/vm/max_map_count")
             .ok()?
@@ -1381,7 +1381,7 @@ mod tests {
     /// # Safety
     /// Only in a forked child that leaves with `_exit`: nothing else in the process may need a mapping
     /// afterwards.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) unsafe fn fill_mapping_table(max: usize, spare: usize) {
         let page = pal::page_size();
         let len = 2 * (max + 16) * page;
@@ -1773,7 +1773,7 @@ mod tests {
     /// read-only data writable and its NULL guard open. In a forked child that fills its own mapping
     /// table, then frees just enough for the window itself: the window alone is granted (checked);
     /// its read-only page and its NULL guard each need a split the table has no room for.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_run_whose_window_cannot_be_seeded_ends_with_thread_fault() {
         const WRONG_RAN: i32 = 1;
@@ -1840,7 +1840,7 @@ mod tests {
     /// another mapping reports the refusal, where it used to panic or leave a protection missing. Run
     /// in a forked child, which fills its own mapping table and leaves this process's alone; once the
     /// table is full the child allocates nothing.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn window_operations_report_a_refusal_at_the_mapping_limit() {
         const WRONG_PROTECT: i32 = 1;

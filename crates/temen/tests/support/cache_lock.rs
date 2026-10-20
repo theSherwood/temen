@@ -28,7 +28,29 @@ pub fn lock(dir: &Path) -> File {
         .write(true)
         .open(&path)
         .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-    file.lock()
-        .unwrap_or_else(|e| panic!("lock {}: {e}", path.display()));
+    lock_exclusive(&file).unwrap_or_else(|e| panic!("lock {}: {e}", path.display()));
     file
+}
+
+#[cfg(not(target_os = "android"))]
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    file.lock()
+}
+
+/// `File::lock` as std implements it on Linux, with `flock`: std answers `lock() not supported` on
+/// Android, though Bionic has `flock` (#2514).
+#[cfg(target_os = "android")]
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+    const LOCK_EX: c_int = 2;
+    // SAFETY: `file` is open for the whole call; `flock` only blocks until the lock is held.
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }

@@ -292,6 +292,38 @@ jobs:
       # nearly free — it is here so that adding a second starts running it rather than silently not.
       - run: cargo test --workspace --doc
 
+  # #2514 — Android, with the NDK the runner image carries (`ANDROID_NDK_LATEST_HOME`), so nothing is
+  # fetched past the toolchain. `scripts/ci/android.sh` wires the NDK in, for this job and the local
+  # gate alike. The workspace is linted for aarch64-linux-android, and its tests run as x86-64 Android
+  # executables: they link statically, so they run on the runner itself, with no emulator. That
+  # exercises Bionic and temen's Android code paths; aarch64 code generation is macOS's lane, and
+  # ART's signal chaining and the app sandbox need a device (#2514).
+  android:
+    name: android (aarch64 clippy · x86-64 Bionic tests)
+    runs-on: ubuntu-latest
+    # The I7 backstop, as `cross-os` has it.
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: rustup target add aarch64-linux-android x86_64-linux-android
+      - run: bash scripts/ci/android.sh aarch64-linux-android clippy --workspace --all-targets -- -D warnings
+      # #1605's verified nextest archive, as `cross-os` restores it.
+      - name: cache cargo-nextest archive
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci/nextest
+          key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
+      - name: install cargo-nextest (pinned + checksummed per platform)
+        run: bash scripts/ci/install-nextest.sh
+      - run: bash scripts/ci/android.sh x86_64-linux-android nextest run --workspace
+
   fuzz:
     name: cargo-fuzz (all targets)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

@@ -19650,18 +19650,18 @@ pub const MAPS_PER_DOMAIN: u64 = WINDOW_RUNS + 5 + OFFLOAD_POOL_THREADS as u64 *
 /// #2268 — Linux's default `vm.max_map_count`, for a host that cannot read its own.
 const MAPS_LINUX_DEFAULT: u64 = 65530;
 
-/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's
-/// per-process `vm.max_map_count` less what the host keeps for itself ([`MAPS_HOST_RESERVE`]). One
-/// mapping past the OS limit fails an `mmap` or `mprotect` anywhere in the process, the host's own
-/// allocations included, which aborts it; so every `maps` charge, on every engine and in every run,
-/// is held against this as well as its own chain, and refused past it as past a ceiling, even one no
-/// grant refuses (a run's activation, [`Fits::Pool`]). A charge forced past every limit
-/// ([`Fits::Forced`]: a use that exists already, accounted again) counts here too, unrefused. Other
-/// hosts have no such limit: unbounded.
+/// #2268 — how many OS mappings the guests of this process may cause between them: Linux's (and so
+/// Android's) per-process `vm.max_map_count` less what the host keeps for itself
+/// ([`MAPS_HOST_RESERVE`]). One mapping past the OS limit fails an `mmap` or `mprotect` anywhere in
+/// the process, the host's own allocations included, which aborts it; so every `maps` charge, on
+/// every engine and in every run, is held against this as well as its own chain, and refused past it
+/// as past a ceiling, even one no grant refuses (a run's activation, [`Fits::Pool`]). A charge
+/// forced past every limit ([`Fits::Forced`]: a use that exists already, accounted again) counts
+/// here too, unrefused. Other hosts have no such limit: unbounded.
 pub fn maps_pool() -> u64 {
     static POOL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *POOL.get_or_init(|| {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
             std::fs::read_to_string("/proc/sys/vm/max_map_count")
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
@@ -38809,7 +38809,7 @@ mod prot_tests {
     /// is bounded by that, not by the span it names. Over a 128 GiB reservation's 2^25 pages, a walk
     /// of the span took seconds per op; this one costs microseconds. Measured in this thread's CPU
     /// time, which a loaded machine does not stretch.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_page_op_over_the_whole_reservation_costs_what_the_window_holds() {
         let cpu_ns = || -> u64 {
