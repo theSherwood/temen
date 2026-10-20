@@ -122,8 +122,8 @@ impl ForkPlan {
     /// no fibers, threads, `setjmp`, §14 children or §22 units, the state a fork would have to
     /// duplicate that lives outside the window, or code the transform never saw on the stack. (The
     /// oracle forks such a module when it is momentarily bare; FORK.md §9.5.) Nor does it run over
-    /// the locked powerbox ([`locked`]): a twin's is raw, and its code bakes the thunk for the
-    /// powerbox it was compiled over (temen#2389).
+    /// the locked powerbox ([`locked`]): a twin's is raw, and its code is linked to the thunk for
+    /// the powerbox it was compiled over (temen#2389).
     ///
     /// The plan is what the program is instrumented by ([`Self::instrument`]) and what the cap thunk
     /// reads a fork call against ([`serve_request`]): a call is a site by its dispatch pair — the pair
@@ -609,8 +609,8 @@ struct CodeKey {
     debug: bool,
     /// The fork sites its powerbox reads it as having — what its instrumentation depends on.
     sites: Option<Vec<(u32, u32)>>,
-    /// Whether it runs over the locked powerbox ([`locked`]): its code bakes the `call.cap` thunk
-    /// for the powerbox's shape (temen#2389).
+    /// Whether it runs over the locked powerbox ([`locked`]): its code is linked to the `call.cap`
+    /// thunk for the powerbox's shape (temen#2389).
     locked: bool,
 }
 

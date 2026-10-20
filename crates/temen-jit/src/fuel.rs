@@ -135,7 +135,7 @@ impl Drop for FuelCell {
 ///
 /// # Safety
 /// `cell` is a live [`FuelCell`].
-unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
+pub(crate) unsafe extern "C" fn fuel_refill(cell: *mut FuelCell) {
     // Only the `src` field is borrowed: compiled code writes `left` through the raw cell pointer.
     let mut src = (*cell).src.lock().unwrap_or_else(|e| e.into_inner());
     let left = core::ptr::addr_of_mut!((*cell).left);
@@ -180,7 +180,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_module::{Linkage, Module};
     let backend = |e: cranelift_module::ModuleError| crate::JitError::Backend(e.to_string());
-    let mut module = crate::new_jit_module()?;
+    let mut module = crate::new_jit_module(crate::Imports::NONE)?;
     let mut sig = Signature::new(CallConv::PreserveAll);
     sig.params.push(AbiParam::new(I64)); // the cell
     let id = module
@@ -195,13 +195,7 @@ fn compile_refill_trampoline() -> Result<(crate::OwnedJit, usize), crate::JitErr
     b.switch_to_block(entry);
     b.seal_block(entry);
     let cell = b.block_params(entry)[0];
-    let mut inner = Signature::new(module.isa().default_call_conv());
-    inner.params.push(AbiParam::new(I64));
-    let inner = b.import_signature(inner);
-    let refill = b
-        .ins()
-        .iconst(I64, fuel_refill as *const () as usize as i64);
-    b.ins().call_indirect(inner, refill, &[cell]);
+    crate::call_host(&mut module, &mut b, crate::HostFn::FuelRefill, &[cell])?;
     b.ins().return_(&[]);
     b.finalize();
     crate::define_verified(&mut module, id, &mut ctx)?;

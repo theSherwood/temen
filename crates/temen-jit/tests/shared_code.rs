@@ -309,8 +309,16 @@ fn code_that_uses_setjmp_is_shared_and_each_instance_keeps_its_own_jmp_bufs() {
     if !temen_fiber::supported() {
         return;
     }
-    // `setjmp` at 64, then a `longjmp` back to it with 7: the second return of `setjmp` answers.
-    let jumps = "memory 16
+    each_instance_answers(
+        compile(JUMPS, INERT_CAP_THUNK, core::ptr::null_mut(), 0),
+        200,
+        7,
+    );
+}
+
+/// `setjmp` at 64, then a `longjmp` back to it with 7: the second return of `setjmp` answers.
+#[cfg(unix)]
+const JUMPS: &str = "memory 16
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 64
@@ -331,11 +339,31 @@ block 2 (v7: i32) {
   }
 }
 ";
-    each_instance_answers(
-        compile(jumps, INERT_CAP_THUNK, core::ptr::null_mut(), 0),
-        200,
-        7,
+
+/// A unit's `setjmp` keeps its buffer in its instance's `setjmp` table, which only a module that
+/// uses `setjmp` stands up: one defined into any other module would run over none (temen#2452).
+#[cfg(unix)]
+#[test]
+fn a_unit_uses_setjmp_only_where_its_instance_has_a_setjmp_table() {
+    if !temen_fiber::supported() {
+        return;
+    }
+    let unit = parse_module(
+        "func (i64) -> (i32) {\nblock 0 (v0: i64) {\n  v1 = setjmp v0\n  return v1\n  }\n}\n",
+    )
+    .expect("parse unit");
+    let mut plain = compile(ASKS_ITS_POWERBOX, INERT_CAP_THUNK, core::ptr::null_mut(), 4);
+    assert!(
+        matches!(
+            plain.define_extra(&unit.funcs, &unit.types),
+            Err(JitError::Unsupported(_))
+        ),
+        "a module without a setjmp table took a unit that uses setjmp"
     );
+    let mut jumps = compile(JUMPS, INERT_CAP_THUNK, core::ptr::null_mut(), 4);
+    jumps
+        .define_extra(&unit.funcs, &unit.types)
+        .expect("a module that uses setjmp takes a unit that does");
 }
 
 #[test]

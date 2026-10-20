@@ -25,22 +25,22 @@ use std::os::raw::{c_int, c_void};
 use std::sync::Mutex;
 
 extern "C" {
-    /// libc `_setjmp`/`_longjmp` — the **non**-signal-mask variants (no `sigprocmask` save/restore),
-    /// matching the interpreters' semantics. Real exported symbols in glibc/musl. Their addresses are
-    /// baked into the `SetJmp`/`LongJmp` sites and called by `call.dyn` *inline in the guest
-    /// frame* (so `_setjmp` saves that frame's SP and `_longjmp` returns into it).
+    /// libc `_setjmp`/`_longjmp` — the **non**-signal-mask variants (no `sigprocmask`
+    /// save/restore), matching the interpreters' semantics. Real exported symbols in glibc/musl.
+    /// The `SetJmp`/`LongJmp` sites call them *inline in the guest frame* (so `_setjmp` saves that
+    /// frame's SP and `_longjmp` returns into it).
     fn _setjmp(env: *mut c_void) -> c_int;
     fn _longjmp(env: *mut c_void, val: c_int) -> !;
 }
 
-/// Address of libc `_setjmp`, baked into each `SetJmp` site as the inline call target.
-pub(crate) fn setjmp_addr() -> i64 {
-    _setjmp as *const () as i64
+/// Address of libc `_setjmp`, which each `SetJmp` site calls inline (`HostFn::Setjmp`).
+pub(crate) fn setjmp_addr() -> *const () {
+    _setjmp as *const ()
 }
 
-/// Address of libc `_longjmp`, baked into each `LongJmp` site as the inline call target.
-pub(crate) fn longjmp_addr() -> i64 {
-    _longjmp as *const () as i64
+/// Address of libc `_longjmp`, which each `LongJmp` site calls inline (`HostFn::Longjmp`).
+pub(crate) fn longjmp_addr() -> *const () {
+    _longjmp as *const ()
 }
 
 /// One host-owned libc `jmp_buf`, over-aligned and generously sized (glibc/musl `jmp_buf` ≈ 200 B; the
@@ -58,10 +58,10 @@ impl JmpBufCell {
     }
 }
 
-/// Per-run `setjmp` checkpoint table: guest `jmp_buf` window address → host `jmp_buf` storage. Stood up
-/// only when the module uses `setjmp` (`module_uses_setjmp`), one per run; its stable address is baked
-/// into the run's `SetJmp`/`LongJmp` sites (`SetjmpEnv` in `lib.rs`) and the table is owned by the
-/// `CompiledModule`, so it lives exactly as long as the code can run.
+/// Per-instance `setjmp` checkpoint table: guest `jmp_buf` window address → host `jmp_buf` storage.
+/// Stood up only when the module uses `setjmp` (`module_uses_setjmp`), one per instance; the
+/// instance's `SetJmp`/`LongJmp` sites load its address from the `vmctx` (`VmCtx::setjmp`, temen#2389)
+/// and the table is owned by the `CompiledModule`, so it lives exactly as long as the code can run.
 ///
 /// Shared across the run's OS threads (a `thread.spawn`ed guest may also `setjmp`), so guarded by a
 /// `Mutex`. The lock is held **only** to take/insert the slot pointer — released before the inline

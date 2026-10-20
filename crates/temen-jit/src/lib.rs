@@ -64,8 +64,8 @@ use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
 };
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, Function,
-    InstBuilder, JumpTableData, MemFlags, SigRef, Signature, SourceLoc, StackSlotData,
+    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, FuncRef,
+    Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc, StackSlotData,
     StackSlotKind, Type, UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
@@ -1196,9 +1196,8 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
 }
 
 /// Like [`compile_and_run`], but `call.cap`s dispatch through `cap_thunk` with the
-/// caller's `cap_ctx` (the powerbox host). The thunk + ctx addresses are baked into the
-/// compiled code as constants — valid because the module is compiled, run once, then
-/// discarded here.
+/// caller's `cap_ctx` (the powerbox host). The compiled code calls the thunk, and its instance
+/// holds the ctx — valid because the module is compiled, run once, then discarded here.
 ///
 /// # Safety
 /// `cap_thunk`/`cap_ctx` must stay valid for the call and honour the [`CapThunk`] contract.
@@ -2080,8 +2079,8 @@ struct RunOpts<'a> {
     /// #2113 — the run's own budget node: what its vCPUs, fibers and processes are charged to
     /// (`None`: charged to nothing, a host-less run's).
     node: Option<std::sync::Arc<dyn BudgetNode>>,
-    /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) baked into
-    /// safepoints; `None` ⇒ no signal check emitted.
+    /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) the
+    /// safepoints poll; `None` ⇒ no signal check emitted.
     signal: Option<SignalArm>,
 }
 
@@ -2206,7 +2205,7 @@ impl Drop for OwnedJit {
 /// A compiled module whose executable code **outlives a single run** (DESIGN.md §22: the
 /// long-lived `JITModule` split). Owns the [`JITModule`] (the executable memory lives until
 /// drop), the power-of-two-padded function table, the entry's buffer-ABI trampoline, and the
-/// §12/§14 runtimes whose addresses are baked into the code. Produced by
+/// §12/§14 runtimes its instance's code runs on. Produced by
 /// [`CompiledModule::compile`]; [`CompiledModule::run`] executes the entry over a fresh guest
 /// window (allocated per run — the window base is threaded as a runtime argument, not baked).
 ///
@@ -2618,11 +2617,19 @@ pub struct CompiledModule {
     // --- function compiles against the *same* constants as the parent (same confinement
     // --- mask, same cap thunk, same table mask — DESIGN.md §22 "vmctx sharing").
     distinct: Vec<FuncType>,
-    cap: CapEnv,
-    fiber: FiberEnv,
-    thread: ThreadEnv,
-    inst: InstEnv,
-    setjmp: SetjmpEnv,
+    /// §9/D45 — the resolver the code's fast-path `call.cap`s were claimed by.
+    fast_resolver: Option<FastCapResolver>,
+    /// The instance has a §12 fiber runtime its code's `cont.*` sites call into.
+    fibers: bool,
+    /// The instance has a §12 thread domain its code's futex and `thread.*` sites run on.
+    threads: bool,
+    /// The code's `thread.spawn`/`join` sites have a domain to spawn in: always with
+    /// [`Self::threads`] on a root; on a §14 child only when it uses them, which then stands up a
+    /// domain of its own (`child_exec`).
+    spawns: bool,
+    /// The code lowers its `Instantiator` `call.cap`s to the §14 nesting runtime, through the
+    /// instance's nursery.
+    nesting: bool,
     mask: u64,
     /// Whether this module's code polls a kill-path cell / charges a fuel cell (see [`Lower::epoch`]
     /// / [`Lower::fuel`]) — the code's shape, which `define_extra` compiles new units to match.
@@ -3020,15 +3027,15 @@ impl CompiledModule {
 
     /// Compile the whole module (the compile half of the old one-shot `compile_and_run*`):
     /// declare + define every function, the entry's buffer-ABI trampoline, finalize once, and
-    /// build the function table. Everything *baked into code* — the confinement mask, the
-    /// `call.cap` thunk/ctx, the runtime addresses, the table mask, the §5 interrupt cell — is
-    /// fixed here; per-run state (the window, the trap cell) is supplied by [`Self::run`].
+    /// build the function table. What the code is compiled for — the confinement mask, the table
+    /// mask, the checks it emits — and its instance's `call.cap` ctx, runtimes and §5 interrupt
+    /// cell are fixed here; per-run state (the window, the trap cell) is supplied by [`Self::run`].
     ///
     /// # Safety-relevant contract (not `unsafe`, but load-bearing)
-    /// `cap_thunk`/`cap_ctx`/`fast_resolver`/`interrupt` addresses are baked into the compiled
-    /// code: they must stay valid for the **lifetime of this `CompiledModule`** (not just one
-    /// run) and honour their respective ABIs — the same contract the one-shot entry points
-    /// documented per call, stretched over the module's life.
+    /// The compiled code calls `cap_thunk` and the targets `fast_resolver` claims, and its instance
+    /// holds `cap_ctx` and `interrupt`: they must stay valid for the **lifetime of this
+    /// `CompiledModule`** (not just one run) and honour their respective ABIs — the same contract
+    /// the one-shot entry points documented per call, stretched over the module's life.
     #[allow(clippy::too_many_arguments)]
     pub fn compile(
         m: &IrModule,
@@ -3104,16 +3111,13 @@ impl CompiledModule {
         // fuel checks emitted — guest code byte-identical). The caller owns the `u64` cell (it must
         // outlive the runs that charge it) and reads the remaining budget back after the run.
         let fuel_addr = fuel.map_or(0, |p| p as i64);
-        // #932 — the async-signal delivery arm `emit_signal_check` polls at safepoints. `null` (no
-        // checks emitted) unless the caller supplied a `SignalArm`. The two thunks are process globals
-        // baked into the code; the `Host::sig_armed` flag + the delivery ctx are the instance's, read
-        // from its `VmCtx`, so the caller keeps them valid for the runs of this instance (the one-shot
-        // signal entry holds the delivery ctx for the whole run).
-        let sig = signal.as_ref().map_or(SigEnv::null(), |s| SigEnv {
-            armed: true,
-            take_thunk: s.take as usize as i64,
-            return_thunk: s.ret as usize as i64,
-        });
+        // #932 — the async-signal delivery arm `emit_signal_check` polls at safepoints: none (no
+        // checks emitted) unless the caller supplied a `SignalArm`. The code calls its two thunks
+        // ([`HostFn::SigTake`], [`HostFn::SigReturn`]); the `Host::sig_armed` flag + the delivery
+        // ctx are the instance's, read from its `VmCtx`, so the caller keeps them valid for the
+        // runs of this instance (the one-shot signal entry holds the delivery ctx for the whole
+        // run).
+        let signals = signal.is_some();
         // The thread domain and the nursery, if any, are stood up below.
         #[cfg_attr(not(fiber_rt), allow(unused_mut))]
         let mut instance = InstanceAddrs {
@@ -3152,7 +3156,11 @@ impl CompiledModule {
             None => (0, 0, 0),
         };
 
-        let mut module = new_jit_module()?;
+        let mut module = new_jit_module(Imports {
+            cap_thunk: cap_thunk as *const u8,
+            sig: signal.as_ref().map(|s| (s.take, s.ret)),
+            fast_resolver,
+        })?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them.
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
@@ -3181,13 +3189,6 @@ impl CompiledModule {
             intern_type(&mut distinct, &fiber_func_type())?;
         }
         let distinct = distinct;
-
-        // The host thunk address, baked into `call.cap` sites as a constant (its ctx is the
-        // instance's, read from the `VmCtx`).
-        let cap = CapEnv {
-            thunk_addr: cap_thunk as usize as i64,
-            fast_resolver,
-        };
 
         // §12 fibers: if the module uses `cont.*`, stand up a host fiber runtime (an entry publishes it
         // in a thread-local the `cont.*` thunks read). The `FiberRuntime` box is created now; the
@@ -3248,23 +3249,12 @@ impl CompiledModule {
         } else {
             None
         };
-        // The `cont.*` thunk addresses (the runtime itself is found via a thread-local at call time).
+        // The code's `cont.*` sites call the fiber thunks, which find the runtime via a
+        // thread-local.
         #[cfg(fiber_rt)]
-        let fiber = if uses_fibers {
-            FiberEnv {
-                new_thunk: fiber_rt::fiber_new as *const () as i64,
-                resume_thunk: fiber_rt::fiber_resume as *const () as i64,
-                block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
-                suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
-                // The register-flush trampoline (not `gc_roots` directly): it spills the callee-saved
-                // registers before the scan so a guest root parked in one is captured (see its docs).
-                roots_thunk: fiber_rt::temen_gc_roots_flush as *const () as i64,
-            }
-        } else {
-            FiberEnv::null()
-        };
+        let fibers = uses_fibers;
         #[cfg(not(fiber_rt))]
-        let fiber = FiberEnv::null();
+        let fibers = false;
 
         // §12 threads: stand up the 1:1 OS-thread executor `Domain` the `thread.*` sites load from the
         // instance's vmctx. It owns no scheduling policy — `thread.spawn` launches a real OS thread (the
@@ -3286,19 +3276,13 @@ impl CompiledModule {
                 None
             };
         #[cfg(fiber_rt)]
-        let thread = if let Some(d) = &domain {
+        if let Some(d) = &domain {
             instance.sched = &**d as *const os_thread_rt::Domain as *const core::ffi::c_void;
-            ThreadEnv {
-                spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
-                join_thunk: os_thread_rt::thread_join as *const () as i64,
-                wait_thunk: os_thread_rt::thread_wait as *const () as i64,
-                notify_thunk: os_thread_rt::thread_notify as *const () as i64,
-            }
-        } else {
-            ThreadEnv::null()
-        };
+        }
+        #[cfg(fiber_rt)]
+        let threads = domain.is_some();
         #[cfg(not(fiber_rt))]
-        let thread = ThreadEnv::null();
+        let threads = false;
 
         // §14 nesting: if the module holds an `Instantiator` (a `call.cap` to iface 6), stand up the
         // per-run `Nursery` those sites spawn through, which they load from the instance's vmctx.
@@ -3324,9 +3308,9 @@ impl CompiledModule {
             instance.nursery = &**n as *const instantiator_rt::Nursery as *const core::ffi::c_void;
         }
         #[cfg(fiber_rt)]
-        let inst = InstEnv::nesting(nursery.is_some());
+        let nesting = nursery.is_some();
         #[cfg(not(fiber_rt))]
-        let inst = InstEnv::null();
+        let nesting = false;
 
         // `setjmp`/`longjmp` (LLVM.md §"JIT `longjmp`", Option B): when the module uses them, stand up
         // the per-run host `jmp_buf` table the `SetJmp`/`LongJmp` sites load from the instance's vmctx.
@@ -3352,21 +3336,11 @@ impl CompiledModule {
         } else {
             None
         };
+        // temen#2389: the sites load the table from the instance's vmctx, as they load the domain.
         #[cfg(setjmp_rt)]
-        let setjmp = if let Some(r) = &setjmp_runtime {
-            // temen#2389: the sites load the table from the instance's vmctx, as they load the domain.
+        if let Some(r) = &setjmp_runtime {
             instance.setjmp = &**r as *const setjmp_rt::SetjmpRuntime as *const core::ffi::c_void;
-            SetjmpEnv {
-                slot_thunk: setjmp_rt::rt_setjmp_slot as *const () as i64,
-                lookup_thunk: setjmp_rt::rt_setjmp_lookup as *const () as i64,
-                setjmp_addr: setjmp_rt::setjmp_addr(),
-                longjmp_addr: setjmp_rt::longjmp_addr(),
-            }
-        } else {
-            SetjmpEnv::null()
-        };
-        #[cfg(not(setjmp_rt))]
-        let setjmp = SetjmpEnv::null();
+        }
 
         // W5 JIT/DWARF tier (Stages 0–1): when the module carries `-g` debug info, build the
         // `(func,block,inst) → debug_info.locs` index lookup that stamps each op with a `SourceLoc`,
@@ -3437,12 +3411,9 @@ impl CompiledModule {
                     &m.funcs,
                     &distinct,
                     &m.types,
-                    cap,
-                    fiber,
-                    thread,
-                    inst,
-                    setjmp,
-                    sig, // #932 async signal delivery arm (null unless a `SignalArm` was supplied)
+                    fast_resolver,
+                    nesting,
+                    signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
                     &mut ctx.func,
                     &m.funcs[fi],
                     mask,
@@ -3450,7 +3421,7 @@ impl CompiledModule {
                     guard_offset_of(win_reserved as u64),
                     epoch_addr != 0,
                     fuel_addr != 0,
-                    !thread.is_null(), // spawned vCPUs run this code beside the root
+                    threads,                // spawned vCPUs run this code beside the root
                     (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
                     None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
                     fi as u32,
@@ -3524,7 +3495,7 @@ impl CompiledModule {
         let mut ctx = module.make_context();
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false);
+        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false)?;
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -3547,7 +3518,7 @@ impl CompiledModule {
                             ids[f as usize],
                             &m.funcs[f as usize],
                             false,
-                        );
+                        )?;
                         let id = module
                             .declare_function(
                                 &format!("serve_tramp_{f}"),
@@ -3717,11 +3688,11 @@ impl CompiledModule {
             n_results: entry.results.len(),
             n_real_funcs: m.funcs.len(),
             distinct,
-            cap,
-            fiber,
-            thread,
-            inst,
-            setjmp,
+            fast_resolver,
+            fibers,
+            threads,
+            spawns: threads,
+            nesting,
             mask,
             epoch: epoch_addr != 0,
             fuel: fuel_addr != 0,
@@ -4024,11 +3995,11 @@ impl CompiledModule {
             n_results: self.n_results,
             n_real_funcs: self.n_real_funcs,
             distinct: self.distinct.clone(),
-            cap: self.cap,
-            fiber: self.fiber,
-            thread: self.thread,
-            inst: InstEnv::null(),
-            setjmp: self.setjmp,
+            fast_resolver: self.fast_resolver,
+            fibers: self.fibers,
+            threads: self.threads,
+            spawns: self.spawns,
+            nesting: false,
             mask: self.mask,
             epoch: self.epoch,
             fuel: self.fuel,
@@ -4999,21 +4970,27 @@ impl CompiledModule {
             ensure_supported(f, types)?;
             // Threads/futex ARE hosted (CONSOLIDATION.md §11) — but only when the domain stood up a
             // thread scheduler (`enable_thread_hosting`, driven by a thread-hosting `Jit` grant, or a
-            // parent that itself uses threads). Without it the thunk addresses are null, so a
-            // thread/futex-using unit fails closed rather than `call.dyn` through null — exactly
-            // the fiber gate below.
-            if (f.uses_threads() || f.uses_futex()) && self.thread.is_null() {
+            // parent that itself uses threads). Without it the instance has no domain for the
+            // unit's sites to run on, so a thread/futex-using unit fails closed — exactly the fiber
+            // gate below.
+            if (f.uses_threads() || f.uses_futex()) && !self.threads {
                 return Err(JitError::Unsupported(
                     "a submitted unit using threads/futex requires a thread-hosting Jit domain",
                 ));
             }
             // Fibers ARE hosted — but only when the domain stood up a fiber runtime
-            // (`enable_fiber_hosting`, driven by a fiber-hosting `Jit` grant). Without it the
-            // `cont.*` thunk addresses are null, so a fiber-using unit must fail closed rather than
-            // lower a `call.dyn` through null.
-            if f.uses_fibers() && self.fiber.is_null() {
+            // (`enable_fiber_hosting`, driven by a fiber-hosting `Jit` grant). Without it there is
+            // no runtime for the unit's `cont.*` sites, so a fiber-using unit must fail closed.
+            if f.uses_fibers() && !self.fibers {
                 return Err(JitError::Unsupported(
                     "a submitted unit using fibers requires a fiber-hosting Jit domain",
+                ));
+            }
+            // `setjmp`/`longjmp` keep their buffers in the instance's `setjmp` table, which only a
+            // module that uses them stands up: without it the unit's sites would run over none.
+            if f.uses_setjmp() && self.instance.setjmp.is_null() {
+                return Err(JitError::Unsupported(
+                    "a submitted unit using setjmp/longjmp requires a module that uses them",
                 ));
             }
         }
@@ -5068,7 +5045,7 @@ impl CompiledModule {
             None
         };
 
-        let inst = self.inst;
+        let nesting = self.nesting;
         // Byte-accurate occupancy: each function's emitted code size.
         let mut extra_bytes = 0;
         define_funcs(
@@ -5081,12 +5058,9 @@ impl CompiledModule {
                     funcs,
                     &self.distinct,
                     types,
-                    self.cap,
-                    self.fiber,
-                    self.thread,
-                    inst,
-                    self.setjmp,
-                    SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
+                    self.fast_resolver,
+                    nesting,
+                    false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
                     &mut ctx.func,
                     &funcs[fi],
                     self.mask,
@@ -5094,7 +5068,7 @@ impl CompiledModule {
                     guard_offset_of(self.win_reserved as u64),
                     self.epoch,
                     self.fuel, // charges the running instance's fuel cell, as the parent's functions do
-                    !self.thread.is_null(), // as the parent module's functions
+                    self.threads, // as the parent module's functions
                     self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
                     ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
                     0,
@@ -5111,7 +5085,7 @@ impl CompiledModule {
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&mut *module, &mut ctx.func, *id, f, false);
+                build_trampoline(&mut *module, &mut ctx.func, *id, f, false)?;
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
                 let t = module
@@ -5182,10 +5156,10 @@ impl CompiledModule {
     /// Stand up the §12 **fiber runtime** on an already-compiled module so guest-submitted units
     /// (`define_extra` / `invoke_extra`) may host `cont.*` (DESIGN.md §22 "Concurrency",
     /// renegotiated 2026-07-30). A `Jit`-granting parent typically does not itself use fibers, so
-    /// its `compile` left `self.fiber` null — and a fiber-using submitted unit then lowers `cont.*`
-    /// through null thunks (`define_extra` rejects it via [`FiberEnv::is_null`]). This installs the
+    /// its `compile` stood up no fiber runtime — and `define_extra` rejects a fiber-using
+    /// submitted unit (its `cont.*` sites would have none to call into). This installs the
     /// **same** runtime `compile` builds when the top-level module uses fibers — the domain-shared
-    /// table, the root vCPU's [`fiber_rt::FiberRuntime`], the `cont.*` thunk env, and the call
+    /// table, the root vCPU's [`fiber_rt::FiberRuntime`], and the call
     /// trampoline — reusing the incremental define+finalize path (`define_extra`'s, W^X-safe: only
     /// the fresh trampoline page is mprotected; running code is untouched).
     ///
@@ -5199,7 +5173,7 @@ impl CompiledModule {
     /// `cont.*`/`gc.roots`), reusing an existing table/trampoline a thread-only parent already built.
     #[cfg(fiber_rt)]
     pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
-        if !self.fiber.is_null() {
+        if self.fibers {
             return Ok(()); // already hosting fibers (parent used cont.*/gc.roots at compile time)
         }
         // Append the fiber-entry signature to the per-domain type registry (idempotent; an id never
@@ -5257,18 +5231,12 @@ impl CompiledModule {
         self.hosted = true;
         self.call_tramp = Some(tramp);
         self.fiber_cfg = Some((fiber_type_id, fiber_mask));
-        self.fiber = FiberEnv {
-            new_thunk: fiber_rt::fiber_new as *const () as i64,
-            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
-            block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
-            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
-            roots_thunk: fiber_rt::temen_gc_roots_flush as *const () as i64,
-        };
+        self.fibers = true;
         Ok(())
     }
 
     /// Fiber hosting on a target without stack-switch support: a no-op — fibers stay unsupported, so
-    /// a fiber-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
+    /// a fiber-using submitted unit remains rejected by `define_extra`'s fiber gate.
     #[cfg(not(fiber_rt))]
     pub fn enable_fiber_hosting(&mut self) -> Result<(), JitError> {
         Ok(())
@@ -5278,8 +5246,8 @@ impl CompiledModule {
     /// (`define_extra` / `install`) may host `thread.spawn`/`thread.join` and the `memory.wait`/
     /// `notify` futex (CONSOLIDATION.md §11 — installed units join the caller's concurrency model).
     /// The twin of [`Self::enable_fiber_hosting`]: a `Jit`-granting parent that itself uses no threads
-    /// left `self.thread` null at `compile`, so a thread-using submitted unit would lower `thread.*`
-    /// through null thunks (`define_extra` rejects it via [`ThreadEnv::is_null`]). This installs the
+    /// stood up no thread domain at `compile`, so `define_extra` rejects a thread-using submitted
+    /// unit (its `thread.*` sites would have none to run on). This installs the
     /// **same** runtime `compile` builds for a threaded module: the 1:1 OS-thread executor `Domain`
     /// (which the unit's `thread.*` sites load from the vmctx), the domain-shared fiber table the
     /// spawned vCPUs allocate their durable contexts over (D57 3b-ii — created even for a fiber-free
@@ -5299,7 +5267,7 @@ impl CompiledModule {
     /// also hosted, so the two `enable_*` calls compose in either order.
     #[cfg(fiber_rt)]
     pub fn enable_thread_hosting(&mut self) -> Result<(), JitError> {
-        if !self.thread.is_null() {
+        if self.threads {
             return Ok(()); // already hosting threads (parent used thread.*, or a nesting Domain exists)
         }
         // The domain-shared fiber table (D57 3b-ii): every spawned vCPU builds its `FiberRuntime` /
@@ -5344,12 +5312,8 @@ impl CompiledModule {
         // run entry's `set_env`; the address is stable now, which is all the context needs.
         let domain = Box::new(os_thread_rt::Domain::new(self.node.clone()));
         self.instance.sched = &*domain as *const os_thread_rt::Domain as *const core::ffi::c_void;
-        self.thread = ThreadEnv {
-            spawn_thunk: os_thread_rt::thread_spawn as *const () as i64,
-            join_thunk: os_thread_rt::thread_join as *const () as i64,
-            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
-            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
-        };
+        self.threads = true;
+        self.spawns = true;
         self.domain = Some(domain);
         self.hosted = true;
         self.call_tramp = Some(tramp);
@@ -5359,7 +5323,7 @@ impl CompiledModule {
     }
 
     /// Thread hosting on a target without the fiber/thread runtime: a no-op — threads stay unsupported,
-    /// so a thread-using submitted unit remains rejected by `define_extra`'s null-thunk gate.
+    /// so a thread-using submitted unit remains rejected by `define_extra`'s thread gate.
     #[cfg(not(fiber_rt))]
     pub fn enable_thread_hosting(&mut self) -> Result<(), JitError> {
         Ok(())
@@ -5631,6 +5595,350 @@ const _: fn() = || {
     assert_send_sync::<CompiledModule>();
 };
 
+/// A host function compiled code calls. The code names it by a symbol, through a relocation, never
+/// by its address: [`new_jit_module`] binds each symbol to the function's address in this process
+/// when the code is linked, so the same code links into a process whose functions sit elsewhere
+/// (#2452). A call costs what a call to a baked address cost: Cranelift lowers a call to an
+/// imported symbol to the same `movabs` and indirect `call` on x86-64, a literal load and `blr` on
+/// AArch64. The symbols are not C identifiers, so no lookup in the process's own symbol table can
+/// bind one: only [`new_jit_module`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostFn {
+    /// The `call.cap` thunk ([`CapThunk`]): the embedder's, or a §14 child's coroutine thunk.
+    CapThunk,
+    /// #932 — the delivery-decision thunk of the compile's [`SignalArm`].
+    SigTake,
+    /// #932 — the handler-return thunk of the compile's [`SignalArm`].
+    SigReturn,
+    FiberNew,
+    FiberResume,
+    /// I48 — `cont.resume.block`'s thunk.
+    FiberResumeBlock,
+    FiberSuspend,
+    /// The `gc.roots` register-flush trampoline.
+    GcRoots,
+    ThreadSpawn,
+    ThreadJoin,
+    ThreadWait,
+    ThreadNotify,
+    InstJoin,
+    InstPoll,
+    InstDetach,
+    InstKill,
+    /// §3c — the config-record spawn (op 17).
+    InstSpawn,
+    ChildOffer,
+    ChildGrant,
+    SetjmpSlot,
+    SetjmpLookup,
+    /// libc `_setjmp`, called inline in the guest frame (LLVM.md §"JIT `longjmp`").
+    Setjmp,
+    /// libc `_longjmp`, called inline in the guest frame.
+    Longjmp,
+    VcpuTlsGet,
+    VcpuTlsSet,
+    DurableShadowBase,
+    /// The calling thread's stack limit, which a root's entry trampoline takes (#1983).
+    StackLimit,
+    /// §5 W3 — the explicit-trap backtrace capture (`temen_capture_explicit_trap`).
+    TrapCapture,
+    /// The counted-fuel refill, which `fuel`'s trampoline calls.
+    FuelRefill,
+}
+
+impl HostFn {
+    /// Every host function, for [`new_jit_module`] to bind.
+    const ALL: [HostFn; 29] = [
+        HostFn::CapThunk,
+        HostFn::SigTake,
+        HostFn::SigReturn,
+        HostFn::FiberNew,
+        HostFn::FiberResume,
+        HostFn::FiberResumeBlock,
+        HostFn::FiberSuspend,
+        HostFn::GcRoots,
+        HostFn::ThreadSpawn,
+        HostFn::ThreadJoin,
+        HostFn::ThreadWait,
+        HostFn::ThreadNotify,
+        HostFn::InstJoin,
+        HostFn::InstPoll,
+        HostFn::InstDetach,
+        HostFn::InstKill,
+        HostFn::InstSpawn,
+        HostFn::ChildOffer,
+        HostFn::ChildGrant,
+        HostFn::SetjmpSlot,
+        HostFn::SetjmpLookup,
+        HostFn::Setjmp,
+        HostFn::Longjmp,
+        HostFn::VcpuTlsGet,
+        HostFn::VcpuTlsSet,
+        HostFn::DurableShadowBase,
+        HostFn::StackLimit,
+        HostFn::TrapCapture,
+        HostFn::FuelRefill,
+    ];
+
+    /// The symbol compiled code calls it by.
+    fn symbol(self) -> &'static str {
+        match self {
+            HostFn::CapThunk => "temen.cap_thunk",
+            HostFn::SigTake => "temen.sig_take",
+            HostFn::SigReturn => "temen.sig_return",
+            HostFn::FiberNew => "temen.fiber_new",
+            HostFn::FiberResume => "temen.fiber_resume",
+            HostFn::FiberResumeBlock => "temen.fiber_resume_block",
+            HostFn::FiberSuspend => "temen.fiber_suspend",
+            HostFn::GcRoots => "temen.gc_roots",
+            HostFn::ThreadSpawn => "temen.thread_spawn",
+            HostFn::ThreadJoin => "temen.thread_join",
+            HostFn::ThreadWait => "temen.thread_wait",
+            HostFn::ThreadNotify => "temen.thread_notify",
+            HostFn::InstJoin => "temen.inst_join",
+            HostFn::InstPoll => "temen.inst_poll",
+            HostFn::InstDetach => "temen.inst_detach",
+            HostFn::InstKill => "temen.inst_kill",
+            HostFn::InstSpawn => "temen.inst_spawn",
+            HostFn::ChildOffer => "temen.child_offer",
+            HostFn::ChildGrant => "temen.child_grant",
+            HostFn::SetjmpSlot => "temen.setjmp_slot",
+            HostFn::SetjmpLookup => "temen.setjmp_lookup",
+            HostFn::Setjmp => "temen.setjmp",
+            HostFn::Longjmp => "temen.longjmp",
+            HostFn::VcpuTlsGet => "temen.vcpu_tls_get",
+            HostFn::VcpuTlsSet => "temen.vcpu_tls_set",
+            HostFn::DurableShadowBase => "temen.durable_shadow_base",
+            HostFn::StackLimit => "temen.stack_limit",
+            HostFn::TrapCapture => "temen.trap_capture",
+            HostFn::FuelRefill => "temen.fuel_refill",
+        }
+    }
+
+    /// Its C signature, in the target's calling convention `cc`.
+    fn signature(self, cc: cranelift_codegen::isa::CallConv) -> Signature {
+        use HostFn::*;
+        let (params, returns): (&[Type], &[Type]) = match self {
+            // (ctx, mem_base, mem_size, mem_reserved, type_id, op, handle, args, n_args, results,
+            // n_results, trap_out)
+            CapThunk => (
+                &[I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64],
+                &[],
+            ),
+            // (ctx, out) -> 1 when a signal is deliverable, 0 when not
+            SigTake => (&[I64, I64], &[I32]),
+            // (ctx)
+            SigReturn => (&[I64], &[]),
+            // (mem_base, fn_table, trap_out, funcref, sp, fuel) -> handle (16-bit slot, 48-bit
+            // generation)
+            FiberNew => (&[I64, I64, I64, I32, I64, I64], &[I64]),
+            // (handle, arg, status_out, trap_out) -> value
+            FiberResume => (&[I64, I64, I64, I64], &[I64]),
+            // (domain, handle, arg, status_out, trap_out) -> value
+            FiberResumeBlock => (&[I64, I64, I64, I64, I64], &[I64]),
+            // (value, trap_out) -> value
+            FiberSuspend => (&[I64, I64], &[I64]),
+            // (args) -> the candidates found
+            GcRoots => (&[I64], &[I64]),
+            // (domain, mem_base, fn_table, trap_out, func, sp, arg) -> handle
+            ThreadSpawn => (&[I64, I64, I64, I64, I32, I64, I64], &[I32]),
+            // (domain, handle, trap_out) -> result
+            ThreadJoin => (&[I64, I32, I64], &[I64]),
+            // (domain, addr, expected, width, timeout, trap_out) -> how the wait ended
+            ThreadWait => (&[I64, I64, I64, I32, I64, I64], &[I32]),
+            // (domain, addr, count) -> the waiters woken
+            ThreadNotify => (&[I64, I64, I32], &[I32]),
+            // (nursery, mem_base, instantiator, child, status_out, trap_out) -> value
+            InstJoin => (&[I64, I64, I32, I32, I64, I64], &[I64]),
+            // (nursery, mem_base, instantiator, child, trap_out) -> status
+            InstPoll | InstDetach | InstKill => (&[I64, I64, I32, I32, I64], &[I32]),
+            // (nursery, mem_base, mem_size, instantiator, record, trap_out) -> child
+            InstSpawn => (&[I64, I64, I64, I32, I64, I64], &[I32]),
+            // (nursery, mem_base, instantiator, child, arg, trap_out) -> handle or -errno
+            ChildOffer | ChildGrant => (&[I64, I64, I32, I32, I64, I64], &[I32]),
+            // (table, buf) -> jmp_buf
+            SetjmpSlot => (&[I64, I64], &[I64]),
+            // (table, buf, trap_out) -> jmp_buf
+            SetjmpLookup => (&[I64, I64, I64], &[I64]),
+            // (jmp_buf) -> 0, or the value a `longjmp` to it passes
+            Setjmp => (&[I64], &[I32]),
+            // (jmp_buf, value)
+            Longjmp => (&[I64, I32], &[]),
+            VcpuTlsGet | DurableShadowBase | StackLimit => (&[], &[I64]),
+            // (value)
+            VcpuTlsSet => (&[I64], &[]),
+            // (the trapping frame pointer)
+            TrapCapture => (&[I64], &[]),
+            // (the fuel cell)
+            FuelRefill => (&[I64], &[]),
+        };
+        c_signature(cc, params, returns)
+    }
+
+    /// The function's address in this process: the compile's own from `imports`. `None` for one
+    /// the compile has none of, or this target lacks: no code it emits calls those.
+    fn addr(self, imports: &Imports) -> Option<*const u8> {
+        let f: *const () = match self {
+            HostFn::CapThunk => return Some(imports.cap_thunk).filter(|p| !p.is_null()),
+            HostFn::SigTake => return imports.sig.map(|(take, _)| take as *const u8),
+            HostFn::SigReturn => return imports.sig.map(|(_, ret)| ret as *const u8),
+            #[cfg(fiber_rt)]
+            HostFn::FiberNew => fiber_rt::fiber_new as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::FiberResume => fiber_rt::fiber_resume as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::FiberResumeBlock => os_thread_rt::fiber_resume_block as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::FiberSuspend => fiber_rt::fiber_suspend as *const (),
+            // The register-flush trampoline, not `gc_roots` itself: it spills the callee-saved
+            // registers before the scan, so a guest root parked in one is captured.
+            #[cfg(fiber_rt)]
+            HostFn::GcRoots => fiber_rt::temen_gc_roots_flush as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ThreadSpawn => os_thread_rt::thread_spawn as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ThreadJoin => os_thread_rt::thread_join as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ThreadWait => os_thread_rt::thread_wait as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ThreadNotify => os_thread_rt::thread_notify as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::InstJoin => instantiator_rt::join as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::InstPoll => instantiator_rt::poll as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::InstDetach => instantiator_rt::detach as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::InstKill => instantiator_rt::kill as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::InstSpawn => instantiator_rt::instantiate_rec as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ChildOffer => instantiator_rt::child_offer as *const (),
+            #[cfg(fiber_rt)]
+            HostFn::ChildGrant => instantiator_rt::child_grant as *const (),
+            #[cfg(setjmp_rt)]
+            HostFn::SetjmpSlot => setjmp_rt::rt_setjmp_slot as *const (),
+            #[cfg(setjmp_rt)]
+            HostFn::SetjmpLookup => setjmp_rt::rt_setjmp_lookup as *const (),
+            #[cfg(setjmp_rt)]
+            HostFn::Setjmp => setjmp_rt::setjmp_addr(),
+            #[cfg(setjmp_rt)]
+            HostFn::Longjmp => setjmp_rt::longjmp_addr(),
+            HostFn::VcpuTlsGet => vcpu_tls::get as *const (),
+            HostFn::VcpuTlsSet => vcpu_tls::set as *const (),
+            HostFn::DurableShadowBase => durable_shadow::get as *const (),
+            HostFn::StackLimit => stack_check::thread_limit as *const (),
+            HostFn::TrapCapture => trap_capture_addr()?,
+            HostFn::FuelRefill => fuel::fuel_refill as *const (),
+            #[allow(unreachable_patterns)]
+            _ => return None,
+        };
+        Some(f as *const u8)
+    }
+}
+
+/// The embedder's functions a compile's code calls: what [`new_jit_module`] binds their
+/// [`HostFn`] symbols to, beside temen-jit's own functions. Each compile supplies its own.
+#[derive(Clone, Copy)]
+struct Imports {
+    /// The `call.cap` thunk ([`HostFn::CapThunk`]); null for code that makes no `call.cap`.
+    cap_thunk: *const u8,
+    /// #932 — the signal-delivery thunks, when the compile arms delivery.
+    sig: Option<(SigTakeThunk, SigReturnThunk)>,
+    /// §9/D45 — the resolver that binds a fast-path `call.cap`'s target ([`fast_cap_symbol`]).
+    fast_resolver: Option<FastCapResolver>,
+}
+
+impl Imports {
+    /// None: code that calls temen-jit's own functions alone.
+    const NONE: Imports = Imports {
+        cap_thunk: core::ptr::null(),
+        sig: None,
+        fast_resolver: None,
+    };
+}
+
+/// A C signature in the calling convention `cc`.
+fn c_signature(
+    cc: cranelift_codegen::isa::CallConv,
+    params: &[Type],
+    returns: &[Type],
+) -> Signature {
+    let mut sig = Signature::new(cc);
+    sig.params.extend(params.iter().map(|&t| AbiParam::new(t)));
+    sig.returns
+        .extend(returns.iter().map(|&t| AbiParam::new(t)));
+    sig
+}
+
+/// Call the host function `f`: a call to the symbol the code names it by.
+fn call_host(
+    module: &mut JITModule,
+    b: &mut FunctionBuilder,
+    f: HostFn,
+    args: &[Value],
+) -> Result<cranelift_codegen::ir::Inst, JitError> {
+    let callee = import_host(module, b.func, f)?;
+    Ok(b.ins().call(callee, args))
+}
+
+/// Import the host function `f` into `func`.
+fn import_host(
+    module: &mut JITModule,
+    func: &mut Function,
+    f: HostFn,
+) -> Result<FuncRef, JitError> {
+    let sig = f.signature(module.isa().default_call_conv());
+    import_symbol(module, func, f.symbol(), &sig)
+}
+
+/// Import the host symbol `name`, whose C signature is `sig`, into `func`.
+fn import_symbol(
+    module: &mut JITModule,
+    func: &mut Function,
+    name: &str,
+    sig: &Signature,
+) -> Result<FuncRef, JitError> {
+    let id = module
+        .declare_function(name, Linkage::Import, sig)
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    Ok(module.declare_func_in_func(id, func))
+}
+
+/// The symbol a §9/D45 fast-path `call.cap` calls its target by: the `(type_id, op, n_args,
+/// n_res)` the compile's resolver claimed, which [`fast_cap_addr`] asks it again at link time.
+fn fast_cap_symbol(type_id: u32, op: u32, n_args: usize, n_res: usize) -> String {
+    format!("temen.fast_cap.{type_id}.{op}.{n_args}.{n_res}")
+}
+
+/// A fast-path target's C signature: `(ctx, mem_base, mem_size, handle, trap_out, args…) ->
+/// [result]`, each arg and the result in its `i64` register slot.
+fn fast_cap_signature(
+    cc: cranelift_codegen::isa::CallConv,
+    n_args: usize,
+    n_res: usize,
+) -> Signature {
+    let mut params = vec![I64, I64, I64, I32, I64];
+    params.resize(5 + n_args, I64);
+    c_signature(cc, &params, &[I64][..n_res])
+}
+
+/// The target `resolver` binds a [`fast_cap_symbol`] to; `None` for any other symbol.
+fn fast_cap_addr(resolver: FastCapResolver, name: &str) -> Option<*const u8> {
+    let key: Vec<u32> = name
+        .strip_prefix("temen.fast_cap.")?
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    let [type_id, op, n_args, n_res] = key[..] else {
+        return None;
+    };
+    // SAFETY: `resolver` honours the `FastCapResolver` contract, which the compile's caller
+    // guaranteed: a pure lookup, which the compile already made for this key (`fast_cap_target`).
+    let target = unsafe { resolver(type_id, op, n_args, n_res) };
+    (!target.is_null()).then_some(target as *const u8)
+}
+
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
 /// (top-level [`CompiledModule::compile`] and nested [`compile_child_windowed`]) — one audited copy,
 /// so the soundness-critical flags cannot drift between them. Most load-bearing is
@@ -5639,8 +5947,19 @@ const _: fn() = || {
 /// the entry-block check — a probestack that page-walked the frame downward would touch below the
 /// fiber's low bound *before* the check (silent neighbour-slot corruption under the arena, which has
 /// no guard page). Pinning it here locks that assumption against a future Cranelift default flip.
-fn new_jit_module() -> Result<JITModule, JitError> {
+///
+/// It binds every symbol the code calls the host by ([`HostFn`]): temen-jit's functions, and the
+/// compile's `imports`.
+fn new_jit_module(imports: Imports) -> Result<JITModule, JitError> {
     let mut builder = JITBuilder::with_isa(jit_isa()?, cranelift_module::default_libcall_names());
+    for f in HostFn::ALL {
+        if let Some(addr) = f.addr(&imports) {
+            builder.symbol(f.symbol(), addr);
+        }
+    }
+    if let Some(resolver) = imports.fast_resolver {
+        builder.symbol_lookup_fn(Box::new(move |name| fast_cap_addr(resolver, name)));
+    }
     // Code + read-only data (float constants, jump tables) from a single contiguous 256 MiB arena
     // (VA only, committed on demand) rather than separate `mmap`s: x64's 32-bit PC-relative
     // relocations (`X86CallPCRel4`/`X86PCRel4`) overflow if ASLR places independent mmaps > 2 GiB
@@ -5739,6 +6058,8 @@ fn define_funcs(
                 module
                     .define_function_bytes(ids[next], align, code.code_buffer(), &relocs)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
+                #[cfg(test)]
+                record_emitted(module, code.code_buffer(), &relocs);
                 defined(module, &code, next);
                 next += 1;
             }
@@ -5810,7 +6131,311 @@ fn define_verified(
             &relocs,
         )
         .map_err(|e| JitError::Backend(e.to_string()))?;
+    #[cfg(test)]
+    record_emitted(module, code.code_buffer(), &relocs);
     Ok(code)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// temen#2452 — what the compiling thread defines while a test records it: each function's code
+    /// as Cranelift emitted it, before its link, and its relocations, their targets by symbol.
+    static EMITTED: core::cell::RefCell<Option<Vec<u8>>> = const { core::cell::RefCell::new(None) };
+}
+
+/// Record a function `module` defines from `code` and `relocs`, if a test is recording.
+#[cfg(test)]
+fn record_emitted(module: &JITModule, code: &[u8], relocs: &[ModuleReloc]) {
+    EMITTED.with(|e| {
+        let mut e = e.borrow_mut();
+        let Some(out) = e.as_mut() else { return };
+        out.extend_from_slice(code);
+        for r in relocs {
+            let target = if cranelift_module::ModuleDeclarations::is_function(&r.name) {
+                let id = FuncId::from_name(&r.name);
+                format!("{:?}", module.declarations().get_function_decl(id).name)
+            } else {
+                format!("{:?}", r.name)
+            };
+            let line = format!("\n{} {:?} {target} {}\n", r.offset, r.kind, r.addend);
+            out.extend_from_slice(line.as_bytes());
+        }
+    });
+}
+
+/// temen#2452 — the code a compile emits names no address in its process: two processes emit the
+/// same code for one program, though each placed the functions it calls elsewhere.
+#[cfg(all(test, fiber_rt, setjmp_rt))]
+mod relocatable_code_tests {
+    use super::*;
+    use core::ffi::c_void;
+
+    /// A program whose code calls every host function a root's can but `setjmp`'s, which a module
+    /// that spawns may not use: `call.cap`s (one on the D45 fast path), fibers, threads, the futex,
+    /// `gc.roots`, the vCPU TLS register, the durable shadow base, every `Instantiator` op, and a
+    /// trap, which captures a backtrace under `-g`.
+    const CALLS: &str = "memory 16
+func (i32, i32, i64) -> (i64) {
+block 0 (vh: i32, vi: i32, vx: i64) {
+  vgen = call.cap 3 7 (i64) -> (i64) vh (vx)
+  vfast = call.cap 3 8 (i64) -> (i64) vh (vx)
+  vf = i32.const 1
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vs1, vv1 = cont.resume vk vx
+  vs2, vv2 = cont.resume.block vk vx
+  vt = thread.spawn 1 vsp vx
+  vj = thread.join vt
+  va = i64.const 64
+  ve = i32.const 0
+  vto = i64.const 0
+  vw = i32.atomic.wait va ve vto
+  vc = i32.const 1
+  vn = atomic.notify va vc
+  vlo = i64.const 0
+  vhi = i64.const 4096
+  vm = i64.const -1
+  vbuf = i64.const 128
+  vcap = i64.const 4
+  vr = gc.roots vlo vhi vm vbuf vcap
+  vtls = vcpu.tls.get
+  vcpu.tls.set vtls
+  vsb = durable.shadow_base
+  vkid = call.cap 6 17 (i64) -> (i32) vi (vx)
+  vst, vval = call.cap 6 1 (i32) -> (i64, i64) vi (vkid)
+  vp = call.cap 6 9 (i32) -> (i32) vi (vkid)
+  vd = call.cap 6 10 (i32) -> (i32) vi (vkid)
+  vkl = call.cap 6 12 (i32) -> (i32) vi (vkid)
+  vo = call.cap 6 14 (i32, i64) -> (i32) vi (vkid, vx)
+  vg = call.cap 6 19 (i32, i64) -> (i32) vi (vkid, vx)
+  vz = i64.const 0
+  vq = i64.div_s vx vz
+  return vq
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vs = suspend varg
+  return vs
+  }
+}
+";
+
+    /// `setjmp` and `longjmp`.
+    const JUMPS: &str = "memory 16
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 64
+  v2 = setjmp v1
+  v3 = i32.const 0
+  v4 = i32.eq v2 v3
+  br_if v4 1() 2(v2)
+  }
+block 1 () {
+  v5 = i64.const 64
+  v6 = i32.const 7
+  longjmp v5 v6
+  unreachable
+  }
+block 2 (v7: i32) {
+  v8 = i64.extend_i32_u v7
+  return v8
+  }
+}
+";
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn cap_thunk(
+        _: *mut c_void,
+        _: *mut u8,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: i32,
+        _: *const i64,
+        _: u64,
+        _: *mut i64,
+        _: u64,
+        _: *mut i64,
+    ) {
+    }
+
+    unsafe extern "C" fn fast_target(
+        _: *mut c_void,
+        _: *mut u8,
+        _: u64,
+        _: i32,
+        _: *mut i64,
+        _: i64,
+    ) -> i64 {
+        0
+    }
+
+    /// Claims `call.cap 3 8` with one argument and one result.
+    unsafe extern "C" fn resolver(type_id: u32, op: u32, n_args: u32, n_res: u32) -> *const c_void {
+        if (type_id, op, n_args, n_res) == (3, 8, 1, 1) {
+            fast_target as *const c_void
+        } else {
+            core::ptr::null()
+        }
+    }
+
+    unsafe extern "C" fn sig_take(_: *mut c_void, _: *mut i64) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn sig_return(_: *mut c_void) {}
+
+    /// What the test programs' compiles bind beside temen-jit's own functions.
+    fn imports() -> Imports {
+        Imports {
+            cap_thunk: cap_thunk as *const u8,
+            sig: Some((sig_take, sig_return)),
+            fast_resolver: Some(resolver),
+        }
+    }
+
+    fn program(src: &str) -> IrModule {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        m
+    }
+
+    /// What this process's compiles of the programs emit: a root's of each, and a §14 child's of
+    /// the calls.
+    fn emit() -> Vec<u8> {
+        EMITTED.with(|e| *e.borrow_mut() = Some(Vec::new()));
+        // Its refill trampoline compiles now, in a process that has compiled none.
+        let mut fuel = FuelCell::fixed(1);
+        let interrupt = AtomicU64::new(0);
+        let armed = core::sync::atomic::AtomicBool::new(false);
+        let mut calls = program(CALLS);
+        calls.debug_info = Some(temen_ir::DebugInfo::default());
+        let mut root = |m: &IrModule, signal| {
+            CompiledModule::compile_with_signal(
+                m,
+                0,
+                cap_thunk,
+                core::ptr::null_mut(),
+                0,
+                None,
+                Some(&interrupt as *const AtomicU64),
+                Some(&mut *fuel as *mut FuelCell),
+                Some(resolver),
+                None,
+                0,
+                signal,
+            )
+            .expect("a root's compile")
+        };
+        let calls_root = root(
+            &calls,
+            Some(SignalArm {
+                armed: &armed,
+                take: sig_take,
+                ret: sig_return,
+                ctx: core::ptr::null_mut(),
+            }),
+        );
+        let jumps_root = root(&program(JUMPS), None);
+        // Never run, so the domain and the nursery it names are never reached.
+        let child = compile_child_windowed(&ChildCompile {
+            funcs: &calls.funcs,
+            types: &calls.types,
+            entry: 0,
+            mapped_log2: 16,
+            reserved_log2: 16,
+            thunk: cap_thunk,
+            addrs: InstanceAddrs {
+                sched: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                nursery: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                ..InstanceAddrs::NONE
+            },
+            impl_exports: &[],
+            table_reserve_log2: 0,
+            shadow: temen_ir::durable_abi::ShadowArena::EMPTY,
+        })
+        .expect("a child's compile");
+        drop((calls_root, jumps_root, child));
+        EMITTED.with(|e| e.borrow_mut().take()).expect("recorded")
+    }
+
+    const EMIT_TO: &str = "TEMEN_JIT_EMIT_TO";
+
+    /// The half of [`two_processes_emit_the_same_code`] that runs in a process of its own: it
+    /// writes where this process placed each host function, then what it emitted.
+    #[test]
+    #[ignore = "run in a process of its own by two_processes_emit_the_same_code"]
+    fn emit_in_this_process() {
+        let Some(path) = std::env::var_os(EMIT_TO) else {
+            return;
+        };
+        let mut out: Vec<u8> = HostFn::ALL
+            .iter()
+            .flat_map(|f| (f.addr(&imports()).expect("bound") as u64).to_le_bytes())
+            .collect();
+        out.extend(emit());
+        std::fs::write(path, out).expect("write what this process emitted");
+    }
+
+    #[test]
+    fn two_processes_emit_the_same_code() {
+        let exe = std::env::current_exe().expect("this test binary");
+        let run = |name: &str| {
+            let path =
+                std::env::temp_dir().join(format!("temen-jit-emit-{}-{name}", std::process::id()));
+            let run = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "relocatable_code_tests::emit_in_this_process",
+                    "--ignored",
+                ])
+                .env(EMIT_TO, &path)
+                .output()
+                .expect("run this test binary");
+            assert!(
+                run.status.success(),
+                "process {name}: {}\n{}{}",
+                run.status,
+                String::from_utf8_lossy(&run.stdout),
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let out = std::fs::read(&path).expect("read what the process emitted");
+            let _ = std::fs::remove_file(&path);
+            let (addrs, code) = out.split_at(8 * HostFn::ALL.len());
+            let addrs: Vec<u64> = addrs
+                .chunks(8)
+                .map(|a| u64::from_le_bytes(a.try_into().unwrap()))
+                .collect();
+            (addrs, code.to_vec())
+        };
+        let (addrs_a, a) = run("a");
+        let (addrs_b, b) = run("b");
+        assert_ne!(
+            addrs_a, addrs_b,
+            "both processes placed the host functions at the same addresses, so their code \
+             cannot tell an address from a symbol: this test needs ASLR"
+        );
+        for (addrs, code) in [(&addrs_a, &a), (&addrs_b, &b)] {
+            for (f, addr) in HostFn::ALL.iter().zip(addrs) {
+                let named = code
+                    .windows(f.symbol().len())
+                    .any(|w| w == f.symbol().as_bytes());
+                assert!(named, "no code calls {}", f.symbol());
+                let held = code.windows(8).any(|w| w == addr.to_le_bytes());
+                assert!(!held, "the code holds the address of {}", f.symbol());
+            }
+        }
+        let fast = fast_cap_symbol(3, 8, 1, 1);
+        assert!(a.windows(fast.len()).any(|w| w == fast.as_bytes()));
+        assert!(
+            a == b,
+            "two processes emitted different code for the same programs ({} and {} bytes)",
+            a.len(),
+            b.len()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5949,16 +6574,17 @@ pub(crate) struct ChildCompile<'a> {
 /// `mapped_log2 == reserved_log2` is a fully-mapped window.
 ///
 /// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
-/// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
-/// thunk, its window geometry, and no setjmp runtime of its own (those ops are rejected below). Its
-/// powerbox, the cells it polls and charges, the domain it waits in and the nursery it spawns
-/// through are its instance's, in its vmctx. A child that runs as an executor task may use `cont.*`
-/// fibers, `gc.roots` and `thread.spawn`/`join` (#1469; a durable one since #2010): the thunks are
-/// static and find the running fiber runtime and thread domain through thread-locals, and each task
-/// brings its own (`child_exec`). So the code is shared by every spawn of it ([`ChildCodeCache`],
-/// temen#2168). Being the root's shape is what lets a child hold a re-granted `Jit` capability:
-/// `define_extra` / `invoke_extra` / `install` lower a submitted unit against exactly these baked
-/// constants, into the child's own table — so such a child's code is its own.
+/// domain however it came into being). What differs is only what its code is compiled for: the
+/// `call.cap` thunk its link binds (its own), its window geometry, and no setjmp runtime of its own
+/// (those ops are rejected below). Its powerbox, the cells it polls and charges, the domain it
+/// waits in and the nursery it spawns through are its instance's, in its vmctx. A child that runs
+/// as an executor task may use `cont.*` fibers, `gc.roots` and `thread.spawn`/`join` (#1469; a
+/// durable one since #2010): the thunks are static and find the running fiber runtime and thread
+/// domain through thread-locals, and each task brings its own (`child_exec`). So the code is shared
+/// by every spawn of it ([`ChildCodeCache`], temen#2168). Being the root's shape is what lets a
+/// child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
+/// submitted unit as this compile lowered the child's code, into the child's own table — so such a
+/// child's code is its own.
 fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitError> {
     let ChildCompile {
         funcs,
@@ -5976,9 +6602,9 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     let fuel_addr = addrs.fuel as usize;
     let futex_sched = addrs.sched as usize;
     #[cfg(fiber_rt)]
-    let inst_env = InstEnv::nesting(!addrs.nursery.is_null());
+    let nesting = !addrs.nursery.is_null();
     #[cfg(not(fiber_rt))]
-    let inst_env = InstEnv::null();
+    let nesting = false;
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
@@ -6019,8 +6645,8 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                 "a §14 JIT child using atomic.wait/notify needs the parent's futex domain",
             ));
         }
-        // Likewise `setjmp`/`longjmp`: the child gets a null `SetjmpEnv` (no per-child `setjmp` table
-        // yet), so reject rather than bake a null table address into a `SetJmp` site.
+        // Likewise `setjmp`/`longjmp`: a child has no `setjmp` table yet (its vmctx's is null), so
+        // reject rather than run a `SetJmp` site over none.
         if f.uses_setjmp() {
             return Err(JitError::Unsupported(
                 "a §14 JIT child using setjmp/longjmp is not supported yet",
@@ -6038,7 +6664,10 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         .max(1);
     let fn_table_mask = (table_len as u64) - 1;
 
-    let mut module = new_jit_module()?;
+    let mut module = new_jit_module(Imports {
+        cap_thunk: cap_thunk as *const u8,
+        ..Imports::NONE
+    })?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
     // Function signatures first, then every call-site signature (as the root does), so a unit a
     // `Jit`-holding child later submits interns against stable ids — id-equality ≡ structural
@@ -6055,39 +6684,11 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         intern_type(&mut distinct, &fiber_func_type())?;
     }
     let distinct = distinct;
-    #[cfg(fiber_rt)]
-    let fiber = if uses_fibers {
-        FiberEnv {
-            new_thunk: fiber_rt::fiber_new as *const () as i64,
-            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
-            block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
-            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
-            roots_thunk: fiber_rt::temen_gc_roots_flush as *const () as i64,
-        }
-    } else {
-        FiberEnv::null()
-    };
-    #[cfg(not(fiber_rt))]
-    let fiber = FiberEnv::null();
-
-    let cap = CapEnv {
-        thunk_addr: cap_thunk as *const () as i64,
-        fast_resolver: None, // nested child: `call.cap`s go to the coroutine thunk, not a fast path
-    };
-    // The thread env over the **parent's** futex domain: wait/notify rendezvous there, and a task's
-    // `thread.spawn`/`join` act in its own domain, which the thunks look up (`CURRENT_DOMAIN`). The
-    // spawn/join thunks are null unless the child uses them; null when no domain was supplied.
-    let thread_env = if futex_sched != 0 {
-        let if_threads = |t: i64| if uses_threads { t } else { 0 };
-        ThreadEnv {
-            spawn_thunk: if_threads(os_thread_rt::thread_spawn as *const () as i64),
-            join_thunk: if_threads(os_thread_rt::thread_join as *const () as i64),
-            wait_thunk: os_thread_rt::thread_wait as *const () as i64,
-            notify_thunk: os_thread_rt::thread_notify as *const () as i64,
-        }
-    } else {
-        ThreadEnv::null()
-    };
+    // The **parent's** futex domain: wait/notify rendezvous there, and a task's
+    // `thread.spawn`/`join` act in its own domain, which the thunks look up (`CURRENT_DOMAIN`) — so
+    // the child spawns only when it uses them. Neither when no domain was supplied.
+    let threads = futex_sched != 0;
+    let spawns = threads && uses_threads;
     let mut base_bytes = 0usize;
     define_funcs(
         &mut module,
@@ -6099,12 +6700,9 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                 funcs,
                 &distinct,
                 types,
-                cap,
-                fiber,
-                thread_env,
-                inst_env, // a child that spawns loads its own nursery from its vmctx (temen#2168)
-                SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
-                SigEnv::null(),    // #932 — a §14 child is not signal-delivery armed (slice 1b)
+                None,    // nested child: `call.cap`s go to the coroutine thunk, not a fast path
+                nesting, // a child that spawns loads its own nursery from its vmctx (temen#2168)
+                false,   // #932 — a §14 child is not signal-delivery armed (slice 1b)
                 &mut ctx.func,
                 &funcs[fi],
                 mask,
@@ -6129,7 +6727,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         ids[child_entry as usize],
         &entry,
         false,
-    );
+    )?;
     let tramp = module
         .declare_function("child_trampoline", Linkage::Export, &ctx.func.signature)
         .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -6144,7 +6742,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         ids[child_entry as usize],
         &entry,
         true,
-    );
+    )?;
     let tramp_limited = module
         .declare_function(
             "child_trampoline_limited",
@@ -6168,7 +6766,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                     ids[f as usize],
                     &funcs[f as usize],
                     false,
-                );
+                )?;
                 let id = module
                     .declare_function(
                         &format!("child_serve_tramp_{f}"),
@@ -6255,7 +6853,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         // (temen#2168), so its code is only code: every spawn of it can run one compile
         // ([`ChildCodeCache`]).
         hosted: false,
-        nests: inst_env.is_active() && funcs_use_instantiator(funcs),
+        nests: nesting && funcs_use_instantiator(funcs),
         fn_table,
         tramp_code: code,
         tramp_code_limited: code_limited,
@@ -6264,11 +6862,11 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         n_results: entry.results.len(),
         n_real_funcs: funcs.len(),
         distinct,
-        cap,
-        fiber,
-        thread: thread_env,
-        inst: inst_env,
-        setjmp: SetjmpEnv::null(),
+        fast_resolver: None,
+        fibers: cfg!(fiber_rt) && uses_fibers,
+        threads,
+        spawns,
+        nesting,
         mask,
         epoch: epoch_addr != 0,
         fuel: fuel_addr != 0,
@@ -6609,10 +7207,10 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
                 | Inst::Bitselect { .. }
                 | Inst::Shuffle { .. }
                 | Inst::Swizzle { .. } => {}
-                // §12 per-vCPU TLS register: a baked thunk over a thread-local — substrate-independent
+                // §12 per-vCPU TLS register: a thunk over a thread-local — substrate-independent
                 // (works for a plain non-fiber root), so supported on every target.
                 Inst::VcpuTlsGet | Inst::VcpuTlsSet { .. } => {}
-                // §12.8 4A.5 durable-runtime-internal: a baked thunk over a per-OS-thread word (like
+                // §12.8 4A.5 durable-runtime-internal: a thunk over a per-OS-thread word (like
                 // the TLS register), so supported on every target.
                 Inst::DurableShadowBase => {}
                 // Every `VIntBin` lane op is lowered: `i8x16.mul` via widen → `i16x8` multiply →
@@ -6707,8 +7305,8 @@ pub type SigReturnThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
 
 /// #932 — the host's async-signal delivery **arm** for a JIT run: the `Host::sig_armed` flag the
 /// lowering polls at its safepoints (function entries + taken back-edges), plus the two call-out
-/// thunks and their ctx. Passed to [`compile_and_run_with_host_signals`]. All three addresses are
-/// baked into the compiled code, so the flag, the thunks, and the ctx must stay valid for the whole
+/// thunks and their ctx. Passed to [`compile_and_run_with_host_signals`]. The compiled code calls
+/// the thunks, and its instance holds the flag and the ctx, so all must stay valid for the whole
 /// run. See `temen_run::JitSigDelivery` for the host side.
 pub struct SignalArm {
     /// The `AtomicBool` "a signal is armed" flag (`Host::sig_armed`) the lowering polls inline.
@@ -6719,197 +7317,6 @@ pub struct SignalArm {
     pub ret: SigReturnThunk,
     /// The opaque host delivery context passed to both thunks (a `*mut temen_run::JitSigDelivery`).
     pub ctx: *mut core::ffi::c_void,
-}
-
-/// #932 — the async-signal delivery shape baked into [`emit_signal_check`]: whether this compile
-/// delivers at all, and the two call-out thunk addresses (process globals). The instance's `armed`
-/// flag and delivery ctx are per-instance, read from its [`VmCtx`]. Un-armed ⇒ the check is not
-/// emitted — guest code is byte-identical to the un-armed build, exactly like [`Lower::epoch`] /
-/// [`Lower::fuel`].
-#[derive(Clone, Copy)]
-struct SigEnv {
-    armed: bool,
-    take_thunk: i64,
-    return_thunk: i64,
-}
-
-impl SigEnv {
-    fn null() -> SigEnv {
-        SigEnv {
-            armed: false,
-            take_thunk: 0,
-            return_thunk: 0,
-        }
-    }
-    /// True when this compile arms safepoint signal delivery (the host supplied a [`SignalArm`]).
-    fn is_armed(&self) -> bool {
-        self.armed
-    }
-}
-
-/// The host `call.cap` thunk address, baked into each `call.cap` as a constant (a process global).
-/// The ctx it is handed — the instance's powerbox — is per-instance, read from its [`VmCtx`].
-#[derive(Clone, Copy)]
-struct CapEnv {
-    thunk_addr: i64,
-    /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
-    /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
-    fast_resolver: Option<FastCapResolver>,
-}
-
-/// The three `cont.*` thunk addresses, baked into `cont.new`/`cont.resume`/`suspend` sites as
-/// constants. All `0` (`null`) when the module uses no fibers or the target has no stack-switch
-/// support. The fiber *runtime* itself is found via a thread-local (per vCPU), not baked here.
-#[derive(Clone, Copy)]
-struct FiberEnv {
-    new_thunk: i64,
-    resume_thunk: i64,
-    /// I48 — the `cont.resume.block` thunk (`os_thread_rt::fiber_resume_block`): resume that idles
-    /// the OS thread on a still-parked fiber instead of returning `FIBER_PARKED`. Takes the domain
-    /// pointer as its first arg (the instance's, [`vmctx::SCHED`]), like the `thread.*` thunks.
-    block_resume_thunk: i64,
-    suspend_thunk: i64,
-    /// The `gc.roots` thunk (conservative root enumeration over the live fiber stacks). `0` when the
-    /// module uses no fibers / `gc.roots`, or the target has no stack-switch support.
-    roots_thunk: i64,
-}
-
-impl FiberEnv {
-    fn null() -> FiberEnv {
-        FiberEnv {
-            new_thunk: 0,
-            resume_thunk: 0,
-            block_resume_thunk: 0,
-            suspend_thunk: 0,
-            roots_thunk: 0,
-        }
-    }
-    /// No fiber runtime is stood up for this module (the `cont.*` thunk addresses are unbaked). A
-    /// submitted unit that uses fibers must be rejected in this state — else its `cont.*` would
-    /// `call.dyn` through a null thunk. `enable_fiber_hosting` clears this for a `Jit` domain.
-    fn is_null(&self) -> bool {
-        self.new_thunk == 0
-    }
-}
-
-/// The §12 `thread.*` and futex thunk addresses, baked into `thread.spawn`/`thread.join` and
-/// `atomic.wait`/`notify` sites as constants. The domain they run on is the instance's, which the
-/// sites load from its [`VmCtx`] ([`vmctx::SCHED`]). All `0` when no domain is stood up for the module:
-/// it uses no threads or futex, or the target has no stack-switch support (in which case
-/// `ensure_supported` has already rejected any thread op).
-#[derive(Clone, Copy)]
-struct ThreadEnv {
-    spawn_thunk: i64,
-    join_thunk: i64,
-    wait_thunk: i64,
-    notify_thunk: i64,
-}
-
-impl ThreadEnv {
-    fn null() -> ThreadEnv {
-        ThreadEnv {
-            spawn_thunk: 0,
-            join_thunk: 0,
-            wait_thunk: 0,
-            notify_thunk: 0,
-        }
-    }
-    /// No thread scheduler is stood up for this module (the `thread.*`/futex thunk addresses are
-    /// unbaked). A submitted unit that uses threads/futex must be rejected in this state — else its
-    /// `thread.spawn` would `call.dyn` through a null thunk. `enable_thread_hosting` clears this
-    /// (CONSOLIDATION.md §11) — the twin of [`FiberEnv::is_null`] / `enable_fiber_hosting`.
-    fn is_null(&self) -> bool {
-        self.wait_thunk == 0
-    }
-}
-
-/// The `instantiate`/`join` thunk addresses baked into the module's `Instantiator` `call.cap` sites,
-/// which pass each thunk the instance's §14 nursery, loaded from its vmctx ([`VmCtx::nursery`],
-/// temen#2168). All `0` when the compile has no nursery: a module that holds no `Instantiator`, or a
-/// §14 child that cannot spawn. Its `Instantiator` `call.cap` then takes the ordinary `call.cap`
-/// path, an inert `CapFault`. A detached child (#1956) that uses the `Instantiator` gets a nursery
-/// of its own.
-#[derive(Clone, Copy)]
-struct InstEnv {
-    /// Whether the compile lowers `Instantiator` calls to the nesting runtime: every instance of
-    /// the code has a nursery.
-    active: bool,
-    join_thunk: i64,
-    // PROCESS.md S3 lifecycle thunks (poll / detach / kill) — parity with the interpreter's ops 9/10/12.
-    poll_thunk: i64,
-    detach_thunk: i64,
-    kill_thunk: i64,
-    // §3c — the config-record spawn (op 17), the one spawn form.
-    instantiate_rec_thunk: i64,
-    // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
-    // child's nursery-retained shared powerbox.
-    child_offer_thunk: i64,
-    // #2220 — op 19 (`grant`): grant a capability into that powerbox while the child runs.
-    child_grant_thunk: i64,
-}
-
-impl InstEnv {
-    fn null() -> InstEnv {
-        InstEnv {
-            active: false,
-            join_thunk: 0,
-            poll_thunk: 0,
-            detach_thunk: 0,
-            kill_thunk: 0,
-            instantiate_rec_thunk: 0,
-            child_offer_thunk: 0,
-            child_grant_thunk: 0,
-        }
-    }
-    /// The env that lowers a compile's `Instantiator` calls to its instance's nursery, for code of
-    /// module 0's program; [`Self::null`] for a compile with none.
-    #[cfg(fiber_rt)]
-    fn nesting(nests: bool) -> InstEnv {
-        if !nests {
-            return InstEnv::null();
-        }
-        InstEnv {
-            active: true,
-            join_thunk: instantiator_rt::join as *const () as i64,
-            poll_thunk: instantiator_rt::poll as *const () as i64,
-            detach_thunk: instantiator_rt::detach as *const () as i64,
-            kill_thunk: instantiator_rt::kill as *const () as i64,
-            instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
-            child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
-            child_grant_thunk: instantiator_rt::child_grant as *const () as i64,
-        }
-    }
-
-    /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
-    /// parent compile with a live `Nursery`); `false` ⇒ they take the ordinary `call.cap` path.
-    fn is_active(&self) -> bool {
-        self.active
-    }
-}
-
-/// The four thunk/libc addresses baked into the module's `SetJmp`/`LongJmp` sites (LLVM.md §"JIT
-/// `longjmp`", Option B). All `0` (`null`) when the module uses no `setjmp`, or the target lacks the
-/// `setjmp_rt` runtime (non-unix / non-`fiber_rt`), in which case `ensure_supported` has already
-/// rejected any `SetJmp`/`LongJmp`. The sites load the instance's `SetjmpRuntime` from its vmctx
-/// ([`vmctx::SETJMP`], temen#2389); `setjmp_addr`/`longjmp_addr` are libc `_setjmp`/`_longjmp`,
-/// called inline in the guest frame.
-#[derive(Clone, Copy)]
-struct SetjmpEnv {
-    slot_thunk: i64,
-    lookup_thunk: i64,
-    setjmp_addr: i64,
-    longjmp_addr: i64,
-}
-
-impl SetjmpEnv {
-    fn null() -> SetjmpEnv {
-        SetjmpEnv {
-            slot_thunk: 0,
-            lookup_thunk: 0,
-            setjmp_addr: 0,
-            longjmp_addr: 0,
-        }
-    }
 }
 
 /// Per-function lowering context shared across blocks.
@@ -6952,23 +7359,16 @@ struct Lower<'a> {
     /// lets a unit `cont.new`/`thread.spawn`/`call.dyn` over its OWN function; it changes only
     /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
     ref_slots: Option<&'a [u32]>,
-    /// The host `call.cap` thunk + ctx (constant addresses).
-    cap: CapEnv,
-    /// The §12 fiber runtime + thunk addresses for `cont.*` lowering.
-    fiber: FiberEnv,
-    /// The §12 thread scheduler + thunk addresses for `thread.*` lowering.
-    thread: ThreadEnv,
-    /// The §14 nesting runtime + thunk addresses for `Instantiator` `call.cap` lowering (`null` ⇒
-    /// `Instantiator` call.cap calls take the ordinary `call.cap` path — an inert `CapFault`).
-    inst: InstEnv,
-    /// The per-run `setjmp` table + libc `_setjmp`/`_longjmp` addresses for `SetJmp`/`LongJmp` lowering
-    /// (`null` ⇒ the module has no `setjmp`, or the target lacks the runtime and `ensure_supported`
-    /// already rejected the ops).
-    setjmp: SetjmpEnv,
-    /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) baked into
-    /// [`emit_signal_check`] at safepoints (`SigEnv::null()` ⇒ no signal delivery armed — the check is
-    /// not emitted, guest code byte-identical to the un-armed build).
-    sig: SigEnv,
+    /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
+    /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
+    fast_resolver: Option<FastCapResolver>,
+    /// Lower `Instantiator` `call.cap`s to the §14 nesting runtime (`false` ⇒ they take the
+    /// ordinary `call.cap` path — an inert `CapFault`).
+    nesting: bool,
+    /// #932 — emit the async-signal delivery check ([`emit_signal_check`]) at safepoints (`false` ⇒
+    /// no signal delivery armed — the check is not emitted, guest code byte-identical to the
+    /// un-armed build).
+    signals: bool,
     /// Whether this compile polls the host-owned **interrupt cell** (`AtomicU64`, the instance's
     /// [`VmCtx::epoch`]) for the §5 fuel/epoch kill-path. `false` ⇒ no kill-path is armed (the checks
     /// are not emitted — guest code is byte-identical to the un-armed build). When set, the lowering
@@ -7020,30 +7420,31 @@ struct Lower<'a> {
     /// Cranelift records its machine-location ranges. `None` ⇒ no `-g` vars (no labels, codegen
     /// unchanged).
     var_labels: Option<&'a VarLabelMap>,
-    /// §5 W3 Stage 2 explicit-trap backtrace: `Some((sigref, addr))` to bake a call to the
-    /// trap-capture helper (`temen_capture_explicit_trap`) into every [`emit_trap`] site, so an
-    /// explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a source
-    /// backtrace before it unwinds — the way memory faults do via the signal handler. `None` without
-    /// `-g` (the backtrace would be empty) or where the helper isn't linked (a target with no trap
-    /// runtime), leaving the trap path byte-identical to before.
-    trap_capture: Option<(SigRef, i64)>,
+    /// §5 W3 Stage 2 explicit-trap backtrace: `Some(helper)` to call the trap-capture helper
+    /// (`temen_capture_explicit_trap`, [`HostFn::TrapCapture`]) from every [`emit_trap`] site, so
+    /// an explicit trap (div-by-zero, `unreachable`, `OutOfFuel`, indirect-call-type) records a
+    /// source backtrace before it unwinds — the way memory faults do via the signal handler. `None`
+    /// without `-g` (the backtrace would be empty) or where the helper isn't linked (a target with
+    /// no trap runtime), leaving the trap path byte-identical to before.
+    trap_capture: Option<FuncRef>,
 }
 
 /// The address of the §5 W3 explicit-trap capture helper (`temen_capture_explicit_trap` in
-/// `trap_capture.c`): baked into each [`emit_trap`] site under `-g`. The helper takes the trapping
-/// frame pointer as an argument (the JIT threads it in via Cranelift `get_frame_pointer`), so it works
-/// on every target the shim compiles for — **unix and windows** (MSVC has no `__builtin_frame_address`,
-/// but the passed `fp` + `_ReturnAddress` sidestep it). `0` on a target with no trap runtime.
+/// `trap_capture.c`), which each [`emit_trap`] site calls under `-g` ([`HostFn::TrapCapture`]). The
+/// helper takes the trapping frame pointer as an argument (the JIT threads it in via Cranelift
+/// `get_frame_pointer`), so it works on every target the shim compiles for — **unix and windows**
+/// (MSVC has no `__builtin_frame_address`, but the passed `fp` + `_ReturnAddress` sidestep it).
+/// `None` on a target with no trap runtime.
 #[cfg(any(unix, windows))]
-fn trap_capture_addr() -> i64 {
+fn trap_capture_addr() -> Option<*const ()> {
     extern "C" {
         fn temen_capture_explicit_trap(fp: usize);
     }
-    temen_capture_explicit_trap as unsafe extern "C" fn(usize) as usize as i64
+    Some(temen_capture_explicit_trap as unsafe extern "C" fn(usize) as *const ())
 }
 #[cfg(not(any(unix, windows)))]
-fn trap_capture_addr() -> i64 {
-    0
+fn trap_capture_addr() -> Option<*const ()> {
+    None
 }
 
 /// Build the natural-ABI CLIF for one IR function: `(mem_base, fn_table_base, params…)
@@ -7063,12 +7464,9 @@ fn build_clif(
     funcs: &[Func],
     distinct: &[FuncType],
     type_section: &[temen_ir::TypeEntry],
-    cap: CapEnv,
-    fiber: FiberEnv,
-    thread: ThreadEnv,
-    inst: InstEnv,
-    setjmp: SetjmpEnv,
-    sig: SigEnv,
+    fast_resolver: Option<FastCapResolver>,
+    nesting: bool,
+    signals: bool,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -7148,15 +7546,11 @@ fn build_clif(
     } else {
         None
     };
-    // §5 W3 Stage 2: under `-g`, import the trap-capture helper's `(i64) -> ()` host-C signature (it
-    // takes the trapping frame pointer) and bake its address, so `emit_trap` can record an explicit
-    // trap's source backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
+    // §5 W3 Stage 2: under `-g`, import the trap-capture helper (its `(i64) -> ()` host-C signature
+    // takes the trapping frame pointer), so `emit_trap` can record an explicit trap's source
+    // backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
     let trap_capture = match trap_capture_addr() {
-        addr if srclocs.is_some() && addr != 0 => {
-            let mut sig = module.make_signature(); // host C ABI
-            sig.params.push(AbiParam::new(I64)); // the trapping frame pointer
-            Some((b.import_signature(sig), addr))
-        }
+        Some(_) if srclocs.is_some() => Some(import_host(module, b.func, HostFn::TrapCapture)?),
         _ => None,
     };
     let lower = Lower {
@@ -7173,12 +7567,9 @@ fn build_clif(
         frontend_config: module.target_config(),
         fn_table_mask,
         ref_slots,
-        cap,
-        fiber,
-        thread,
-        inst,
-        setjmp,
-        sig,
+        fast_resolver,
+        nesting,
+        signals,
         epoch,
         fuel,
         domain_poll,
@@ -7212,7 +7603,7 @@ fn build_clif(
     }) {
         emit_domain_poll(&mut b, &lower);
     }
-    emit_signal_check(module, &mut b, &lower); // #932 async signal delivery (no-op when disarmed)
+    emit_signal_check(module, &mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks.clif[0], &entry_args);
@@ -7242,7 +7633,7 @@ fn build_trampoline(
     entry_id: FuncId,
     entry: &Func,
     with_limit: bool,
-) {
+) -> Result<(), JitError> {
     clif.signature.params.push(AbiParam::new(I64)); // args_ptr
     clif.signature.params.push(AbiParam::new(I64)); // results_ptr
     clif.signature.params.push(AbiParam::new(I64)); // mem_base
@@ -7277,13 +7668,7 @@ fn build_trampoline(
     let limit = if with_limit {
         b.block_params(blk)[5]
     } else {
-        let mut sig = module.make_signature(); // host C ABI
-        sig.returns.push(AbiParam::new(I64));
-        let sig = b.import_signature(sig);
-        let f = b
-            .ins()
-            .iconst(I64, stack_check::thread_limit as *const () as i64);
-        let call = b.ins().call_indirect(sig, f, &[]);
+        let call = call_host(module, &mut b, HostFn::StackLimit, &[])?;
         b.inst_results(call)[0]
     };
     call_args.push(limit);
@@ -7316,6 +7701,7 @@ fn build_trampoline(
     b.ins().return_(&[]);
     b.seal_all_blocks();
     b.finalize();
+    Ok(())
 }
 
 /// The fixed signature of a §12 fiber/thread entry: `(i64 sp, i64 arg) -> i64` (the unified
@@ -7596,12 +7982,12 @@ fn lower_block(
             // `instantiate`/`join` to its thunks instead of the generic `call.cap` — spawning a child
             // needs the host compiler, which the flat `call.cap` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
-            if *type_id == cap_id::INSTANTIATOR && lower.inst.is_active() {
+            if *type_id == cap_id::INSTANTIATOR && lower.nesting {
                 lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
             } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
                 // D45 devirtualized fast path: a register-to-register direct call to the specialized
                 // host fn the resolver claimed for this `(type_id, op)`.
-                lower_cap_call_fast(module, b, lower, target, sig, *handle, args, &mut vals)?;
+                lower_cap_call_fast(module, b, lower, &target, sig, *handle, args, &mut vals)?;
             } else {
                 let h = get(&vals, *handle)?;
                 lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
@@ -7698,9 +8084,9 @@ fn lower_block(
         // §7/§6 capability reflection (`self.count`/`get`/`resolve`/`label`/`attest`) is no longer
         // a distinct IR op — the frontend emits its `call.cap CAP_SELF op N` form, lowered by the
         // generic `Inst::CapCall` arm above (a `lower_cap_call` thunk the host services directly).
-        // §12 fibers: lower `cont.*` to indirect calls to the host fiber thunks (addresses baked into
-        // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk that
-        // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
+        // §12 fibers: lower `cont.*` to calls to the host fiber thunks ([`HostFn`]), threading
+        // `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk that sets the trap cell
+        // (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, sp } = inst {
             // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64, fuel_addr:i64) -> i32
             // handle. The running vCPU's fiber runtime is read from a thread-local, so threads +
@@ -7711,21 +8097,17 @@ fn lower_block(
             let trap_out = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let spv = get(&vals, *sp)?;
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
             let fuel = if lower.fuel {
                 vmctx_load(b, lower, vmctx::FUEL)
             } else {
                 b.ins().iconst(I64, 0)
             };
-            let call =
-                b.ins()
-                    .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv, fuel]);
+            let call = call_host(
+                module,
+                b,
+                HostFn::FiberNew,
+                &[mem_base, fnt, trap_out, funcref, spv, fuel],
+            )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -7753,26 +8135,20 @@ fn lower_block(
             let call = if blocking {
                 // fiber_resume_block(sched, handle, arg, status_out, trap_out) -> value:i64.
                 let sched = vmctx_load(b, lower, vmctx::SCHED);
-                let mut tsig = module.make_signature();
-                for t in [I64, I64, I64, I64, I64] {
-                    tsig.params.push(AbiParam::new(t));
-                }
-                tsig.returns.push(AbiParam::new(I64));
-                let tref = b.import_signature(tsig);
-                let thunk = b.ins().iconst(I64, lower.fiber.block_resume_thunk);
-                b.ins()
-                    .call_indirect(tref, thunk, &[sched, kh, av, status_ptr, trap_out])
+                call_host(
+                    module,
+                    b,
+                    HostFn::FiberResumeBlock,
+                    &[sched, kh, av, status_ptr, trap_out],
+                )?
             } else {
                 // fiber_resume(handle, arg, status_out, trap_out) -> value:i64.
-                let mut tsig = module.make_signature();
-                for t in [I64, I64, I64, I64] {
-                    tsig.params.push(AbiParam::new(t));
-                }
-                tsig.returns.push(AbiParam::new(I64));
-                let tref = b.import_signature(tsig);
-                let thunk = b.ins().iconst(I64, lower.fiber.resume_thunk);
-                b.ins()
-                    .call_indirect(tref, thunk, &[kh, av, status_ptr, trap_out])
+                call_host(
+                    module,
+                    b,
+                    HostFn::FiberResume,
+                    &[kh, av, status_ptr, trap_out],
+                )?
             };
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
@@ -7786,44 +8162,26 @@ fn lower_block(
             // fiber_suspend(value:i64, trap_out:i64) -> next-resume arg:i64
             let v = get(&vals, *value)?;
             let trap_out = b.use_var(lower.vmctx_var);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.fiber.suspend_thunk);
-            let call = b.ins().call_indirect(tref, thunk, &[v, trap_out]);
+            let call = call_host(module, b, HostFn::FiberSuspend, &[v, trap_out])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         // `setjmp` (LLVM.md §"JIT `longjmp`", Option B): two calls. First a host thunk returns the
-        // stable host `jmp_buf` slot for this guest `buf` address (`rt_setjmp_slot`); then `_setjmp` is
-        // called **inline in this guest frame** — the frame a later `longjmp` returns to — so it saves
-        // *this* frame's SP/return-addr. The libc `_setjmp` address is baked directly (not wrapped in a
-        // Rust thunk, whose frame would be gone by `longjmp` time — UB). Result is the `i32` 0 (direct)
-        // / long-jump value (re-entry). The slot alloc is infallible, so no trap-propagate.
+        // stable host `jmp_buf` slot for this guest `buf` address (`rt_setjmp_slot`); then
+        // `_setjmp` is called **inline in this guest frame** — the frame a later `longjmp` returns
+        // to — so it saves *this* frame's SP/return-addr. The code calls libc `_setjmp` itself (not
+        // wrapped in a Rust thunk, whose frame would be gone by `longjmp` time — UB). Result is the
+        // `i32` 0 (direct) / long-jump value (re-entry). The slot alloc is infallible, so no
+        // trap-propagate.
         if let Inst::SetJmp { buf } = inst {
             let bufv = get(&vals, *buf)?; // i64 guest jmp_buf window address (the table key)
                                           // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
-            let mut s1 = module.make_signature();
-            for t in [I64, I64] {
-                s1.params.push(AbiParam::new(t));
-            }
-            s1.returns.push(AbiParam::new(I64));
-            let r1 = b.import_signature(s1);
-            let slot_thunk = b.ins().iconst(I64, lower.setjmp.slot_thunk);
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = b.ins().call_indirect(r1, slot_thunk, &[rt_addr, bufv]);
+            let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
-            let mut s2 = module.make_signature();
-            s2.params.push(AbiParam::new(I64));
-            s2.returns.push(AbiParam::new(I32));
-            let r2 = b.import_signature(s2);
-            let setjmp_fn = b.ins().iconst(I64, lower.setjmp.setjmp_addr);
-            let c2 = b.ins().call_indirect(r2, setjmp_fn, &[slot]);
+            let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
             vals.push(b.inst_results(c2)[0]);
             continue;
         }
@@ -7837,59 +8195,33 @@ fn lower_block(
             let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
             let trap_out = b.use_var(lower.vmctx_var);
             // slot = rt_setjmp_lookup(rt_addr, buf, trap_out) -> *mut jmp_buf (null + trap on miss)
-            let mut s1 = module.make_signature();
-            for t in [I64, I64, I64] {
-                s1.params.push(AbiParam::new(t));
-            }
-            s1.returns.push(AbiParam::new(I64));
-            let r1 = b.import_signature(s1);
-            let lookup_thunk = b.ins().iconst(I64, lower.setjmp.lookup_thunk);
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = b
-                .ins()
-                .call_indirect(r1, lookup_thunk, &[rt_addr, bufv, trap_out]);
+            let c1 = call_host(module, b, HostFn::SetjmpLookup, &[rt_addr, bufv, trap_out])?;
             let slot = b.inst_results(c1)[0];
             emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
                                            // _longjmp(slot, val) — inline, noreturn.
-            let mut s2 = module.make_signature();
-            s2.params.push(AbiParam::new(I64));
-            s2.params.push(AbiParam::new(I32));
-            let r2 = b.import_signature(s2);
-            let longjmp_fn = b.ins().iconst(I64, lower.setjmp.longjmp_addr);
-            b.ins().call_indirect(r2, longjmp_fn, &[slot, valv]);
+            call_host(module, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
-        // §12 per-vCPU TLS register: baked thunks over a per-OS-thread word (no window/trap context —
+        // §12 per-vCPU TLS register: thunks over a per-OS-thread word (no window/trap context —
         // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
         // is correct after a fiber migrates here.
         if let Inst::VcpuTlsGet = inst {
-            let mut tsig = module.make_signature();
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, vcpu_tls::get as *const () as i64);
-            let call = b.ins().call_indirect(tref, thunk, &[]);
+            let call = call_host(module, b, HostFn::VcpuTlsGet, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         // §12.8 4A.5 durable-runtime-internal: read the current context's shadow-region base from the
-        // per-OS-thread register (a baked thunk, like `vcpu.tls.get`; cannot fault, no window/trap
+        // per-OS-thread register (a thunk, like `vcpu.tls.get`; cannot fault, no window/trap
         // context). The durable transform emits this to address this context's own shadow-SP word.
         if let Inst::DurableShadowBase = inst {
-            let mut tsig = module.make_signature();
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, durable_shadow::get as *const () as i64);
-            let call = b.ins().call_indirect(tref, thunk, &[]);
+            let call = call_host(module, b, HostFn::DurableShadowBase, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::VcpuTlsSet { val } = inst {
             let v = get(&vals, *val)?;
-            let mut tsig = module.make_signature();
-            tsig.params.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, vcpu_tls::set as *const () as i64);
-            b.ins().call_indirect(tref, thunk, &[v]);
+            call_host(module, b, HostFn::VcpuTlsSet, &[v])?;
             continue;
         }
         if let Inst::GcRoots {
@@ -7947,19 +8279,14 @@ fn lower_block(
                 b.ins().stack_store(v, slot, (i * 8) as i32);
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
-            let mut tsig = module.make_signature();
-            tsig.params.push(AbiParam::new(I64)); // args pointer
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.fiber.roots_thunk);
-            let call = b.ins().call_indirect(tref, thunk, &[args_ptr]);
+            let call = call_host(module, b, HostFn::GcRoots, &[args_ptr])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
-        // §12 threads: lower `thread.spawn`/`thread.join` to indirect calls to the host scheduler
-        // thunks (addresses baked into `lower.thread`), threading `mem_base`/`fn_table_base`/`trap_out`
-        // like `call.cap`. A thunk that sets the trap cell (forged handle, thread-bomb) propagates here.
+        // §12 threads: lower `thread.spawn`/`thread.join` to calls to the host scheduler thunks
+        // ([`HostFn`]), threading `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk
+        // that sets the trap cell (forged handle, thread-bomb) propagates here.
         if let Inst::ThreadSpawn { func, sp, arg } = inst {
             // thread_spawn(sched, mem_base, fn_table_base, trap_out, func_idx:i32, sp:i64, arg:i64) -> i32
             let sched = vmctx_load(b, lower, vmctx::SCHED);
@@ -7979,18 +8306,12 @@ fn lower_block(
             let func_idx = b.ins().iconst(I32, entry as i64);
             let spv = get(&vals, *sp)?;
             let av = get(&vals, *arg)?;
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I64, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.thread.spawn_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
+            let call = call_host(
+                module,
+                b,
+                HostFn::ThreadSpawn,
                 &[sched, mem_base, fnt, trap_out, func_idx, spv, av],
-            );
+            )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8000,14 +8321,7 @@ fn lower_block(
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let h = get(&vals, *handle)?;
             let trap_out = b.use_var(lower.vmctx_var);
-            let mut tsig = module.make_signature();
-            for t in [I64, I32, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.thread.join_thunk);
-            let call = b.ins().call_indirect(tref, thunk, &[sched, h, trap_out]);
+            let call = call_host(module, b, HostFn::ThreadJoin, &[sched, h, trap_out])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8035,16 +8349,12 @@ fn lower_block(
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
             let trap_out = b.use_var(lower.vmctx_var);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.thread.wait_thunk);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[sched, phys, exp, width, to, trap_out]);
+            let call = call_host(
+                module,
+                b,
+                HostFn::ThreadWait,
+                &[sched, phys, exp, width, to, trap_out],
+            )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8055,14 +8365,7 @@ fn lower_block(
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let cnt = get(&vals, *count)?;
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.thread.notify_thunk);
-            let call = b.ins().call_indirect(tref, thunk, &[sched, phys, cnt]);
+            let call = call_host(module, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -8930,10 +9233,10 @@ fn lower_block(
             if *target as usize <= block_idx {
                 emit_domain_poll(b, lower);
             }
-            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
-                                                 // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
-                                                 // target block index is at-or-before this block's, matching the interpreters' `backedge!`
-                                                 // (`$t <= pc`). Back-edge-ness is fully static here (one target).
+            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                                  // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
+                                                  // target block index is at-or-before this block's, matching the interpreters' `backedge!`
+                                                  // (`$t <= pc`). Back-edge-ness is fully static here (one target).
             if *target as usize <= block_idx {
                 emit_fuel_check(b, lower);
             }
@@ -8961,12 +9264,12 @@ fn lower_block(
             if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
-                                                 // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
-                                                 // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
-                                                 // static per edge, but which edge is taken is a runtime value — so an edge that is a
-                                                 // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
-                                                 // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
+            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                                  // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
+                                                  // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
+                                                  // static per edge, but which edge is taken is a runtime value — so an edge that is a
+                                                  // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
+                                                  // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
             let then_be = lower.fuel && *then_blk as usize <= block_idx;
             let else_be = lower.fuel && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
@@ -9011,13 +9314,13 @@ fn lower_block(
             {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
-                                                 // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
-                                                 // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
-                                                 // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
-                                                 // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
-                                                 // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
-                                                 // `fuel_addr != 0` so an un-armed compile builds the identical table.
+            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                                  // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
+                                                  // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
+                                                  // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
+                                                  // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
+                                                  // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
+                                                  // `fuel_addr != 0` so an un-armed compile builds the identical table.
             let is_be = |t: u32| lower.fuel && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
@@ -9227,13 +9530,12 @@ fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
     // `SourceLoc` is in effect, so the call inherits it and symbolizes to the trapping op's line.
     // Only present under `-g` (else the backtrace would be empty); the trap path is otherwise
     // unchanged.
-    if let Some((sigref, addr)) = lower.trap_capture {
+    if let Some(capture) = lower.trap_capture {
         // Pass the trapping function's frame pointer so the helper can walk the caller chain without
         // `__builtin_frame_address` (which MSVC lacks); it pairs `fp` with its own return address (the
         // trap site) for the innermost frame.
         let fp = b.ins().get_frame_pointer(I64);
-        let helper = b.ins().iconst(I64, addr);
-        b.ins().call_indirect(sigref, helper, &[fp]);
+        b.ins().call(capture, &[fp]);
     }
     let cell = b.use_var(lower.vmctx_var);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
@@ -9316,26 +9618,31 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.
 }
 
-/// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag (`Host::sig_armed`)
-/// and, when set, call out to the host's decision thunk; if it returns a deliverable signal, redirect
-/// into the guest handler `void(int)` (dispatched through the §3c function table like a `call.dyn`) on
-/// the guest-registered signal stack, then notify handler-return and **re-poll** (so a signal that
-/// arrived during the handler, or a queued one exposed by unblocking, is delivered before continuing).
-/// A no-op when no signal delivery is armed (`SigEnv::null()`) — then the guest code is byte-identical
-/// to the un-armed build. Placed at the same safepoints as [`emit_epoch_check`] (function entry +
-/// every branch), so a compute-bound guest polls within a bounded number of steps and delivers its
-/// handler mid-loop — the JIT twin of the interpreters' per-op redirect (`#796` / `#1146`). The
-/// **decision** (nesting bound + consume) and **return** bookkeeping (mask restore) live in the shared
-/// `SignalSource` behind the thunks, so delivery is byte-identical to the interpreter under the
-/// differential oracle (DESIGN.md §18); only the redirect codegen is here.
+/// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag
+/// (`Host::sig_armed`) and, when set, call out to the host's decision thunk; if it returns a
+/// deliverable signal, redirect into the guest handler `void(int)` (dispatched through the §3c
+/// function table like a `call.dyn`) on the guest-registered signal stack, then notify
+/// handler-return and **re-poll** (so a signal that arrived during the handler, or a queued one
+/// exposed by unblocking, is delivered before continuing). A no-op when no signal delivery is armed
+/// ([`Lower::signals`]) — then the guest code is byte-identical to the un-armed build. Placed at
+/// the same safepoints as [`emit_epoch_check`] (function entry + every branch), so a compute-bound
+/// guest polls within a bounded number of steps and delivers its handler mid-loop — the JIT twin of
+/// the interpreters' per-op redirect (`#796` / `#1146`). The **decision** (nesting bound + consume)
+/// and **return** bookkeeping (mask restore) live in the shared `SignalSource` behind the thunks,
+/// so delivery is byte-identical to the interpreter under the differential oracle (DESIGN.md §18);
+/// only the redirect codegen is here.
 ///
 /// On return the builder is positioned at a fresh continuation block (the not-delivered path); the
 /// caller emits the real terminator / next check there. The armed flag is loaded **atomically** (as
 /// [`emit_epoch_check`] does) so Cranelift's alias analysis cannot hoist the poll out of a loop — the
 /// host sets it from another thread and the guest never stores it.
-fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lower) {
-    if !lower.sig.is_armed() {
-        return; // no signal delivery armed for this compile — emit nothing
+fn emit_signal_check(
+    module: &mut JITModule,
+    b: &mut FunctionBuilder,
+    lower: &Lower,
+) -> Result<(), JitError> {
+    if !lower.signals {
+        return Ok(()); // no signal delivery armed for this compile — emit nothing
     }
     let poll = b.create_block(); // re-poll head (revisited after a handler returns)
     let cont = b.create_block(); // the not-delivered continuation
@@ -9353,15 +9660,7 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
     let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
-    let take_sig = {
-        let mut s = module.make_signature(); // host C ABI (matches the `extern "C"` thunk)
-        s.params.push(AbiParam::new(I64)); // ctx
-        s.params.push(AbiParam::new(I64)); // out ptr
-        s.returns.push(AbiParam::new(I32)); // 1 = deliverable, 0 = not
-        b.import_signature(s)
-    };
-    let take = b.ins().iconst(I64, lower.sig.take_thunk);
-    let got = b.ins().call_indirect(take_sig, take, &[ctx, out]);
+    let got = call_host(module, b, HostFn::SigTake, &[ctx, out])?;
     let got = b.inst_results(got)[0];
     let deliver = b.create_block();
     b.ins().brif(got, deliver, &[], cont, &[]);
@@ -9390,17 +9689,12 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
     // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
     emit_trap_propagate(b, lower);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
-    let ret_sig = {
-        let mut s = module.make_signature();
-        s.params.push(AbiParam::new(I64)); // ctx
-        b.import_signature(s)
-    };
-    let retf = b.ins().iconst(I64, lower.sig.return_thunk);
     let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
-    b.ins().call_indirect(ret_sig, retf, &[ctx2]);
+    call_host(module, b, HostFn::SigReturn, &[ctx2])?;
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
     // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
+    Ok(())
 }
 
 /// Emit the safepoint-anchored **counted-fuel** decrement (INTERP_PERF.md "Fuel unification"): charge
@@ -9663,12 +9957,14 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.seal_block(cont);
 }
 
-/// Resolve the §9/D45 fast-path target for a `call.cap`, if one applies: there is a [`FastCapResolver`]
-/// (top-level compile), the op has **at most one result** (the register ABI returns a single i64), and
-/// the resolver claims this `(type_id, op)` (returns a non-null specialized fn). Returns the baked
-/// target address. Resolution is a **compile-time** call into the embedder's resolver.
-fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Option<i64> {
-    let resolver = lower.cap.fast_resolver?;
+/// Resolve the §9/D45 fast-path target for a `call.cap`, if one applies: there is a
+/// [`FastCapResolver`] (top-level compile), the op has **at most one result** (the register ABI
+/// returns a single i64), and the resolver claims this `(type_id, op)` (returns a non-null
+/// specialized fn). Returns the symbol the call names the target by ([`fast_cap_symbol`]).
+/// Resolution is a **compile-time** call into the embedder's resolver, which the code's link makes
+/// again to bind the symbol.
+fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Option<String> {
+    let resolver = lower.fast_resolver?;
     if sig.results.len() > 1 {
         return None; // the fast ABI returns a single register; multi-result falls back to the thunk
     }
@@ -9683,21 +9979,22 @@ fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Opti
             sig.params.len() as u32,
             sig.results.len() as u32,
         )
-    } as i64;
-    (target != 0).then_some(target)
+    };
+    (!target.is_null()).then(|| fast_cap_symbol(type_id, op, sig.params.len(), sig.results.len()))
 }
 
 /// Lower a `call.cap` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
-/// call to the specialized host fn at `target`, passing `ctx`/`mem_base`/`mem_size`/`handle`/`trap_out`
-/// then each argument **in a register** (widened to its i64 slot), and reading the single result back
-/// from a register — no stack-slot marshalling, no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap
-/// cell is checked exactly as in [`lower_cap_call`].
+/// call to the specialized host fn the symbol `target` names, passing
+/// `ctx`/`mem_base`/`mem_size`/`handle`/`trap_out` then each argument **in a register** (widened to
+/// its i64 slot), and reading the single result back from a register — no stack-slot marshalling,
+/// no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap cell is checked exactly as in
+/// [`lower_cap_call`].
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call_fast(
     module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
-    target: i64,
+    target: &str,
     sig: &FuncType,
     handle: u32,
     args: &[u32],
@@ -9715,26 +10012,14 @@ fn lower_cap_call_fast(
     let h = get(vals, handle)?;
     let trap_out = b.use_var(lower.vmctx_var);
 
-    // Signature: (ctx, mem_base, mem_size, handle:i32, trap_out, args…:i64) -> [i64].
-    let mut tsig = module.make_signature();
-    for t in [I64, I64, I64, I32, I64] {
-        tsig.params.push(AbiParam::new(t));
-    }
-    for _ in args {
-        tsig.params.push(AbiParam::new(I64));
-    }
-    if n_res == 1 {
-        tsig.returns.push(AbiParam::new(I64));
-    }
-    let tsigref = b.import_signature(tsig);
-
+    let tsig = fast_cap_signature(module.isa().default_call_conv(), args.len(), n_res);
     let mut call_args = vec![ctx, mem_base, mem_size, h, trap_out];
     for a in args {
         let v = get(vals, *a)?;
         call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
     }
-    let target_v = b.ins().iconst(I64, target);
-    let call = b.ins().call_indirect(tsigref, target_v, &call_args);
+    let callee = import_symbol(module, b.func, target, &tsig)?;
+    let call = b.ins().call(callee, &call_args);
 
     // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
     emit_trap_propagate(b, lower);
@@ -9747,7 +10032,7 @@ fn lower_cap_call_fast(
 }
 
 /// Lower a `call.cap` (§3c/§9): marshal the arg slots into a stack buffer, call the host
-/// thunk (a baked-in constant address) with the cap immediates + the guest window, and
+/// thunk ([`HostFn::CapThunk`]) with the cap immediates + the guest window, and
 /// — unless it set the trap cell — read the result slots back. A trap from the thunk
 /// (CapFault / Exit) propagates like any other (return early; the cell is already set).
 #[allow(clippy::too_many_arguments)]
@@ -9825,13 +10110,7 @@ fn lower_cap_call(
     let na = b.ins().iconst(I64, n_args as i64);
     let nr = b.ins().iconst(I64, n_res as i64);
     let trap_out = b.use_var(lower.vmctx_var);
-    let thunk = b.ins().iconst(I64, lower.cap.thunk_addr);
 
-    let mut tsig = module.make_signature(); // host C ABI (matches `extern "C"`)
-    for t in [I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64] {
-        tsig.params.push(AbiParam::new(t));
-    }
-    let tsigref = b.import_signature(tsig);
     let call_args = [
         ctx,
         mem_base,
@@ -9846,7 +10125,7 @@ fn lower_cap_call(
         nr,
         trap_out,
     ];
-    b.ins().call_indirect(tsigref, thunk, &call_args);
+    call_host(module, b, HostFn::CapThunk, &call_args)?;
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
@@ -9863,9 +10142,9 @@ fn lower_cap_call(
 }
 
 /// Lower a §14 `Instantiator` `call.cap` (iface 6) to the nesting runtime ([`instantiator_rt`]) — only
-/// reached when this (parent) compile has a live `Nursery` (`lower.inst.is_active()`). Each served op
+/// reached when this (parent) compile has a live `Nursery` (`lower.nesting`). Each served op
 /// (`temen_ir::served_contract`: 17 `instantiate_rec`, 1 `join`, 9/10/12 supervision, 14
-/// `child_offer`, 19 `grant`) calls its baked thunk, threading `mem_base` (the live parent window) +
+/// `child_offer`, 19 `grant`) calls its thunk, threading `mem_base` (the live parent window) +
 /// `trap_out`; a thunk that sets the trap cell (forged handle, refused spawn, child trap) propagates
 /// here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
@@ -9899,18 +10178,12 @@ fn lower_instantiator(
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I64));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
+            let call = call_host(
+                module,
+                b,
+                HostFn::InstJoin,
                 &[nursery, mem_base, h, child, status_ptr, trap_out],
-            );
+            )?;
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
             let status = b.ins().stack_load(I64, ss, 0);
@@ -9922,21 +10195,12 @@ fn lower_instantiator(
             // trap_out:i64) -> status:i32 — resolved and dispatched as `join` is.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk_addr = match op {
-                9 => lower.inst.poll_thunk,
-                10 => lower.inst.detach_thunk,
-                _ => lower.inst.kill_thunk,
+            let thunk = match op {
+                9 => HostFn::InstPoll,
+                10 => HostFn::InstDetach,
+                _ => HostFn::InstKill,
             };
-            let thunk = b.ins().iconst(I64, thunk_addr);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
+            let call = call_host(module, b, thunk, &[nursery, mem_base, h, child, trap_out])?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -9957,18 +10221,12 @@ fn lower_instantiator(
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk = b.ins().iconst(I64, lower.inst.instantiate_rec_thunk);
-            let call = b.ins().call_indirect(
-                tref,
-                thunk,
+            let call = call_host(
+                module,
+                b,
+                HostFn::InstSpawn,
                 &[nursery, mem_base, mem_size, h, record_ptr, trap_out],
-            );
+            )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -9983,20 +10241,16 @@ fn lower_instantiator(
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let arg = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
-            let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I32, I64, I64] {
-                tsig.params.push(AbiParam::new(t));
-            }
-            tsig.returns.push(AbiParam::new(I32));
-            let tref = b.import_signature(tsig);
-            let thunk_addr = match op {
-                14 => lower.inst.child_offer_thunk,
-                _ => lower.inst.child_grant_thunk,
+            let thunk = match op {
+                14 => HostFn::ChildOffer,
+                _ => HostFn::ChildGrant,
             };
-            let thunk = b.ins().iconst(I64, thunk_addr);
-            let call =
-                b.ins()
-                    .call_indirect(tref, thunk, &[nursery, mem_base, h, child, arg, trap_out]);
+            let call = call_host(
+                module,
+                b,
+                thunk,
+                &[nursery, mem_base, h, child, arg, trap_out],
+            )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

@@ -689,7 +689,7 @@ fn import_dispatch(host: &Host, packed: u32) -> Option<(u32, u32, i32)> {
 /// threads make concurrent `call.cap`s (notably `Jit.compile`, which mutates the `Host` unit
 /// registry and the live `CompiledModule`) does not data-race. `ctx` is `*const Mutex<Host>`
 /// (vs `cap_thunk`'s raw `*mut Host`), so single-threaded guests keep the unlocked `cap_thunk`
-/// and pay nothing; only a concurrent guest's run bakes *this* thunk (see [`jit_cap_run`]).
+/// and pay nothing; only a concurrent guest's run links *this* thunk (see [`jit_cap_run`]).
 ///
 /// **Re-entrancy** (the "running units compile more" case): `Jit.invoke` runs guest code that may
 /// itself `call.cap` (e.g. compile more) on the same thread, so the lock must **not** be held
@@ -1973,10 +1973,10 @@ pub fn recompact_jit(
         !old.is_running(),
         "recompact_jit is quiescent-only: no run may be in flight on the old module"
     );
-    // Single-threaded path: the fresh module bakes the unlocked `cap_thunk` + raw `Host`. A
+    // Single-threaded path: the fresh module links the unlocked `cap_thunk` over a raw `Host`. A
     // *concurrent* guest must compact through [`JitSession`] (or replicate its pattern:
     // `cap_thunk_locked` over a stable `Mutex<Host>`, then [`recompact_into`]) — re-running a fresh
-    // module that baked the unlocked thunk under threads would race (DESIGN.md §22).
+    // module that links the unlocked thunk under threads would race (DESIGN.md §22).
     let mut fresh = CompiledModule::compile(
         base,
         entry,
@@ -1997,9 +1997,9 @@ pub fn recompact_jit(
 
 /// Rebuild the domain's **live unit set** into an already-compiled `fresh` module: carry every unit
 /// still reachable (held through a live `CompiledCode` handle, [`Host::jit_live_units`], **or**
-/// occupying a `call.dyn` slot of `old`), re-`define_extra` it, remap the `Host` unit→native
-/// record (so existing handles keep resolving), and reproduce occupied slots at their **exact**
-/// index. The thunk/ctx baked into `fresh` (locked vs raw) is the caller's choice — this is the
+/// occupying a `call.dyn` slot of `old`), re-`define_extra` it, remap the `Host` unit→native record
+/// (so existing handles keep resolving), and reproduce occupied slots at their **exact** index. The
+/// thunk/ctx `fresh` is compiled with (locked vs raw) is the caller's choice — this is the
 /// thunk-agnostic half of compaction, shared by [`recompact_jit`] (raw) and [`JitSession`] (locked,
 /// concurrency-capable). Quiescent-only.
 pub fn recompact_into(

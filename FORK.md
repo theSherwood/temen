@@ -1011,9 +1011,9 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   thread-local its entry sets, so the root of a session that spawns and parks fibers compiles once
   too. A program that can drive the §22 `Jit`, whose code a unit could extend, is still compiled
   per process. The tree finds a program over the locked powerbox apart from a raw one's, since the
-  code bakes the `call.cap` thunk for the powerbox's shape. Before, sites baked the domain, and a
-  program that could wait (nim's `nanosleep` is a timed wait, #1930) could not fork. A program
-  forks only when it is bare and runs over the raw powerbox: a twin's powerbox is raw.
+  code's link binds the `call.cap` thunk for the powerbox's shape. Before, sites baked the domain,
+  and a program that could wait (nim's `nanosleep` is a timed wait, #1930) could not fork. A
+  program forks only when it is bare and runs over the raw powerbox: a twin's powerbox is raw.
 - **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
   rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
   re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its

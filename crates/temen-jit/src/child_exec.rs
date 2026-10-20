@@ -519,7 +519,7 @@ impl ChildExec {
                     .store(TrapKind::FiberFault as i64, Ordering::Relaxed);
             }
         }
-        if task._code.thread.spawn_thunk != 0 || durable {
+        if task._code.spawns || durable {
             if let Some(hub) = self.domain() {
                 let d = Arc::new(Domain::new_child(hub, task.chain.clone(), task.node.take()));
                 d.set_env(
