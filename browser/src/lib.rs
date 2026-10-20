@@ -1321,6 +1321,7 @@ extern "C" {
         over: u32,
         out: *mut i64,
         mem: i32,
+        work: *mut u64,
     ) -> i32;
     fn x2_invoke(
         code: i32,
@@ -1443,8 +1444,10 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let ptr: X2Call = unsafe { std::mem::transmute(ptr) };
     let outer = X2_CALL.with(|c| c.replace(Some(ptr)));
     X2_BOUNCE_TRAP.with(|t| t.set(None));
-    // SAFETY: `argv`, `out`, the unit's bytes and types are live for the call; `win` and `over` are
-    // this run's.
+    // #2474: the fuel the emitted code burns, which the Worker counts.
+    let mut work = 0u64;
+    // SAFETY: `argv`, `out`, `work`, the unit's bytes and types are live for the call; `win` and
+    // `over` are this run's.
     let n = unsafe {
         match &unit {
             Err((module, func)) => x2_tierup(
@@ -1457,6 +1460,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
                 over,
                 out.as_mut_ptr(),
                 mem,
+                &mut work,
             ),
             Ok((code, wasm, types, nparams, nresults)) => x2_invoke(
                 *code,
@@ -1479,6 +1483,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
         return Err(bounced.unwrap_or_else(|| emitted_trap(-(n + 1))));
     }
     call.results = out[..n as usize].to_vec();
+    call.work = work;
     Ok(())
 }
 
@@ -1713,8 +1718,8 @@ pub extern "C" fn temen_x2_thread(start: *mut bytecode::ThreadStart) {
 /// window from offset 0 before the data segments: the unit blobs a runtime-compile guest reads.
 ///
 /// With `tierup` set, a module-0 task's calls to the functions the coop driver's region emit takes
-/// ([`coop_emit_for`], its tier-up floor included: [`temen_coop_set_tierup_floor`]) run on it, each
-/// on its thread's Worker, and the run is of the module that emit outlined. With §22 codegen on
+/// ([`coop_emit_for`], when [`temen_coop_set_hotness`] says) run on it, each on its thread's
+/// Worker, and the run is of the module that emit outlined. With §22 codegen on
 /// ([`temen_par_jit_set_codegen`]), a guest's `Jit.invoke` of a unit with emitted wasm runs it there
 /// too, its `call.dyn`s reaching the run's dispatch table through each Worker's mirror of it. The
 /// emitted code addresses the root's window as one span, so then the window is a flat one of the
@@ -1759,10 +1764,7 @@ pub extern "C" fn temen_x2_start(
         Some(e) => {
             // A local-table emit leaves the run's table as it is.
             let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
-            (
-                e.m,
-                Some((e.wasm, e.eligible, table_log2, e.paged, e.spill)),
-            )
+            (e.m, Some((e.wasm, e.emit, table_log2, e.spill)))
         }
         None => (m, None),
     };
@@ -1819,8 +1821,8 @@ pub extern "C" fn temen_x2_start(
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, eligible, table_log2, paged, spill) =
-            regions.unwrap_or_else(|| (Vec::new(), vec![false; m.funcs.len()], 0, false, false));
+        let (wasm, emit, table_log2, spill) =
+            regions.unwrap_or_else(|| (Vec::new(), bytecode::ProgramEmit::default(), 0, false));
         // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
         host.set_jit_table_log2(table_log2);
         // The units emit as the coop driver's do, over this run's window and table, or none does
@@ -1843,8 +1845,7 @@ pub extern "C" fn temen_x2_start(
         let programs = (tierup != 0).then(Programs::default);
         *X2_PROGRAMS.lock().unwrap_or_else(|e| e.into_inner()) = programs.clone();
         platform.tier = Some(bytecode::ThreadTier {
-            eligible: eligible.into(),
-            page_checked: paged,
+            root: emit,
             // Each thread's spill stack is the size of the coop run's.
             spill: if spill { COOP_SPILL_BYTES / 8 } else { 0 },
             modules: programs.map(|p| module_emitter(p, true, true)),
@@ -2664,7 +2665,7 @@ static ONRAMP_GRANT_INSTANTIATOR: std::sync::atomic::AtomicBool =
 
 /// #816: opt subsequent on-ramp opens (plain, coop, JIT alike — every path through
 /// [`grant_onramp_caps`]) in or out of the `"instantiator"` grant. A test/embedder knob, exactly
-/// like [`temen_coop_set_tierup_floor`]; the playground leaves it at its default.
+/// like [`temen_coop_set_hotness`]; the playground leaves it at its default.
 #[no_mangle]
 pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
     ONRAMP_GRANT_INSTANTIATOR.store(on != 0, std::sync::atomic::Ordering::Relaxed);
@@ -5485,11 +5486,10 @@ struct WarmCoop {
 }
 
 /// A warm session's region emit ([`WarmCoop::regions`]): the [`coop_emit_for`] outputs, with the
-/// wasm and eligibility in shared form (cloned per Run as cheap `Arc`s).
+/// wasm in shared form (cloned per Run as a cheap `Arc`).
 struct WarmRegions {
     wasm: std::sync::Arc<[u8]>,
-    eligible: std::sync::Arc<[bool]>,
-    paged: bool,
+    emit: bytecode::ProgramEmit,
     all_shimmable: bool,
     table_log2: u8,
     jit_importer: bool,
@@ -5887,8 +5887,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
             Ok(e) => {
                 wc.regions = Some(WarmRegions {
                     wasm: e.wasm.into(),
-                    eligible: e.eligible.into(),
-                    paged: e.paged,
+                    emit: e.emit,
                     all_shimmable: e.all_shimmable,
                     table_log2: e.table_log2,
                     jit_importer: e.jit_importer,
@@ -5915,10 +5914,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
-        root: bytecode::ProgramEmit {
-            eligible: std::sync::Arc::clone(&r.eligible),
-            page_checked: r.paged,
-        },
+        root: r.emit.clone(),
         leaf: None,
         modules: None,
     };
@@ -5957,7 +5953,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
                 .map(|f| (f.params.clone(), f.results.clone()))
                 .collect(),
             frame,
-            paged: r.paged,
+            paged: r.emit.page_checked,
             spill: spill_region(r.spill),
             ..CoopTierupRun::over(run)
         });
@@ -10770,15 +10766,25 @@ static TIERUP_UNIT_WIN_LOG2: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(ONRAMP_JIT_TABLE_LOG2);
 
-/// #1026 slice 4 — the **leaf tier-up size floor** (estimated emitted bytes): a leaf below it stays
-/// on the interpreter rather than tiering up, because the interp↔wasm crossing per call outweighs
-/// what so small an emitted body saves (measured net loss on every dispatch-heavy card, #1026). The
-/// production default is [`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]; [`temen_coop_open`] reads
-/// this when building its eligibility bitmap. Overridable via [`temen_coop_set_tierup_floor`] so the
-/// differential harness can exercise the emitted **mechanism** with tiny guests (floor 0) separately
-/// from this size **policy**, and `bench_tierup_cards.mjs` can sweep the floor in one build.
-static COOP_TIERUP_FLOOR: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+/// #2474 — when a coop run's calls tier up ([`bytecode::Hotness`]): a crossing into emitted code costs
+/// about 2 µs whatever the callee does (#1026), so only a call doing enough work repays it. Every
+/// emit an open makes reads it ([`coop_emit_for`], [`emit_module`]). [`temen_coop_set_hotness`] sets
+/// it, so the harness can exercise the emitted **mechanism** with tiny guests (`0, 0`: every
+/// eligible call) apart from this **policy**, and `bench_tierup_cards.mjs` can sweep it in one
+/// build.
+static COOP_HOTNESS: std::sync::Mutex<bytecode::Hotness> = std::sync::Mutex::new(COOP_HOT);
+
+/// The production [`COOP_HOTNESS`], calibrated with `bench_tierup_cards.mjs`, #2443's fork-join pair
+/// and the loop helper (#2474).
+const COOP_HOT: bytecode::Hotness = bytecode::Hotness {
+    per_call: 16,
+    window: 8,
+};
+
+/// [`COOP_HOTNESS`] now.
+fn coop_hotness() -> bytecode::Hotness {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The wasm emitter the tier-up driver installs for a `vm_jit_*`-importing guest (#835/#846), and
 /// the parallel driver for a run whose §22 units run emitted (`temen_x2_start`):
@@ -11208,11 +11214,6 @@ impl CoopTierupRun {
 
 static mut COOP_RUN: Option<CoopTierupRun> = None;
 
-/// #1026 slice 4 — override the leaf tier-up size floor (estimated emitted bytes) for subsequent
-/// [`temen_coop_open`]s; takes effect at the next open. `bytes == 0` disables the floor entirely (any
-/// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
-/// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
-/// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
 /// Host policy (#1384): override the emitter's per-function size cap
 /// (`temen_wasm_jit::MAX_EST_EMITTED_FN_BYTES`, estimated emitted bytes above which a function stays
 /// on the interpreter) for subsequent opens; `0` restores the default. The default guards the engine's
@@ -11223,14 +11224,38 @@ pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
     temen_wasm_jit::set_max_est_emitted_fn_bytes(bytes);
 }
 
+/// #2474 — set when the calls of subsequent opens' runs tier up ([`COOP_HOTNESS`]): a function's
+/// calls tier up from the first, until `window` of them in a row average under `per_call` work, on
+/// either tier, and again once `window` of them average that. Work is the fuel a call burns: one
+/// unit per taken back edge and per call, its callees' included. `per_call` 0 tiers up every
+/// eligible call. [`temen_coop_reset_hotness`] restores the default.
 #[no_mangle]
-pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
-    COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
+pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32) {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = bytecode::Hotness {
+        per_call: per_call.into(),
+        window,
+    };
+}
+
+/// #2474 — the work the pending TIERUP's emitted call did, the fuel its code burned: call before
+/// [`temen_coop_deliver`].
+#[no_mangle]
+pub extern "C" fn temen_coop_set_emitted_work(work: u64) {
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        s.run.set_emitted_work(work);
+    }
+}
+
+/// #2474 — restore the production [`COOP_HOTNESS`] after [`temen_coop_set_hotness`].
+#[no_mangle]
+pub extern "C" fn temen_coop_reset_hotness() {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = COOP_HOT;
 }
 
 /// The cooperative tier-up **emit decision** for a guest module — everything [`temen_coop_open`]
 /// and the warm-coop open ([`temen_warm_coop_open`]) share before a run exists: the outlining, the
-/// B2/paged mode gates, the wasm emit, and the eligibility bitmap. Returned as one bundle so both
+/// B2/paged mode gates, the wasm emit, and what its tasks tier up into. Returned as one bundle so both
 /// opens use the SAME outlined module for both tiers (slot numbering must stay consistent between
 /// the emitted mask, the engine table, and the driver's shims). `Err(status)` on an unsupported
 /// shape (the caller falls back to its interpreter path).
@@ -11239,8 +11264,8 @@ struct CoopEmit {
     /// emitted wasm's masks/table were built from it, the shim generator reads its `sigs`.
     m: temen_ir::Module,
     wasm: Vec<u8>,
-    eligible: Vec<bool>,
-    paged: bool,
+    /// What the run's tasks tier up into, and when. Its `page_checked` is the emit's paged mode.
+    emit: bytecode::ProgramEmit,
     all_shimmable: bool,
     table_log2: u8,
     jit_importer: bool,
@@ -11348,31 +11373,22 @@ fn coop_emit_for(
     let Ok((wasm, emit)) = emitted_res else {
         return Err(STATUS_UNSUPPORTED);
     };
-    // A function is an **emittable leaf** iff the emitter emitted it with an all-i64 signature (the
-    // i64-slot transport the host marshals by) — exactly the single-vCPU gate. It actually **tiers
-    // up** only if it *also* clears the #1026 leaf tier-up size floor: below it, the interp↔wasm
-    // crossing per call costs more than so small an emitted body saves over interpreting it inline —
-    // a net loss on every dispatch-heavy card. A sub-floor leaf stays *emitted* (an emitted sibling
-    // still calls it natively, no crossing) — only the interpreter's decision to tier *up* into it is
-    // suppressed. Whole-program (no per-leaf crossing) and the `vm_jit_*` unit path (`jit_importer`
-    // below) are untouched.
-    let (emittable_leaf, eligible) = tierup_eligible(&m, &emit);
-    // #835/#926: a `vm_jit_*` importer stays worth opening even with no emittable leaf — its win is
-    // the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
-    // neither an emittable leaf nor a jit importer has nothing for the emitted tier to ever run →
-    // decline (the plain interpreter serves it), exactly as before #1026 slice 4. A guest *with* an
-    // emittable leaf that the size floor gated still opens: coop runs it on its cooperative
-    // interpreter (measured faster than the plain fallback) with zero tier-ups — the "leaves off,
-    // same open" the #1026 bench compares, not a decline to the slower plain path.
+    // What the run's calls tier up into, and when: the hotness rule weighs each call's crossing
+    // against the work it does (#2474). Emitted code calls its emitted callees natively, whatever the
+    // rule says.
+    let eligible = tierup_eligible(&emit_m, &emit);
+    // #835/#926: a `vm_jit_*` importer stays worth opening even with no eligible function — its win
+    // is the runtime-compiled §22 units running emitted (the JACL macro-staging shape). A guest with
+    // neither has nothing for the emitted tier to ever run → decline (the plain interpreter serves
+    // it).
     let jit_importer = m.imports.iter().any(|im| im.name.starts_with("vm_jit_"));
-    if !emittable_leaf.iter().any(|&e| e) && !jit_importer {
+    if !eligible.contains(&true) && !jit_importer {
         return Err(STATUS_UNSUPPORTED);
     }
     Ok(CoopEmit {
         m,
         wasm,
-        eligible,
-        paged,
+        emit: program_emit(eligible, paged),
         all_shimmable,
         table_log2,
         jit_importer,
@@ -11380,25 +11396,26 @@ fn coop_emit_for(
     })
 }
 
-/// The functions of `m` a coop run tiers up into, given what its emit emitted (`emit`): first those
-/// emitted with an all-`i64` signature, the emittable leaves; then those of them over the tier-up
-/// size floor (#1026), the eligible ones.
-fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> (Vec<bool>, Vec<bool>) {
+/// The functions of emitted module `m` a coop run tiers up into, given what its emit emitted
+/// (`emit`): those emitted with an all-`i64` signature, the slots a tier-up's operands and results
+/// travel in.
+fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
     let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
-    let floor = COOP_TIERUP_FLOOR.load(std::sync::atomic::Ordering::Relaxed);
-    let emittable_leaf: Vec<bool> = m
-        .funcs
+    m.funcs
         .iter()
-        .enumerate()
-        .map(|(i, f)| emit[i] && all_i64(&f.params) && all_i64(&f.results))
-        .collect();
-    let eligible = m
-        .funcs
-        .iter()
-        .zip(&emittable_leaf)
-        .map(|(f, &leaf)| leaf && temen_wasm_jit::est_emitted_size(f) >= floor)
-        .collect();
-    (emittable_leaf, eligible)
+        .zip(emit)
+        .map(|(f, &e)| e && all_i64(&f.params) && all_i64(&f.results))
+        .collect()
+}
+
+/// What a coop run's tasks tier up into: the functions `eligible` makes so, when [`COOP_HOTNESS`]
+/// says, over a page-checked emit if `paged`.
+fn program_emit(eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
+    bytecode::ProgramEmit {
+        eligible: eligible.into(),
+        page_checked: paged,
+        hot: coop_hotness(),
+    }
 }
 
 /// #2248 — a session's emitter for the granted modules its children run: it emits a module's
@@ -11442,20 +11459,16 @@ fn emit_module(
     parks: bool,
 ) -> Option<(std::sync::Arc<[u8]>, bytecode::ProgramEmit)> {
     m.memory?;
-    let paged = m.data.iter().any(|d| d.readonly)
-        || temen_wasm_jit::module_uses_addr_space_page_ops(m);
+    let paged =
+        m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_addr_space_page_ops(m);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let page_log2 = paged.then_some(page_log2);
     let (wasm, emit) =
         temen_wasm_jit::compile_module_tierup_live(m, shared, page_log2, parks).ok()?;
-    let (_, eligible) = tierup_eligible(m, &emit);
-    eligible.contains(&true).then(|| {
-        let emit = bytecode::ProgramEmit {
-            eligible: eligible.into(),
-            page_checked: paged,
-        };
-        (wasm.into(), emit)
-    })
+    let eligible = tierup_eligible(m, &emit);
+    eligible
+        .contains(&true)
+        .then(|| (wasm.into(), program_emit(eligible, paged)))
 }
 
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
@@ -11643,8 +11656,7 @@ pub extern "C" fn temen_coop_open(
     let CoopEmit {
         m,
         wasm,
-        eligible,
-        paged,
+        emit,
         all_shimmable,
         table_log2,
         jit_importer,
@@ -11681,13 +11693,11 @@ pub extern "C" fn temen_coop_open(
     }
     // #2248: the granted modules this run's children run are emitted as it meets them.
     let programs = Programs::default();
+    // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
+    // fidelity `scalar_extent` cannot, as on the pump.
+    let paged = emit.page_checked;
     let tierup = bytecode::TierUpConfig {
-        root: bytecode::ProgramEmit {
-            eligible: std::sync::Arc::from(eligible.into_boxed_slice()),
-            // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table
-            // carries the fidelity `scalar_extent` cannot, as on the pump.
-            page_checked: paged,
-        },
+        root: emit,
         leaf: None,
         modules: Some(module_emitter(programs.clone(), shared != 0, false)),
     };

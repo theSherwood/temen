@@ -20,12 +20,13 @@ use temen_browser::{
     temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_open_fs, temen_coop_paged, temen_coop_pagestate_len,
-    temen_coop_pagestate_ptr, temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr,
-    temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr,
-    temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
-    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
-    temen_coop_win_len, temen_coop_win_ptr, temen_framebuffer_height, temen_framebuffer_len,
-    temen_framebuffer_ptr, temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
+    temen_coop_pagestate_ptr, temen_coop_reset_hotness, temen_coop_run,
+    temen_coop_set_emitted_work, temen_coop_set_hotness, temen_coop_shim_ptr, temen_coop_shim_wasm,
+    temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr, temen_coop_table_gen,
+    temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
+    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_framebuffer_height, temen_framebuffer_len, temen_framebuffer_ptr,
+    temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
     temen_onramp_frame_begin, temen_onramp_freeze, temen_onramp_key, temen_onramp_moment_free,
     temen_onramp_moment_restore, temen_onramp_moment_take, temen_onramp_open, temen_onramp_open_fs,
     temen_onramp_set_grant_instantiator, temen_onramp_thaw, temen_onramp_timeline_begin_tick,
@@ -59,23 +60,22 @@ mod rec;
 /// in this binary across them.
 static FFI_LOCK: Mutex<()> = Mutex::new(());
 
-/// Acquire [`FFI_LOCK`] and disable the #1026 leaf tier-up **size floor** for this test. These
+/// Acquire [`FFI_LOCK`] and tier up every eligible call at its start for this test (#2474). These
 /// differentials exercise the emitted-tier **mechanism** with deliberately tiny synthetic leaves; the
-/// size **policy** (a leaf below the floor stays on the interpreter) is pinned separately in
-/// [`leaf_tierup_size_floor_gates_tiny_and_admits_heavy`]. Floor 0 ⇒ any emittable leaf tiers up, the
-/// behavior these tests were written against. The guard resets to production default on drop so a
+/// **policy** (a call tiers up once the work it does repays the crossing) is pinned separately in
+/// [`calls_tier_up_on_the_work_they_do`]. The guard restores the production default on drop so a
 /// test that does *not* call this (the policy test) sees the real default even after one that did.
-fn ffi_guard() -> FloorGuard {
+fn ffi_guard() -> HotnessGuard {
     let g = FFI_LOCK.lock().unwrap();
-    temen_coop_set_tierup_floor(0);
-    FloorGuard(g)
+    temen_coop_set_hotness(0, 0);
+    HotnessGuard(g)
 }
 // The `MutexGuard` is held purely for its lifetime/Drop (it keeps `FFI_LOCK` locked for the test and
-// resets the floor on drop), never read — so the field trips `dead_code` under `-D warnings`.
-struct FloorGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-impl Drop for FloorGuard {
+// restores the default on drop), never read — so the field trips `dead_code` under `-D warnings`.
+struct HotnessGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+impl Drop for HotnessGuard {
     fn drop(&mut self) {
-        temen_coop_set_tierup_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
+        temen_coop_reset_hotness();
     }
 }
 
@@ -226,7 +226,14 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
     params.extend(argv.iter().map(|a| Val::I64(*a)));
     let mut results: Vec<Val> = (0..n_results).map(|_| Val::I64(0)).collect();
+    // #2474: the work the call does is the fuel its code burns, which the driver reports.
+    let fuel = instance.get_global(&store, "fuel");
+    let armed = fuel.map(|g| g.get(&store).i64().unwrap_or(0));
     let ran = f.call(&mut store, &params, &mut results);
+    if let (Some(g), Some(armed)) = (fuel, armed) {
+        let left = g.get(&store).i64().unwrap_or(armed);
+        temen_coop_set_emitted_work(armed.saturating_sub(left).max(0) as u64);
+    }
 
     // Copy emitted writes back into the live window before the task resumes.
     mirror_out(&store);
@@ -685,40 +692,125 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
     temen_coop_close();
 }
 
-/// #1026 slice 4 — the leaf tier-up **size floor** gates strictly by [`temen_wasm_jit::est_emitted_size`]:
-/// the same guest tiers up when the floor is at-or-below its leaf's estimated body and stays on the
-/// interpreter when the floor is one byte above — with **identical** guest-observable results either
-/// way (INVARIANTS.md #9: the gate changes which tier runs, never the semantics). Pins that a
-/// dispatch-heavy card's tiny leaves (far below the production default) will not tier up, while a
-/// genuinely heavy leaf still does — the "decision in one place" #1026 asks for.
+/// A guest whose `_start` makes one call of function 1, which counts to 50 000 in a loop and returns
+/// the sum of the counts, then writes it to stdout.
+fn one_long_call_text() -> String {
+    let out_h = onramp_out_handle();
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vn = i64.const 50000
+  vr = call 1 (vn)
+  vsl = i64.const {SLOT}
+  i64.store vsl vr
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  v0 = i64.const 0
+  br 1(vn, v0, v0)
+}}
+block 1 (vm: i64, vk: i64, vs: i64) {{
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vs) 3(vs)
+}}
+block 2 (am: i64, ak: i64, as: i64) {{
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as ak
+  br 1(am, ak1, as1)
+}}
+block 3 (rs: i64) {{
+  return rs
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// A guest whose `_start` calls function 1 40 times in a loop, then writes the sum of the results to
+/// stdout. Function 1 counts to `iters` in a loop and returns the sum of the counts.
+fn many_calls_text(iters: u32) -> String {
+    let out_h = onramp_out_handle();
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 0
+  br 1(v0, v0)
+}}
+block 1 (vk: i64, vs: i64) {{
+  vn = i64.const 40
+  vlt = i64.lt_s vk vn
+  br_if vlt 2(vk, vs) 3(vs)
+}}
+block 2 (ak: i64, as: i64) {{
+  vi = i64.const {iters}
+  vr = call 1 (vi)
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as vr
+  br 1(ak1, as1)
+}}
+block 3 (rs: i64) {{
+  vsl = i64.const {SLOT}
+  i64.store vsl rs
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return rs
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  v0 = i64.const 0
+  br 1(vn, v0, v0)
+}}
+block 1 (vm: i64, vk: i64, vs: i64) {{
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vs) 3(vs)
+}}
+block 2 (am: i64, ak: i64, as: i64) {{
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as ak
+  br 1(am, ak1, as1)
+}}
+block 3 (rs: i64) {{
+  return rs
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// #2474 — a coop run's calls tier up on the work they do ([`temen_coop_set_hotness`]), with
+/// **identical** guest-observable results whichever tier runs them (INVARIANTS.md #9):
+/// - At the production default every eligible function starts tiering up: each of
+///   [`coop_guest_text`]'s tasks tiers its one call up, and one long call tiers up at its start.
+/// - A function whose calls turn out light backs off after one window of them: of 40 calls that each
+///   count to 2, the first window's tier up and the rest interpret. Calls that each count to 1000
+///   repay the crossing, as their host reports the fuel they burned, so all 40 tier up.
+/// - At `0, 0` every eligible call tiers up, light or not.
 #[test]
-fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
-    let _g = ffi_guard(); // resets the floor to the production default on drop
-    let m = temen_text::parse_module(&coop_guest_text()).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let bytes = temen_encode::encode_module(&m);
-    // The floor is compared against the *outlined* module the open builds its eligibility from
-    // (`outline_cap_calls` runs first), so compute the leaf's estimate on the same shape.
-    let leaf_sz = {
-        let mut outlined = m.clone();
-        temen_wasm_jit::outline_cap_calls(&mut outlined);
-        temen_wasm_jit::est_emitted_size(&outlined.funcs[2])
-    };
-    assert!(
-        leaf_sz < temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES,
-        "the synthetic leaf ({leaf_sz}B) must sit below the production default \
-         ({}B) — so the default gates it, as it gates every dispatch-heavy card's leaves",
-        temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES
-    );
-
-    let want = onramp_exec_root(&m, b"");
-    assert_eq!(want.status, STATUS_OK, "oracle sanity");
-    assert_eq!(want.value, 38, "oracle: f(3) + f(5) = 16 + 22 = 38");
-
-    // Drive the guest to completion at a given floor, returning the tier-up count. Parity with the
-    // oracle is asserted on every arm — the gate must never change the result.
-    let drive_at_floor = |floor: usize| -> u32 {
-        temen_coop_set_tierup_floor(floor);
+fn calls_tier_up_on_the_work_they_do() {
+    // The guard restores the production default on drop.
+    let _g = ffi_guard();
+    // Drive `src` to completion, returning the functions its tier-ups named. Parity with the oracle
+    // is asserted on every arm: the rule changes which tier runs, never the result.
+    let drive = |src: &str, what: &str| -> Vec<i32> {
+        let m = temen_text::parse_module(src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
+        let want = onramp_exec_root(&m, b"");
+        assert_eq!(want.status, STATUS_OK, "oracle sanity ({what})");
         let opened = temen_coop_open(
             bytes.as_ptr(),
             bytes.len(),
@@ -729,65 +821,61 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
             0,
             0,
         );
-        assert_eq!(opened, 0, "open (floor {floor}) status {}", temen_status());
-        let n_results = m.funcs[2].results.len();
-        let mut tierups = 0u32;
+        assert_eq!(opened, 0, "open ({what}) status {}", temen_status());
+        let mut tierups = Vec::new();
         loop {
             match temen_coop_run() {
                 COOP_RUN_TIERUP => {
-                    tierups += 1;
-                    assert!(tierups < 50, "runaway tier-ups");
-                    // The worker's entry f1 is the leaf's size, and tiers up with it (#1414 ED-1).
-                    assert!(
-                        matches!(temen_coop_func(), 1 | 2),
-                        "only the worker's entry and the leaf can tier up"
-                    );
-                    match service_coop_on_wasmi(n_results) {
+                    tierups.push(temen_coop_func());
+                    assert!(tierups.len() < 50, "runaway tier-ups ({what})");
+                    match service_coop_on_wasmi(1) {
                         Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
                         Err(code) => temen_coop_deliver_trap(code),
                     }
                 }
                 COOP_RUN_DONE => break,
-                ev => panic!(
-                    "unexpected event {ev} (floor {floor}, status {})",
-                    temen_status()
-                ),
+                ev => panic!("unexpected event {ev} ({what}, status {})", temen_status()),
             }
         }
-        assert_eq!(temen_status(), want.status, "status parity (floor {floor})");
-        assert_eq!(
-            temen_coop_value(),
-            want.value,
-            "value parity (floor {floor})"
-        );
+        assert_eq!(temen_status(), want.status, "status parity ({what})");
+        assert_eq!(temen_coop_value(), want.value, "value parity ({what})");
         // SAFETY: DONE-arm capture slots; sole accessor under FFI_LOCK.
         let got_out =
             unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
-        assert_eq!(got_out, want.stdout, "stdout parity (floor {floor})");
+        assert_eq!(got_out, want.stdout, "stdout parity ({what})");
         temen_coop_close();
         tierups
     };
 
-    // A floor comfortably below the leaf's estimate ⇒ eligible (the predicate is `>=`) ⇒ the root's
-    // `call 2` and the worker's entry tier up. (Floors are held off the exact estimate to stay
-    // robust to a byte or two of encode/outline drift between here and the open.)
+    let light = coop_guest_text();
+    temen_coop_reset_hotness();
+    let mut first = drive(&light, "light calls, the default");
+    first.sort_unstable();
     assert_eq!(
-        drive_at_floor(leaf_sz / 2),
-        2,
-        "a floor below the leaf est size admits it (root + worker tier up)"
+        first,
+        [1, 2],
+        "the worker's entry and the root's call of the leaf, before either is seen"
     );
-    // A floor a few times the leaf ⇒ gated ⇒ the interpreter runs the leaf inline, zero crossings,
-    // same result — the size comparison, not an on/off switch.
     assert_eq!(
-        drive_at_floor(leaf_sz * 4),
-        0,
-        "a floor above the leaf est size suppresses its tier-up"
+        drive(&one_long_call_text(), "one long call, the default"),
+        [1],
+        "the long call tiers up at its start"
     );
-    // And the production default (well above any dispatch leaf) gates it too.
     assert_eq!(
-        drive_at_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES),
-        0,
-        "the production default gates this dispatch-leaf-sized function"
+        drive(&many_calls_text(2), "many light calls, the default"),
+        [1; 8],
+        "the callee backs off after a window of calls too light to repay a crossing"
+    );
+    assert_eq!(
+        drive(&many_calls_text(1000), "many heavy calls, the default"),
+        [1; 40],
+        "the callee's emitted calls repay the crossing, so it stays hot"
+    );
+    temen_coop_set_hotness(0, 0);
+    assert_eq!(
+        drive(&many_calls_text(2), "many light calls, every call"),
+        [1; 40],
+        "every call tiers up"
     );
 }
 
@@ -3598,9 +3686,9 @@ fn coop_forth_thread_words_decline_to_the_oracle() {
 
 /// #816: opt the on-ramp powerbox into the `"instantiator"` grant for this test, resetting on drop
 /// (panic-safe) so no other test's guest inherits spawn authority. Composes with [`ffi_guard`]
-/// (holds the FFI lock + zeroes the tier-up floor first).
-// The inner `FloorGuard` is held purely for its Drop (resets the instantiator grant), never read.
-struct InstantiatorGuard(#[allow(dead_code)] FloorGuard);
+/// (holds the FFI lock + tiers up every eligible call first).
+// The inner `HotnessGuard` is held purely for its Drop (resets the instantiator grant), never read.
+struct InstantiatorGuard(#[allow(dead_code)] HotnessGuard);
 fn instantiator_guard() -> InstantiatorGuard {
     let g = ffi_guard();
     temen_onramp_set_grant_instantiator(1);
