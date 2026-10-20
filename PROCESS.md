@@ -642,13 +642,15 @@ with `-EAGAIN`, and every twin the providers before it minted is abandoned, so n
 >
 > **The pager is typed (#744, 2026-10-07):** a record's `pager` must name an impl export of exactly
 > `{ page: (i64) -> (i64) }` (`Module::is_pager_export`), the one shape the fault's dispatch serves;
-> naming any other export fails the spawn closed. Demand paging runs on both interpreters: the
-> tree-walker, and the bytecode engine's drivers that serve their children, the cooperative pump
-> and the parallel driver (#2164). There a fault is a `page(addr)` request into the spawner's
-> serve loop, and the faulting op re-executes once the page is in place. The bytecode engine's
-> debug scheduler and `Vcpu` serve no child, so they decline a module that could page one, to the
-> oracle. The Cranelift JIT refuses a pager record, and a module that could build one leaves it
-> for the bytecode engine (#2164).
+> naming any other export fails the spawn closed. Demand paging runs on every engine: the
+> tree-walker, the bytecode engine's drivers that serve their children, the cooperative pump and
+> the parallel driver, and the Cranelift JIT (#2164). A fault is a `page(addr)` request into the
+> spawner's serve loop. On the interpreters the faulting op re-executes once the page is in place.
+> The JIT takes no fault: a paged child's compile tests an access table before each access, and a
+> miss requests the page and waits for it before the access runs. Every engine parks the whole
+> vCPU for a page, from a guest fiber too: its resumer never sees `FIBER_PARKED`. The bytecode
+> engine's debug scheduler and `Vcpu` serve no child, so they decline a module that could page
+> one, to the oracle. A durable run pages on the tree-walker only (DURABILITY.md §4, #2489).
 >
 > **A paged child is durable (#2438, owner 2026-10-15):** its pager rides its launch record across
 > a freeze, and the thaw re-links its faults to it (DURABILITY.md §4). The pager supplies the guest's
@@ -664,9 +666,10 @@ Two different things surface as "SIGSEGV" and the design splits them:
   tree, for the benefit of a guest probing its confinement. Post-mortem observation is
   covered (trap kind + backtrace to the parent — `jit_trap_backtrace`).
 - **In-window memory-management faults (unmapped / protected page)** — a *resumable
-  event* (on the interpreters; #2164 for the Cranelift JIT): a demand-paged child's fault
-  suspends it with the fault address, the pager supplies the page, and **resume retries
-  the access**. Retry-on-resume is the trick:
+  event* on the interpreters: a demand-paged child's fault suspends it with the fault
+  address, the pager supplies the page, and **resume retries the access**. (The Cranelift
+  JIT checks before the access instead, so it never takes the fault, #2164.) Retry-on-resume
+  is the trick:
   precise fault handling with no per-access deoptimization metadata — the tax that
   makes in-band SIGSEGV handlers expensive in a JIT, and which Cranelift won't sell
   cheaply. The pager's side is a plain serve loop, and it never outlives its client

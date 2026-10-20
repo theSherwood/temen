@@ -87,7 +87,7 @@ fn spawn_child(parent: &mut Host, grants: &[(String, i32)]) -> Option<(Host, i32
         bytes: 1 << 16,
         runs: WINDOW_RUNS,
     };
-    parent.spawn_detached_child(grants, 1 << 16, lease, -1)
+    parent.spawn_detached_child(grants, 1 << 16, lease, -1, false)
 }
 
 #[test]

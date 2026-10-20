@@ -372,6 +372,7 @@ fn paged_tierup(eligible: Vec<bool>) -> TierUpConfig {
         root: ProgramEmit {
             eligible: Arc::from(eligible),
             page_checked: true,
+            ..Default::default()
         },
         leaf: None,
         modules: None,

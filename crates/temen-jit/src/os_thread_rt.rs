@@ -249,11 +249,24 @@ pub enum HostPark {
     Ended,
 }
 
+/// #2164 — whose park a host call's is ([`park_host_call`]).
+#[cfg(not(loom))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Parks {
+    /// The calling fiber's alone: a guest fiber yields `FIBER_PARKED` to its resumer, which runs on
+    /// (#1952). A host call's park, on every engine.
+    Fiber,
+    /// The calling vCPU's, whatever fiber it is in: a demand-paged child's page fault, which blocks
+    /// its whole vCPU on every engine, as a join does (#2322).
+    Vcpu,
+}
+
 /// #1826 — park the calling fiber's host call until `still_parked` turns false. Fiber 0 parks its
 /// vCPU on `key` through the run's futex hub ([`futex_wait`]), so it has the futex wait's every exit:
 /// a kill, the domain's teardown, a freeze (`WAIT_FROZEN`), and deadlock detection (no live vCPU left
-/// to end it); a [`wake_host_parks`] on `key` re-checks it. Any other fiber parks alone (#1952). `still_parked` must not take the `Host` (a waker holds
-/// it while it takes the futex lock): it reads state the host shares, such as a pipe's FIFO.
+/// to end it); a [`wake_host_parks`] on `key` re-checks it. Any other fiber parks as `parks` says:
+/// alone, or with its vCPU. `still_parked` must not take the `Host` (a waker holds it while it takes
+/// the futex lock): it reads state the host shares, such as a pipe's FIFO.
 ///
 /// A durable run's deferred children run first ([`Domain::drive_deferred_before_park`]): one of
 /// them may be what ends the park. The caller holds no lock the run's other vCPUs need.
@@ -266,21 +279,29 @@ pub unsafe fn park_host_call(
     trap_out: *mut i64,
     unwind_base: u64,
     key: u64,
+    parks: Parks,
     still_parked: impl Fn() -> bool,
 ) -> HostPark {
     let vm = crate::vmctx::VmCtx::of_trap_out(trap_out);
     let frozen = || unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
     // #1952 — a fiber's park takes the fiber alone: it yields `FIBER_PARKED` to its resumer, which
     // runs on, and re-checks each time a `cont.resume` polls it. It parks before the first re-check,
-    // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives.
-    if let Some(slot) = fiber_rt::current_fiber_slot() {
+    // for the one transient `FIBER_PARKED` the oracle's register-then-recheck gives. A vCPU's park
+    // in a task parks every context up to the task's own (`fiber_rt::fiber_resume`); on an OS vCPU
+    // it blocks in place, below.
+    let on = match parks {
+        Parks::Fiber => fiber_rt::ParkOn::Event,
+        Parks::Vcpu => fiber_rt::ParkOn::Page,
+    };
+    let slot = fiber_rt::current_fiber_slot().filter(|_| !on.blocks_vcpu() || fiber_rt::in_task());
+    if let Some(slot) = slot {
         let ended = || epoch_fired(vm.epoch as usize) || domain_ended(trap_out);
         loop {
             if frozen() {
                 mark_reissue(unwind_base);
                 return HostPark::Frozen;
             }
-            fiber_rt::fiber_event_park(&slot, None, fiber_rt::ParkOn::Event);
+            fiber_rt::fiber_event_park(&slot, None, on.clone());
             if ended() {
                 return HostPark::Ended;
             }

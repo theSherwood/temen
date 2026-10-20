@@ -542,6 +542,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
             lane_cap: -1,
             parent_domain: 0,
             parent_lane_cap: -1,
+            pages: std::ptr::null(),
         };
         let mut trap = 0i64;
         let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
@@ -559,6 +560,7 @@ fn two_interleaved_detached_spawns_each_get_their_own_lane_and_budget() {
                 WINDOW,
                 temen_ir::WINDOW_RUNS,
                 lane,
+                u32::MAX, // no pager
                 &mut gc,
                 &mut trap,
             )

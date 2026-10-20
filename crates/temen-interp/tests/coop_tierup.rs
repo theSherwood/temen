@@ -90,6 +90,7 @@ fn coop_tierup_run(
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -321,6 +322,38 @@ fn a_task_tiers_up_once_per_call() {
     }
 }
 
+/// #2474 — a call through the dispatch table (`call.dyn`) to an eligible function tiers up as a
+/// direct call does, with the same result.
+#[test]
+fn an_indirect_call_tiers_up() {
+    let m = parse_module(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vf = ref.func 1
+  vx = i64.const 5
+  vr = call.dyn (i64) -> (i64) vf (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vr = i64.mul vx v3
+  return vr
+  }
+}
+",
+    )
+    .unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let want = oracle(&m);
+    assert_eq!(want, Ok(vec![Value::I64(15)]));
+    let (got, tierups) = coop_tierup_run(&m, std::sync::Arc::from(vec![false, true]), Host::new());
+    assert_eq!(got, want, "the tier-up run diverged from the oracle");
+    assert_eq!(tierups, [1], "the indirect call to function 1");
+}
+
 // A tier-up leaf whose emitted region **bounces** back to an interp-resident callee: func 1 (`L`, the
 // eligible leaf) is `L(x) = C(x)`, and func 2 (`C`) is `C(x) = 3x + 7`. The host services the `TierUp`
 // by calling `CoopRun::bounce` — emulating the emitted `f1` reaching `call_interp` for func 2 — then
@@ -369,6 +402,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -485,6 +519,7 @@ fn a_bounce_polls_a_fiber_the_pump_parked() {
         root: ProgramEmit {
             eligible,
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -843,6 +878,7 @@ fn coop_tierup_child_env_tasks_tier_up() {
     let leaf = || ProgramEmit {
         eligible: std::sync::Arc::from(vec![false, false, false, true]),
         page_checked: false,
+        ..Default::default()
     };
     // `(child, the image's emit, the programs the tier-ups name)`. The child's two calls surface
     // first: the root is parked on the join.
@@ -945,6 +981,7 @@ block 0 (vx: i64) {
         let (modules, offered) = modules_emitter(Some(ProgramEmit {
             eligible: std::sync::Arc::from(eligible),
             page_checked: false,
+            ..Default::default()
         }));
         let tierup = TierUpConfig {
             root: ProgramEmit::default(),
@@ -1147,6 +1184,7 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
     let leaf = ProgramEmit {
         eligible: std::sync::Arc::from(vec![false, false, false, false, false, true]),
         page_checked: false,
+        ..Default::default()
     };
     let (modules, _) = modules_emitter(Some(leaf.clone()));
     let (got, got_out, mut events) = fork_twin_run(
@@ -1332,6 +1370,7 @@ fn root_fork_run(
         root: ProgramEmit {
             eligible: Arc::from(vec![false, true, false]),
             page_checked: false,
+            ..Default::default()
         },
         leaf: None,
         modules: None,
@@ -1479,6 +1518,7 @@ block 0 (vx: i64) {
                     root: ProgramEmit {
                         eligible: std::sync::Arc::clone(&eligible),
                         page_checked: false,
+                        ..Default::default()
                     },
                     leaf: None,
                     modules: None,
