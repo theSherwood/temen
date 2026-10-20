@@ -393,7 +393,7 @@ export 0 func \"_start\" 0
 fn a_twin_keeps_a_readonly_segment_page_its_parent_made_writable_on_every_engine() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         assert_eq!(
-            run_on(FORK_RO_SEGMENT, false, backend),
+            run_on(FORK_RO_SEGMENT, false, backend, &RunConfig::default()),
             Outcome::Exited(120),
             "{backend:?}"
         );
