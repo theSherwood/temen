@@ -52,6 +52,13 @@ self.onmessage = async (e) => {
   // often it looks.
   const X2_SLICE = 1n << 20n;
   let x2Tier = null, x2Over = 0, x2Win = 0, x2Mapped = 0n;
+  // #2474: how many slices the emitted code has spent, so a tier-up can report the work it did.
+  let x2Slices = 0;
+  const x2Fuel = () => {
+    if (Atomics.load(new Uint8Array(memory.buffer), x2Over) !== 0) return undefined;
+    x2Slices++;
+    return X2_SLICE;
+  };
   const x2Bytes = (len) => {
     if (len === 0) return null;
     const p = Number(ex.temen_x2_bytes_ptr());
@@ -78,7 +85,7 @@ self.onmessage = async (e) => {
         deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
         spillBytes: () => ex.temen_x2_spill_bytes(),
         spillPtr: () => ex.temen_x2_spill_ptr(),
-        fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
+        fuelOut: x2Fuel,
       });
       const p = Number(ex.temen_x2_wasm_ptr()), n = Number(ex.temen_x2_wasm_len());
       if (n > 0) {
@@ -147,7 +154,7 @@ self.onmessage = async (e) => {
         deliverFaultAddr: (addr) => ex.temen_x2_deliver_fault_addr(addr),
         spillBytes: () => 0,
         spillPtr: () => 0,
-        fuelOut: () => (Atomics.load(new Uint8Array(memory.buffer), x2Over) === 0 ? X2_SLICE : undefined),
+        fuelOut: x2Fuel,
       });
     }
     if (module !== x2ChildModule) {
@@ -189,14 +196,25 @@ self.onmessage = async (e) => {
   };
   // A tier-up of the thread's task: `f{func}` of program `module`'s emit, its slots all i64. Over
   // the engine's memory (`mem` -1) it is the run's own program; over a child's own memory, the
-  // child's granted module.
-  const x2_tierup = (module, func, argv, argc, win, mapped, over, out, mem) => x2Call(() => {
-    const [tier, base] = mem < 0 ? x2Enter(win, mapped, over) : x2ChildEnter(mem, module, mapped, over);
-    const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
-    const args = [];
-    for (let i = 0; i < argc; i++) args.push(view[at + i]);
-    return [tier, base, tier.program()['f' + func], args];
-  }, out, (r) => BigInt(r));
+  // child's granted module. The fuel the call spent goes to `work`, for the run's tier-up profile.
+  const x2_tierup = (module, func, argv, argc, win, mapped, over, out, mem, work) => {
+    let fuel, slices;
+    const n = x2Call(() => {
+      const [tier, base] = mem < 0 ? x2Enter(win, mapped, over) : x2ChildEnter(mem, module, mapped, over);
+      const at = argv >>> 3, view = new BigInt64Array(memory.buffer);
+      const args = [];
+      for (let i = 0; i < argc; i++) args.push(view[at + i]);
+      const program = tier.program();
+      fuel = program.fuel;
+      slices = x2Slices;
+      return [tier, base, program['f' + func], args];
+    }, out, (r) => BigInt(r));
+    if (fuel) {
+      const spent = BigInt(x2Slices - slices) * X2_SLICE + X2_SLICE - fuel.value;
+      new BigUint64Array(memory.buffer)[work >>> 3] = spent > 0n ? spent : 0n;
+    }
+    return n;
+  };
   // A §22 invoke of the unit with code handle `code`: its emitted module's `f0`, instantiated once
   // per Worker, its slots marshalled by the types at `types`.
   const x2_invoke = (code, wasm, wasmLen, types, nparams, nresults, argv, win, mapped, over, out) => {
