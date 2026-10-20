@@ -1341,7 +1341,7 @@ extern "C" {
 /// The run's tier-up module, which each Worker instantiates when it first runs emitted code. Empty
 /// when no function of the run tiers up.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
-static X2_WASM: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static X2_WASM: std::sync::Mutex<Option<std::sync::Arc<[u8]>>> = std::sync::Mutex::new(None);
 
 /// The granted modules the run's children tier up into (#1414 ED-2), by program index: what the
 /// tier's module emitter emitted for them ([`module_emitter`]).
@@ -1365,14 +1365,16 @@ pub extern "C" fn temen_x2_program_len(module: u32) -> usize {
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_wasm_ptr() -> *const u8 {
-    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).as_ptr()
+    let wasm = X2_WASM.lock().unwrap_or_else(|e| e.into_inner());
+    wasm.as_deref().map_or(core::ptr::null(), <[u8]>::as_ptr)
 }
 
 /// The run's tier-up module ([`X2_WASM`]): its length.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 #[no_mangle]
 pub extern "C" fn temen_x2_wasm_len() -> usize {
-    X2_WASM.lock().unwrap_or_else(|e| e.into_inner()).len()
+    let wasm = X2_WASM.lock().unwrap_or_else(|e| e.into_inner());
+    wasm.as_deref().map_or(0, <[u8]>::len)
 }
 
 /// The run's program's signatures: its dispatch table's natural prefix, whose slots a Worker fills
@@ -1764,11 +1766,16 @@ pub extern "C" fn temen_x2_start(
         Some(e) => {
             // A local-table emit leaves the run's table as it is.
             let table_log2 = if e.all_shimmable { e.table_log2 } else { 0 };
-            (e.m, Some((e.wasm, e.emit, table_log2, e.spill)))
+            let regions = (
+                std::sync::Arc::clone(&e.wasm),
+                e.program_emit(),
+                table_log2,
+                e.spill,
+            );
+            (std::sync::Arc::clone(&e.m), Some(regions))
         }
-        None => (m, None),
+        None => (std::sync::Arc::new(m), None),
     };
-    let m = std::sync::Arc::new(m);
     let io = par_io();
     let rt = par_jit_rt();
     // A §22 host whose units run on emitted wasm: codegen asked for, and a unit to run.
@@ -1821,8 +1828,14 @@ pub extern "C" fn temen_x2_start(
             return 0;
         };
         back = Some(std::sync::Arc::new(flat));
-        let (wasm, emit, table_log2, spill) =
-            regions.unwrap_or_else(|| (Vec::new(), bytecode::ProgramEmit::default(), 0, false));
+        let (wasm, emit, table_log2, spill) = regions.unwrap_or_else(|| {
+            (
+                std::sync::Arc::from([]),
+                bytecode::ProgramEmit::default(),
+                0,
+                false,
+            )
+        });
         // A B2 emit masks `call.dyn` by its table's size, so the run's dispatch table is that size.
         host.set_jit_table_log2(table_log2);
         // The units emit as the coop driver's do, over this run's window and table, or none does
@@ -1835,7 +1848,7 @@ pub extern "C" fn temen_x2_start(
         } else {
             host.set_jit_wasm_emitter(|_| None);
         }
-        *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = wasm;
+        *X2_WASM.lock().unwrap_or_else(|e| e.into_inner()) = Some(wasm);
         *X2_SIGS.lock().unwrap_or_else(|e| e.into_inner()) = m
             .funcs
             .iter()
@@ -5482,19 +5495,7 @@ struct WarmCoop {
     /// eval's powerbox, which every eval of the session shares, so it is not made again.
     leaf_declined: bool,
     /// The region emit, made on the first eval whose root does not run whole.
-    regions: Option<WarmRegions>,
-}
-
-/// A warm session's region emit ([`WarmCoop::regions`]): the [`coop_emit_for`] outputs, with the
-/// wasm in shared form (cloned per Run as a cheap `Arc`).
-struct WarmRegions {
-    wasm: std::sync::Arc<[u8]>,
-    emit: bytecode::ProgramEmit,
-    all_shimmable: bool,
-    table_log2: u8,
-    jit_importer: bool,
-    /// #1627: the emit is spill-instrumented (see [`CoopEmit::spill`]).
-    spill: bool,
+    regions: Option<std::sync::Arc<CoopEmit>>,
 }
 
 /// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`temen_warm_open`].
@@ -5884,16 +5885,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // playing `JIT_RUN_WIN_LOG2.max(declared)`; `temen_warm_open` already gated declared ≤
         // mapped). The emit outlines the same module the same way, so its functions are `wc.m`'s.
         match coop_emit_for(&s.module, wc.shared, WARM_MAPPED_LOG2, false) {
-            Ok(e) => {
-                wc.regions = Some(WarmRegions {
-                    wasm: e.wasm.into(),
-                    emit: e.emit,
-                    all_shimmable: e.all_shimmable,
-                    table_log2: e.table_log2,
-                    jit_importer: e.jit_importer,
-                    spill: e.spill,
-                })
-            }
+            Ok(e) => wc.regions = Some(e),
             Err(status) => {
                 set(status);
                 return -status;
@@ -5914,7 +5906,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     let tierup = bytecode::TierUpConfig {
-        root: r.emit.clone(),
+        root: r.program_emit(),
         leaf: None,
         modules: None,
     };
@@ -5953,7 +5945,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
                 .map(|f| (f.params.clone(), f.results.clone()))
                 .collect(),
             frame,
-            paged: r.emit.page_checked,
+            paged: r.paged,
             spill: spill_region(r.spill),
             ..CoopTierupRun::over(run)
         });
@@ -11262,10 +11254,12 @@ pub extern "C" fn temen_coop_reset_hotness() {
 struct CoopEmit {
     /// The **outlined** module (#889) — the one BOTH tiers run: `CoopRun` interprets it, the
     /// emitted wasm's masks/table were built from it, the shim generator reads its `sigs`.
-    m: temen_ir::Module,
-    wasm: Vec<u8>,
-    /// What the run's tasks tier up into, and when. Its `page_checked` is the emit's paged mode.
-    emit: bytecode::ProgramEmit,
+    m: std::sync::Arc<temen_ir::Module>,
+    wasm: std::sync::Arc<[u8]>,
+    /// The functions the run's tasks tier up into ([`CoopEmit::program_emit`]).
+    eligible: std::sync::Arc<[bool]>,
+    /// The emit checks each access against the page-state table (#1009).
+    paged: bool,
     all_shimmable: bool,
     table_log2: u8,
     jit_importer: bool,
@@ -11274,6 +11268,36 @@ struct CoopEmit {
     /// each bounce ([`temen_coop_call_interp`]'s `spill_*`).
     spill: bool,
 }
+
+impl CoopEmit {
+    /// What the run's tasks tier up into, and when: [`COOP_HOTNESS`] as it is now, not as it was when
+    /// the emit was made.
+    fn program_emit(&self) -> bytecode::ProgramEmit {
+        program_emit(std::sync::Arc::clone(&self.eligible), self.paged)
+    }
+}
+
+/// #2503 — what a region emit ([`coop_emit_for`]) is made from: equal keys emit the same.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RegionKey {
+    /// The guest module's content digest ([`temen_interp::module_digest`]).
+    digest: [u8; 32],
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+    /// The emitter's function-size cap ([`temen_coop_set_emit_cap`]).
+    cap: usize,
+}
+
+/// The region emit the last open made or refused, by its key: a card's next Run opens the same
+/// program (#2503).
+type LastRegions = Option<(RegionKey, Result<std::sync::Arc<CoopEmit>, i32>)>;
+
+/// This engine's [`LastRegions`].
+static LAST_REGIONS: std::sync::Mutex<LastRegions> = std::sync::Mutex::new(None);
+
+/// How many region emits this engine has made rather than reused ([`temen_coop_region_emits`]).
+static REGION_EMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Whether every function of `m` can take a bounce shim (scalar operands, arity ≤ the env
 /// scratch's slot count): what a B2 dispatch table needs to fill each slot an emitted `call.dyn`
@@ -11298,7 +11322,36 @@ fn all_shimmable(m: &temen_ir::Module) -> bool {
     })
 }
 
+/// What a coop run of `m0` tiers up into ([`emit_regions`]): the last open's, when that open made
+/// it from the same key ([`LAST_REGIONS`]).
 fn coop_emit_for(
+    m0: &temen_ir::Module,
+    shared: bool,
+    win_log2: u8,
+    parks: bool,
+) -> Result<std::sync::Arc<CoopEmit>, i32> {
+    let key = RegionKey {
+        digest: temen_interp::module_digest(m0),
+        shared,
+        win_log2,
+        parks,
+        cap: temen_wasm_jit::max_est_emitted_fn_bytes(),
+    };
+    let mut last = LAST_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, e)) = last.as_ref().filter(|(k, _)| *k == key) {
+        return e.clone();
+    }
+    // The last program goes before this one is made: the wasm heap never shrinks, so holding both
+    // would raise its high-water mark.
+    *last = None;
+    REGION_EMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let e = emit_regions(m0, shared, win_log2, parks).map(std::sync::Arc::new);
+    *last = Some((key, e.clone()));
+    e
+}
+
+/// [`coop_emit_for`] made anew.
+fn emit_regions(
     m0: &temen_ir::Module,
     shared: bool,
     win_log2: u8,
@@ -11386,9 +11439,10 @@ fn coop_emit_for(
         return Err(STATUS_UNSUPPORTED);
     }
     Ok(CoopEmit {
-        m,
-        wasm,
-        emit: program_emit(eligible, paged),
+        m: m.into(),
+        wasm: wasm.into(),
+        eligible: eligible.into(),
+        paged,
         all_shimmable,
         table_log2,
         jit_importer,
@@ -11410,9 +11464,9 @@ fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
 
 /// What a coop run's tasks tier up into: the functions `eligible` makes so, when [`COOP_HOTNESS`]
 /// says, over a page-checked emit if `paged`.
-fn program_emit(eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
+fn program_emit(eligible: std::sync::Arc<[bool]>, paged: bool) -> bytecode::ProgramEmit {
     bytecode::ProgramEmit {
-        eligible: eligible.into(),
+        eligible,
         page_checked: paged,
         hot: coop_hotness(),
     }
@@ -11468,7 +11522,7 @@ fn emit_module(
     let eligible = tierup_eligible(m, &emit);
     eligible
         .contains(&true)
-        .then(|| (wasm.into(), program_emit(eligible, paged)))
+        .then(|| (wasm.into(), program_emit(eligible.into(), paged)))
 }
 
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.
@@ -11653,30 +11707,22 @@ pub extern "C" fn temen_coop_open(
             }
         };
     }
-    let CoopEmit {
-        m,
-        wasm,
-        emit,
-        all_shimmable,
-        table_log2,
-        jit_importer,
-        spill,
-    } = match coop_emit_for(&m0, shared != 0, win_log2, false) {
+    let e = match coop_emit_for(&m0, shared != 0, win_log2, false) {
         Ok(e) => e,
         Err(status) => {
             set(status);
             return -status;
         }
     };
-    let (mut host, frame) = host_for(&m);
+    let (mut host, frame) = host_for(&e.m);
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
     // the domain with `host.jit_table_log2()`, so force it here (a `vm_jit_*` importer's
     // `grant_onramp_caps` already set it to the floor; `set_jit_table_log2` takes the max, so this
     // raises it to the guest's size).
-    if all_shimmable {
-        host.set_jit_table_log2(table_log2);
+    if e.all_shimmable {
+        host.set_jit_table_log2(e.table_log2);
     }
     // #926 slice 2e/2f: arm the §22 unit wasm-emitter for a `vm_jit_*` importer so its runtime-compiled
     // units run emitted (the pump then surfaces a `CoopEvent::JitInvoke` when a unit has emitted wasm;
@@ -11687,21 +11733,18 @@ pub extern "C" fn temen_coop_open(
     // Reuses the single-vCPU emitter and its shared parameters — only one driver runs at a time.
     TIERUP_UNIT_SHARED.store(shared != 0, std::sync::atomic::Ordering::Relaxed);
     TIERUP_UNIT_WIN_LOG2.store(win_log2, std::sync::atomic::Ordering::Relaxed);
-    TIERUP_UNIT_TABLE_LOG2.store(table_log2, std::sync::atomic::Ordering::Relaxed);
-    if jit_importer && all_shimmable {
+    TIERUP_UNIT_TABLE_LOG2.store(e.table_log2, std::sync::atomic::Ordering::Relaxed);
+    if e.jit_importer && e.all_shimmable {
         host.set_jit_wasm_emitter(onramp_tierup_unit_emitter);
     }
     // #2248: the granted modules this run's children run are emitted as it meets them.
     let programs = Programs::default();
-    // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries the
-    // fidelity `scalar_extent` cannot, as on the pump.
-    let paged = emit.page_checked;
     let tierup = bytecode::TierUpConfig {
-        root: emit,
+        root: e.program_emit(),
         leaf: None,
         modules: Some(module_emitter(programs.clone(), shared != 0, false)),
     };
-    let run = match open_run(&m, host, Some(tierup)) {
+    let run = match open_run(&e.m, host, Some(tierup)) {
         Some(Ok(r)) => r,
         Some(Err(_)) => {
             set(STATUS_TRAP);
@@ -11717,15 +11760,18 @@ pub extern "C" fn temen_coop_open(
         programs,
         caps: caps.clone(),
         requests: requests.clone(),
-        emitted_wasm: wasm.into(),
-        sigs: m
+        emitted_wasm: std::sync::Arc::clone(&e.wasm),
+        sigs: e
+            .m
             .funcs
             .iter()
             .map(|f| (f.params.clone(), f.results.clone()))
             .collect(),
         frame,
-        paged,
-        spill: spill_region(spill),
+        // #1009 paged: the vCPUs skip the scalar decline — the per-event page-state table carries
+        // the fidelity `scalar_extent` cannot, as on the pump.
+        paged: e.paged,
+        spill: spill_region(e.spill),
         ..CoopTierupRun::over(run)
     })
 }
@@ -12069,6 +12115,13 @@ pub extern "C" fn temen_coop_program_key_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn temen_coop_leaf_emits() -> u32 {
     EMITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #2503: how many region emits ([`coop_emit_for`]) this engine has made rather than reused: what a
+/// driver's tests count to see a Run of the same program reuse its emit.
+#[no_mangle]
+pub extern "C" fn temen_coop_region_emits() -> u32 {
+    REGION_EMITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
