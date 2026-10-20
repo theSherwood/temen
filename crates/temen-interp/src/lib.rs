@@ -428,8 +428,8 @@ pub enum StopReason {
     /// and the clock did not advance; push bytes (the DAP `provideStdin` request) and resume —
     /// the parked read re-issues against them.
     StdinPark,
-    /// #1366 — parked on a **host-completed cap call** with this completion id: the embedder
-    /// services the request it recorded under `id`, then `deliver_cap`/`provideCap` resumes.
+    /// #1366 — parked on a **host-answered cap call** with this completion id: the embedder
+    /// answers the request it recorded under `id` (`provideCap`), then resumes.
     CapPark { id: u64 },
     /// A budgeted run reached the end of its budget with no other stop (the bytecode engine's
     /// `run_until_turn`). Live and resumable: the embedder runs a long program in slices.
@@ -1064,19 +1064,21 @@ pub enum VarValue {
     Bytes(Vec<u8>),
 }
 
-/// #1366 / #1953 — a call parked on a **declared host-completed cap**
-/// ([`Host::grant_declared_host_caps`]): its completion id, the cap's name, and the guest's flat
-/// call arguments (the guest's own op rides in `args[0]` by convention, like `vm_fs`).
-#[derive(Clone, Debug, PartialEq)]
+/// #1366 / #1953 — a call parked on a **declared host-answered cap**
+/// ([`Host::grant_declared_host_caps`]): the cap's name, the guest's flat call arguments (the
+/// guest's own op rides in `args[0]` by convention, like `vm_fs`), and the [`Completer`] that
+/// answers it.
+#[derive(Debug)]
 pub struct CapRequest {
-    pub id: u64,
     pub name: String,
     pub args: Vec<i64>,
+    pub completer: Completer,
 }
 
-/// The calls parked on one session's declared host-completed caps, keyed by completion id: filled by
-/// the procs' submit hooks, read and cleared by the embedder. Shared (`Arc`) so a rebuilt run's procs
-/// file into the same map.
+/// The calls parked on one session's declared host-answered caps, keyed by completion id: filled by
+/// the procs' submit hooks; the embedder takes a request out to answer it. Shared (`Arc`) so a
+/// rebuilt run's procs file into the same map. Dropping a request answers its call
+/// `CAP_REVOKED`.
 pub type CapRequests = Arc<Mutex<BTreeMap<u64, CapRequest>>>;
 
 /// One recorded crossing of the capability boundary (DEBUGGING.md W1 `CapTape`): the inputs the
@@ -15402,27 +15404,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // host locking). Threads of a domain serialize their capability calls here.
                     let mut hg = host.lock_unpoisoned();
                     let mut pending_id = None;
-                    let results = hg.cap_dispatch_slots_pending(
-                        *type_id,
-                        *op,
-                        h,
-                        &argv,
-                        gm,
-                        &mut pending_id,
-                    )?;
+                    // #2495 — under a recording host this engine offers no parking face: it tapes
+                    // no delivered value, so a host-answered call declines before its embedder
+                    // sees it. A pool job runs inline under a tape on either face.
+                    let face = (!hg.records_caps()).then_some(&mut pending_id);
+                    let results = hg.cap_dispatch_slots_impl(*type_id, *op, h, &argv, gm, face)?;
                     // §12 parking-on-blocking: a punted offloadable dispatch — release the host
                     // lock **before** waiting (the §5b serialization fix), then take the scalar
                     // completion. The placeholder `results` is discarded.
                     if let Some(id) = pending_id {
+                        let comps = hg.completions();
+                        let svck = hg.domain_id() as usize;
+                        drop(hg);
                         if call_sig(&cur_types, *sig).results.len() > 1 {
                             // Parkable ops carry a single-slot scalar reply (invariant 8) — a
                             // wider declared signature is a registration bug, fail-closed. Checked
                             // BEFORE any park: a fault after the vCPU is filed is unrecoverable.
+                            comps.withdraw(id);
                             return Err(Trap::CapFault);
                         }
-                        let comps = hg.completions();
-                        let svck = hg.domain_id() as usize;
-                        drop(hg);
                         // F1 (FIBER_PARK.md) — a punt inside a FIBER parks the fiber, not the
                         // vCPU: the §3.6 slice-5a contract (`FIBER_PARKED` unwinds to the
                         // resumer; the completion wakes the fiber; the next resume delivers the
@@ -15471,13 +15471,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
                         // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
                         // jobs return one i64 by contract).
-                        // #1366: a host-completed punt (`OffloadOutcome::Host`) has no completer
-                        // on the oracle — no driver surfaces the park to an embedder — so
-                        // neither parking nor the degenerate wait below could ever finish it.
-                        // Decline fail-closed rather than hang (invariant 9).
-                        if comps.is_host_owned(id) {
-                            return Err(Trap::CapFault);
-                        }
+                        // #2495: a host-answered call (`OffloadOutcome::Host`) parks the same
+                        // way; its embedder's answer posts to the same store.
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -15489,8 +15484,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             return Ok(Inner::Park(Blocked::CapPending { id }));
                         }
                         // Degenerate blocking wait (slice 1): single-fiber guests, durable
-                        // callers, non-i64 signatures, the deterministic explorer.
-                        let r = comps.wait(id);
+                        // callers, non-i64 signatures, the deterministic explorer. A
+                        // host-answered call declines here, as on every engine where its caller
+                        // cannot park (#2495).
+                        let r = comps.wait_unless_host_owned(id).ok_or(Trap::CapFault)?;
                         push_results(
                             &mut frames[top].vals,
                             &[r],
@@ -21421,29 +21418,30 @@ pub struct Completions {
     /// not the `Host`, so a pool job reads the hook installed when it finishes, not when it was
     /// punted, and a driver can install it on any domain's store a caller parks on (#2424).
     notify: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// #1366 — whether a driver that **surfaces** cap parks to the embedder is running this host
-    /// (set by [`bytecode::Vcpu::run`]). A host-completed punt is admitted only then; every other
-    /// driver could only wait inline on it, so the dispatch declines *before* the submit hook runs
-    /// — the embedder is never handed a request nobody can finish.
-    host_ok: std::sync::atomic::AtomicBool,
 }
 
 struct CompletionState {
     /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
     ready: BTreeMap<u64, i64>,
-    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt: completed by the embedder, never
-    /// by a pool worker. An inline waiter must not block on one (nobody could wake it).
+    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt and not yet answered: the embedder
+    /// answers them ([`Completer`]), never a pool worker, so a driver whose embedder answers only
+    /// once it has control back must hand control back rather than wait on one.
     host_owned: BTreeSet<u64>,
     /// #1366 — for a host-owned id minted while the host is **recording** its cap tape: the call's
     /// `(type_id, op, handle, args)`, so the *delivered* value (not the dispatch-time placeholder)
-    /// joins the tape as the call's `CapRecord` when the embedder completes it — a reverse `seek`
-    /// then serves it from the tape and never re-parks.
+    /// joins the tape as the call's `CapRecord` where a driver delivers it
+    /// ([`Completions::take_record`]) — a reverse `seek` then serves it from the tape and never
+    /// re-parks.
     host_pending: BTreeMap<u64, (u32, u32, i32, Vec<i64>)>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
-    /// Next completion id. Monotonic per host, so among answers already in, the lowest id is the
-    /// earliest call (#2477).
-    next_id: u64,
+    /// How many ids this store has minted ([`Completions::minted`]).
+    minted: u64,
+    /// #2495 — the host-answered call whose submit hook is running, under its dispatcher's host
+    /// lock (one at a time: the store is its domain's). An answer it gets meanwhile posts without
+    /// ringing the wake hook, which may take a scheduler lock the dispatcher must not nest under
+    /// its host lock; no one waits on the call yet, and its caller's park finds the answer.
+    submitting: Option<u64>,
     /// F3 (FIBER_PARK.md) — Cranelift-JIT fiber-park cells, keyed by completion id: a punting
     /// fiber registers here and its resumer's polls read the cell. Each cell takes its answer as
     /// it comes (#2477): [`complete`](Completions::complete) fills a registered cell, and a
@@ -21473,12 +21471,12 @@ impl Completions {
                 host_owned: BTreeSet::new(),
                 host_pending: BTreeMap::new(),
                 in_flight: 0,
-                next_id: 0,
+                minted: 0,
+                submitting: None,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
             notify: Mutex::new(None),
-            host_ok: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -21487,18 +21485,6 @@ impl Completions {
     /// installed is found by the driver's recheck after the park, one posted after rings it.
     pub fn set_notify(&self, f: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.notify.lock_unpoisoned() = f;
-    }
-
-    /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
-    /// and completes them via `deliver_cap`, admitting [`OffloadOutcome::Host`] punts on this host.
-    pub fn allow_host_completed(&self) {
-        self.host_ok
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// #1366 — whether host-completed punts are admitted (see [`allow_host_completed`](Self::allow_host_completed)).
-    pub fn host_completed_allowed(&self) -> bool {
-        self.host_ok.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, under the
@@ -21523,13 +21509,19 @@ impl Completions {
         g.fiber_cells.remove(&id);
     }
 
-    /// Mint the next completion id (also counts it in-flight). Called only on the punt path.
+    /// Mint the next completion id (also counts it in-flight). Called only on the punt path. Ids
+    /// come from one count for the whole process (#2495), so a call's id names it in every domain:
+    /// an embedder answering calls from several domains keys them by id, and within a store the
+    /// lowest id among the answers in is still its earliest call (#2477).
     fn mint(&self) -> u64 {
-        let mut g = self.mx.lock_unpoisoned();
-        let id = g.next_id;
-        g.next_id += 1;
+        Self::mint_locked(&mut self.mx.lock_unpoisoned())
+    }
+
+    fn mint_locked(g: &mut CompletionState) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        g.minted += 1;
         g.in_flight += 1;
-        id
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Post a punted job's scalar result (pool-worker side) and wake waiters. A JIT fiber's cell
@@ -21544,8 +21536,12 @@ impl Completions {
                 g.ready.insert(id, result);
             }
         }
+        let quiet = g.submitting == Some(id);
         drop(g);
         self.cv.notify_all();
+        if quiet {
+            return;
+        }
         // The result post happens-before the wake hook, so a drain the hook runs always finds the
         // result it is delivering (no lost wakeup). Called with no lock held: the hook drains.
         let hook = self.notify.lock_unpoisoned().clone();
@@ -21554,59 +21550,89 @@ impl Completions {
         }
     }
 
-    /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
-    /// host-owned under the one lock.
-    fn mint_host_owned(&self, record: Option<(u32, u32, i32, Vec<i64>)>) -> u64 {
-        let mut g = self.mx.lock_unpoisoned();
-        let id = g.next_id;
-        g.next_id += 1;
-        g.in_flight += 1;
-        g.host_owned.insert(id);
-        if let Some(prefix) = record {
-            g.host_pending.insert(id, prefix);
-        }
+    /// #1366 — mint an id for a host-answered punt ([`OffloadOutcome::Host`]) and run its submit
+    /// hook with the call's [`Completer`]: minted + marked host-owned under the one lock, with the
+    /// call's tape prefix when its host records. An answer the hook gives at once posts quietly
+    /// ([`CompletionState::submitting`]).
+    fn submit_host_owned(
+        self: &Arc<Self>,
+        record: Option<(u32, u32, i32, Vec<i64>)>,
+        submit: HostCompletion,
+    ) -> u64 {
+        let id = {
+            let mut g = self.mx.lock_unpoisoned();
+            let id = Self::mint_locked(&mut g);
+            g.host_owned.insert(id);
+            if let Some(prefix) = record {
+                g.host_pending.insert(id, prefix);
+            }
+            g.submitting = Some(id);
+            id
+        };
+        submit(Completer {
+            store: Arc::downgrade(self),
+            id,
+        });
+        self.mx.lock_unpoisoned().submitting = None;
         id
     }
 
-    /// #1366 — whether `id` is a host-completed punt (the embedder, not a pool worker, finishes
-    /// it). A driver that surfaces parks checks this to decide between "surface the id" and the
-    /// inline pool wait.
+    /// #1366 — whether `id` is a host-answered call still waiting for its answer: the embedder,
+    /// not a pool worker, answers it. A driver whose embedder answers only once it has control back
+    /// hands control back on one instead of waiting.
     pub fn is_host_owned(&self, id: u64) -> bool {
         self.mx.lock_unpoisoned().host_owned.contains(&id)
     }
 
-    /// #1366 — the embedder finishes a host-completed punt: post `result` for `id` and wake
-    /// waiters exactly as a pool worker's [`complete`](Completions::complete) would. The id stops
-    /// being host-owned. Unknown/foreign ids are ignored (no-op, `None`) rather than corrupting the
-    /// store. Returns the call's recorded `(type_id, op, handle, args)` when the host was taping
-    /// (so the caller can push the delivered value as the call's [`CapRecord`]).
-    pub fn complete_host(&self, id: u64, result: i64) -> Option<(u32, u32, i32, Vec<i64>)> {
-        let prefix = {
-            let mut g = self.mx.lock_unpoisoned();
-            if !g.host_owned.remove(&id) {
-                return None;
-            }
-            g.host_pending.remove(&id)
-        };
+    /// #2495 — a host-answered call's answer ([`Completer`]): post it as a pool worker's
+    /// [`complete`](Completions::complete) does, waking whoever waits on it. `false`, posting
+    /// nothing, for an id that is not an unanswered host-answered call: answered already, or
+    /// withdrawn ([`withdraw`](Completions::withdraw)).
+    fn complete_host(&self, id: u64, result: i64) -> bool {
+        if !self.mx.lock_unpoisoned().host_owned.remove(&id) {
+            return false;
+        }
         self.complete(id, result);
-        prefix
+        true
     }
 
-    /// #1366 — the inline-wait form for drivers that cannot surface a park: block for a
-    /// pool-completed `id` as [`wait`](Completions::wait) does, but **decline** (`None`) a
-    /// host-owned one, which no pool worker will ever complete — the caller traps `CapFault`
-    /// instead of hanging.
-    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+    /// #2495 — decline host-answered call `id` after it was minted (its caller cannot park on
+    /// it): no answer will be taken, so its completer answers nothing and it stops counting as in
+    /// flight. `false` if it is not an unanswered host-answered call.
+    pub fn withdraw(&self, id: u64) -> bool {
         let mut g = self.mx.lock_unpoisoned();
-        loop {
-            if let Some(r) = g.ready.remove(&id) {
-                return Some(r);
-            }
-            if g.host_owned.contains(&id) {
-                return None;
-            }
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        if !g.host_owned.remove(&id) {
+            return false;
         }
+        g.host_pending.remove(&id);
+        g.in_flight -= 1;
+        true
+    }
+
+    /// #2495 — the [`CapRecord`] a driver tapes as it delivers answer `result` to call `id`: `Some`
+    /// for a host-answered call minted while its host recorded its cap tape (DEBUGGING.md W1), so
+    /// the delivered value, not the dispatch-time placeholder, joins the tape.
+    pub fn take_record(&self, id: u64, result: i64) -> Option<CapRecord> {
+        let (type_id, op, handle, args) = self.mx.lock_unpoisoned().host_pending.remove(&id)?;
+        Some(CapRecord {
+            type_id,
+            op,
+            handle,
+            args,
+            result: Ok(vec![result]),
+            mem_writes: Vec::new(),
+        })
+    }
+
+    /// The inline wait of a caller that cannot park: block for `id` as
+    /// [`wait`](Completions::wait) does, but **decline** (`None`) a host-answered call, withdrawn
+    /// ([`withdraw`](Completions::withdraw)): its embedder may answer only once it has control
+    /// back, so the caller traps `CapFault` instead of hanging (INVARIANTS.md 9).
+    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+        if self.withdraw(id) {
+            return None;
+        }
+        Some(self.wait(id))
     }
 
     /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
@@ -21688,7 +21714,7 @@ impl Completions {
     /// Total completion ids ever minted on this host — `0` proves no dispatch ever touched the
     /// parking machinery (the §12 "sync ops never pay" pin, asserted by tests).
     pub fn minted(&self) -> u64 {
-        self.mx.lock_unpoisoned().next_id
+        self.mx.lock_unpoisoned().minted
     }
 }
 
@@ -21830,23 +21856,60 @@ pub enum OffloadOutcome {
     /// Would block: run this job off the vCPU thread. The call's declared signature must have at
     /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
     Offload(OffloadWork),
-    /// **Host-completed** (#1366): would block, and the *embedder* — not a pool thread — will
-    /// supply the scalar later. On the parking face the dispatch mints a completion id, marks it
-    /// host-owned, hands it to `submit` (so the host can record the request against that id), and
-    /// parks the caller; a resumable driver surfaces [`bytecode::VcpuEvent::CapPending`] and the
-    /// host finishes it with [`bytecode::Vcpu::deliver_cap`] (or [`Completions::complete_host`]).
-    /// This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
-    /// exist) services a cap asynchronously while the guest still sees a plain synchronous call.
-    /// Admitted only under a driver that surfaces the park (`Vcpu` flags its host via
-    /// [`Completions::allow_host_completed`]); any other driver has no way to complete it and
-    /// **declines** with `CapFault` before `submit` runs (invariant 9: decline, never diverge —
-    /// and never hang).
+    /// **Host-answered** (#1366, #2495): would block, and the *embedder* — not a pool thread —
+    /// answers it later. On the parking face the dispatch mints a completion id, hands `submit` the
+    /// call's [`Completer`], and parks the caller, which waits on the call as on a pool job: a
+    /// call that waits on the world holds no thread while it waits. Admitted on every engine and in
+    /// every domain wherever the caller can park; it declines with `CapFault` before `submit` runs
+    /// on the sync face and in a durable run (invariant 9: never hang), and after it where the
+    /// caller cannot park (a reply that is not one `i64`). A driver its embedder pumps
+    /// ([`bytecode::Vcpu`], [`bytecode::CoopRun`], the debug run) hands control back while such a
+    /// call waits, so a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
+    /// exist) answers between pumps.
     Host(HostCompletion),
 }
 
-/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once with the minted completion
-/// id on the parking face, before the caller parks.
-pub type HostCompletion = Box<dyn FnOnce(u64) + Send>;
+/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once on the parking face, before
+/// the caller parks, with the call's [`Completer`].
+pub type HostCompletion = Box<dyn FnOnce(Completer) + Send>;
+
+/// #2495 — the right to answer one host-answered call ([`OffloadOutcome::Host`]), handed to its
+/// submit hook: the embedder answers it with [`complete`](Completer::complete), from any thread, at
+/// any time. A completer dropped unanswered answers `CAP_REVOKED` (`-9`), so a call its host can no
+/// longer answer never hangs (INVARIANTS.md 9). It holds its domain's store weakly: once the domain
+/// is gone, answering does nothing.
+#[derive(Debug)]
+pub struct Completer {
+    store: std::sync::Weak<Completions>,
+    id: u64,
+}
+
+impl Completer {
+    /// The call's completion id: what a driver that hands control back reports the call by
+    /// ([`bytecode::VcpuEvent::CapPending`], [`bytecode::CoopEvent::CapPark`]). Unique in the
+    /// process.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Answer the call with `result`, waking its caller. A call whose caller declined it, or whose
+    /// domain is gone, takes nothing.
+    pub fn complete(mut self, result: i64) {
+        self.answer(result);
+    }
+
+    fn answer(&mut self, result: i64) {
+        if let Some(store) = std::mem::take(&mut self.store).upgrade() {
+            store.complete_host(self.id, result);
+        }
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        self.answer(CAP_REVOKED);
+    }
+}
 
 /// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
 /// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
@@ -25250,6 +25313,11 @@ impl Host {
         self.durable
     }
 
+    /// Whether this host records its cap tape ([`record_caps`](Host::record_caps)).
+    pub fn records_caps(&self) -> bool {
+        self.cap_record.is_some()
+    }
+
     /// The fibers the freeze driver flattened on the last freeze run (slice 3.1.5) — the host-side
     /// residue a snapshot records (their continuations are in the captured window). Empty otherwise.
     pub fn frozen_fibers(&self) -> &[FrozenFiber] {
@@ -26066,11 +26134,12 @@ impl Host {
         }
     }
 
-    /// #1366 — dispose of a host-completed punt ([`OffloadOutcome::Host`]) per the dispatch face:
-    /// on the parking face mint a host-owned completion id, hand it to `submit`, and return it
-    /// through `pending` (the caller parks; a resumable driver surfaces the id and the embedder
-    /// completes it). On the sync face there is nothing to run inline and no one to complete the
-    /// call — decline fail-closed with `CapFault` rather than block forever.
+    /// #1366 — dispose of a host-answered punt ([`OffloadOutcome::Host`]) per the dispatch face:
+    /// on the parking face mint a host-owned completion id, hand `submit` its [`Completer`], and
+    /// return the id through `pending` (the caller parks on it as on a pool job). The sync face has
+    /// nothing to run inline and no caller that can park, and a durable run's caller never parks on
+    /// a call (the freeze has no cap park to re-derive): both decline fail-closed with `CapFault`,
+    /// before the embedder sees the call, rather than block forever (#2495).
     fn punt_host(
         &mut self,
         type_id: u32,
@@ -26080,31 +26149,22 @@ impl Host {
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
-        // Only a driver that surfaces the park (`Vcpu`, `ScheduledDebugRun`) can ever finish this call:
-        // decline before the submit hook runs under any other, so the embedder never records a
-        // dead request.
-        if !self.completions.host_completed_allowed() {
+        let Some(slot) = pending.filter(|_| !self.durable) else {
             return Err(Trap::CapFault);
-        }
-        match pending {
-            Some(slot) => {
-                // While taping, remember the call so the *delivered* value can be recorded as its
-                // `CapRecord` (the dispatch-time placeholder below is never taped).
-                let record = self
-                    .cap_record
-                    .is_some()
-                    .then(|| (type_id, op, handle, args.to_vec()));
-                let id = self.completions.mint_host_owned(record);
-                submit(id);
-                *slot = Some(id);
-                Ok(Vec::new())
-            }
-            None => Err(Trap::CapFault),
-        }
+        };
+        // While taping, remember the call so the *delivered* value can be recorded as its
+        // `CapRecord` (the dispatch-time placeholder below is never taped).
+        let record = self
+            .cap_record
+            .is_some()
+            .then(|| (type_id, op, handle, args.to_vec()));
+        *slot = Some(self.completions.submit_host_owned(record, submit));
+        Ok(Vec::new())
     }
 
     /// #1366 — push a [`CapRecord`] onto this host's cap tape if it is recording (no-op otherwise):
-    /// the embedder's delivered value for a host-completed call, recorded by `deliver_cap`.
+    /// the embedder's delivered value for a host-answered call, taped where a driver delivers it
+    /// ([`Completions::take_record`]).
     pub fn tape_cap_record(&mut self, rec: CapRecord) {
         if let Some(r) = &mut self.cap_record {
             r.push(rec);
@@ -28057,14 +28117,15 @@ impl Host {
         })
     }
 
-    /// #1366 / #1953 — grant the embedder's **declared host-completed caps**: for each of `names`
+    /// #1366 / #1953 — grant the embedder's **declared host-answered caps**: for each of `names`
     /// (in order) that `imports` imports, an offloadable proc that always punts to the embedder
     /// ([`OffloadOutcome::Host`]). The guest's flat `call.sym "<name>"` (its own op in `args[0]`)
-    /// parks the run; the proc's submit hook files the call in `requests` under its completion id,
-    /// and the embedder answers it with the driver's `deliver_cap`. Each is registered under its
-    /// name. Returns the `(name, handle)` seams for [`Host::bind_powerbox_manifest`]. Nothing here
-    /// is embedder-specific: temen never learns what a name means. The one grant every session
-    /// that serves declared caps uses (the DAP debug session, the browser release session).
+    /// parks its caller; the proc's submit hook files the call in `requests` under its completion
+    /// id, and the embedder takes the request out and answers it with its [`Completer`]. Each is
+    /// registered under its name. Returns the `(name, handle)` seams for
+    /// [`Host::bind_powerbox_manifest`]. Nothing here is embedder-specific: temen never learns what
+    /// a name means. The one grant every session that serves declared caps uses (the DAP debug
+    /// session, the browser release session).
     pub fn grant_declared_host_caps(
         &mut self,
         imports: &[temen_ir::Import],
@@ -28083,10 +28144,14 @@ impl Host {
                     let requests = Arc::clone(&requests);
                     let name = cap.clone();
                     let args = args.to_vec();
-                    OffloadOutcome::Host(Box::new(move |id| {
-                        requests
-                            .lock_unpoisoned()
-                            .insert(id, CapRequest { id, name, args });
+                    OffloadOutcome::Host(Box::new(move |completer: Completer| {
+                        let request = CapRequest {
+                            name,
+                            args,
+                            completer,
+                        };
+                        let id = request.completer.id();
+                        requests.lock_unpoisoned().insert(id, request);
                     }))
                 }),
                 None,
@@ -31547,8 +31612,8 @@ impl Host {
         // real one (the same reasoning as the parked-stdin tape suppression below).
         // #1366: the face is no longer forced sync under a W1 tape — a pool job is still run inline
         // under a tape (see `punt_or_inline`, so the taped result is the real one), while a
-        // host-completed punt keeps the parking face: it has no job to run inline, parks, and its
-        // delivered value joins the tape at `deliver_cap`.
+        // host-answered punt keeps the parking face: it has no job to run inline, parks, and its
+        // delivered value joins the tape where a driver delivers it (#2495).
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -31691,9 +31756,9 @@ impl Host {
                 // A parked blocking-stdin read (W4) is a placeholder the driver discards and
                 // re-issues — taping it would replay as a phantom EOF. Only the re-issued
                 // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
-                // completed, or an offloaded job): its result slots are a placeholder the
-                // completion fills in later — a host-completed call's delivered value is taped by
-                // `deliver_cap` instead.
+                // answered, or an offloaded job): its result slots are a placeholder the
+                // completion fills in later — a host-answered call's delivered value is taped
+                // where a driver delivers it instead ([`Completions::take_record`]).
                 let punted = pending.as_deref().is_some_and(|p| p.is_some());
                 if !self.stdin_parked && !punted {
                     rec.push(CapRecord {
@@ -40148,6 +40213,102 @@ mod offload_pool_tests {
             took < Duration::from_secs(1),
             "the drop waited {took:?} for the call"
         );
+    }
+}
+
+#[cfg(test)]
+mod completer_tests {
+    //! #2495 — a host-answered call's [`Completer`], against its domain's store.
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A store whose wake hook counts its rings.
+    fn store() -> (Arc<Completions>, Arc<AtomicUsize>) {
+        let comps = Arc::new(Completions::new());
+        let rings = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&rings);
+        comps.set_notify(Some(Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        })));
+        (comps, rings)
+    }
+
+    /// The completer of a call minted on `comps`, taken out of its submit hook.
+    fn submit(comps: &Arc<Completions>) -> Completer {
+        let (tx, rx) = std::sync::mpsc::channel();
+        comps.submit_host_owned(None, Box::new(move |c| tx.send(c).unwrap()));
+        rx.recv().unwrap()
+    }
+
+    /// An answer given later posts and rings the wake hook, as a pool answer does.
+    #[test]
+    fn an_answer_posts_and_rings() {
+        let (comps, rings) = store();
+        let c = submit(&comps);
+        let id = c.id();
+        assert!(comps.is_host_owned(id));
+        c.complete(7);
+        assert_eq!(comps.try_take(id), Some(7));
+        assert_eq!(rings.load(Ordering::SeqCst), 1);
+        assert_eq!(comps.outstanding(), 0);
+    }
+
+    /// An answer given inside its submit hook, under its dispatcher's host lock, posts without
+    /// ringing: the hook may take a scheduler lock the dispatcher must not nest under its host
+    /// lock (the tree-walker's pipe park takes them the other way round). Its caller's park finds
+    /// the answer.
+    #[test]
+    fn an_answer_inside_its_submit_hook_does_not_ring() {
+        let (comps, rings) = store();
+        let id = comps.submit_host_owned(None, Box::new(|c| c.complete(7)));
+        assert_eq!(comps.try_take(id), Some(7));
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
+        // The next call's answer rings again.
+        submit(&comps).complete(8);
+        assert_eq!(rings.load(Ordering::SeqCst), 1);
+    }
+
+    /// A completer dropped unanswered answers `CAP_REVOKED`, so its caller never hangs.
+    #[test]
+    fn a_dropped_completer_answers_cap_revoked() {
+        let (comps, _) = store();
+        let id = submit(&comps).id();
+        assert_eq!(comps.try_take(id), Some(CAP_REVOKED));
+        assert_eq!(comps.outstanding(), 0);
+    }
+
+    /// A withdrawn call takes no answer and no longer counts in flight.
+    #[test]
+    fn a_withdrawn_call_takes_no_answer() {
+        let (comps, rings) = store();
+        let c = submit(&comps);
+        let id = c.id();
+        assert!(comps.withdraw(id));
+        assert_eq!(comps.outstanding(), 0);
+        c.complete(7);
+        assert_eq!(comps.try_take(id), None);
+        assert_eq!(rings.load(Ordering::SeqCst), 0);
+        assert!(!comps.withdraw(id), "withdrawn once");
+    }
+
+    /// A completer whose domain's store is gone answers nothing, and does not fail.
+    #[test]
+    fn a_completer_outliving_its_store_answers_nothing() {
+        let (comps, _) = store();
+        let c = submit(&comps);
+        drop(comps);
+        c.complete(7);
+    }
+
+    /// Ids are unique across stores, so one embedder serving several domains keys its calls by
+    /// id.
+    #[test]
+    fn ids_are_unique_across_stores() {
+        let (a, _) = store();
+        let (b, _) = store();
+        let (ca, cb) = (submit(&a), submit(&b));
+        assert_ne!(ca.id(), cb.id());
+        assert_eq!((a.minted(), b.minted()), (1, 1));
     }
 }
 

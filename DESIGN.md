@@ -1936,8 +1936,8 @@ every engine in `temen-run/tests/cap_park.rs`.
 **A child's call parks the child alone (#2424, 2026-10-16).** A provider that gives an offloadable
 procedure a fork factory (`grant_host_proc_offloadable`'s `fork`, minting `ForkedProc::offloadable`)
 lets a spawn re-grant it to a §14 child and a fork twin carry it, as a synchronous one's. Each
-domain's calls stay in its own `Completions`, ids minted from 0, and each answer is delivered as it
-arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
+domain's calls stay in its own `Completions`, ids unique in the process (#2495), and each answer is
+delivered as it arrives (#2477), so no outstanding call holds back another's answer, in its domain or another. The
 oracle keys its waiters by `(domain, id)` and drains domain by domain; the wake hook is the store's
 (`Completions::set_notify`), installed at each park and holding the scheduler weakly. The pump and the
 parallel driver park a child's task or fiber as the root's, their drains cover every domain, and the
@@ -1950,6 +1950,27 @@ not), and the answer re-offers it (`outside_waker`). Nor is a `cont.resume.block
 on one, on a task or an OS vCPU: a JIT root blocking on such a fiber read as deadlocked once the
 answer took longer than two 20 ms re-checks. A domain that has punted still forks: the offload
 pool's jobs never touch the window and answer into their own domain's store.
+
+**A call its embedder answers (#2495, 2026-10-20).** An offloadable procedure's call may be answered
+by the embedder instead of a pool thread (`OffloadOutcome::Host`): its submit hook gets the call's
+`Completer`, which answers it from any thread, at any time, into the domain's store with the wake a
+pool answer rings. So the caller parks and wakes as on a pool call, on every engine and in every
+domain, and a call that waits on the world (a bell rung by outside input) holds no host thread while
+it waits — the pool keeps genuinely blocking host work. A completer dropped unanswered answers
+`CAP_REVOKED`, so a call its host can no longer answer never hangs; one whose domain is gone answers
+nothing. Where its caller cannot park the call declines with `CapFault`: before the embedder sees it
+on the sync face and in a durable run, else withdrawn (`Completions::withdraw`, so its completer
+answers nothing) — a reply that is not one `i64`, a tier-up region, a `Jit.invoke` unit, the
+explorer. A driver its embedder pumps (`Vcpu`, `CoopRun`, the debug scheduler) hands control back
+while such a call waits, the earliest in any domain, so a single-threaded embedder (the browser)
+answers between pumps; a driver nothing pumps (the tree-walker, the native pump, the parallel
+driver, the JIT) waits on the store as on the pool, and its embedder answers from a thread of its
+own. Ids are unique in the process, so one embedder serving several domains keys its requests by
+id. Under a recording host (W1) the bytecode drivers tape the delivered value where they deliver it
+(`Completions::take_record`); the tree-walker and the JIT tape none, so they offer no parking face
+there and the call declines. The completer is the one way to answer: `deliver_cap` is gone, and the
+browser's `temen_coop_deliver_cap` and the DAP's `provideCap` answer through the request's
+completer.
 
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
@@ -2482,8 +2503,9 @@ durable, or when emitted code can't address the root window flat. A third kind o
 joins stream calls and children: a **declared host-completed cap** (`Host::grant_declared_host_caps`,
 answered by the embedder — a browser game's `fb_present`), `OpParks::OnHost`. In a bounce out of a
 leaf whose host suspends its frames, such a call parks its task in `BlockedHostCap` with the rest of
-the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and `CoopRun::deliver_cap`
-writes the answer into that continuation; the pump runs it and `Resume` hands the frames its results.
+the call, the pump surfaces `CoopEvent::CapPark` once nothing else can run, and the next pump after
+the call's `Completer` answers writes the answer into that continuation; the pump runs it and
+`Resume` hands the frames its results.
 Anywhere nothing holds the frames (a tier-up region, a `Jit.invoke` unit) the call declines with
 `CapFault`: no one could ever complete it there.
 

@@ -27,12 +27,19 @@
 //! **Nothing waits for a call whose caller is gone** (#2493): a root that kills a child waiting on
 //! the host joins it at once, and a run whose root returns over a fiber still waiting ends at once.
 //! The calls go on running, and their answers land where no one waits.
+//!
+//! **Every case runs twice** (#2495): with `wait` answered by the domain's offload pool, and with
+//! `wait` answered by the embedder, through each call's [`Completer`], from a thread of its own.
+//! A host-answered call parks and wakes exactly as a pool call does, on every engine and in every
+//! domain.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use temen_interp::{CapState, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome, Value};
+use temen_interp::{
+    CapState, Completer, ForkedProc, Host, MemLayout, OffloadHostProc, OffloadOutcome, Value,
+};
 use temen_ir::{Module, SpawnRec};
 use temen_jit::{JitOutcome, TrapKind};
 
@@ -399,28 +406,49 @@ fn tick_proc(ticks: &Arc<Ticks>) -> temen_interp::HostProc {
     Box::new(move |_op, _args, _mem, _minter| Ok(vec![t.tick()]))
 }
 
-/// `wait`: op 0 `wait(n)` punts a wait for `n` ticks to the offload pool, op 1 `started(k)` a wait
-/// for `k` waits to have begun, and op 2 a wait of [`SLOW`] that answers `n`. Forkable over the
-/// same ticks, so a spawn can grant it to a child (#2424).
-fn wait_proc(ticks: &Arc<Ticks>) -> OffloadHostProc {
+/// Who answers a `wait` call (#2495).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answer {
+    /// The domain's offload pool ([`OffloadOutcome::Offload`]).
+    Pool,
+    /// The embedder, through the call's [`Completer`] ([`OffloadOutcome::Host`]), from a thread of
+    /// its own.
+    Host,
+}
+
+/// `wait`: op 0 `wait(n)` waits for `n` ticks, op 1 `started(k)` for `k` waits to have begun, and
+/// op 2 for [`SLOW`], answering `n`; answered by `answer`. Forkable over the same ticks, so a spawn
+/// can grant it to a child (#2424).
+fn wait_proc(ticks: &Arc<Ticks>, answer: Answer) -> OffloadHostProc {
     let t = Arc::clone(ticks);
     Box::new(move |op, args| {
         let (t, n) = (Arc::clone(&t), args.first().copied().unwrap_or(0) as u64);
-        OffloadOutcome::Offload(Box::new(move || match op {
+        let wait = move || match op {
             1 => t.started(n),
             2 => {
                 std::thread::sleep(SLOW);
                 n as i64
             }
             _ => t.wait_for(n),
-        }))
+        };
+        match answer {
+            Answer::Pool => OffloadOutcome::Offload(Box::new(wait)),
+            Answer::Host => OffloadOutcome::Host(Box::new(move |c: Completer| {
+                std::thread::spawn(move || c.complete(wait()));
+            })),
+        }
     })
 }
 
-/// The root's powerbox: an `Instantiator` over its window, `tick`, `wait`, an unbounded `Budget`
-/// and a child image of each of `kids`, on `lanes` lanes (`-1`: as many as it likes). Fresh ticks
-/// for each run.
-fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, Vec<Value>) + 'a {
+/// The root's powerbox: an `Instantiator` over its window, `tick`, `wait` answered by `answer`, an
+/// unbounded `Budget` and a child image of each of `kids`, on `lanes` lanes (`-1`: as many as it
+/// likes). Fresh ticks for each run.
+fn setup<'a>(
+    m: &'a Module,
+    lanes: i64,
+    kids: &'a [u32],
+    answer: Answer,
+) -> impl Fn() -> (Host, Vec<Value>) + 'a {
     move || {
         let ticks = Arc::new(Ticks::default());
         let mut h = Host::new();
@@ -434,10 +462,10 @@ fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, 
         );
         let forked = Arc::clone(&ticks);
         let wait = h.grant_host_proc_offloadable(
-            wait_proc(&ticks),
+            wait_proc(&ticks, answer),
             Some(Arc::new(move |_pid| {
                 Some(ForkedProc::offloadable(
-                    wait_proc(&forked),
+                    wait_proc(&forked, answer),
                     CapState::Stateless,
                 ))
             })),
@@ -456,8 +484,14 @@ fn setup<'a>(m: &'a Module, lanes: i64, kids: &'a [u32]) -> impl Fn() -> (Host, 
 }
 
 /// What the root returned on `driver`, or why there is nothing to compare.
-fn on_driver(driver: Driver, m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
-    let ran = run_on(driver, m, &setup(m, lanes, kids)).ok_or("declined the module")?;
+fn on_driver(
+    driver: Driver,
+    m: &Module,
+    lanes: i64,
+    kids: &[u32],
+    answer: Answer,
+) -> Result<i64, String> {
+    let ran = run_on(driver, m, &setup(m, lanes, kids, answer)).ok_or("declined the module")?;
     match ran.result {
         Ok(v) if v.len() == 1 => match v[0] {
             Value::I64(r) => Ok(r),
@@ -468,8 +502,8 @@ fn on_driver(driver: Driver, m: &Module, lanes: i64, kids: &[u32]) -> Result<i64
 }
 
 /// What the root returned on the Cranelift JIT.
-fn on_the_jit(m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
-    let (mut host, args) = setup(m, lanes, kids)();
+fn on_the_jit(m: &Module, lanes: i64, kids: &[u32], answer: Answer) -> Result<i64, String> {
+    let (mut host, args) = setup(m, lanes, kids, answer)();
     let args: Vec<i64> = args
         .iter()
         .map(|v| match v {
@@ -486,8 +520,8 @@ fn on_the_jit(m: &Module, lanes: i64, kids: &[u32]) -> Result<i64, String> {
     }
 }
 
-/// `m` on every engine, and each that returned anything but `want`. `paced` leaves out the `Vcpu`
-/// harness, which orchestrates no futex `Wait`.
+/// `m` on every engine, `wait` answered each way, and each that returned anything but `want`.
+/// `paced` leaves out the `Vcpu` harness, which orchestrates no futex `Wait`.
 fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced: bool, lanes: i64) {
     let mut wrong = Vec::new();
     let mut each = |engine: String, got: Result<i64, String>| {
@@ -495,13 +529,17 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
             wrong.push(format!("  {engine}: {got:?}"));
         }
     };
-    for driver in drivers::ALL {
-        if paced && driver == Driver::Vcpu {
-            continue;
+    for answer in [Answer::Pool, Answer::Host] {
+        for driver in drivers::ALL {
+            if paced && driver == Driver::Vcpu {
+                continue;
+            }
+            let got = on_driver(driver, m, lanes, kids, answer);
+            each(format!("{driver:?}, {answer:?}-answered"), got);
         }
-        each(format!("{driver:?}"), on_driver(driver, m, lanes, kids));
+        let got = on_the_jit(m, lanes, kids, answer);
+        each(format!("JIT, {answer:?}-answered"), got);
     }
-    each("JIT".into(), on_the_jit(m, lanes, kids));
     assert!(
         wrong.is_empty(),
         "{what}{}{}: want {want} on every engine, but\n{}",
@@ -511,8 +549,8 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
     );
 }
 
-/// `m` on each of `drivers` and the JIT, each run returning `want` in under half of [`GIVE_UP`]:
-/// well before the call it left waiting could have answered.
+/// `m` on each of `drivers` and the JIT, `wait` answered each way, each run returning `want` in
+/// under half of [`GIVE_UP`]: well before the call it left waiting could have answered.
 fn check_prompt(what: &str, m: &Module, kids: &[u32], want: i64, drivers: &[Driver]) {
     let mut wrong = Vec::new();
     let mut each = |engine: String, run: &dyn Fn() -> Result<i64, String>| {
@@ -523,10 +561,15 @@ fn check_prompt(what: &str, m: &Module, kids: &[u32], want: i64, drivers: &[Driv
             wrong.push(format!("  {engine}: {got:?} after {took:?}"));
         }
     };
-    for &driver in drivers {
-        each(format!("{driver:?}"), &|| on_driver(driver, m, -1, kids));
+    for answer in [Answer::Pool, Answer::Host] {
+        for &driver in drivers {
+            let engine = format!("{driver:?}, {answer:?}-answered");
+            each(engine, &|| on_driver(driver, m, -1, kids, answer));
+        }
+        each(format!("JIT, {answer:?}-answered"), &|| {
+            on_the_jit(m, -1, kids, answer)
+        });
     }
-    each("JIT".into(), &|| on_the_jit(m, -1, kids));
     assert!(
         wrong.is_empty(),
         "{what}: want {want} on every engine, before its call could answer, but\n{}",

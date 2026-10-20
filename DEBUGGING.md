@@ -925,7 +925,10 @@ arm it declined on was unreachable; the admission at the top of every advance is
 exist at all. The DAP backend's `Engine::Threaded` arms for `provideCap`, the `cap` stop and the
 request stop answering `false`/`None` — "single-vCPU sessions only" — now call through. Gated by
 `debug_run_cap_park.rs` (both engines, same cases) and `dap_cap_park.rs`'s threaded twin, which makes
-the declared call from a spawned thread and gets its value back through the join.
+the declared call from a spawned thread and gets its value back through the join. (#2495 folded
+`deliver_cap` into the call's `Completer`: the embedder answers through it, the next advance takes
+the answer, counting the turn, and tapes it; and every driver admits such calls, so the admission
+flag is gone.)
 
 ---
 
