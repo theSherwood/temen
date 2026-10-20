@@ -7951,29 +7951,33 @@ fn dbg_pick_runnable(
 /// answer, counting the turn: the lowest-index one whose answer has come, or, with none come yet,
 /// the first to come (#2424 — one thread's answer never waits on another's call, which may wait on
 /// what that thread does). Taken only here, where nothing else could run meanwhile, so when it
-/// comes changes nothing a replay sees, and taped as it is taken ([`tape_answer`]). `false` when no
-/// thread is parked, or, with no answer in, one waits on its embedder (#2495): the run stops for
-/// it.
+/// comes changes nothing a replay sees, and taped as it is taken ([`tape_answer`]).
+///
+/// `Ok` when a thread took its answer. Else, with no answer in, the lowest-index thread whose call
+/// waits on its embedder (#2495), as `(thread, id, at)`, for the run to stop on; or `None` when no
+/// thread is parked. The stop is the one found here: the embedder may answer the call from another
+/// thread before it sees the stop, and the next advance takes the answer. Looking for it again
+/// after this returned could find it answered, and the run, with its answer in, read as blocked.
 fn dbg_take_answer(
     tasks: &mut [TaskSlot],
     extra_envs: &mut [DbgEnv],
     host: &mut Host,
     turn: &mut u64,
-) -> bool {
+) -> Result<(), Option<(usize, u64, Option<super::IrPc>)>> {
     let parked: Vec<_> = tasks
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.state {
-            TaskState::BlockedHostCap { id, dst, .. } => Some((i, t.env, dst, id)),
+            TaskState::BlockedHostCap { id, dst, at } => Some((i, t.env, dst, id, at)),
             _ => None,
         })
         .collect();
     let calls: Vec<_> = parked
         .iter()
-        .map(|&(_, env, _, id)| (dbg_completions(env, extra_envs, host), id))
+        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
         .collect();
     loop {
-        for &(p, env, dst, id) in &parked {
+        for &(p, env, dst, id, _) in &parked {
             let h = match env {
                 None => &mut *host,
                 Some(k) => &mut extra_envs[k].host,
@@ -7982,12 +7986,18 @@ fn dbg_take_answer(
                 tasks[p].deliver(dst, Reg::from_i64(r));
                 tasks[p].state = TaskState::Runnable;
                 *turn += 1;
-                return true;
+                return Ok(());
             }
         }
-        let on_embedder = calls.iter().any(|(comps, id)| comps.is_host_owned(*id));
-        if calls.is_empty() || on_embedder {
-            return false;
+        let on_embedder = parked
+            .iter()
+            .zip(&calls)
+            .find(|(_, (comps, id))| comps.is_host_owned(*id));
+        if let Some((&(p, _, _, id, at), _)) = on_embedder {
+            return Err(Some((p, id, at)));
+        }
+        if calls.is_empty() {
+            return Err(None);
         }
         super::Completions::wait_any(&calls, None, None);
     }
@@ -8551,22 +8561,13 @@ impl ScheduledDebugRun {
                     // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
                     // lowest-index one), else a true deadlock.
                     None => {
-                        if dbg_take_answer(tasks, extra_envs, host, turn) {
-                            continue;
-                        }
+                        let on_embedder = match dbg_take_answer(tasks, extra_envs, host, turn) {
+                            Ok(()) => continue,
+                            Err(on_embedder) => on_embedder,
+                        };
                         // #1366: a thread parked on a host-answered cap is a live `CapPark` stop
                         // on that thread (lowest-index), resumed once its embedder answers.
-                        if let Some((p, id, at)) =
-                            tasks.iter().enumerate().find_map(|(i, t)| match t.state {
-                                TaskState::BlockedHostCap { id, at, .. }
-                                    if dbg_completions(t.env, extra_envs, host)
-                                        .is_host_owned(id) =>
-                                {
-                                    Some((i, id, at))
-                                }
-                                _ => None,
-                            })
-                        {
+                        if let Some((p, id, at)) = on_embedder {
                             // The stop location is the call itself, falling back to the live pc.
                             let pc = at.or_else(|| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                             if let Some(pc) = pc {
@@ -8894,7 +8895,7 @@ impl ScheduledDebugRun {
         }) else {
             // A parked thread's answer is this tick, as in `drive`; else no runnable thread and no
             // waiter (deadlock, or its embedder's to answer) — can't advance.
-            return dbg_take_answer(tasks, extra_envs, host, turn);
+            return dbg_take_answer(tasks, extra_envs, host, turn).is_ok();
         };
         if let Some(before) = pre_pick.as_ref() {
             let mut events = Vec::new();
