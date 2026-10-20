@@ -6,14 +6,16 @@
 //! these guests pin is what that mechanism could get wrong and the interpreters' vCPU clone cannot:
 //! values live across the fork call in the frames below it, a fork inside a loop, the twin's window
 //! being a *copy* (its writes never reach the parent), a twin forking again, the pids both copies
-//! see, and a twin that crashes. Each guest runs on the tree-walk oracle, the bytecode engine and the
-//! JIT, and every engine must produce the same outcome.
+//! see, and a twin that crashes. They also pin the twin's fuel, which comes out of the run's budget
+//! (on the JIT through a cell of the twin's own, #2459). Each guest runs on the tree-walk oracle, the
+//! bytecode engine and the JIT, and every engine must produce the same outcome.
 //!
 //! `caller_request_parity.rs` covers the call forms and grant shapes of the same requests; this file
 //! covers the shapes of the program around them.
 
+use std::time::Duration;
 use temen_run::{
-    instantiate_with_imports, Backend, HostCap, Imports, Outcome, RunConfig, SharedHostProc,
+    instantiate_with_imports, Backend, HostCap, Imports, Limits, Outcome, RunConfig, SharedHostProc,
 };
 use temen_text::parse_module;
 
@@ -25,8 +27,9 @@ import 0 \"fork\" () -> (i64)\n\
 import 1 \"wait4\" (i64, i64, i64, i64) -> (i64)\n\
 import 2 \"exit\" (i32) -> ()\n";
 
-/// Run `src` (after [`HEAD`], or bare when `head` is false) on `backend` over a POSIX personality.
-fn run_on(src: &str, head: bool, backend: Backend) -> Outcome {
+/// Run `src` (after [`HEAD`], or bare when `head` is false) on `backend` over a POSIX personality,
+/// under `cfg`.
+fn run_on(src: &str, head: bool, backend: Backend, cfg: &RunConfig) -> Outcome {
     let text = if head {
         format!("{HEAD}{src}")
     } else {
@@ -55,7 +58,7 @@ fn run_on(src: &str, head: bool, backend: Backend) -> Outcome {
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
     };
-    inst.run_with_caps_and_host(backend, &RunConfig::default(), &[], Some(&mut setup))
+    inst.run_with_caps_and_host(backend, cfg, &[], Some(&mut setup))
         .unwrap_or_else(|e| panic!("{backend:?}: {e}"))
         .outcome
 }
@@ -63,7 +66,11 @@ fn run_on(src: &str, head: bool, backend: Backend) -> Outcome {
 /// Every engine must run `src` to `want`.
 fn assert_every_engine(src: &str, want: Outcome) {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        assert_eq!(run_on(src, true, backend), want, "{backend:?}");
+        assert_eq!(
+            run_on(src, true, backend, &RunConfig::default()),
+            want,
+            "{backend:?}"
+        );
     }
 }
 
@@ -319,7 +326,7 @@ export 0 func \"_start\" 0
 fn a_crashing_twin_reaps_as_128_identically_on_every_engine() {
     for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
         assert_eq!(
-            run_on(FORK_CRASH, true, backend),
+            run_on(FORK_CRASH, true, backend, &RunConfig::default()),
             Outcome::Exited(128),
             "{backend:?}"
         );
@@ -498,13 +505,13 @@ export 0 func \"_start\" 0
 fn without_a_shadow_arena_the_jit_refuses_fork_probeably() {
     for backend in [Backend::TreeWalk, Backend::Bytecode] {
         assert_eq!(
-            run_on(FORK_NO_ARENA, false, backend),
+            run_on(FORK_NO_ARENA, false, backend, &RunConfig::default()),
             Outcome::Exited(2),
             "{backend:?}"
         );
     }
     assert_eq!(
-        run_on(FORK_NO_ARENA, false, Backend::Jit),
+        run_on(FORK_NO_ARENA, false, Backend::Jit, &RunConfig::default()),
         Outcome::Exited(100 + 38),
         "the JIT answers -ENOSYS"
     );
@@ -574,13 +581,13 @@ fn a_fork_beneath_a_forged_index_is_refused_probeably_on_the_jit() {
     let src = FORK_THROUGH_SLOT.replace("SLOT", "idx = i32.const 1");
     for backend in [Backend::TreeWalk, Backend::Bytecode] {
         assert_eq!(
-            run_on(&src, true, backend),
+            run_on(&src, true, backend, &RunConfig::default()),
             Outcome::Exited(2),
             "{backend:?}"
         );
     }
     assert_eq!(
-        run_on(&src, true, Backend::Jit),
+        run_on(&src, true, Backend::Jit, &RunConfig::default()),
         Outcome::Exited(100 + 38),
         "the JIT answers -ENOSYS"
     );
@@ -649,4 +656,130 @@ export 0 func \"_start\" 0
 #[test]
 fn a_second_fork_beneath_a_rewound_caller_unwinds_it_again_on_every_engine() {
     assert_every_engine(FORK_TWICE, Outcome::Exited(33));
+}
+
+/// #2459 — the twin's fuel is the run's. The parent reads its fuel (`fuel.remaining`, self op 13),
+/// forks a child that turns a loop 100000 times and exits, reaps it, and reads its fuel again: the
+/// second read is less by what the child burned, its loop and a few entries. On the JIT the child
+/// charges a fuel cell of its own, drawn from the run's budget, so by the time it is reaped the cell
+/// must have handed back what it drew and did not burn. The parent exits `0` when the difference is
+/// within 1000 of the loop's count, `1` when it is short (the child's burn did not come out of the
+/// run's budget), and `2` when it is over (a draw the child did not burn was kept).
+const FORK_FUEL: &str = "\
+func () -> () {
+block 0 () {
+  fz = i32.const 0
+  f0 = call.cap 4294967295 13 () -> (i64) fz ()
+  fa = i64.const 40000
+  i64.store fa f0
+  p = call.import 0 ()
+  z = i64.const 0
+  child = i64.eq p z
+  br_if child 1(z) 3(p)
+  }
+block 1 (ck: i64) {
+  cn = i64.const 100000
+  cmore = i64.lt_u ck cn
+  cone = i64.const 1
+  ck1 = i64.add ck cone
+  br_if cmore 1(ck1) 2()
+  }
+block 2 () {
+  ez = i32.const 0
+  call.import 2 (ez)
+  unreachable
+  }
+block 3 (pp: i64) {
+  pst = i64.const 41000
+  pz = i64.const 0
+  pw = call.import 1 (pp, pst, pz, pz)
+  qz = i32.const 0
+  q1 = call.cap 4294967295 13 () -> (i64) qz ()
+  qa = i64.const 40000
+  q0 = i64.load qa
+  qd = i64.sub q0 q1
+  qn = i64.const 100000
+  qshort = i64.lt_s qd qn
+  br_if qshort 4() 5(qd)
+  }
+block 4 () {
+  one = i32.const 1
+  call.import 2 (one)
+  unreachable
+  }
+block 5 (rd: i64) {
+  rmax = i64.const 101000
+  rover = i64.gt_s rd rmax
+  br_if rover 6() 7()
+  }
+block 6 () {
+  two = i32.const 2
+  call.import 2 (two)
+  unreachable
+  }
+block 7 () {
+  zero = i32.const 0
+  call.import 2 (zero)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn a_reaped_twin_has_burned_its_fuel_from_the_runs_budget_on_every_engine() {
+    assert_every_engine(FORK_FUEL, Outcome::Exited(0));
+}
+
+/// #2459 — the run's fuel bounds every process of its tree. The child spins forever; the run's grant
+/// of a million stops it with `OutOfFuel`, which its parent reaps as a crash, `128`, and exits with.
+/// The deadline only turns a child the grant failed to stop into a failure rather than a hang: the
+/// run would end trapped, not exited.
+const FORK_SPIN: &str = "\
+func () -> () {
+block 0 () {
+  p = call.import 0 ()
+  z = i64.const 0
+  child = i64.eq p z
+  br_if child 1() 2(p)
+  }
+block 1 () {
+  br 1()
+  }
+block 2 (pp: i64) {
+  pst = i64.const 41000
+  pz = i64.const 0
+  pw = call.import 1 (pp, pst, pz, pz)
+  phi = i64.const 41001
+  pcode8 = i32.load8_u phi
+  call.import 2 (pcode8)
+  unreachable
+  }
+}
+export 0 func \"_start\" 0
+";
+
+#[test]
+fn the_runs_fuel_stops_a_spinning_twin_on_every_engine() {
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: Some(1_000_000),
+            deadline: Some(Duration::from_secs(30)),
+            ..Limits::default()
+        },
+        ..RunConfig::default()
+    };
+    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+        assert_eq!(
+            run_on(FORK_SPIN, true, backend, &cfg),
+            Outcome::Exited(128),
+            "{backend:?}"
+        );
+        // The bytecode engine keeps no twin-trap record; the other two name the trap.
+        if backend != Backend::Bytecode {
+            let traps = temen_interp::last_twin_traps();
+            assert_eq!(traps.len(), 1, "{backend:?}: {traps:?}");
+            assert_eq!(traps[0].trap, temen_interp::Trap::OutOfFuel, "{backend:?}");
+        }
+    }
 }

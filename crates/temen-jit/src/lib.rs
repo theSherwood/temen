@@ -2591,6 +2591,153 @@ mod domain_teardown_tests {
             other => panic!("expected Returned([42]), got {other:?}"),
         }
     }
+
+    /// #2498 — a powerbox whose calls answer as temen-run's thunk answers a successful one: by
+    /// writing `0` to the trap cell, which the vCPUs of a domain share. Op 0 is `exit(code)`. Op 1
+    /// answers once the trap cell holds the domain's end (a sibling's call in flight when it lands);
+    /// op 2 once teardown has recorded it in the stop word. Each waits at most half of [`PROMPT`], so
+    /// a run that never records the end still ends, with whatever outcome it then reports.
+    unsafe extern "C" fn in_flight_thunk(
+        _ctx: *mut core::ffi::c_void,
+        _mem_base: *mut u8,
+        _mem_size: u64,
+        _mem_reserved: u64,
+        _type_id: u32,
+        op: u32,
+        _handle: i32,
+        args: *const i64,
+        _n_args: u64,
+        _results: *mut i64,
+        _n_results: u64,
+        trap_out: *mut i64,
+    ) {
+        use core::sync::atomic::Ordering;
+        let vm = crate::VmCtx::of_trap_out(trap_out);
+        let ended = |op| match op {
+            1 => vm.trap.load(Ordering::Relaxed) != 0,
+            _ => vm.stop.load(Ordering::Relaxed) != 0,
+        };
+        if op == 0 {
+            *trap_out = EXIT_CODE as i64 | ((*args as i32 as i64) << 32);
+            return;
+        }
+        let start = Instant::now();
+        while !ended(op) && start.elapsed() < PROMPT / 2 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *trap_out = 0;
+    }
+
+    /// Run `src` over [`in_flight_thunk`] on a thread of its own, and fail if it has not ended
+    /// within [`PROMPT`]: the hang this guards against would otherwise hang the test too.
+    fn run_in_flight(src: String) -> JitOutcome {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let m = parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}\n{src}"));
+            verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}\n{src}"));
+            let out = compile_and_run_with_host(&m, 0, &[], in_flight_thunk, core::ptr::null_mut());
+            let _ = tx.send(out.expect("jit compile/run"));
+        });
+        rx.recv_timeout(PROMPT)
+            .unwrap_or_else(|_| panic!("the run did not end within {PROMPT:?}"))
+    }
+
+    /// The root half of every #2498 fixture: spawn func 1, wait until it has stored `1` at 16392
+    /// (it does just before its host call), then `end`.
+    fn root_then(ret: &str, end: &str) -> String {
+        format!(
+            "memory 16\n\
+             func () -> ({ret}) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.const 16392\n\
+             \x20 v3 = i32.const 0\n\
+             \x20 v4 = i64.const -1\n\
+             \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+             \x20 {end}\n\
+               }}\n\
+             }}\n"
+        )
+    }
+
+    /// Func 1 of every #2498 fixture: store `1` at 16392 and notify the root, make host call `op`,
+    /// then `then`, with `blocks` after.
+    fn sibling_calls(op: u32, then: &str, blocks: &str) -> String {
+        format!(
+            "func (i64, i64) -> (i64) {{\n\
+             block 0 (vsp: i64, v0: i64) {{\n\
+             \x20 v1 = i64.const 16392\n\
+             \x20 v2 = i32.const 1\n\
+             \x20 i32.atomic.store v1 v2\n\
+             \x20 v3 = atomic.notify v1 v2\n\
+             \x20 v4 = i32.const 0\n\
+             \x20 v5 = call.cap 1 {op} (i32) -> (i64) v4 (v4)\n\
+             \x20 {then}\n\
+               }}\n\
+             {blocks}\
+             }}\n"
+        )
+    }
+
+    /// #2498 — the root's completion survives a sibling's host call: a successful `call.cap`
+    /// resets the trap cell, which erased the sentinel teardown had stored there, so a sibling that
+    /// went on spinning never saw the domain end, and `join_all` waited for it forever (nim's
+    /// `parfor` corpus case: an idle pool worker's host call). The stop word, which no host call
+    /// resets, ends it at its next back-edge poll.
+    #[test]
+    fn root_return_tears_down_a_sibling_whose_host_call_wiped_the_trap_cell() {
+        let src = format!(
+            "{}{}",
+            root_then("i64", "v6 = i64.const 42\n  return v6"),
+            sibling_calls(1, "br 1()", "block 1 () {\n  br 1()\n  }\n")
+        );
+        match run_in_flight(src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// #2498 — and a sibling that parks after such a call: its wait re-checks the stop word, so it
+    /// unwinds rather than being read as a deadlock, which reported `ThreadFault` for a root that
+    /// returned cleanly.
+    #[test]
+    fn root_return_tears_down_a_sibling_that_parks_after_its_host_call_wiped_the_trap_cell() {
+        let src = format!(
+            "{}{}",
+            root_then("i64", "v6 = i64.const 42\n  return v6"),
+            sibling_calls(
+                1,
+                "v6 = i64.const 16400\n  v7 = i32.const 0\n  v8 = i64.const -1\n  \
+                 v9 = i32.atomic.wait v6 v7 v8\n  v10 = i64.const 7\n  return v10",
+                ""
+            )
+        );
+        match run_in_flight(src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// #2498 — the root's `exit` survives a sibling's host call that answers after teardown: the
+    /// call wipes the trap cell that held the exit, and the sibling then returns, so no poll puts
+    /// it back. Teardown recorded the exit in the stop word, which the run's outcome reads.
+    #[test]
+    fn root_exit_survives_a_sibling_host_call_that_wiped_the_trap_cell_after_teardown() {
+        let src = format!(
+            "{}{}",
+            root_then(
+                "",
+                "v6 = i32.const 0\n  v7 = i32.const 3\n  \
+                 v8 = call.cap 1 0 (i32) -> (i64) v6 (v7)\n  unreachable"
+            ),
+            sibling_calls(2, "v6 = i64.const 7\n  return v6", "")
+        );
+        match run_in_flight(src) {
+            JitOutcome::Exited(code) => assert_eq!(code, 3),
+            other => panic!("expected Exited(3), got {other:?}"),
+        }
+    }
 }
 
 /// `(func, block) → [(block-local value index, value-label id)]` — the source variables to stamp
@@ -5039,8 +5186,12 @@ impl CompiledModule {
         };
 
         // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
-        // synchronization point); Relaxed suffices.
-        let cell = trap_cell.load(Ordering::Relaxed);
+        // synchronization point); Relaxed suffices. A cell a sibling's host call wiped after teardown
+        // falls back to the stop word, where teardown recorded what ended the domain (#2498).
+        let cell = match trap_cell.load(Ordering::Relaxed) {
+            0 => vm.stop.load(Ordering::Relaxed),
+            cell => cell,
+        };
         let code = cell as u32;
         let outcome = if code == 0 || code == DOMAIN_DONE_CODE {
             // `DOMAIN_DONE_CODE` is the internal root-completed teardown sentinel (owner decision
@@ -10133,9 +10284,9 @@ fn emit_signal_check(
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
 /// by the host from another thread, so a plain (non-atomic) load/store is enough — and cheaper. A
-/// domain's vCPUs share the cell, so their plain stores race and their charge is approximate; after
-/// a refill the check charges from the allowance it granted, so a sibling's stale `0` in `left` is
-/// never read as a spent chain; (2)
+/// domain's vCPUs share the cell, so their plain stores race and their charge is approximate (and
+/// vCPUs running at once contend for its cache line, #2488); after a refill the check charges from
+/// the allowance it granted, so a sibling's stale `0` in `left` is never read as a spent chain; (2)
 /// the store of `fuel-1` back to the same address it just loaded creates a store⇒load dependency that
 /// stops Cranelift's alias analysis from treating the load as loop-invariant and hoisting it out (the
 /// reason `emit_epoch_check` needs an *atomic* load to achieve the same). Trap when the loaded value
