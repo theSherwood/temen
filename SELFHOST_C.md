@@ -285,9 +285,10 @@ compiler bug is a clean error, never an escape.
    substrate / TCB change** — the emitter, the interpreter, and the powerbox are all untouched.
    *(Retired by #1414 S4-3b: the card's compile is now a pump open, `temen_coop_open_fs`, which runs
    chibicc's root whole as a leaf, page-checked over its read-only data.)* Gated by:
-   - `browser/tests/chibicc_jit.rs` — a native `wasmi` differential (the `jit_module.rs` pattern): the
-     JIT-emitted IR is **byte-identical** to the interpreter oracle (`onramp_fs_exec`), and the emitted
-     program then parses + runs to its expected stdout.
+   - `browser/tests/coop_tierup_driver.rs`'s `coop_open_fs_compiles_c_with_chibicc_as_a_root_leaf` —
+     the pump's compile emits IR **byte-identical** to the interpreter oracle (`onramp_fs_exec`). Its
+     predecessor, the native `wasmi` differential `browser/tests/chibicc_jit.rs`, went with the
+     single-shot run (#1414 S4-5b).
    - `browser-play-editor-test.mjs` — Chromium asserts the card compiles-and-runs **on the wasm-JIT**
      in-browser (the `.state` message reports `(wasm-JIT)`, so a silent interpreter fallback fails), and
      the card's **"Prove interp ≡ JIT"** button (`proveChibiccParity`) shows byte-identical emitted IR
@@ -304,8 +305,8 @@ compiler bug is a clean error, never an escape.
    (emitting chibicc's `_start` + `WebAssembly.compile` of the ~1.2 MB emitted module) paid **once per
    page load** — the emitted module is the same for every program (the user's C is *data* in the seeded
    memfs, not part of the emitted code), so V8 code-caches it and every compile after the first reuses it.
-   The bench also asserts the two tiers emit **byte-identical IR** (a second guard alongside
-   `chibicc_jit.rs`), so it doubles as a perf-and-correctness regression check.
+   The bench also asserts the two tiers emit **byte-identical IR** (a second guard alongside the
+   native test above), so it doubles as a perf-and-correctness regression check.
 
    **→ Larger libc + predefined macros DONE 2026-07-28.** The seeded playground libc grew from "enough
    for a `printf` demo" to "enough for real programs":

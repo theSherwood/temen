@@ -776,8 +776,9 @@ has no threads); (2) **`self.resolve` outlining** — the powerbox `_start` synt
 out-of-subset op, hoisted into a cross-tier wrapper like `call.cap`, so func 0 itself becomes
 emittable; (3) **per-type pooled locals** — the emitter reused block-value locals across blocks, so
 `JS_CallInternal` dropped from 373646 locals (past V8's per-function cap) to 356. The single-shot
-module JIT path (`temen_onramp_jit_run_*` → `compile_module_reactor` rooted at `_start`) emits **1176 of
-1201** functions; only the 25 tiny host-boundary wrappers stay cross-tier. Verified in real Chromium/V8
+module JIT path (then `temen_onramp_jit_run_*` → `compile_module_reactor` rooted at `_start`; retired
+by #1414 S4-3 and S4-5b) emitted **1176 of 1201** functions; only the 25 tiny host-boundary wrappers
+stayed cross-tier. Verified in real Chromium/V8
 (`browser-jit-module-test.mjs`): stdout byte-identical across tiers, **~6×** faster (a
 fib+sort+loop+regex script: 80.4 s → 12.9 s). The playground JS tab's "wasm-JIT" toggle now runs it.
 

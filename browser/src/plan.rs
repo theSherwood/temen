@@ -10,7 +10,7 @@
 //! The plan is also the document a guest graph-runner would read (#1717, option B), so moving the
 //! generation into a guest later changes where this runs, not what it reads.
 
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::{bytecode, Host, Trap, Value};
 use temen_ir::Module;
 
 /// The root's own window: grant records, the capability names they point at, and each node's argv
@@ -324,112 +324,19 @@ pub fn outcome(root: Result<Vec<Value>, Trap>) -> Result<Vec<Value>, Trap> {
     }
 }
 
-/// Run `plan` to completion on the resumable interpreter (the native / single-threaded driver,
-/// [`drive_op13`]): generate the root, grant it [`Plan::root_args`] over `host` (which already holds
-/// `caps`), and return the last node's outcome ([`outcome`]).
+/// Run `plan` to completion on the pump: generate the root, grant it [`Plan::root_args`] over `host`
+/// (which already holds `caps`), and return the last node's outcome ([`outcome`]). The nodes run as
+/// the root's detached children, interleaved, so a pipe's reader can wait for its writer.
 pub fn run(
     plan: &Plan,
     modules: &[&Module],
     mut host: Host,
     caps: &[i32],
 ) -> Result<Vec<Value>, Trap> {
-    // This driver runs each child to completion as it is spawned, so a pipe's reader could never
-    // wait for its writer: refuse a plan with pipes up front rather than trap mid-run.
-    if !plan.pipes.is_empty() {
-        return Err(Trap::Malformed);
-    }
     let src = plan.root_src().map_err(|_| Trap::Malformed)?;
     let root = temen_text::parse_module(&src).map_err(|_| Trap::Malformed)?;
-    let prog = bytecode::VcpuProgram::compile(&root).ok_or(Trap::Malformed)?;
     let args = plan.root_args(&mut host, modules, caps);
-    let win = 1usize << ROOT_WINDOW_LOG2;
-    let layout = std::alloc::Layout::from_size_align(win, 8).map_err(|_| Trap::Malformed)?;
-    // SAFETY: non-zero 8-aligned layout; owned here until the dealloc below, after the root vCPU and
-    // every region view over it are dropped.
-    let base = unsafe { std::alloc::alloc_zeroed(layout) };
-    if base.is_null() {
-        return Err(Trap::Malformed);
-    }
-    let back = std::sync::Arc::new(unsafe { Region::shared(base, win as u64) });
-    let out = bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &args,
-        std::sync::Arc::clone(&back),
-        &[],
-        host,
-    )
-    .and_then(|root| drive_op13(&prog, root));
-    drop(back);
-    // SAFETY: same layout; the root vCPU and its region views are dropped above.
-    unsafe { std::alloc::dealloc(base, layout) };
-    outcome(out)
-}
-
-/// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`), for a root (see
-/// [`run`]) or a child a driver runs on the interpreter. The engine admits every spawn, its powerbox
-/// built; this loop only starts the child. On a **detached** spawn (#1288) it mints the fresh window's
-/// backing, a root-sized lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged`
-/// fallback on wasm32), which the engine seeds (committed window = the declared size, starter caps
-/// over the reservation, so `vm_map` grows it), and drives the child to completion — at any depth.
-/// `Join` delivers the child's result. A carve child (retired, #1289) is the driver's decline.
-pub(crate) fn drive_op13<'p>(
-    prog: &'p bytecode::VcpuProgram,
-    mut vcpu: bytecode::Vcpu<'p>,
-) -> Result<Vec<Value>, Trap> {
-    let mut children: Vec<Option<Result<Vec<Value>, Trap>>> = Vec::new();
-    loop {
-        match vcpu.run() {
-            bytecode::VcpuEvent::Done(v) => return Ok(v),
-            bytecode::VcpuEvent::Trapped(t) => return Err(t),
-            bytecode::VcpuEvent::InstantiateDetached { .. } => {
-                // The fresh window's backing, a lazy reservation; the engine seeds it.
-                let back = std::sync::Arc::new(Region::new(
-                    1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
-                    temen_interp::host_page_size(),
-                ));
-                let r = vcpu
-                    .take_child()
-                    .ok_or(Trap::Malformed)
-                    .and_then(|c| c.start(prog, back))
-                    .and_then(|c| drive_op13(prog, c));
-                let token = children.len() as u64;
-                children.push(Some(r));
-                vcpu.deliver_child(token);
-            }
-            // The engine resolved the guest's handle (a bad one traps in the vCPU) and hands each
-            // child's token back once.
-            bytecode::VcpuEvent::Join { child } => {
-                let banked = children[child as usize]
-                    .take()
-                    .expect("the engine hands a child's token back once");
-                vcpu.deliver_join(banked);
-            }
-            // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
-            // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own
-            // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
-            // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
-            bytecode::VcpuEvent::JitInstall { handle, code } => {
-                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
-                vcpu.deliver_jit_install(unit);
-            }
-            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
-                let authorized = vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
-                vcpu.deliver_jit_uninstall(authorized);
-            }
-            bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
-                let unit = vcpu.host_mut().resolve_jit_unit(handle, code);
-                vcpu.deliver_jit_invoke(unit);
-            }
-            // The children this loop drives are single-threaded and non-interactive: no threads, no
-            // cap or stdin park. The driver's decline — a
-            // value at the parent's join, never a parent-killing trap (see `crate::declined_child`).
-            // Named rather than `_` (see `VcpuEvent`).
-            bytecode::VcpuEvent::Spawn { .. }
-            | bytecode::VcpuEvent::Wait { .. }
-            | bytecode::VcpuEvent::Notify { .. }
-            | bytecode::VcpuEvent::CapPending { .. }
-            | bytecode::VcpuEvent::StdinPark => return crate::declined_child(),
-        }
-    }
+    let mut fuel = u64::MAX;
+    let ran = bytecode::compile_and_run_with_host(&root, 0, &args, &mut fuel, &mut host);
+    outcome(ran.ok_or(Trap::Malformed)?)
 }

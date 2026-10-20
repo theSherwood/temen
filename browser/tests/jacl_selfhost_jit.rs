@@ -1,28 +1,17 @@
-//! JACL self-hosted compiler-guest — the two engine contracts the browser relies on.
+//! JACL self-hosted compiler-guest — the engine contract the browser relies on.
 //!
 //! `jacl_compiler.temen` is the JACL frontend compiled to Temen: it reads JACL source on stdin and
 //! writes TEMEN-IR on stdout, expanding macros IN-GUEST via the §22 `Jit` capability (`grant_onramp_caps`
-//! grants it because the guest imports `vm_jit_*`). This test pins the two facts the playground's
-//! run path depends on:
-//!
-//!   1. **Guest-JIT macro staging works** — on the on-ramp interpreter ([`onramp_exec`]) the compiler
-//!      expands the tour's `unless` macro (→ `if` → `br_if`) in-guest. This is the tour fix.
-//!   2. **The wasm-JIT reactor correctly refuses the compiler** — the compiler links the full `jaclrt`
-//!      runtime (STW GC + scheduler), whose safepoint/`spawn`/`await` use §12 suspend/`cont`/futex ops.
-//!      `compile_jit`'s `reachable_concurrency` guard therefore returns `InterpDriven`, and the
-//!      wasm-driven [`JitOnrampRun`] reactor fails closed with `STATUS_UNSUPPORTED`. The playground
-//!      falls back to the interpreter for it (as for any non-wasm-drivable guest).
-//!
-//! Making the compiler (or any linked JACL program) wasm-drivable needs a single-threaded, no-scheduler
-//! `jaclrt` build variant so no reachable function carries a concurrency op — tracked separately.
+//! grants it because the guest imports `vm_jit_*`). This test pins the fact the playground's run path
+//! depends on: **guest-JIT macro staging works** — on the on-ramp interpreter ([`onramp_exec`]) the
+//! compiler expands the tour's `unless` macro (→ `if` → `br_if`) in-guest. This is the tour fix. Its
+//! run on the emitted tier, over the pump, is `coop_tierup_driver.rs`'s
+//! `coop_jacl_compiler_runs_through_the_driver`.
 //!
 //! Cross-repo asset: `jacl_compiler.temen` is built by the outer jacl_impl repo
 //! (codegen/selfhost/build_compiler_temen.sh). Absent ⇒ the test SKIPs.
 
-use temen_browser::{onramp_exec, JitOnrampRun, STATUS_EXIT, STATUS_OK, STATUS_UNSUPPORTED};
-
-const WIN_LOG2: u8 = 27; // 128 MiB (the compiler + macro staging heap)
-const WIN_SIZE: u64 = 1 << WIN_LOG2;
+use temen_browser::{onramp_exec, STATUS_EXIT, STATUS_OK};
 
 // The tour's macro: a pure syntax-quote template. Expands `unless C {B}` → `[if C {} {B}]` → br_if.
 const MACRO_SRC: &str = "defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
@@ -76,43 +65,4 @@ fn jacl_bytecode_guest_jit_stages_the_tour_macro() {
         "OK: {} bytes of IR, `unless` staged in-guest on the interpreter",
         ir.len()
     );
-}
-
-#[test]
-fn jacl_compiler_wasmjit_reactor_open_is_well_formed() {
-    let Some(compiler) = jacl_compiler_temen() else {
-        eprintln!("SKIP: jacl_compiler.temen absent");
-        return;
-    };
-    // The single-shot wasm-JIT reactor either emits the compiler-guest (wasm-drivable `_start`) or
-    // fails closed with `STATUS_UNSUPPORTED` — at which point the browser runs it on the interpreter
-    // (the guaranteed path, exercised by the test above). Which branch is taken depends on the vendored
-    // engine's concurrency-reachability analysis of the full `jaclrt` runtime the compiler links, so
-    // this asserts only the well-formed contract (open, or a clean `STATUS_UNSUPPORTED`), not a
-    // specific drive mode — the interpreter path is the invariant, not wasm-drivability.
-    let mut win = vec![0u8; WIN_SIZE as usize].into_boxed_slice();
-    let win_ptr = win.as_mut_ptr();
-    // SAFETY: `win` outlives the call and is used solely as this run's window.
-    let opened = unsafe {
-        JitOnrampRun::open_shared_run(
-            &compiler,
-            win_ptr,
-            WIN_SIZE,
-            WIN_LOG2,
-            false,
-            MACRO_SRC.as_bytes().to_vec(),
-        )
-    };
-    match opened {
-        Ok(_) => {
-            eprintln!("OK: wasm-JIT reactor emits the compiler-guest (wasm-drivable `_start`)")
-        }
-        Err(status) => {
-            assert_eq!(
-                status, STATUS_UNSUPPORTED,
-                "reactor refusal must be a clean STATUS_UNSUPPORTED (interpreter fallback), got {status}"
-            );
-            eprintln!("OK: wasm-JIT reactor refuses the compiler-guest → interpreter fallback");
-        }
-    }
 }

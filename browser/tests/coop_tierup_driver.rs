@@ -1828,24 +1828,27 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
 /// `readonly` data segment. Keyed on rodata alone, `temen_coop_open` emitted it non-paged, the
 /// emitter's window-remapping gate module-gated it to emit-nothing, and the open **declined** —
 /// interpreter-only for a guest paged mode carries fine. Now the flip also keys on
-/// `module_uses_unmap_protect`: the guest opens paged, the leaf tiers up, and the post-`protect`
-/// access matches the oracle (Ro load succeeds, Ro store traps) through the per-event
-/// `sync_pagestate` refresh.
+/// `module_uses_unmap_protect`: the guest opens paged, the leaf tiers up, and the access after the
+/// page op matches the oracle (an Ro load succeeds; an Ro store, and a store to a page the guest
+/// unmapped, trap) through the per-event `sync_pagestate` refresh.
 #[test]
 fn coop_unmap_protect_guest_without_rodata_opens_paged() {
     let _g = ffi_guard();
     let (_out_h, mem_h) = onramp_out_mem_handles();
 
-    for (store, want_trap) in [(false, false), (true, true)] {
-        let body = if store {
-            "  i64.store v0 v0\n  vl = i64.load v0\n  return vl\n"
-        } else {
-            "  vl = i64.load v0\n  return vl\n"
-        };
-        // `_start` seeds the page while it is still Rw, `protect`s [64 KiB, 80 KiB) read-only
-        // (interp-serviced — a call.cap-bearing function never emits), then calls the leaf.
+    let protect = "  vprot = i32.const 1\n  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n";
+    let unmap = "  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)\n";
+    let load = "  vl = i64.load v0\n  return vl\n";
+    let store_load = "  i64.store v0 v0\n  vl = i64.load v0\n  return vl\n";
+    for (case, page_op, body, want_trap) in [
+        ("an Ro load", protect, load, false),
+        ("an Ro store", protect, store_load, true),
+        ("a store to an unmapped page", unmap, store_load, true),
+    ] {
+        // `_start` seeds the page while it is still Rw, `protect`s [64 KiB, 80 KiB) read-only or
+        // unmaps it (interp-serviced — a call.cap-bearing function never emits), then calls the leaf.
         let src = format!(
-            "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n  vprot = i32.const 1\n  vr = call.cap 5 2 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)\n  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
+            "memory 17\nfunc () -> (i64) {{\nblock 0 () {{\n  vp = i64.const 65536\n  i64.store vp vp\n  vas = i32.const {mem_h}\n  voff = i64.const 65536\n  vlen = i64.const 16384\n{page_op}  vres = call 1 (vp)\n  return vres\n  }}\n}}\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n{body}  }}\n}}\nexport 0 func \"_start\" 0\n"
         );
         let m = temen_text::parse_module(&src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
@@ -1854,7 +1857,7 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
         assert_eq!(
             want.status,
             if want_trap { STATUS_TRAP } else { STATUS_OK },
-            "oracle sanity (store={store})"
+            "oracle sanity ({case})"
         );
         let opened = temen_coop_open(
             bytes.as_ptr(),
@@ -1874,11 +1877,7 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
         );
         let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
         assert!(tierups >= 1, "the leaf tiers up on the coop path");
-        assert_eq!(
-            temen_status(),
-            want.status,
-            "coop status parity (store={store})"
-        );
+        assert_eq!(temen_status(), want.status, "coop status parity ({case})");
         if !want_trap {
             assert_eq!(
                 temen_coop_value(),
@@ -4504,12 +4503,24 @@ fn coop_tierup_serves_a_parents_children() {
 /// The §14 child page-op guest. f0 (root): resolve the granted `Instantiator` and `"budget"`, spawn
 /// a child at f1 (`child`) detached through a spawn record, join it, return the join's status: how the
 /// child ended, its trap's wire code if it trapped (#2066). f1 (child
-/// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace,
-/// then call the eligible leaf f2. f2 (leaf): load `[16384]` — a page the child just unmapped — so the
-/// **emitted** leaf's paged per-access check must trap `MemoryFault` over the child's window, exactly
-/// as the interpreter oracle does, through the real coop FFI over a confined child's own window
-/// (#1151, INVARIANTS #14 nesting + code-origin axes).
-fn coop_child_paged_guest_text() -> String {
+/// entry `(inst, as)`): `unmap` `[16384, 32768)` of its own window through its starter AddressSpace
+/// (or, with `protect`, make it read-only), then call the eligible leaf f2. f2 (leaf): load `[16384]`
+/// — a page the child just unmapped — or store to it, read-only, so the **emitted** leaf's paged
+/// per-access check must trap `MemoryFault` over the child's window, exactly as the interpreter oracle
+/// does, through the real coop FFI over a confined child's own window (#1151, INVARIANTS #14 nesting +
+/// code-origin axes).
+fn coop_child_paged_guest_text(protect: bool) -> String {
+    let (page_op, access) = if protect {
+        (
+            "  vro = i32.const 1\n  vu = call.cap 5 2 (i64, i64, i32) -> (i64) vasi (voff, vlen, vro)\n",
+            "  i64.store vaddr vx\n  vld = i64.load vaddr\n",
+        )
+    } else {
+        (
+            "  vu = call.cap 5 1 (i64, i64) -> (i64) vasi (voff, vlen)\n",
+            "  vld = i64.load vaddr\n",
+        )
+    };
     let name = b"instantiator";
     let mut w0 = [0u8; 8];
     w0.copy_from_slice(&name[0..8]);
@@ -4538,8 +4549,7 @@ block 0 (vinst: i64, vas: i64) {{
   vasi = i32.wrap_i64 vas
   voff = i64.const 16384
   vlen = i64.const 16384
-  vu = call.cap 5 1 (i64, i64) -> (i64) vasi (voff, vlen)
-  v5 = i64.const 5
+{page_op}  v5 = i64.const 5
   vr = call 2 (v5)
   return vr
   }}
@@ -4547,8 +4557,7 @@ block 0 (vinst: i64, vas: i64) {{
 func (i64) -> (i64) {{
 block 0 (vx: i64) {{
   vaddr = i64.const 16384
-  vld = i64.load vaddr
-  return vld
+{access}  return vld
   }}
 }}
 export 0 func "_start" 0
@@ -4561,17 +4570,25 @@ export 1 func "_child" 1
 #[test]
 fn coop_tierup_child_paged_traps_over_its_own_window() {
     let _g = instantiator_guard();
-    let m = temen_text::parse_module(&coop_child_paged_guest_text()).expect("parse");
+    for protect in [false, true] {
+        child_paged_traps_over_its_own_window(protect);
+    }
+}
+
+/// [`coop_tierup_child_paged_traps_over_its_own_window`] for one page op.
+fn child_paged_traps_over_its_own_window(protect: bool) {
+    let m = temen_text::parse_module(&coop_child_paged_guest_text(protect)).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: the plain bytecode path with the identical powerbox — the child unmaps part of
-    // its window then loads it, so it traps `MemoryFault`, which the root's join answers.
+    // its window then loads it, or protects it then stores to it, so it traps `MemoryFault`, which
+    // the root's join answers.
     let want = onramp_exec_root(&m, b"");
     assert_eq!(
         (want.status, want.value),
         (STATUS_OK, temen_ir::trap_code::MEMORY_FAULT),
-        "oracle: the child's load of its own unmapped page traps"
+        "oracle (protect={protect}): the child's access to its own page traps"
     );
 
     let opened = temen_coop_open(
@@ -4600,7 +4617,7 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
                 assert!(calls.len() < 50, "runaway tier-ups");
                 assert_ne!(temen_coop_paged(), 0, "the child's code is paged");
                 calls.push((temen_coop_module(), temen_coop_func()));
-                // The child's code runs paged over its window; loading the unmapped page must
+                // The child's code runs paged over its window; its access to the page must
                 // trap, so `service_coop_on_wasmi` returns the emitted `MemoryFault`'s code.
                 match service_coop_on_wasmi(n_results) {
                     Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
@@ -4625,7 +4642,139 @@ fn coop_tierup_child_paged_traps_over_its_own_window() {
     assert_eq!(
         (temen_status(), temen_coop_value()),
         (want.status, want.value),
-        "trap-kind parity with the interpreter oracle over the child's window"
+        "trap-kind parity with the interpreter oracle over the child's window (protect={protect})"
+    );
+    temen_coop_close();
+}
+
+/// A §14 child grows its own window past its declared size, and its emitted leaf uses the grown
+/// page as the interpreter does. The root (`memory 18`, so the on-ramp's `"budget"` holds 256 KiB)
+/// spawns `"worker"` (`memory 17`), whose window spends half of it and leaves the rest for growth.
+/// The worker's entry `vm_map`s `[128 KiB, 144 KiB)` through its starter AddressSpace and calls its
+/// leaf, which stores 5 there and loads it back on the emitted tier. The root passes the join's status plus the
+/// worker's value to its own leaf, which adds 100: 105, where a refused map or a stale page state
+/// would trap the worker (108).
+#[test]
+fn coop_tierup_child_grows_its_own_window() {
+    let _g = instantiator_guard();
+    let root = temen_text::parse_module(
+        r#"memory 18
+data ro 40960 "instantiator"
+data ro 40976 "budget"
+data ro 40984 "worker"
+func () -> (i64) {
+block 0 () {
+  vip = i64.const 40960
+  vil = i64.const 12
+  vinst = self.resolve vip vil
+  vbp = i64.const 40976
+  vbl = i64.const 6
+  vb = self.resolve vbp vbl
+  vwp = i64.const 40984
+  vwl = i64.const 6
+  vw = self.resolve vwp vwl
+  vrec = i64.const 34816
+  vw0 = i64.const -4294967296
+  i64.store vrec vw0
+  i32.store vrec vw offset=8
+  i32.store vrec vb offset=12
+  vw6 = i64.const 4294967295
+  i64.store vrec vw6 offset=48
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vrec)
+  vj_st, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vh)
+  vsum = i64.add vj_st vj
+  vr = call 1 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v100 = i64.const 100
+  va = i64.add vx v100
+  return va
+  }
+}
+export 0 func "_start" 0
+"#,
+    )
+    .expect("parse");
+    let worker = temen_text::parse_module(
+        r#"memory 17
+func (i64, i64) -> (i64) {
+block 0 (vinst: i64, vas: i64) {
+  vasi = i32.wrap_i64 vas
+  voff = i64.const 131072
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vu = call.cap 5 0 (i64, i64, i32) -> (i64) vasi (voff, vlen, vrw)
+  v5 = i64.const 5
+  vr = call 1 (v5)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  vaddr = i64.const 131080
+  i64.store vaddr vx
+  vld = i64.load vaddr
+  return vld
+  }
+}
+"#,
+    )
+    .expect("parse");
+    temen_verify::verify_module(&root).expect("verify");
+    temen_verify::verify_module(&worker).expect("verify");
+    let bytes = temen_encode::encode_module(&root);
+
+    // Each run takes the staged program, so stage it before each.
+    stage_child_program("worker", worker.clone());
+    let want = onramp_exec_root(&root, b"");
+    assert_eq!(
+        (want.status, want.value),
+        (STATUS_OK, 105),
+        "oracle: the worker reads back the 5 it stored in its grown page"
+    );
+
+    stage_child_program("worker", worker);
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        core::ptr::null(),
+        0,
+        0,
+        core::ptr::null(),
+        0,
+        0,
+    );
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let mut calls = Vec::new();
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_TIERUP => {
+                assert!(calls.len() < 50, "runaway tier-ups");
+                assert_ne!(temen_coop_paged(), 0, "the worker's code is paged");
+                calls.push((temen_coop_module(), temen_coop_func()));
+                match service_coop_on_wasmi(1) {
+                    Ok(res) => temen_coop_deliver(res.as_ptr(), res.len()),
+                    Err(code) => temen_coop_deliver_trap(code),
+                }
+            }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    // The worker is program 1. Its entry maps the page, interpreted, and its leaf tiers up over
+    // the window the map grew, with the page state the map left. Then the root's own leaf.
+    assert_eq!(
+        calls,
+        vec![(1, 1), (0, 1)],
+        "the worker's leaf, then the root's, (program, function)"
+    );
+    assert_eq!(
+        (temen_status(), temen_coop_value()),
+        (want.status, want.value),
+        "parity with the interpreter oracle over the worker's grown window"
     );
     temen_coop_close();
 }
@@ -6238,6 +6387,82 @@ export 0 func "_start" 0
             "mode {mode}"
         );
     }
+}
+
+/// **A module card runs whole as a root leaf, as the interpreter runs it**: the card's Run on the
+/// emitted tier (`runJitModule`) offers hello_c's root whole, and it is taken. It tiers up once and
+/// ends with the interpreter's status, value and output.
+#[test]
+fn coop_root_leaf_runs_hello_c_as_the_interpreter_does() {
+    let _g = ffi_guard();
+    let bytes = include_bytes!("../web/assets/hello_c.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode hello_c.temen");
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    let mut answer = |cap: &str, _: &[i64]| -> i64 { panic!("no caps: {cap}") };
+    let (leaf, _) = drive_declared(
+        bytes,
+        &[],
+        COOP_LEAF_ROOT | COOP_NO_REGIONS,
+        None,
+        &mut answer,
+    )
+    .expect("opens");
+    assert_eq!(
+        (leaf.status, leaf.value, leaf.stdout, leaf.tierups),
+        (want.status, want.value, want.stdout, 1)
+    );
+}
+
+/// **A C program that grows its heap runs whole as a root leaf** (#1153, #2212): its `malloc` maps
+/// the heap arena from the window's mapped boundary, through a bounce, and the leaf prints what the
+/// interpreter prints. Asset-gated.
+#[test]
+fn coop_root_leaf_runs_a_chibicc_program_that_grows_its_heap() {
+    let _g = ffi_guard();
+    let Ok(cc) = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/web/assets/chibicc.temen"
+    )) else {
+        eprintln!("SKIP: browser/web/assets/chibicc.temen absent");
+        return;
+    };
+    let chibicc = temen_encode::decode_module(&cc).expect("decode chibicc.temen");
+    let src = "#include <stdio.h>\n#include <string.h>\n\
+        int main(void){ char*d=strdup(\"libc\"); printf(\"%s\\n\", d); return 0; }\n";
+    let mut files = temen_browser::playground_include_files();
+    files.push(("in.c".to_string(), src.as_bytes().to_vec()));
+    let image = temen_fs::encode_image(&files, &["include".to_string()]);
+    let out = temen_browser::onramp_fs_exec(
+        &chibicc,
+        &image,
+        &[
+            b"chibicc",
+            b"--data-page",
+            b"65536",
+            b"--emit-object",
+            b"/in.c",
+        ],
+        b"",
+    );
+    let ir = String::from_utf8(out.stdout).expect("IR utf8");
+    let m = pg_heap::link(&[], &temen_text::parse_module(&ir).expect("parse IR"));
+    let bytes = temen_encode::encode_module(&m);
+    let want = onramp_exec_root(&m, b"");
+    assert_eq!(want.stdout, b"libc\n", "oracle sanity");
+    let mut answer = |cap: &str, _: &[i64]| -> i64 { panic!("no caps: {cap}") };
+    let (leaf, _) = drive_declared(
+        &bytes,
+        &[],
+        COOP_LEAF_ROOT | COOP_NO_REGIONS,
+        None,
+        &mut answer,
+    )
+    .expect("opens");
+    assert_eq!(
+        (leaf.status, leaf.stdout, leaf.tierups),
+        (want.status, want.stdout, 1)
+    );
 }
 
 /// A chibicc C program that asks the embedder through two declared caps: `ping` for each of 300

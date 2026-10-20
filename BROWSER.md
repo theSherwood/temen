@@ -533,7 +533,7 @@ program with `-g`:
 so the engine keeps it in one slot that the C and self-host cards share (`ProgramCache`, the bash
 card's cache generalized). It decodes and verifies the compiler on the first Run, compiles its
 bytecode program on the first interpreter Run, and emits it for the wasm-JIT on the first wasm-JIT Run
-(`JitOnrampRun::emit_for_run`). Later Runs start at the run itself, and a rebuilt asset changes the
+(the pump's root-leaf emit, kept by its digest, #2087). Later Runs start at the run itself, and a rebuilt asset changes the
 slot's key and fills it again. The card's interpreter tier links and runs the program in one call
 (`temen_link_run_libs`), against the libraries laid out once and through their compile memo (#1373,
 above). Measured in the wasm engine under Node on a `printf`/`snprintf`/`puts` program:
@@ -1189,16 +1189,11 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    the unmapped page faults on both tiers). *Superseded (#1865):* these items run **detached**
    children now — the spawn is an op-17 record, serviced from emitted code as `env.instantiate_rec`
    (`temen_par_inst_instantiate_rec`, admitted by the child's own vCPU) — and
-   `temen_par_inst_instantiate` is gone. The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
-   #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a
-   page-op child **paged** (`compile_jit_paged` → `compile_module_reactor_paged`; `JitOnrampRun`
-   rebuilds the page-state table after each bounce and `driveDetachedRun` re-points
-   `"pagestate"`/`"mapped"`, the child's real starter `AddressSpace` handle reaching the emitted entry) —
-   the same paged emit serves a root on-ramp guest that `unmap`s/`protect`s
-   (`browser/tests/jit_paged_onramp.rs`, the wasmi twin of that single-shot driver;
-   `browser-op13jit-e2e-test.mjs` in real Chromium). A child the emit still
-   declines (`SharedRegion` aliasing, fibers) runs on the interpreter over the same carve and marshaled
-   powerbox instead of trapping the driver (`op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   `temen_par_inst_instantiate` is gone. *(The JS-orchestrated **op-13** loop, #1025 Path 1, which also
+   ran a page-op child **paged** on the single-shot emit, #1201, was deleted in #1414 S4-5b. A detached
+   child now runs its program's region emit, paged on the same rule, on the pump and on the parallel
+   driver; the pump's page-op children are pinned by `coop_tierup_driver.rs`'s
+   `coop_tierup_child_paged_traps_over_its_own_window`.)* *(All scalar unit signatures — i32/i64/f32/f64 — now
    marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
    §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `temen-wasmjit` cross-engine bench
@@ -1294,21 +1289,23 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    `browser/browser-jit-reactor-test.mjs` (each reactor guest renders byte-identically on both tiers in
    real Chromium). *(This does **not** bring `call.cap` into the emitted subset — the note at slice 3's
    deopt still holds; it makes cap-call-bearing **functions** emittable by outlining the cap op.)*
-8. **[landed — capability] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
+8. **[retired — #1414 S4-3, S4-5b] Single-shot module wasm-JIT (Lua/SQLite run-to-completion).** The
    run-to-completion twin of the reactor: a `.temen` module's whole program *is* func 0 (`_start`), so
-   [`JitOnrampRun`] emits **that** and runs `f0(win, env, ...slots)` **once** (`_start` takes the granted
+   `JitOnrampRun` emitted **that** and ran `f0(win, env, ...slots)` **once** (`_start` takes the granted
    capability handles as params, stashes them, seeds the heap, and calls `main(sp)`), with the ~7%
    cross-tier helpers relaying to the interpreter through `env.call_interp` over the shared window. Unlike
    the reactor, `_start` is **not** pre-run on the interpreter; the `.data`/`.rodata` are materialized up
    front (emitted `_start` seeds only the heap), and the window is sized to the module's **declared**
    `size_log2` (Lua declares 64 MiB — a smaller allocation faults any access into its upper range). FFI:
    `temen_onramp_jit_run_open` + the `temen_onramp_jit_run_*` accessors; JS: `web/wasmjit-module.js`.
-   *(Retired for module runs by #1414 S4-3a: `runJitModule` opens on the pump, which runs the root whole
-   as a leaf — `temen_coop_open` with `COOP_LEAF_ROOT` — and checks read-only data, #2302.)* Proven
-   **byte-identical** to the interpreter (`temen_run_onramp`) for hello_c / Lua / SQLite by the native
-   `tests/jit_module.rs` (hello_c; Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their
-   giant hot functions, which V8 runs fine) and the committed `browser/browser-jit-module-test.mjs` (V8
-   differential + timing). **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
+   *(Retired: #1414 S4-3a moved module runs onto the pump, which runs the root whole as a leaf —
+   `temen_coop_open` with `COOP_LEAF_ROOT` — and checks read-only data, #2302; S4-5b deleted
+   `JitOnrampRun`, its exports and its native differential `tests/jit_module.rs`, whose hello_c case
+   is now `coop_tierup_driver.rs`'s `coop_root_leaf_runs_hello_c_as_the_interpreter_does`.)* It was
+   proven **byte-identical** to the interpreter (`temen_run_onramp`) for hello_c / Lua / SQLite by that
+   differential (Lua/SQLite `#[ignore]`d — `wasmi`'s register allocator rejects their giant hot
+   functions, which V8 runs fine) and by `browser/browser-jit-module-test.mjs` (V8 differential +
+   timing), which now runs the pump's root leaf. **Finding — the speedup here is modest** (Lua ~3×, SQLite ~1.3×, vs the
    reactor demos' 24–34×), and it is **not** a compile cost (V8 compiles the emitted 3 MB Lua module in
    ~6 ms). The reactor demos win big because their hot loops are *small* functions; Lua/SQLite's hot
    functions (`luaV_execute`, `sqlite3VdbeExec`) are *giant*, and giant emitted functions run slowly.

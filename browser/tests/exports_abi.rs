@@ -78,7 +78,7 @@ fn the_parser_sees_attribute_runs() {
         "some exports are cfg-gated; the parser must record that"
     );
     assert!(
-        exports.len() >= 280,
+        exports.len() >= 260,
         "export count fell to {}",
         exports.len()
     );
