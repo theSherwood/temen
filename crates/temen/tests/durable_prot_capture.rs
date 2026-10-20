@@ -315,9 +315,6 @@ fn jit_re_establishes_ro_so_a_thawed_write_faults() {
 
 #[test]
 fn jit_capture_matches_interp_for_a_readonly_segment() {
-    use core::ffi::c_void;
-    use temen_jit::compile_and_run_capture_reserved_with_host_prots;
-
     let mut m = temen_text::parse_module(SRC).expect("parse"); // `data ro 20480 "ABCD"`
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
@@ -333,29 +330,22 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
         .1
         .dense_prots();
 
-    // JIT capture: run, then reconstruct the protections from the host (data segments + cap map).
+    // JIT capture: the window the run leaves, under the page map its host keeps, which its read-only
+    // pages start in (#2268).
     let mut hj = Host::new();
     let _ = hj.grant_clock();
-    let _ = compile_and_run_capture_reserved_with_host_prots(
+    let (_, jlayout) = temen_run::jit_cap_run(
         &m,
         0,
         &[0i64],
-        &init,
-        &[],
+        &MemLayout::image(init),
         SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut hj as *mut Host as *mut c_void,
+        0,
+        &mut hj,
+        None,
     )
     .expect("jit compiles");
-    let caps_j = hj
-        .capture_window_layout(
-            &m.data,
-            WINDOW as u64,
-            temen_ir::module_null_guard(),
-            init,
-            Vec::new(),
-        )
-        .dense_prots();
+    let caps_j = jlayout.dense_prots();
 
     assert_eq!(caps_i[RO_OFF / PAGE], CapturedProt::Ro);
     assert_eq!(
@@ -378,7 +368,7 @@ fn jit_capture_overlays_runtime_protect_over_the_default() {
     let map = h.cap_window_pages(0);
     map.lock().unwrap().insert(0, temen_ir::PageState::Unmapped);
     let caps = h
-        .capture_window_layout(&[], WINDOW as u64, 0, vec![0; WINDOW], Vec::new())
+        .capture_window_layout(WINDOW as u64, 0, vec![0; WINDOW], Vec::new())
         .dense_prots();
     assert_eq!(
         caps[0],
@@ -766,4 +756,184 @@ fn a_jit_thaw_keeps_the_page_map_the_artifact_carries() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #2441, #2307: a guest that writes its writable data segment and makes its read-only one's page
+/// writable to write that too (entry 0); one that reads both bytes back as `w * 1000 + r` (1); and one
+/// that stores to the page it made writable (2).
+const SEGMENTS: &str = "memory 17
+data 81920 \"abcd\"
+data ro 98304 \"efgh\"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vw = i64.const 81920
+  vz = i32.const 122
+  i32.store8 vw vz
+  vr = i64.const 98304
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  v1 = call.cap 5 2 (i64, i64, i32) -> (i64) v0 (vr, vlen, vrw)
+  vy = i32.const 121
+  i32.store8 vr vy
+  return v1
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vw = i64.const 81920
+  w = i64.load8_u vw
+  vr = i64.const 98304
+  r = i64.load8_u vr
+  vk = i64.const 1000
+  wk = i64.mul w vk
+  s = i64.add wk r
+  return s
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vr = i64.const 98304
+  vx = i32.const 120
+  i32.store8 vr vx
+  vz = i64.const 0
+  return vz
+  }
+}
+";
+
+/// #2441, #2307: a thaw is the window the guest froze, on either engine, frozen on either. Each
+/// thaw used to lay the module's data segments over the restored image, so the guest's writes to them
+/// reverted (`97101`, the segments' `a` and `e`, for `122121`), and to protect the read-only segment's
+/// page again, so a store the frozen guest could make faulted. The JIT's capture recorded that page
+/// read-only too: it laid the segment under its page map, which has no entry for a page made writable.
+#[test]
+fn a_thaw_keeps_what_the_guest_wrote_to_its_data_segments() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let m = temen_text::parse_module(SEGMENTS).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let fresh = MemLayout::image(vec![0u8; WINDOW]);
+    // `entry` on the interpreter or the JIT over `init`: how it ended, and the window it left.
+    let run = |jit: bool, entry: u32, init: &MemLayout, reserved: u8| {
+        if jit {
+            let mut h = Host::new();
+            h.set_durable(true);
+            let mh = h.grant_memory();
+            let (o, left) =
+                temen_run::jit_cap_run(&m, entry, &[mh as i64], init, reserved, 0, &mut h, None)
+                    .expect("jit");
+            let out = match o {
+                temen_jit::JitOutcome::Returned(v) => format!("{:?}", v[0]),
+                other => format!("{other:?}"),
+            };
+            (out, left)
+        } else {
+            let mut h = Host::new();
+            let mh = h.grant_memory();
+            let (r, left) = interp_run(&m, entry, &[Value::I32(mh)], init, reserved, &mut h);
+            let out = match r {
+                Ok(v) => match v[0] {
+                    Value::I64(x) => format!("{x}"),
+                    other => format!("{other:?}"),
+                },
+                Err(t) => format!("{t:?}"),
+            };
+            (out, left)
+        }
+    };
+    let name = |jit: bool| if jit { "JIT" } else { "interpreter" };
+
+    let (iout, ilayout) = run(false, 0, &fresh, SIZE_LOG2);
+    let (jout, jlayout) = run(true, 0, &fresh, SIZE_LOG2);
+    assert_eq!((iout.as_str(), jout.as_str()), ("0", "0"), "entry 0 runs");
+    assert_eq!(
+        held(&ilayout).1[98304 / PAGE],
+        CapturedProt::Rw,
+        "the page the guest made writable"
+    );
+    let mut wrong = Vec::new();
+    if held(&jlayout) != held(&ilayout) {
+        wrong.push("the JIT's capture differs from the interpreter's".to_string());
+    }
+    for (frozen_on, frozen) in [(false, &ilayout), (true, &jlayout)] {
+        let art =
+            temen_snapshot::freeze_layout(&m, frozen, SIZE_LOG2, &Host::new()).expect("freeze");
+        for thawed_on in [false, true] {
+            let (layout, reserved) =
+                temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
+            for (entry, want) in [(1, "122121"), (2, "0")] {
+                let (out, _) = run(thawed_on, entry, &layout, reserved);
+                if out != want {
+                    wrong.push(format!(
+                        "frozen on the {}, thawed on the {}: entry {entry} gave {out}, not {want}",
+                        name(frozen_on),
+                        name(thawed_on)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #2441: a window whose page map is empty — smaller than the NULL guard, which then stays off, and
+/// with no `readonly` segment — that writes its data segment (entry 0) and reads it back (1).
+const SMALL_SEGMENT: &str = "memory 13
+data 4096 \"abcd\"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vw = i64.const 4096
+  vz = i32.const 122
+  i32.store8 vw vz
+  vr = i64.const 0
+  return vr
+  }
+}
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vw = i64.const 4096
+  w = i64.load8_u vw
+  return w
+  }
+}
+";
+
+/// #2441: a thaw is a whole window even when nothing in its page map says so. A run told a fresh
+/// seed from a thaw by whether the layout's page map was empty, and a window captured with none — no
+/// NULL guard, no read-only page — came back as a seed, its data segments laid over what the guest
+/// wrote to them (`97`, the segment's `a`, for `122`).
+#[test]
+fn a_thaw_with_an_empty_page_map_keeps_its_data_segment() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let m = temen_text::parse_module(SMALL_SEGMENT).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let fresh = MemLayout::image(vec![0u8; 1 << 13]);
+    let mut hi = Host::new();
+    let (r, frozen) = interp_run(&m, 0, &[Value::I32(0)], &fresh, 13, &mut hi);
+    assert_eq!(r, Ok(vec![Value::I64(0)]));
+    assert!(
+        frozen.page_map().is_empty(),
+        "nothing deviates in the window"
+    );
+    let art = temen_snapshot::freeze_layout(&m, &frozen, 13, &Host::new()).expect("freeze");
+
+    let (layout, reserved) =
+        temen_snapshot::restore_layout(&art, &m, &mut Host::new()).expect("restore");
+    let mut hi = Host::new();
+    let (ir, _) = interp_run(&m, 1, &[Value::I32(0)], &layout, reserved, &mut hi);
+    let mut hj = Host::new();
+    hj.set_durable(true);
+    let (jo, _) =
+        temen_run::jit_cap_run(&m, 1, &[0], &layout, reserved, 0, &mut hj, None).expect("jit");
+    assert_eq!(
+        (ir, jo),
+        (
+            Ok(vec![Value::I64(122)]),
+            temen_jit::JitOutcome::Returned(vec![122])
+        ),
+        "the interpreter's thaw, then the JIT's"
+    );
 }

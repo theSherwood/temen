@@ -479,7 +479,7 @@ pub enum JitOutcome {
 /// window is seeded with, and one per [`TailPage`] it holds past that (#2427): a `Rw` entry in the
 /// backed prefix keeps the default, and past it every entry is a page the window holds. Lets a
 /// thawed guest fault on a restored `Ro`/`Unmapped` page exactly as the frozen one would,
-/// matching the interpreter (`temen-interp`'s `Mem::apply_layout`).
+/// matching the interpreter (`temen-interp`'s `Mem::restore_layout`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowProt {
     Rw,
@@ -495,6 +495,17 @@ pub struct TailPage {
     pub off: u64,
     pub prot: WindowProt,
     pub bytes: Option<Vec<u8>>,
+}
+
+/// #2441 — the window a thaw's run starts from (DURABILITY.md §12.3): the image it is seeded with is
+/// the whole window, its data segments holding what the guest left in them, and `prots` its page map,
+/// one [`WindowProt`] per [`DURABLE_SNAPSHOT_PAGE`] of that image — read-only only where it says,
+/// never where a `readonly` segment lies (#2307); then `tail`, each page it holds past the image
+/// (#2427). A run without one builds a fresh instance's window, its data segments laid in.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct WindowRestore {
+    pub prots: Vec<WindowProt>,
+    pub tail: Vec<TailPage>,
 }
 
 /// The host-side residue of a fiber the durable freeze driver flattened (DURABILITY.md §12.8) — the
@@ -1612,7 +1623,10 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
         None, // no budget node
         0,    // one-shot path: natural table size
     )?;
-    cm.restore_prots = init_prots.to_vec();
+    cm.restore = (!init_prots.is_empty()).then(|| WindowRestore {
+        prots: init_prots.to_vec(),
+        tail: Vec::new(),
+    });
     cm.run(args, Some(init_mem), Some(SNAP_CAP))
 }
 
@@ -1897,8 +1911,6 @@ pub type ForkHook = Box<dyn FnMut(&ForkPoint<'_>) -> i64 + Send>;
 /// root's shadow stack, and what a private duplicate of it needs.
 pub struct ForkPoint<'a> {
     window: &'a mem::GuestWindow,
-    /// The module's data segments (its `readonly` ones are read-only pages of every window).
-    data: &'a [Data],
     /// The NULL guard every window of this module seeds inaccessible (`None` when it does not fit).
     null_guard: Option<u64>,
     shadow: temen_ir::durable_abi::ShadowArena,
@@ -1940,11 +1952,12 @@ impl ForkPoint<'_> {
     /// The twin's window: a private duplicate of this one (the JIT's `Mem::fork_private`) — every
     /// committed page's bytes and protection — with `reply` injected as the fork call's result and
     /// its root set rewinding. `pages` is the run's page-state map (host page → its
-    /// [`temen_ir::PageState`], absent ⇒ the default), which says which tail pages the guest
-    /// committed and which pages it protected; together with the module's read-only data segments
-    /// and NULL guard it describes every page. `None` when the window cannot be duplicated: a page
-    /// aliases a §13 shared region (fork shares no memory — the interpreter's `fork_private` refuses
-    /// the same window), or the address space has no room for another window.
+    /// [`temen_ir::PageState`], absent ⇒ the default): the read-only pages the window started with
+    /// (#2268) and every page the guest committed or protected since, a `readonly` data segment's
+    /// page it made writable left out of it (#2307). With the NULL guard, which no page op changes,
+    /// it describes every page. `None` when the window cannot be duplicated: a page aliases a §13
+    /// shared region (fork shares no memory — the interpreter's `fork_private` refuses the same
+    /// window), or the address space has no room for another window.
     pub fn twin(
         &self,
         pages: &BTreeMap<u64, temen_ir::PageState>,
@@ -1953,27 +1966,13 @@ impl ForkPoint<'_> {
         use temen_ir::PageState as ps;
         let page = mem::page_size() as u64;
         let mut prots: BTreeMap<usize, mem::Prot> = BTreeMap::new();
-        // The seed-time protections: the NULL guard, then the read-only data segments (host-page
-        // granular, as `GuestWindow::protect` applies them).
+        // The NULL guard (host-page granular, as `GuestWindow::protect` applies it).
         if let Some(guard) = self.null_guard.filter(|g| g.is_multiple_of(page)) {
             for p in 0..guard / page {
                 prots.insert(p as usize, mem::Prot::None);
             }
         }
-        for d in self
-            .data
-            .iter()
-            .filter(|d| d.readonly && !d.bytes.is_empty())
-        {
-            let (lo, hi) = (
-                d.offset / page,
-                (d.offset + d.bytes.len() as u64).div_ceil(page),
-            );
-            for p in lo..hi {
-                prots.insert(p as usize, mem::Prot::Ro);
-            }
-        }
-        // What the guest changed since, which overrides them (the same order a live window saw).
+        // Then the page map.
         let prefix = (self.window.mapped() as u64).div_ceil(page);
         for (&p, &state) in pages {
             let prot = match state {
@@ -2077,7 +2076,10 @@ pub fn compile_and_run_durable(
             None, // node
             0,
         )?;
-        cm.restore_prots = run.init_prots;
+        cm.restore = (!run.init_prots.is_empty()).then(|| WindowRestore {
+            prots: run.init_prots,
+            tail: Vec::new(),
+        });
         cm.set_durable(run.seed);
         cm.concurrent_durable = run.freeze.is_some();
         cm.freeze_ctl = run.freeze;
@@ -2723,11 +2725,9 @@ pub struct CompiledModule {
     /// Initialized data segments, owned so a run can seed a fresh window (the module may
     /// outlive the borrowed `IrModule`).
     data: Vec<Data>,
-    /// Per-page protections to re-establish on the window before a run — the durable-restore
-    /// step (DURABILITY.md §12.3). Empty ⇒ none (the common path); set per-run by `run_inner`.
-    restore_prots: Vec<WindowProt>,
-    /// #2427 — and the pages past the seed image the window holds.
-    restore_tail: Vec<TailPage>,
+    /// The thaw's window the next run restores ([`WindowRestore`], the durable-restore step,
+    /// DURABILITY.md §12.3); `None` (the common path) builds a fresh instance's window.
+    restore: Option<WindowRestore>,
     /// #2427 — the pages a durable run's capture read past its declared window, by byte offset
     /// ([`Self::take_tail_out`]).
     tail_out: Vec<(u64, Vec<u8>)>,
@@ -3794,8 +3794,7 @@ impl CompiledModule {
             null_guard: temen_ir::module_null_guard(),
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone(),
-            restore_prots: Vec::new(),
-            restore_tail: Vec::new(),
+            restore: None,
             tail_out: Vec::new(),
             durable: false,
             shadow,
@@ -4019,8 +4018,7 @@ impl CompiledModule {
             null_guard: self.null_guard,
             mem_size_log2: self.mem_size_log2,
             data: self.data.clone(),
-            restore_prots: Vec::new(),
-            restore_tail: Vec::new(),
+            restore: None,
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
@@ -4224,13 +4222,13 @@ impl CompiledModule {
         self.window_ready = hook;
     }
 
-    /// #1834 — the page map the next run's window is built under (DURABILITY.md §12.3): a thaw's,
-    /// one [`WindowProt`] per [`DURABLE_SNAPSHOT_PAGE`] of the run's `init_mem`, a page past the
-    /// backed prefix committed and seeded from it when `Rw`/`Ro`; then (#2427) each page of `tail`,
-    /// those the window holds past `init_mem`. Both empty (the default) builds the fresh window.
-    pub fn set_restore_prots(&mut self, prots: Vec<WindowProt>, tail: Vec<TailPage>) {
-        self.restore_prots = prots;
-        self.restore_tail = tail;
+    /// #1834, #2441 — the thaw's window the next run restores ([`WindowRestore`]): its `init_mem` is
+    /// that window, under its page map (DURABILITY.md §12.3), a page past the backed prefix committed
+    /// and seeded from it when `Rw`/`Ro`; then (#2427) each page the window holds past `init_mem`.
+    /// `None` (the default) builds a fresh instance's window, `init_mem` its low bytes and its data
+    /// segments laid over them.
+    pub fn set_restore(&mut self, restore: Option<WindowRestore>) {
+        self.restore = restore;
     }
 
     pub fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
@@ -4310,11 +4308,12 @@ impl CompiledModule {
         Ok(())
     }
 
-    /// A run's fresh window, seeded: `init_mem` (the escape-oracle's low bytes, or a thaw's image),
-    /// the data segments with the `readonly` ones made read-only, a thaw's captured page map, and
-    /// the NULL guard. With it, the read-only ranges, for the embedder's page map (`window_ready`).
-    /// `None`, nothing kept, when the OS refuses the reservation or any commit or protection
-    /// (#2305, #2286): a window missing one would let the guest write or read where the
+    /// A run's window: a fresh instance's — `init_mem` (the escape-oracle's or an embedder's low
+    /// bytes), the data segments over it with the `readonly` ones made read-only — or a thaw's
+    /// ([`WindowRestore`]): `init_mem` as it is, under its captured page map. Then the NULL guard.
+    /// With it, the read-only ranges the data segments made, for the embedder's page map
+    /// (`window_ready`). `None`, nothing kept, when the OS refuses the reservation or any commit or
+    /// protection (#2305, #2286): a window missing one would let the guest write or read where the
     /// interpreter traps.
     fn seed_window(&self, init_mem: Option<&[u8]>) -> Option<(mem::GuestWindow, Vec<[u64; 2]>)> {
         let mut window = mem::GuestWindow::try_new(self.win_mapped, self.win_reserved)?;
@@ -4323,11 +4322,13 @@ impl CompiledModule {
             let n = init.len().min(self.win_mapped);
             window.rw_mut()[..n].copy_from_slice(&init[..n]);
         }
-        // Initialized data segments (§3a / D40): copy each segment's bytes into the window, then map
-        // the `readonly` ones RO (so a guest write to const data faults into the guard, §4/§5). The
-        // verifier already bounds every segment to `[0, size)`. Done while fully RW.
+        // Initialized data segments (§3a / D40), a fresh instance's alone: a thaw's image holds them
+        // as the guest left them (#2441), and its page map says which of their pages are read-only
+        // (#2307). Copy each segment's bytes into the window, then map the `readonly` ones RO (so a
+        // guest write to const data faults into the guard, §4/§5). The verifier already bounds every
+        // segment to `[0, size)`. Done while fully RW.
         let mut ro: Vec<[u64; 2]> = Vec::new();
-        if let Some(size_log2) = self.mem_size_log2 {
+        if let (None, Some(size_log2)) = (&self.restore, self.mem_size_log2) {
             let size = 1u64 << size_log2;
             let rw = window.rw_mut();
             for d in &self.data {
@@ -4351,23 +4352,26 @@ impl CompiledModule {
                 }
             }
         }
-        // Durable restore (DURABILITY.md §12.3): re-establish captured per-page protections
-        // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
-        // exactly as the frozen one would — matching `temen-interp`'s `apply_layout`. Applied
-        // after the init copy + data segments; a page held past the prefix is committed and
-        // seeded here (#1834, #2427).
+        // Durable restore (DURABILITY.md §12.3): re-establish a thaw's captured per-page protections
+        // on its image so the thawed guest faults on an `Ro`/`Unmapped` page exactly as the frozen
+        // one would — matching `temen-interp`'s `restore_layout`. A page held past the prefix is
+        // committed and seeded here (#1834, #2427).
         // #964: then reserve the marked module's NULL region last, after every host write above
         // (init seed, data segments, durable prots) has landed — the marked layout keeps all
         // live data at or above the guard, so nothing legitimate is covered. A window smaller than
         // the guard skips, matching the interpreter's fit check. The snapshot paths re-assert RW
         // (`restore_rw`/`read_low`) before any host read.
-        let seeded = window.apply_prots(
-            &self.restore_prots,
-            self.win_mapped as u64,
-            init_mem.unwrap_or(&[]),
-            &self.restore_tail,
-        ) && (self.null_guard > self.win_mapped as u64
-            || window.seed_null_guard(self.null_guard));
+        let restored = self.restore.as_ref().is_none_or(|r| {
+            window.apply_prots(
+                &r.prots,
+                self.win_mapped as u64,
+                init_mem.unwrap_or(&[]),
+                &r.tail,
+            )
+        });
+        let seeded = restored
+            && (self.null_guard > self.win_mapped as u64
+                || window.seed_null_guard(self.null_guard));
         seeded.then_some((window, ro))
     }
 
@@ -4682,7 +4686,6 @@ impl CompiledModule {
                     let t = &*this;
                     let point = ForkPoint {
                         window: &window,
-                        data: &t.data,
                         null_guard: (t.null_guard <= t.win_mapped as u64).then_some(t.null_guard),
                         shadow: t.shadow,
                         args,
@@ -6269,8 +6272,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         null_guard: temen_ir::module_null_guard(),
         mem_size_log2: Some(mapped_log2),
         data: Vec::new(), // a child's data segments are materialized into its window by the spawner
-        restore_prots: Vec::new(),
-        restore_tail: Vec::new(),
+        restore: None,
         tail_out: Vec::new(),
         durable: false,
         concurrent_durable: false,
