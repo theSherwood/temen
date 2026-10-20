@@ -402,8 +402,10 @@ export function endSession(session) {
 //   entry and taken back-edge — and when it runs out the leaf's frames suspend for `onSlice`, then run
 //   on with a fresh slice. Elsewhere emitted code is not counted: a leaf runs until it returns or parks.
 // - `leafBudget`: a leaf's slice, in emitted safepoints (see `budget`).
-// - `onOutput(stdout, stderr)`: a sliced run's output (`Uint8Array`s), handed over as each pump return
-//   produces it. Without `budget`, output is read from the stdout/stderr slots once the run is over.
+// - `onOutput(stdout, stderr)`: the run's output (`Uint8Array`s) as it writes it, handed over each time
+//   the driver gets control back: at each pump return (each slice, with `budget`), and at a sliced
+//   leaf's checkpoints. The stdout/stderr slots hold all of it once the run is over, as they do without
+//   `onOutput`.
 // - `onSlice()`: called, and awaited, when a slice is spent — interpreted or a leaf's. Resolve to carry on; resolve to `false` to
 //   stop the run here (the session is closed and the driver returns `null`). This is where an embedder
 //   yields to its event loop, and where it waits out a Pause.
@@ -508,8 +510,7 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   const leafTrap = sliceLeaves
     ? new WebAssembly.Suspending(async (code) => {
       if (code !== 11 /* temen_ir::trap_code::OUT_OF_FUEL */) return recordTrap(code);
-      ex.temen_coop_take_output();
-      if (onOutput) handOutput();
+      handOutput();
       if (onSlice && (await onSlice()) === false) {
         stopLeaf();
         return new Promise(() => {}); // never resumed: the session closes under the frames
@@ -615,21 +616,26 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
     return false;
   };
 
-  // A sliced run's output since the last pump return, to the embedder.
+  // The run's output as it writes it, queued by the `stream_chunk` import's sink (#1414 S5a) and handed
+  // to the embedder when the driver has control.
+  const queued = [[], []];
+  const sink = globalThis.__temen_stream_chunk;
+  if (onOutput) globalThis.__temen_stream_chunk = (fd, seq, bytes) => queued[fd === 2 ? 1 : 0].push(bytes);
   const handOutput = () => {
-    const take = (ptr, len) => {
-      const n = Number(len);
-      return n ? u8().slice(Number(ptr), Number(ptr) + n) : new Uint8Array(0);
-    };
-    const out = take(ex.temen_stdout_ptr(), ex.temen_stdout_len());
-    const err = take(ex.temen_stderr_ptr(), ex.temen_stderr_len());
-    if (out.length || err.length) onOutput(out, err);
+    if (!onOutput || !(queued[0].length || queued[1].length)) return;
+    const [out, err] = queued.map((q) => {
+      const all = new Uint8Array(q.reduce((n, b) => n + b.length, 0));
+      q.reduce((at, b) => (all.set(b, at), at + b.length), 0);
+      q.length = 0;
+      return all;
+    });
+    onOutput(out, err);
   };
   let stopped = false;
   try {
     for (;;) {
       const ev = budget === undefined ? ex.temen_coop_run() : ex.temen_coop_run_for(BigInt(budget));
-      if (budget !== undefined && onOutput) handOutput();
+      handOutput();
       if (ev === 5 /* COOP_RUN_PAUSED */) {
         // #1954: the slice is spent — the embedder's turn (its event loop, or a Pause).
         if (onSlice && (await onSlice()) === false) {
@@ -766,6 +772,8 @@ export async function driveCoopTierupRun(ex, memory, opts = {}) {
   } finally {
     if (!session) host.free();
     ex.temen_coop_close();
+    handOutput();
+    if (onOutput) globalThis.__temen_stream_chunk = sink;
   }
   if (stopped) return null;
   const status = ex.temen_status();

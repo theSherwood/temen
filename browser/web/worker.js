@@ -11,7 +11,7 @@ const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 
 self.onmessage = async (e) => {
   const { module, memory, win, winSize, role, stackTop, tlsBase, tierup, gptr, glen, tierupCell, start,
-    seedLen, x2Mem, x2MemId = -1 } = e.data;
+    seedLen, x2Mem, x2MemId = -1, stream = false } = e.data;
   // Liveness backstop: a trap here (the instantiate, or the engine past it) rejects this async
   // onmessage, and a Worker's unhandled rejection does NOT fire `Worker.onerror` on the page, so the
   // page would wait on a run that has ended. Wrap the entire body so ANY trap is reported as `fail`,
@@ -22,7 +22,8 @@ self.onmessage = async (e) => {
   // no GPU surface (the playground's GPU reactor runs on the main thread via par.js), so stub it to a
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
-  // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker streams no card output.
+  // `stream_chunk` (the live output tee, #1414 S5a) posts each chunk a thread of this Worker wrote to
+  // the page, which orders them by `seq`, when the page asked for the run's output (`onOutput`).
   // The parallel driver's platform (#1414 B6, `X2_PLATFORM` in lib.rs): each thread of its run is a
   // Worker the page starts on `x2spawn`, with a stack and TLS block of its own allocated here, and
   // its clock is one every Worker reads alike. A thread of a detached child steps over the child's own
@@ -228,7 +229,12 @@ self.onmessage = async (e) => {
       return [tier, base, unit['f0'], args];
     }, out, (r, i) => tierupJitRes(r, tc[nparams + i]));
   };
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
+  const stream_chunk = (fd, seq, ptr, len) => {
+    if (!stream) return;
+    const bytes = new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice();
+    self.postMessage({ kind: 'out', fd, seq: seq >>> 0, bytes }, [bytes.buffer]);
+  };
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stream_chunk, js_cap_call: () => -38n, x2_spawn, x2_now_ms, x2_tierup, x2_invoke } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // #1414 B6 — the parallel driver: its run is one in-Rust call on the root's Worker, and each of its

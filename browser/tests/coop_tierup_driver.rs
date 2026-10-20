@@ -6298,8 +6298,8 @@ fn pump(
             Some(b) => temen_coop_run_for(b),
             None => temen_coop_run(),
         };
-        // A sliced run hands back each return's output; an unsliced one all of it at the end.
-        if budget.is_some() || matches!(ev, COOP_RUN_DONE | COOP_RUN_TRAP) {
+        // The stdout slot holds the whole run's output once it has ended, sliced or not.
+        if matches!(ev, COOP_RUN_DONE | COOP_RUN_TRAP) {
             let (p, n) = (temen_stdout_ptr(), temen_stdout_len());
             if !p.is_null() && n > 0 {
                 // SAFETY: the stash stays live until the next call that replaces it.

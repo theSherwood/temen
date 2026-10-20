@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**274 exports** in 38 families — 227 referenced from JS, 47 referenced by nothing, 41 behind a `cfg`.
+**273 exports** in 38 families — 228 referenced from JS, 45 referenced by nothing, 42 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -12,7 +12,7 @@
 | `bash` | 10 | 9 | 0 |
 | `callprof` | 4 | 4 | 4 |
 | `child` | 1 | 1 | 0 |
-| `coop` | 65 | 54 | 0 |
+| `coop` | 64 | 55 | 0 |
 | `dap` | 4 | 4 | 0 |
 | `dealloc` | 1 | 1 | 0 |
 | `detached` | 2 | 2 | 0 |
@@ -32,7 +32,7 @@
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
-| `run` | 19 | 18 | 0 |
+| `run` | 18 | 17 | 0 |
 | `run0` | 1 | 1 | 0 |
 | `selfhost` | 1 | 1 | 0 |
 | `set` | 1 | 1 | 0 |
@@ -43,7 +43,7 @@
 | `trap` | 2 | 2 | 0 |
 | `warm` | 5 | 5 | 0 |
 | `wasmjit` | 10 | 10 | 0 |
-| `x2` | 20 | 20 | 20 |
+| `x2` | 21 | 21 | 21 |
 
 ## Exports by family
 
@@ -114,8 +114,8 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_deliver_jit`
 - `temen_coop_deliver_jit_trap`
 - `temen_coop_deliver_trap`
-- `temen_coop_fs_image` — *unreferenced*
-- `temen_coop_fs_ptr` — *unreferenced*
+- `temen_coop_fs_image`
+- `temen_coop_fs_ptr`
 - `temen_coop_func`
 - `temen_coop_jit_code`
 - `temen_coop_jit_param_types_ptr`
@@ -158,7 +158,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_coop_spill_ptr`
 - `temen_coop_table_gen`
 - `temen_coop_table_log2`
-- `temen_coop_take_output`
 - `temen_coop_task`
 - `temen_coop_tierup_win_len` — *unreferenced*
 - `temen_coop_tierup_win_ptr`
@@ -348,7 +347,6 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_run_onramp`
 - `temen_run_onramp_fs`
 - `temen_run_onramp_posix` — *unreferenced*
-- `temen_run_onramp_stream`
 - `temen_run_pb`
 - `temen_run_pg`
 - `temen_run_reflect`
@@ -431,6 +429,7 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_x2_spill_bytes` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_spill_ptr` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_start` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
+- `temen_x2_stop` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_gen` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_table_log2` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`
 - `temen_x2_thread` — `cfg(all(target_arch = "wasm32", target_feature = "atomics"))`

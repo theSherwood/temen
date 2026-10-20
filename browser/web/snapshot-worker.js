@@ -31,9 +31,17 @@ let interpWarmPromise = null;
 let nim = null;
 // The engine holds one nim session at a time, so each `nimCompile` waits for the one before it.
 let nimTurn = Promise.resolve();
-// Active only during a streaming Run (`runStream`, `runJitStream`, `eval`): a fn that relays one stdout
-// chunk to the main thread. `null` at rest so the `stdout_chunk` import is a no-op for warm/prime dry runs.
-let chunkSink = null;
+// During a streaming Run (`runStream`, `runJitStream`, `eval`), the run's stdout goes to the main thread
+// as the guest writes it: the `stream_chunk` import calls `globalThis.__temen_stream_chunk`, which
+// `relay` sets for the Run and `unrelay` clears, so warm/prime dry runs stream nothing.
+const relay = (id) => {
+  globalThis.__temen_stream_chunk = (fd, seq, bytes) => {
+    if (fd === 1) self.postMessage({ type: 'stdout-chunk', id, bytes }, [bytes.buffer]);
+  };
+};
+const unrelay = () => {
+  globalThis.__temen_stream_chunk = null;
+};
 
 const u8 = () => new Uint8Array(memory.buffer);
 // Read a captured stream out of the worker's memory. `.slice` copies to a non-shared buffer (TextDecoder
@@ -115,11 +123,12 @@ self.onmessage = async (e) => {
           x2_now_ms: () => performance.timeOrigin + performance.now(),
           x2_tierup: () => -1,
           x2_invoke: () => -1,
-          // The live-stdout tee (`temen_run_onramp_stream`): while a streaming Run is active, `chunkSink`
-          // relays each write to the main thread; the worker's run stays synchronous, so the main thread
-          // paints the chunks as they arrive (a Worker's postMessage delivers even while it computes).
-          stdout_chunk: (ptr, len) => {
-            if (chunkSink) chunkSink(new Uint8Array(memory.buffer, Number(ptr), Number(len)).slice());
+          // The live output tee (#1414 S5a): while a streaming Run is active, each write goes to the
+          // main thread (`relay`); the worker's run stays synchronous, so the main thread paints the
+          // chunks as they arrive (a Worker's postMessage delivers even while it computes).
+          stream_chunk: (fd, seq, ptr, len) => {
+            const h = globalThis.__temen_stream_chunk;
+            if (h) h(fd, seq >>> 0, new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice());
           },
         },
       }));
@@ -158,20 +167,20 @@ self.onmessage = async (e) => {
       if (msg.jit) { if (jitPrimePromise) { try { await jitPrimePromise; } catch { /* prime failed → runWarmCoop falls back */ } } }
       else if (interpWarmPromise) { try { await interpWarmPromise; } catch { /* dry eval failed → just run */ } }
       // Live-stream the eval's stdout to the page (#1142): the tee on the warm host (both tiers) fires
-      // `stdout_chunk`, relayed here for the duration of the eval.
-      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      // `stream_chunk`, relayed here for the duration of the eval.
+      relay(msg.id);
       let r;
       try {
         r = await evalWarm(msg.source, msg.jit);
       } finally {
-        chunkSink = null;
+        unrelay();
       }
       self.postMessage({ type: 'reply', id: msg.id, ok: true, ...r });
       return;
     }
     if (msg.type === 'runStream') {
-      // Run a plain on-ramp module (nim/C guest) off the main thread with **live stdout**: the tee
-      // (`temen_run_onramp_stream`) posts each write to the page as the guest produces it, so a long or
+      // Run a plain on-ramp module (nim/C guest) off the main thread with **live stdout**: the run's tee
+      // (`stream_chunk`) posts each write to the page as the guest produces it, so a long or
       // chatty program's output appears progressively instead of in one dump at the end. The final
       // captured stdout is returned too (the page overwrites with it for an exact end state).
       const mod = msg.bytes;
@@ -181,15 +190,15 @@ self.onmessage = async (e) => {
       const view = u8();
       view.set(mod, mp);
       if (sp) view.set(stdin, sp);
-      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
-      // The guest's result is this export's return value (like `temen_run_onramp` on the main
-      // thread) — it never fills the `temen_run_value` slot, which the JIT/warm tiers own; reading
-      // that slot here reported 0 for every streamed module (#1509's Temen card caught it).
+      relay(msg.id);
+      // The guest's result is this export's return value (as on the main thread) — it never fills
+      // the `temen_run_value` slot, which the JIT/warm tiers own; reading that slot here reported 0
+      // for every streamed module (#1509's Temen card caught it).
       let value;
       try {
-        value = Number(ex.temen_run_onramp_stream(mp, mod.length, sp, stdin ? stdin.length : 0));
+        value = Number(ex.temen_run_onramp(mp, mod.length, sp, stdin ? stdin.length : 0));
       } finally {
-        chunkSink = null;
+        unrelay();
       }
       const status = ex.temen_status();
       // Return the framebuffer too (a `display`-cap guest like gradient presents one), so a streamed
@@ -213,20 +222,19 @@ self.onmessage = async (e) => {
     if (msg.type === 'runJitStream') {
       // Run a module's `_start` on the **wasm-JIT tier** off the main thread, with **live stdout** (#1141):
       // `runJitModule` emits `_start`, drives `f0`, and bounces cross-tier `write`s to the interpreter — the
-      // tee on that run's host fires `stdout_chunk`, relayed here as the guest writes. A JIT decline/trap
+      // tee on that run's host fires `stream_chunk`, relayed here as the guest writes. A JIT decline/trap
       // throws → reply `ok:false` so the page falls back to the interpreter path.
       const mod = msg.bytes;
       const stdin = msg.stdin && msg.stdin.length ? msg.stdin : null;
-      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      relay(msg.id);
       let status;
       try {
         status = await runJitModule(ex, memory, mod, stdin, msg.cacheKey);
       } catch (err) {
-        chunkSink = null;
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: String((err && err.message) || err) });
         return;
       } finally {
-        chunkSink = null;
+        unrelay();
       }
       const value = Number(ex.temen_run_value());
       self.postMessage({ type: 'reply', id: msg.id, ok: true, status, value, stdout: readStdout(), stderr: readStderr() });

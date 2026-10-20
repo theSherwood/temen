@@ -2058,14 +2058,16 @@ fn release_host_caps_run(module: &temen_ir::Module, budget: u64) -> (String, Opt
     let mut out = Vec::new();
     let mut parks = 0;
     loop {
-        let r = temen_coop_run_for(budget);
-        let (sp, sn) = (temen_stdout_ptr(), temen_stdout_len());
-        if !sp.is_null() && sn > 0 {
-            // SAFETY: the stash stays live until the next call that replaces it.
-            out.extend_from_slice(unsafe { core::slice::from_raw_parts(sp, sn) });
-        }
-        match r {
-            COOP_RUN_DONE => break,
+        match temen_coop_run_for(budget) {
+            COOP_RUN_DONE => {
+                // The stdout slot holds the whole run's output once it has ended.
+                let (sp, sn) = (temen_stdout_ptr(), temen_stdout_len());
+                if !sp.is_null() && sn > 0 {
+                    // SAFETY: the stash stays live until the next call that replaces it.
+                    out.extend_from_slice(unsafe { core::slice::from_raw_parts(sp, sn) });
+                }
+                break;
+            }
             COOP_RUN_PAUSED => {}
             COOP_RUN_CAP_PARK => {
                 parks += 1;
