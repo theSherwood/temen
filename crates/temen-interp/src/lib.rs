@@ -8928,6 +8928,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
                 let key = domain_key_of(&v);
+                // #2480 — the domain's main vCPU finishing ends the domain (#1917), and with it the
+                // fibers no one will resume now.
+                let ends_domain = !froze && v.spawn_residue.is_none();
                 let spawner_domain = v.spawner_domain;
                 let dying_host = Arc::clone(&v.host);
                 let own_tickets: Vec<u64> = v
@@ -9032,6 +9035,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 }
                 for pipe in &pipe_epipes {
                     wake_pipe_writers_locked(&mut s, *pipe);
+                }
+                // #2480 — a call a fiber of the ended domain is parked on wakes no one: it leaves
+                // the wait set, as a dying domain's does at its teardown, so the run's deadlock
+                // verdict does not wait for its answer.
+                if ends_domain {
+                    let of_dom = |&(d, _): &(u64, u64), w: &Waiter| {
+                        d == key as u64 && matches!(w, Waiter::Fiber { .. })
+                    };
+                    s.completion_waiters.retain(|k, w| !of_dom(k, w));
                 }
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
                 // backtrace + fiber, so the root's later trap on its behalf (a teardown, or a child's
@@ -21399,6 +21411,26 @@ impl OffloadPool {
     }
 }
 
+/// A run's doorbell (#1122): how many times it has rung, and the condvar each ring notifies. The
+/// embedder's ([`Host::arm_external_wake`]) rings when it feeds the run or signals it; a store rings
+/// it when an answer posts, while a driver waits on it ([`Completions::wait_any`]).
+pub(crate) type Bell = Arc<(Mutex<u64>, Condvar)>;
+
+/// Wait on `bell` until it rings past count `seen`, or for at most `within`: whether it rang.
+pub(crate) fn wait_for_ring(bell: &Bell, seen: u64, within: Option<std::time::Duration>) -> bool {
+    let (rung, cv) = &**bell;
+    let g = rung.lock_unpoisoned();
+    let not_yet = |g: &mut u64| *g == seen;
+    let g = match within {
+        None => cv.wait_while(g, not_yet).unwrap_or_else(|e| e.into_inner()),
+        Some(d) => {
+            let waited = cv.wait_timeout_while(g, d, not_yet);
+            waited.unwrap_or_else(|e| e.into_inner()).0
+        }
+    };
+    *g != seen
+}
+
 /// §12 parking-on-blocking — the **completion store** behind a `Pending` dispatch. When an
 /// offloadable handler punts ([`OffloadOutcome::Offload`]) on the parking-aware dispatch face
 /// ([`Host::cap_dispatch_slots_pending`]), the dispatch mints an id here, hands the job to the
@@ -21660,22 +21692,33 @@ impl Completions {
         g.ready.remove(&id)
     }
 
-    /// Block until one of `calls` (each a store and an id minted there) has arrived, or for at most
-    /// `within`, and leave it for its drain to take: a cooperative driver's idle wait (#2047) and
-    /// its wait for its next deadline (#1979), while callers in any number of domains are parked,
-    /// each domain's calls in its own store (#2424). Whether a store rang. Each rings this wait's
-    /// bell when a result posts ([`Completions::set_notify`]), hung before any is looked at, so a
-    /// result posted meanwhile is not missed. The hook outlives the wait as a no-op.
-    pub fn wait_any(
+    /// Block until one of `calls` (each a store and an id minted there) has its answer in, or
+    /// `bell` (a run's doorbell, and the ring count already seen) rings again, or for at most
+    /// `within`, and leave the answer for its drain to take: a cooperative driver's idle wait
+    /// (#2047), its wait for its next deadline (#1979) and the debug scheduler's, while callers in
+    /// any number of domains are parked, each domain's calls in its own store (#2424). One wait
+    /// for every wake source (#2480): each store rings the bell when an answer posts
+    /// ([`Completions::set_notify`]), hung before any is looked at, so an answer posted meanwhile is
+    /// not missed; with no bell, the wait rings one of its own. Whether something came. The hook
+    /// outlives the wait, ringing a bell no one may be waiting on.
+    pub(crate) fn wait_any(
         calls: &[(Arc<Completions>, u64)],
+        bell: Option<(&Bell, u64)>,
         within: Option<std::time::Duration>,
     ) -> bool {
-        let bell = Arc::new((Mutex::new(false), Condvar::new()));
+        let own: Bell;
+        let (bell, seen) = match bell {
+            Some(rung) => rung,
+            None => {
+                own = Arc::new((Mutex::new(0), Condvar::new()));
+                (&own, 0)
+            }
+        };
         for (comps, _) in calls {
-            let bell = Arc::downgrade(&bell);
+            let bell = Arc::downgrade(bell);
             comps.set_notify(Some(Arc::new(move || {
                 if let Some(bell) = bell.upgrade() {
-                    *bell.0.lock_unpoisoned() = true;
+                    *bell.0.lock_unpoisoned() += 1;
                     bell.1.notify_all();
                 }
             })));
@@ -21686,16 +21729,7 @@ impl Completions {
         if calls.iter().any(arrived) {
             return true;
         }
-        let (rung, cv) = &*bell;
-        let g = rung.lock_unpoisoned();
-        let g = match within {
-            None => cv.wait_while(g, |r| !*r).unwrap_or_else(|e| e.into_inner()),
-            Some(d) => {
-                let waited = cv.wait_timeout_while(g, d, |r| !*r);
-                waited.unwrap_or_else(|e| e.into_inner()).0
-            }
-        };
-        *g
+        wait_for_ring(bell, seen, within)
     }
 
     /// Take completion `id`'s result if it has already arrived (non-blocking) — the ordered

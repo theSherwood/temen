@@ -11,11 +11,16 @@
 //! The parallel driver (executor 2) has no all-parked block: its parked threads sleep until a rule
 //! wakes them or their deadline comes. A watcher on the bell settles the run on each ring, so the
 //! same kill ends a run whose every task sleeps, at once rather than at the deadline.
+//!
+//! #2480 — nor does the pump sleep through a kill while a host call is outstanding: its idle wait
+//! for the call's answer is a wait on the same bell, which the call's store rings too.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-use temen_interp::{bytecode, Host, SignalSource, StreamRole, Trap, Value};
+use temen_interp::{
+    bytecode, CapState, Host, OffloadOutcome, SignalSource, StreamRole, Trap, Value,
+};
 
 /// Answers `killed()` truthfully, but on the `trigger`th query goes dead *after* answering and rings
 /// the kill door — a terminate arriving from another thread just after the sweep looked.
@@ -141,4 +146,69 @@ fn a_kill_that_rings_the_bell_ends_a_parallel_run_whose_tasks_all_sleep() {
         .expect("the run slept through a kill that rang its bell");
     let r = r.expect("the parallel driver runs this module");
     assert_eq!(r, Err(Trap::ThreadFault), "the killed root is finalized");
+}
+
+/// The root makes a host call that answers only once the test lets it, or after 30 s.
+const WAIT_ON_HOST: &str = r#"
+memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  vr = call.cap 13 0 (i64) -> (i64) vh (vz)
+  return vr
+  }
+}
+"#;
+
+/// #2480 — the root waits on a host call and nothing else can run, so the pump blocks for the call's
+/// answer. A kill lands right after the sweep that found the root parked, and rings the bell: the
+/// pump must see it at once, not when the call answers. It waited on the call's store alone, deaf to
+/// the bell, so the kill waited 30 s for the call.
+#[test]
+fn a_kill_is_not_slept_through_while_a_call_waits() {
+    let m = temen_text::parse_module(WAIT_ON_HOST).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let let_go = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate = Arc::clone(&let_go);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut host = Host::new();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |_op, _args| {
+                let gate = Arc::clone(&gate);
+                OffloadOutcome::Offload(Box::new(move || {
+                    let (open, rung) = &*gate;
+                    let open = open.lock().unwrap();
+                    let wait = rung.wait_timeout_while(open, Duration::from_secs(30), |o| !*o);
+                    drop(wait.unwrap());
+                    7
+                }))
+            }),
+            None,
+            CapState::Stateless,
+        );
+        host.arm_external_wake();
+        // Query 1: the root is still runnable. Query 2: the root is parked on its call — the kill
+        // lands right after this sweep, and the pump's next move is the all-parked block.
+        let source = Arc::new(KilledAfterTheSweep {
+            queries: AtomicUsize::new(0),
+            trigger: 2,
+            dead: AtomicBool::new(false),
+            ring: Mutex::new(None),
+        });
+        host.set_signal_source(source, Arc::new(AtomicBool::new(false)));
+        let mut fuel = u64::MAX;
+        let r = bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(h)], &mut fuel, &mut host);
+        let _ = tx.send(r);
+    });
+    let r = rx.recv_timeout(Duration::from_secs(10));
+    *let_go.0.lock().unwrap() = true;
+    let_go.1.notify_all();
+    let r = r
+        .expect("the pump slept through a kill while a call waited")
+        .expect("the bytecode engine runs this module");
+    assert!(
+        r.is_err(),
+        "the killed root is finalized, not returned: {r:?}"
+    );
 }

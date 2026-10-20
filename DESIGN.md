@@ -1975,13 +1975,24 @@ completer.
 **An idle pump lets a wait's time pass (#1979, 2026-10-15).** The cooperative pump's clock is
 logical, for determinism (#2224): it moves with the work done, one ns per op, and when nothing can
 run, to the earliest deadline. On the native `drive` that time now passes first, in real time, as
-the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call ends the
-wait early, or with none outstanding a ring of the embedder's bell, and the clock moves by the time
-that passed, so the schedule is the clock's as before. A run with no outside input keeps its
+the other engines' waits take theirs (`wait_out`). The answer to an outstanding punted call or a ring
+of the embedder's bell ends the wait early, and the clock moves by the time that passed, so the
+schedule is the clock's as before. A run with no outside input keeps its
 schedule exactly, and only now takes as long as it asked to wait. Without it a 10 ms wait ended
 after ~80 µs, and while a root waited on the world its threads' timed waits fired back to back. The
 debug scheduler keeps the jump, so a replay stays exact; a `CoopRun`'s embedder (the browser) does
 too, as wasm has no clock to wait on (#2439). Pinned in `temen-interp/tests/timed_waits.rs`.
+
+**One bell for an idle pump (#2480, 2026-10-20).** With nothing to run, the pump waited either on the
+answers to its outstanding calls or on the embedder's bell, never both, so a feed, a signal or a
+kill went unseen until a call answered — and a call may wait on the world. Now every store a parked
+caller waits on rings the embedder's bell (a bell of the wait's own when none is armed), and the
+pump waits on that one bell, past the round's `bell_gen` snapshot (`Completions::wait_any`): each wake
+source ends the one wait, and the next round sees which. A call counts only while its answer would
+wake a task — a task's own, or that of a fiber a task resumes blocking — as the parallel driver
+already counted, so a fiber no one resumes holds no wait and no deadlock verdict; the tree-walker
+drops a domain's fiber waiters when the domain ends, as its teardown does a dying one's. Pinned in
+`bytecode_pump_kill.rs` and `cap_park.rs`.
 
 Pinned constraints (tests in `temen/tests/host_park.rs`, `temen-run/tests/fast_cap.rs`): a parkable
 registration is **never** `fast_cap_resolver`-claimed; **sync ops never pay for parkable ops'

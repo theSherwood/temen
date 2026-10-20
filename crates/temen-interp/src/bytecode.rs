@@ -7996,7 +7996,7 @@ fn dbg_take_answer(
         if calls.is_empty() || on_embedder {
             return false;
         }
-        super::Completions::wait_any(&calls, None);
+        super::Completions::wait_any(&calls, None, None);
     }
 }
 
@@ -11100,32 +11100,36 @@ fn drain_fiber_completions(
     claimed
 }
 
-/// The punted calls the run's parked callers wait on, each with the domain it was made in (`None`
-/// the root): a fiber's `CapParked` in any domain's registry, a task's `BlockedHostCap`.
+/// The punted calls whose answer would wake a parked task, each with the domain it was made in
+/// (`None` the root): a task's own (`BlockedHostCap`), and that of a `CapParked` fiber a task
+/// resumes, blocking (`BlockedOnFiber`), as the parallel driver counts them. A fiber no task
+/// resumes is left out, one of a domain that has finished, say (#2480): its answer wakes no one,
+/// so nothing waits for it.
 fn outstanding_calls(
     tasks: &[TaskSlot],
     fibers: &[FiberState],
     extra_envs: &[ChildEnv],
 ) -> Vec<(Option<usize>, u64)> {
-    let regs = std::iter::once((None, fibers)).chain(
-        extra_envs
-            .iter()
-            .enumerate()
-            .map(|(k, e)| (Some(k), &e.fibers.fibers[..])),
-    );
-    let fiber_calls = regs.flat_map(|(env, reg)| {
-        reg.iter().filter_map(move |f| match f {
-            FiberState::CapParked {
-                id, woken: None, ..
-            } => Some((env, *id)),
-            _ => None,
-        })
-    });
-    let task_calls = tasks.iter().filter_map(|t| match t.state {
-        TaskState::BlockedHostCap { id, .. } => Some((t.env, id)),
+    let parked = |t: &TaskSlot| match t.state {
+        TaskState::BlockedHostCap { id, .. } => Some(id),
+        TaskState::BlockedOnFiber { fiber } => {
+            let reg = match t.env {
+                None => fibers,
+                Some(k) => &extra_envs[k].fibers.fibers[..],
+            };
+            match reg.get(fiber) {
+                Some(FiberState::CapParked {
+                    id, woken: None, ..
+                }) => Some(*id),
+                _ => None,
+            }
+        }
         _ => None,
-    });
-    fiber_calls.chain(task_calls).collect()
+    };
+    tasks
+        .iter()
+        .filter_map(|t| parked(t).map(|id| (t.env, id)))
+        .collect()
 }
 
 /// The root activation's id in a vCPU's resume chain (it has no fiber handle).
@@ -14188,30 +14192,15 @@ impl CoopSched {
                     .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
                     .collect();
                 if !fire_next_timeout(tasks, &mut regs, clock) {
-                    // #2047 — no timer is left, but a punted call is outstanding: work in flight
-                    // on the offload pool, never a deadlock. Block until one arrives, in any
-                    // domain (#2424), and deliver it: a fiber's through its domain's ordered
-                    // drain, a task's at the next round's. Only after the timers, as a call may
-                    // wait on the world, or on what a timed waiter will do: it must not hold the
-                    // clock back.
-                    if !calls.is_empty() {
-                        super::Completions::wait_any(&calls, None);
-                        drain_fiber_completions(fibers, extra_envs, root);
-                        continue;
-                    }
                     // #1146 slice 2 — before blocking, interrupt the parks a deliverable signal
                     // reached ([`interrupt_parks`]).
                     if interrupt_parks(tasks, extra_envs, root) {
                         continue;
                     }
-                    // #1122 — every task is parked and no internal wake can come. With an
-                    // armed doorbell and at least one task parked on a PIPE — the state an
-                    // embedder can feed from outside the run (the interactive terminal) —
-                    // BLOCK for the next ring instead of declaring deadlock, then re-settle
-                    // (the readiness poll above sees the deposit). The `bell_gen` snapshot
-                    // predates that poll, so a feed racing this park is never lost. Without
-                    // a doorbell, or with only internally-wakeable parks (a join cycle),
-                    // this is the deadlock it always was.
+                    // #1122 — every task is parked and no internal wake can come: only the world
+                    // can wake the run. A task parked on a PIPE is the state an embedder can feed
+                    // from outside the run (the interactive terminal); a punted call is work in
+                    // flight, never a deadlock (#2047), in any domain (#2424).
                     let external = tasks.iter().any(|t| {
                         matches!(
                             t.state,
@@ -14227,14 +14216,29 @@ impl CoopSched {
                     // #1122 route (a) — a suspend/resume session: hand the idle state back to the
                     // driver (it feeds the terminal and pumps again; the loop-top settle then sees
                     // the deposit / the signal) instead of sleeping this thread on the bell.
-                    if *suspend_on_idle && external {
+                    if *suspend_on_idle && external && calls.is_empty() {
                         return Ok(CoopStep::Idle);
                     }
+                    // #2480 — BLOCK for whichever comes first, on one bell: an answer to an
+                    // outstanding call, delivered by the next round (a fiber's by the drain
+                    // here), or a ring of the armed doorbell past `bell_gen` — a feed, a signal,
+                    // a kill — then re-settle (the readiness poll above sees the deposit). The
+                    // snapshot predates that poll, so a feed racing this park is never lost. Only
+                    // after the timers, as a call may wait on the world, or on what a timed
+                    // waiter will do: it must not hold the clock back. With no call outstanding
+                    // the doorbell counts only for a task parked on what an embedder feeds; with
+                    // neither (a join cycle), this is the deadlock it always was.
                     let bell = root.lock_unpoisoned().external_wake();
-                    match bell.filter(|_| external) {
-                        Some(bell) => _ = wait_for_ring(&bell, bell_gen, None),
-                        None => return Err(Trap::ThreadFault), // deadlock (no runnable, no waiters)
+                    let bell = bell.filter(|_| external || !calls.is_empty());
+                    if calls.is_empty() && bell.is_none() {
+                        return Err(Trap::ThreadFault);
                     }
+                    super::Completions::wait_any(
+                        &calls,
+                        bell.as_ref().map(|b| (b, bell_gen)),
+                        None,
+                    );
+                    drain_fiber_completions(fibers, extra_envs, root);
                 }
                 continue;
             };
@@ -18073,46 +18077,18 @@ fn wait_out(
     woke
 }
 
-/// [`wait_out`]'s wait: `ns` of real time, on the answers to `calls` when any is outstanding, else
-/// on the embedder's bell when one is armed, else asleep. Whether something came before the time
-/// was up. No lock is held while it waits.
+/// [`wait_out`]'s wait: `ns` of real time, ended early by an answer to one of `calls` or a ring
+/// of the embedder's bell past generation `seen`, one bell for both (#2480). Whether something came
+/// before the time was up. No lock is held while it waits.
 fn idle_wait(
     root: &DomainCell,
     calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
     ns: u64,
 ) -> bool {
-    let d = std::time::Duration::from_nanos(ns);
-    if !calls.is_empty() {
-        return super::Completions::wait_any(calls, Some(d));
-    }
     let bell = root.lock_unpoisoned().external_wake();
-    match bell {
-        Some(bell) => wait_for_ring(&bell, seen, Some(d)),
-        None => {
-            std::thread::sleep(d);
-            false
-        }
-    }
-}
-
-/// Wait on `bell` until it rings past generation `seen`, or for at most `within`: whether it rang.
-fn wait_for_ring(
-    bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
-    seen: u64,
-    within: Option<std::time::Duration>,
-) -> bool {
-    let (gen, cv) = &**bell;
-    let g = gen.lock().unwrap_or_else(|e| e.into_inner());
-    let not_yet = |g: &mut u64| *g == seen;
-    let g = match within {
-        None => cv.wait_while(g, not_yet).unwrap_or_else(|e| e.into_inner()),
-        Some(d) => {
-            let waited = cv.wait_timeout_while(g, d, not_yet);
-            waited.unwrap_or_else(|e| e.into_inner()).0
-        }
-    };
-    *g != seen
+    let within = Some(std::time::Duration::from_nanos(ns));
+    super::Completions::wait_any(calls, bell.as_ref().map(|b| (b, seen)), within)
 }
 
 /// #1146 slice 2 — interrupt an all-parked run's interruptible parks before it blocks, when a

@@ -549,15 +549,21 @@ fn check_on_every_engine(what: &str, m: &Module, kids: &[u32], want: i64, paced:
     );
 }
 
-/// `m` on each of `drivers` and the JIT, `wait` answered each way, each run returning `want` in
-/// under half of [`GIVE_UP`]: well before the call it left waiting could have answered.
-fn check_prompt(what: &str, m: &Module, kids: &[u32], want: i64, drivers: &[Driver]) {
+/// `m` on each of `drivers` and the JIT, `wait` answered each way, each run ending as `want` says
+/// in under half of [`GIVE_UP`]: well before the call it left waiting could have answered. `want`
+/// is what the root returns, or the trap the run ends with.
+fn check_prompt(what: &str, m: &Module, kids: &[u32], want: Result<i64, &str>, drivers: &[Driver]) {
     let mut wrong = Vec::new();
     let mut each = |engine: String, run: &dyn Fn() -> Result<i64, String>| {
         let started = Instant::now();
         let got = run();
         let took = started.elapsed();
-        if got != Ok(want) || took >= GIVE_UP / 2 {
+        let right = match (&got, want) {
+            (Ok(r), Ok(w)) => *r == w,
+            (Err(ended), Err(trap)) => ended.contains(trap),
+            _ => false,
+        };
+        if !right || took >= GIVE_UP / 2 {
             wrong.push(format!("  {engine}: {got:?} after {took:?}"));
         }
     };
@@ -572,7 +578,7 @@ fn check_prompt(what: &str, m: &Module, kids: &[u32], want: i64, drivers: &[Driv
     }
     assert!(
         wrong.is_empty(),
-        "{what}: want {want} on every engine, before its call could answer, but\n{}",
+        "{what}: want {want:?} on every engine, before its call could answer, but\n{}",
         wrong.join("\n")
     );
 }
@@ -781,7 +787,7 @@ block 0 (v0: i64) {{
         rec = rec::segment(17408, &child),
     ));
     let what = "a killed child waiting on the host";
-    check_prompt(what, &m, &[1], 1, &drivers::SCHEDULING);
+    check_prompt(what, &m, &[1], Ok(1), &drivers::SCHEDULING);
 }
 
 /// A root returns over a fiber of its own still waiting on a host call nobody will answer
@@ -812,7 +818,66 @@ block 0 (vsp: i64, varg: i64) {{
 }}"
     ));
     let fiber_parks = [Driver::Oracle, Driver::Coop, Driver::Parallel];
-    check_prompt("a run over a waiting fiber", &m, &[], 3, &fiber_parks);
+    check_prompt("a run over a waiting fiber", &m, &[], Ok(3), &fiber_parks);
+}
+
+/// A child resumes a fiber of its own that waits on a host call nobody will answer, and returns over
+/// it; the root joins the child, then waits on a word nothing will ever notify (#2480). Nothing in
+/// the run can wake it, so the run ends in a `ThreadFault` at once. The child's fiber's call wakes no
+/// one, its domain having ended: the pump and the tree-walker still counted it, and waited for its
+/// answer before the verdict. On the engines that park the fiber alone, as above.
+#[test]
+fn a_run_deadlocks_at_once_over_an_ended_childs_waiting_fiber() {
+    let child = SpawnRec {
+        grants_ptr: 17600,
+        grants_n: 1,
+        ..SpawnRec::default()
+    };
+    let m = module_of(&format!(
+        "memory 17
+data 17710 \"wait\"
+func (i32, i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32, vmod: i32) {{
+{grant}{prelude}  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vst, vj = call.cap 6 1 (i32) -> (i64, i64) vinst (vch)
+  va = i64.const 17800
+  ve = i32.const 0
+  vinf = i64.const -1
+  vs = i32.atomic.wait va ve vinf
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = i64.const 17710
+  vl = i64.const 4
+  vh = self.resolve vp vl
+  vf = ref.func 2
+  vsp = i64.const 0
+  vk = cont.new vf vsp
+  vh64 = i64.extend_i32_u vh
+  vs, vv = cont.resume vk vh64
+  vr = i64.extend_i32_u vs
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const {TICKS}
+  vr = call.cap 13 0 (i64) -> (i64) vh (vn)
+  return vr
+}}
+}}
+{rec}",
+        grant = rec::grant("gw", 17600, 17710, 4, "vwait"),
+        prelude = spawn_prelude(17408, "vmod", ""),
+        rec = rec::segment(17408, &child),
+    ));
+    let fiber_parks = [Driver::Oracle, Driver::Coop, Driver::Parallel];
+    let what = "a run over an ended child's waiting fiber";
+    check_prompt(what, &m, &[1], Err("ThreadFault"), &fiber_parks);
 }
 
 /// A JIT root killed while it waits on a host call that will not answer: the watchdog sets the
