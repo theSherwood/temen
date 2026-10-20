@@ -8,14 +8,17 @@
 //! once for each shape: a metered child's code charges its fuel cell, and an unmetered one's does
 //! not. Runs handed one `JitCodeCache` share those compiles, so a later run compiles none — the
 //! root's included, though it spawns: each instance of its code stands up a nursery of its own
-//! (temen#2389).
+//! (temen#2389). A cache that keeps its code in a directory (temen#2452) carries that to a later
+//! process.
 //!
-//! The only test in its binary, so the process-wide compile counter moves only for its runs.
+//! The process-wide compile counters move only for one test's runs: the other runs its in
+//! processes of their own.
 
 #[path = "support/detached.rs"]
 mod detached;
 
 use detached::{module, nester, rec, within_a_minute};
+use std::path::PathBuf;
 use temen_interp::{Host, Value};
 use temen_ir::SpawnRec;
 use temen_run::{instantiate, Backend, JitCodeCache, Limits, Outcome, RunConfig};
@@ -139,16 +142,20 @@ fn compiles(cfg: &RunConfig) -> (u64, u64) {
     )
 }
 
-#[test]
-fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
-    // An unmetered root, so the budget a spawn names decides whether the child is metered.
-    let unmetered = RunConfig {
+/// An unmetered root, so the budget a spawn names decides whether the child is metered.
+fn unmetered() -> RunConfig {
+    RunConfig {
         limits: Limits {
             fuel: Some(u64::MAX),
             ..Limits::default()
         },
         ..RunConfig::default()
-    };
+    }
+}
+
+#[test]
+fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
+    let unmetered = unmetered();
     for backend in [Backend::TreeWalk, Backend::Bytecode] {
         assert_eq!(
             run(backend, unmetered.clone()),
@@ -179,4 +186,67 @@ fn a_run_compiles_each_detached_child_once_for_all_its_spawns() {
     );
     assert_eq!(cache.children_compiled(), 2);
     assert_eq!(cache.compiled(), 1);
+}
+
+/// Where [`run_kept_here`] keeps its code, and writes what it compiled.
+const KEPT_DIR: &str = "TEMEN_RUN_KEPT_DIR";
+const KEPT_OUT: &str = "TEMEN_RUN_KEPT_OUT";
+
+/// The half of [`a_later_process_compiles_none_of_what_an_earlier_one_kept`] that runs in a process
+/// of its own: a JIT run handed a cache kept in `$KEPT_DIR`, which writes how many children and
+/// roots it compiled.
+#[test]
+#[ignore = "run in a process of its own by a_later_process_compiles_none_of_what_an_earlier_one_kept"]
+fn run_kept_here() {
+    let (Some(dir), Some(out)) = (std::env::var_os(KEPT_DIR), std::env::var_os(KEPT_OUT)) else {
+        return;
+    };
+    let cache = JitCodeCache::kept_in(PathBuf::from(dir)).expect("open the code directory");
+    let kept = RunConfig {
+        jit_code: Some(cache),
+        ..unmetered()
+    };
+    let (children, roots) = compiles(&kept);
+    std::fs::write(out, format!("{children} {roots}")).expect("write what this process compiled");
+}
+
+/// [`run_kept_here`] in a process of its own over `dir`: the children and the roots it compiled.
+#[cfg(unix)]
+fn in_a_process(dir: &std::path::Path) -> (u64, u64) {
+    let out = dir.with_extension("out");
+    let run = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "run_kept_here", "--ignored"])
+        .env(KEPT_DIR, dir)
+        .env(KEPT_OUT, &out)
+        .output()
+        .expect("run this test binary");
+    assert!(
+        run.status.success(),
+        "{}\n{}{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let saw = std::fs::read_to_string(&out).expect("what the process compiled");
+    let _ = std::fs::remove_file(&out);
+    let (children, roots) = saw.split_once(' ').expect("two numbers");
+    (children.parse().unwrap(), roots.parse().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_later_process_compiles_none_of_what_an_earlier_one_kept() {
+    let dir = std::env::temp_dir().join(format!("temen-run-kept-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        in_a_process(&dir),
+        (2, 1),
+        "the first process compiles the nester's two shapes and the root"
+    );
+    assert_eq!(
+        in_a_process(&dir),
+        (0, 0),
+        "a later process compiles none of them: it defines the code the first kept"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

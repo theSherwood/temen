@@ -189,6 +189,10 @@ mod vmctx;
 pub use vmctx::{InstanceAddrs, VmCtx};
 mod fuel;
 pub use fuel::{BudgetNode, FuelCell};
+// temen#2452 — compiled code kept on disk, so a later process defines it instead of compiling.
+mod code_dir;
+pub use code_dir::CodeDir;
+use code_dir::{Codegen, EmittedCode};
 
 // §12.8 4A.5 durable-runtime-internal per-OS-thread shadow-region base (`durable.shadow_base`): the
 // base of the region the running durable context spills into, so concurrent vCPUs each have their own
@@ -2140,6 +2144,7 @@ fn run_inner(
         node,
         0,      // one-shot path: natural table size (no B2 reservation)
         signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
+        None,
     )?;
     // PROCESS.md S2 (JIT parity): install the child-powerbox host callbacks into the §14 nursery
     // before the guest runs (the nursery only exists when the module holds an `Instantiator`). `None`
@@ -3066,6 +3071,44 @@ impl CompiledModule {
             node,
             table_reserve_log2,
             None,
+            None,
+        )
+    }
+
+    /// [`Self::compile`], keeping the code in a [`CodeDir`] when `kept` names one, under the
+    /// module's content digest: a compile of the same module with the same arguments, in this
+    /// process or a later one, defines the code kept instead of compiling it (temen#2452). A module
+    /// with debug info compiles as by [`Self::compile`] and keeps nothing: its code is not all its
+    /// compile makes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_kept(
+        kept: Option<(&CodeDir, [u8; 32])>,
+        m: &IrModule,
+        func: FuncIdx,
+        cap_thunk: CapThunk,
+        cap_ctx: *mut core::ffi::c_void,
+        reserved_log2: u8,
+        resolve_module: Option<ModuleResolver>,
+        interrupt: Option<*const AtomicU64>,
+        fuel: Option<*mut FuelCell>,
+        fast_resolver: Option<FastCapResolver>,
+        node: Option<std::sync::Arc<dyn BudgetNode>>,
+        table_reserve_log2: u8,
+    ) -> Result<CompiledModule, JitError> {
+        Self::compile_with_signal(
+            m,
+            func,
+            cap_thunk,
+            cap_ctx,
+            reserved_log2,
+            resolve_module,
+            interrupt,
+            fuel,
+            fast_resolver,
+            node,
+            table_reserve_log2,
+            None,
+            kept,
         )
     }
 
@@ -3086,6 +3129,7 @@ impl CompiledModule {
         node: Option<std::sync::Arc<dyn BudgetNode>>,
         table_reserve_log2: u8,
         signal: Option<SignalArm>,
+        kept: Option<(&CodeDir, [u8; 32])>,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
         let shadow = m
@@ -3156,14 +3200,40 @@ impl CompiledModule {
             None => (0, 0, 0),
         };
 
-        let mut module = new_jit_module(Imports {
+        let imports = Imports {
             cap_thunk: cap_thunk as *const u8,
             sig: signal.as_ref().map(|s| (s.take, s.ret)),
             fast_resolver,
-        })?;
+        };
+        let mut module = new_jit_module(imports)?;
 
         // Declare every function (natural ABI) up front so calls can reference any of them.
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
+
+        // temen#2452 — the code a `CodeDir` kept for this compile, defined in place of compiling,
+        // or else a record of the code the compile emits, to keep. A module's debug info or a signal
+        // arm makes more than code, so neither compile is kept.
+        let kept = kept
+            .filter(|_| m.debug_info.is_none() && signal.is_none())
+            .map(|(dir, digest)| {
+                let key = code_dir::root_key(
+                    &digest,
+                    func,
+                    epoch_addr != 0,
+                    fuel_addr != 0,
+                    fast_resolver.is_some(),
+                    reserved_log2,
+                    table_reserve_log2,
+                );
+                (dir, key)
+            });
+        let replay = kept
+            .and_then(|(dir, key)| dir.load(&key))
+            .filter(|code| code.fits(&module, &ids, &imports));
+        let mut codegen = match &replay {
+            Some(kept) => Codegen::Replay(kept, &imports),
+            None => Codegen::Compile(kept.map(|_| EmittedCode::default())),
+        };
 
         // Distinct signatures give each function (and call site) a structural type id, the
         // basis for the `call.dyn` type check (matching the interpreter). Function
@@ -3393,10 +3463,10 @@ impl CompiledModule {
         // effect unless the env var is set; used to compare temen-jit's generated code against other
         // backends (e.g. the Embench cross-engine bench).
         let dump_codegen = std::env::var_os("TEMEN_JIT_DUMP_CLIF").is_some();
-        let mut base_bytes = 0usize;
-        define_funcs(
+        let base_bytes = define_funcs(
             &mut module,
             &ids,
+            &mut codegen,
             |module, ctx, fi| {
                 // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
                 // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
@@ -3446,7 +3516,6 @@ impl CompiledModule {
                         eprintln!("=== TEMEN-JIT VCODE fn{fi} ===\n{d}");
                     }
                 }
-                base_bytes += cc.code_buffer().len();
                 if srcloc_map.is_some() {
                     let ranges: Vec<(u32, u32, u32)> = cc
                         .buffer
@@ -3676,7 +3745,12 @@ impl CompiledModule {
             .collect();
         #[cfg(not(fiber_rt))]
         let _ = (&node, resolve_module);
-        MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
+        if let (Some((dir, key)), Codegen::Compile(Some(emitted))) = (kept, &codegen) {
+            dir.keep(&key, emitted);
+        }
+        if replay.is_none() {
+            MODULE_COMPILES.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(CompiledModule {
             hosted: false,
             nests: cfg!(fiber_rt) && module_uses_instantiator(m),
@@ -5046,11 +5120,11 @@ impl CompiledModule {
         };
 
         let nesting = self.nesting;
-        // Byte-accurate occupancy: each function's emitted code size.
-        let mut extra_bytes = 0;
-        define_funcs(
+        // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
+        let extra_bytes = define_funcs(
             &mut *module,
             &ids,
+            &mut Codegen::Compile(None),
             |module, ctx, fi| {
                 build_clif(
                     module,
@@ -5076,7 +5150,7 @@ impl CompiledModule {
                     None, // …nor value-label points (Stage 3a)
                 )
             },
-            |_, cc, _| extra_bytes += cc.code_buffer().len(),
+            |_, _, _| {},
         )?;
         self.extra_bytes += extra_bytes;
         let mut ctx = module.make_context();
@@ -5923,20 +5997,39 @@ fn fast_cap_signature(
     c_signature(cc, &params, &[I64][..n_res])
 }
 
-/// The target `resolver` binds a [`fast_cap_symbol`] to; `None` for any other symbol.
-fn fast_cap_addr(resolver: FastCapResolver, name: &str) -> Option<*const u8> {
+/// The `(type_id, op, n_args, n_res)` a [`fast_cap_symbol`] names; `None` for any other symbol.
+fn fast_cap_key(name: &str) -> Option<[u32; 4]> {
     let key: Vec<u32> = name
         .strip_prefix("temen.fast_cap.")?
         .split('.')
         .map(|n| n.parse().ok())
         .collect::<Option<_>>()?;
-    let [type_id, op, n_args, n_res] = key[..] else {
-        return None;
-    };
+    key.try_into().ok()
+}
+
+/// The target `resolver` binds a [`fast_cap_symbol`] to; `None` for any other symbol.
+fn fast_cap_addr(resolver: FastCapResolver, name: &str) -> Option<*const u8> {
+    let [type_id, op, n_args, n_res] = fast_cap_key(name)?;
     // SAFETY: `resolver` honours the `FastCapResolver` contract, which the compile's caller
     // guaranteed: a pure lookup, which the compile already made for this key (`fast_cap_target`).
     let target = unsafe { resolver(type_id, op, n_args, n_res) };
     (!target.is_null()).then_some(target as *const u8)
+}
+
+/// The C signature, in the calling convention `cc`, of the host function the symbol `name` names
+/// ([`HostFn`], or a fast-path target), if a link with the compile's `imports` binds it: what a
+/// compile declares the imports of code a [`CodeDir`] kept with (temen#2452).
+fn host_import(
+    name: &str,
+    cc: cranelift_codegen::isa::CallConv,
+    imports: &Imports,
+) -> Option<Signature> {
+    if let Some(f) = HostFn::ALL.into_iter().find(|f| f.symbol() == name) {
+        return f.addr(imports).map(|_| f.signature(cc));
+    }
+    let [_, _, n_args, n_res] = fast_cap_key(name)?;
+    let bound = fast_cap_addr(imports.fast_resolver?, name).is_some();
+    (bound && n_res <= 1).then(|| fast_cap_signature(cc, n_args as usize, n_res as usize))
 }
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
@@ -6004,17 +6097,24 @@ type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), S
 /// the CLIF, each function in a context of its own, and this thread defines the code in function
 /// order, `defined` seeing each function's as it goes. A function's code depends on its CLIF and the
 /// ISA alone, so the module's code is the same on any number of threads; a compile that fails or
-/// panics fails or panics here, at its function, as it would on one thread.
+/// panics fails or panics here, at its function, as it would on one thread. `code` says where the
+/// code comes from: the compile, which keeps it while its record holds code, or code a [`CodeDir`]
+/// kept, defined as is (temen#2452). Returns the bytes of code defined.
 fn define_funcs(
     module: &mut JITModule,
     ids: &[FuncId],
+    code: &mut Codegen<'_>,
     mut lower: impl FnMut(
         &mut JITModule,
         &mut cranelift_codegen::Context,
         usize,
     ) -> Result<(), JitError>,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
-) -> Result<(), JitError> {
+) -> Result<usize, JitError> {
+    let keep = match code {
+        Codegen::Replay(kept, imports) => return kept.replay(module, ids, imports),
+        Codegen::Compile(keep) => keep,
+    };
     let isa = jit_isa()?;
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
@@ -6047,6 +6147,7 @@ fn define_funcs(
         drop(done_tx);
         let mut done: Vec<Option<CompiledFn>> = (0..ids.len()).map(|_| None).collect();
         let mut next = 0;
+        let mut bytes = 0;
         // Define, in order, every function compiled so far.
         let mut define = |module: &mut JITModule, done: &mut [Option<CompiledFn>]| {
             while let Some(out) = done.get_mut(next).and_then(Option::take) {
@@ -6060,6 +6161,13 @@ fn define_funcs(
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
+                let kept = keep
+                    .as_mut()
+                    .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
+                if !kept {
+                    *keep = None;
+                }
+                bytes += code.code_buffer().len();
                 defined(module, &code, next);
                 next += 1;
             }
@@ -6081,7 +6189,7 @@ fn define_funcs(
             done[j] = Some(out);
             define(module, &mut done)?;
         }
-        Ok(())
+        Ok(bytes)
     })
 }
 
@@ -6326,6 +6434,7 @@ block 2 (v7: i32) {
                 None,
                 0,
                 signal,
+                None,
             )
             .expect("a root's compile")
         };
@@ -6340,22 +6449,25 @@ block 2 (v7: i32) {
         );
         let jumps_root = root(&program(JUMPS), None);
         // Never run, so the domain and the nursery it names are never reached.
-        let child = compile_child_windowed(&ChildCompile {
-            funcs: &calls.funcs,
-            types: &calls.types,
-            entry: 0,
-            mapped_log2: 16,
-            reserved_log2: 16,
-            thunk: cap_thunk,
-            addrs: InstanceAddrs {
-                sched: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
-                nursery: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
-                ..InstanceAddrs::NONE
+        let child = compile_child_windowed(
+            &ChildCompile {
+                funcs: &calls.funcs,
+                types: &calls.types,
+                entry: 0,
+                mapped_log2: 16,
+                reserved_log2: 16,
+                thunk: cap_thunk,
+                addrs: InstanceAddrs {
+                    sched: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    nursery: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+                    ..InstanceAddrs::NONE
+                },
+                impl_exports: &[],
+                table_reserve_log2: 0,
+                shadow: temen_ir::durable_abi::ShadowArena::EMPTY,
             },
-            impl_exports: &[],
-            table_reserve_log2: 0,
-            shadow: temen_ir::durable_abi::ShadowArena::EMPTY,
-        })
+            None,
+        )
         .expect("a child's compile");
         drop((calls_root, jumps_root, child));
         EMITTED.with(|e| e.borrow_mut().take()).expect("recorded")
@@ -6585,7 +6697,13 @@ pub(crate) struct ChildCompile<'a> {
 /// child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
 /// submitted unit as this compile lowered the child's code, into the child's own table — so such a
 /// child's code is its own.
-fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitError> {
+///
+/// `kept` is where its code is kept and under what key ([`ChildCodeKey::kept`]): the code kept
+/// there is defined in place of compiling, or else the compile's is kept (temen#2452).
+fn compile_child_windowed(
+    c: &ChildCompile<'_>,
+    kept: Option<(&CodeDir, [u8; 32])>,
+) -> Result<CompiledModule, JitError> {
     let ChildCompile {
         funcs,
         types,
@@ -6664,11 +6782,21 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         .max(1);
     let fn_table_mask = (table_len as u64) - 1;
 
-    let mut module = new_jit_module(Imports {
+    let imports = Imports {
         cap_thunk: cap_thunk as *const u8,
         ..Imports::NONE
-    })?;
+    };
+    let mut module = new_jit_module(imports)?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
+    // temen#2452 — the code kept for this compile, defined in place of compiling, or else a record
+    // of the code it emits, to keep.
+    let replay = kept
+        .and_then(|(dir, key)| dir.load(&key))
+        .filter(|code| code.fits(&module, &ids, &imports));
+    let mut codegen = match &replay {
+        Some(kept) => Codegen::Replay(kept, &imports),
+        None => Codegen::Compile(kept.map(|_| EmittedCode::default())),
+    };
     // Function signatures first, then every call-site signature (as the root does), so a unit a
     // `Jit`-holding child later submits interns against stable ids — id-equality ≡ structural
     // equality across the child's program and its units (DESIGN.md §22).
@@ -6689,10 +6817,10 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     // the child spawns only when it uses them. Neither when no domain was supplied.
     let threads = futex_sched != 0;
     let spawns = threads && uses_threads;
-    let mut base_bytes = 0usize;
-    define_funcs(
+    let base_bytes = define_funcs(
         &mut module,
         &ids,
+        &mut codegen,
         |module, ctx, fi| {
             build_clif(
                 module,
@@ -6718,7 +6846,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                 None, // …nor value-label points (Stage 3a)
             )
         },
-        |_, cc, _| base_bytes += cc.code_buffer().len(),
+        |_, _, _| {},
     )?;
     let mut ctx = module.make_context();
     build_trampoline(
@@ -6845,9 +6973,14 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
             )
         })
         .collect();
+    if let (Some((dir, key)), Codegen::Compile(Some(emitted))) = (kept, &codegen) {
+        dir.keep(&key, emitted);
+    }
     // PROCESS.md S1: a child module was actually JIT-compiled. Counting successful compiles is what
-    // lets a test prove a child ran compiled.
-    CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
+    // lets a test prove a child ran compiled; code a `CodeDir` kept is defined, not compiled.
+    if replay.is_none() {
+        CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(CompiledModule {
         // A §14 child's runtimes are its task's (`child_exec`) and its nursery is its instance's
         // (temen#2168), so its code is only code: every spawn of it can run one compile
@@ -6945,6 +7078,19 @@ struct ChildCodeKey {
 }
 
 impl ChildCodeKey {
+    /// The key a [`CodeDir`] keeps the code under: this one's but the `call.cap` thunk, which only
+    /// the code's link binds.
+    fn kept(&self) -> [u8; 32] {
+        code_dir::child_key(
+            &self.digest,
+            self.entry,
+            self.mapped_log2,
+            self.reserved_log2,
+            self.cells,
+            self.table_reserve_log2,
+        )
+    }
+
     fn of(digest: [u8; 32], c: &ChildCompile<'_>) -> ChildCodeKey {
         let a = &c.addrs;
         ChildCodeKey {
@@ -6974,15 +7120,26 @@ type ChildCodeSlot = Arc<std::sync::Mutex<Option<SharedCode>>>;
 /// The code lives as long as the cache: a run keeps a compile of each child it spawned, as the
 /// bytecode engine keeps one of each module a run grants.
 #[derive(Clone, Default)]
-pub struct ChildCodeCache(
-    Arc<std::sync::Mutex<std::collections::HashMap<ChildCodeKey, ChildCodeSlot>>>,
-);
+pub struct ChildCodeCache {
+    slots: Arc<std::sync::Mutex<std::collections::HashMap<ChildCodeKey, ChildCodeSlot>>>,
+    /// temen#2452 — where its children's code is kept, so a later process's first spawn of one
+    /// defines the code kept instead of compiling it.
+    dir: Option<CodeDir>,
+}
 
 impl ChildCodeCache {
+    /// A cache that keeps its children's code in `dir` too ([`CodeDir`]).
+    pub fn kept_in(dir: CodeDir) -> ChildCodeCache {
+        ChildCodeCache {
+            slots: Arc::default(),
+            dir: Some(dir),
+        }
+    }
+
     /// How many children it holds a compile of. One being compiled right now is not counted (its
     /// slot is held for the compile, and this does not wait for it).
     pub fn compiled(&self) -> usize {
-        self.0
+        self.slots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
@@ -6999,11 +7156,13 @@ impl ChildCodeCache {
         digest: [u8; 32],
         c: &ChildCompile<'_>,
     ) -> Result<CompiledModule, JitError> {
+        let key = ChildCodeKey::of(digest, c);
+        let disk = self.dir.as_ref().map(|dir| (dir, key.kept()));
         let slot = Arc::clone(
-            self.0
+            self.slots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .entry(ChildCodeKey::of(digest, c))
+                .entry(key)
                 .or_default(),
         );
         let mut kept = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -7011,7 +7170,7 @@ impl ChildCodeCache {
             // A child's runtimes are its task's: its instance stands none up, and charges no node.
             return Ok(code.instance(c.addrs, None));
         }
-        let first = compile_child_windowed(c)?;
+        let first = compile_child_windowed(c, disk)?;
         *kept = first.share();
         Ok(first)
     }
@@ -7036,8 +7195,8 @@ static MODULE_COMPILES: AtomicU64 = AtomicU64::new(0);
 
 /// #1825 — how many modules this process has JIT-compiled whole ([`CompiledModule::compile`]; a §14
 /// child's compile counts in [`child_compiles`] instead). An instance of shared code
-/// ([`SharedCode::instance`]) does **not** advance it: the metric is the observable of the process
-/// tree's compile-once.
+/// ([`SharedCode::instance`]) does **not** advance it, nor does a compile that defines code a
+/// [`CodeDir`] kept: the metric is the observable of the process tree's compile-once.
 pub fn module_compiles() -> u64 {
     MODULE_COMPILES.load(Ordering::Relaxed)
 }

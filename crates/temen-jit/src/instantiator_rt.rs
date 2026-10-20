@@ -1081,18 +1081,21 @@ impl Nursery {
             .as_deref()
             .map_or(0, |c| c as *const crate::FuelCell as usize);
         // Its program is the artifact's, which names no digest here, so the thaw compiles its own.
-        let Ok(code) = crate::compile_child_windowed(&crate::ChildCompile {
-            funcs: &funcs,
-            types: &types,
-            entry: 0,
-            mapped_log2,
-            reserved_log2,
-            thunk: child_thunk,
-            addrs: self.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
-            impl_exports: &impl_exports,
-            table_reserve_log2: gc.jit_table_log2,
-            shadow,
-        }) else {
+        let Ok(code) = crate::compile_child_windowed(
+            &crate::ChildCompile {
+                funcs: &funcs,
+                types: &types,
+                entry: 0,
+                mapped_log2,
+                reserved_log2,
+                thunk: child_thunk,
+                addrs: self.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
+                impl_exports: &impl_exports,
+                table_reserve_log2: gc.jit_table_log2,
+                shadow,
+            },
+            None,
+        ) else {
             release(gc.ctx);
             release(gc.retained_ctx);
             return false;
@@ -1684,7 +1687,7 @@ unsafe fn spawn_detached(
     // temen#2168 — an instance of the run's one compile of this child, unless the child holds a
     // `Jit`: it extends its own code, so it compiles its own.
     let compiled = if gc.holds_jit {
-        crate::compile_child_windowed(&cc)
+        crate::compile_child_windowed(&cc, None)
     } else {
         rt.child_code().instance(digest, &cc)
     };

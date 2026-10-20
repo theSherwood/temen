@@ -355,16 +355,17 @@ impl Tree {
                     }
                     Some(None) => {
                         drop(kept);
-                        compile(cc, program, entry, jit, plan, interrupt, self)?
+                        compile(cc, program, entry, jit, plan, interrupt, self, Some(digest))?
                     }
                     None => {
-                        let (cm, image) = compile(cc, program, entry, jit, plan, interrupt, self)?;
+                        let (cm, image) =
+                            compile(cc, program, entry, jit, plan, interrupt, self, Some(digest))?;
                         *kept = Some(image.clone());
                         (cm, image)
                     }
                 }
             }
-            _ => compile(cc, program, entry, jit, plan, interrupt, self)?,
+            _ => compile(cc, program, entry, jit, plan, interrupt, self, None)?,
         };
         Ok(Loaded { cm, image })
     }
@@ -631,9 +632,24 @@ struct CodeSlot {
 pub struct JitCodeCache {
     programs: Arc<Mutex<HashMap<CodeKey, Arc<CodeSlot>>>>,
     children: temen_jit::ChildCodeCache,
+    /// temen#2452 — where it keeps the code it compiles on disk too.
+    dir: Option<temen_jit::CodeDir>,
 }
 
 impl JitCodeCache {
+    /// A cache that keeps the code it compiles in the directory at `dir` too, made if it does not
+    /// exist: a later process handed a cache over the same directory defines the code of the
+    /// programs and children this one compiled, instead of compiling them (temen#2452). Fails as
+    /// [`temen_jit::CodeDir::open`] does: unless only its owner can write it, and off unix.
+    pub fn kept_in(dir: impl Into<std::path::PathBuf>) -> std::io::Result<JitCodeCache> {
+        let dir = temen_jit::CodeDir::open(dir)?;
+        Ok(JitCodeCache {
+            programs: Arc::default(),
+            children: temen_jit::ChildCodeCache::kept_in(dir.clone()),
+            dir: Some(dir),
+        })
+    }
+
     /// How many §14 children it holds a compile of ([`temen_jit::ChildCodeCache::compiled`]).
     pub fn children_compiled(&self) -> usize {
         self.children.compiled()
@@ -876,10 +892,12 @@ struct Loaded {
 /// Compile `program` at `entry` over the powerbox `cc` names — instrumented to fork when `plan` says
 /// it can — and share its code as an [`Image`], unless the program can extend its code (`jit`) or the
 /// code is more than code ([`CompiledModule::share`]: a concurrent program's is). `tree` is the run's:
-/// its quota, and its fuel cell if armed.
+/// its quota, its fuel cell if armed, and its code cache, whose directory, if it has one, keeps the
+/// code under the program's `digest` (temen#2452; `None` for a program no cache keeps).
 ///
 /// # Safety
 /// As [`compile_image`].
+#[allow(clippy::too_many_arguments)]
 unsafe fn compile(
     cc: CapCtx,
     program: &Program<'_>,
@@ -888,6 +906,7 @@ unsafe fn compile(
     plan: Option<ForkPlan>,
     interrupt: Option<*const AtomicU64>,
     tree: &Tree,
+    digest: Option<[u8; 32]>,
 ) -> Result<(CompiledModule, Option<Arc<Image>>), temen_jit::JitError> {
     let m = program.module();
     let instrumented = plan.as_ref().and_then(|p| p.instrument(m, entry));
@@ -895,7 +914,23 @@ unsafe fn compile(
         .as_ref()
         .map_or((m, entry), |(im, at)| (im, *at));
     let fuel = (tree.fuel != 0).then_some(tree.fuel as *mut temen_jit::FuelCell);
-    let cm = compile_image(cc, code, at, interrupt, jit, fuel)?;
+    // temen#2452 — the code is kept under what it was compiled from: the program, and the fork
+    // sites it was instrumented at.
+    let kept = tree.code.dir.as_ref().zip(digest).map(|(dir, digest)| {
+        let digest = match (&instrumented, &plan) {
+            (Some(_), Some(plan)) => {
+                let mut at_sites = digest.to_vec();
+                for (a, b) in &plan.sites {
+                    at_sites.extend(a.to_le_bytes());
+                    at_sites.extend(b.to_le_bytes());
+                }
+                temen_encode::digest256(&at_sites)
+            }
+            _ => digest,
+        };
+        (dir, digest)
+    });
+    let cm = compile_image(cc, code, at, interrupt, jit, fuel, kept)?;
     let image = (!jit).then(|| cm.share()).flatten().map(|code| {
         Arc::new(Image {
             code,
@@ -958,6 +993,7 @@ pub(crate) unsafe fn with_cap_ctx<R>(
 /// [`crate::cap_thunk`] over a raw `*mut Host` with the D45 fast path, or for a concurrent program
 /// [`crate::cap_thunk_locked`] over the `Mutex<Host>` that serializes its vCPUs' calls. §14 module
 /// children resolve their `Module` grant, and the §5 kill-path `interrupt` is polled when `Some`.
+/// `kept` names the directory its code is kept in and the image's digest, when a cache keeps it.
 ///
 /// An image that can drive the §22 `Jit` interface (`jit`, see [`drives_jit`]) gets the runtime its
 /// grant hosts in a submitted unit: the fibers a unit's `cont.*` resolve against, and in the
@@ -975,6 +1011,7 @@ pub(crate) unsafe fn compile_image(
     interrupt: Option<*const AtomicU64>,
     jit: bool,
     fuel: Option<*mut temen_jit::FuelCell>,
+    kept: Option<(&temen_jit::CodeDir, [u8; 32])>,
 ) -> Result<CompiledModule, temen_jit::JitError> {
     // The fast fns and the raw resolver deref a `*mut Host`, not a `Mutex<Host>`.
     let (resolver, fast): (
@@ -984,7 +1021,8 @@ pub(crate) unsafe fn compile_image(
         CapCtx::Raw(_) => (module_resolver, Some(fast_cap_resolver)),
         CapCtx::Locked(_) => (module_resolver_locked, None),
     };
-    let mut cm = CompiledModule::compile(
+    let mut cm = CompiledModule::compile_kept(
+        kept,
         module,
         entry,
         cc.thunk(),

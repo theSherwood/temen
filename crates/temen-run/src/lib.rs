@@ -6716,7 +6716,7 @@ fn jit_run(
             let jit = jit_proc::drives_jit(&jit_proc::host_calls(m), host);
             let r = unsafe {
                 jit_proc::with_cap_ctx(host, jit_proc::locked(m), |cc| {
-                    jit_proc::compile_image(cc, m, func, ip, jit, fuel)
+                    jit_proc::compile_image(cc, m, func, ip, jit, fuel, None)
                         .and_then(|cm| jit_proc::run_image(cc, cm, None, start))
                 })
             };
