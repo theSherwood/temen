@@ -82,7 +82,7 @@ use temen_ir::{
     AtomicRmwOp, BinOp, Block, CastOp, ConvOp, Data, FBinOp, FCmpOp, FUnOp, FloatTy, Func, FuncIdx,
     FuncType, Inst, IntTy, IntUnOp, LoadOp, Module as IrModule, StoreOp, Terminator, VBitBinOp,
     VCvtOp, VFCmpOp, VFloatBinOp, VFloatUnOp, VICmpOp, VIntBinOp, VIntUnOp, VNarrowOp, VPMinMaxOp,
-    VSatBinOp, VShape, VShiftOp, ValType, DEFAULT_RESERVED_LOG2,
+    VSatBinOp, VShape, VShiftOp, ValType,
 };
 
 mod dwarf;
@@ -1239,7 +1239,7 @@ pub fn compile(m: &IrModule, func: FuncIdx) -> Result<CompiledModule, JitError> 
         func,
         empty_cap_thunk,
         core::ptr::null_mut(),
-        DEFAULT_RESERVED_LOG2,
+        temen_ir::default_reserved_log2(),
         None, // resolve_module
         None, // interrupt
         None, // fuel
@@ -1450,7 +1450,7 @@ pub fn compile_and_run_capture(
     init_mem: &[u8],
 ) -> Result<(JitOutcome, Vec<u8>), JitError> {
     // Default reservation policy (§4): a large reserved range, only `mapped` backed.
-    compile_and_run_capture_reserved(m, func, args, init_mem, DEFAULT_RESERVED_LOG2)
+    compile_and_run_capture_reserved(m, func, args, init_mem, temen_ir::default_reserved_log2())
 }
 
 /// Like [`compile_and_run_capture`], but with a host **reservation policy**: the window masks
@@ -2134,7 +2134,7 @@ impl Default for RunOpts<'_> {
         RunOpts {
             init_mem: None,
             // The default reservation policy (§4): a large reserved range, only `mapped` backed.
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: temen_ir::default_reserved_log2(),
             snapshot_cap: None,
             resolve_module: None,
             grant_child: None,

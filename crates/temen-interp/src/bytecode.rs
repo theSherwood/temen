@@ -42,15 +42,16 @@
 //! construction of the compiler, and `compile_module` rejects anything it can't lower.
 
 use temen_ir::{
-    BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp, FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx,
-    IToF, Inst, IntTy, IntUnOp, LoadOp, Module, SpawnRec, StoreOp, Terminator, ValType, VarLoc,
+    default_reserved_log2, window_reserved_log2, BinOp, CastOp, CmpOp, ConvOp, DebugInfo, FBinOp,
+    FCmpOp, FToI, FUnOp, FloatTy, Func, FuncIdx, IToF, Inst, IntTy, IntUnOp, LoadOp, Module,
+    SpawnRec, StoreOp, Terminator, ValType, VarLoc,
 };
 
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, Fuel, GuestMem, Host, HostCharge,
     Lease, LentFuel, LiveFiber, LiveVcpu, LockUnpoisoned, Mem, MemLayout, NodeRef, Reg, RootWindow,
-    Trap, Value, VarValue, WindowSpec, DEFAULT_FUEL, DEFAULT_RESERVED_LOG2,
+    Trap, Value, VarValue, WindowSpec, DEFAULT_FUEL,
 };
 use crate::moment::{Moment, Refusal};
 
@@ -2008,7 +2009,7 @@ impl FreshWindow {
         host: &mut Host,
     ) -> Result<Mem, Trap> {
         let mut mem = Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: window_reserved_log2(self.size_log2),
             mapped_log2: self.size_log2,
             shadow: self.shadow,
             back,
@@ -2147,7 +2148,7 @@ fn admit_detached_child(
     // D66 — the child's lane cap is the lane its budget carries, as on the tree-walker and the JIT:
     // its `self.parallelism`, and the ceiling on the lanes it grants its own children.
     child_host.set_lane_cap(lane);
-    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+    let reservation = 1u64 << window_reserved_log2(size_log2 as u8);
     let (cinst, cas) = child_host.grant_starter_caps(reservation);
     // #1944 — the budget that paid for the window is the child's own.
     host.give_child_budget(lease, &mut child_host);
@@ -3266,7 +3267,7 @@ pub fn compile_and_run_seeded_with_host(
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
@@ -3314,7 +3315,7 @@ pub fn compile_and_run_with_host_traced(
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut vm = match Vm::new(
         &dom.source.primary(),
         func as usize,
@@ -3430,7 +3431,7 @@ pub fn compile_and_run_capture(
     }
     let mut host = Host::new();
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, init_mem);
     let r = run(dom, func, args, fuel, &mut mem, &mut host);
     let snap = mem
         .as_ref()
@@ -3464,7 +3465,7 @@ pub fn compile_and_run_capture_over(
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = Mem::root(
         m,
-        DEFAULT_RESERVED_LOG2,
+        default_reserved_log2(),
         Some(std::sync::Arc::clone(&back)),
         init_mem,
     );
@@ -3505,7 +3506,7 @@ pub fn compile_and_run_over_shared_with_host(
     // every call, as the cached form does; only the data waits for `seed_data`.
     let mut mem = m.memory.map(|mc| {
         Mem::from_spec(WindowSpec {
-            reserved_log2: DEFAULT_RESERVED_LOG2,
+            reserved_log2: default_reserved_log2(),
             mapped_log2: mc.size_log2,
             shadow: mc.shadow,
             back: Some(back),
@@ -3569,7 +3570,7 @@ impl SharedProgram {
             back,
             host,
             seed_data,
-            DEFAULT_RESERVED_LOG2,
+            default_reserved_log2(),
             None,
         )
         .0
@@ -3818,7 +3819,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     // `ParkEvent`s through it (the same wiring the cooperative entries install); without it the ops
     // degrade to `-ENOSYS`/the ECHILD poll and the `ForkSelf`/`ReapWait` rules never apply.
     host.wire_park_door();
-    let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, back, init_mem);
+    let mem = Mem::root(m, default_reserved_log2(), back, init_mem);
     let (r, mem) = drive_threads(dom, func, args, fuel, mem, host);
     let snap = mem
         .as_ref()
@@ -3931,7 +3932,7 @@ impl Reactor {
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
-            mem: Mem::root(m, DEFAULT_RESERVED_LOG2, back, &[]),
+            mem: Mem::root(m, default_reserved_log2(), back, &[]),
         })
     }
 
@@ -4324,7 +4325,7 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         init_mem: &[u8],
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
+        let mem = Mem::root(&prog.module, default_reserved_log2(), Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, Host::new())
     }
 
@@ -4344,7 +4345,7 @@ impl<'p> Vcpu<'p> {
         init_mem: &[u8],
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = Mem::root(&prog.module, DEFAULT_RESERVED_LOG2, Some(back), init_mem);
+        let mem = Mem::root(&prog.module, default_reserved_log2(), Some(back), init_mem);
         Vcpu::with_mem(prog, func, args, mem, host)
     }
 
@@ -4354,7 +4355,7 @@ impl<'p> Vcpu<'p> {
     /// persistent-backend seam: a single owned-host vCPU that grows its heap into the `reserved_log2`
     /// tail and stays alive across [`run`](Vcpu::run) parks, so blocking stdin
     /// ([`set_stdin_blocking`](Vcpu::set_stdin_blocking)) can suspend it between queries. Uses the same
-    /// `DEFAULT_RESERVED_LOG2`-scale window a one-shot `--single` boot uses; pass that.
+    /// [`default_reserved_log2`] window a one-shot `--single` boot uses; pass that.
     pub fn new_root_reserved_with_powerbox(
         prog: &'p VcpuProgram,
         func: u32,
@@ -4440,7 +4441,7 @@ impl<'p> Vcpu<'p> {
         // data: the window is already live with the root's image.
         let mem = size_log2.map(|sl| {
             Mem::from_spec(WindowSpec {
-                reserved_log2: DEFAULT_RESERVED_LOG2,
+                reserved_log2: default_reserved_log2(),
                 mapped_log2: sl,
                 shadow: prog.dom.source.get(module as usize).and_then(|c| c.shadow),
                 back: Some(back),
@@ -5374,7 +5375,7 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
         &dom.source.primary(),
@@ -5429,7 +5430,7 @@ pub fn ir_window_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
         &dom.source.primary(),
@@ -5502,7 +5503,7 @@ pub fn ir_value_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(
         &dom.source.primary(),
@@ -8060,7 +8061,7 @@ impl ScheduledDebugRun {
         let mut source = ModuleSource::over(std::sync::Arc::new(c));
         source.debug = true;
         let source = std::sync::Arc::new(source);
-        let mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+        let mem = Mem::root(m, default_reserved_log2(), None, &[]);
         let vt = VTask::new(
             &source.primary(),
             func as usize,
@@ -9469,7 +9470,7 @@ pub fn compile_and_run_sliced(
         return Some(Err(Trap::Malformed));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]);
+    let mut mem = Mem::root(m, default_reserved_log2(), None, &[]);
     let mut host = Host::new();
     Some(drive(
         dom,
@@ -15749,7 +15750,7 @@ impl CoopRun {
             fuel,
             host,
             tierup,
-            Mem::root(m, DEFAULT_RESERVED_LOG2, None, &[]),
+            Mem::root(m, default_reserved_log2(), None, &[]),
         )
     }
 
@@ -15772,7 +15773,7 @@ impl CoopRun {
             fuel,
             host,
             None,
-            Mem::root(m, DEFAULT_RESERVED_LOG2, None, init_mem),
+            Mem::root(m, default_reserved_log2(), None, init_mem),
         )
     }
 
@@ -15975,7 +15976,7 @@ impl CoopRun {
     /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
     ///
     /// #1312: the length is the backing-clamped [`Mem::win_flat_len`], not the reservation — a
-    /// cooperative run now reserves the oracle's `DEFAULT_RESERVED_LOG2` over a growable backing, and
+    /// cooperative run now reserves the oracle's [`default_reserved_log2`] over a growable backing, and
     /// a driver must mirror what exists, not the mask domain. **Re-read both per event and after any
     /// bounce**: a `vm_map` grow can extend *and relocate* the backing.
     pub fn pending_win(&self) -> Option<(*const u8, u64)> {

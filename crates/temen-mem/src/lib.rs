@@ -1004,6 +1004,23 @@ mod shared {
     }
 }
 
+/// #2517 — how many bits of address space the OS gives this process: 47 on most x86-64 and arm64
+/// hosts, 39 on many Android phones. Linux and Android put a process's initial stack, and the
+/// `AT_RANDOM` bytes on it, just under the top of the space an `mmap` without a hint draws from, so
+/// their address rounds up to its size. qemu-user puts the stack lower, a third of the way into the
+/// space it gives, so there the size reads smaller, never larger. `None` where it cannot be read:
+/// other hosts, and Miri.
+pub fn user_address_bits() -> Option<u32> {
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    {
+        // SAFETY: `getauxval` only reads the auxiliary vector the kernel gave the process.
+        let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) } as u64;
+        (at_random != 0).then(|| u64::BITS - at_random.leading_zeros())
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "android"), not(miri))))]
+    None
+}
+
 #[cfg(unix)]
 pub use mapped::Mapped;
 
@@ -2195,6 +2212,28 @@ mod tests {
         // A dropped page is an ordinary page again once written.
         r.set_byte(3 * page + 7, 0x5A);
         assert_eq!(r.byte(3 * page + 7), 0x5A);
+    }
+
+    /// #2517 — the address space read from the initial stack holds what the process maps: this
+    /// thread's stack and a fresh mapping both lie below its top.
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+    #[test]
+    fn the_address_space_holds_the_process_mappings() {
+        let bits = user_address_bits().expect("Linux and Android give every process AT_RANDOM");
+        assert!(bits >= 32, "{bits} bits");
+        let on_stack = &bits as *const u32 as u64;
+        // SAFETY: `sysconf` has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let r = Region::new(16 * page, page);
+        let Region::Mapped(m) = &r else {
+            panic!("unix Region::new is the mmap backing")
+        };
+        for at in [on_stack, m.raw.base_ptr() as u64] {
+            assert!(
+                at < 1 << bits,
+                "{at:#x} lies past a {bits}-bit address space"
+            );
+        }
     }
 }
 

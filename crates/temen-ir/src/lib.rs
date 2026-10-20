@@ -4072,15 +4072,59 @@ impl Memory {
 }
 
 /// The reference host's **default reservation policy** (§4): the size (`log2`) of the reserved
-/// virtual range a window's `mapped` bytes live inside, 128 GiB. DESIGN §4 makes this
-/// host-configurable; this is the default the reference `run`/`compile_and_run` entries apply when a
-/// caller doesn't pass one. It is *policy*, not verified semantics — both backends share this one
-/// constant so they stay in differential lockstep, and the masking unit (`temen-mask`) never
-/// hard-codes a reservation. The reserved range is `PROT_NONE` + lazily paged, so a large value
-/// costs virtual address space, not committed memory, but every window spends it: the process's
-/// pool of it (`temen_interp::RESERVED_POOL`, 64 TiB) holds 512 windows of this size (#2305). A
-/// guest maps nothing past it.
+/// virtual range a window's `mapped` bytes live inside, 128 GiB, unless the embedder chooses
+/// smaller windows for its process ([`set_default_reserved_log2`]). It is *policy*, not verified
+/// semantics — every engine reads the one [`default_reserved_log2`] so they stay in differential
+/// lockstep, and the masking unit (`temen-mask`) never hard-codes a reservation. The reserved range
+/// is `PROT_NONE` + lazily paged, so a large value costs virtual address space, not committed
+/// memory, but every window spends it: the process's pool of it (`temen_interp::reserved_pool`,
+/// half the host's address space) holds 512 windows of this size on a 47-bit host (#2305). A guest
+/// maps nothing past it.
 pub const DEFAULT_RESERVED_LOG2: u8 = 37;
+
+/// #2517 — the log2 of the mask domain each window of this process reserves when what builds it
+/// names none: the root of every entry point that takes no reservation, and every detached child,
+/// on every engine (raised to the window's size, [`window_reserved_log2`]). The embedder's choice
+/// ([`set_default_reserved_log2`]), else [`DEFAULT_RESERVED_LOG2`]. The first read fixes it, so
+/// every window and every charge to the process's pool of address space sees one value.
+pub fn default_reserved_log2() -> u8 {
+    use core::sync::atomic::Ordering::Relaxed;
+    match CHOSEN_RESERVED_LOG2.load(Relaxed) {
+        UNCHOSEN => match CHOSEN_RESERVED_LOG2.compare_exchange(
+            UNCHOSEN,
+            DEFAULT_RESERVED_LOG2,
+            Relaxed,
+            Relaxed,
+        ) {
+            Ok(_) => DEFAULT_RESERVED_LOG2,
+            Err(chosen) => chosen,
+        },
+        chosen => chosen,
+    }
+}
+
+/// #2517 — choose [`default_reserved_log2`] for a host with less address space than the default
+/// spends: a 39-bit phone's pool of it holds two windows of 128 GiB, and 64 of 4 GiB (`32`). It only
+/// lowers the default, and only before anything has read it: `false`, changing nothing, otherwise.
+#[must_use]
+pub fn set_default_reserved_log2(log2: u8) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    log2 <= DEFAULT_RESERVED_LOG2
+        && CHOSEN_RESERVED_LOG2
+            .compare_exchange(UNCHOSEN, log2, Relaxed, Relaxed)
+            .is_ok()
+}
+
+/// #2517 — the log2 of the mask domain a window of `1 << mapped_log2` bytes reserves when what
+/// builds it names none: [`default_reserved_log2`], raised to the window as every engine raises it.
+pub fn window_reserved_log2(mapped_log2: u8) -> u8 {
+    default_reserved_log2().max(mapped_log2)
+}
+
+/// No choice read or made yet: larger than any reservation's log2.
+const UNCHOSEN: u8 = u8::MAX;
+static CHOSEN_RESERVED_LOG2: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(UNCHOSEN);
 
 /// The §3e powerbox **args-buffer** window offset: where a host seeds the program-arguments blob so
 /// the frontend's `_start` can hand `argc`/`argv` to a C `main(int, char**)`. This is the

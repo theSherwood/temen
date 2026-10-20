@@ -3373,7 +3373,8 @@ pub unsafe extern "C" fn page_miss(
         let Some(paging) = g.jit_paging() else {
             return fault();
         };
-        let reserved = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+        // The reservation the child's window was built with: the default, raised to the window.
+        let reserved = (1u64 << temen_ir::default_reserved_log2()).max(paging.mapped);
         let win = MprotectWindow::of(&mut g, base, paging.mapped, reserved);
         (win, paging.mapped, g.jit_pager())
     };
@@ -5692,7 +5693,7 @@ impl PowerboxProgram {
                 0,
                 cc.thunk(),
                 cc.ptr(),
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 // §14 module children (ops 5/13/15) resolve their `Module` grant through the
                 // powerbox host — the ctx is that host's box (`cc.ptr()`), as `cap_thunk`'s.
                 Some(module_resolver),
@@ -5738,7 +5739,7 @@ impl PowerboxProgram {
         self.inst.grant_caps(&mut self.host, self.win);
         // #2113 — the run's window and main vCPU, charged to its node, and the default fuel its code
         // draws from it, as `run_powerbox`'s.
-        let window = RootWindow::fresh(&self.inst.module, temen_ir::DEFAULT_RESERVED_LOG2);
+        let window = RootWindow::fresh(&self.inst.module, temen_ir::default_reserved_log2());
         let Some(node) = self
             .host
             .begin_activation(temen_interp::DEFAULT_FUEL, window)
@@ -6970,7 +6971,7 @@ fn jit_run(
     // which pays for its window and main vCPU as an interpreter's does. A chain unbounded at every
     // level meters nothing, and the run's code compiles without fuel checks.
     limits.grant(host);
-    let window = RootWindow::fresh(m, temen_ir::DEFAULT_RESERVED_LOG2);
+    let window = RootWindow::fresh(m, temen_ir::default_reserved_log2());
     let Some(node) = host.begin_activation(limits.fuel(), window) else {
         return Err(no_room_for_run());
     };
@@ -7119,7 +7120,7 @@ fn run_interp_untraced(
                 args,
                 fuel,
                 mem,
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 host,
             )
             .0
@@ -7136,7 +7137,7 @@ fn run_interp_untraced(
                     args,
                     fuel,
                     mem,
-                    temen_ir::DEFAULT_RESERVED_LOG2,
+                    temen_ir::default_reserved_log2(),
                     host,
                 )
                 .map(|(r, _snap)| r)
@@ -7154,7 +7155,7 @@ fn run_interp_untraced(
                         args,
                         fuel,
                         mem,
-                        temen_ir::DEFAULT_RESERVED_LOG2,
+                        temen_ir::default_reserved_log2(),
                         host,
                     )
                     .0
@@ -8192,7 +8193,7 @@ impl Instance {
             host,
             None,
             init_mem.as_deref().unwrap_or(&[]),
-            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_ir::default_reserved_log2(),
         )
         .ok_or_else(|| {
             "module outside the bytecode engine's subset (no session driver)".to_string()
@@ -8716,7 +8717,7 @@ fn run_capture_on(
             args,
             &mut fuel,
             init_mem,
-            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_ir::default_reserved_log2(),
             host,
         )
     };
@@ -8733,7 +8734,7 @@ fn run_capture_on(
                 args,
                 &mut fuel,
                 init_mem,
-                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_ir::default_reserved_log2(),
                 host,
             ) {
                 Some((r, snap)) => Ok((outcome_from_interp(r)?, snap)),

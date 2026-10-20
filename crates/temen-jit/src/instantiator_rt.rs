@@ -1640,7 +1640,9 @@ unsafe fn spawn_detached(
     if lane == crate::ADMIT_REFUSED {
         return EINVAL as i32;
     }
-    let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+    // #2517 — the process's default reservation, raised to the window, as on every engine.
+    let reserved_log2 = temen_ir::window_reserved_log2(size_log2 as u8);
+    let reservation = 1u64 << reserved_log2;
     let mut gc = crate::GrantChild {
         ctx: core::ptr::null_mut(),
         retained_ctx: core::ptr::null_mut(),
@@ -1721,7 +1723,7 @@ unsafe fn spawn_detached(
         types: child_types,
         entry: 0,
         mapped_log2: size_log2 as u8,
-        reserved_log2: temen_ir::DEFAULT_RESERVED_LOG2,
+        reserved_log2,
         thunk: child_thunk,
         addrs: rt.child_addrs(&gc, child_fuel_addr, kid.as_deref()),
         impl_exports: &child.impl_exports,
@@ -1775,7 +1777,7 @@ unsafe fn spawn_detached(
         rt,
         code,
         size_log2 as u8,
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        reserved_log2,
         seeds,
         window_ready,
         args,

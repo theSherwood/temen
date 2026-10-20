@@ -138,7 +138,7 @@ fn build_run(
         let mut host = Host::new();
         grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
         if let Some(limit) = mem_limit {
-            let mem = RootWindow::fresh(module, temen_ir::DEFAULT_RESERVED_LOG2)
+            let mem = RootWindow::fresh(module, temen_ir::default_reserved_log2())
                 .declared
                 .saturating_add(limit);
             host.set_grant(

@@ -1055,7 +1055,7 @@ pub(crate) unsafe fn compile_image(
         entry,
         cc.thunk(),
         cc.ptr(),
-        temen_ir::DEFAULT_RESERVED_LOG2,
+        temen_ir::default_reserved_log2(),
         Some(resolver),
         interrupt,
         fuel, // the cell the code charges when `Limits.fuel` bounds the run (`jit_run`)
