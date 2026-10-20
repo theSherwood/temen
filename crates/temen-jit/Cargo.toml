@@ -70,4 +70,4 @@ loom = "0.7"
 
 [lints.rust]
 # `--cfg loom` is set manually for loom model-checking runs; tell rustc it's expected.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
