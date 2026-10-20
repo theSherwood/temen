@@ -3573,9 +3573,7 @@ impl CompiledModule {
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
-        module
-            .define_function(tramp, &mut ctx)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
+        define_verified(&mut module, tramp, &mut ctx)?;
         module.clear_context(&mut ctx);
 
         // I36 slice 3 (§3.6 JIT serve loop): a buffer-ABI trampoline for every **impl-export
@@ -3602,9 +3600,7 @@ impl CompiledModule {
                                 &ctx.func.signature,
                             )
                             .map_err(|e| JitError::Backend(e.to_string()))?;
-                        module
-                            .define_function(id, &mut ctx)
-                            .map_err(|e| JitError::Backend(e.to_string()))?;
+                        define_verified(&mut module, id, &mut ctx)?;
                         module.clear_context(&mut ctx);
                         serve_ids.push((f, id));
                     }
@@ -3620,9 +3616,7 @@ impl CompiledModule {
             let id = module
                 .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
-            module
-                .define_function(id, &mut ctx)
-                .map_err(|e| JitError::Backend(e.to_string()))?;
+            define_verified(&mut module, id, &mut ctx)?;
             module.clear_context(&mut ctx);
             Some(id)
         } else {
@@ -5093,10 +5087,7 @@ impl CompiledModule {
                 let t = module
                     .declare_function(&name, Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                module
-                    .define_function(t, &mut ctx)
-                    .map_err(|e| JitError::Backend(e.to_string()))?;
-                self.extra_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
+                self.extra_bytes += define_verified(module, t, &mut ctx)?.code_buffer().len();
                 module.clear_context(&mut ctx);
                 Ok(t)
             })
@@ -5219,9 +5210,7 @@ impl CompiledModule {
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                module
-                    .define_function(id, &mut ctx)
-                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                define_verified(module, id, &mut ctx)?;
                 module.clear_context(&mut ctx);
                 module
                     .finalize_definitions()
@@ -5309,9 +5298,7 @@ impl CompiledModule {
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                module
-                    .define_function(id, &mut ctx)
-                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                define_verified(module, id, &mut ctx)?;
                 module.clear_context(&mut ctx);
                 module
                     .finalize_definitions()
@@ -5642,6 +5629,11 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     let _ = flags.set("opt_level", "speed");
     // The escape-TCB pin — see `new_jit_module`'s doc.
     let _ = flags.set("enable_probestack", "false");
+    // [`compile_verified`] runs Cranelift's verifier before and after Cranelift's passes on every
+    // compile (#2449). With debug assertions and under the fuzzers, Cranelift also runs it after
+    // each pass, which names the pass that broke the CLIF.
+    let per_pass = cfg!(any(debug_assertions, fuzzing));
+    let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
@@ -5683,11 +5675,7 @@ fn define_funcs(
                 let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
                 let Ok((i, mut ctx)) = job else { break };
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ctx.compile(isa, &mut Default::default())
-                        .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
-                    let code = ctx
-                        .take_compiled_code()
-                        .expect("a compiled function's code");
+                    let code = compile_verified(isa, &mut ctx)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -5738,6 +5726,137 @@ fn define_funcs(
         }
         Ok(())
     })
+}
+
+/// Compile `ctx`'s CLIF for `isa`, with Cranelift's verifier at the two points #2449 settled on:
+/// on the CLIF temen lowered, before Cranelift's passes rely on it being well formed, and on the CLIF
+/// those passes hand the backend. A lowering bug that makes malformed CLIF fails the compile there,
+/// and so does a pass that breaks it. With debug assertions and under the fuzzers, [`jit_isa`]'s
+/// `enable_verifier` also runs the verifier after each pass. No verifier sees the machine code the
+/// backend emits (#2481).
+fn compile_verified(
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
+    ctx: &mut cranelift_codegen::Context,
+) -> Result<CompiledCode, String> {
+    let mut ctrl = cranelift_codegen::control::ControlPlane::default();
+    ctx.verify(isa)
+        .map_err(|e| format!("CLIF verifier, on the lowered CLIF: {e}"))?;
+    ctx.optimize(isa, &mut ctrl)
+        .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
+    ctx.verify(isa)
+        .map_err(|e| format!("CLIF verifier, after Cranelift's passes: {e}"))?;
+    let code = isa
+        .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
+        .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
+    Ok(code.apply_params(&ctx.func.params))
+}
+
+/// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
+/// Every function the JIT defines outside [`define_funcs`] (the trampolines, and `fuel`'s refill
+/// trampoline) comes through here.
+fn define_verified(
+    module: &mut JITModule,
+    id: FuncId,
+    ctx: &mut cranelift_codegen::Context,
+) -> Result<CompiledCode, JitError> {
+    let code = compile_verified(module.isa(), ctx).map_err(JitError::Backend)?;
+    let relocs: Vec<ModuleReloc> = code
+        .buffer
+        .relocs()
+        .iter()
+        .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, id))
+        .collect();
+    module
+        .define_function_bytes(
+            id,
+            code.buffer.alignment as u64,
+            code.code_buffer(),
+            &relocs,
+        )
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    Ok(code)
+}
+
+#[cfg(test)]
+mod compile_verified_tests {
+    use super::*;
+
+    /// A function adding an `i32` to an `i64`, and returning the sum from an `i64` function.
+    fn malformed(isa: &dyn cranelift_codegen::isa::TargetIsa) -> Function {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+        let block = b.create_block();
+        b.switch_to_block(block);
+        b.seal_block(block);
+        let x = b.ins().iconst(I32, 1);
+        let y = b.ins().iconst(I64, 2);
+        let sum = b.ins().iadd(x, y);
+        b.ins().return_(&[sum]);
+        b.finalize();
+        func
+    }
+
+    #[test]
+    fn malformed_clif_fails_the_compile_before_cranelifts_passes() {
+        let isa = jit_isa().unwrap();
+        let mut ctx = cranelift_codegen::Context::for_function(malformed(&*isa));
+        let err = compile_verified(&*isa, &mut ctx).unwrap_err();
+        assert!(
+            err.starts_with("CLIF verifier, on the lowered CLIF"),
+            "{err}"
+        );
+    }
+
+    /// A loop summing `0..n`: block params, a branch and a back edge for Cranelift's passes.
+    fn summing(isa: &dyn cranelift_codegen::isa::TargetIsa) -> Function {
+        let mut sig = Signature::new(isa.default_call_conv());
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut func, &mut fctx);
+        let [entry, head, body, exit] = [(); 4].map(|_| b.create_block());
+        b.append_block_params_for_function_params(entry);
+        let (i, sum) = (
+            b.append_block_param(head, I64),
+            b.append_block_param(head, I64),
+        );
+        let total = b.append_block_param(exit, I64);
+        b.switch_to_block(entry);
+        let n = b.block_params(entry)[0];
+        let zero = b.ins().iconst(I64, 0);
+        b.ins()
+            .jump(head, &[BlockArg::Value(zero), BlockArg::Value(zero)]);
+        b.switch_to_block(head);
+        let done = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, i, n);
+        b.ins().brif(done, exit, &[BlockArg::Value(sum)], body, &[]);
+        b.switch_to_block(body);
+        let (sum, i) = (b.ins().iadd(sum, i), b.ins().iadd_imm(i, 1));
+        b.ins()
+            .jump(head, &[BlockArg::Value(i), BlockArg::Value(sum)]);
+        b.switch_to_block(exit);
+        b.ins().return_(&[total]);
+        b.seal_all_blocks();
+        b.finalize();
+        func
+    }
+
+    /// [`compile_verified`] repeats the steps of Cranelift's `Context::compile` with the verifier
+    /// around its passes, so a Cranelift whose compile gains a step fails here rather than
+    /// compiling without it.
+    #[test]
+    fn compile_verified_emits_what_cranelifts_compile_emits() {
+        let isa = jit_isa().unwrap();
+        let mut ours = cranelift_codegen::Context::for_function(summing(&*isa));
+        let code = compile_verified(&*isa, &mut ours).unwrap();
+        let mut theirs = cranelift_codegen::Context::for_function(summing(&*isa));
+        let want = theirs.compile(&*isa, &mut Default::default()).unwrap();
+        assert_eq!(code.code_buffer(), want.code_buffer());
+        assert_eq!(code.buffer.relocs().len(), want.buffer.relocs().len());
+    }
 }
 
 /// Declare every function (natural ABI, `f{i}` local linkage) up front so any call site can
@@ -5993,9 +6112,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
     let tramp = module
         .declare_function("child_trampoline", Linkage::Export, &ctx.func.signature)
         .map_err(|e| JitError::Backend(e.to_string()))?;
-    module
-        .define_function(tramp, &mut ctx)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
+    define_verified(&mut module, tramp, &mut ctx)?;
     module.clear_context(&mut ctx);
     // D66 — the same entry through the limit-taking variant, for a child-domain **task** (a detached
     // child resumed on a platform fiber by the executor, `child_exec`): its body passes the fiber's
@@ -6014,9 +6131,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
             &ctx.func.signature,
         )
         .map_err(|e| JitError::Backend(e.to_string()))?;
-    module
-        .define_function(tramp_limited, &mut ctx)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
+    define_verified(&mut module, tramp_limited, &mut ctx)?;
     module.clear_context(&mut ctx);
     // CALLS.md 5c.1a — a serve trampoline per impl-export handler (the `CompiledModule::compile`
     // serve_ids block, child twin), so the locked thunk's child serve arm can invoke a handler of
@@ -6040,9 +6155,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
                         &ctx.func.signature,
                     )
                     .map_err(|e| JitError::Backend(e.to_string()))?;
-                module
-                    .define_function(id, &mut ctx)
-                    .map_err(|e| JitError::Backend(e.to_string()))?;
+                define_verified(&mut module, id, &mut ctx)?;
                 module.clear_context(&mut ctx);
                 serve_ids.push((f, id));
             }
@@ -6056,9 +6169,7 @@ fn compile_child_windowed(c: &ChildCompile<'_>) -> Result<CompiledModule, JitErr
         let id = module
             .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
-        module
-            .define_function(id, &mut ctx)
-            .map_err(|e| JitError::Backend(e.to_string()))?;
+        define_verified(&mut module, id, &mut ctx)?;
         module.clear_context(&mut ctx);
         Some(id)
     } else {
