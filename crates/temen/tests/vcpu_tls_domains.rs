@@ -6,9 +6,6 @@
 //! Before, only the JIT numbered within the domain. The tree-walker seeded each vCPU with its
 //! run-wide task id, so a child's root started nonzero; the cooperative and debug drivers numbered
 //! threads across the run; and the parallel driver's count took in the child's spawn too.
-//!
-//! The `Vcpu` driver, the browser's per-Worker path, still numbers threads across the run: its
-//! threads hold no handle on their domain (#2236).
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;

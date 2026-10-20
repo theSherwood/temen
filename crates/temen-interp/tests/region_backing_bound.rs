@@ -1,6 +1,6 @@
 //! **Accesses past a caller-provided backing never reach host memory** (#1191, found by the #1151
-//! `nested_paged` differential). Every Region-backed vCPU path (`Vcpu::new_root_with_powerbox`, the
-//! browser's `Region::shared` reactor / tier-up / threads windows) asks for the 128 GiB
+//! `nested_paged` differential). Every Region-backed run (the pump over a caller's backing,
+//! `CoopRun::new_over`: the browser's `Region::shared` reactor / tier-up / threads windows) asks for the 128 GiB
 //! `DEFAULT_RESERVED_LOG2` reservation over a backing of the window's size — deliberately (#1153: a
 //! guest's high `vm_map` is admitted so the emitted tier's bounds check turns the first access into a
 //! decline). The confinement bound is the reservation plus the page map; the flat backings' word and
@@ -12,7 +12,9 @@
 //! (the oracle's engine-`mmap`ed window would too — the divergence is the tier's to decline).
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Region, Trap, Value};
+use temen_interp::bytecode::{CoopEvent, CoopRun};
+use temen_interp::{Host, Region, Trap, Value};
+use temen_ir::{Module, DEFAULT_RESERVED_LOG2};
 
 /// The declared window and the backing: both 128 KiB (`memory 17`) — no room to grow.
 const WIN_LOG2: u8 = 17;
@@ -52,12 +54,53 @@ block 0 (vas: i32, voff: i64, vlen: i64) {{
     )
 }
 
+fn module(op: u32) -> Module {
+    let m = temen_text::parse_module(&src(op)).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// Run `m`'s `func(as, off, len)` on the pump over `back`, a window reserving
+/// `DEFAULT_RESERVED_LOG2` (#1153). Returns the result and the window's reservation.
+fn run_over(
+    m: &Module,
+    func: u32,
+    off: u64,
+    len: u64,
+    back: Arc<Region>,
+) -> (Result<Vec<Value>, Trap>, u64) {
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let args = [
+        Value::I32(asl),
+        Value::I64(off as i64),
+        Value::I64(len as i64),
+    ];
+    let mut run = CoopRun::new_over(
+        m,
+        func,
+        &args,
+        50_000_000,
+        host,
+        None,
+        &[],
+        DEFAULT_RESERVED_LOG2,
+        back,
+    )
+    .expect("the bytecode engine runs it")
+    .expect("root");
+    let res = match run.run() {
+        CoopEvent::Done(v) => Ok(v),
+        CoopEvent::Trapped(t) => Err(t),
+        _ => panic!("unexpected event"),
+    };
+    let reserved = run.mem_map_info().expect("window").2;
+    (res, reserved)
+}
+
 /// A zeroed buffer twice the window, the `Region::shared` covering only the first half, and a canary
 /// right after the backing's end — the byte a host-memory escape would clobber.
 fn run(op: u32, func: u32, off: u64, len: u64) -> (Result<Vec<Value>, Trap>, u8) {
-    let m = temen_text::parse_module(&src(op)).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let layout = std::alloc::Layout::from_size_align(2 * WIN as usize, 8).unwrap();
     // SAFETY: non-zero layout; the buffer is owned here and freed after the vCPU is dropped.
     let base = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -67,27 +110,12 @@ fn run(op: u32, func: u32, off: u64, len: u64) -> (Result<Vec<Value>, Trap>, u8)
     unsafe { base.add(WIN as usize + 8).write(CANARY) };
     // SAFETY: `[base, base+WIN)` is valid, 8-aligned, exclusively this window's.
     let back = Arc::new(unsafe { Region::shared(base, WIN) });
-    let mut host = Host::new();
-    let asl = host.grant_memory();
-    let args = [
-        Value::I32(asl),
-        Value::I64(off as i64),
-        Value::I64(len as i64),
-    ];
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, func, &args, back, &[], host)
-        .expect("root vcpu");
-    let res = match vcpu.run() {
-        bytecode::VcpuEvent::Done(v) => Ok(v),
-        bytecode::VcpuEvent::Trapped(t) => Err(t),
-        _ => panic!("unexpected event"),
-    };
-    let reserved = vcpu.mem_map_info().expect("window").2;
+    let (res, reserved) = run_over(&module(op), func, off, len, back);
     assert!(
         reserved > WIN,
         "the reservation stays wider than the backing (#1153)"
     );
-    drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped.
+    // SAFETY: the run (and its `Mem` aliasing the region) is dropped.
     let canary = unsafe { base.add(WIN as usize + 8).read() };
     unsafe { std::alloc::dealloc(base, layout) };
     (res, canary)
@@ -148,26 +176,10 @@ fn protect_straddling_the_backing_end_never_reads_host_memory() {
 #[test]
 fn map_past_a_growable_backing_grows_it_and_the_access_lands() {
     let page = temen_interp::host_page_size();
-    let m = temen_text::parse_module(&src(0)).expect("parse");
-    temen_verify::verify_module(&m).expect("verify");
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
     let back = Arc::new(Region::growable(WIN, page).expect("growable backing"));
     assert_eq!(back.len(), WIN, "starts at the declared window");
-    let mut host = Host::new();
-    let asl = host.grant_memory();
     // func 1: map [WIN, WIN+page) RW, store a marker in the last word, load it back.
-    let args = [
-        Value::I32(asl),
-        Value::I64(WIN as i64),
-        Value::I64(page as i64),
-    ];
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 1, &args, back.clone(), &[], host)
-        .expect("root vcpu");
-    let res = match vcpu.run() {
-        bytecode::VcpuEvent::Done(v) => Ok(v),
-        bytecode::VcpuEvent::Trapped(t) => Err(t),
-        _ => panic!("unexpected event"),
-    };
+    let (res, reserved) = run_over(&module(0), 1, WIN, page, back.clone());
     assert_eq!(
         errno_of(&res),
         424242,
@@ -180,8 +192,7 @@ fn map_past_a_growable_backing_grows_it_and_the_access_lands() {
     );
     // The reservation still bounds growth: a map past `1 << DEFAULT_RESERVED_LOG2` is -EINVAL on
     // this window exactly as on a fixed one — growth extends the backing, never the mask domain.
-    let reserved = vcpu.mem_map_info().expect("window").2;
-    assert_eq!(reserved, 1u64 << temen_ir::DEFAULT_RESERVED_LOG2);
+    assert_eq!(reserved, 1u64 << DEFAULT_RESERVED_LOG2);
 }
 
 #[test]

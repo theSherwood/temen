@@ -918,7 +918,9 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
 > `outline_nested_cap_calls`, the `env.join`/`env.instantiate_rec`/`env.thread_*` bounces) and the
 > `Vcpu` lanes only it used (`with_jit_eligible`, `VcpuEvent::TierUp`, `bounce_call`,
 > `with_shared_fibers`) are deleted too: a function that spawns, joins or waits interprets on executor
-> 2 until #2443.
+> 2 until #2443. Since #1414 S4-5b-2 the resumable `Vcpu` API itself is deleted, with the native
+> tests that drove it; the slices below that name it are history. The pump (`CoopRun`) is the seam
+> they describe now.
 
 1. **[landed] Emitter core, proven natively first.** Compute ops + dispatcher control flow +
    masking + traps + fuel back-edges → wasm bytes; the whole differential gate works before any
@@ -1039,7 +1041,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    table, so the Spectre-safe table mask never moves — DESIGN.md §22). Authority still resolves
    through the powerbox before the invoke surfaces (a forged/cross-domain handle traps identically).
    Proofs: `crates/temen/tests/vcpu_jit_codegen.rs` (the external-result seam on the resumable `Vcpu`,
-   value + trap parity vs the interpreter), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
+   value + trap parity vs the interpreter; deleted with `Vcpu` — `jit_wasm_codegen.rs` pins the same
+   seam on the pump), `browser/jitcodegen.mjs` (single-vCPU FFI + emitted-unit
    path, interp vs codegen both 142 for i32 **and** f64), the Node twin `threads-spawn.mjs
    TEMEN_JIT_CODEGEN=1` (`TEMEN_JIT_SERVICE=1` for the f64 kernel) (8 Workers
    each `Jit.invoke` on emitted wasm → 1136, = interp, non-vacuity-counted), and the **Chromium**
@@ -1074,8 +1077,8 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    unit's wasm emitted and cached on the `JitUnit` at its first driver read (`Host::jit_unit_wasm_or_emit`,
    the one emit path for `compile`, `compile_linked`, thawed and forked units alike, #1346); a later
    `invoke` runs that guest-own unit's `f0(win, env, args…)` instead of a fixed setup unit. The mechanism is pinned by
-   `crates/temen/tests/jit_wasm_codegen.rs`: a resumable `Vcpu` guest `compile`s a unit at runtime then
-   `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
+   `crates/temen/tests/jit_wasm_codegen.rs`: a guest on the pump (`CoopRun`) `compile`s a unit at
+   runtime then `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
    (value + trap, i32/i64 sigs; the `emitted_ran` guard rejects a silent interp fallback). Zero cost
    when unset — every non-browser run leaves the emitter `None`.
    **[landed — the browser wiring, single-Worker *and* cross-Worker]** A `Jit` grant (+ validator +
@@ -1090,7 +1093,7 @@ subset" concept this tier generalizes: a unit outside the emitter's subset invok
    `HostCell::Shared` uses, DESIGN.md §22). Pinned natively by
    `bytecode_parallel_jit.rs::parallel_runtime_compile_invoke_is_sound` (8 worker vCPUs each
    runtime-compile their own unit on the shared host → schedule-independent 56 over 50 runs) +
-   `jit_wasm_codegen.rs` (owned- and shared-host runtime compile → emitted wasm ≡ interp). The
+   `jit_wasm_codegen.rs` (runtime compile on the pump → emitted wasm ≡ interp). The
    single-vCPU JS driver is `browser/jitcodegen_runtime.mjs`; the **multi-Worker Chromium twin landed**
    as the CI-gated `jitruntime` work item (`browser-test.mjs`): 8 worker vCPUs each runtime-compile
    their own unit through the shared powerbox and invoke it on per-Worker emitted wasm — interp ≡

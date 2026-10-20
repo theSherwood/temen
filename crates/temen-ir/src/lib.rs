@@ -2661,8 +2661,8 @@ pub enum Inst {
     /// core (the cooperative and the parallel driver) genuinely idles the resumer
     /// (`TaskState::BlockedOnFiber`, zero fuel), the wasm-JIT inherits that via its
     /// `DriveMode::InterpDriven` fold, and the Cranelift JIT parks the resumer's OS thread on
-    /// `Domain.futex_cv` via the `fiber_resume_block` thunk; only the single-vCPU bytecode
-    /// `Vcpu::run` takes the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
+    /// `Domain.futex_cv` via the `fiber_resume_block` thunk; the bytecode debug scheduler and a
+    /// nested interpretation take the advisory `FIBER_PARKED` downgrade. `block: false` never idles.
     /// Advisory only — no new semantics, invariant 9 preserved.
     ContResume {
         k: ValIdx,

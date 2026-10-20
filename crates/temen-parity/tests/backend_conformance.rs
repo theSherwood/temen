@@ -248,7 +248,7 @@ fn the_backend_column_matches_what_the_backends_actually_do() {
 
 /// #1573, pinned so it stays fixed: `join` (op 1) on a child handle that names no live child traps
 /// `ThreadFault` on every backend. It used to trap `CapFault` under Cranelift — the JIT's nesting
-/// runtime chose `CapFault` where the oracle's `take_child` answers `ThreadFault`. Pinned on its own
+/// runtime chose `CapFault` where the oracle's join rule answers `ThreadFault`. Pinned on its own
 /// so a regression names itself instead of just reddening the row's cell.
 #[test]
 fn join_traps_as_the_oracle_does() {

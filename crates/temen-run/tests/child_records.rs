@@ -249,10 +249,7 @@ fn left_per_child(engine: &str, run: impl Fn(u64)) -> usize {
 
 fn check(end: End) {
     let mut over = Vec::new();
-    for driver in [Driver::Oracle, Driver::Coop, Driver::Parallel, Driver::Vcpu] {
-        if matches!((driver, end), (Driver::Vcpu, End::Detach)) {
-            continue; // the resumable `Vcpu` has no `detach` (#2083)
-        }
+    for driver in [Driver::Oracle, Driver::Coop, Driver::Parallel] {
         let per = left_per_child(&format!("{driver:?} {end:?}"), |n| {
             on_driver(driver, n, end)
         });

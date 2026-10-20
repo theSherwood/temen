@@ -11640,17 +11640,6 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
         .ok_or(Trap::ThreadFault)
 }
 
-/// Join child `handle`: take its entry out of `children` and retire the slot, by the
-/// [`resolve_thread`] rule: a negative handle, or one whose masked slot is spent or was never issued,
-/// is `ThreadFault`. The join rule of a child table kept outside a scheduler's task list —
-/// [`bytecode::Vcpu`]'s — so it answers a join as the oracle does (#1728).
-pub(crate) fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
-    let slot = resolve_thread(children, handle)?;
-    Ok(children[slot]
-        .take()
-        .expect("resolve_thread checked liveness"))
-}
-
 /// #2359 — drop what a vCPU keeps for the child at join `slot` once no handle names the child and it
 /// has ended: its powerbox, its kill flag, its freeze doorbell and spawn, and a thaw's
 /// delivery of it (PROCESS.md §3: a domain's end drops its records). Every reader of these reaches
@@ -11667,29 +11656,6 @@ fn forget_child(
     child_kill.remove(&slot);
     child_freeze.remove(&slot);
     delivered_detached.retain(|&(s, _)| s != slot);
-}
-
-#[cfg(test)]
-mod take_child_tests {
-    //! #1728 — the join rule an embedder's child table gets from [`take_child`].
-    use super::*;
-
-    #[test]
-    fn a_join_takes_the_entry_once() {
-        let mut children = vec![Some('a'), Some('b')];
-        assert_eq!(take_child(&mut children, 1), Ok('b'));
-        assert_eq!(take_child(&mut children, 1), Err(Trap::ThreadFault));
-        assert_eq!(take_child(&mut children, 0), Ok('a'));
-    }
-
-    #[test]
-    fn a_negative_out_of_range_or_empty_handle_is_a_thread_fault() {
-        let mut children = vec![Some('a'), Some('b'), Some('c')];
-        for bad in [-1, i32::MIN, 3, 7] {
-            assert_eq!(take_child(&mut children, bad), Err(Trap::ThreadFault));
-        }
-        assert_eq!(take_child::<char>(&mut [], 0), Err(Trap::ThreadFault));
-    }
 }
 
 /// A computation paused under a `Jit.invoke` while the invoked unit runs inline ([`VCpu::below`]):
@@ -16596,7 +16562,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // The child runs `entry` in this module over the shared domain view (its `funcs`
                     // primary stays module 0, so the domain numbering is consistent; the unit is
                     // reached through the shared `dt` via `resolve_module`, exactly as the bytecode
-                    // engine's `VcpuEvent::Spawn { module }` starts the child in the unit's module).
+                    // engine starts the child in the unit's module).
                     let cmodule = frames[top].module;
                     let spv = get_i64(&frames[top].vals, *sp)?; // the thread's data-stack base
                     let av = get_i64(&frames[top].vals, *arg)?;
@@ -21978,7 +21944,7 @@ pub enum OffloadOutcome {
     /// every domain wherever the caller can park; it declines with `CapFault` before `submit` runs
     /// on the sync face and in a durable run (invariant 9: never hang), and after it where the
     /// caller cannot park (a reply that is not one `i64`). A driver its embedder pumps
-    /// ([`bytecode::Vcpu`], [`bytecode::CoopRun`], the debug run) hands control back while such a
+    /// ([`bytecode::CoopRun`], the debug run) hands control back while such a
     /// call waits, so a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
     /// exist) answers between pumps.
     Host(HostCompletion),
@@ -22001,8 +21967,7 @@ pub struct Completer {
 
 impl Completer {
     /// The call's completion id: what a driver that hands control back reports the call by
-    /// ([`bytecode::VcpuEvent::CapPending`], [`bytecode::CoopEvent::CapPark`]). Unique in the
-    /// process.
+    /// ([`bytecode::CoopEvent::CapPark`], [`bytecode::SchedStop::CapPark`]). Unique in the process.
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -25179,13 +25144,13 @@ impl Host {
     }
 
     /// Enable **blocking stdin** (a persistent interactive session — see [`Self::stdin_block`]). With it
-    /// on, a `read` on an exhausted stdin buffer parks the vCPU (surfacing [`VcpuEvent::StdinPark`]) so
-    /// the driver can push more input and resume, rather than returning EOF and letting the guest exit.
+    /// on, a `read` on an exhausted stdin buffer parks the reader until the driver pushes more input
+    /// ([`Self::push_stdin`]), rather than returning EOF and letting the guest exit.
     pub fn set_stdin_blocking(&mut self, on: bool) {
         self.stdin_block = on;
     }
 
-    /// Append bytes to the stdin buffer (a resumed [`VcpuEvent::StdinPark`] then reads them). The
+    /// Append bytes to the stdin buffer (a reader parked on it then reads them). The
     /// consumed prefix is not reclaimed — fine for the interactive session's modest per-query input.
     pub fn push_stdin(&mut self, bytes: &[u8]) {
         self.stdin.extend_from_slice(bytes);
@@ -29689,20 +29654,6 @@ impl Host {
     pub fn has_premap(&self) -> bool {
         self.premap.is_some() || !self.realias.is_empty()
     }
-    /// Take the staged op-17 pre-map — `(the region's backing, window offset)` — **instead of**
-    /// applying it, for a driver whose emitted tier cannot alias (#1527): the browser's op-13
-    /// servicer copies the region's bytes into the child's own `WebAssembly.Memory` at the offset
-    /// before the child starts and copies `[offset, offset + size)` back into the region when it
-    /// returns. A detached child runs to completion before its parent resumes (the handle is
-    /// delivered only after the run, and `join` reads the banked result), so with no interleaving
-    /// copy-in/copy-out is observationally identical to the alias. The child keeps the region
-    /// handle it was re-granted, exactly as after [`apply_premap`](Self::apply_premap).
-    pub fn take_premap(&mut self) -> Option<(RegionBacking, u64)> {
-        let (id, off) = self.premap.take()?;
-        let backing = self.region(id).cloned()?;
-        Some((backing, off))
-    }
-
     /// Spawn **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
     /// `mem` at the staged offset through [`region_map`](Self::region_map) — the child's own
     /// `SharedRegion.map` path. #2025 — and the §13 aliases a JIT thaw's window is restored with
@@ -30319,8 +30270,8 @@ impl Host {
 
     /// Resolve a `Jit.install`/`invoke` `(jit, code)` pair: authority (a forged handle is a
     /// `CapFault`) and the cross-table check (a code handle from another table is one too), to the
-    /// unit's funcs, its type section (#922) and its `(table, unit)`. What every engine installs or
-    /// invokes, and what a [`bytecode::Vcpu`]'s embedder delivers for a `JitInstall`.
+    /// unit's funcs, its type section (#922) and its `(table, unit)`: what every engine installs or
+    /// invokes.
     pub fn resolve_jit_unit(&self, jit: i32, code: i32) -> Result<ResolvedJitUnit, Trap> {
         let table = self.resolve_jit_domain(jit)?;
         let (t, u) = self.resolve_jit_code(code)?;

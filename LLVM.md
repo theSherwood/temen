@@ -1756,7 +1756,7 @@ backend **in wasm** (`browser/build-pg-assets.mjs`; the one-shot `temen_run_pg`)
 **live interactive session** — the first Run boots to `backend>`, every Run after feeds the editor's
 SQL to the *same* backend (~30–120 ms vs the ~9–13 s in-browser boot) and state persists across
 queries, psql-style. The enabler was a **blocking-stdin park** in the interpreter
-(`Host::set_stdin_blocking` → `Outcome::StdinPark`/`VcpuEvent::StdinPark`, `temen-interp`; session
+(`Host::set_stdin_blocking` → `Outcome::StdinPark`, `temen-interp`; session
 exports `temen_pg_open`/`temen_pg_query`/`temen_pg_close`, `browser/src/lib.rs` + `browser/web/play.js`).
 The session also **survives page reloads**: the live data dir serializes out through `temen-fs`'s shared
 in-memory mount (`mem_fs_seeded_shared` + `MemFsHandle::image` → the `temen_pg_snapshot` export →

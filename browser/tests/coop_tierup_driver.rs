@@ -1828,7 +1828,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
 /// `readonly` data segment. Keyed on rodata alone, `temen_coop_open` emitted it non-paged, the
 /// emitter's window-remapping gate module-gated it to emit-nothing, and the open **declined** —
 /// interpreter-only for a guest paged mode carries fine. Now the flip also keys on
-/// `module_uses_unmap_protect`: the guest opens paged, the leaf tiers up, and the access after the
+/// `module_uses_addr_space_page_ops`: the guest opens paged, the leaf tiers up, and the access after the
 /// page op matches the oracle (an Ro load succeeds; an Ro store, and a store to a page the guest
 /// unmapped, trap) through the per-event `sync_pagestate` refresh.
 #[test]
@@ -2174,8 +2174,8 @@ const MID_GROW_PROBE: i64 = 81920 + 8;
 /// cap-calling helper `f1` — interpreter-resident, so the edge **bounces** via `env.call_interp` (the
 /// callback grows `[80 KiB, 96 KiB)` and streams); (2) stores into that just-grown page (correct only
 /// if the post-bounce `"mapped"` fan-out admits the growth); (3) `call.dyn`s slot 2 → the pure leaf
-/// `f2` — emitted, **native**. The bounce runs through the invoke-confined fiber registry (`Vcpu`
-/// parity), and must match the interpreted oracle bit-for-bit.
+/// `f2` — emitted, **native**. The bounce runs through the invoke-confined fiber registry, and must
+/// match the interpreted oracle bit-for-bit.
 fn coop_invoke_bounce_guest_text() -> String {
     let (out_h, mem_h) = onramp_out_mem_handles();
     let unit_src = format!(

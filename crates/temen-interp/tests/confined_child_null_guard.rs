@@ -1,8 +1,7 @@
 //! **#1206 — a child's window carries the NULL guard, on every engine.** The guard
 //! (`[0, POWERBOX_NULL_GUARD)` unmapped, #964/#1094) is "unconditional — every module reserves it",
-//! and every root `Mem` constructor seeded it; the confined-child constructors (`nested_view`, the
-//! in-engine cooperative/parallel arms' chokepoint, and the resumable `Vcpu`'s child constructors,
-//! the host-orchestrated / browser path) did not — so a child in a carve of 16 KiB or more could store
+//! and every root `Mem` constructor seeded it; the confined-child constructors (`nested_view` and
+//! the in-engine cooperative/parallel arms' chokepoint) did not — so a child in a carve of 16 KiB or more could store
 //! at NULL on the interpreter where the emitted tier's guard compare (and any cross-tier bounce over
 //! the same carve) traps. Now every child is guarded like a root; #1867 moves the child here to its
 //! own detached window, the one placement once the carve is gone.

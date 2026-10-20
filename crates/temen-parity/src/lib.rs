@@ -198,8 +198,7 @@ fn parity_capcall(type_id: u32, op: u32) -> [Cell; 4] {
         // poll (9) / detach (10) / kill (12) / child_offer (14) / instantiate_rec (17) / grant
         // (19): native on both interpreters (`Op::InstantiateRec`/`InstJoin`/`ChildCtl`/
         // `ChildOffer`) and on Cranelift
-        // (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp. (The bytecode
-        // engine's resumable `Vcpu`, whose host runs the children, traps when 9/10/12/19 run: #2083.)
+        // (`instantiator_rt`). The wasm-JIT leaf-folds the call.cap to the interp.
         (capcall::INSTANTIATOR, o)
             if temen_ir::served_contract(capcall::INSTANTIATOR, o).is_some() =>
         {

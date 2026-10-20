@@ -10,12 +10,15 @@ once it closes.
 > modes live natively and across real Web Workers (spawn/join + futex + atomics, §22 JIT, §14
 > children, shared-`Host` I/O, the playground). Since #1414 B6-4a the browser's parallel mode is
 > executor 2, the native parallel driver, with each thread on a Worker; the per-Worker `Vcpu` driver
-> this plan built (`temen_par_run` and its Node twin `threads-spawn.mjs`) is deleted, and the entries
-> below record it as history. Threads-touching work since then lives in its owning docs:
+> this plan built (`temen_par_run` and its Node twin `threads-spawn.mjs`) is deleted, and since #1414
+> S4-5b-2 so is the resumable `Vcpu` API itself, with the tests that drove it. The entries below record
+> them as history; the pump (`CoopRun`) and executor 2 carry what they proved, pinned across every
+> driver by `crates/temen-interp/tests/support/drivers.rs`. Threads-touching work since then lives in
+> its owning docs:
 > **wasm-JIT tier-up** of a parallel run's threads, each on its own Worker (the Chromium `#x2`
 > item — plus §22 units and §14 children on emitted wasm) in `BROWSER.md`;
-> `VcpuEvent::StdinPark` (exhausted interactive stdin parks a resumable vCPU instead of spinning)
-> in `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
+> blocking stdin (an exhausted interactive stdin parks the reader instead of spinning) in
+> `BOOTSPEED.md`; the native-side futex extensions (canonical-key `FutexKey::{Anon,Region}`,
 > the cross-domain futex for async §14 children) in `PROCESS.md`.
 
 ---
@@ -458,16 +461,11 @@ cargo test -p temen-mem shared                          # Region::Shared cross-t
 cargo test -p temen --test bytecode_shared_window       # engine over a caller-owned shared window
 cargo test -p temen --test bytecode_parallel            # 4c: native parallel driver vs oracle
 cargo test -p temen --test bytecode_parallel_caps       # 4c-host: shared-powerbox call.cap vs oracle
-cargo test -p temen --test bytecode_vcpu_orchestration  # 4c-wasm: resumable Vcpu API, host-orchestrated
 cargo test -p temen --test bytecode_parallel_jit            # 4c-domain B: §22 JIT in the parallel driver vs oracle
-cargo test -p temen --test bytecode_vcpu_orchestration_jit  # 4c-domain C1: §22 JIT via resumable Vcpu vs oracle
 cargo test -p temen --test bytecode_parallel_instantiate    # 4c-domain: a child's trap ends only its domain, cooperative + parallel
 cargo +nightly miri test -p temen-interp --test parallel_miri       # 4c: parallel driver + shared host race-free
 cargo +nightly miri test -p temen-interp --test parallel_jit_miri   # 4c-domain B: §22 JIT shared-Domain race-free
 cargo +nightly miri test -p temen-interp --test parallel_instantiate_miri  # 4c-domain: detached children race-free
-cargo +nightly miri test -p temen-interp --test vcpu_instantiate_miri      # 4c-domain §14-D2: detached children + pre-mapped regions race-free
-cargo test -p temen --test bytecode_vcpu_orchestration_caps         # 4d: shared-powerbox call.cap via resumable Vcpu vs oracle
-cargo +nightly miri test -p temen-interp --test vcpu_shared_host_miri      # 4d: shared Mutex<Host> call.cap race-free
 
 # Step 1-futex / 4c-wasm — the cross-Worker blocking futex (`browser/threads-spike/threads-futex.mjs`)
 # was retired with the spike above; its result is recorded above and the code remains in git history.

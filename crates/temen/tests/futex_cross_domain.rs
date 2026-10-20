@@ -7,8 +7,7 @@
 //! as a **library** over shared memory + futex (PROCESS.md §4 "library first") instead of new runtime
 //! rendezvous machinery.
 //!
-//! Pinned on every driver that schedules a child itself (`drivers::SCHEDULING`): the `Vcpu` harness
-//! runs a child to completion when it is spawned and orchestrates no `wait`.
+//! Pinned on every driver (`drivers::ALL`).
 
 #[path = "../../temen-interp/tests/support/drivers.rs"]
 mod drivers;
@@ -119,8 +118,7 @@ block 2 () {
 }
 ";
     // status 0 (woken) * 100 + child result 7 — any other status means the keys diverged.
-    drivers::agree_on(
-        &drivers::SCHEDULING,
+    drivers::agree_on_every_driver(
         "the parent is woken by the child's notify of the same region byte",
         &m,
         &setup(child),
@@ -164,7 +162,7 @@ block 0 (v0: i64) {
   }
 }
 ";
-    for driver in drivers::SCHEDULING {
+    for driver in drivers::ALL {
         let r = drivers::run_on(driver, &m, &setup(child))
             .unwrap_or_else(|| panic!("{driver:?} declined the module"))
             .result;

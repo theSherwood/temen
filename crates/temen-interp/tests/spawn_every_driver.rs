@@ -1,21 +1,20 @@
 //! **#1855 — a spawn answers the same on every driver.** The §14 spawns had one admission per
-//! driver, and three of them still refused what the cooperative driver serves: a budget-funded or
-//! grant-carrying op-17 spawn trapped `Malformed` on the parallel driver and the debug scheduler (the
-//! grant list on `Vcpu` too). The §5 detached spawn had a second admission on `Vcpu`, whose host
-//! built the child's powerbox and seeded its window (#1414). The carve forms this file pinned beside
-//! them (ops 0, 5 and 13 and the carve record) are retired, and so is op 15's positional spawn: every
-//! driver refuses them, which `crates/temen/tests/carve_spawn_refused.rs` and `self_spawn_refused.rs`
-//! pin (#1867, #2067). Every spawn here is a spawn record (op 17).
+//! driver, and two of them still refused what the cooperative driver serves: a budget-funded or
+//! grant-carrying op-17 spawn trapped `Malformed` on the parallel driver and the debug scheduler.
+//! The carve forms this file pinned beside them (ops 0, 5 and 13 and the carve record) are retired,
+//! and so is op 15's positional spawn: every driver refuses them, which
+//! `crates/temen/tests/carve_spawn_refused.rs` and `self_spawn_refused.rs` pin (#1867, #2067). Every
+//! spawn here is a spawn record (op 17).
 //!
-//! Each case runs on the oracle, the cooperative executor, the parallel driver, the debug scheduler
-//! and an orchestrated `Vcpu`, and every one must give the oracle's result and stream bytes.
+//! Each case runs on the oracle, the cooperative executor, the parallel driver and the debug
+//! scheduler, and every one must give the oracle's result and stream bytes.
 
 #[path = "support/drivers.rs"]
 mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use drivers::{agree_on, agree_on_every_driver, run_on, run_on_then, Driver, Ran, SCHEDULING};
+use drivers::{agree_on, agree_on_every_driver, run_on_then, Driver, Ran, ALL};
 use temen_interp::{cap_id, Attestation, Host, StreamRole, Trap, Value};
 use temen_ir::{Module, SpawnRec};
 use temen_text::parse_module;
@@ -239,11 +238,16 @@ block 2 () {
 
 /// [`detached`] ending in `tail` instead of [`JOIN_OR_ERRNO`].
 fn detached_then(grant: bool, tail: &str) -> String {
+    detached_with(grant, (20480, 8), tail)
+}
+
+/// [`detached_then`] whose record names `args` as the child's payload, `(0, 0)` for none.
+fn detached_with(grant: bool, args: (u64, u64), tail: &str) -> String {
     let rec = SpawnRec {
         size_log2: 15,
         grants_ptr: 16384,
         grants_n: u64::from(grant),
-        args: (20480, 8),
+        args,
         ..SpawnRec::default()
     };
     format!(
@@ -365,8 +369,21 @@ fn a_detached_child_starts_with_its_data_and_payload() {
     );
 }
 
+/// A record naming no payload seeds none: the child's args word reads 0.
+#[test]
+fn a_detached_child_without_a_payload_reads_zero_args() {
+    let m = module(&detached_with(false, (0, 0), JOIN_OR_ERRNO));
+    let child = module(CHILD_READS);
+    agree_on_every_driver(
+        "a detached spawn, data, no payload",
+        &m,
+        &detached_setup(&child, 1 << 20),
+        &ok(i64::from_le_bytes(*b"ABCDEFGH")),
+    );
+}
+
 /// A detached child attests its spawner's isolation tier, with a window no ancestor reads (PROCESS.md
-/// §5). `Vcpu`'s host used to build the child's powerbox and gave it the default report, tier 1.
+/// §5).
 #[test]
 fn a_detached_child_attests_its_spawners_tier() {
     let m = module(&detached(false));
@@ -384,8 +401,7 @@ fn a_detached_child_attests_its_spawners_tier() {
     agree_on_every_driver("a detached spawn, a tier-0 spawner", &m, &setup, &ok(0));
 }
 
-/// An unbound required import refuses the spawn `-EINVAL` (IMPORTS.md §3.3 withhold). `Vcpu`'s host
-/// used to bind the manifest when it built the child and trapped `Malformed`.
+/// An unbound required import refuses the spawn `-EINVAL` (IMPORTS.md §3.3 withhold).
 #[test]
 fn a_detached_child_whose_import_is_unbound_is_refused() {
     let m = module(&detached(false));
@@ -421,8 +437,7 @@ fn a_detached_child_gets_the_caps_granted_it_by_name() {
 }
 
 /// A `ro` data segment is read-only in the child's fresh window: the child's write faults, and its
-/// parent's join answers `MEMORY_FAULT`. `Vcpu`'s hosts used to seed the window themselves,
-/// writably.
+/// parent's join answers `MEMORY_FAULT`.
 #[test]
 fn a_detached_childs_read_only_data_stays_read_only() {
     let m = module(&detached_then(false, JOIN_BOTH));
@@ -654,8 +669,7 @@ fn join(dst: &str, h: &str) -> String {
 
 /// Run `joins` after three detached spawns on every driver. A join's handle is resolved by the
 /// oracle's rule (`resolve_thread`): negative traps, any other is masked to the table's power-of-two
-/// span, and a spent or never-issued slot traps. The `Vcpu`'s hosts each kept their own table and
-/// rule until the engine took it over: the test orchestrator waited forever on a re-join.
+/// span, and a spent or never-issued slot traps.
 fn joins_agree(what: &str, joins: &str, want: &Ran) {
     handles_agree(&drivers::ALL, what, joins, want);
 }
@@ -726,15 +740,14 @@ fn a_handle_masks_onto_the_table() {
 }
 
 /// The drivers that answer `child_offer` (op 14): the debug scheduler declines it.
-const OFFERING: [Driver; 4] = [Driver::Oracle, Driver::Coop, Driver::Parallel, Driver::Vcpu];
+const OFFERING: [Driver; 3] = [Driver::Oracle, Driver::Coop, Driver::Parallel];
 
 /// #2378 — every child op resolves a handle by the join's rule, so a spent or forged one gets one
 /// answer on every driver: the oracle's. `join`, `poll`, `detach` and `kill` trap `ThreadFault`;
 /// `child_offer` and `grant` answer `-EINVAL`, the value they give a child they cannot reach. The
 /// handles: child 0 spent by a join, child 0 spent by a detach, a negative one, and 3, past the
-/// table (the span is 4, and slot 3 was never issued). The `Vcpu` has no surface for ops 9, 10, 12
-/// and 19 yet (#2083), so those run on the drivers that schedule their children, and the debug
-/// scheduler declines op 14 ([`OFFERING`]).
+/// table (the span is 4, and slot 3 was never issued). The debug scheduler declines op 14
+/// ([`OFFERING`]).
 #[test]
 fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     let spend = [
@@ -751,23 +764,23 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
     // An op answering an `i32` leaves it in `vo`, widened into `vr`.
     let widen = |call: &str| format!("{call}  vr = i64.extend_i32_s vo\n");
     let ops: [(&str, String, &[Driver], &Ran); 6] = [
-        ("join", join("vr", "vbad"), &drivers::ALL, &faults),
+        ("join", join("vr", "vbad"), &ALL, &faults),
         (
             "poll",
             widen("  vo = call.cap 6 9 (i32) -> (i32) vinst (vbad)\n"),
-            &SCHEDULING,
+            &ALL,
             &faults,
         ),
         (
             "detach",
             widen("  vo = call.cap 6 10 (i32) -> (i32) vinst (vbad)\n"),
-            &SCHEDULING,
+            &ALL,
             &faults,
         ),
         (
             "kill",
             widen("  vo = call.cap 6 12 (i32) -> (i32) vinst (vbad)\n"),
-            &SCHEDULING,
+            &ALL,
             &faults,
         ),
         (
@@ -781,20 +794,14 @@ fn a_spent_or_forged_handle_gets_the_oracles_answer_from_every_child_op() {
             widen(
                 "  vgh = i64.extend_i32_s vout\n  vo = call.cap 6 19 (i32, i64) -> (i32) vinst (vbad, vgh)\n",
             ),
-            &SCHEDULING,
+            &ALL,
             &einval,
         ),
     ];
     for (handle, prelude) in &spend {
         for (op, call, drivers, want) in &ops {
-            // Spending a handle by `detach` is itself an op the `Vcpu` has no surface for.
-            let drivers: Vec<Driver> = drivers
-                .iter()
-                .copied()
-                .filter(|d| *handle != "detached" || !matches!(d, Driver::Vcpu))
-                .collect();
             handles_agree(
-                &drivers,
+                drivers,
                 &format!("{op} on a {handle} handle"),
                 &format!("{prelude}{call}"),
                 want,
@@ -813,7 +820,7 @@ fn a_masked_handle_detaches_the_child_it_names() {
         join("vr", "vh1")
     );
     handles_agree(
-        &SCHEDULING,
+        &ALL,
         "detach(5), then join child 1",
         &ops,
         &trapped(Trap::ThreadFault),
@@ -1358,11 +1365,8 @@ const DETACH_JOIN: &str = "\
 /// - `poll` on a child that returned answers 1, and leaves it for its `join`;
 /// - `detach` spends the handle, so a `join` after it is a `ThreadFault`;
 /// - a kill of a child that has ended does nothing: its `join` still gets its value.
-///
-/// The `Vcpu`'s host runs its children and has no surface to answer these yet (#2083), so each
-/// one traps `ThreadFault` there when it runs.
 #[test]
-fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
+fn poll_detach_and_kill_answer_on_every_driver() {
     use temen_ir::trap_code;
     let spins = module(CHILD_SPINS);
     let loops = module(CHILD_LOOPS);
@@ -1401,12 +1405,7 @@ fn poll_detach_and_kill_answer_on_every_scheduling_driver() {
     for (what, tail, child, fuel, want) in cases {
         let m = module(&detached_then(false, &tail));
         let setup = detached_fuel_setup(child, fuel);
-        agree_on(&SCHEDULING, what, &m, &setup, &want);
-        assert_eq!(
-            run_on(Driver::Vcpu, &m, &setup),
-            Some(trapped(Trap::ThreadFault)),
-            "{what}: the Vcpu fails closed"
-        );
+        agree_on_every_driver(what, &m, &setup, &want);
     }
 }
 
@@ -1427,8 +1426,8 @@ block 2 (rv: i64) {
 }
 ";
 
-/// #2083 — a module that contains `kill` but never runs it runs on every driver, the `Vcpu`
-/// included: every JACL program links `unir_kill`, and the browser's Worker driver is a `Vcpu`.
+/// #2083 — a module that contains `kill` but never runs it runs on every driver: every JACL program
+/// links `unir_kill`.
 #[test]
 fn a_kill_that_never_runs_does_not_stop_a_module_on_any_driver() {
     let loops = module(CHILD_LOOPS);
@@ -1470,15 +1469,13 @@ fn budget_held(h: &Host) -> (i64, i64) {
 
 /// #2006 — a detached child still live when its run ends ends with it, as the oracle's teardown reaps
 /// it: its window and first vCPU go back to the budget that paid for them. The parent returns without
-/// joining a child parked on a timed wait; once the run is over, the budget holds nothing. (The
-/// `Vcpu`'s host runs its children, and the engine hands a child's charge back only at its join:
-/// #2119.)
+/// joining a child parked on a timed wait; once the run is over, the budget holds nothing.
 #[test]
 fn a_child_live_at_the_runs_end_hands_its_window_back() {
     let m = module(&detached_then(false, NO_JOIN));
     let child = module(CHILD_WAITS);
     let setup = detached_setup(&child, 1 << 15);
-    for d in SCHEDULING {
+    for d in ALL {
         let (ran, held) = run_on_then(d, &m, &setup, &budget_held).expect("runs");
         assert_eq!(ran, ok(0), "{d:?}");
         assert_eq!(held, (0, 0), "{d:?}: the run's end left the child charged");
@@ -1488,8 +1485,7 @@ fn a_child_live_at_the_runs_end_hands_its_window_back() {
 /// #2196: the root maps 64 KiB past its declared 64 KiB window, stores 77 there and loads it back,
 /// then spawns a thread that loads the same word and joins it. Returns `own * 1000 + thread`, plus a
 /// million if the `map` failed. The parallel driver ran over a backing the size of the declared
-/// window, so the store was dropped and both loads read 0. The `Vcpu`'s host builds a thread's window
-/// from its own page map, so the thread faults there: #2196's other half, B6 of #1414.
+/// window, so the store was dropped and both loads read 0.
 const MAP_PAST_THE_WINDOW: &str = "memory 16
 func (i32) -> (i64) {
 block 0 (vas: i32) {
@@ -1530,13 +1526,7 @@ fn a_thread_reads_a_page_its_spawner_mapped_past_the_declared_window() {
         let asl = host.grant_memory();
         (host, vec![Value::I32(asl)])
     };
-    agree_on(
-        &SCHEDULING,
-        "a page mapped past the window",
-        &m,
-        &setup,
-        &ok(77_077),
-    );
+    agree_on_every_driver("a page mapped past the window", &m, &setup, &ok(77_077));
 }
 
 // ---- #2219 empty grants: a parent leaves an import empty on purpose ----
@@ -1756,7 +1746,7 @@ const LIVE_CALLER: &str = include_str!("fixtures/live_caller.temt");
 
 /// #744 — a live call to a serving child parks the caller until the child serves it, on every
 /// driver that serves its children: the oracle, the pump, and the parallel driver, whose root and
-/// child run on their own threads. (The debug scheduler and `Vcpu` decline the module.)
+/// child run on their own threads. (The debug scheduler declines the module.)
 #[test]
 fn a_live_call_to_a_serving_child_parks_until_the_child_serves_it() {
     // Without its newline: a Windows checkout ends the fixture's lines with `\r\n`.

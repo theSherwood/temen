@@ -15,7 +15,7 @@ mod drivers;
 #[path = "support/rec.rs"]
 mod rec;
 
-use drivers::{agree_on, agree_on_every_driver, Ran, SCHEDULING};
+use drivers::{agree_on_every_driver, Ran};
 use temen_interp::{Host, Value};
 use temen_ir::{Module, SpawnRec};
 
@@ -179,11 +179,11 @@ block 0 (v0: i64) {{
 }
 
 /// #2189 — a region word that a parent and its child both map is one futex word: the parent's
-/// notify wakes the child's wait on every scheduling driver (woken once, the child's wait `0`).
+/// notify wakes the child's wait on every driver (woken once, the child's wait `0`).
 /// The parallel driver kept a futex table per domain, keyed on the raw address, so the notify
 /// found no waiter and the child timed out.
 #[test]
-fn a_notify_on_a_region_word_wakes_the_childs_wait_on_every_scheduling_driver() {
+fn a_notify_on_a_region_word_wakes_the_childs_wait_on_every_driver() {
     let m: Module = temen_text::parse_module(&shared_futex_src()).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let setup = || {
@@ -199,5 +199,5 @@ fn a_notify_on_a_region_word_wakes_the_childs_wait_on_every_scheduling_driver() 
         stdout: Vec::new(),
         stderr: Vec::new(),
     };
-    agree_on(&SCHEDULING, "a shared region futex", &m, &setup, &want);
+    agree_on_every_driver("a shared region futex", &m, &setup, &want);
 }

@@ -455,7 +455,7 @@ already running); the ~20% that gates everything is **`fork` + R8**.
 > **Retired:** the spawn ops this plan brings to bytecode parity (0, 5, 11, 13) are carve spawns.
 > Every engine now traps them `CapFault` (INVARIANTS #13; #1867), so the text below is history, and
 > the tests and ops it names are deleted. The detached spawn, the op-17 record, runs on the
-> bytecode engine (`VcpuEvent::InstantiateDetached`; DETACHED_JIT.md §1).
+> bytecode engine (DETACHED_JIT.md §1).
 
 Running bash *in the playground* is **not** just "native bash + compile for wasm": the playground is
 **bytecode-only** (the tree-walker uses OS threads + a wall clock, and the wasm-JIT tier is a
