@@ -322,6 +322,38 @@ fn a_task_tiers_up_once_per_call() {
     }
 }
 
+/// #2474 — a call through the dispatch table (`call.dyn`) to an eligible function tiers up as a
+/// direct call does, with the same result.
+#[test]
+fn an_indirect_call_tiers_up() {
+    let m = parse_module(
+        "memory 16
+func () -> (i64) {
+block 0 () {
+  vf = ref.func 1
+  vx = i64.const 5
+  vr = call.dyn (i64) -> (i64) vf (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  v3 = i64.const 3
+  vr = i64.mul vx v3
+  return vr
+  }
+}
+",
+    )
+    .unwrap();
+    temen_verify::verify_module(&m).expect("verify");
+    let want = oracle(&m);
+    assert_eq!(want, Ok(vec![Value::I64(15)]));
+    let (got, tierups) = coop_tierup_run(&m, std::sync::Arc::from(vec![false, true]), Host::new());
+    assert_eq!(got, want, "the tier-up run diverged from the oracle");
+    assert_eq!(tierups, [1], "the indirect call to function 1");
+}
+
 // A tier-up leaf whose emitted region **bounces** back to an interp-resident callee: func 1 (`L`, the
 // eligible leaf) is `L(x) = C(x)`, and func 2 (`C`) is `C(x) = 3x + 7`. The host services the `TierUp`
 // by calling `CoopRun::bounce` — emulating the emitted `f1` reaching `call_interp` for func 2 — then

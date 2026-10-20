@@ -86,7 +86,7 @@ const exCounted = Object.fromEntries(
 
 // The guest calls its leaf once: tier up every eligible call at its start (#2474), so the leaf runs
 // emitted, and say so rather than inheriting the default.
-ex.temen_coop_set_hotness(0, 0, 0);
+ex.temen_coop_set_hotness(0, 0);
 
 // The window's final size has to be read while the session is still open, so sample it at the last
 // bounce (the run closes its session before `runJitModule` returns).

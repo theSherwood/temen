@@ -221,7 +221,7 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter, selfRootSrc,
   const run = makeRunner(eng);
   // The children's entries are short: the emitted runs' engines tier up every eligible call at its
   // start (#2474), as coop's own tests do.
-  if (emitted) ex.temen_coop_set_hotness(0, 0, 0);
+  if (emitted) ex.temen_coop_set_hotness(0, 0);
   try {
     const { value, started, tierups, childMems } = await run(root, src.plain ? {}
       : { inst: true, unit: child, minter: src.minter, winSize: src.winSize, tierup: emitted });

@@ -81,9 +81,8 @@ async function main() {
     return run(await fetchBytes(guestPath), o);
   };
   // The emitted tier: each thread runs its task's regions on its Worker. The guests' calls are
-  // short, so these runs' engines tier up every eligible call at its start (#2474), as coop's own
-  // tests do.
-  const emit = { tierup: true, hotness: [0, 0, 0] };
+  // short, so these runs' engines tier up every eligible call (#2474), as coop's own tests do.
+  const emit = { tierup: true, hotness: [0, 0] };
 
   // --- 2) one guest's threads across real Web Workers (executor 2, #1414 B6) ----------------------
   // The run is one in-Rust call on the root's Worker, and each of its threads a Worker the page

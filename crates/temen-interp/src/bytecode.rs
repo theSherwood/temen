@@ -10161,8 +10161,8 @@ enum Outcome {
     /// must supply the page. The cursor sits AT the faulting op, which re-executes once the page is
     /// in place. Only a child the driver pages raises it ([`Host::pager`]).
     PageFault(u64),
-    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a direct `Call` to an eligible
-    /// function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
+    /// **wasm-JIT tier-up** (browser wasm-JIT threads slice): a call, direct or `call.dyn`, to an
+    /// eligible function of program `module` ([`Vm::jit_module`]), or a task's eligible entry
     /// ([`Vm::jit_entry`]). The host runs the emitted `f{func}` region and delivers its `n_results`
     /// results to `dst`: the caller frame's slots, or the task's end. `argv` is the marshalled
     /// arguments (raw i64 slots). `mapped` is the window's scalar committed extent
@@ -13146,7 +13146,7 @@ fn drive(
 }
 
 /// A pause point of [`CoopSched::pump`]: either the run finished (`Done`) or a task hit an eligible
-/// direct `Call` of its program and the emitted region must run on the host (`TierUp`) before the
+/// call of its program and the emitted region must run on the host (`TierUp`) before the
 /// paused task is resumed via [`CoopSched::deliver_tierup`]. `pump` returns `Err(trap)` for a
 /// run-fatal trap (the root task trapped, or a driver operation failed) — mirroring the `Result`
 /// `drive` returns.
@@ -13361,7 +13361,7 @@ struct SchedCore {
 #[derive(Default)]
 struct EmitTier {
     /// #926 slice 2, #2248: what each program's tasks tier up into. A task running a program with
-    /// an emit carries it in its `Vm`, so a direct `Call` in that program to an eligible function
+    /// an emit carries it in its `Vm`, so a call in that program to an eligible function
     /// surfaces as [`CoopStep::TierUp`] instead of interpreting the callee — the host runs the
     /// emitted `f{func}` and delivers the results back.
     programs: ProgramEmits,
@@ -13918,7 +13918,7 @@ impl CoopSched {
     /// Build the initial scheduler state: the run's [`SchedCore`] (`drive`'s former preamble
     /// verbatim, so its behaviour is unchanged) and the emitted tier's. `tierup` is the run's #926
     /// slice 2 config: `None` (the native `drive`) leaves everything interpreting; a config makes
-    /// each task's direct calls to the functions its program's emit makes eligible surface as
+    /// each task's calls to the functions its program's emit makes eligible surface as
     /// tier-ups.
     fn new(
         dom: &Domain,
@@ -14572,8 +14572,8 @@ impl SchedCore {
             Err(trap) => complete(tasks, ti, Err(trap)),
             Ok(VcpuStop::Preempted) => {}
             Ok(VcpuStop::Done(vals)) => complete(tasks, ti, Ok(vals)),
-            // #926 slice 2 — wasm-JIT tier-up: this task hit a direct call to an eligible function
-            // of `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
+            // #926 slice 2 — wasm-JIT tier-up: this task hit a call to an eligible function of
+            // `module`, the program its `Vm` carries an emit for (#2248). `step_vcpu` has
             // already spilled the frame past the call, so the task is resumable with just the
             // result slots filled. Stash the delivery target — `(task, dst, result types)` — and
             // surface the region to the driver; `deliver_tierup` writes the emitted results back
@@ -15525,7 +15525,7 @@ impl SchedCore {
 }
 
 /// #926 slice 2 tier-up configuration for a cooperative run — a `None` config is "no tier-up",
-/// exactly the native `drive`. A task tiers up the direct calls of the program it runs that the
+/// exactly the native `drive`. A task tiers up the calls of the program it runs that the
 /// program's emit makes eligible: the run's own program's, and a granted module's that a child runs
 /// (#2248).
 pub struct TierUpConfig {
@@ -15544,26 +15544,23 @@ pub struct TierUpConfig {
 /// What the host emitted of a program for its tasks to tier up into (#926 slice 2).
 #[derive(Clone, Default)]
 pub struct ProgramEmit {
-    /// Per-function eligibility (index = function). `true` ⇒ a direct call may tier up, once
-    /// [`Self::hot`] says it is worth the crossing.
+    /// Per-function eligibility (index = function). `true` ⇒ a call may tier up, direct or through
+    /// the dispatch table (`call.dyn`), while [`Self::hot`] says it is worth the crossing.
     pub eligible: std::sync::Arc<[bool]>,
     /// #750 paged tier-up: the emitted region carries a per-access page check, so an
     /// unrepresentable window surfaces with the reserved size instead of declining.
     pub page_checked: bool,
-    /// #2474 — when an eligible function's calls start to tier up.
+    /// #2474 — when an eligible function's calls tier up.
     pub hot: Hotness,
-    /// #2474 — the functions whose calls tier up before any of them is seen, where [`Self::hot`]
-    /// weighs calls (`per_call` > 0): the rest start interpreted. Index = function; empty = none.
-    pub start_hot: std::sync::Arc<[bool]>,
 }
 
-/// #2474 — when a task's calls to an eligible function tier up: once its calls have done `per_call`
-/// work on average over `window` calls in a row, and until they average less. A crossing into
-/// emitted code costs a fixed amount, which only a call doing enough work repays. Work is the fuel a
-/// call burns, its taken back edges and calls, its callees' included: an interpreted call's from
-/// [`Vm::work`], an emitted call's as its host reports it ([`Vm::emitted_returned`]), the same
-/// safepoints (INVARIANTS #9). A function starts tiering up or not as [`ProgramEmit::start_hot`]
-/// says. Each task keeps its own count. The default, `per_call` 0, tiers up every eligible call.
+/// #2474 — when a task's calls to an eligible function tier up: from the first, until `window` of
+/// them in a row average under `per_call` work, and again once `window` of them average that. A
+/// crossing into emitted code costs a fixed amount, which only a call doing enough work repays.
+/// Work is the fuel a call burns, its taken back edges and calls, its callees' included: an
+/// interpreted call's from [`Vm::work`], an emitted call's as its host reports it
+/// ([`Vm::emitted_returned`]), the same safepoints (INVARIANTS #9). Each task keeps its own count.
+/// The default, `per_call` 0, tiers up every eligible call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hotness {
     pub per_call: u64,
@@ -15647,7 +15644,7 @@ pub enum CoopEvent {
     /// The run trapped (the root task, or a fatal driver fault).
     Trapped(Trap),
     /// A task paused to run `func` of program `module` emitted, with raw i64 arg slots `argv`: a
-    /// task on an eligible direct `Call` of the program it runs — the run's own (`0`), or a granted
+    /// task on an eligible call of the program it runs — the run's own (`0`), or a granted
     /// module a child runs ([`TierUpConfig::modules`]) — or a process whose exec'd image is a leaf
     /// the host emitted ([`TierUpConfig::leaf`]), at its entry. `mapped` is the committed scalar
     /// window extent for the emitted `"mapped"` global. The host runs the emitted `f{func}` and
@@ -16697,7 +16694,7 @@ impl ThreadPlatform {
 #[derive(Clone)]
 pub struct ThreadTier {
     /// The run's own program's emit, as the pump's ([`TierUpConfig::root`]): a module-0 task's
-    /// direct call to a function it tiers up runs on the emitted tier. Where its code checks each
+    /// call to a function it tiers up runs on the emitted tier. Where its code checks each
     /// access against a page-state table (#750), each call carries its thread's
     /// ([`EmittedCall::pagestate`]).
     pub root: ProgramEmit,
@@ -16718,7 +16715,7 @@ pub struct ThreadTier {
 /// What a call on the emitted tier runs ([`EmittedCall::target`]).
 pub enum EmittedTarget<'a> {
     /// Function `func` of program `module`, the run's own (`0`) or a granted module a child runs: a
-    /// direct call to it, or the entry of a task the run started, tiered up.
+    /// call to it, or the entry of a task the run started, tiered up.
     Region { module: u32, func: u32 },
     /// The entry `f0` of the §22 unit the guest invoked with code handle `code`: its emitted `wasm`,
     /// and the types the argument and result slots carry.
@@ -18444,8 +18441,8 @@ struct Vm {
     durable_region_base: u64,
     /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for program `jit_module`'s
     /// functions only. Set by [`Vm::tier_up`] on a task running a program with an emit
-    /// ([`ProgramEmits`]); a direct `Call` in that program to
-    /// an eligible function surfaces [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
+    /// ([`ProgramEmits`]); a call in that program to an eligible function surfaces
+    /// [`Outcome::TierUp`] instead of interpreting. `None` (fibers,
     /// invoked units, non-JIT runs) ⇒ everything interprets — tier-up is a pure acceleration, never
     /// a correctness gate.
     jit_eligible: Option<std::sync::Arc<[bool]>>,
@@ -18523,7 +18520,7 @@ const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
 
 /// #2474 — a task's count of its calls into a program its emit tiers up on observed work
 /// ([`Hotness`]): per function, the calls and their work since its last decision, and whether its
-/// calls tier up.
+/// calls interpret.
 #[derive(Clone)]
 struct Profile {
     rule: Hotness,
@@ -18533,28 +18530,26 @@ struct Profile {
 #[derive(Clone, Copy, Default)]
 struct FnCount {
     calls: u32,
-    hot: bool,
+    /// Its last window of calls averaged under the rule's work: its calls interpret.
+    cold: bool,
     work: u64,
 }
 
 impl Profile {
-    fn new(rule: Hotness, funcs: usize, start_hot: &[bool]) -> Profile {
-        let fns = (0..funcs).map(|f| FnCount {
-            hot: start_hot.get(f).copied().unwrap_or(false),
-            ..FnCount::default()
-        });
+    /// Every function's calls tier up until some of them are seen.
+    fn new(rule: Hotness, funcs: usize) -> Profile {
         Profile {
             rule,
-            fns: fns.collect(),
+            fns: vec![FnCount::default(); funcs].into(),
         }
     }
 
     fn hot(&self, f: usize) -> bool {
-        self.fns.get(f).is_some_and(|c| c.hot)
+        self.fns.get(f).is_some_and(|c| !c.cold)
     }
 
-    /// A call of `f` that did `work` returned, on either tier. With `window` calls in, `f` is hot if
-    /// they averaged `per_call` work, and the count starts again.
+    /// A call of `f` that did `work` returned, on either tier. With `window` calls in, `f` goes cold
+    /// if they averaged under `per_call` work and hot otherwise, and the count starts again.
     fn returned(&mut self, f: usize, work: u64) {
         let Some(c) = self.fns.get_mut(f) else {
             return;
@@ -18562,7 +18557,7 @@ impl Profile {
         c.calls += 1;
         c.work = c.work.saturating_add(work);
         if c.calls >= self.rule.window.max(1) {
-            c.hot = c.work >= self.rule.per_call.saturating_mul(c.calls.into());
+            c.cold = c.work < self.rule.per_call.saturating_mul(c.calls.into());
             c.calls = 0;
             c.work = 0;
         }
@@ -18658,15 +18653,15 @@ fn grown_capacity(capacity: usize, need: usize, max: usize) -> usize {
 }
 
 impl Vm {
-    /// Tier up program `module`'s direct calls to the functions `emit` makes eligible (#2248). With
+    /// Tier up program `module`'s calls to the functions `emit` makes eligible (#2248). With
     /// `entry`, this task's own entry tiers up too when `emit` makes it eligible: the run started
     /// the task at it, as a call to it ([`Vm::jit_entry`], #1414 ED-1).
     fn tier_up(&mut self, module: u32, emit: &ProgramEmit, entry: bool) {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
         self.jit_module = module as usize;
-        self.profile = (emit.hot.per_call > 0)
-            .then(|| Box::new(Profile::new(emit.hot, emit.eligible.len(), &emit.start_hot)));
+        self.profile =
+            (emit.hot.per_call > 0).then(|| Box::new(Profile::new(emit.hot, emit.eligible.len())));
         self.jit_entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
     }
 
@@ -18677,8 +18672,8 @@ impl Vm {
         self.profile = None;
     }
 
-    /// Whether a direct call to function `f` of program `jit_module` tiers up: `f` is eligible,
-    /// and hot where the emit tiers calls up on observed work (#2474).
+    /// Whether a call to function `f` of program `jit_module` tiers up: `f` is eligible, and hot
+    /// where the emit tiers calls up on observed work (#2474).
     fn tiers_up(&self, f: usize) -> bool {
         self.jit_eligible
             .as_ref()
@@ -19040,6 +19035,38 @@ impl Vm {
             ($t:expr) => {
                 if ($t as usize) <= pc {
                     safepoint!();
+                }
+            };
+        }
+        // wasm-JIT tier-up: a call (`$args` into `$dst`) to function `$f` of program `$m`, the one
+        // this Vm has an emit for, while `$f` is hot, surfaces to the host, which runs the emitted
+        // region and delivers the results. `argv` is the raw i64 arg slots; the host reads them per
+        // the callee's signature. Suspension-free by construction (`mixed_ok`), so this is a plain
+        // "fast call": spill past the op and resume with the results in `dst` (`deliver_tierup`),
+        // exactly like an interp call. A window the emitted code cannot bound declines, and the call
+        // interprets ([`Vm::tierup_extent`]).
+        macro_rules! tier_up {
+            ($m:expr, $f:expr, $results:expr, $args:expr, $dst:expr) => {
+                if $m == self.jit_module && self.tiers_up($f) {
+                    if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                        let argv: Box<[i64]> = $args.iter().map(|a| r!(*a).i64()).collect();
+                        let results: Box<[ValType]> = $results.clone().into();
+                        // Spill past the call with the caller's window intact (no callee frame
+                        // pushed); `deliver_tierup` writes the results into `dst` relative to
+                        // this base.
+                        self.module = module;
+                        self.cur = cur;
+                        self.base = base;
+                        self.pc = pc + 1;
+                        return Ok(Outcome::TierUp {
+                            module: $m as u32,
+                            func: $f as u32,
+                            argv,
+                            dst: TierUpDst::Frame(*$dst as usize),
+                            results,
+                            mapped,
+                        });
+                    }
                 }
             };
         }
@@ -19469,35 +19496,7 @@ impl Vm {
                     if module == 0 {
                         callprof::hit(callee);
                     }
-                    // wasm-JIT tier-up: a direct call to an eligible function of the program this
-                    // Vm has an emit for surfaces to the host, which runs the emitted region and
-                    // delivers the results. `argv` is the raw i64 arg slots; the host reads them
-                    // per the callee's signature. Suspension-free by construction (`mixed_ok`), so
-                    // this is a plain "fast call": spill past the op and resume with the results in
-                    // `dst` (`deliver_tierup`), exactly like an interp call.
-                    if module == self.jit_module && self.tiers_up(callee) {
-                        // A window the emitted code cannot bound declines: the call below
-                        // interprets ([`Vm::tierup_extent`]).
-                        if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
-                            let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
-                            let results: Box<[ValType]> = c.result_types[callee].clone().into();
-                            // Spill past the call with the caller's window intact (no callee frame
-                            // pushed); `deliver_tierup` writes the results into `dst` relative to
-                            // this base.
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc + 1;
-                            return Ok(Outcome::TierUp {
-                                module: module as u32,
-                                func: callee as u32,
-                                argv,
-                                dst: TierUpDst::Frame(*dst as usize),
-                                results,
-                                mapped,
-                            });
-                        }
-                    }
+                    tier_up!(module, callee, c.result_types[callee], args, dst);
                     // A direct call stays in the current module.
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + c.progs[callee].nslots as usize;
@@ -19541,26 +19540,8 @@ impl Vm {
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
                     }
-                    // #2474 — a call through the table to an eligible function of the program the
-                    // emit is for tiers up as a direct one does.
-                    if tmod == self.jit_module && self.tiers_up(tfunc) {
-                        if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
-                            let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
-                            let results: Box<[ValType]> = tm.result_types[tfunc].clone().into();
-                            self.module = module;
-                            self.cur = cur;
-                            self.base = base;
-                            self.pc = pc + 1;
-                            return Ok(Outcome::TierUp {
-                                module: tmod as u32,
-                                func: tfunc as u32,
-                                argv,
-                                dst: TierUpDst::Frame(*dst as usize),
-                                results,
-                                mapped,
-                            });
-                        }
-                    }
+                    // #2474 — a call through the table tiers up as a direct one does.
+                    tier_up!(tmod, tfunc, tm.result_types[tfunc], args, dst);
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + tm.progs[tfunc].nslots as usize;
                     self.open_frame(need)?;

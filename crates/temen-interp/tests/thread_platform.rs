@@ -345,12 +345,12 @@ fn recording_hot_calls(call: &mut EmittedCall<'_>) -> Result<(), Trap> {
     bounce_whole_call(call)
 }
 
-/// #2474 — calls tier up on the work they do, on either tier: once a function's calls average 100
-/// safepoints over 4 calls, its later calls tier up, and they stay up while the work their host
-/// reports keeps that average. The function counting to 200 tiers up after its first four calls;
-/// the one counting to 3 never does, however often it is called.
+/// #2474 — calls tier up on the work they do, on either tier: every function's calls tier up from
+/// the first, until 4 of them in a row average under 100 safepoints. The function counting to 200
+/// stays up, as the work its host reports keeps the average; the one counting to 3 backs off after
+/// its first four calls, and its interpreted calls keep it there.
 #[test]
-fn a_call_tiers_up_once_its_calls_have_done_enough_work() {
+fn a_call_tiers_up_while_its_calls_do_enough_work() {
     let m = module(LIGHT_AND_HEAVY_CALLS);
     let interpreted = run_over(&m, ThreadPlatform::OS, flat_window());
     assert_eq!(interpreted, Ok(vec![Value::I64(10150)]));
@@ -361,7 +361,12 @@ fn a_call_tiers_up_once_its_calls_have_done_enough_work() {
     };
     assert_eq!(run_over(&m, platform, flat_window()), interpreted);
     let ran = HOT_CALLS.lock().unwrap().clone();
-    assert_eq!(ran, [2; 46], "function 2, on its 5th to 50th calls");
+    let first_window = [1, 2].repeat(4);
+    assert_eq!(
+        ran,
+        [first_window, vec![2; 46]].concat(),
+        "both functions' first four calls, then function 2's other 46"
+    );
 }
 
 static SPARSE_TIERUPS: AtomicUsize = AtomicUsize::new(0);

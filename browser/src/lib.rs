@@ -10769,34 +10769,20 @@ static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
 /// #2474 — when a coop run's calls tier up ([`bytecode::Hotness`]): a crossing into emitted code costs
 /// about 2 µs whatever the callee does (#1026), so only a call doing enough work repays it. Every
 /// emit an open makes reads it ([`coop_emit_for`], [`emit_module`]). [`temen_coop_set_hotness`] sets
-/// it, so the harness can exercise the emitted **mechanism** with tiny guests (`0, 0, 0`: every
-/// eligible call at its start) apart from this **policy**, and `bench_tierup_cards.mjs` can sweep it
-/// in one build.
-static COOP_HOTNESS: std::sync::Mutex<(bytecode::Hotness, CoopStart)> =
-    std::sync::Mutex::new(COOP_HOT);
+/// it, so the harness can exercise the emitted **mechanism** with tiny guests (`0, 0`: every
+/// eligible call) apart from this **policy**, and `bench_tierup_cards.mjs` can sweep it in one
+/// build.
+static COOP_HOTNESS: std::sync::Mutex<bytecode::Hotness> = std::sync::Mutex::new(COOP_HOT);
 
-/// #2474 (prototype) — which functions' calls tier up before any is seen ([`ProgramEmit::start_hot`]):
-/// every eligible one, those with a loop, those over the old #1026 size floor, or none.
-#[derive(Clone, Copy)]
-enum CoopStart {
-    None,
-    All,
-    Loops,
-    Floor,
-}
-
-/// The production [`COOP_HOTNESS`], calibrated with `bench_tierup_cards.mjs` and #2443's fork-join
-/// pair (#2474).
-const COOP_HOT: (bytecode::Hotness, CoopStart) = (
-    bytecode::Hotness {
-        per_call: 16,
-        window: 8,
-    },
-    CoopStart::All,
-);
+/// The production [`COOP_HOTNESS`], calibrated with `bench_tierup_cards.mjs`, #2443's fork-join pair
+/// and the loop helper (#2474).
+const COOP_HOT: bytecode::Hotness = bytecode::Hotness {
+    per_call: 16,
+    window: 8,
+};
 
 /// [`COOP_HOTNESS`] now.
-fn coop_hotness() -> (bytecode::Hotness, CoopStart) {
+fn coop_hotness() -> bytecode::Hotness {
     *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -11239,26 +11225,16 @@ pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
 }
 
 /// #2474 — set when the calls of subsequent opens' runs tier up ([`COOP_HOTNESS`]): a function's
-/// calls while its calls average `per_call` work over `window` of them, on either tier. Work is the
-/// fuel a call burns: one unit per taken back edge and per call, its callees' included. `start`
-/// (prototype): which functions tier up before any call is seen: `0` none, `1` every eligible one,
-/// `2` those with a loop, `3` those over the old size floor. `per_call` 0 tiers up every eligible
-/// call. [`temen_coop_reset_hotness`] restores the default.
+/// calls tier up from the first, until `window` of them in a row average under `per_call` work, on
+/// either tier, and again once `window` of them average that. Work is the fuel a call burns: one
+/// unit per taken back edge and per call, its callees' included. `per_call` 0 tiers up every
+/// eligible call. [`temen_coop_reset_hotness`] restores the default.
 #[no_mangle]
-pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32, start: u32) {
-    let start = match start {
-        0 => CoopStart::None,
-        2 => CoopStart::Loops,
-        3 => CoopStart::Floor,
-        _ => CoopStart::All,
+pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32) {
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = bytecode::Hotness {
+        per_call: per_call.into(),
+        window,
     };
-    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = (
-        bytecode::Hotness {
-            per_call: per_call.into(),
-            window,
-        },
-        start,
-    );
 }
 
 /// #2474 — the work the pending TIERUP's emitted call did, the fuel its code burned: call before
@@ -11412,7 +11388,7 @@ fn coop_emit_for(
     Ok(CoopEmit {
         m,
         wasm,
-        emit: program_emit(&emit_m, eligible, paged),
+        emit: program_emit(eligible, paged),
         all_shimmable,
         table_log2,
         jit_importer,
@@ -11432,31 +11408,13 @@ fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
         .collect()
 }
 
-/// What a coop run's tasks tier up into: the functions of `m` that `eligible` makes so, when
-/// [`COOP_HOTNESS`] says, over a page-checked emit if `paged`.
-fn program_emit(m: &temen_ir::Module, eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
-    let (hot, start) = coop_hotness();
-    let has_loop = |f: &temen_ir::Func| {
-        f.blocks
-            .iter()
-            .enumerate()
-            .any(|(k, b)| b.term.edges().iter().any(|e| e.0 as usize <= k))
-    };
-    let start_hot: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| match start {
-            CoopStart::None => false,
-            CoopStart::All => true,
-            CoopStart::Loops => has_loop(f),
-            CoopStart::Floor => temen_wasm_jit::est_emitted_size(f) >= 4096,
-        })
-        .collect();
+/// What a coop run's tasks tier up into: the functions `eligible` makes so, when [`COOP_HOTNESS`]
+/// says, over a page-checked emit if `paged`.
+fn program_emit(eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
     bytecode::ProgramEmit {
         eligible: eligible.into(),
         page_checked: paged,
-        hot,
-        start_hot: start_hot.into(),
+        hot: coop_hotness(),
     }
 }
 
@@ -11510,7 +11468,7 @@ fn emit_module(
     let eligible = tierup_eligible(m, &emit);
     eligible
         .contains(&true)
-        .then(|| (wasm.into(), program_emit(m, eligible, paged)))
+        .then(|| (wasm.into(), program_emit(eligible, paged)))
 }
 
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.

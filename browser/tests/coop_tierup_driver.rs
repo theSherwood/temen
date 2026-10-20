@@ -67,7 +67,7 @@ static FFI_LOCK: Mutex<()> = Mutex::new(());
 /// test that does *not* call this (the policy test) sees the real default even after one that did.
 fn ffi_guard() -> HotnessGuard {
     let g = FFI_LOCK.lock().unwrap();
-    temen_coop_set_hotness(0, 0, 0);
+    temen_coop_set_hotness(0, 0);
     HotnessGuard(g)
 }
 // The `MutexGuard` is held purely for its lifetime/Drop (it keeps `FFI_LOCK` locked for the test and
@@ -798,7 +798,7 @@ export 0 func "_start" 0
 /// - A function whose calls turn out light backs off after one window of them: of 40 calls that each
 ///   count to 2, the first window's tier up and the rest interpret. Calls that each count to 1000
 ///   repay the crossing, as their host reports the fuel they burned, so all 40 tier up.
-/// - At `0, 0, 0` every eligible call tiers up, light or not.
+/// - At `0, 0` every eligible call tiers up, light or not.
 #[test]
 fn calls_tier_up_on_the_work_they_do() {
     // The guard restores the production default on drop.
@@ -871,7 +871,7 @@ fn calls_tier_up_on_the_work_they_do() {
         [1; 40],
         "the callee's emitted calls repay the crossing, so it stays hot"
     );
-    temen_coop_set_hotness(0, 0, 0);
+    temen_coop_set_hotness(0, 0);
     assert_eq!(
         drive(&many_calls_text(2), "many light calls, every call"),
         [1; 40],

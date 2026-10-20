@@ -89,7 +89,7 @@ const res = await page.evaluate(async ({ src }) => {
 
   // The leaf's calls are short: every eligible call tiers up at its start (#2474), as coop's own
   // tests do, so the test exercises the mechanism rather than the hotness policy.
-  eng.ex.temen_coop_set_hotness(0, 0, 0);
+  eng.ex.temen_coop_set_hotness(0, 0);
   const plain = await run(guest, {});                 // all-interpreter
   const tiered = await run(guest, { tierup: true });  // mainline tier-up over the live window
   return {

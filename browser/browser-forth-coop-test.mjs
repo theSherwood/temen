@@ -132,7 +132,7 @@ const exCounted = Object.fromEntries(
 
 // Tier up every eligible call at its start (#2474), so the kernel's outer loop is admitted (the
 // native pin runs under the same rule), and say so rather than inheriting a default.
-ex.temen_coop_set_hotness(0, 0, 0);
+ex.temen_coop_set_hotness(0, 0);
 
 const fail = (msg) => { console.error(`FAIL: ${msg}`); process.exitCode = 1; };
 
