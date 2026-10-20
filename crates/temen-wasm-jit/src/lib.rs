@@ -1082,12 +1082,6 @@ fn func_in_subset(m: &Module, f: &Func, atomics_ok: bool) -> bool {
     if !atomics_ok && func_uses_atomics(f) {
         return false;
     }
-    // The JS API's limits on a wasm signature, which the emitted one meets with `win` and `env`
-    // ahead of the params: past them the module compiles nowhere. (#2474: an OSR entry takes a
-    // slot per param of its widest loop entry.)
-    if f.params.len() + 2 > 1000 || f.results.len() > 1000 {
-        return false;
-    }
     f.blocks.iter().all(|b| {
         block_value_types(m, b).is_ok_and(|tys| tys.iter().all(|t| valtype_byte(*t).is_ok()))
             && term_in_subset(&b.term)
@@ -1367,20 +1361,6 @@ static MAX_EST_EMITTED_FN_BYTES_OVERRIDE: core::sync::atomic::AtomicUsize =
 /// headroom over the largest known-good emit and ~11% under the known-fatal size. Fail-safe like the per-function valve: a
 /// decline/degrade only routes more code to the interpreter oracle, never an escape.
 const MAX_EST_EMITTED_MODULE_BYTES: usize = 104 << 20;
-
-/// #2474 — append `m`'s OSR entries ([`temen_ir::append_osr_entries`]) for a tier-up emit, where a
-/// call that has run long goes on emitted mid-call. All of them, or none when the module with them
-/// would estimate past [`MAX_EST_EMITTED_MODULE_BYTES`]: the degrade loop would otherwise drop
-/// functions of the guest's own to make room for copies of them. Returns whether it appended them.
-pub fn with_osr_entries(m: &mut Module) -> bool {
-    let n = m.funcs.len();
-    temen_ir::append_osr_entries(m);
-    let fits = m.funcs.iter().map(est_emitted_size).sum::<usize>() <= MAX_EST_EMITTED_MODULE_BYTES;
-    if !fits {
-        m.funcs.truncate(n);
-    }
-    fits
-}
 
 /// The function indices `f` calls (direct `Call`s + tail-call terminators — the latter keeps the
 /// reachability sound even though a tail call itself isn't emitted).

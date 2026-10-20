@@ -1321,6 +1321,7 @@ extern "C" {
         over: u32,
         out: *mut i64,
         mem: i32,
+        work: *mut u64,
     ) -> i32;
     fn x2_invoke(
         code: i32,
@@ -1443,8 +1444,10 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
     let ptr: X2Call = unsafe { std::mem::transmute(ptr) };
     let outer = X2_CALL.with(|c| c.replace(Some(ptr)));
     X2_BOUNCE_TRAP.with(|t| t.set(None));
-    // SAFETY: `argv`, `out`, the unit's bytes and types are live for the call; `win` and `over` are
-    // this run's.
+    // #2474: the fuel the emitted code burns, which the Worker counts.
+    let mut work = 0u64;
+    // SAFETY: `argv`, `out`, `work`, the unit's bytes and types are live for the call; `win` and
+    // `over` are this run's.
     let n = unsafe {
         match &unit {
             Err((module, func)) => x2_tierup(
@@ -1457,6 +1460,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
                 over,
                 out.as_mut_ptr(),
                 mem,
+                &mut work,
             ),
             Ok((code, wasm, types, nparams, nresults)) => x2_invoke(
                 *code,
@@ -1479,6 +1483,7 @@ fn x2_run(call: &mut bytecode::EmittedCall<'_>) -> Result<(), Trap> {
         return Err(bounced.unwrap_or_else(|| emitted_trap(-(n + 1))));
     }
     call.results = out[..n as usize].to_vec();
+    call.work = work;
     Ok(())
 }
 
@@ -10767,18 +10772,31 @@ static TIERUP_UNIT_TABLE_LOG2: std::sync::atomic::AtomicU8 =
 /// it, so the harness can exercise the emitted **mechanism** with tiny guests (`0, 0, 0`: every
 /// eligible call at its start) apart from this **policy**, and `bench_tierup_cards.mjs` can sweep it
 /// in one build.
-static COOP_HOTNESS: std::sync::Mutex<bytecode::Hotness> = std::sync::Mutex::new(COOP_HOT);
+static COOP_HOTNESS: std::sync::Mutex<(bytecode::Hotness, CoopStart)> =
+    std::sync::Mutex::new(COOP_HOT);
+
+/// #2474 (prototype) — which functions' calls tier up before any is seen ([`ProgramEmit::start_hot`]):
+/// every eligible one, those with a loop, those over the old #1026 size floor, or none.
+#[derive(Clone, Copy)]
+enum CoopStart {
+    None,
+    All,
+    Loops,
+    Floor,
+}
 
 /// The production [`COOP_HOTNESS`], calibrated with `bench_tierup_cards.mjs` and #2443's fork-join
 /// pair (#2474).
-const COOP_HOT: bytecode::Hotness = bytecode::Hotness {
-    per_call: 16,
-    window: 8,
-    in_call: 10_000,
-};
+const COOP_HOT: (bytecode::Hotness, CoopStart) = (
+    bytecode::Hotness {
+        per_call: 16,
+        window: 8,
+    },
+    CoopStart::All,
+);
 
 /// [`COOP_HOTNESS`] now.
-fn coop_hotness() -> bytecode::Hotness {
+fn coop_hotness() -> (bytecode::Hotness, CoopStart) {
     *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -11221,17 +11239,36 @@ pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
 }
 
 /// #2474 — set when the calls of subsequent opens' runs tier up ([`COOP_HOTNESS`]): a function's
-/// calls once its interpreted calls have averaged `per_call` work over `window` of them, and a call
-/// at a loop once it has done `in_call` work, in its function's OSR entry. Work is the fuel a call
-/// burns: one unit per taken back edge and per call, its callees' included. `0, 0, 0` tiers up every
-/// eligible call at its start and never mid-call. [`temen_coop_reset_hotness`] restores the default.
+/// calls while its calls average `per_call` work over `window` of them, on either tier. Work is the
+/// fuel a call burns: one unit per taken back edge and per call, its callees' included. `start`
+/// (prototype): which functions tier up before any call is seen: `0` none, `1` every eligible one,
+/// `2` those with a loop, `3` those over the old size floor. `per_call` 0 tiers up every eligible
+/// call. [`temen_coop_reset_hotness`] restores the default.
 #[no_mangle]
-pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32, in_call: u32) {
-    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = bytecode::Hotness {
-        per_call: per_call.into(),
-        window,
-        in_call: in_call.into(),
+pub extern "C" fn temen_coop_set_hotness(per_call: u32, window: u32, start: u32) {
+    let start = match start {
+        0 => CoopStart::None,
+        2 => CoopStart::Loops,
+        3 => CoopStart::Floor,
+        _ => CoopStart::All,
     };
+    *COOP_HOTNESS.lock().unwrap_or_else(|e| e.into_inner()) = (
+        bytecode::Hotness {
+            per_call: per_call.into(),
+            window,
+        },
+        start,
+    );
+}
+
+/// #2474 — the work the pending TIERUP's emitted call did, the fuel its code burned: call before
+/// [`temen_coop_deliver`].
+#[no_mangle]
+pub extern "C" fn temen_coop_set_emitted_work(work: u64) {
+    // SAFETY: single-threaded wasm; exclusive access to the session for this call.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() } {
+        s.run.set_emitted_work(work);
+    }
 }
 
 /// #2474 — restore the production [`COOP_HOTNESS`] after [`temen_coop_set_hotness`].
@@ -11319,13 +11356,6 @@ fn coop_emit_for(
     // over-arity) emits in the old local-table mode, where a null shared-table slot can never
     // diverge from the interpreter's dispatch. An unsupported shape declines.
     let all_shimmable = all_shimmable(&m);
-    // #2474: a call that has run long goes on emitted at a loop, in its function's OSR entry. The
-    // entries follow the module's own functions in the emit only: the run interprets `m`, and its
-    // engine numbers them past it the same way. A local table would number them as dispatch slots,
-    // so they ride a shared-table emit only.
-    if all_shimmable {
-        temen_wasm_jit::with_osr_entries(&mut emit_m);
-    }
     // #1009 M1: size the shared table to the guest (see `tierup_table_log2`), consistently across
     // the emit, the host's domain table, the slot mirror, the unit emitter, and the driver.
     let table_log2 = tierup_table_log2(m.funcs.len());
@@ -11382,7 +11412,7 @@ fn coop_emit_for(
     Ok(CoopEmit {
         m,
         wasm,
-        emit: program_emit(eligible, paged),
+        emit: program_emit(&emit_m, eligible, paged),
         all_shimmable,
         table_log2,
         jit_importer,
@@ -11392,7 +11422,7 @@ fn coop_emit_for(
 
 /// The functions of emitted module `m` a coop run tiers up into, given what its emit emitted
 /// (`emit`): those emitted with an all-`i64` signature, the slots a tier-up's operands and results
-/// travel in. Every OSR entry is one ([`temen_ir::Func::osr_entry`]).
+/// travel in.
 fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
     let all_i64 = |ts: &[temen_ir::ValType]| ts.iter().all(|t| *t == temen_ir::ValType::I64);
     m.funcs
@@ -11402,13 +11432,31 @@ fn tierup_eligible(m: &temen_ir::Module, emit: &[bool]) -> Vec<bool> {
         .collect()
 }
 
-/// What a coop run's tasks tier up into: the functions `eligible` makes so, when [`COOP_HOTNESS`]
-/// says, over a page-checked emit if `paged`.
-fn program_emit(eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
+/// What a coop run's tasks tier up into: the functions of `m` that `eligible` makes so, when
+/// [`COOP_HOTNESS`] says, over a page-checked emit if `paged`.
+fn program_emit(m: &temen_ir::Module, eligible: Vec<bool>, paged: bool) -> bytecode::ProgramEmit {
+    let (hot, start) = coop_hotness();
+    let has_loop = |f: &temen_ir::Func| {
+        f.blocks
+            .iter()
+            .enumerate()
+            .any(|(k, b)| b.term.edges().iter().any(|e| e.0 as usize <= k))
+    };
+    let start_hot: Vec<bool> = m
+        .funcs
+        .iter()
+        .map(|f| match start {
+            CoopStart::None => false,
+            CoopStart::All => true,
+            CoopStart::Loops => has_loop(f),
+            CoopStart::Floor => temen_wasm_jit::est_emitted_size(f) >= 4096,
+        })
+        .collect();
     bytecode::ProgramEmit {
         eligible: eligible.into(),
         page_checked: paged,
-        hot: coop_hotness(),
+        hot,
+        start_hot: start_hot.into(),
     }
 }
 
@@ -11462,7 +11510,7 @@ fn emit_module(
     let eligible = tierup_eligible(m, &emit);
     eligible
         .contains(&true)
-        .then(|| (wasm.into(), program_emit(eligible, paged)))
+        .then(|| (wasm.into(), program_emit(m, eligible, paged)))
 }
 
 /// `temen_coop_open`'s `leaf`: no root leaf — the run tiers up regions of its own emit only.

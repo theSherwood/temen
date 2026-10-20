@@ -20,12 +20,13 @@ use temen_browser::{
     temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_open_fs, temen_coop_paged, temen_coop_pagestate_len,
-    temen_coop_pagestate_ptr, temen_coop_reset_hotness, temen_coop_run, temen_coop_set_hotness,
-    temen_coop_shim_ptr, temen_coop_shim_wasm, temen_coop_slot_unit, temen_coop_spill_bytes,
-    temen_coop_spill_ptr, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
-    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
-    temen_coop_win_len, temen_coop_win_ptr, temen_framebuffer_height, temen_framebuffer_len,
-    temen_framebuffer_ptr, temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
+    temen_coop_pagestate_ptr, temen_coop_reset_hotness, temen_coop_run,
+    temen_coop_set_emitted_work, temen_coop_set_hotness, temen_coop_shim_ptr, temen_coop_shim_wasm,
+    temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr, temen_coop_table_gen,
+    temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
+    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_framebuffer_height, temen_framebuffer_len, temen_framebuffer_ptr,
+    temen_framebuffer_width, temen_onramp_artifact_ptr, temen_onramp_close,
     temen_onramp_frame_begin, temen_onramp_freeze, temen_onramp_key, temen_onramp_moment_free,
     temen_onramp_moment_restore, temen_onramp_moment_take, temen_onramp_open, temen_onramp_open_fs,
     temen_onramp_set_grant_instantiator, temen_onramp_thaw, temen_onramp_timeline_begin_tick,
@@ -225,7 +226,14 @@ fn service_coop_on_wasmi(n_results: usize) -> Result<Vec<i64>, i32> {
     let mut params = vec![Val::I32(WIN_BASE as i32), Val::I32(ENV_PTR as i32)];
     params.extend(argv.iter().map(|a| Val::I64(*a)));
     let mut results: Vec<Val> = (0..n_results).map(|_| Val::I64(0)).collect();
+    // #2474: the work the call does is the fuel its code burns, which the driver reports.
+    let fuel = instance.get_global(&store, "fuel");
+    let armed = fuel.map(|g| g.get(&store).i64().unwrap_or(0));
     let ran = f.call(&mut store, &params, &mut results);
+    if let (Some(g), Some(armed)) = (fuel, armed) {
+        let left = g.get(&store).i64().unwrap_or(armed);
+        temen_coop_set_emitted_work(armed.saturating_sub(left).max(0) as u64);
+    }
 
     // Copy emitted writes back into the live window before the task resumes.
     mirror_out(&store);
@@ -726,14 +734,71 @@ export 0 func "_start" 0
     )
 }
 
+/// A guest whose `_start` calls function 1 40 times in a loop, then writes the sum of the results to
+/// stdout. Function 1 counts to `iters` in a loop and returns the sum of the counts.
+fn many_calls_text(iters: u32) -> String {
+    let out_h = onramp_out_handle();
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  v0 = i64.const 0
+  br 1(v0, v0)
+}}
+block 1 (vk: i64, vs: i64) {{
+  vn = i64.const 40
+  vlt = i64.lt_s vk vn
+  br_if vlt 2(vk, vs) 3(vs)
+}}
+block 2 (ak: i64, as: i64) {{
+  vi = i64.const {iters}
+  vr = call 1 (vi)
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as vr
+  br 1(ak1, as1)
+}}
+block 3 (rs: i64) {{
+  vsl = i64.const {SLOT}
+  i64.store vsl rs
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return rs
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vn: i64) {{
+  v0 = i64.const 0
+  br 1(vn, v0, v0)
+}}
+block 1 (vm: i64, vk: i64, vs: i64) {{
+  vlt = i64.lt_s vk vm
+  br_if vlt 2(vm, vk, vs) 3(vs)
+}}
+block 2 (am: i64, ak: i64, as: i64) {{
+  v1 = i64.const 1
+  ak1 = i64.add ak v1
+  as1 = i64.add as ak
+  br 1(am, ak1, as1)
+}}
+block 3 (rs: i64) {{
+  return rs
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
 /// #2474 — a coop run's calls tier up on the work they do ([`temen_coop_set_hotness`]), with
 /// **identical** guest-observable results whichever tier runs them (INVARIANTS.md #9):
-/// - At the production default, light calls stay interpreted: each of [`coop_guest_text`]'s tasks
-///   calls its tiny leaf once.
-/// - At `0, 0, 0`, every eligible call tiers up at its start: the root's call of the leaf and the
-///   worker's entry.
-/// - At the production default, one long call goes on emitted at its loop, in its function's OSR
-///   entry: the browser's emit carries the entries past the outlined module's own functions.
+/// - At the production default every eligible function starts tiering up: each of
+///   [`coop_guest_text`]'s tasks tiers its one call up, and one long call tiers up at its start.
+/// - A function whose calls turn out light backs off after one window of them: of 40 calls that each
+///   count to 2, the first window's tier up and the rest interpret. Calls that each count to 1000
+///   repay the crossing, as their host reports the fuel they burned, so all 40 tier up.
+/// - At `0, 0, 0` every eligible call tiers up, light or not.
 #[test]
 fn calls_tier_up_on_the_work_they_do() {
     // The guard restores the production default on drop.
@@ -784,27 +849,33 @@ fn calls_tier_up_on_the_work_they_do() {
 
     let light = coop_guest_text();
     temen_coop_reset_hotness();
+    let mut first = drive(&light, "light calls, the default");
+    first.sort_unstable();
     assert_eq!(
-        drive(&light, "light calls, the default"),
-        [],
-        "a call doing a few ops' work never repays a crossing"
-    );
-    temen_coop_set_hotness(0, 0, 0);
-    let mut every = drive(&light, "light calls, every call");
-    every.sort_unstable();
-    assert_eq!(
-        every,
+        first,
         [1, 2],
-        "the worker's entry and the root's call of the leaf"
+        "the worker's entry and the root's call of the leaf, before either is seen"
     );
-
-    // The outlined module is `_start`, the loop and the wrapper of `_start`'s `call.cap`, so the
-    // loop's OSR entry is function 3.
-    temen_coop_reset_hotness();
     assert_eq!(
         drive(&one_long_call_text(), "one long call, the default"),
-        [3],
-        "the long call goes on in its OSR entry, once"
+        [1],
+        "the long call tiers up at its start"
+    );
+    assert_eq!(
+        drive(&many_calls_text(2), "many light calls, the default"),
+        [1; 8],
+        "the callee backs off after a window of calls too light to repay a crossing"
+    );
+    assert_eq!(
+        drive(&many_calls_text(1000), "many heavy calls, the default"),
+        [1; 40],
+        "the callee's emitted calls repay the crossing, so it stays hot"
+    );
+    temen_coop_set_hotness(0, 0, 0);
+    assert_eq!(
+        drive(&many_calls_text(2), "many light calls, every call"),
+        [1; 40],
+        "every call tiers up"
     );
 }
 

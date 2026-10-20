@@ -31,9 +31,9 @@ const readStdout = () => dec.decode(u8().slice(
 // Event counters, observed from outside: one TIERUP service reads temen_coop_func once; a
 // JIT_INVOKE reads temen_coop_jit_wasm_ptr once; every cross-tier bounce goes through
 // temen_coop_call_interp (#1026: the coop driver is the one fallback tier; the pump is gone).
-// #2474: when calls tier up, as `per_call,window,in_call` triples (temen_coop_set_hotness): every
-// eligible call at its start, the production default (null), and never. `HOTNESS="16,8,10000;..."`
-// adds triples to calibrate the default against.
+// #2474: when calls tier up, as `per_call,window,start` triples (temen_coop_set_hotness; `start` 0
+// none, 1 all, 2 functions with loops, 3 the size floor): every eligible call, the production
+// default (null), and never. `HOTNESS="16,8,2;..."` adds triples to calibrate the default against.
 const HOTNESS = [['every-call', [0, 0, 0]], ['default', null], ['never', [0xffffffff, 1, 0]],
   ...(process.env.HOTNESS ?? '').split(';').filter(Boolean).map((t) => [t, t.split(',').map(Number)])];
 let forceRegions = false;

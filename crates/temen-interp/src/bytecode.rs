@@ -666,10 +666,6 @@ struct Program {
     /// reports both, keeping the engine's step/breakpoint location trace identical to the
     /// tree-walker's [`crate::IrPc`] sequence op-for-op.
     src: Box<[Option<(u32, u32)>]>,
-    /// #2474 — the function's loop entries ([`Func::loop_entries`]), in block order: each one's
-    /// entry pc and the slots its params are in. A call goes on in the function's OSR entry
-    /// ([`Compiled::osr`]) at one of them, chosen by its position here.
-    loops: Box<[(u32, Box<[u32]>)]>,
 }
 
 thread_local! {
@@ -687,9 +683,6 @@ pub struct Compiled {
     /// a child window built for this program places its contexts here.
     shadow: Option<super::ShadowArena>,
     progs: Vec<Program>,
-    /// #2474 — per function, where its OSR entry is in the module emitted code runs
-    /// ([`temen_ir::osr_entries`]), or `None` for one without.
-    osr: Vec<Option<u32>>,
     result_types: Vec<Vec<ValType>>,
     /// Per-function `(params, results)` for `call.dyn` type-checking — the natural module-0
     /// function table indexes these directly (slot `i` ⇒ func `i`).
@@ -2369,7 +2362,6 @@ fn compile_module_with(
     Some(Compiled {
         shadow,
         progs,
-        osr: temen_ir::osr_entries(funcs),
         result_types: funcs.iter().map(|f| f.results.clone()).collect(),
         sigs: funcs
             .iter()
@@ -2696,26 +2688,10 @@ fn compile_func(f: &Func, view: &ModuleView<'_>, fuse: bool) -> Option<Program> 
             _ => {}
         }
     }
-    let loops = f
-        .loop_entries()
-        .into_iter()
-        .map(|h| {
-            let h = h as usize;
-            let slot = |i: usize| match forwarded(h, i) {
-                Some((sb, si)) => base[sb as usize] + si,
-                None => base[h] + i as u32,
-            };
-            (
-                block_pc[h],
-                (0..f.blocks[h].params.len()).map(slot).collect(),
-            )
-        })
-        .collect();
     Some(Program {
         ops,
         nslots,
         src: src.into_boxed_slice(),
-        loops,
     })
 }
 
@@ -13397,6 +13373,11 @@ struct EmitTier {
     /// pumping again — so a single slot suffices. `None` between round-trips (and always, on the
     /// native driver).
     pending_tierup: Option<(usize, TierUpDst, Box<[ValType]>)>,
+    /// #2474 — the function the pending tier-up called, `(program, function)`, whose calls count
+    /// the work the host reports it did ([`CoopSched::set_emitted_work`]); `None` for a leaf.
+    pending_call: Option<(u32, u32)>,
+    /// #2474 — the work the host counted the pending tier-up doing on the emitted tier.
+    emitted_work: u64,
     /// The task currently paused on a surfaced §22 `Jit.invoke`, awaiting
     /// [`deliver_jit_invoke_vals`](CoopSched::deliver_jit_invoke_vals): `(task index, dst slot,
     /// result types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a
@@ -13969,6 +13950,8 @@ impl CoopSched {
                 programs,
                 leaf,
                 pending_tierup: None,
+                pending_call: None,
+                emitted_work: 0,
                 pending_jit: None,
                 // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's
                 // bounces.
@@ -14455,6 +14438,11 @@ impl CoopSched {
         }
     }
 
+    /// #2474 — the work the pending tier-up did on the emitted tier ([`CoopRun::set_emitted_work`]).
+    fn set_emitted_work(&mut self, work: u64) {
+        self.emit.emitted_work = work;
+    }
+
     /// #926 slice 2 — deliver an emitted tier-up region's results into the paused task and clear the
     /// pending slot, so the next [`pump`](Self::pump) resumes it. `vals` are the raw i64 result slots
     /// the host read out of the emitted `f{func}` run; they are re-tagged into the caller frame's `dst`
@@ -14466,6 +14454,10 @@ impl CoopSched {
             .pending_tierup
             .take()
             .expect("deliver_tierup with no pending tier-up");
+        let (call, work) = (
+            self.emit.pending_call.take(),
+            core::mem::take(&mut self.emit.emitted_work),
+        );
         if vals.len() < results.len() {
             complete(&mut self.core.tasks, ti, Err(Trap::Malformed));
             return;
@@ -14473,12 +14465,12 @@ impl CoopSched {
         let vals = results.iter().zip(vals).map(|(ty, v)| slot_to_val(*ty, *v));
         match dst {
             TierUpDst::Frame(dst) => {
+                let vm = &mut self.core.tasks[ti].vm.vt.active;
                 for (i, v) in vals.enumerate() {
-                    self.core.tasks[ti]
-                        .vm
-                        .vt
-                        .active
-                        .set(dst as u32 + i as u32, Reg::from_value(v));
+                    vm.set(dst as u32 + i as u32, Reg::from_value(v));
+                }
+                if let Some((module, func)) = call {
+                    vm.emitted_returned(module as usize, func as usize, work);
                 }
             }
             // #1896: the process ran whole: it returned from its entry.
@@ -14489,6 +14481,8 @@ impl CoopSched {
     /// #926 slice 2 — the emitted tier-up region trapped: surface it exactly where the interpreter
     /// would by trapping the paused task.
     fn deliver_tierup_trap(&mut self, trap: Trap) {
+        self.emit.pending_call = None;
+        self.emit.emitted_work = 0;
         let (ti, _dst, _results) = self
             .emit
             .pending_tierup
@@ -14570,6 +14564,7 @@ impl SchedCore {
             programs,
             leaf,
             pending_tierup,
+            pending_call,
             pending_jit,
             ..
         } = emit;
@@ -14599,6 +14594,7 @@ impl SchedCore {
                     "a tier-up is already outstanding — deliver_tierup was skipped"
                 );
                 *pending_tierup = Some((ti, dst, results));
+                *pending_call = Some((module, func));
                 return Some(CoopStep::TierUp {
                     module,
                     func,
@@ -15556,24 +15552,22 @@ pub struct ProgramEmit {
     pub page_checked: bool,
     /// #2474 — when an eligible function's calls start to tier up.
     pub hot: Hotness,
+    /// #2474 — the functions whose calls tier up before any of them is seen, where [`Self::hot`]
+    /// weighs calls (`per_call` > 0): the rest start interpreted. Index = function; empty = none.
+    pub start_hot: std::sync::Arc<[bool]>,
 }
 
-/// #2474 — when a task's calls tier up. A crossing into emitted code costs a fixed amount, which
-/// only a call doing enough work repays. Work is the fuel a call burns, its taken back edges and
-/// calls, its callees' included ([`Vm::work`]), and each task keeps its own count.
-///
-/// - A call to an eligible function tiers up once the function's interpreted calls have done
-///   `per_call` work on average over `window` calls in a row. `per_call` 0 tiers up every one.
-/// - A call that has done `in_call` work goes on in its function's OSR entry
-///   ([`temen_ir::Func::osr_entry`]) at its next branch back to a loop entry, if the emit has it.
-///   `0` never does.
-///
-/// The default tiers up every eligible call at its start.
+/// #2474 — when a task's calls to an eligible function tier up: once its calls have done `per_call`
+/// work on average over `window` calls in a row, and until they average less. A crossing into
+/// emitted code costs a fixed amount, which only a call doing enough work repays. Work is the fuel a
+/// call burns, its taken back edges and calls, its callees' included: an interpreted call's from
+/// [`Vm::work`], an emitted call's as its host reports it ([`Vm::emitted_returned`]), the same
+/// safepoints (INVARIANTS #9). A function starts tiering up or not as [`ProgramEmit::start_hot`]
+/// says. Each task keeps its own count. The default, `per_call` 0, tiers up every eligible call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Hotness {
     pub per_call: u64,
     pub window: u32,
-    pub in_call: u64,
 }
 
 /// The host's emitter for granted modules ([`TierUpConfig::modules`]). Offered one
@@ -16140,6 +16134,12 @@ impl CoopRun {
     /// [`CoopSched::deliver_tierup`]). Call exactly once after a [`CoopEvent::TierUp`], before `run`.
     pub fn deliver_tierup(&mut self, vals: &[i64]) {
         self.sched.deliver_tierup(vals);
+    }
+
+    /// #2474 — the work the pending tier-up did on the emitted tier, as its host counted it: the
+    /// fuel its code burned. Call before [`Self::deliver_tierup`]; a delivery without it counts none.
+    pub fn set_emitted_work(&mut self, work: u64) {
+        self.sched.set_emitted_work(work);
     }
 
     /// Surface an emitted tier-up region's trap and resume (the paused task traps). Call once after a
@@ -16750,6 +16750,9 @@ pub struct EmittedCall<'a> {
     pub over: &'a std::sync::atomic::AtomicBool,
     /// The results, as raw i64 slots: `run` fills them.
     pub results: Vec<i64>,
+    /// #2474 — the work the call did on the emitted tier, the fuel its code burned: `run` counts it,
+    /// and the task's count of the callee's calls takes it ([`Hotness`]).
+    pub work: u64,
     /// Where a `MemoryFault` the emitted code ended with faulted, window-relative: the address its
     /// guard left (#2126). `run` sets it, and the task's window records it, as it records an
     /// interpreted fault (#2275).
@@ -17228,7 +17231,7 @@ impl ThreadRun {
                         vm: &mut *vm,
                         exits: &mut *exits,
                     };
-                    let vals = self.emitted(
+                    let (vals, work) = self.emitted(
                         tier,
                         &mut fibers,
                         Some(task),
@@ -17244,7 +17247,9 @@ impl ThreadRun {
                     }
                     match dst {
                         TierUpDst::Frame(dst) => {
-                            set_slot_results(&mut vm.vt.active, dst as u32, &results, vals)
+                            set_slot_results(&mut vm.vt.active, dst as u32, &results, vals);
+                            let f = func as usize;
+                            vm.vt.active.emitted_returned(module as usize, f, work);
                         }
                         // A task that tiered up at its entry ran whole: its results end it.
                         TierUpDst::Entry { .. } => {
@@ -17305,7 +17310,7 @@ impl ThreadRun {
         };
         let mut cell = fibers.cell();
         let at = (inv.mapped, tier.root.page_checked);
-        let vals = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
+        let (vals, _) = self.emitted(tier, &mut cell, None, ctx, state, target, &inv.argv, at)?;
         // A short reply is malformed, as the pump's `deliver_jit_invoke_vals` has it.
         if vals.len() < inv.results.len() {
             return Err(Trap::Malformed);
@@ -17335,7 +17340,7 @@ impl ThreadRun {
         target: EmittedTarget<'_>,
         argv: &[i64],
         at: (u64, bool),
-    ) -> Result<Vec<i64>, Trap> {
+    ) -> Result<(Vec<i64>, u64), Trap> {
         // Emitted code runs over a window with a flat span in the engine's memory, over a window in
         // a memory of its own, which the host places (#1414 ED-2), or over none at all.
         let (win, memory) = match ctx.mem.as_ref() {
@@ -17434,6 +17439,7 @@ impl ThreadRun {
             memory,
             over: &self.over,
             results: Vec::new(),
+            work: 0,
             fault: None,
             bounce: &mut bounce,
             table,
@@ -17443,11 +17449,11 @@ impl ThreadRun {
             spill: spilled,
         };
         let ran = (tier.run)(&mut call);
-        let (results, fault) = (call.results, call.fault);
+        let (results, work, fault) = (call.results, call.work, call.fault);
         if let (Err(Trap::MemoryFault), Some(rel), Some(m)) = (&ran, fault, mem.as_ref()) {
             m.report_fault_rel(rel);
         }
-        ran.map(|()| results)
+        ran.map(|()| (results, work))
     }
 
     /// Ring the run's external-wake bell, if it has one: its watcher looks at the run.
@@ -18445,7 +18451,7 @@ struct Vm {
     jit_eligible: Option<std::sync::Arc<[bool]>>,
     /// #2248 — the program `jit_eligible` is for: `0`, the run's own, or a granted module a child
     /// runs.
-    jit_module: u32,
+    jit_module: usize,
     /// #1414 ED-1 — the task tiers up at its entry, which `jit_eligible` makes eligible: its first
     /// resume surfaces the entry as [`Outcome::TierUp`], as a call to it would, and the results end
     /// the task. Set by [`Vm::tier_up`] for a task the run starts, and spent by that first resume.
@@ -18464,9 +18470,6 @@ struct Vm {
     work: u64,
     /// #2474 — [`Self::work`] when the running activation was entered.
     entered: u64,
-    /// #2474 — the work after which a call goes on in its OSR entry ([`Hotness::in_call`]), or
-    /// `u64::MAX`.
-    osr_after: u64,
     /// §12 per-vCPU **thread-local register** (`vcpu.tls.get`/`set`). One i64 of per-vCPU state,
     /// seeded to this vCPU's dense id at construction (root = 0; a spawned thread's `Vm` is re-seeded
     /// to its id in `drive`'s `Spawn` arm), guest-overwritable. Read at the op's execution point.
@@ -18518,9 +18521,9 @@ struct VmRare {
 
 const _: () = assert!(std::mem::size_of::<Vm>() <= 256);
 
-/// #2474 — a task's count of its interpreted calls into a program its emit tiers up on observed
-/// work ([`Hotness`]): per function, the calls and their work since its last decision, and whether
-/// its calls tier up.
+/// #2474 — a task's count of its calls into a program its emit tiers up on observed work
+/// ([`Hotness`]): per function, the calls and their work since its last decision, and whether its
+/// calls tier up.
 #[derive(Clone)]
 struct Profile {
     rule: Hotness,
@@ -18535,18 +18538,22 @@ struct FnCount {
 }
 
 impl Profile {
-    fn new(rule: Hotness, funcs: usize) -> Profile {
+    fn new(rule: Hotness, funcs: usize, start_hot: &[bool]) -> Profile {
+        let fns = (0..funcs).map(|f| FnCount {
+            hot: start_hot.get(f).copied().unwrap_or(false),
+            ..FnCount::default()
+        });
         Profile {
             rule,
-            fns: vec![FnCount::default(); funcs].into(),
+            fns: fns.collect(),
         }
     }
 
     fn hot(&self, f: usize) -> bool {
-        self.rule.per_call == 0 || self.fns.get(f).is_some_and(|c| c.hot)
+        self.fns.get(f).is_some_and(|c| c.hot)
     }
 
-    /// An interpreted call of `f` that did `work` returned. With `window` calls in, `f` is hot if
+    /// A call of `f` that did `work` returned, on either tier. With `window` calls in, `f` is hot if
     /// they averaged `per_call` work, and the count starts again.
     fn returned(&mut self, f: usize, work: u64) {
         let Some(c) = self.fns.get_mut(f) else {
@@ -18657,14 +18664,10 @@ impl Vm {
     fn tier_up(&mut self, module: u32, emit: &ProgramEmit, entry: bool) {
         self.jit_eligible = Some(std::sync::Arc::clone(&emit.eligible));
         self.jit_page_checked = emit.page_checked;
-        self.jit_module = module;
-        self.profile =
-            (emit.hot.per_call > 0).then(|| Box::new(Profile::new(emit.hot, emit.eligible.len())));
-        self.osr_after = match emit.hot.in_call {
-            0 => u64::MAX,
-            n => n,
-        };
-        self.jit_entry = entry && self.runs_emit(self.module) && self.tiers_up(self.cur);
+        self.jit_module = module as usize;
+        self.profile = (emit.hot.per_call > 0)
+            .then(|| Box::new(Profile::new(emit.hot, emit.eligible.len(), &emit.start_hot)));
+        self.jit_entry = entry && self.module == self.jit_module && self.tiers_up(self.cur);
     }
 
     /// Undo [`Self::tier_up`]: every call interprets.
@@ -18672,12 +18675,6 @@ impl Vm {
         self.jit_eligible = None;
         self.jit_page_checked = false;
         self.profile = None;
-        self.osr_after = u64::MAX;
-    }
-
-    /// Whether program `module` is the one this task's emit is for.
-    fn runs_emit(&self, module: usize) -> bool {
-        module == self.jit_module as usize
     }
 
     /// Whether a direct call to function `f` of program `jit_module` tiers up: `f` is eligible,
@@ -18689,67 +18686,24 @@ impl Vm {
             && self.profile.as_ref().is_none_or(|p| p.hot(f))
     }
 
-    /// #2474 — a call of function `cur` of program `module` that has done enough work branches back
-    /// to op `t`. Where `t` is one of its loop entries and the emit holds its OSR entry, the call
-    /// goes on there: its frame ends into a tier-up of the entry, given the entry's position and
-    /// its params (in place after the branch's copies), whose results return from the call.
-    /// `None` leaves the call interpreting. Neither a signal handler's frame (its return restores
-    /// the mask), a serve handler's, nor one holding a `setjmp` checkpoint goes on emitted.
-    fn osr(
-        &mut self,
-        c: &Compiled,
-        module: usize,
-        cur: usize,
-        base: usize,
-        t: usize,
-        mem: Option<&Mem>,
-    ) -> Option<Outcome> {
-        let entry = c.osr.get(cur).copied().flatten()?;
-        let eligible = self.jit_eligible.as_ref()?.get(entry as usize).copied();
-        let depth = self.stack.len();
-        if !self.runs_emit(module)
-            || eligible != Some(true)
-            || self.sig_handler_stack.last() == Some(&depth)
-            || self.rare.as_ref().is_some_and(|r| {
-                r.serve_ticket.is_some() || r.setjmp_points.values().any(|p| p.depth == depth)
-            })
-        {
-            return None;
-        }
-        let loops = &c.progs[cur].loops;
-        let at = loops.binary_search_by_key(&(t as u32), |l| l.0).ok()?;
-        let mapped = self.tierup_extent(mem)?;
-        let width = loops.iter().map(|l| l.1.len()).max().unwrap_or(0);
-        let mut argv = vec![0; 1 + width];
-        argv[0] = at as i64;
-        for (a, &s) in argv[1..].iter_mut().zip(loops[at].1.iter()) {
-            *a = self.regs[base + s as usize].i64();
-        }
-        self.count_call(module, cur);
-        let dst = match self.stack.pop() {
-            Some((cmod, cprog, cbase, cpc, ret_abs, centered)) => {
-                (self.module, self.cur, self.base, self.pc) = (cmod, cprog, cbase, cpc);
-                self.entered = centered;
-                TierUpDst::Frame(ret_abs - cbase)
-            }
-            None => TierUpDst::Entry { parks: false },
-        };
-        Some(Outcome::TierUp {
-            module: module as u32,
-            func: entry,
-            argv: argv.into(),
-            dst,
-            results: c.result_types[cur].clone().into(),
-            mapped,
-        })
-    }
-
     /// #2474 — the running activation of program `module` returns, or tail-calls out: count its
     /// work where calls tier up on observed work.
     fn count_call(&mut self, module: usize, f: usize) {
-        if self.runs_emit(module) {
+        if module == self.jit_module {
             if let Some(p) = &mut self.profile {
                 p.returned(f, self.work - self.entered);
+            }
+        }
+    }
+
+    /// #2474 — a call of function `f` of program `module` that tiered up returned, having done
+    /// `work` on the emitted tier as its host counted it: the caller's work includes it, and so does
+    /// the count of `f`'s calls.
+    fn emitted_returned(&mut self, module: usize, f: usize, work: u64) {
+        self.work = self.work.wrapping_add(work);
+        if module == self.jit_module {
+            if let Some(p) = &mut self.profile {
+                p.returned(f, work);
             }
         }
     }
@@ -18848,7 +18802,6 @@ impl Vm {
             profile: None,
             work: 0,
             entered: 0,
-            osr_after: u64::MAX,
             tls: 0, // §12 per-vCPU TLS seed: dense vCPU id (root = 0; a spawned thread re-seeds to its id)
             home: 0,
             sig_handler_stack: Vec::new(), // #1146 — no delivery in flight at entry
@@ -19083,25 +19036,12 @@ impl Vm {
         // loop/recursion (an infinite loop must cross its back-edge unboundedly) while leaving
         // straight-line code free — the one unit the tree-walker and JIT can meter identically. The
         // per-op `budget` (suspension / single-step) is unchanged.
-        // A taken branch to op `$t` with `$copies`. A branch back is a safepoint, or, once the call
-        // has done enough work, where it may go on in its OSR entry (#2474, [`Vm::osr`]).
-        macro_rules! take {
-            ($t:expr, $copies:expr) => {{
-                let t = $t as usize;
-                if t <= pc && self.work.wrapping_sub(self.entered) >= self.osr_after {
-                    edge!($copies);
-                    if let Some(o) = self.osr(&c, module, cur, base, t, mem.as_ref()) {
-                        return Ok(o);
-                    }
+        macro_rules! backedge {
+            ($t:expr) => {
+                if ($t as usize) <= pc {
                     safepoint!();
-                } else {
-                    if t <= pc {
-                        safepoint!();
-                    }
-                    edge!($copies);
                 }
-                pc = t;
-            }};
+            };
         }
 
         loop {
@@ -19379,7 +19319,11 @@ impl Vm {
                     r!(*dst) = Reg::from_value(res);
                     pc += 1;
                 }
-                Op::Br { copies, target } => take!(*target, copies),
+                Op::Br { copies, target } => {
+                    backedge!(*target);
+                    edge!(copies);
+                    pc = *target as usize;
+                }
                 Op::BrIf {
                     cond,
                     then_copies,
@@ -19388,9 +19332,13 @@ impl Vm {
                     else_pc,
                 } => {
                     if r!(*cond).i32() != 0 {
-                        take!(*then_pc, then_copies);
+                        backedge!(*then_pc);
+                        edge!(then_copies);
+                        pc = *then_pc as usize;
                     } else {
-                        take!(*else_pc, else_copies);
+                        backedge!(*else_pc);
+                        edge!(else_copies);
+                        pc = *else_pc as usize;
                     }
                 }
                 // Slice 5a fused compare+branch. Fuel is charged only if the taken edge is a
@@ -19411,15 +19359,21 @@ impl Vm {
                         IntTy::I64 => cmp64(*op, r!(*a).i64(), r!(*b).i64()),
                     };
                     if taken {
-                        take!(*then_pc, then_copies);
+                        backedge!(*then_pc);
+                        edge!(then_copies);
+                        pc = *then_pc as usize;
                     } else {
-                        take!(*else_pc, else_copies);
+                        backedge!(*else_pc);
+                        edge!(else_copies);
+                        pc = *else_pc as usize;
                     }
                 }
                 Op::BrTable { idx, arms, default } => {
                     let i = r!(*idx).i32() as u32 as usize;
                     let (copies, target) = arms.get(i).unwrap_or(default);
-                    take!(*target, copies);
+                    backedge!(*target);
+                    edge!(copies);
+                    pc = *target as usize;
                 }
                 // `<setjmp.h>` `setjmp`: checkpoint the resume point (the op after this, in this
                 // activation) keyed by the guest `jmp_buf` address, and return 0. The register window
@@ -19521,7 +19475,7 @@ impl Vm {
                     // per the callee's signature. Suspension-free by construction (`mixed_ok`), so
                     // this is a plain "fast call": spill past the op and resume with the results in
                     // `dst` (`deliver_tierup`), exactly like an interp call.
-                    if self.runs_emit(module) && self.tiers_up(callee) {
+                    if module == self.jit_module && self.tiers_up(callee) {
                         // A window the emitted code cannot bound declines: the call below
                         // interprets ([`Vm::tierup_extent`]).
                         if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
@@ -19586,6 +19540,26 @@ impl Vm {
                     let (cp, cr) = &tm.sigs[tfunc];
                     if cp.as_slice() != &want_params[..] || cr.as_slice() != &want_results[..] {
                         return Err(Trap::IndirectCallType);
+                    }
+                    // #2474 — a call through the table to an eligible function of the program the
+                    // emit is for tiers up as a direct one does.
+                    if tmod == self.jit_module && self.tiers_up(tfunc) {
+                        if let Some(mapped) = self.tierup_extent(mem.as_ref()) {
+                            let argv: Box<[i64]> = args.iter().map(|a| r!(*a).i64()).collect();
+                            let results: Box<[ValType]> = tm.result_types[tfunc].clone().into();
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc + 1;
+                            return Ok(Outcome::TierUp {
+                                module: tmod as u32,
+                                func: tfunc as u32,
+                                argv,
+                                dst: TierUpDst::Frame(*dst as usize),
+                                results,
+                                mapped,
+                            });
+                        }
                     }
                     let nb = base + c.progs[cur].nslots as usize;
                     let need = nb + tm.progs[tfunc].nslots as usize;
