@@ -11,14 +11,18 @@
 //! cell (a trap store, the post-call propagation check, a host thunk's `*trap_out = …`) is unchanged.
 //!
 //! What stays baked is what describes the **code**, not the instance: the window geometry (the
-//! confinement mask is an immediate on the hot path), the table mask, the thunk *functions* (process
-//! globals), and whether each check is emitted at all (a compile armed with no kill-path, fuel budget
-//! or signal source emits no check, so its code is byte-identical to before). The §12 thread
-//! `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it, and so does the
-//! §14 `Nursery` the `Instantiator` sites spawn through (temen#2168), so every spawn of a child runs
-//! one compile of its code. A compile's other per-instance runtimes (the `setjmp` table, a §22
-//! unit's program) are still baked; a module that has none is **instance-independent** — the
-//! property a fork twin sharing its parent's code, and a compile cache, rely on (#1825).
+//! confinement mask is an immediate on the hot path), the table mask, and whether each check is
+//! emitted at all (a compile armed with no kill-path, fuel budget or signal source emits no check,
+//! so its code is byte-identical to before). The host functions the code calls (its thunks) it
+//! names by symbol, which its link binds to their addresses in the process (`HostFn`, temen#2452).
+//! The §12 thread `Domain` lives here too: the `thread.*`, futex and blocking-resume sites load it,
+//! and so does the §14 `Nursery` the `Instantiator` sites spawn through (temen#2168), so every
+//! spawn of a child runs one compile of its code, and so does the `setjmp` table (temen#2389). The
+//! fiber runtime is found through a thread-local each entry sets. So the code names no per-instance
+//! object, and each instance stands up runtimes of its own (`CompiledModule::instance`): the code
+//! is **instance-independent** — the property a fork twin sharing its parent's code, and a compile
+//! cache, rely on (#1825). Only a §22 unit's program, defined into a module after its compile, is
+//! more than the compile; such a module is never shared.
 //!
 //! **The trust argument is the entry.** Code that runs with the wrong vmctx dispatches its `call.cap`s
 //! into the wrong powerbox — authority confusion, not a crash. So every entry into compiled code takes
@@ -64,6 +68,9 @@ pub struct VmCtx {
     /// temen#2168 — the §14 `Nursery` (`instantiator_rt::Nursery`) the instance's `Instantiator`
     /// sites spawn and join through: its own, which holds its children. Null when it has none.
     pub nursery: *const c_void,
+    /// temen#2389 — the `setjmp` table (`setjmp_rt::SetjmpRuntime`) the instance's `SetJmp` and
+    /// `LongJmp` sites keep their host `jmp_buf`s in. Null when the code uses neither.
+    pub setjmp: *const c_void,
     /// #2164 — a demand-paged child's **access table** (`temen_ir::PAGE_READ`), which a paged
     /// compile tests before each access. Null when the instance is not paged.
     pub pages: *const AtomicU8,
@@ -82,12 +89,13 @@ pub struct InstanceAddrs {
     pub embedder: *mut c_void,
     pub sched: *const c_void,
     pub nursery: *const c_void,
+    pub setjmp: *const c_void,
     pub pages: *const AtomicU8,
 }
 
 impl InstanceAddrs {
     /// No powerbox, no kill-path, no fuel, no signals, no embedder state, no thread domain, no
-    /// nursery, no paging.
+    /// nursery, no `setjmp` table, no paging.
     pub const NONE: InstanceAddrs = InstanceAddrs {
         cap_ctx: core::ptr::null_mut(),
         epoch: core::ptr::null(),
@@ -97,6 +105,7 @@ impl InstanceAddrs {
         embedder: core::ptr::null_mut(),
         sched: core::ptr::null(),
         nursery: core::ptr::null(),
+        setjmp: core::ptr::null(),
         pages: core::ptr::null(),
     };
 }
@@ -115,6 +124,7 @@ impl VmCtx {
             sched: a.sched,
             stop: AtomicI64::new(0),
             nursery: a.nursery,
+            setjmp: a.setjmp,
             pages: a.pages,
         }
     }
@@ -152,6 +162,7 @@ pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
 pub(crate) const STOP: i32 = core::mem::offset_of!(VmCtx, stop) as i32;
 pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
+pub(crate) const SETJMP: i32 = core::mem::offset_of!(VmCtx, setjmp) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.

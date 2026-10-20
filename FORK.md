@@ -1003,15 +1003,19 @@ unwind at the fork call (`temen_run`'s `jit_proc`):
   fork sites. An embedder can keep these compiles past the run (`RunConfig::jit_code`, a
   `JitCodeCache`, #2145). Every run handed the same cache compiles each program once, the root's
   included. Each instance polls its own run's cells, which reach the code through the `vmctx`, so
-  code compiled in one run serves the next. The §14 children a tree's processes spawn are compiled
+  code compiled in one run serves the next. A cache kept in a directory (`JitCodeCache::kept_in`,
+  temen#2452, DESIGN D71) carries that to the next process, which defines the code instead of
+  compiling it; a forked program's code is kept under its fork sites too. The §14 children a tree's processes spawn are compiled
   once too, in the same cache (temen#2168): a child's code loads its nursery from the `vmctx`, and
-  each of its tasks brings its own fiber runtime and domain. A program's code that needs
-  a runtime one instance owns (a §14 nursery, a `setjmp` table, the fiber and thread runtime), or
-  that a program able to drive the §22 `Jit` could extend, is compiled per process. Code that only
-  waits and notifies is shared: its futex sites load the thread domain from the `vmctx`, and each
-  instance gets a domain of its own. Such a program is single-threaded, so it also runs as a process
-  when it is the tree's root, and it forks. Before, the sites baked the domain, and a program that
-  could wait (nim's `nanosleep` is a timed wait, #1930) could not fork.
+  each of its tasks brings its own fiber runtime and domain. Every runtime a program's code runs on,
+  each instance stands up its own (temen#2389): its thread domain, its fiber table and runtime, its
+  §14 nursery and its `setjmp` table. The code loads each from the `vmctx` or finds it through a
+  thread-local its entry sets, so the root of a session that spawns and parks fibers compiles once
+  too. A program that can drive the §22 `Jit`, whose code a unit could extend, is still compiled
+  per process. The tree finds a program over the locked powerbox apart from a raw one's, since the
+  code's link binds the `call.cap` thunk for the powerbox's shape. Before, sites baked the domain,
+  and a program that could wait (nim's `nanosleep` is a timed wait, #1930) could not fork. A
+  program forks only when it is bare and runs over the raw powerbox: a twin's powerbox is raw.
 - **Fork again.** Every fork after a process's first unwinds through frames the previous fork's
   rewind rebuilt, each by re-issuing its call. The transform's thaw arms now poll after an op they
   re-run, as the forward path does (`temen-durable`'s `poll`). Before, an arm ran on into its
