@@ -3590,13 +3590,15 @@ pub enum CapturedProt {
 }
 
 /// [`run_capture_reserved_with_host`] over a whole window [`MemLayout`]: the run **starts** from
-/// `init` — its bytes, then its page map and the pages it holds past them re-established, so a thawed
-/// guest faults exactly as the frozen one would (the durable-restore step) — and **returns** its
-/// window's layout ([`Mem::layout_snapshot`], the durable-freeze step), `None` for a memoryless
-/// module. #2427 — a layout carries the prefix and each page held past it, so neither step costs
-/// more than the window holds. A `Backed` page of `init` re-aliases the region it names, which must
-/// already be in `host` (the codec's restore rebuilt it, #2025); one that does not map traps the run
-/// `Malformed` before it starts.
+/// `init` and **returns** its window's layout ([`Mem::layout_snapshot`], the durable-freeze step),
+/// `None` for a memoryless module. A fresh run's seed ([`MemLayout::is_seed`]) is the low bytes the
+/// module's data segments are laid over. Any other `init` is the window a thaw starts from as it is
+/// (#2441): its bytes, its page map in place of the one the segments made (#2307), and the pages it
+/// holds past them, so a thawed guest reads and faults exactly as the frozen one would (the
+/// durable-restore step). #2427 — a layout carries the prefix and each page held past it, so neither
+/// step costs more than the window holds. A `Backed` page of `init` re-aliases the region it names,
+/// which must already be in `host` (the codec's restore rebuilt it, #2025); one that does not map
+/// traps the run `Malformed` before it starts.
 pub fn run_capture_reserved_with_host_layout(
     m: &Module,
     func: FuncIdx,
@@ -3609,9 +3611,15 @@ pub fn run_capture_reserved_with_host_layout(
     if m.funcs.get(func as usize).is_none() {
         return (Err(Trap::Malformed), None);
     }
-    let mut mem = Mem::root(m, reserved_log2, None, init.bytes());
+    // A thaw's image is written once, by its restore below.
+    let seed = if init.is_seed() { init.bytes() } else { &[] };
+    let mut mem = Mem::root(m, reserved_log2, None, seed);
     if let Some(mm) = mem.as_mut() {
-        mm.apply_layout(init);
+        // A thaw's window is the layout's: its bytes over what instantiation laid, and its page map
+        // in place of the one the data segments made.
+        if !init.is_seed() {
+            mm.restore_layout(init);
+        }
         if !host.realias_regions(mm, init.page_map()) {
             return (Err(Trap::Malformed), None);
         }
@@ -26129,21 +26137,18 @@ impl Host {
 
     /// Capture a **JIT** window for a durable freeze (DURABILITY.md §12.3): `bytes`, its prefix, and
     /// `tail`, each page past it the window holds ([`Host::cap_held_tail`]) whose bytes are not all
-    /// zero, under the page map the host rebuilds for it. The JIT keeps protections in the OS page tables, so — unlike the
-    /// interpreter, whose `Mem` reads its own map — the map comes from two host-side sources,
-    /// mirroring the interpreter's `init_data`/`seed_null_guard`/page ops so the backends agree page
-    /// for page:
-    ///
-    /// * the NULL guard and the module's `readonly` data segments (`Unmapped`, `Ro`), which the window
-    ///   applied at instantiation but `cap_pages` does not record, and
-    /// * the runtime page-state map the Memory cap maintained (`cap_pages`: `map`/`unmap`/`protect`, and
-    ///   §13 aliases, #2025) — which **overrides** them for any page the guest changed.
+    /// zero, under the window's page map. The JIT keeps protections in the OS page tables, so the map
+    /// is the one the host keeps beside them (`cap_pages`), which matches the interpreter's own page
+    /// for page: the read-only pages the window started with (#2268: its data segments' as a fresh
+    /// window lays them, or a thaw's artifact's), then every `map`/`unmap`/`protect` and §13 alias
+    /// (#2025) since. A `readonly` segment's page the guest made writable has no entry, as in the
+    /// interpreter's map (#2307). The NULL guard, which no page op can change, is outside it and
+    /// added here (`Unmapped`).
     ///
     /// `mapped` is the declared window's length; past it, a page in neither is one the window does not
     /// hold (#2427).
     pub fn capture_window_layout(
         &self,
-        data: &[Data],
         mapped: u64,
         null_guard: u64,
         bytes: Vec<u8>,
@@ -26158,13 +26163,7 @@ impl Host {
         if null_guard > 0 && null_guard.is_multiple_of(page) && null_guard <= mapped {
             prot.extend((0..null_guard / page).map(|p| (p, PageProt::Unmapped)));
         }
-        // `readonly` data segments → Ro. Protection is **host-page** granular (the JIT's
-        // `GuestWindow::protect` and the interpreter's `init_data` protect the whole host page).
-        for d in data.iter().filter(|d| d.readonly && !d.bytes.is_empty()) {
-            let last = d.offset + d.bytes.len() as u64 - 1;
-            prot.extend((d.offset / page..=last / page).map(|p| (p, PageProt::Ro)));
-        }
-        // Runtime map/unmap/protect (host-page-indexed) override the defaults.
+        // The window's page map, host-page-indexed.
         if let Some((_, map)) = &self.cap_pages {
             use temen_ir::PageState as ps;
             let m = map.lock().unwrap_or_else(|e| e.into_inner());
@@ -26190,6 +26189,7 @@ impl Host {
             bytes,
             tail: tail.into_iter().collect(),
             map: PageMap { prot, page, mapped },
+            seed: false,
         }
     }
 
@@ -33411,6 +33411,10 @@ pub struct MemLayout {
     tail: BTreeMap<u64, Vec<u8>>,
     /// Which pages deviate, in what unit, over what committed prefix.
     map: PageMap,
+    /// #2441 — a fresh run's seed ([`MemLayout::image`]): the low bytes a new instance's window starts
+    /// with, its data segments laid over them. Every other layout is a whole window, a capture's or an
+    /// artifact's, which a run starts from as it is.
+    seed: bool,
 }
 
 impl MemLayout {
@@ -33432,6 +33436,7 @@ impl MemLayout {
             bytes,
             tail: BTreeMap::new(),
             map: PageMap::from_entries(page, mapped, prot)?,
+            seed: false,
         })
     }
 
@@ -33473,6 +33478,7 @@ impl MemLayout {
                 page: DURABLE_SNAPSHOT_PAGE,
                 mapped,
             },
+            seed: false,
         }
     }
 
@@ -33559,13 +33565,21 @@ impl MemLayout {
     }
 
     /// A bare image under the region default — no page deviating from it: what a fresh run is seeded
-    /// with.
+    /// with, its data segments laid over it ([`is_seed`](Self::is_seed)).
     pub fn image(bytes: Vec<u8>) -> MemLayout {
         MemLayout {
             bytes,
             tail: BTreeMap::new(),
             map: PageMap::empty(),
+            seed: true,
         }
+    }
+
+    /// #2441 — whether this is a fresh run's seed ([`image`](Self::image)), over which the new
+    /// instance's window lays its data segments, rather than a whole window (a capture's, or a thaw's
+    /// from an artifact), which a run starts from as it is.
+    pub fn is_seed(&self) -> bool {
+        self.seed
     }
 
     /// The captured window bytes `[0, len)`: the head. The pages held past it are
@@ -35585,6 +35599,7 @@ impl Mem {
                 page: self.page,
                 mapped,
             },
+            seed: false,
         }
     }
 
@@ -35645,6 +35660,13 @@ impl Mem {
             space
                 .prot
                 .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+            // The NULL guard is this window's, not the layout's (#964): a layout captured where the
+            // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
+            // window does, and as the JIT's restore re-seeds it.
+            let guard = self.null_guard / self.page;
+            space
+                .prot
+                .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
             drop(space);
             for (lo, hi) in stale {
                 self.back.zero(lo * self.page, (hi - lo) * self.page);
@@ -35692,30 +35714,6 @@ impl Mem {
             }
         }
         out
-    }
-
-    /// Re-establish a captured layout on this freshly seeded window (the durable-restore step, the
-    /// inverse of [`layout_snapshot`](Mem::layout_snapshot) once [`seed`](Mem::seed) laid its prefix
-    /// down): its page map's entries over the seeded ones, so a thawed guest faults on an `Ro` or
-    /// `Unmapped` page exactly as the frozen one would, and each page held past the prefix with its
-    /// bytes (#1834, #2427). A `Backed` page is the host's to re-alias ([`Host::realias_regions`]). The
-    /// JIT's `GuestWindow::apply_prots` is this rule on its page tables.
-    fn apply_layout(&mut self, layout: &MemLayout) {
-        for (&off, bytes) in &layout.tail {
-            // A fresh window has no §13 region, so the bytes go straight to the backing.
-            self.back.write_from(off, bytes);
-        }
-        if layout.map.is_empty() {
-            return;
-        }
-        let mut space = self.space_write();
-        space.prot.extend(
-            layout
-                .map
-                .rebased_to(self.page)
-                .into_iter()
-                .filter(|(_, p)| !matches!(p, PageProt::Backed { .. })),
-        );
     }
 }
 
@@ -36962,9 +36960,33 @@ mod growth_tests {
         );
         assert_eq!(image.page_map().grown_bytes(), page);
         let mut thawed = Mem::with_reservation(20, 16, None);
-        thawed.apply_layout(&image);
+        thawed.restore_layout(&image);
         assert_eq!(thawed.read_bytes(top + 7, 1), Some(vec![0x5a]));
         assert_eq!(thawed.tail_bytes(0, 1 << 20).held, page);
+    }
+
+    /// #2441 — a window restored from a layout keeps its own NULL guard, though the layout names none
+    /// (one captured where the guard disengaged): the root's thaw replaces the window's page map with
+    /// the layout's, as a detached child's relaunch does, and the guard stays as a fresh window has it.
+    #[test]
+    fn a_restored_window_keeps_its_null_guard() {
+        let guard = temen_ir::module_null_guard();
+        if guard == 0 || !guard.is_multiple_of(host_page_size()) {
+            return; // the guard disengages on this host
+        }
+        let mut mem = Mem::from_spec(WindowSpec {
+            reserved_log2: 17,
+            mapped_log2: 17,
+            null_guard: guard,
+            ..WindowSpec::default()
+        });
+        mem.restore_layout(&MemLayout::from_parts(vec![1; 1 << 17], 4096, 1 << 17, &[]).unwrap());
+        assert_eq!(mem.read_bytes(0, 1), None, "the guard still faults");
+        assert_eq!(
+            mem.read_bytes(guard, 1),
+            Some(vec![1]),
+            "the image above it"
+        );
     }
 
     /// #2427 — a window rewound to a capture holds what the capture held, though the guest wrote and
