@@ -223,16 +223,27 @@ pub(crate) mod x86 {
         }
     }
 
-    /// One decoded instruction: its length in bytes and its classification.
+    /// One decoded instruction: its length, its classification, and its operands (empty for
+    /// instructions without a ModRM byte — the control-flow and no-operand forms).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct Decoded {
         pub len: usize,
         pub kind: Kind,
+        // `operands` is consumed by the cross-check now and by the slice-2b policy next; see `Mem`.
+        #[allow(dead_code)]
+        pub operands: Operands,
     }
+
+    const NO_OPERANDS: Operands = Operands {
+        reg: None,
+        rm_reg: None,
+        mem: None,
+    };
 
     const UNDECODABLE: Decoded = Decoded {
         len: 0,
         kind: Kind::Undecodable,
+        operands: NO_OPERANDS,
     };
 
     /// Decode the instruction at `bytes[start..]`. Returns [`UNDECODABLE`] (length 0) for an encoding
@@ -280,8 +291,11 @@ pub(crate) mod x86 {
     /// Operand-size inputs gathered from the prefixes and REX.
     #[derive(Default, Clone, Copy)]
     struct Pfx {
-        op66: bool, // 0x66 operand-size override
-        rex_w: bool,
+        op66: bool,  // 0x66 operand-size override
+        rex_w: bool, // 64-bit operand size
+        rex_r: bool, // ModRM.reg extension (bit 3)
+        rex_x: bool, // SIB.index extension
+        rex_b: bool, // ModRM.rm / SIB.base extension
     }
 
     fn decode_inner(c: &mut Cursor, start: usize) -> Option<Decoded> {
@@ -311,54 +325,143 @@ pub(crate) mod x86 {
         // REX (0x40..=0x4F) — the last prefix before the opcode in 64-bit mode.
         if let Some(b @ 0x40..=0x4F) = c.peek() {
             p.rex_w = b & 0x08 != 0;
+            p.rex_r = b & 0x04 != 0;
+            p.rex_x = b & 0x02 != 0;
+            p.rex_b = b & 0x01 != 0;
             c.pos += 1;
         }
         let op = c.next()?;
         if op == 0x0F {
             let op2 = c.next()?;
             match op2 {
-                0x38 => decode_0f38(c, start),
-                0x3A => decode_0f3a(c, start),
-                _ => decode_0f(c, start, op2),
+                0x38 => decode_0f38(c, start, &p),
+                0x3A => decode_0f3a(c, start, &p),
+                _ => decode_0f(c, start, &p, op2),
             }
         } else {
             decode_1byte(c, start, &p, op)
         }
     }
 
+    /// A memory operand `[base + index*scale + disp]`, or RIP-relative. Register numbers are the full
+    /// 0..15 (REX-extended). `base`/`index` are `None` when absent.
+    ///
+    /// `#[allow(dead_code)]`: the decoder exposes these now and the iced-x86 cross-check consumes
+    /// them, but the production reader — the slice-2b dataflow + memory-access policy — lands next.
+    /// Scaffolding with a scheduled removal of the allow when that policy arrives (INVARIANTS #13).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[allow(dead_code)]
+    pub(crate) struct Mem {
+        pub base: Option<u8>,
+        pub index: Option<u8>,
+        pub scale: u8,
+        pub disp: i64,
+        pub rip: bool,
+    }
+
+    /// The operands a ModRM instruction carries, as the policy/dataflow needs them: the `reg`-field
+    /// register, and the r/m operand — either a register or a memory reference. (Operation class and
+    /// read/write direction come in slice 2b, where the dataflow needs them.)
+    ///
+    /// `#[allow(dead_code)]`: see [`Mem`] — consumed by the cross-check now, by the policy in 2b.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[allow(dead_code)]
+    pub(crate) struct Operands {
+        pub reg: Option<u8>,
+        pub rm_reg: Option<u8>,
+        pub mem: Option<Mem>,
+    }
+
     /// Consume a ModRM byte and whatever addressing bytes it implies (SIB, displacement) in 64-bit
-    /// mode, then `imm` immediate bytes; classify as `kind`.
-    fn finish_modrm(c: &mut Cursor, start: usize, imm: usize, kind: Kind) -> Option<Decoded> {
-        consume_modrm(c)?;
+    /// mode, then `imm` immediate bytes; classify as `kind` and attach the decoded operands.
+    fn finish_modrm(
+        c: &mut Cursor,
+        start: usize,
+        p: &Pfx,
+        imm: usize,
+        kind: Kind,
+    ) -> Option<Decoded> {
+        let operands = read_modrm(c, p)?;
         c.skip(imm)?;
         Some(Decoded {
             len: c.pos - start,
             kind,
+            operands,
         })
     }
 
-    fn consume_modrm(c: &mut Cursor) -> Option<()> {
+    /// Read a ModRM byte and its SIB/displacement in 64-bit mode, returning the operands and leaving
+    /// the cursor just past them. The byte count consumed is identical to the length-only form this
+    /// replaces, so instruction lengths are unchanged.
+    fn read_modrm(c: &mut Cursor, p: &Pfx) -> Option<Operands> {
         let modrm = c.next()?;
         let md = modrm >> 6;
         let rm = modrm & 0x07;
+        let reg = Some((u8::from(p.rex_r) << 3) | ((modrm >> 3) & 0x07));
         if md == 0b11 {
-            return Some(()); // register operand
+            // Register r/m: no SIB, no displacement.
+            let rm_reg = Some((u8::from(p.rex_b) << 3) | rm);
+            return Some(Operands {
+                reg,
+                rm_reg,
+                mem: None,
+            });
         }
-        let mut disp = 0usize;
-        let has_sib = rm == 0b100;
+        // Scale is reported as 1 when there is no index (iced's normalization), so default it to 1
+        // and only derive it from the SIB scale field when an index is actually present.
+        let mut m = Mem {
+            scale: 1,
+            ..Mem::default()
+        };
+        let mut disp_bytes = 0usize;
+        if rm == 0b100 {
+            // SIB byte.
+            let sib = c.next()?;
+            let ss = sib >> 6;
+            let idx = (u8::from(p.rex_x) << 3) | ((sib >> 3) & 0x07);
+            let base = (u8::from(p.rex_b) << 3) | (sib & 0x07);
+            // index == 100 (no REX.X) encodes "no index".
+            if idx != 0b100 {
+                m.index = Some(idx);
+                m.scale = 1 << ss;
+            }
+            if md == 0b00 && (sib & 0x07) == 0b101 {
+                disp_bytes = 4; // base absent, disp32
+            } else {
+                m.base = Some(base);
+            }
+        } else if md == 0b00 && rm == 0b101 {
+            m.rip = true; // RIP-relative disp32
+            disp_bytes = 4;
+        } else {
+            m.base = Some((u8::from(p.rex_b) << 3) | rm);
+        }
         match md {
-            0b00 if rm == 0b101 => disp = 4, // RIP-relative disp32
-            0b01 => disp = 1,
-            0b10 => disp = 4,
+            0b01 => disp_bytes = 1,
+            0b10 => disp_bytes = 4,
             _ => {}
         }
-        if has_sib {
-            let sib = c.next()?;
-            if md == 0b00 && (sib & 0x07) == 0b101 {
-                disp = 4; // SIB base == 101 with mod == 00 ⇒ disp32, no base
+        m.disp = read_disp(c, disp_bytes)?;
+        Some(Operands {
+            reg,
+            rm_reg: None,
+            mem: Some(m),
+        })
+    }
+
+    /// Read a sign-extended displacement of `bytes` (0, 1, or 4) and advance the cursor.
+    fn read_disp(c: &mut Cursor, bytes: usize) -> Option<i64> {
+        let v = match bytes {
+            0 => 0,
+            1 => i64::from(*c.bytes.get(c.pos)? as i8),
+            4 => {
+                let b = c.bytes.get(c.pos..c.pos + 4)?;
+                i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             }
-        }
-        c.skip(disp)
+            _ => return None,
+        };
+        c.pos += bytes;
+        Some(v)
     }
 
     /// Size of an operand-size-dependent "immediate word" (`Iz`): 2 bytes under 0x66, else 4 (a
@@ -403,6 +506,7 @@ pub(crate) mod x86 {
                 return Some(Decoded {
                     len: c.pos - start,
                     kind: DirectCall,
+                    operands: NO_OPERANDS,
                 });
             }
             0x70..=0x7F => {
@@ -429,15 +533,15 @@ pub(crate) mod x86 {
             | 0x8D
             | 0x8F
             | 0xD0..=0xD3
-            | 0xFE => finish_modrm(c, start, 0, Normal),
+            | 0xFE => finish_modrm(c, start, p, 0, Normal),
             // ModRM + imm8.
-            0x80 | 0x82 | 0x83 | 0x6B | 0xC0 | 0xC1 | 0xC6 => finish_modrm(c, start, 1, Normal),
+            0x80 | 0x82 | 0x83 | 0x6B | 0xC0 | 0xC1 | 0xC6 => finish_modrm(c, start, p, 1, Normal),
             // ModRM + immZ.
-            0x81 | 0x69 | 0xC7 => finish_modrm(c, start, imm_z(p), Normal),
+            0x81 | 0x69 | 0xC7 => finish_modrm(c, start, p, imm_z(p), Normal),
             // groups 3/5: immediate (if any) depends on the /reg field — peek at the ModRM.
-            0xF6 => group3(c, start, 1),
-            0xF7 => group3(c, start, imm_z(p)),
-            0xFF => group5(c, start),
+            0xF6 => group3(c, start, p, 1),
+            0xF7 => group3(c, start, p, imm_z(p)),
+            0xFF => group5(c, start, p),
             // No ModRM, no immediate.
             0x06
             | 0x07
@@ -475,23 +579,23 @@ pub(crate) mod x86 {
 
     /// Group 3 (`F6`/`F7`): `/0`,`/1` (test) carry an immediate; `/2..` (not/neg/mul/imul/div/idiv)
     /// do not.
-    fn group3(c: &mut Cursor, start: usize, imm: usize) -> Option<Decoded> {
+    fn group3(c: &mut Cursor, start: usize, p: &Pfx, imm: usize) -> Option<Decoded> {
         let reg = (c.peek()? >> 3) & 0x07;
-        finish_modrm(c, start, if reg <= 1 { imm } else { 0 }, Kind::Normal)
+        finish_modrm(c, start, p, if reg <= 1 { imm } else { 0 }, Kind::Normal)
     }
 
     /// Group 5 (`FF`): `/2`,`/3` indirect call, `/4`,`/5` indirect jmp, others inc/dec/push r/m.
-    fn group5(c: &mut Cursor, start: usize) -> Option<Decoded> {
+    fn group5(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         let reg = (c.peek()? >> 3) & 0x07;
         let kind = match reg {
             2 | 3 => Kind::IndirectCall,
             4 | 5 => Kind::IndirectJmp,
             _ => Kind::Normal,
         };
-        finish_modrm(c, start, 0, kind)
+        finish_modrm(c, start, p, 0, kind)
     }
 
-    fn decode_0f(c: &mut Cursor, start: usize, op2: u8) -> Option<Decoded> {
+    fn decode_0f(c: &mut Cursor, start: usize, p: &Pfx, op2: u8) -> Option<Decoded> {
         use Kind::*;
         match op2 {
             0x05 => return Some(one(c, start, Forbidden("syscall"))),
@@ -499,7 +603,7 @@ pub(crate) mod x86 {
             0x34 => return Some(one(c, start, Forbidden("sysenter"))),
             0x35 => return Some(one(c, start, Forbidden("sysexit"))),
             0x0B => return Some(one(c, start, Ud2)), // the trap Cranelift emits for `unreachable`
-            0x20..=0x23 => return finish_modrm(c, start, 0, Forbidden("mov cr/dr")),
+            0x20..=0x23 => return finish_modrm(c, start, p, 0, Forbidden("mov cr/dr")),
             0x80..=0x8F => {
                 let rel = c.rel(4)?; // jcc rel32
                 return Some(rel_insn(start, c.pos, rel, Branch::Jcc));
@@ -509,59 +613,77 @@ pub(crate) mod x86 {
         match op2 {
             // ModRM + imm8 (pshuf, cmpps/sd, shufps, pinsrw/pextrw, the shift groups, shld/shrd imm8).
             0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6 | 0xA4 | 0xAC => {
-                finish_modrm(c, start, 1, Normal)
+                finish_modrm(c, start, p, 1, Normal)
             }
             // The 0F opcodes with no ModRM byte Cranelift emits: emms, cpuid, rdtsc.
             0x77 | 0xA2 | 0x31 => Some(one(c, start, Normal)),
             // 0F AE (fence / clflush) and everything else in the 0F map: ModRM, no immediate.
-            _ => finish_modrm(c, start, 0, Normal),
+            _ => finish_modrm(c, start, p, 0, Normal),
         }
     }
 
-    fn decode_0f38(c: &mut Cursor, start: usize) -> Option<Decoded> {
+    fn decode_0f38(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         c.next()?; // opcode in the 0F38 map — all have ModRM, no immediate
-        finish_modrm(c, start, 0, Kind::Normal)
+        finish_modrm(c, start, p, 0, Kind::Normal)
     }
 
-    fn decode_0f3a(c: &mut Cursor, start: usize) -> Option<Decoded> {
+    fn decode_0f3a(c: &mut Cursor, start: usize, p: &Pfx) -> Option<Decoded> {
         c.next()?; // opcode in the 0F3A map — all have ModRM + imm8
-        finish_modrm(c, start, 1, Kind::Normal)
+        finish_modrm(c, start, p, 1, Kind::Normal)
     }
 
     fn decode_vex2(c: &mut Cursor, start: usize) -> Option<Decoded> {
         c.next()?; // 0xC5
-        c.next()?; // R vvvv L pp
+        let b1 = c.next()?; // R vvvv L pp (R inverted; no X/B/W in 2-byte VEX)
         let op = c.next()?;
-        vex_body(c, start, Map::Of, op)
+        let p = Pfx {
+            rex_r: (b1 & 0x80) == 0,
+            ..Pfx::default()
+        };
+        vex_body(c, start, &p, Map::Of, op)
     }
 
     fn decode_vex3(c: &mut Cursor, start: usize) -> Option<Decoded> {
         c.next()?; // 0xC4
-        let b1 = c.next()?; // R X B mmmmm
-        c.next()?; // W vvvv L pp
+        let b1 = c.next()?; // R X B mmmmm (R/X/B inverted)
+        let b2 = c.next()?; // W vvvv L pp
         let op = c.next()?;
+        let p = Pfx {
+            rex_r: (b1 & 0x80) == 0,
+            rex_x: (b1 & 0x40) == 0,
+            rex_b: (b1 & 0x20) == 0,
+            rex_w: (b2 & 0x80) != 0,
+            ..Pfx::default()
+        };
         let map = match b1 & 0x1f {
             1 => Map::Of,
             2 => Map::Of38,
             3 => Map::Of3a,
             _ => return Some(UNDECODABLE),
         };
-        vex_body(c, start, map, op)
+        vex_body(c, start, &p, map, op)
     }
 
     fn decode_evex(c: &mut Cursor, start: usize) -> Option<Decoded> {
         c.next()?; // 0x62
-        let b0 = c.next()?;
-        c.next()?; // p1
+        let b0 = c.next()?; // R X B R' 0 0 m m (R/X/B inverted)
+        let b1 = c.next()?; // W v v v v 1 p p
         c.next()?; // p2
         let op = c.next()?;
+        let p = Pfx {
+            rex_r: (b0 & 0x80) == 0,
+            rex_x: (b0 & 0x40) == 0,
+            rex_b: (b0 & 0x20) == 0,
+            rex_w: (b1 & 0x80) != 0,
+            ..Pfx::default()
+        };
         let map = match b0 & 0x07 {
             1 => Map::Of,
             2 => Map::Of38,
             3 => Map::Of3a,
             _ => return Some(UNDECODABLE),
         };
-        vex_body(c, start, map, op)
+        vex_body(c, start, &p, map, op)
     }
 
     #[derive(Clone, Copy)]
@@ -573,19 +695,20 @@ pub(crate) mod x86 {
 
     /// The ModRM (+imm8 for the 0F3A map and the 0F imm8 ops) body shared by VEX/EVEX; the opcode
     /// byte was already consumed.
-    fn vex_body(c: &mut Cursor, start: usize, map: Map, op: u8) -> Option<Decoded> {
+    fn vex_body(c: &mut Cursor, start: usize, p: &Pfx, map: Map, op: u8) -> Option<Decoded> {
         let imm = match map {
             Map::Of3a => 1,
             Map::Of38 => 0,
             Map::Of => usize::from(matches!(op, 0x70..=0x73 | 0xC2 | 0xC4 | 0xC5 | 0xC6)),
         };
-        finish_modrm(c, start, imm, Kind::Normal)
+        finish_modrm(c, start, p, imm, Kind::Normal)
     }
 
     fn one(c: &Cursor, start: usize, kind: Kind) -> Decoded {
         Decoded {
             len: c.pos - start,
             kind,
+            operands: NO_OPERANDS,
         }
     }
 
@@ -594,6 +717,7 @@ pub(crate) mod x86 {
         Some(Decoded {
             len: c.pos - start,
             kind,
+            operands: NO_OPERANDS,
         })
     }
 
@@ -613,6 +737,7 @@ pub(crate) mod x86 {
         Decoded {
             len: end - start,
             kind,
+            operands: NO_OPERANDS,
         }
     }
 
@@ -650,7 +775,7 @@ pub(crate) mod x86 {
     mod tests {
         use super::*;
         use crate::{compile, validate};
-        use iced_x86::{Decoder, DecoderOptions};
+        use iced_x86::{Decoder, DecoderOptions, Instruction, OpKind, Register};
         use temen_text::parse_module;
 
         /// Compile `src` through the real JIT path and return each function's `(code, bb_starts)`.
@@ -661,27 +786,72 @@ pub(crate) mod x86 {
             validate::take_capture()
         }
 
-        /// iced-x86's length for the one instruction at `bytes[at..]`, or `None` if iced rejects it.
-        fn iced_len(bytes: &[u8], at: usize) -> Option<usize> {
+        /// iced-x86's decode of the one instruction at `bytes[at..]`, or `None` if iced rejects it.
+        fn iced_at(bytes: &[u8], at: usize) -> Option<Instruction> {
             let mut dec = Decoder::with_ip(64, &bytes[at..], at as u64, DecoderOptions::NONE);
             let insn = dec.decode();
-            (!insn.is_invalid()).then(|| insn.len())
+            (!insn.is_invalid()).then_some(insn)
         }
 
-        /// The decoder's instruction boundaries and validity must match iced-x86 on real output, and
-        /// `check` must find nothing on clean Cranelift code.
+        /// A GP register's 0..15 encoding number, or `None` for a non-GP / absent register.
+        fn gp(r: Register) -> Option<u8> {
+            r.is_gpr64().then(|| r.number() as u8)
+        }
+
+        /// iced's single explicit memory operand as `(base, index, scale, disp, rip)`, in our shape,
+        /// or `None` if the instruction has no explicit memory operand.
+        fn iced_mem(insn: &Instruction) -> Option<Mem> {
+            let has_mem = (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory);
+            if !has_mem {
+                return None;
+            }
+            let rip = insn.is_ip_rel_memory_operand();
+            Some(Mem {
+                base: if rip { None } else { gp(insn.memory_base()) },
+                index: gp(insn.memory_index()),
+                scale: insn.memory_index_scale() as u8,
+                // iced reports the RIP-relative displacement as the resolved absolute target, not the
+                // raw field, so only compare disp for non-rip operands.
+                disp: if rip {
+                    0
+                } else {
+                    insn.memory_displacement64() as i64
+                },
+                rip,
+            })
+        }
+
+        /// The decoder's boundaries, validity, and memory-operand decode must match iced-x86 on real
+        /// output, and `check` must find nothing on clean Cranelift code.
         fn cross_check(src: &str) {
             for (bytes, bb_starts) in compiled(src) {
                 for (pos, d) in walk(&bytes, &bb_starts) {
                     assert_ne!(d.len, 0, "ours: undecodable at +0x{pos:x}\n{:02x?}", bytes);
-                    let iced = iced_len(&bytes, pos).unwrap_or_else(|| {
+                    let insn = iced_at(&bytes, pos).unwrap_or_else(|| {
                         panic!("iced rejects what we decoded at +0x{pos:x}\n{:02x?}", bytes)
                     });
                     assert_eq!(
-                        d.len, iced,
+                        d.len,
+                        insn.len(),
                         "length mismatch at +0x{pos:x}: ours {} iced {}\n{:02x?}",
-                        d.len, iced, bytes
+                        d.len,
+                        insn.len(),
+                        bytes
                     );
+                    // When our decoder reports a memory operand, iced must see the same one.
+                    if let Some(mem) = d.operands.mem {
+                        let want = iced_mem(&insn);
+                        // Compare the fields iced exposes identically (disp only when not rip-rel).
+                        let ours = if mem.rip { Mem { disp: 0, ..mem } } else { mem };
+                        assert_eq!(
+                            Some(ours),
+                            want,
+                            "memory-operand mismatch at +0x{pos:x}: ours {:?} iced {:?}\n{:02x?}",
+                            mem,
+                            want,
+                            bytes
+                        );
+                    }
                 }
                 let findings = check(&bytes, &bb_starts);
                 assert!(
