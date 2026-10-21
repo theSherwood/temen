@@ -36,6 +36,9 @@
 //! **A host procedure may answer a call itself** (#2522): one thread's procedure answers another
 //! thread's host-answered call while it holds the domain's host, and its caller wakes on every
 //! engine.
+//!
+//! **A timer never holds an answer back** (#2538): a root that polls on a timer while its thread
+//! waits on the host sees the thread's answer on every engine.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -997,6 +1000,30 @@ fn bounded(run: impl FnOnce() -> Result<i64, String> + Send + 'static) -> Result
         .unwrap_or_else(|_| Err(format!("still running after {GIVE_UP:?}")))
 }
 
+/// Each engine on which `m`, run [`bounded`] over the powerbox and arguments `setup` makes, did not
+/// return `want`: a line naming the engine, then `answered`.
+fn bounded_on_every_engine(
+    m: &Module,
+    setup: impl Fn() -> (Host, Vec<Value>) + Clone + Send + 'static,
+    want: i64,
+    answered: &str,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for driver in drivers::ALL {
+        let (m, setup) = (m.clone(), setup.clone());
+        let got = bounded(move || on_driver(driver, &m, &setup));
+        if got != Ok(want) {
+            wrong.push(format!("  {driver:?}{answered}: {got:?}"));
+        }
+    }
+    let m = m.clone();
+    let got = bounded(move || on_the_jit(&m, &setup));
+    if got != Ok(want) {
+        wrong.push(format!("  JIT{answered}: {got:?}"));
+    }
+    wrong
+}
+
 /// #2522 — a host procedure answers another thread's host-answered call. Thread 1 makes the call
 /// (arg 7). Thread 2 calls `answer` until it has answered that call, and returns its `1`. The root
 /// waits for the flag `answer` raises while it holds the domain's host, then joins thread 1, then
@@ -1056,21 +1083,68 @@ block 2 (vr: i64) {
 }
 }",
     );
-    let mut wrong = Vec::new();
-    for driver in drivers::ALL {
-        let m = m.clone();
-        let got = bounded(move || on_driver(driver, &m, &answering_inside));
-        if got != Ok(107_001) {
-            wrong.push(format!("  {driver:?}: {got:?}"));
-        }
-    }
-    let got = bounded(move || on_the_jit(&m, &answering_inside));
-    if got != Ok(107_001) {
-        wrong.push(format!("  JIT: {got:?}"));
-    }
+    let wrong = bounded_on_every_engine(&m, answering_inside, 107_001, "");
     assert!(
         wrong.is_empty(),
         "want 107001 on every engine, but\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// #2538 — a root polls while its thread waits on the host. Thread 1 waits in `wait`'s op 2, which
+/// answers 7 after [`SLOW`], then raises the flag at 16388. The root looks for the flag until it is
+/// up, then joins thread 1: between looks it waits 1 ms on a word nobody notifies when `paced`, else
+/// it spins. The debug scheduler took an answer only when nothing could run and no timer was left,
+/// so a root that kept a timer going, or kept running, held thread 1's answer back for good.
+#[test]
+fn a_polling_root_sees_its_threads_answer() {
+    let mut wrong = Vec::new();
+    for paced in [true, false] {
+        let m = module_of(&format!(
+            "memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (vinst: i32, vtick: i32, vwait: i32, vbud: i32) {{
+  vsp = i64.const 0
+  vwa = i64.extend_i32_u vwait
+  vth = thread.spawn 1 vsp vwa
+  br 1(vth)
+}}
+block 1 (vth1: i32) {{
+{pace}  vfa = i64.const 16388
+  vf = i32.atomic.load vfa
+  vdown = i32.const 0
+  vup = i32.ne vf vdown
+  br_if vup 2(vth1) 1(vth1)
+}}
+block 2 (vth2: i32) {{
+  vr = thread.join vth2
+  return vr
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const 7
+  vr = call.cap 13 2 (i64) -> (i64) vh (vn)
+  vfa = i64.const 16388
+  vone = i32.const 1
+  i32.atomic.store vfa vone
+  return vr
+}}
+}}",
+            pace = pace(paced)
+        ));
+        for answer in [Answer::Pool, Answer::Host] {
+            let owned = m.clone();
+            let powerbox = move || setup(&owned, -1, &[], answer)();
+            let how = if paced { "paced" } else { "spinning" };
+            let answered = format!(", {how}, {answer:?}-answered");
+            wrong.extend(bounded_on_every_engine(&m, powerbox, 7, &answered));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "want 7 on every engine, but\n{}",
         wrong.join("\n")
     );
 }
