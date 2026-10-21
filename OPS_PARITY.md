@@ -499,10 +499,10 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `grant` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.poll` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `svc.wait` | ✅ | ✅ | ✅ | ⛔ | native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift still folds (serve loop in temen-run, native-frame twin) — the next slice (FORK.md §9.1); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `clone_caller` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift answers -EINVAL where the oracle forks (#2553) — native fork there is FORK.md §9.3; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `reap` | ✅ | ✅ | 🚧 | ⛔ | native on tree-walk + bytecode; Cranelift answers -EINVAL where the oracle forks (#2553) — native fork there is FORK.md §9.3; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `fuel.remaining` | ✅ | 🚧 | ✅ | ⛔ | declines the module (folds to the oracle) rather than adding a native op; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `exec_module` | ✅ | 🚧 | 🚧 | ⛔ | eval-loop-only image-replace (Step::Exec); the fast tiers decline the module and fold to the oracle (FORK.md §8.6); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `exec_module` | ✅ | ✅ | 🚧 | ⛔ | image-replace on tree-walk (Step::Exec) + bytecode (Op::ExecModule); Cranelift declines the module (#2555, FORK.md §8.6); leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `parallelism` | ✅ | ✅ | ✅ | ⛔ | leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## fibers, threads & non-local control

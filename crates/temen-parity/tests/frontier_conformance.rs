@@ -25,6 +25,8 @@
 //! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
 //! moves in one direction.
 
+mod support;
+use support::cites_an_issue;
 use temen_interp::{DurableBinding, Host, Lease, NonDurableKind, StreamRole, WINDOW_RUNS};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
@@ -276,13 +278,6 @@ fn every_known_gap_names_its_issue() {
             );
         }
     }
-}
-
-/// Whether `note` carries a `#1234`-shaped issue reference.
-fn cites_an_issue(note: &str) -> bool {
-    note.split('#')
-        .skip(1)
-        .any(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
 }
 
 /// [`cites_an_issue`] is the whole strength of the assertion above, so it is pinned directly —
