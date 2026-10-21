@@ -37,6 +37,8 @@ struct TestCtx {
     types: Vec<TypeEntry>,
     /// Cached trampoline from the first mid-run `define_extra` (later calls reuse it).
     code: Cell<*const u8>,
+    /// An end the handler raises on the guest's context before it invokes the unit (`0`: none).
+    end_first: Cell<i64>,
 }
 
 /// The stand-in handler: on first call, `define_extra` the unit **mid-run**; then
@@ -53,7 +55,7 @@ unsafe extern "C" fn reentry_thunk(
     n_args: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) {
     let tc = &*(ctx as *const TestCtx);
     let cm = tc.cm.get();
@@ -67,8 +69,10 @@ unsafe extern "C" fn reentry_thunk(
     }
     let args = std::slice::from_raw_parts(args, n_args as usize);
     let results = std::slice::from_raw_parts_mut(results, n_results as usize);
-    // The thunk's `trap_out` is the running instance's `VmCtx`: the unit runs as that instance.
-    let vm = trap_out as *const temen_jit::VmCtx;
+    if tc.end_first.get() != 0 {
+        vm.raise(tc.end_first.get());
+    }
+    // The thunk's `vm` is the running instance's `VmCtx`: the unit runs as that instance.
     CompiledModule::invoke_extra(cm, tc.code.get(), args, results, mem_base, vm)
         .expect("invoke_extra during a live run");
 }
@@ -85,6 +89,7 @@ fn setup(extra_src: &str) -> (Box<TestCtx>, Box<CompiledModule>) {
         funcs: extra.funcs,
         types: extra.types,
         code: Cell::new(core::ptr::null()),
+        end_first: Cell::new(0),
     });
     let cm = CompiledModule::compile(
         &parent,
@@ -146,6 +151,20 @@ fn trap_in_invoked_code_kills_the_domain() {
         matches!(out, JitOutcome::Trapped(TrapKind::Unreachable)),
         "{out:?}"
     );
+}
+
+/// #2499 — a trap that compiled code raises once its domain has ended loses to the end raised
+/// first: the handler raises an `exit` on the guest's context, then invokes a unit that traps on it.
+/// The run reports the exit, as the oracle would.
+#[test]
+fn trap_after_the_domain_ended_leaves_the_first_end() {
+    let extra_src =
+        "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  unreachable\n  }\n}\n";
+    let (ctx, _cm) = setup(extra_src);
+    ctx.end_first.set(temen_jit::EXIT_CODE as i64 | (5 << 32));
+    let cm_ptr = ctx.cm.get();
+    let (out, _) = unsafe { CompiledModule::run_raw(cm_ptr, &[1, 2], None, None) }.expect("run");
+    assert!(matches!(out, JitOutcome::Exited(5)), "{out:?}");
 }
 
 /// A memory fault inside invoked code (store past the backed extent, into the reserved tail)

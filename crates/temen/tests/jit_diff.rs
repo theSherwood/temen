@@ -1599,7 +1599,7 @@ mod cap {
     ///
     /// # Safety
     /// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-    /// valid for their lengths, and `trap_out` is live.
+    /// valid for their lengths, and `vm` is the calling instance's live context.
     unsafe extern "C" fn cap_thunk(
         ctx: *mut c_void,
         mem_base: *mut u8,
@@ -1612,7 +1612,7 @@ mod cap {
         n_args: u64,
         results: *mut i64,
         n_results: u64,
-        trap_out: *mut i64,
+        vm: &temen_jit::VmCtx,
     ) {
         let host = &mut *(ctx as *mut Host);
         // Null args pointer when there are 0 args; `from_raw_parts` needs non-null even for len 0.
@@ -1639,10 +1639,9 @@ mod cap {
                         *o = r;
                     }
                 }
-                *trap_out = 0;
             }
             // The host's trap on the one wire code, as `temen_run::cap_thunk` reports it (#1735).
-            Err(t) => *trap_out = t.code(),
+            Err(t) => vm.raise(t.code()),
         }
     }
 
@@ -2117,7 +2116,7 @@ mod fast_cap {
         n_args: u64,
         results: *mut i64,
         n_results: u64,
-        trap_out: *mut i64,
+        _vm: &temen_jit::VmCtx,
     ) {
         let a = if n_args == 0 {
             &[][..]
@@ -2131,7 +2130,6 @@ mod fast_cap {
         if n_results != 0 {
             *results = r;
         }
-        *trap_out = 0;
     }
 
     /// The specialized (register-ABI) fast fn for `(42, 0)`: `a0 + 1` — must match the generic op-0.
@@ -2140,10 +2138,9 @@ mod fast_cap {
         _mem_base: *mut u8,
         _mem_size: u64,
         _handle: i32,
-        trap_out: *mut i64,
+        _vm: &temen_jit::VmCtx,
         a0: i64,
     ) -> i64 {
-        *trap_out = 0;
         a0.wrapping_add(1)
     }
 

@@ -97,25 +97,25 @@ pub(crate) unsafe extern "C" fn rt_setjmp_slot(
     cell.as_ptr()
 }
 
-/// `rt_setjmp_lookup(rt, guest_buf, trap_out)` — find the host `jmp_buf` for `guest_buf` (set by a prior
-/// `setjmp`). On a **miss** — a stale/forged token, or a buffer never `setjmp`'d — write the
-/// [`TrapKind::SetjmpFault`] marker into `*trap_out` and return null; the JIT's trap-propagate check
-/// then bails *before* the (skipped) `_longjmp`, matching the interpreters' `Trap::Malformed`
-/// (§3b totality). Never `_longjmp`s into a missing slot.
+/// `rt_setjmp_lookup(rt, guest_buf, vm)` — find the host `jmp_buf` for `guest_buf` (set by a prior
+/// `setjmp`). On a **miss** — a stale/forged token, or a buffer never `setjmp`'d — raise the
+/// [`TrapKind::SetjmpFault`] marker on `vm` and return null; the JIT's trap-propagate check then
+/// bails *before* the (skipped) `_longjmp`, matching the interpreters' `Trap::Malformed` (§3b
+/// totality). Never `_longjmp`s into a missing slot.
 ///
 /// # Safety
-/// `rt` and `trap_out` are valid for the run (baked / threaded by the lowering).
+/// `rt` and the context at `vm` are valid for the run (baked / threaded by the lowering).
 pub(crate) unsafe extern "C" fn rt_setjmp_lookup(
     rt: *mut SetjmpRuntime,
     guest_buf: u64,
-    trap_out: u64,
+    vm: u64,
 ) -> *mut c_void {
     let rt = &*rt;
     let slots = rt.slots.lock().unwrap_or_else(|e| e.into_inner());
     match slots.get(&guest_buf) {
         Some(cell) => cell.as_ptr(),
         None => {
-            *(trap_out as *mut i64) = TrapKind::SetjmpFault as i64;
+            crate::VmCtx::at(vm).raise(TrapKind::SetjmpFault as i64);
             core::ptr::null_mut()
         }
     }

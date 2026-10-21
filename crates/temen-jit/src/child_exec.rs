@@ -296,7 +296,7 @@ impl ChildTask {
             return false;
         };
         let base = self.window.base() as u64;
-        self.vm.trap.load(Ordering::Relaxed) == 0
+        self.vm.ended().is_none()
             // SAFETY: the window is live while the task is; its arena holds the freeze word and, in
             // context 0's region, the root's shadow-SP word.
             && unsafe { fiber_rt::window_is_unwinding(base, d.shadow) }
@@ -318,8 +318,7 @@ impl ChildTask {
     /// The child ends with `ThreadFault`, unless it trapped already: the host could not read its
     /// window (#2286, #2318).
     fn end_refused(&self) {
-        let fault = TrapKind::ThreadFault as i64;
-        let _ = (self.vm.trap).compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed);
+        self.vm.raise(TrapKind::ThreadFault as i64);
     }
 
     /// #1361 step 4 — what a durable child whose root unwound for a freeze leaves for its parent's
@@ -515,9 +514,7 @@ impl ChildExec {
                     )
                 };
             if !seeded {
-                task.vm
-                    .trap
-                    .store(TrapKind::FiberFault as i64, Ordering::Relaxed);
+                task.vm.raise(TrapKind::FiberFault as i64);
             }
         }
         if task._code.spawns || durable {
@@ -602,16 +599,9 @@ impl ChildExec {
                 d.kill_in_flight(true);
             }
         }
-        // The stop word ends it at its next poll, whatever its host calls do to the trap cell
-        // (#2088); the trap cell ends the waits a parked vCPU of it re-checks. Never clobber a trap
-        // the child already recorded.
-        let code = TrapKind::ThreadFault as i64;
-        let _ =
-            e.vm.stop
-                .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
-        let _ =
-            e.vm.trap
-                .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+        // Its next poll ends it, and so does a wait a parked vCPU of it re-checks; a trap the child
+        // already raised outranks the kill (#2499).
+        e.vm.raise(TrapKind::ThreadFault as i64);
         if let Some(d) = &e.dom {
             d.wake_own_parked();
         }
@@ -837,8 +827,7 @@ impl ChildExec {
                         let t = task.as_ref().expect("held");
                         match t.at_teardown() {
                             AtTeardown::Poison => {
-                                t.vm.trap
-                                    .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                                t.vm.raise(crate::DOMAIN_DONE_CODE as i64);
                                 if let Some(d) = &t.dom {
                                     d.wake_own_parked(); // its vCPUs share the cell
                                 }
@@ -875,8 +864,7 @@ impl ChildExec {
                         // the parked ones. Under a freeze of a durable child's window they are only
                         // woken, to unwind (#2010).
                         if t.at_teardown() == AtTeardown::Poison {
-                            t.vm.trap
-                                .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                            t.vm.raise(crate::DOMAIN_DONE_CODE as i64);
                         }
                         if let Some(d) = &t.dom {
                             d.wake_own_parked();
@@ -966,7 +954,7 @@ impl ChildExec {
         }
         fiber_rt::set_current(prev_rt);
         if faulted {
-            task.vm.trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
+            task.vm.raise(mem::FAULT_TRAP);
             task.slot.finish_task();
             return Outcome::Finished;
         }
@@ -981,9 +969,7 @@ impl ChildExec {
             }
             Some(State::Yielded(_)) => {
                 // Unreachable by construction; fail closed rather than resume an unknown yield.
-                task.vm
-                    .trap
-                    .store(TrapKind::ThreadFault as i64, Ordering::Relaxed);
+                task.vm.raise(TrapKind::ThreadFault as i64);
                 task.slot.finish_task();
                 Outcome::Finished
             }
@@ -1031,7 +1017,7 @@ impl ChildExec {
                 };
                 // A fiber that traps as it flattens is the child's trap, as a run's root's is: its
                 // outcome, not a capture.
-                if task.vm.trap.load(Ordering::Relaxed) == 0 {
+                if task.vm.ended().is_none() {
                     match task.capture(d, fibers) {
                         Some(c) => {
                             *d.capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
@@ -1051,7 +1037,7 @@ impl ChildExec {
             t(captured);
         }
         // A retiring task published at `settle`, unless its root unwound, whose capture this is.
-        let trap = task.vm.trap.load(Ordering::Relaxed);
+        let trap = task.vm.ended().unwrap_or(0);
         let result = task.results.first().copied().unwrap_or(0);
         done.publish(result, trap, self.domain());
         let retiring = task.retiring;
@@ -1074,7 +1060,7 @@ impl ChildExec {
     /// they have ended is what its parent's join is owed.
     fn settle(&self, task: &mut ChildTask) {
         task.retiring = true;
-        let trap = task.vm.trap.load(Ordering::Relaxed);
+        let trap = task.vm.ended().unwrap_or(0);
         let result = task.results.first().copied().unwrap_or(0);
         // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
         if trap != 0 {
@@ -1097,7 +1083,7 @@ impl ChildExec {
     ///
     /// `end_domain` — the run is ending (not freezing): every task ends with it, running or not yet
     /// started, as the oracle ends a child domain with the run (DESIGN §23, D66).
-    /// Its stop word gets the completion sentinel, which its entry and back-edge polls observe
+    /// Its context gets the completion sentinel raised, which its entry and back-edge polls observe
     /// (`emit_domain_poll`). A freeze skips this, so a child the freeze reaches still unwinds under
     /// its own freeze word.
     /// For the same reason a **durable** child under a word the freeze rang
@@ -1116,19 +1102,13 @@ impl ChildExec {
                     .is_some_and(|t| t.at_teardown() != AtTeardown::Poison);
                 let poisoned = if e.parked && !spared {
                     if let Some(t) = &e.task {
-                        t.vm.trap
-                            .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                        t.vm.raise(crate::DOMAIN_DONE_CODE as i64);
                     }
                     true
                 } else if end_domain && !spared {
-                    // As `kill` ends a task: the stop word ends it at its next poll, whatever its
-                    // host calls do to the trap cell (#2088), and the trap cell ends a host-side
-                    // wait it re-checks (a serve loop's park). Never clobber either already set.
-                    let done = crate::DOMAIN_DONE_CODE as i64;
-                    for cell in [&e.vm.stop, &e.vm.trap] {
-                        let _ =
-                            cell.compare_exchange(0, done, Ordering::Relaxed, Ordering::Relaxed);
-                    }
+                    // As `kill` ends a task: its next poll ends it, and so does a host-side wait it
+                    // re-checks (a serve loop's park).
+                    e.vm.raise(crate::DOMAIN_DONE_CODE as i64);
                     true
                 } else {
                     false

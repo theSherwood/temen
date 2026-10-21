@@ -32,11 +32,10 @@ unsafe extern "C" fn ctx_value_thunk(
     _n_args: u64,
     results: *mut i64,
     _n_results: u64,
-    trap_out: *mut i64,
+    _vm: &temen_jit::VmCtx,
 ) {
     unsafe {
         *results = *(ctx as *const i64);
-        *trap_out = 0;
     }
 }
 

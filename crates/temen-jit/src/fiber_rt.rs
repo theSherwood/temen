@@ -2,7 +2,7 @@
 //! resume, and suspend stackful fibers via [`temen_fiber`].
 //!
 //! The JIT lowers `cont.new`/`cont.resume`/`suspend` to indirect calls to the three thunks here
-//! (passing `mem_base`/`fn_table_base`/`trap_out` from the threaded context, exactly like `call.cap`).
+//! (passing `mem_base`/`fn_table_base`/`vm` from the threaded context, exactly like `call.cap`).
 //! A fiber's body runs **JITted guest code** on its own native control stack: because Rust cannot call
 //! the guest `Tail` calling convention directly, the body goes through a small generated CLIF
 //! *call-trampoline* ([`FiberCallTramp`]) that `call.dyn`s the guest entry. A `suspend` from deep
@@ -273,16 +273,16 @@ pub(crate) unsafe fn window_is_unwinding(mem_base: u64, arena: ShadowArena) -> b
 }
 
 /// The generated CLIF call-trampoline: `extern "C"` on the outside (callable from Rust), it
-/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, trap_out, sp, arg) ->
+/// `call.dyn`s a guest fiber entry (`Tail` ABI `(mem_base, fn_table_base, vm, sp, arg) ->
 /// i64`). One trampoline serves every fiber since all fiber entries share that signature (§12).
-/// The entry ABI carries a `stack_limit` param right after `trap_out` (§2b path B — the always-on
+/// The entry ABI carries a `stack_limit` param right after `vm` (§2b path B — the always-on
 /// software stack guard), so this fn-pointer type does too — kept in exact lockstep with `sig_from` /
 /// the CLIF trampoline.
 pub(crate) type FiberCallTramp = extern "C" fn(
     code: u64,
     mem_base: u64,
     fn_table_base: u64,
-    trap_out: u64,
+    vm: u64,
     stack_limit: u64,
     sp: u64,
     arg: u64,
@@ -972,12 +972,12 @@ impl FiberRuntime {
     }
 }
 
-/// Write `FiberFault` into the host trap cell (the JIT propagates it after the thunk returns).
+/// Raise `FiberFault` on the caller's context (the JIT propagates it after the thunk returns).
 ///
 /// # Safety
-/// `trap_out` is the live `*mut i64` trap cell threaded from the call site.
-unsafe fn fault(trap_out: u64) {
-    *(trap_out as *mut i64) = TrapKind::FiberFault as i64;
+/// `vm` is the live context address threaded from the call site.
+unsafe fn fault(vm: u64) {
+    crate::VmCtx::at(vm).raise(TrapKind::FiberFault as i64);
 }
 
 // Reentrancy discipline (all three thunks): a running fiber may call back in (create/resume/suspend),
@@ -997,7 +997,7 @@ unsafe fn fault(trap_out: u64) {
 /// `FiberFault`, never an abort, so a guest spawning many fibers can't crash the host (ISSUES.md I1).
 ///
 /// # Safety
-/// `fn_table_base`/`mem_base`/`trap_out`/`call_tramp` are this run's threaded context (live for the
+/// `fn_table_base`/`mem_base`/`vm`/`call_tramp` are this run's threaded context (live for the
 /// fiber's lifetime); the body reads [`CURRENT_RT`] dynamically at each use (3c migration).
 #[allow(clippy::too_many_arguments)]
 unsafe fn make_fiber(
@@ -1005,7 +1005,7 @@ unsafe fn make_fiber(
     sp: u64,
     mem_base: u64,
     fn_table_base: u64,
-    trap_out: u64,
+    vm: u64,
     mask: u64,
     type_id: u32,
     call_tramp: FiberCallTramp,
@@ -1024,7 +1024,7 @@ unsafe fn make_fiber(
             let slot = (funcref as u32 as usize) & (mask as usize);
             let entry = (fn_table_base as *const FnEntry).add(slot);
             let result = if (*entry).type_id() != type_id {
-                fault(trap_out);
+                fault(vm);
                 0u64
             } else {
                 // Fuel unification (#1642): the `cont.resume` starting this fiber already charged the
@@ -1042,7 +1042,7 @@ unsafe fn make_fiber(
                     (*entry).code(),
                     mem_base,
                     fn_table_base,
-                    trap_out,
+                    vm,
                     y.stack_low(),
                     sp,
                     arg,
@@ -1082,21 +1082,21 @@ pub(crate) unsafe fn make_task_fiber(
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** bound, or its `Budget.mem`).
 ///
 /// # Safety
-/// `fn_table_base`/`trap_out` are the threaded context; `fuel_addr` is this compile's counted-fuel
+/// `fn_table_base`/`vm` are the threaded context; `fuel_addr` is this compile's counted-fuel
 /// cell (`0` ⇒ un-armed), for [`make_fiber`]'s start refund. The running vCPU's fiber runtime is read
 /// from the [`CURRENT_RT`] thread-local. The funcref is resolved (and type-checked) lazily on first
 /// resume, matching the interpreter.
 pub(crate) unsafe extern "C" fn fiber_new(
     mem_base: u64,
     fn_table_base: u64,
-    trap_out: u64,
+    vm: u64,
     funcref: i32,
     sp: u64,
     fuel_addr: u64,
 ) -> i64 {
     let rt = current();
     if rt.is_null() {
-        fault(trap_out);
+        fault(vm);
         return -1;
     }
     let (mask, type_id, call_tramp, charge) = {
@@ -1105,13 +1105,13 @@ pub(crate) unsafe extern "C" fn fiber_new(
         // never exhausts the OS map limit. (`create` re-checks under the table lock — a racing
         // sibling vCPU may fill the last slot — at the cost of one transient stack allocation.)
         if !rt.table.has_room() {
-            fault(trap_out);
+            fault(vm);
             return -1;
         }
         // #2112 — the fiber is `FIBER_STACK` of its domain's `mem` while it lives, charged before
         // its stack is mapped, as the ceiling is checked. A failure below drops it, handing it back.
         let Some(charge) = rt.table.fiber_charge() else {
-            fault(trap_out);
+            fault(vm);
             return -1;
         };
         (
@@ -1128,7 +1128,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
         sp,
         mem_base,
         fn_table_base,
-        trap_out,
+        vm,
         mask,
         type_id,
         call_tramp,
@@ -1137,7 +1137,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
         Some(f) => f,
         None => {
             // The OS refused the control-stack reservation — recoverable, not an abort (I1).
-            fault(trap_out);
+            fault(vm);
             return -1;
         }
     };
@@ -1146,7 +1146,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
     match rt.table.create(Box::new(fiber), funcref, sp as i64, charge) {
         Some(handle) => handle,
         None => {
-            fault(trap_out); // a sibling vCPU filled the domain quota since the pre-check
+            fault(vm); // a sibling vCPU filled the domain quota since the pre-check
             -1
         }
     }
@@ -1162,16 +1162,17 @@ pub(crate) unsafe extern "C" fn fiber_new(
 /// the interpreter.
 ///
 /// # Safety
-/// `status_out`/`trap_out` are live `*mut i64` cells. The running vCPU's runtime is [`CURRENT_RT`].
+/// `status_out` is a live `*mut i64` cell and `vm` a live context address. The running vCPU's
+/// runtime is [`CURRENT_RT`].
 pub(crate) unsafe extern "C" fn fiber_resume(
     handle: i64,
     arg: i64,
     status_out: *mut i64,
-    trap_out: u64,
+    vm: u64,
 ) -> i64 {
     let rt = current();
     if rt.is_null() {
-        fault(trap_out);
+        fault(vm);
         *status_out = 1;
         return 0;
     }
@@ -1190,7 +1191,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     let (slot_idx, slot, fib): (usize, Arc<FiberSlot>, *mut Fiber) = {
         let rt = &*rt;
         let Some((slot_idx, slot)) = rt.table.resolve(handle) else {
-            fault(trap_out);
+            fault(vm);
             *status_out = 1;
             return 0;
         };
@@ -1210,7 +1211,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // since: that claimant records it, so this one skips it. Only a guest's lost claim is a
             // forged, running or finished handle.
             if !rt.flattening {
-                fault(trap_out);
+                fault(vm);
             }
             *status_out = 1;
             return 0;
@@ -1250,7 +1251,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // Unreachable by invariant (a claimable slot holds its fiber); fail closed, leaving
             // the slot claimed (inert thereafter) rather than aliasing anything.
             None => {
-                fault(trap_out);
+                fault(vm);
                 *status_out = 1;
                 return 0;
             }
@@ -1444,11 +1445,11 @@ pub(crate) unsafe extern "C" fn fiber_resume(
 /// with no running fiber (the root computation) traps (`FiberFault`).
 ///
 /// # Safety
-/// `trap_out` is the live trap cell. The running vCPU's runtime is read from [`CURRENT_RT`].
-pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 {
+/// `vm` is the live context address. The running vCPU's runtime is read from [`CURRENT_RT`].
+pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, vm: u64) -> i64 {
     let rt = current();
     if rt.is_null() {
-        fault(trap_out);
+        fault(vm);
         return 0;
     }
     // Mid-run freeze trigger: count this `suspend` safepoint before the switch (mirroring the
@@ -1457,7 +1458,7 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
     // #1469 — a child root runs on its task's platform fiber, whose yielder is the executor's: the
     // root suspending is the root computation suspending, a `FiberFault` as on an OS thread.
     if current_fiber_slot().is_some_and(|s| s.is_platform()) {
-        fault(trap_out);
+        fault(vm);
         return 0;
     }
     if (*rt).durable {
@@ -1492,7 +1493,7 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
         match rt.yielders.pop() {
             Some(y) => y,
             None => {
-                fault(trap_out); // root computation cannot suspend
+                fault(vm); // root computation cannot suspend
                 return 0;
             }
         }
@@ -1633,9 +1634,10 @@ pub(crate) unsafe fn fiber_event_park(
 /// during the root run — so [`take_frozen`] returns both. This driver only walks the parked set.
 ///
 /// # Safety
-/// `rt` is the live root runtime (its `mem_base`/`durable` armed for this run); `trap_out` is the
-/// live trap cell. Called at a quiescent safepoint (the root returned), so the table is at rest.
-pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) {
+/// `rt` is the live root runtime (its `mem_base`/`durable` armed for this run); `vm` is the
+/// live context address. Called at a quiescent safepoint (the root returned), so the table is at
+/// rest.
+pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, vm: u64) {
     // The entry path already published `rt` as CURRENT_RT and hasn't restored it yet, but set it
     // explicitly so the driver is correct independent of caller ordering.
     let prev = set_current(rt);
@@ -1645,7 +1647,7 @@ pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) {
     for handle in table.runnable_handles() {
         // Resume under the in-progress UNWINDING state word: the fiber flattens itself, returns, and
         // its `Complete` arm records the residue into `rt.frozen`.
-        fiber_resume(handle, 0, &mut status as *mut i64, trap_out);
+        fiber_resume(handle, 0, &mut status as *mut i64, vm);
     }
     (*rt).flattening = false;
     set_current(prev);
@@ -1663,10 +1665,10 @@ pub(crate) unsafe fn take_frozen(rt: *mut FiberRuntime) -> Vec<crate::FrozenFibe
 /// before the root re-enters under `REWINDING`. Builds a fiber that re-enters its recorded entry
 /// (`make_fiber`, the same path as `cont.new`) at its dense slot, with its flattened shadow-SP
 /// restored. The seed is sorted/dense by slot, so handles match the freeze (`cont.resume k` resolves
-/// the same fiber). `rt` supplies the per-run threaded context; `mem_base`/`fn_table_base`/`trap_out`
-/// are this run's window/table/trap cell.
+/// the same fiber). `rt` supplies the per-run threaded context; `mem_base`/`fn_table_base`/`vm`
+/// are this run's window/table/context.
 ///
-/// Returns `false` (after writing a `FiberFault` to `trap_out`) if the OS refuses a control-stack
+/// Returns `false` (after raising a `FiberFault` on `vm`) if the OS refuses a control-stack
 /// reservation mid-seed — the caller skips the re-entry rather than aborting (ISSUES.md I1); `true`
 /// when every frozen fiber was re-seeded.
 ///
@@ -1677,7 +1679,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
     seed: &[crate::FrozenFiber],
     mem_base: u64,
     fn_table_base: u64,
-    trap_out: u64,
+    vm: u64,
 ) -> bool {
     let r = &*rt;
     let (mask, type_id, call_tramp) = (
@@ -1700,14 +1702,14 @@ pub(crate) unsafe fn seed_frozen_fibers(
             f.sp as u64,
             mem_base,
             fn_table_base,
-            trap_out,
+            vm,
             mask,
             type_id,
             call_tramp,
             0,
         ) else {
             // The OS refused a thaw control-stack reservation — recoverable, not an abort (I1).
-            fault(trap_out);
+            fault(vm);
             return false;
         };
         let got = r.table.seed_frozen(
@@ -1793,7 +1795,7 @@ unsafe fn scan_words(
 /// fibers are scanned normally.
 ///
 /// # Safety
-/// `mem_base`/`mask`/`mapped`/`trap_out` are the threaded guest-window context (as for
+/// `mem_base`/`mask`/`mapped`/`vm` are the threaded guest-window context (as for
 /// `call.cap`). `payload_mask` is the §GC tagged-pointer mask (distinct from the window-confinement
 /// `mask`). The running vCPU's fiber runtime is read from [`CURRENT_RT`]; a null runtime, an
 /// out-of-window `buf`, a non-STW call (a fiber running on another vCPU), or a `payload_mask` that
@@ -1812,7 +1814,7 @@ pub(crate) struct GcRootsArgs {
     mem_base: u64,
     mask: u64,
     mapped: u64,
-    trap_out: u64,
+    vm: u64,
     /// #2164 — a demand-paged instance's declared page count, which bounds its access table
     /// ([`crate::VmCtx::pages`]); `0` for any other.
     pages: u64,
@@ -1829,7 +1831,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     // SAFETY: the JIT hands the address of a live 10-field slot; the flush trampoline is the only
     // caller.
     let a = unsafe { &*args };
-    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out) = (
+    let (heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, vm) = (
         a.heap_lo,
         a.heap_hi,
         a.payload_mask,
@@ -1838,11 +1840,11 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         a.mem_base,
         a.mask,
         a.mapped,
-        a.trap_out,
+        a.vm,
     );
     let rt = current();
     if rt.is_null() {
-        fault(trap_out);
+        fault(vm);
         return 0;
     }
     // Security: the payload mask may only clear the top byte (low 56 bits all-ones), else a host
@@ -1850,7 +1852,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     // (GC.md §3, §6). The verifier rejects a constant fold-down mask statically; this defends an
     // unverified module / non-constant mask, mirroring the interpreter's runtime check.
     if payload_mask | 0xFF00_0000_0000_0000 != u64::MAX {
-        fault(trap_out);
+        fault(vm);
         return 0;
     }
     let rt = &*rt;
@@ -1900,7 +1902,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
                     // fiber running on *this* vCPU is the caller's own resume chain (quiescent while
                     // this synchronous thunk runs).
                     if slot.running_on.load(Ordering::Relaxed) != rt.me {
-                        fault(trap_out);
+                        fault(vm);
                         return 0;
                     }
                     // Tight `[sp, top)` from the resume chain. A running fiber on this vCPU is always
@@ -1963,7 +1965,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
         let refused = masked.checked_add(nbytes).is_none_or(|end| end > mapped)
             || (a.pages != 0
                 && !crate::table_admits(
-                    crate::VmCtx::of_trap_out(trap_out as *mut i64).pages,
+                    crate::VmCtx::at(vm).pages,
                     a.pages,
                     masked,
                     nbytes,
@@ -1971,7 +1973,7 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
                 ));
         if refused {
             // A forged, out-of-window or unwritable buffer: the interpreters' `MemoryFault`.
-            *(trap_out as *mut i64) = TrapKind::MemoryFault as i64;
+            crate::VmCtx::at(vm).raise(TrapKind::MemoryFault as i64);
             return 0;
         }
         let dst = (mem_base + masked) as *mut u8;
@@ -2167,23 +2169,27 @@ mod flatten_claim_tests {
         let rt = Box::into_raw(Box::new(FiberRuntime::new(table, 0, 0)));
         let prev = set_current(rt);
         let mut status = 0i64;
-        let mut trap = 0i64;
-        let trap_out = &mut trap as *mut i64 as u64;
+        let ctx = crate::VmCtx::new(crate::InstanceAddrs::NONE);
+        let vm = &ctx as *const crate::VmCtx as u64;
         // SAFETY: `rt` is published as this thread's runtime for both calls, and the claim fails
         // before any stack switch, so no fiber runs.
         unsafe {
             (*rt).flattening = true;
-            fiber_resume(snapshot, 0, &mut status, trap_out);
+            fiber_resume(snapshot, 0, &mut status, vm);
         }
-        assert_eq!(trap, 0, "a driver's stale snapshot is not a forgery");
+        assert_eq!(
+            ctx.ended(),
+            None,
+            "a driver's stale snapshot is not a forgery"
+        );
         // SAFETY: as above.
         unsafe {
             (*rt).flattening = false;
-            fiber_resume(snapshot, 0, &mut status, trap_out);
+            fiber_resume(snapshot, 0, &mut status, vm);
         }
         assert_eq!(
-            trap,
-            TrapKind::FiberFault as i64,
+            ctx.ended(),
+            Some(TrapKind::FiberFault as i64),
             "a guest's resume of a flattened fiber still faults"
         );
         set_current(prev);

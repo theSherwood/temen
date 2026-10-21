@@ -345,8 +345,8 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
     let m = Mutex::new(host);
     let ctx = &m as *const Mutex<Host> as *mut core::ffi::c_void;
     // SAFETY: `ctx` is a live `*const Mutex<Host>` for the scope; args/results are valid
-    // per-thread locals, and `trap_out` is each worker's own `VmCtx` trap cell, as compiled code
-    // passes it (the thunk's wait reads the instance through it: here no domain, no kill cell); no
+    // per-thread locals, and `vm` is each worker's own `VmCtx`, as compiled code passes it (the
+    // thunk's wait reads the instance through it: here no domain, no kill cell); no
     // window (`mem_base` null) — the `CapThunk` contract.
     let addr = ctx as usize;
     let results: Vec<i64> = std::thread::scope(|s| {
@@ -369,11 +369,10 @@ fn jit_locked_thunk_releases_lock_before_completion_wait() {
                             1,
                             &mut result,
                             1,
-                            vm.trap_ptr(),
+                            &vm,
                         );
                     }
-                    let trap = vm.trap.load(std::sync::atomic::Ordering::Relaxed);
-                    assert_eq!(trap, 0, "worker {i}: clean dispatch");
+                    assert_eq!(vm.ended(), None, "worker {i}: clean dispatch");
                     result
                 })
             })

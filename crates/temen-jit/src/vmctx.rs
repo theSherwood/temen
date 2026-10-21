@@ -6,9 +6,9 @@
 //! flag + ctx. That tied the machine code to one `Host`, so a fork twin — its own powerbox over the
 //! parent's program — could not run its parent's code, and an exec'd image could not reuse a compile.
 //! Now each of those addresses lives here, and the code loads it: Wasmtime's `VMContext`, placed where
-//! the ABI already had a slot for it. Every function threads a pointer to its instance's trap cell;
-//! that cell is this struct's first field, so the pointer *is* the vmctx, and every reader of the trap
-//! cell (a trap store, the post-call propagation check, a host thunk's `*trap_out = …`) is unchanged.
+//! the ABI already had a slot for it. Every function threads a pointer to its instance's context, whose
+//! first field is the trap cell, so compiled code raises and checks the cell at offset 0 of the pointer
+//! it already has, and a host thunk is handed the same pointer as a `&VmCtx`.
 //!
 //! What stays baked is what describes the **code**, not the instance: the window geometry (the
 //! confinement mask is an immediate on the hot path), the table mask, and whether each check is
@@ -30,18 +30,25 @@
 //! root's, a child's, a fiber of the running instance (its creator's), a spawned vCPU (its domain's), a
 //! handler invoked over a live window (the window's owner). The type makes the omission a compile
 //! error; the comment at each site says which instance.
+//!
+//! **The trap cell is how the domain ended, written once (#2499).** Every vCPU of a domain shares its
+//! context, and by invariants 5 and 6 every code the cell can hold — a trap, an `exit`, the end
+//! teardown records — ends the whole domain. So the cell is not a per-call status: [`VmCtx::raise`]
+//! records an end only if none is recorded (the first end wins), nothing clears it while a run is in
+//! it, and every check — the propagation guard after each call, a loop's poll, a park, the run's
+//! outcome — reads that one word. The field is private: a host thunk raises and reads, never stores.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 
 /// The per-instance context (see the module docs). `#[repr(C)]`: compiled code addresses the fields
 /// at the fixed offsets below.
 #[repr(C)]
 pub struct VmCtx {
-    /// The trap cell: `0` = running / ok; the low 32 bits a [`crate::TrapKind`] / `EXIT_CODE` /
-    /// internal code, the high 32 bits an exit code. **Offset 0** — a pointer to the vmctx is a
-    /// pointer to the trap cell.
-    pub trap: AtomicI64,
+    /// The trap cell: `0` while the domain runs; once it ended, the low 32 bits a [`crate::TrapKind`] /
+    /// `EXIT_CODE` / internal code, the high 32 bits an exit code. Written once, by [`Self::raise`].
+    /// **Offset 0** — a pointer to the vmctx is a pointer to the trap cell.
+    trap: AtomicI64,
     /// The `call.cap` thunk's opaque ctx: the instance's powerbox (`*mut Host`, `*const Mutex<Host>`,
     /// or a child's own), handed to every `call.cap` as the thunk's first argument.
     pub cap_ctx: *mut c_void,
@@ -54,17 +61,12 @@ pub struct VmCtx {
     /// #932 — the signal-delivery ctx handed to the take/return thunks (null when not armed).
     pub sig_ctx: *mut c_void,
     /// The embedder's own per-instance state, opaque to the JIT and never read by compiled code:
-    /// what a `call.cap` thunk — which is handed this context as its `trap_out` — needs beyond the
-    /// powerbox (temen-run's process-tree membership, #1768). Null when the embedder keeps none.
+    /// what a `call.cap` thunk — which is handed this context — needs beyond the powerbox
+    /// (temen-run's process-tree membership, #1768). Null when the embedder keeps none.
     pub embedder: *mut c_void,
     /// The §12 thread domain (`os_thread_rt::Domain`) the instance's `thread.*`, futex and blocking
     /// `cont.resume` sites run on: its own, or for a §14 child its parent's. Null when it has none.
     pub sched: *const c_void,
-    /// #2088 — the **stop word**: a trap code a parent's `kill` or teardown sets to end this instance's
-    /// running vCPUs. Their entry and back-edge poll (`emit_domain_poll`) moves it into the trap cell
-    /// and unwinds. It is apart from the trap cell because a successful `call.cap` resets that cell to
-    /// `0`, which would erase a stop that landed during the call.
-    pub stop: AtomicI64,
     /// temen#2168 — the §14 `Nursery` (`instantiator_rt::Nursery`) the instance's `Instantiator`
     /// sites spawn and join through: its own, which holds its children. Null when it has none.
     pub nursery: *const c_void,
@@ -122,33 +124,45 @@ impl VmCtx {
             sig_ctx: a.sig_ctx,
             embedder: a.embedder,
             sched: a.sched,
-            stop: AtomicI64::new(0),
             nursery: a.nursery,
             setjmp: a.setjmp,
             pages: a.pages,
         }
     }
 
-    /// The context a `call.cap` thunk was handed as its `trap_out` (a vmctx's field 0).
-    ///
-    /// # Safety
-    /// `trap_out` is the `trap_out` argument of a thunk call made by compiled code, whose instance
-    /// context is live for the call.
-    pub unsafe fn of_trap_out<'a>(trap_out: *mut i64) -> &'a VmCtx {
-        &*(trap_out as *const VmCtx)
+    /// End this context's domain with `code` — a trap, an `exit`, or an internal end — unless an end
+    /// is already recorded: the first end wins, and a later one changes nothing (#2499). Every vCPU
+    /// sharing the context sees it at its next check.
+    pub fn raise(&self, code: i64) {
+        debug_assert_ne!(code, 0, "an end is never 0");
+        let _ = self
+            .trap
+            .compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
     }
 
-    /// The trap cell's address — what the FFI entry shims and the host thunks spell `trap_out`.
-    pub fn trap_ptr(&self) -> *mut i64 {
-        self.trap.as_ptr()
+    /// The code that ended this context's domain, or `None` while it runs.
+    pub fn ended(&self) -> Option<i64> {
+        match self.trap.load(Ordering::Relaxed) {
+            0 => None,
+            code => Some(code),
+        }
+    }
+
+    /// The context at `vm`: the address compiled code threads, as a `u64`, to the runtime functions
+    /// it calls.
+    ///
+    /// # Safety
+    /// `vm` is the address of a context live for the returned borrow.
+    pub(crate) unsafe fn at<'a>(vm: u64) -> &'a VmCtx {
+        &*(vm as *const VmCtx)
     }
 }
 
 // SAFETY: every pointer field is the address of a host-owned object that outlives each run entering
 // through this context (the caller's contract at every entry), and compiled code only *reads* them; the
-// one field written concurrently — the trap cell, by sibling vCPUs of one instance — is atomic. So one
-// context may be shared by the threads of one instance (its spawned vCPUs, a §14 task's worker). The
-// stop word is atomic too: a parent's thread writes it while the instance runs.
+// one field written concurrently — the trap cell, by sibling vCPUs of one instance and a parent ending
+// it — is atomic. So one context may be shared by the threads of one instance (its spawned vCPUs, a
+// §14 task's worker).
 unsafe impl Send for VmCtx {}
 unsafe impl Sync for VmCtx {}
 
@@ -160,10 +174,24 @@ pub(crate) const FUEL: i32 = core::mem::offset_of!(VmCtx, fuel) as i32;
 pub(crate) const SIG_ARMED: i32 = core::mem::offset_of!(VmCtx, sig_armed) as i32;
 pub(crate) const SIG_CTX: i32 = core::mem::offset_of!(VmCtx, sig_ctx) as i32;
 pub(crate) const SCHED: i32 = core::mem::offset_of!(VmCtx, sched) as i32;
-pub(crate) const STOP: i32 = core::mem::offset_of!(VmCtx, stop) as i32;
 pub(crate) const NURSERY: i32 = core::mem::offset_of!(VmCtx, nursery) as i32;
 pub(crate) const SETJMP: i32 = core::mem::offset_of!(VmCtx, setjmp) as i32;
 pub(crate) const PAGES: i32 = core::mem::offset_of!(VmCtx, pages) as i32;
 
 // The trap cell must be the first field: every trap-cell reader dereferences the vmctx pointer itself.
 const _: () = assert!(core::mem::offset_of!(VmCtx, trap) == 0);
+
+#[cfg(test)]
+mod tests {
+    use super::{InstanceAddrs, VmCtx};
+
+    /// #2499 — a domain ends once: the first end raised stands, and a later one changes nothing.
+    #[test]
+    fn the_first_end_wins() {
+        let vm = VmCtx::new(InstanceAddrs::NONE);
+        assert_eq!(vm.ended(), None);
+        vm.raise(7);
+        vm.raise(9);
+        assert_eq!(vm.ended(), Some(7));
+    }
+}
