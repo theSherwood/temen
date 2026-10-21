@@ -156,7 +156,8 @@ fn bench(name: &str, src: &str, py_key: &str, interp_big: i64, jit_big: i64) {
 
 // acc = load(load(acc) stored at a fixed address) + i, for i in 0..n. Each iteration does an
 // i64 store + i64 load against linear memory, so this kernel exercises the memory-op path
-// (confinement + page-protection check + the `Mem` wrappers) rather than pure ALU dispatch.
+// (confinement + page-protection check + the `Mem` wrappers) rather than pure ALU dispatch. The word
+// sits above the 16 KiB NULL guard every module gets (#1094), which traps an access below it.
 const MEM: &str = r#"
 memory 16
 func (i64) -> (i64) {
@@ -170,7 +171,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
   br_if v6 2(v3, v4, v5) 3(v4)
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
-  v10 = i64.const 8
+  v10 = i64.const 16392
   i64.store v10 v8
   v11 = i64.load v10
   v12 = i64.add v11 v9

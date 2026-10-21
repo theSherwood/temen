@@ -33843,12 +33843,12 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
-    /// Fast-path flag: set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13
-    /// region alias, demand/supply paging) — monotonic, dirtied at the [`Mem::space_write`] choke
-    /// point. While clear — the overwhelmingly common case (no syscalls, no demand children, no regions)
-    /// — [`Mem::check_prot`] knows every in-prefix page is plain RW and skips the address-space
-    /// `RwLock` read entirely. Shared with the same topology as `space` (cloned for a forked thread,
-    /// fresh for a §14 child, which has its own address space).
+    /// Set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13 region alias,
+    /// demand/supply paging, the NULL guard, read-only data) — monotonic, dirtied at the
+    /// [`Mem::space_write`] choke point. While clear, every in-prefix page is plain RW, which a fork
+    /// and a snapshot use to skip reading the map. (The access fast path is [`fast`](Mem::fast)'s:
+    /// the guard sets this in nearly every window.) Shared with the same topology as `space` (cloned
+    /// for a forked thread, fresh for a §14 child, which has its own address space).
     prot_dirty: Arc<AtomicBool>,
     /// #1009 paged tier-up: a monotonic **page-map version**, bumped at the [`Mem::space_write`] choke
     /// point on every address-space mutation. A page-checked driver rebuilds its page-state table
@@ -33858,6 +33858,14 @@ struct Mem {
     /// child with its own address space). Over-counts harmlessly (a write-lock taken without a real
     /// mutation just forces one extra rebuild — never a stale table).
     map_version: Arc<AtomicU64>,
+    /// #2577 — what an access may skip the page map for, a packed [`FastRun`]: the run of readable
+    /// pages from the NULL guard, and the span of its read-only ones. An access inside it needs
+    /// neither the map nor its lock ([`Mem::in_fast_run`]). [`Mem::space_write`] empties it once it
+    /// holds the lock, and its guard republishes it before releasing the lock, so it never covers a
+    /// page while that page changes. It may admit less than the map, never more. It replaces
+    /// `prot_dirty` as the fast-path gate, which the NULL guard set in every window. Shares
+    /// `space`'s topology.
+    fast: Arc<AtomicU64>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
     /// `confine_checked` clears it to [`NO_FAULT`]). A demand child's fault seam reads it
@@ -33908,6 +33916,63 @@ struct AddrSpace {
     /// frame boundary counts holders as a freeze after a run does (#2051). A page whose region is
     /// gone reads zero and drops its stores, as one naming no region always has.
     regions: BTreeMap<u32, Weak<dyn SharedBacking>>,
+}
+
+/// The address space under its write lock ([`Mem::space_write`]). Dropping it republishes the
+/// window's [`FastRun`] ([`Mem::fast`]) for the map it leaves, before the lock is released (#2577).
+struct SpaceWrite<'a> {
+    mem: &'a Mem,
+    space: std::sync::RwLockWriteGuard<'a, AddrSpace>,
+}
+
+impl std::ops::Deref for SpaceWrite<'_> {
+    type Target = AddrSpace;
+    fn deref(&self) -> &AddrSpace {
+        &self.space
+    }
+}
+
+impl std::ops::DerefMut for SpaceWrite<'_> {
+    fn deref_mut(&mut self) -> &mut AddrSpace {
+        &mut self.space
+    }
+}
+
+impl Drop for SpaceWrite<'_> {
+    fn drop(&mut self) {
+        let run = self.mem.fast_run(&self.space.prot);
+        self.mem.fast.store(run.pack(), Ordering::Release);
+    }
+}
+
+/// #2577 — the pages an access may skip a window's page map for, in page units: every page in
+/// `[null_guard, top)` admits loads from `back` (the mapped prefix and the `Rw` or `Ro` pages that
+/// continue it), and every one outside `[ro_lo, ro_hi)`, the span of its `Ro` pages, admits stores
+/// too. Packed into one word ([`Mem::fast`]), so a reader never mixes two maps' worth.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FastRun {
+    top: u64,
+    ro_lo: u64,
+    ro_hi: u64,
+}
+
+impl FastRun {
+    /// Bits per field: three fit in a word. `2^21` pages is 8 GiB of 4 KiB pages; a run is cut
+    /// there, and an access past it takes the exact path.
+    const BITS: u32 = 21;
+    const MAX: u64 = (1 << Self::BITS) - 1;
+
+    fn pack(self) -> u64 {
+        self.top | self.ro_lo << Self::BITS | self.ro_hi << (2 * Self::BITS)
+    }
+
+    fn unpack(word: u64) -> FastRun {
+        FastRun {
+            top: word & Self::MAX,
+            ro_lo: word >> Self::BITS & Self::MAX,
+            ro_hi: word >> (2 * Self::BITS) & Self::MAX,
+        }
+    }
 }
 
 /// How a fresh window starts (#1737): its geometry, the backing it sits on, and what is laid into it,
@@ -33980,7 +34045,7 @@ impl Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
-        Mem {
+        let mem = Mem {
             back: Arc::new(Self::reserved_backing(window.reserved(), page)),
             window,
             page,
@@ -33994,7 +34059,10 @@ impl Mem {
             writes: 0,
             null_guard: 0,
             shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
+            fast: Arc::new(AtomicU64::new(0)),
+        };
+        mem.refresh_fast();
+        mem
     }
 
     /// #1145 — the largest reservation [`Mem::with_reservation`] will eagerly allocate a **flat
@@ -34054,7 +34122,7 @@ impl Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
-        Mem {
+        let mem = Mem {
             back,
             window,
             page,
@@ -34068,7 +34136,10 @@ impl Mem {
             writes: 0,
             null_guard: 0,
             shadow: shadow.unwrap_or(ShadowArena::EMPTY),
-        }
+            fast: Arc::new(AtomicU64::new(0)),
+        };
+        mem.refresh_fast();
+        mem
     }
 
     /// Read/write the shared address space, recovering from a poisoned lock (the interpreter never
@@ -34076,17 +34147,76 @@ impl Mem {
     fn space_read(&self) -> std::sync::RwLockReadGuard<'_, AddrSpace> {
         self.space.read_unpoisoned()
     }
-    fn space_write(&self) -> std::sync::RwLockWriteGuard<'_, AddrSpace> {
-        // Any address-space mutation (the only reason to take the write lock) disables the lock-free
-        // `check_prot` fast path, monotonically. Set *before* acquiring the lock so a concurrent
-        // reader never observes a clear flag after a mutation has begun (a false positive just makes
-        // it take the read lock — always safe; a false negative would not be).
+    fn space_write(&self) -> SpaceWrite<'_> {
+        // Any address-space mutation (the only reason to take the write lock) marks the space ever
+        // mutated, monotonically. Set *before* acquiring the lock so a concurrent reader never
+        // observes a clear flag after a mutation has begun.
         self.prot_dirty.store(true, Ordering::Release);
         // #1009: bump the page-map version — a paged tier-up driver reuses its page-state table
         // across events while this is unchanged (see the field). Bumped once per write-lock take
         // (per `map`/`unmap`/`protect` op), before the mutation, same discipline as `prot_dirty`.
         self.map_version.fetch_add(1, Ordering::Release);
-        self.space.write_unpoisoned()
+        let space = self.space.write_unpoisoned();
+        // #2577: no access takes the lock-free path while the map changes. The guard republishes
+        // the run when it drops.
+        self.fast.store(0, Ordering::Release);
+        SpaceWrite { mem: self, space }
+    }
+
+    /// #2577 — the [`FastRun`] `prot` leaves: from the NULL guard, the mapped prefix and the `Rw` or
+    /// `Ro` pages that continue it, up to the first unmapped or aliased page, the first hole and the
+    /// backing's end, with the span of the `Ro` pages among them.
+    fn fast_run(&self, prot: &BTreeMap<u64, PageProt>) -> FastRun {
+        let mut top = self.window.mapped().div_ceil(self.page);
+        let mut ro: Option<(u64, u64)> = None;
+        for (&page, state) in prot.range(self.null_guard / self.page..) {
+            match state {
+                PageProt::Rw | PageProt::Ro if page <= top => {
+                    if page == top {
+                        top += 1;
+                    }
+                    if matches!(state, PageProt::Ro) {
+                        let (lo, hi) = ro.unwrap_or((page, page));
+                        ro = Some((lo.min(page), hi.max(page + 1)));
+                    }
+                }
+                _ => {
+                    top = top.min(page); // an unmapped or aliased page, or a hole
+                    break;
+                }
+            }
+        }
+        let top = top.min(self.win_flat_len() / self.page).min(FastRun::MAX);
+        let (ro_lo, ro_hi) = ro.map_or((top, top), |(lo, hi)| (lo.min(top), hi.min(top)));
+        FastRun { top, ro_lo, ro_hi }
+    }
+
+    /// Republish [`fast`](Mem::fast) after a change the page map does not record: a new window, its
+    /// mapped prefix or backing grew, or its NULL guard was set.
+    fn refresh_fast(&self) {
+        let space = self.space_read();
+        self.fast
+            .store(self.fast_run(&space.prot).pack(), Ordering::Release);
+    }
+
+    /// Whether the bytes `[base, last]` lie in the window's [`FastRun`] (#2577), so a load of them,
+    /// or a store when `write`, needs no page-state lookup.
+    #[inline]
+    fn in_fast_run(&self, base: u64, last: u64, write: bool) -> bool {
+        let run = FastRun::unpack(self.fast.load(Ordering::Acquire));
+        base >= self.null_guard
+            && last < run.top * self.page
+            && (!write || last < run.ro_lo * self.page || base >= run.ro_hi * self.page)
+    }
+
+    /// `addr + offset` when the whole `width`-byte access lies in the window's [`FastRun`]: it needs
+    /// neither the page map nor [`confine_checked`](Mem::confine_checked)'s `last_fault` reset. The
+    /// reserved bound is temen-mask's, as there.
+    #[inline]
+    fn fast_access(&self, addr: u64, offset: u64, width: u32, write: bool) -> Option<u64> {
+        let abs = self.window.checked_reserved(addr, offset, width)?;
+        self.in_fast_run(abs, abs + width as u64 - 1, write)
+            .then_some(abs)
     }
 
     /// #1009 paged tier-up: the current page-map version (see the [`map_version`](Mem::map_version)
@@ -34125,6 +34255,7 @@ impl Mem {
             has_regions: Arc::clone(&self.has_regions),
             prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
+            fast: Arc::clone(&self.fast),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
             fault_report: AtomicU64::new(NO_FAULT),
@@ -34213,6 +34344,7 @@ impl Mem {
         // #964: the twin runs the same module — its NULL guard (already in `prot_copy` as pages,
         // and enforced by `prot_pages`' refusal via this field) carries over.
         twin.null_guard = self.null_guard;
+        twin.refresh_fast();
         Some(twin)
     }
 
@@ -34271,20 +34403,15 @@ impl Mem {
 
     /// Enforce the page state for a `width`-byte access at confined offset `base`: any access to an
     /// unmapped page, or a store to a read-only page, faults (§4/§5). Fast-pathed when the access
-    /// lies wholly in the committed prefix and no page has been re-protected (the common case), so
-    /// unprotected windows pay nothing.
+    /// lies wholly in the window's [`FastRun`] (the common case), so it reads no page map.
     fn check_prot(&self, base: u64, width: u32, write: bool) -> Result<(), Trap> {
         let last = base + width as u64 - 1;
-        // Lock-free fast path: the address space has never been mutated, so every page is in its
-        // region default — RW inside `[0, mapped)`. An in-prefix access is unconditionally fine and
-        // skips the `RwLock` read entirely (the hot, overwhelmingly common case).
-        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+        // Lock-free fast path (#2577): the access lies in the window's [`FastRun`], so every page it
+        // touches admits it and the `RwLock` read is skipped (the hot, overwhelmingly common case).
+        if self.in_fast_run(base, last, write) {
             return Ok(());
         }
         let space = self.space_read();
-        if space.prot.is_empty() && last < self.window.mapped() {
-            return Ok(());
-        }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(self.refused(base, page)), // unmapped
@@ -34401,6 +34528,7 @@ impl Mem {
         }
         if high > self.window.mapped() {
             self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
+            self.refresh_fast();
         }
         if entries.is_empty() {
             return;
@@ -34735,13 +34863,10 @@ impl Mem {
     /// [`Self::check_prot`]. `len >= 1` (see [`Self::confine_span`]).
     fn check_prot_span(&self, base: u64, len: u64, write: bool) -> Result<(), Trap> {
         let last = base + (len - 1);
-        if !self.prot_dirty.load(Ordering::Acquire) && last < self.window.mapped() {
+        if self.in_fast_run(base, last, write) {
             return Ok(());
         }
         let space = self.space_read();
-        if space.prot.is_empty() && last < self.window.mapped() {
-            return Ok(());
-        }
         for page in (base / self.page)..=(last / self.page) {
             match self.page_access(&space.prot, page) {
                 None => return Err(self.refused(base, page)), // unmapped
@@ -34852,29 +34977,25 @@ impl Mem {
         Ok(())
     }
 
-    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When no protection has
-    /// ever been mutated (`!prot_dirty` — the common case: no syscalls / demand paging / §13 regions, so
-    /// every prefix page is plain committed RW and `!prot_dirty ⟹ !has_regions`) and the access lies
-    /// wholly in the backed prefix ([`Window::checked`]), read straight through — skipping the per-op
-    /// `last_fault` atomic store in `confine_checked` and the `check_prot` page scan. **Semantically
-    /// identical** to the cold [`Mem::load`] for this case (the escape-oracle byte-compares it); any
-    /// other case (RO/unmapped/reserved-tail/regions, or a recoverable demand fault) falls to the cold
-    /// path, which keeps the exact trap + `last_fault` semantics. Returns the [`Reg`] slot directly,
-    /// dropping the `Value` round-trip the bytecode engine paid via `Reg::from_value(load(..))`.
+    /// Bytecode-engine scalar load (Phase 2): the slot-returning fast path. When the access lies
+    /// wholly in the window's [`FastRun`] ([`Mem::fast_access`], #2577), read straight through — skipping the per-op `last_fault` atomic store in `confine_checked` and the
+    /// `check_prot` page scan. **Semantically identical** to the cold [`Mem::load`] for this case (the
+    /// escape-oracle byte-compares it); any other case (RO/unmapped/past the run/regions, or a
+    /// recoverable demand fault) falls to the cold path, which keeps the exact trap + `last_fault`
+    /// semantics. Returns the [`Reg`] slot directly, dropping the `Value` round-trip the bytecode
+    /// engine paid via `Reg::from_value(load(..))`.
     #[inline]
     fn load_scalar(&self, addr: u64, offset: u64, op: LoadOp) -> Result<Reg, Trap> {
         let (_, rty, width, signed) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            if let Some(abs) = self.window.checked(addr, offset, width) {
-                // `!prot_dirty ⟹ !has_regions`, so the bytes live in `back` (no §13 redirect); the
-                // cooperative bytecode engine is the sole accessor, so a single non-atomic word read
-                // is sound (and one instruction, not `width` atomic byte loads).
-                let raw = self.back.read_word(abs, width);
-                return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
-            }
+        if let Some(abs) = self.fast_access(addr, offset, width, false) {
+            // The run holds no `Backed` page, so the bytes live in `back` (no §13 redirect); the
+            // cooperative bytecode engine is the sole accessor, so a single non-atomic word read is
+            // sound (and one instruction, not `width` atomic byte loads).
+            let raw = self.back.read_word(abs, width);
+            return Ok(Reg::from_value(decode_loaded(rty, width, signed, raw)));
         }
-        // Cold path — prot has been mutated (every rodata card sets `prot_dirty` once at init) or the
-        // access reaches the reserved tail. Run the *exact* confine + protection check the oracle
+        // Cold path — the access leaves the [`FastRun`] (an unmapped or aliased page, the NULL
+        // guard, the reserved tail). Run the *exact* confine + protection check the oracle
         // [`Mem::load`] does (identical trap / `last_fault` / demand-fault semantics), but when `back`
         // is contiguous (no §13 region redirect) still finish with **one** wide non-atomic read rather
         // than `load`'s per-byte atomic `read_le` — the same cooperative sole-accessor contract as the
@@ -34896,12 +35017,10 @@ impl Mem {
     #[inline]
     fn store_scalar(&mut self, addr: u64, offset: u64, op: StoreOp, lo: u64) -> Result<(), Trap> {
         let (_, _, width) = op.info();
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            if let Some(abs) = self.window.checked(addr, offset, width) {
-                self.back.write_word(abs, width, lo);
-                self.writes += 1;
-                return Ok(());
-            }
+        if let Some(abs) = self.fast_access(addr, offset, width, true) {
+            self.back.write_word(abs, width, lo);
+            self.writes += 1;
+            return Ok(());
         }
         // Cold path, same reasoning as [`Mem::load_scalar`]: the exact confine + protection check the
         // oracle [`Mem::store`] does, then one wide non-atomic write when `back` is contiguous.
@@ -39043,6 +39162,78 @@ mod prot_tests {
         assert_eq!(m.map(0, page(), PROT_READ | PROT_WRITE), 0);
         assert_eq!(m.load(0, 0, LoadOp::I64), Ok(Value::I64(0)));
         assert!(m.store(0, 0, StoreOp::I64, Value::I64(1)).is_ok());
+    }
+
+    /// #2577 — the lock-free run reaches past a window's read-only pages for loads, not stores, and
+    /// over its `vm_map`-grown tail: a nim tool's stack and heap sit above its libc's rodata. Below
+    /// the NULL guard nothing skips the map.
+    #[test]
+    fn the_fast_run_spans_read_only_pages_for_loads_and_the_grown_tail() {
+        let (p, top) = (page(), 1u64 << 20);
+        let guard = temen_ir::module_null_guard();
+        let mut m = Mem::from_spec(WindowSpec {
+            reserved_log2: 22,
+            mapped_log2: 20,
+            null_guard: guard,
+            ..WindowSpec::default()
+        });
+        let ro = 8 * p;
+        assert_eq!(m.protect(ro, p, PROT_READ), 0);
+        assert_eq!(m.map(top, 2 * p, PROT_READ | PROT_WRITE), 0);
+        let fast = |m: &Mem, at: u64, write| m.in_fast_run(at, at + 7, write);
+        assert!(fast(&m, ro, false), "a load from the read-only page");
+        assert!(!fast(&m, ro, true), "a store to it");
+        assert!(fast(&m, ro + p, true), "a store above it");
+        assert!(fast(&m, top + p, true), "a store to the grown tail");
+        assert!(!fast(&m, top + 2 * p, false), "past the tail");
+        if m.null_guard != 0 {
+            assert!(!fast(&m, 0, false), "the NULL guard");
+        }
+        assert_eq!(
+            m.store_scalar(ro, 0, StoreOp::I64, 1),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(m.store_scalar(top + p, 0, StoreOp::I64, 9), Ok(()));
+        assert_eq!(
+            m.load_scalar(top + p, 0, LoadOp::I64),
+            Ok(Reg::from_value(Value::I64(9)))
+        );
+    }
+
+    /// #2577 — the run is the address space's, so a page one vCPU protects leaves it for every vCPU
+    /// sharing the space, and their stores to it fault.
+    #[test]
+    fn a_page_one_vcpu_protects_leaves_every_vcpus_run() {
+        let p = page();
+        let mut a = Mem::with_reservation(22, 20, None);
+        let mut b = a.fork_for_thread();
+        assert!(b.in_fast_run(p, p + 7, true));
+        assert_eq!(a.protect(p, p, PROT_READ), 0);
+        assert!(!b.in_fast_run(p, p + 7, true));
+        assert_eq!(
+            b.store_scalar(p, 0, StoreOp::I64, 1),
+            Err(Trap::MemoryFault)
+        );
+        assert_eq!(a.unmap(2 * p, p), 0);
+        assert!(
+            !b.in_fast_run(2 * p, 2 * p + 7, false),
+            "nor an unmapped one"
+        );
+        assert!(
+            !b.in_fast_run(3 * p, 3 * p + 7, false),
+            "nor what lies above the hole"
+        );
+    }
+
+    /// #2577 — a window re-seeded across a tier bounce folds its grown tail into the mapped prefix
+    /// ([`Mem::seed_pages`]), and the run follows it.
+    #[test]
+    fn a_reseeded_windows_run_covers_its_folded_tail() {
+        let (p, top) = (page(), 1u64 << 20);
+        let mut m = Mem::with_reservation(22, 20, None);
+        m.seed_pages(0, &[(top, 1), (top + p, 1)]);
+        assert!(m.in_fast_run(top + p, top + p + 7, true));
+        assert!(!m.in_fast_run(top + 2 * p, top + 2 * p + 7, false));
     }
 
     /// #2370 — the runs an op can change: the whole span when it grants access, else the declared
