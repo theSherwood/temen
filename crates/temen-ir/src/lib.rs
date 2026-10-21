@@ -452,46 +452,31 @@ pub mod trap_code {
 /// runtime must agree on. Hoisted here (temen-ir is the common dependency of all three) so the layout
 /// has **one definition** instead of three hand-synced copies gated by a partial pin test (#915).
 pub mod durable_abi {
-    /// Window byte offset of the `i32` **freeze state** word (`NORMAL`/`UNWINDING`/`REWINDING`/
-    /// `ARMED`). A freeze is stop-the-world, so this single global word is the broadcast every poll
-    /// reads (per-context thaw uses [`STATE_IN_REGION_OFF`] instead).
-    ///
-    /// #1094: the whole durable control region is based one [`super::POWERBOX_NULL_GUARD`] up — the
-    /// unconditional NULL guard unmaps `[0, guard)`, so the state word, shadow-SP, arm countdowns and
-    /// shadow arena live in `[guard, ShadowArena::end)` (below guest memory). `[0, guard)` is the
-    /// reserved NULL region.
-    pub const STATE_OFF: u64 = super::POWERBOX_NULL_GUARD;
-    /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset). One guard up
-    /// (#1094 — see [`STATE_OFF`]).
-    pub const SHADOW_SP_OFF: u64 = super::POWERBOX_NULL_GUARD + 8;
     /// Byte length of the in-region shadow-SP word (before the per-context thaw state word).
     pub const SHADOW_SP_WORD_LEN: u64 = 8;
-    /// Window byte offset of the `i64` **fiber-safepoint arm countdown** — safepoints
-    /// (`cont.resume`/`suspend`) still to pass before an `ARMED` run promotes to `UNWINDING`. Inert
-    /// unless armed, so an unarmed run is byte-identical.
-    pub const ARM_COUNTDOWN_OFF: u64 = super::POWERBOX_NULL_GUARD + 16;
-    /// Window byte offset of the `i64` **back-edge arm countdown** — loop back-edges still to pass
-    /// before an `ARMED` run promotes to `UNWINDING` (the Phase-4 Slice A back-edge-poll trigger,
-    /// separate from [`ARM_COUNTDOWN_OFF`]).
-    pub const ARM_BACKEDGE_OFF: u64 = super::POWERBOX_NULL_GUARD + 24;
-    /// Window byte offset of the `i8` **freeze-on-quiesce** flag: non-zero arms the runtime to freeze
-    /// when the run would otherwise block only on scheduler-owned parks (an idle server no countdown
-    /// can reach). In the `i32` [`STATE_OFF`] word's padding, `[guard+4, guard+8)`: `[guard+32,
-    /// guard+64)` is the powerbox heap words and empty argv/envp (#1851).
-    pub const ARM_QUIESCE_OFF: u64 = super::POWERBOX_NULL_GUARD + 4;
     /// §12.8 concurrent-thaw: byte offset of a context's **per-context thaw state** word
     /// (`REWINDING`/`NORMAL`) within its region — just past the [`SHADOW_SP_WORD_LEN`]-byte in-region
     /// SP word. Each frozen vCPU rewinds against its own word, so thaw can run them as concurrent
-    /// threads; the stop-the-world freeze state stays at the global [`STATE_OFF`].
+    /// threads; the stop-the-world freeze state stays in the arena's one freeze word
+    /// ([`ShadowArena::freeze_word`]).
     pub const STATE_IN_REGION_OFF: u64 = SHADOW_SP_WORD_LEN;
     /// #1672: byte offset of a context's `i32` **re-issue** word within its region, just past the thaw
     /// word. The runtime sets it to `1` when it abandons a host call that would have parked while a
     /// freeze is landing: the call took no effect, so the thaw must re-issue it rather than reload a
     /// result. The call's unwind spills the word into its shadow frame and clears it.
     pub const REISSUE_IN_REGION_OFF: u64 = STATE_IN_REGION_OFF + 4;
-    /// §12.8: bytes reserved at a context region's base before its shadow frames — the SP word, the
-    /// thaw state word at [`STATE_IN_REGION_OFF`] and the re-issue word at [`REISSUE_IN_REGION_OFF`].
-    pub const REGION_HEADER_LEN: u64 = 16;
+    /// #2518: the arena's own control words, in context 0's region header past that context's words
+    /// (see [`ShadowArena::freeze_word`] and its siblings, which are how every engine reaches them).
+    const FREEZE_IN_REGION_OFF: u64 = REISSUE_IN_REGION_OFF + 4;
+    const QUIESCE_IN_REGION_OFF: u64 = FREEZE_IN_REGION_OFF + 4;
+    const FIBER_ARM_IN_REGION_OFF: u64 = FREEZE_IN_REGION_OFF + 8;
+    const BACKEDGE_ARM_IN_REGION_OFF: u64 = FIBER_ARM_IN_REGION_OFF + 8;
+    /// §12.8: bytes reserved at a context region's base before its shadow frames: the SP word, the
+    /// thaw state word at [`STATE_IN_REGION_OFF`], the re-issue word at [`REISSUE_IN_REGION_OFF`], and
+    /// the arena's control words (#2518). Context 0's region holds those; every other context's
+    /// leaves the bytes unused, so that every region's frames start at the same offset.
+    pub const REGION_HEADER_LEN: u64 = 48;
+    const _: () = assert!(BACKEDGE_ARM_IN_REGION_OFF + 8 <= REGION_HEADER_LEN);
     /// The shadow-region stride an arena declares unless it names its own
     /// ([`ShadowArena::stride`]): 4 KiB. A deep call chain needs a wider one (#1872).
     pub const DEFAULT_SHADOW_STRIDE: u64 = 1 << 12;
@@ -500,7 +485,7 @@ pub mod durable_abi {
     /// verifier holds a declared arena to it; a producer that *places* an arena (the LLVM on-ramp's
     /// `--shadow-arena`, #1534) sizes against the same number rather than a copy of it.
     pub const MAX_SHADOW_CONTEXTS: usize = 64;
-    /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
+    /// Freeze/thaw **state-word values** ([`ShadowArena::freeze_word`] / [`STATE_IN_REGION_OFF`]).
     pub const STATE_NORMAL: i32 = 0;
     /// A stop-the-world freeze is in progress (unwinding shadow frames).
     pub const STATE_UNWINDING: i32 = 1;
@@ -524,7 +509,7 @@ pub mod durable_abi {
     pub const FIBER_FROZEN: i32 = -1;
 
     /// `svc.poll` / `svc.wait` op indices on the durable service interface (§13.4) — the two the
-    /// quiesce-freeze arming (`ARM_QUIESCE_OFF`) keys on.
+    /// quiesce-freeze arming ([`ShadowArena::quiesce_flag`]) keys on.
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
 
@@ -536,31 +521,24 @@ pub mod durable_abi {
         type_id == crate::CAP_SELF_TYPE_ID && matches!(op, SVC_POLL_OP | SVC_WAIT_OP)
     }
 
-    /// End of the **always-live** durable control words: the state word, shadow-SP and arm
-    /// countdowns occupy `[guard, guard+32)` and are polled at every safepoint, so their offsets
-    /// are fixed ABI; `[guard+32, guard+64)` is the powerbox heap words and empty argv/envp, which a
-    /// durable powerbox program keeps too. Everything the durable runtime keeps in the window
-    /// *beyond* this line — the per-context shadow regions — is live only during freeze/thaw and is
-    /// placed by the [`ShadowArena`], not by a constant.
-    pub const DURABLE_CONTROL_END: u64 = super::POWERBOX_NULL_GUARD + 64;
-
-    /// The **shadow arena**: the window byte range `[base, end)` holding a durable domain's
-    /// per-context shadow regions (context `i` owns `[base + i*stride, +stride)`).
-    /// This is the one durable-runtime structure whose *placement* is not a fixed ABI offset —
-    /// the instrumented IR addresses it through `durable.shadow_base`, so where it sits is a
-    /// property of the module, not of the substrate (INVARIANTS.md #16). So is the region size
-    /// ([`Self::stride`], #1872); the intra-region header ([`REGION_HEADER_LEN`],
-    /// [`STATE_IN_REGION_OFF`]) stays ABI.
+    /// The **shadow arena**: the window byte range `[base, end)` holding every word a durable domain's
+    /// runtime keeps in its window — its per-context shadow regions (context `i` owns
+    /// `[base + i*stride, +stride)`) and, in context 0's region header, the arena's control words: the
+    /// freeze word every poll reads, the quiesce flag and the two arm countdowns (#2518). Its
+    /// *placement* is the module's, not the substrate's — the instrumented IR addresses the regions
+    /// through `durable.shadow_base` and the freeze word at the constant the transform reads off the
+    /// declaration (INVARIANTS.md #16). So is the region size ([`Self::stride`], #1872); the layout of a
+    /// region header ([`REGION_HEADER_LEN`]) stays ABI.
     ///
-    /// **One definition of placement.** Every consumer — the transform's overflow guard and window
-    /// seed, both interpreter tiers' fiber registries, the Cranelift fiber runtime, the snapshot
-    /// codec — computes a region through these methods, replacing the three hand-synced
-    /// `shadow_region_base`/`shadow_region_fits`/`MAX_SHADOW_CTX` copies that used to have to
+    /// **One definition of placement.** Every consumer — the transform's polls, overflow guard and
+    /// window seed, both interpreter tiers, the Cranelift runtime, the snapshot codec — computes a
+    /// word or a region through these methods, replacing the hand-synced copies that used to have to
     /// "MUST match" each other.
     #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct ShadowArena {
-        /// First byte of the arena (context 0's region base). 8-aligned, `>= DURABLE_CONTROL_END`.
+        /// First byte of the arena (context 0's region base). 8-aligned, and clear of the NULL guard
+        /// of a window large enough to hold one (the verifier's rule).
         pub base: u64,
         /// One past the last byte.
         pub end: u64,
@@ -619,11 +597,12 @@ pub mod durable_abi {
             self.frame_base(ctx)
         }
 
-        /// A module that declared **no** arena: zero regions at the control-word boundary. Nothing
-        /// can be placed in it ([`Self::region_fits`] is false for every context), so a durable run
-        /// of such a module is refused at setup rather than defaulted — there is no default
+        /// A module that declared **no** arena: zero regions, so no context ([`Self::region_fits`] is
+        /// false for every one) and no control words ([`Self::freeze_word`] is `None`). Nothing in such a
+        /// module polls a freeze, so nothing can freeze it mid-run, and no engine reads or writes its
+        /// window for one (#2518). The transform refuses to instrument it rather than default a
         /// placement (INVARIANTS.md #16).
-        pub const EMPTY: ShadowArena = ShadowArena::new(DURABLE_CONTROL_END, DURABLE_CONTROL_END);
+        pub const EMPTY: ShadowArena = ShadowArena::new(0, 0);
 
         /// How many whole regions the arena holds (context indices `0..contexts()`).
         pub const fn contexts(self) -> usize {
@@ -644,17 +623,52 @@ pub mod durable_abi {
             ((sp - self.base) / self.stride) as usize
         }
 
+        /// #2518 — window offset of the arena's `i32` **freeze** word (`NORMAL`/`UNWINDING`/`ARMED`):
+        /// the stop-the-world broadcast every poll reads and a freeze request rings. A thaw's
+        /// `REWINDING` is per-context ([`Self::thaw_state_off`]). `None` for an arena with no regions
+        /// ([`Self::EMPTY`]): such a module has no control words, so nothing may read or write one.
+        pub const fn freeze_word(self) -> Option<u64> {
+            self.control_word(FREEZE_IN_REGION_OFF)
+        }
+
+        /// The `i8` **freeze-on-quiesce** flag: non-zero arms the runtime to freeze when the run would
+        /// otherwise block only on scheduler-owned parks (an idle server no countdown can reach).
+        /// `None` as for [`Self::freeze_word`].
+        pub const fn quiesce_flag(self) -> Option<u64> {
+            self.control_word(QUIESCE_IN_REGION_OFF)
+        }
+
+        /// The `i64` **fiber-safepoint arm countdown**: safepoints (`cont.resume`/`suspend`) still to
+        /// pass before an `ARMED` run promotes to `UNWINDING`. Inert unless armed, so an unarmed run is
+        /// byte-identical. `None` as for [`Self::freeze_word`].
+        pub const fn fiber_countdown(self) -> Option<u64> {
+            self.control_word(FIBER_ARM_IN_REGION_OFF)
+        }
+
+        /// The `i64` **back-edge arm countdown**: loop back-edges still to pass before an `ARMED` run
+        /// promotes to `UNWINDING` (the Phase-4 Slice A back-edge-poll trigger, separate from
+        /// [`Self::fiber_countdown`]). `None` as for [`Self::freeze_word`].
+        pub const fn backedge_countdown(self) -> Option<u64> {
+            self.control_word(BACKEDGE_ARM_IN_REGION_OFF)
+        }
+
+        /// The control word at `off` in context 0's region header, when the arena has a context 0.
+        const fn control_word(self, off: u64) -> Option<u64> {
+            if self.region_fits(0) {
+                Some(self.region_base(0) + off)
+            } else {
+                None
+            }
+        }
+
         /// #2426 — whether a page op over the host pages `first..=last` (of `page` bytes) would
-        /// change the protection of a page holding this window's runtime-private words: the control
-        /// words, `[STATE_OFF, DURABLE_CONTROL_END)`, and the arena. A durable run's host reads and
-        /// writes them outside the guest's guarded code (a freeze request rings the state word, and a
-        /// freeze flattens each parked fiber into its region), so a page the guest made read-only or
-        /// inaccessible there would fault in the host. Every engine refuses such an op, as it refuses
-        /// the NULL guard. A module that declared no arena is not freezable, and fences nothing.
+        /// change the protection of a page of the arena, which holds every word a durable run's host
+        /// reads and writes outside the guest's guarded code (a freeze request rings the freeze word,
+        /// and a freeze flattens each parked fiber into its region). A page the guest made read-only or
+        /// inaccessible there would fault in the host, so every engine refuses such an op, as it
+        /// refuses the NULL guard. A module that declared no arena is not freezable, and fences nothing.
         pub fn fences(self, first: u64, last: u64, page: u64) -> bool {
-            let touches = |lo: u64, hi: u64| lo / page <= last && first <= (hi - 1) / page;
-            self.size() > 0
-                && (touches(STATE_OFF, DURABLE_CONTROL_END) || touches(self.base, self.end))
+            self.size() > 0 && self.base / page <= last && first <= (self.end - 1) / page
         }
     }
 }
@@ -4176,9 +4190,8 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// is nothing there, and a null one faults against the #1094 NULL guard (#1422).
 ///
 /// Both sit in page 0's reserved scratch, in the gap between the heap-state words above and the
-/// args buffer at [`POWERBOX_ARGS_BASE`] — and, under the guarded layout, between the durable
-/// control words (`[guard, guard+32)`) and `durable_abi::DURABLE_CONTROL_END` (+64), so they
-/// collide with neither (`page0_words_are_disjoint` pins it).
+/// args buffer at [`POWERBOX_ARGS_BASE`], so they collide with neither (`page0_words_are_disjoint`
+/// pins it).
 pub const POWERBOX_EMPTY_ARGV: u64 = 48;
 /// The `envp` twin of [`POWERBOX_EMPTY_ARGV`]; see it for why an empty vector is a pointer to NULL
 /// rather than NULL itself.
@@ -7622,18 +7635,12 @@ mod page0_tests {
     use super::durable_abi as d;
     use super::*;
 
-    /// #1851: page 0's scratch (one guard up) holds two ABIs' words — the durable control words and
-    /// the powerbox's heap words, empty argv/envp and args buffer — and a durable powerbox program
-    /// keeps both. The quiesce flag once shared its word with the heap pointer.
+    /// #1851: page 0's scratch (one guard up) holds the powerbox's heap words, empty argv/envp and
+    /// args buffer, each clear of the others.
     #[test]
     fn page0_words_are_disjoint() {
         let g = POWERBOX_NULL_GUARD;
-        let words: [(&str, u64, u64); 10] = [
-            ("durable state", d::STATE_OFF, 4),
-            ("durable quiesce arm", d::ARM_QUIESCE_OFF, 1),
-            ("durable shadow SP", d::SHADOW_SP_OFF, d::SHADOW_SP_WORD_LEN),
-            ("durable countdown arm", d::ARM_COUNTDOWN_OFF, 8),
-            ("durable back-edge arm", d::ARM_BACKEDGE_OFF, 8),
+        let words: [(&str, u64, u64); 5] = [
             ("heap brk", g + POWERBOX_HEAP_BRK, 8),
             ("heap top", g + POWERBOX_HEAP_TOP, 8),
             ("empty argv", g + POWERBOX_EMPTY_ARGV, 8),
@@ -7651,8 +7658,48 @@ mod page0_tests {
         }
     }
 
-    /// #2426: a declared arena fences the pages its runtime's words lie on, the control words' and
-    /// its own, at any host page size, and nothing else; an undeclared one fences nothing.
+    /// #2518: a region header holds its context's own words and, in context 0's, the arena's control
+    /// words, each naturally aligned, clear of the others and below the frames; an arena with no
+    /// regions has no control words.
+    #[test]
+    fn a_region_header_holds_its_words_apart() {
+        let a = d::ShadowArena::new(1 << 13, 1 << 14);
+        let words: [(&str, Option<u64>, u64); 7] = [
+            ("shadow SP", Some(a.region_base(0)), d::SHADOW_SP_WORD_LEN),
+            ("thaw state", Some(a.thaw_state_off(0)), 4),
+            (
+                "re-issue",
+                Some(a.region_base(0) + d::REISSUE_IN_REGION_OFF),
+                4,
+            ),
+            ("freeze", a.freeze_word(), 4),
+            ("quiesce", a.quiesce_flag(), 1),
+            ("fiber countdown", a.fiber_countdown(), 8),
+            ("back-edge countdown", a.backedge_countdown(), 8),
+        ];
+        let words = words.map(|(n, o, l)| (n, o.expect("a one-region arena has every word"), l));
+        for (i, &(n, o, l)) in words.iter().enumerate() {
+            assert_eq!(o % l, 0, "{n} is aligned");
+            assert!(o + l <= a.frame_base(0), "{n} runs into the frames");
+            for &(m, p, k) in &words[i + 1..] {
+                assert!(o + l <= p || p + k <= o, "{n} overlaps {m}");
+            }
+        }
+        let e = d::ShadowArena::EMPTY;
+        assert_eq!(
+            (
+                e.freeze_word(),
+                e.quiesce_flag(),
+                e.fiber_countdown(),
+                e.backedge_countdown()
+            ),
+            (None, None, None, None),
+            "no arena, no control words"
+        );
+    }
+
+    /// #2426: a declared arena fences the pages it lies on, at any host page size, and nothing else
+    /// (#2518: the control words are in it); an undeclared one fences nothing.
     #[test]
     fn an_arena_fences_its_runtimes_pages() {
         let arena = d::ShadowArena::new(1 << 17, 1 << 18);
@@ -7660,18 +7707,19 @@ mod page0_tests {
             |page: u64, at: u64, len: u64| arena.fences(at / page, (at + len - 1) / page, page);
         let g = POWERBOX_NULL_GUARD;
         for page in [1 << 12, 1 << 14] {
-            assert!(fenced(page, g, page), "the control words' page, at {page}");
-            assert!(!fenced(page, g + page, page), "the page above them");
             assert!(fenced(page, 1 << 17, page) && fenced(page, (1 << 18) - page, page));
             assert!(
                 fenced(page, (1 << 17) - page, 2 * page),
                 "a span straddling into the arena"
             );
             assert!(!fenced(page, (1 << 17) - page, page) && !fenced(page, 1 << 18, page));
-            assert!(!d::ShadowArena::EMPTY.fences(g / page, g / page, page));
+            assert!(
+                !fenced(page, g, page),
+                "the page above the NULL guard is the guest's"
+            );
+            assert!(!d::ShadowArena::EMPTY.fences(0, u64::MAX / page, page));
         }
-        // On a 64 KiB-page host the control words share page 0 with the NULL guard.
-        assert!(fenced(1 << 16, 0, 1 << 16) && !fenced(1 << 16, 1 << 16, 1 << 16));
+        assert!(fenced(1 << 16, 1 << 17, 1 << 16) && !fenced(1 << 16, 1 << 16, 1 << 16));
     }
 }
 

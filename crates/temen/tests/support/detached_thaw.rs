@@ -200,7 +200,7 @@ pub fn frozen(
     child: &temen_ir::Module,
 ) -> Option<(Host, Vec<i64>, Vec<u8>)> {
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop (and
     // run the probe) before the freeze reaches it; that run is not the case under test — retry it
     // (#1760).

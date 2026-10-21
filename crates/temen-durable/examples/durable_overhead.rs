@@ -159,7 +159,7 @@ fn main() {
 
     // Confirm the freeze lands mid-loop, and capture the snapshot the thaw will resume from.
     let mut probe = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut probe, half);
+    arm_freeze_after_backedges(&mut probe, TEST_ARENA, half);
     let mut fuel = u64::MAX;
     let mut host = Host::new();
     host.set_durable(true);
@@ -172,12 +172,12 @@ fn main() {
         SIZE_LOG2,
         &mut host,
     );
-    let froze = read_state(&snap) == STATE_UNWINDING;
+    let froze = read_state(&snap, TEST_ARENA) == STATE_UNWINDING;
 
     // FREEZE: run the first `half` back-edges, then unwind to the safepoint + spill into the window.
     let freeze = best(15, || {
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after_backedges(&mut win, half);
+        arm_freeze_after_backedges(&mut win, TEST_ARENA, half);
         let mut fuel = u64::MAX;
         let mut host = Host::new();
         host.set_durable(true);

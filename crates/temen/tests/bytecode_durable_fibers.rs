@@ -12,7 +12,7 @@
 //! root's region. The fibers suspend rather than return so neither slot is recycled mid-run.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::{bytecode, Host, Value, DEFAULT_SHADOW_STRIDE, SHADOW_SP_OFF};
+use temen_interp::{bytecode, Host, Value, DEFAULT_SHADOW_STRIDE};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -136,10 +136,11 @@ fn bytecode_non_durable_fiber_run_leaves_the_reserve_untouched() {
     let m = parse_module(src).expect("parse");
     verify_module(&m).expect("verify");
 
+    // The root context's SP word, which a durable run seeds and swaps at every fiber switch.
     const SENTINEL: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    let sp_word = TEST_ARENA.region_base(0) as usize;
     let mut init = vec![0u8; WINDOW];
-    init[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
-        .copy_from_slice(&SENTINEL.to_le_bytes());
+    init[sp_word..sp_word + 8].copy_from_slice(&SENTINEL.to_le_bytes());
 
     let mut host = Host::new(); // durable left false
     let mut fuel = 1_000_000u64;
@@ -158,10 +159,6 @@ fn bytecode_non_durable_fiber_run_leaves_the_reserve_untouched() {
         vec![Value::I64(42)],
         "fiber returns 42"
     );
-    let word = u64::from_le_bytes(
-        snap[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]
-            .try_into()
-            .unwrap(),
-    );
+    let word = u64::from_le_bytes(snap[sp_word..sp_word + 8].try_into().unwrap());
     assert_eq!(word, SENTINEL, "a non-durable run never writes the reserve");
 }

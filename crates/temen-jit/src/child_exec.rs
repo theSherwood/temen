@@ -263,9 +263,10 @@ impl ChildTask {
     /// own freeze word a freeze has rung unwinds and rides the artifact; poisoned, it would end in a
     /// trap and leave no image.
     fn at_teardown(&self) -> AtTeardown {
-        let rung = self.done.durable.is_some()
-            // SAFETY: the task's window is live while the task is; its first page holds the word.
-            && unsafe { fiber_rt::window_is_unwinding(self.window.base() as u64) };
+        // SAFETY: the task's window is live while the task is; its freeze word is in its arena.
+        let rung = self.done.durable.as_ref().is_some_and(|d| unsafe {
+            fiber_rt::window_is_unwinding(self.window.base() as u64, d.shadow)
+        });
         // A retiring task's root has returned while its vCPUs run on. Under a freeze of its window
         // they unwind too, and the last one's end re-offers it; any other teardown ends them.
         if self.retiring {
@@ -296,9 +297,9 @@ impl ChildTask {
         };
         let base = self.window.base() as u64;
         self.vm.trap.load(Ordering::Relaxed) == 0
-            // SAFETY: the window is live while the task is; its first page holds the freeze word at
-            // `STATE_OFF`, and context 0's region the root's shadow-SP word.
-            && unsafe { fiber_rt::window_is_unwinding(base) }
+            // SAFETY: the window is live while the task is; its arena holds the freeze word and, in
+            // context 0's region, the root's shadow-SP word.
+            && unsafe { fiber_rt::window_is_unwinding(base, d.shadow) }
             && unsafe { fiber_rt::read_shadow_sp(base, d.shadow.region_base(0)) }
                 > d.shadow.frame_base(0)
     }
@@ -532,6 +533,7 @@ impl ChildExec {
                     Some(task.rt.table()),
                     task._code.instance.epoch as usize,
                     durable,
+                    task.rt.table().shadow,
                 );
                 // #2010 — a durable child's vCPUs each reserve a shadow context of their own, so a
                 // freeze of its window unwinds each into its own region, wherever its root is. A

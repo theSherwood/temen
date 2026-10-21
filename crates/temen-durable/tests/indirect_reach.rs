@@ -7,8 +7,11 @@
 //!
 //! On the interpreter, the transform's oracle; `temen-run`'s `jit_fork` runs the fork end to end.
 
-use temen_durable::{init_durable_window, transform, IndirectReach, TransformOpts, BARRIER_SP};
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_durable::{
+    init_durable_window, transform, write_state, IndirectReach, TransformOpts, BARRIER_SP,
+    STATE_UNWINDING,
+};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Inst, Memory, Module, Terminator};
 
@@ -194,4 +197,43 @@ fn an_index_the_data_image_holds_is_taken_like_a_ref_func() {
     assert!(is_barrier_over(&fork.module.funcs[0], 3));
     let empty = TEST_ARENA.frame_base(0) as i64;
     assert_eq!(run(&fork.module, fork.body[0], 1), Value::I64(2 * empty));
+}
+
+/// #2518 — a freeze that reaches a barrier traps rather than writes. The barrier holds the shadow-SP
+/// at [`BARRIER_SP`], below every context's frames, and the unwind check refuses a push there. In a
+/// window under one NULL guard nothing else would stop the push: the frame would land on the guest's
+/// own bytes at address 0.
+#[test]
+fn a_freeze_that_reaches_a_barrier_traps_rather_than_writes() {
+    const SMALL_LOG2: u8 = 13;
+    let arena = ShadowArena::new(4096, 8192);
+    let mut m = temen_text::parse_module(&SRC.replace("16448", "4096")).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SMALL_LOG2,
+        shadow: Some(arena),
+    });
+    let fork = transform(&m, &TransformOpts::fork(&is_site)).expect("transform");
+    temen_verify::verify_module(&fork.module).expect("verify");
+    assert!(is_barrier_over(&fork.module.funcs[1], fork.body[1]));
+
+    // Entered at `site`'s slot, its barrier; the freeze lands at `site`'s clock read.
+    let mut win = init_durable_window(1 << SMALL_LOG2, arena);
+    write_state(&mut win, arena, STATE_UNWINDING);
+    let mut host = Host::new();
+    let clk = host.grant_clock();
+    let mut fuel = 1_000_000u64;
+    let (r, left) = run_capture_reserved_with_host(
+        &fork.module,
+        1,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SMALL_LOG2,
+        &mut host,
+    );
+    assert_eq!(r, Err(Trap::Unreachable), "the unwind check traps");
+    assert!(
+        left[..arena.base as usize].iter().all(|&b| b == 0),
+        "no frame landed in the guest's memory"
+    );
 }

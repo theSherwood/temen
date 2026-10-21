@@ -73,7 +73,7 @@ fn a_futex_parked_vcpu_does_not_veto_its_owners_freeze() {
     h.set_durable(true);
     h.set_self_module(&inst);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
     let mut fuel = 1_000_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -121,8 +121,8 @@ fn a_heap_pointer_neither_arms_nor_is_changed_by_the_quiesce_flag() {
     let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
     assert_eq!(r, Err(Trap::ThreadFault), "no one armed a freeze");
 
-    // Nor on a run that is not durable at all, whatever it keeps where the flag would be: it has no
-    // durable control words (the C on-ramp stages names in that scratch).
+    // Nor on a run that is not durable at all, whatever it keeps where the flag would be: a module
+    // that declares no arena has no durable control words (#2518).
     let mut m = temen_text::parse_module(SRC_FUTEX_PARKED_ROOT).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
@@ -131,13 +131,13 @@ fn a_heap_pointer_neither_arms_nor_is_changed_by_the_quiesce_flag() {
     let mut h = Host::new();
     let mut plain = vec![0u8; WINDOW];
     plain[brk..brk + 8].copy_from_slice(&heap);
-    plain[temen_ir::durable_abi::ARM_QUIESCE_OFF as usize] = b'm';
+    plain[TEST_ARENA.quiesce_flag().expect("an arena's flag") as usize] = b'm';
     let mut fuel = 1_000_000u64;
     let (r, _) = run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &plain, SIZE_LOG2, &mut h);
     assert_eq!(r, Err(Trap::ThreadFault), "a plain run deadlocks");
 
     // Armed: the heap pointer is the program's, untouched.
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
     assert_eq!(
         win[brk..brk + 8],
         heap,
@@ -189,7 +189,7 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
     h.set_durable(true);
     h.set_self_module(&inst);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
     let mut fuel = 1_000_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -319,7 +319,7 @@ block 0 (vsp: i64, varg: i64) {
 #[test]
 fn a_freeze_in_flight_brings_a_sibling_parked_before_it() {
     let inst = instrumented(SRC_SIBLING_PARKED_BEFORE_THE_FREEZE);
-    let (r, snap, h) = freeze(&inst, |w| arm_freeze_after_backedges(w, 5));
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_after_backedges(w, TEST_ARENA, 5));
     assert_eq!(
         r,
         Ok(vec![Value::I64(0)]),
@@ -346,7 +346,7 @@ fn a_freeze_in_flight_brings_a_sibling_parked_before_it() {
 #[test]
 fn a_child_that_parks_inside_an_in_flight_freeze_is_captured() {
     let inst = instrumented(SRC_JOIN_ON_A_FUTEX_PARKED_CHILD);
-    let (r, snap, h) = freeze(&inst, |w| write_state(w, STATE_UNWINDING));
+    let (r, snap, h) = freeze(&inst, |w| write_state(w, TEST_ARENA, STATE_UNWINDING));
     assert_eq!(r, Ok(vec![Value::I64(0)]), "a freeze, not a ThreadFault");
     assert_eq!(
         h.frozen_vcpus().len(),
@@ -407,7 +407,7 @@ block 0 (vsp: i64, varg: i64) {
 fn a_futex_parked_fiber_does_not_veto_freeze_on_quiesce() {
     let inst = instrumented(SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME);
     let t = Instant::now();
-    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w));
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w, TEST_ARENA));
     assert_eq!(r, Ok(vec![Value::I64(0)]), "a freeze, not OutOfFuel");
     assert!(
         t.elapsed() < Duration::from_secs(4),
@@ -446,7 +446,7 @@ fn an_unarmed_durable_run_idles_into_the_deadlock_verdict() {
 #[test]
 fn a_thawed_fiber_park_idles_and_freezes_again() {
     let inst = instrumented(SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME);
-    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w));
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w, TEST_ARENA));
     assert_eq!(r, Ok(vec![Value::I64(0)]));
 
     let mut h2 = Host::new();
@@ -458,7 +458,7 @@ fn a_thawed_fiber_park_idles_and_freezes_again() {
     }
     let mut win2 = snap.clone();
     begin_thaw(&mut win2, TEST_ARENA, 0);
-    arm_freeze_on_quiesce(&mut win2);
+    arm_freeze_on_quiesce(&mut win2, TEST_ARENA);
     let mut fuel = 1_000_000u64;
     let (r2, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win2, SIZE_LOG2, &mut h2);
@@ -537,7 +537,7 @@ fn a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw() {
     let (w, r) = h.grant_pipe();
     let args = [Value::I32(r), Value::I32(w)];
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, 5);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 5);
     let mut fuel = 1_000_000u64;
     let (res, snap) =
         run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -636,7 +636,7 @@ fn a_stopped_domain_reaches_its_freeze_point_without_leaving_the_domain() {
     let out = h.grant_stream(temen_interp::StreamRole::Out);
     let args = [Value::I32(out)];
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (inst2, win2) = (inst.clone(), win.clone());
@@ -733,7 +733,7 @@ fn a_vcpu_stopped_before_the_freeze_is_brought_through_it() {
     let out = h.grant_stream(temen_interp::StreamRole::Out);
     let args = [Value::I32(stop), Value::I32(out)];
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_on_quiesce(&mut win);
+    arm_freeze_on_quiesce(&mut win, TEST_ARENA);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let (inst2, win2) = (inst.clone(), win.clone());
@@ -861,7 +861,7 @@ fn a_stdin_parked_root_is_abandoned_and_its_read_reissued_on_thaw() {
     let inst = instrumented(SRC_STDIN_PARKED_ROOT);
     let (h, args) = stdin_host(&inst);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after_backedges(&mut win, 5);
+    arm_freeze_after_backedges(&mut win, TEST_ARENA, 5);
     let (res, snap, mut h) = within_20s(&inst, &args, &win, h);
     assert_eq!(
         res,
@@ -888,7 +888,7 @@ fn a_stdin_read_under_a_landing_freeze_is_abandoned_and_reissued() {
     let inst = instrumented(SRC_STDIN_PARKED_ROOT);
     let (h, args) = stdin_host(&inst);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (res, snap, mut h) = within_20s(&inst, &args, &win, h);
     assert_eq!(
         res,

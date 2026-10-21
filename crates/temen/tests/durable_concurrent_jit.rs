@@ -269,7 +269,7 @@ fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // Everything finished before the freeze landed (rare): already correct.
         assert_eq!(le_i64(&fsnap, OFF_ROOT), K);
         assert_eq!(le_i64(&fsnap, OFF_C1), K);
@@ -288,7 +288,11 @@ fn concurrent_children_self_unwind_and_thaw_reproduces_the_result() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
     assert_eq!(le_i64(&tfinal, OFF_C1), K, "child 1 total reproduced");
     assert_eq!(le_i64(&tfinal, OFF_C2), K, "child 2 total reproduced");
@@ -342,7 +346,7 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         assert_eq!(le_i64(&fsnap, OFF_ROOT), ORACLE, "uninterrupted result");
         return;
     }
@@ -359,7 +363,11 @@ fn concurrent_join_result_survives_a_freeze_before_the_join() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(
         le_i64(&tfinal, OFF_ROOT),
         ORACLE,
@@ -460,14 +468,20 @@ fn concurrent_child_owns_fiber_through_freeze_thaw() {
         matches!(fout, JitOutcome::Returned(_)),
         "a freeze returns whatever its shape: {fout:?}"
     );
-    let clean = read_state(&fsnap) == STATE_UNWINDING && fvcpus.len() == 1 && ffibers.len() == 1;
+    let clean = read_state(&fsnap, TEST_ARENA) == STATE_UNWINDING
+        && fvcpus.len() == 1
+        && ffibers.len() == 1;
     if !clean {
         return;
     }
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
@@ -579,14 +593,20 @@ fn concurrent_child_owns_active_chain_fiber_through_freeze_thaw() {
         matches!(fout, JitOutcome::Returned(_)),
         "a freeze returns whatever its shape: {fout:?}"
     );
-    let clean = read_state(&fsnap) == STATE_UNWINDING && fvcpus.len() == 1 && ffibers.len() == 1;
+    let clean = read_state(&fsnap, TEST_ARENA) == STATE_UNWINDING
+        && fvcpus.len() == 1
+        && ffibers.len() == 1;
     if !clean {
         return;
     }
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(le_i64(&tfinal, OFF_ROOT), K, "root total reproduced");
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
@@ -647,7 +667,7 @@ fn concurrent_freeze_while_root_blocked_in_join() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // The child finished and the root's join resolved before the freeze landed (rare): uninterrupted.
         assert_eq!(le_i64(&fsnap, OFF_ROOT), K);
         return;
@@ -659,7 +679,11 @@ fn concurrent_freeze_while_root_blocked_in_join() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
         K,
@@ -823,7 +847,7 @@ fn nested_concurrent_tree_freezes_and_thaws() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // Everything finished before the freeze landed (rare): already correct.
         assert_eq!(le_i64(&fsnap, OFF_C2), K, "grandchild");
         assert_eq!(le_i64(&fsnap, OFF_C1), 2 * K, "child + grandchild");
@@ -837,7 +861,11 @@ fn nested_concurrent_tree_freezes_and_thaws() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(le_i64(&tfinal, OFF_C2), K, "grandchild total reproduced");
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
@@ -920,7 +948,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
     };
 
     assert_eq!(
-        read_state(&fsnap),
+        read_state(&fsnap, TEST_ARENA),
         STATE_UNWINDING,
         "the freeze always lands"
     );
@@ -931,7 +959,11 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
         K,
@@ -999,7 +1031,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_fails_closed_on_thaw() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // The freeze didn't catch the root parked (rare): nothing to assert about the wait.
         return;
     }
@@ -1081,7 +1113,7 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // The freeze didn't catch the root parked (rare): nothing to assert about the rendezvous.
         return;
     }
@@ -1095,7 +1127,11 @@ fn concurrent_freeze_while_root_blocked_in_wait_thaws_via_sibling_notify() {
         matches!(tout, JitOutcome::Returned(_)),
         "thaw resolves (the parked wait is woken by the sibling's re-issued notify), got {tout:?}",
     );
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(
         le_i64(&tfinal, OFF_C1),
         K,
@@ -1282,7 +1318,7 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
         let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
             continue; // unsupported shape / host alloc pressure: skip this iteration
         };
-        if read_state(&fsnap) != STATE_UNWINDING {
+        if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
             // Everything finished before the freeze landed: the snapshot already holds the oracle.
             assert_eq!(le_i64(&fsnap, OFF_ROOT), K, "iter {i}: root (no-freeze)");
             assert_eq!(le_i64(&fsnap, OFF_C1), K, "iter {i}: child 1 (no-freeze)");
@@ -1299,7 +1335,7 @@ fn concurrent_freeze_thaw_is_deterministic_across_interleavings() {
             "iter {i}: thaw returns"
         );
         assert_eq!(
-            read_state(&tfinal),
+            read_state(&tfinal, TEST_ARENA),
             STATE_NORMAL,
             "iter {i}: back to NORMAL"
         );
@@ -1398,7 +1434,7 @@ fn recycled_context_freeze_residue_is_sparse() {
     let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
         return;
     };
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // The freeze didn't catch the loops (rare): the run completed; A joined, B finished.
         assert_eq!(
             le_i64(&fsnap, OFF_ROOT),
@@ -1424,7 +1460,11 @@ fn recycled_context_freeze_residue_is_sparse() {
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
     assert!(matches!(tout, JitOutcome::Returned(_)), "thaw returns");
-    assert_eq!(read_state(&tfinal), STATE_NORMAL, "thaw back to NORMAL");
+    assert_eq!(
+        read_state(&tfinal, TEST_ARENA),
+        STATE_NORMAL,
+        "thaw back to NORMAL"
+    );
     assert_eq!(
         le_i64(&tfinal, OFF_ROOT),
         ROOT_ORACLE,
@@ -1456,7 +1496,7 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
     let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
         return;
     };
-    if read_state(&fsnap) != STATE_UNWINDING {
+    if read_state(&fsnap, TEST_ARENA) != STATE_UNWINDING {
         // The freeze didn't catch the loops (rare): nothing recycled-sparse to serialize.
         return;
     }

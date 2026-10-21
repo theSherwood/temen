@@ -85,7 +85,7 @@ fn frozen_root(m: &Module) -> (MemLayout, Host) {
     let inst = host.grant_instantiator();
     host.grant_address_space(0, 1 << 17);
     let mut win = init_durable_window(1 << 17, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     let mut fuel = 1_000_000;
     let (r, snap) = run_capture_reserved_with_host(
         m,
@@ -136,7 +136,7 @@ fn parent_with(
         launch,
     }]);
     let mut win = init_durable_window(1 << 17, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     (win, host)
 }
 
@@ -385,7 +385,7 @@ fn a_budget_node_the_parent_and_child_share_is_one_node_after_a_thaw() {
         launch: launch(&c),
     }]);
     let mut win = init_durable_window(1 << 17, ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, ARENA, STATE_UNWINDING);
     let art = freeze(&p, &win, &host).expect("freeze the tree");
 
     let mut rhost = Host::new();

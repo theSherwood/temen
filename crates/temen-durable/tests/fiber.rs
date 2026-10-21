@@ -201,7 +201,7 @@ block 0 (v0: i64, v1: i64) {
 
     // Freeze: seed the window in UNWINDING so the run unwinds instead of completing.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut host = Host::new();
     host.set_durable(true);
     let mut fuel = 1_000_000u64;
@@ -295,7 +295,7 @@ block 0 (v0: i64, v1: i64) {
 
     // Freeze from the start: the run unwinds at resume #1's poll (fiber parked after suspend).
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let mut fuel = 1_000_000u64;
@@ -397,7 +397,7 @@ block 0 (v0: i64, v1: i64) {
         h.clock_ns = 42;
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -669,7 +669,7 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
         let mut h = Host::new();
         h.set_durable(true);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after(&mut win, 2);
+        arm_freeze_after(&mut win, TEST_ARENA, 2);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -775,7 +775,7 @@ fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
     let mut h = Host::new();
     h.set_durable(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 2);
+    arm_freeze_after(&mut win, TEST_ARENA, 2);
     let mut fuel = 1_000_000u64;
     let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
     assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
@@ -841,14 +841,18 @@ fn an_unwoken_cap_parked_fiber_freezes_and_its_thaw_reissues_the_read() {
     let handle = h.grant_stream(StreamRole::In);
     h.set_stdin_blocking(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 2);
+    arm_freeze_after(&mut win, TEST_ARENA, 2);
     let mut fuel = 1_000_000u64;
     let args = [Value::I32(handle)];
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &args, &mut fuel, &win, SIZE_LOG2, &mut h);
     assert!(r.is_ok(), "the freeze returns a placeholder: {r:?}");
     assert_eq!(h.take_freeze_declined(), None, "not declined");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the cut was taken");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "the cut was taken"
+    );
     assert_eq!(h.frozen_fibers().len(), 1, "the parked fiber rides");
 
     // The input arrives after the freeze; the thaw re-issues the fiber's read, which takes it.
@@ -967,7 +971,7 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
         let mut h = Host::new();
         h.set_durable(true);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after(&mut win, 2);
+        arm_freeze_after(&mut win, TEST_ARENA, 2);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -1051,8 +1055,12 @@ fn consumed_park_host(freeze: bool) -> (Host, i32) {
         Box::new(move |_op, _args, mem, _| {
             if freeze {
                 if let Some(m) = mem {
-                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                        .expect("the state word is in the window");
+                    let word = m
+                        .shadow()
+                        .freeze_word()
+                        .expect("the module declares its arena");
+                    m.write_bytes(word, &STATE_UNWINDING.to_le_bytes())
+                        .expect("the freeze word is in the window");
                 }
             }
             Ok(vec![0])

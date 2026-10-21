@@ -40,7 +40,11 @@ const GROW_OFF: u64 = 1 << SIZE_LOG2; // grow starts exactly at the declared win
 const GROW_LEN: u64 = 64 * 1024; // [128 KiB, 192 KiB) — the grown tail, above the declared window
 const MARK_ADDR: u64 = GROW_OFF + 3 * PAGE as u64 + 7; // a byte inside a grown page
 const MARK_VAL: i64 = 77;
-const STATE_ADDR: i64 = 16384; // the window's freeze state word (STATE_OFF), guest-addressable in Phase 1
+/// The arena's freeze word, which this confined guest stores to itself to freeze its own run.
+const STATE_ADDR: u64 = match TEST_ARENA.freeze_word() {
+    Some(w) => w,
+    None => panic!("the arena holds the freeze word"),
+};
 const STATE_UNWINDING: i32 = 1;
 const FREEZE_CLOCK: i64 = 42; // captured at freeze; replayed (not re-issued) on thaw
 const THAW_CLOCK: i64 = 9999; // deliberately different — a re-issue instead of a replay would show it
@@ -147,7 +151,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     );
     froze.expect("freeze run does not trap");
     assert_eq!(
-        read_state(frozen.bytes()),
+        read_state(frozen.bytes(), TEST_ARENA),
         STATE_UNWINDING,
         "froze, did not complete"
     );

@@ -84,10 +84,10 @@ fn a_v128_live_across_the_suspend_point_survives_freeze_and_thaw() {
     );
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
-    assert_eq!(read_state(&snapshot), STATE_UNWINDING);
+    assert_eq!(read_state(&snapshot, TEST_ARENA), STATE_UNWINDING);
 
     let mut win = snapshot.clone();
     begin_thaw(&mut win, TEST_ARENA, 0);

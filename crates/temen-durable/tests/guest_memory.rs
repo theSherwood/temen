@@ -82,10 +82,10 @@ fn guest_memory_survives_freeze_thaw_via_confined_path() {
 
     // Freeze: the store happens, then the poll after the call unwinds.
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
+    write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
     let (_, snapshot) = run(&inst, 42, &win);
     assert_eq!(
-        read_state(&snapshot),
+        read_state(&snapshot, TEST_ARENA),
         STATE_UNWINDING,
         "froze, did not complete"
     );
@@ -113,11 +113,10 @@ fn strict_path_rejects_the_same_memory_using_guest() {
 }
 
 #[test]
-fn a_window_too_small_for_any_arena_is_refused() {
-    // A 4 KiB window cannot hold a shadow arena at all — the verifier requires one to start at or
-    // above `DURABLE_CONTROL_END` (guard+64) and hold a whole `DEFAULT_SHADOW_STRIDE` region — so such a
-    // module can only declare none, and a module that declares none is not freezable: the transform
-    // fails closed rather than inventing a placement (INVARIANTS.md #16).
+fn a_module_that_declares_no_arena_is_refused() {
+    // A module that declares no arena is not freezable, whatever its window: the transform fails
+    // closed rather than inventing a placement (INVARIANTS.md #16). Even this 4 KiB window could
+    // declare one, a single region over the whole window, as it has no NULL guard (#2518).
     let mut m = temen_text::parse_module(
         "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )

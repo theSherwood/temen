@@ -1072,13 +1072,13 @@ storing at NULL traps identically on the interpreter and the emitted tier. A win
 smaller than the guard skips the seed on every tier (it would unmap the whole window).
 
 **A durable module's runtime pages are fenced the same way (#2426).** A module that
-declares a shadow arena (DURABILITY.md, INVARIANTS #16) keeps runtime words in its
-window that the host reads and writes outside the guest's guarded code: the control
-words at `[guard, guard+64)`, which a freeze request rings, and the arena, into which
-a freeze flattens each parked fiber. A protection the guest gave one of their pages
-would fault in the host, so every engine refuses a page op over any page they touch,
-as over the guard (`ShadowArena::fences`): `-EINVAL`, nothing changed. A module that
-declares no arena is not freezable and fences nothing past the guard.
+declares a shadow arena (DURABILITY.md, INVARIANTS #16) keeps runtime words in it that
+the host reads and writes outside the guest's guarded code: the control words in its
+first region's header (#2518), which a freeze request rings, and the regions, into
+which a freeze flattens each parked fiber. A protection the guest gave one of the
+arena's pages would fault in the host, so every engine refuses a page op over any page
+it touches, as over the guard (`ShadowArena::fences`): `-EINVAL`, nothing changed. A
+module that declares no arena is not freezable and fences nothing past the guard.
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete

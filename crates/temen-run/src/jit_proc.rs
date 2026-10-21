@@ -43,7 +43,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use temen_interp::{
     ExecCmd, GuestMem, Host, LiveVcpu, ParkEvent, ParkTransients, SpawnPlan, Trap, TwinTrap, Value,
 };
-use temen_ir::durable_abi::{ShadowArena, STATE_OFF, STATE_UNWINDING};
+use temen_ir::durable_abi::{ShadowArena, STATE_UNWINDING};
 use temen_ir::errno::{EAGAIN, EINTR, EINVAL, ENOSYS};
 use temen_ir::{cap_id, FuncIdx, Inst, Module, ValType};
 use temen_jit::{
@@ -1323,7 +1323,7 @@ pub(crate) unsafe fn wait_for_bell(trap_out: *mut i64, bell: u64) -> bool {
     true
 }
 
-/// Start the root context's unwind for a fork: set the window's freeze word, which the call's
+/// Start the root context's unwind for a fork: set the arena's freeze word, which the call's
 /// trailing poll reads. Only from an **empty** shadow stack — its SP word reads its frame base. The
 /// leaf frame must land there, where the fork injects the reply ([`ShadowArena::leaf_reply`]); and a
 /// barrier below the call holds it occupied ([`temen_durable::BARRIER_SP`]) when a `call.dyn`
@@ -1336,9 +1336,11 @@ fn begin_fork_unwind(window: &mut dyn GuestMem, arena: ShadowArena) -> bool {
         .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
         .is_some_and(|b| u64::from_le_bytes(b) == arena.frame_base(0));
     empty
-        && window
-            .write_bytes(STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-            .is_some()
+        && arena.freeze_word().is_some_and(|at| {
+            window
+                .write_bytes(at, &STATE_UNWINDING.to_le_bytes())
+                .is_some()
+        })
 }
 
 /// Whether the run delivers #932 async signals (its compile armed the delivery check).

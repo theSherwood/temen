@@ -32,7 +32,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn window_with(state: i32) -> Vec<u8> {
     let mut w = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut w, state);
+    write_state(&mut w, TEST_ARENA, state);
     w
 }
 
@@ -110,7 +110,7 @@ fn check_with(
         "freeze returns a placeholder\n{src}"
     );
     assert_eq!(
-        read_state(&snap_bc),
+        read_state(&snap_bc, TEST_ARENA),
         STATE_UNWINDING,
         "bytecode leaves the artifact UNWINDING\n{src}"
     );
@@ -165,12 +165,12 @@ fn check_with(
         "bytecode thaw must reproduce the uninterrupted result\n{src}"
     );
     assert_eq!(
-        read_state(&final_tw),
+        read_state(&final_tw, TEST_ARENA),
         STATE_NORMAL,
         "tree-walker thaw flips the state word back to NORMAL\n{src}"
     );
     assert_eq!(
-        read_state(&final_bc),
+        read_state(&final_bc, TEST_ARENA),
         STATE_NORMAL,
         "bytecode thaw flips the state word back to NORMAL\n{src}"
     );
@@ -290,8 +290,12 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
             Box::new(move |_op, _args, mem, _| {
                 if freeze {
                     if let Some(m) = mem {
-                        m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                            .expect("the state word is in the window");
+                        let word = m
+                            .shadow()
+                            .freeze_word()
+                            .expect("the module declares its arena");
+                        m.write_bytes(word, &STATE_UNWINDING.to_le_bytes())
+                            .expect("the freeze word is in the window");
                     }
                 }
                 Ok(vec![0])
@@ -430,8 +434,12 @@ fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) 
             Box::new(move |_op, _args, mem, _| {
                 if freeze {
                     if let Some(m) = mem {
-                        m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
-                            .expect("the state word is in the window");
+                        let word = m
+                            .shadow()
+                            .freeze_word()
+                            .expect("the module declares its arena");
+                        m.write_bytes(word, &STATE_UNWINDING.to_le_bytes())
+                            .expect("the freeze word is in the window");
                     }
                 }
                 Ok(vec![0])

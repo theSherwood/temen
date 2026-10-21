@@ -80,7 +80,7 @@ fn run_armed(n: i64) -> (u64, bool) {
     );
 
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, n);
+    arm_freeze_after(&mut win, TEST_ARENA, n);
     let mut fuel = 100_000u64;
     let (res, snap) = run_capture_reserved_with_host(
         &inst,
@@ -94,7 +94,7 @@ fn run_armed(n: i64) -> (u64, bool) {
     assert!(res.is_ok(), "armed run trapped: {res:?}");
     (
         calls.load(Ordering::Relaxed),
-        read_state(&snap) == STATE_UNWINDING,
+        read_state(&snap, TEST_ARENA) == STATE_UNWINDING,
     )
 }
 
@@ -152,7 +152,7 @@ fn an_unarmed_durable_run_is_untouched() {
     assert!(res.is_ok(), "unarmed durable run trapped: {res:?}");
     assert_eq!(calls.load(Ordering::Relaxed), 4, "ran to completion");
     assert_ne!(
-        read_state(&snap),
+        read_state(&snap, TEST_ARENA),
         STATE_UNWINDING,
         "never entered UNWINDING"
     );
@@ -205,12 +205,16 @@ fn a_resume_of_a_parked_fiber_frozen_mid_delivery_continues_with_the_delivered_v
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 3);
+    arm_freeze_after(&mut win, TEST_ARENA, 3);
     let mut fuel = 100_000u64;
     let (r, snap) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
     assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "froze at resume #2");
+    assert_eq!(
+        read_state(&snap, TEST_ARENA),
+        STATE_UNWINDING,
+        "froze at resume #2"
+    );
     let frozen = fhost.frozen_fibers().to_vec();
     assert_eq!(frozen.len(), 1, "the in-flight fiber was captured");
 

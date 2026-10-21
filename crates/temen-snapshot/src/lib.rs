@@ -282,7 +282,11 @@ use temen_ir::Module;
 /// #1909), so a zero page stores none, whatever its protection.
 /// v47 (#2438): a Section 8 launch record carries the spawner's pager export (plus one; `0` = an
 /// unpaged child), so a demand-paged child thaws with its pager.
-const FORMAT_VERSION: u16 = 47;
+/// v48 (#2518): the freeze word, the freeze-on-quiesce flag and the two arm countdowns left their
+/// fixed slot one NULL guard up for context 0's region header in the module's declared arena, and
+/// every region header grew from 16 bytes to 48 (`REGION_HEADER_LEN`), so frames start 32 bytes
+/// later. The window image layout changed, so a v47 artifact would mis-thaw and is refused.
+const FORMAT_VERSION: u16 = 48;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.

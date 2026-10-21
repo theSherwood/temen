@@ -571,8 +571,8 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
 }
 
 // §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at
-// `ShadowArena::region_base(0)`), not the legacy global `SHADOW_SP_OFF`. Frames grow past the 16-byte
-// region header (SP word + thaw word), so an empty root stack reads `ShadowArena::frame_base(0)`.
+// `ShadowArena::region_base(0)`), not the legacy global `SHADOW_SP_OFF`. Frames grow past the region
+// header (`REGION_HEADER_LEN`), so an empty root stack reads `ShadowArena::frame_base(0)`.
 // (This used to say `+ 8` — the 4A.5 value from before §12.8 stage 1 added the thaw word — which
 // made the `read_sp > ROOT_EMPTY_SP` "a frame was pushed" assertions vacuous.)
 fn read_sp(w: &[u8]) -> u64 {
@@ -760,7 +760,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
         let mut h = Host::new();
         h.set_durable(true);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -974,7 +974,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
         let mut h = Host::new();
         h.set_durable(true);
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        arm_freeze_after(&mut win, arm);
+        arm_freeze_after(&mut win, TEST_ARENA, arm);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -982,7 +982,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
     };
     assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, TEST_ARENA),
         STATE_UNWINDING,
         "the armed run promoted itself to UNWINDING at the recycled fiber's suspend"
     );
@@ -1075,7 +1075,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
         h.clock_ns = clock_v; // same initial conditions as the baseline
         let clk = h.grant_clock();
         let mut win = init_durable_window(WINDOW, TEST_ARENA);
-        write_state(&mut win, STATE_UNWINDING);
+        write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
             &inst,
@@ -1090,7 +1090,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
     };
     assert!(r_freeze.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(
-        read_state(&snap),
+        read_state(&snap, TEST_ARENA),
         STATE_UNWINDING,
         "artifact is still UNWINDING (the stack unwound, did not complete)"
     );

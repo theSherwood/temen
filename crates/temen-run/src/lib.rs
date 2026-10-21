@@ -265,8 +265,8 @@ pub(crate) enum HostParkReq {
         /// The pipe end the op is waiting on, or `None` for stdin, which nothing can feed during a
         /// JIT run (the embedder's `push_stdin` needs the `Host` the run holds).
         probe: Option<temen_interp::PipeProbe>,
-        /// A durable run's window base, or `0`.
-        unwind_base: u64,
+        /// Where a durable run's park watches for a freeze; `None` where none can land.
+        freeze: Option<temen_jit::FreezeWatch>,
     },
     /// #1768 — in a process tree: a pipe park or a blocking `wait4`, which another process may end,
     /// so it waits for the tree's bell to ring past `bell`, the count read before the op looked
@@ -285,13 +285,13 @@ impl HostParkReq {
     /// # Safety
     /// `trap_out` is the live call's trap cell; the caller holds no lock the run's other vCPUs need.
     unsafe fn park(&self, trap_out: *mut i64) -> bool {
-        let (probe, unwind_base) = match self {
+        let (probe, freeze) = match self {
             HostParkReq::Tree { bell } => return jit_proc::wait_for_bell(trap_out, *bell),
-            HostParkReq::Hub { probe, unwind_base } => (probe, *unwind_base),
+            HostParkReq::Hub { probe, freeze } => (probe, *freeze),
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
-        match temen_jit::park_host_call(trap_out, unwind_base, key, Parks::Fiber, still_parked) {
+        match temen_jit::park_host_call(trap_out, freeze, key, Parks::Fiber, still_parked) {
             temen_jit::HostPark::Woken => true,
             temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
             temen_jit::HostPark::Deadlock => {
@@ -652,14 +652,12 @@ pub(crate) unsafe fn host_park(
         Some((pipe, write)) => Some(host.pipe_probe(pipe, write)?),
         None => None,
     };
-    Some(HostParkReq::Hub {
-        probe,
-        unwind_base: if host.is_durable() {
-            mem_base as u64
-        } else {
-            0
-        },
-    })
+    // #2518 — the window the cap names, whose arena the host was given as it started.
+    let freeze = host
+        .is_durable()
+        .then(|| temen_jit::FreezeWatch::new(mem_base as u64, host.cap_window_shadow()))
+        .flatten();
+    Some(HostParkReq::Hub { probe, freeze })
 }
 
 /// The `(type_id, op, handle)` a thunk's `call.import` dispatch reaches — `packed` is the dispatch's
@@ -2976,7 +2974,7 @@ unsafe fn park_on_bell(
     parks: Parks,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(trap_out, 0, key, parks, || {
+    temen_jit::park_host_call(trap_out, None, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -4869,6 +4867,10 @@ impl GuestMem for MprotectWindow {
             let _ = (win_off, region_off, len, prot, region, backing);
             EINVAL
         }
+    }
+
+    fn shadow(&self) -> temen_interp::ShadowArena {
+        self.shadow
     }
 }
 

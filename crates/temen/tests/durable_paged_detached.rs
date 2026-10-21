@@ -40,7 +40,7 @@ fn a_paged_child_cut_mid_run_thaws_with_its_pager() {
     let child = child_module(&child_src(false));
     let parent = parent(PARENT_SRC, &[17]);
     let (art, args) = artifact(&parent, &[&child], 1, |w| {
-        arm_freeze_after_backedges(w, 2000)
+        arm_freeze_after_backedges(w, ARENA, 2000)
     });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
@@ -56,7 +56,9 @@ fn a_paged_child_cut_mid_run_thaws_with_its_pager() {
 fn a_paged_child_frozen_before_it_runs_thaws_with_its_pager() {
     let child = child_module(&child_src(false));
     let parent = parent(PARENT_SRC, &[17]);
-    let (art, args) = artifact(&parent, &[&child], 1, |w| write_state(w, STATE_UNWINDING));
+    let (art, args) = artifact(&parent, &[&child], 1, |w| {
+        write_state(w, ARENA, STATE_UNWINDING)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(Out::Ret(EXPECT))
@@ -71,7 +73,9 @@ fn a_paged_child_frozen_before_it_runs_thaws_with_its_pager() {
 fn a_paged_child_that_faults_before_it_can_unwind_is_served_and_thaws() {
     let child = child_module(&child_src(true));
     let parent = parent(PARENT_SRC, &[17]);
-    let (art, args) = artifact(&parent, &[&child], 1, |w| write_state(w, STATE_UNWINDING));
+    let (art, args) = artifact(&parent, &[&child], 1, |w| {
+        write_state(w, ARENA, STATE_UNWINDING)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(Out::Ret(EXPECT))
@@ -86,7 +90,9 @@ fn a_paged_child_rung_at_a_trigger_is_served_before_it_unwinds() {
     let parent = parent(PARENT_SRC, &[17]);
     // The countdown fires at the parent's first branch past the spawn (the transform's entry
     // dispatch is its first), long before its quantum ends and the child first runs.
-    let (art, args) = artifact(&parent, &[&child], 1, |w| arm_freeze_after_backedges(w, 2));
+    let (art, args) = artifact(&parent, &[&child], 1, |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(Out::Ret(EXPECT))
@@ -107,7 +113,7 @@ fn a_paged_child_streaming_fresh_pages_freezes_mid_stream() {
     );
     for arm in [20_000, 80_000] {
         let (art, args) = artifact(&parent, &[&child], 1, |w| {
-            arm_freeze_after_backedges(w, arm)
+            arm_freeze_after_backedges(w, ARENA, arm)
         });
         assert_eq!(
             thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
@@ -131,7 +137,9 @@ fn a_held_pager_reads_a_child_that_unwound_first_as_running() {
     let parent = parent(TWO_PARENT_SRC, &[17, 17]);
     let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
     assert_eq!(fresh, Out::Ret(EXPECT_TWO));
-    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| arm_freeze_after_backedges(w, 2));
+    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&a, &b], &args),
         Some(Out::Ret(EXPECT_TWO))
@@ -164,7 +172,9 @@ fn a_held_pager_kills_a_child_that_unwound_first() {
         EXPECT & ((1 << 48) - 1),
         "B ran to its end"
     );
-    let (art, args) = artifact(&parent, &[&a, &b], 1, |w| arm_freeze_after_backedges(w, 2));
+    let (art, args) = artifact(&parent, &[&a, &b], 1, |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&a, &b], &args),
         Some(fresh)
@@ -179,7 +189,9 @@ fn a_kill_of_the_last_child_a_pager_is_held_for_lets_it_unwind() {
     let parent = parent(KILL_AT_ONCE_PARENT_SRC, &[17]);
     let (fresh, ..) = run_from(&parent, &[&child], |_| {});
     assert!(matches!(fresh, Out::Ret(v) if v >> 56 != 0), "{fresh:?}");
-    let (art, args) = artifact(&parent, &[&child], 0, |w| arm_freeze_after_backedges(w, 2));
+    let (art, args) = artifact(&parent, &[&child], 0, |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     assert_eq!(
         thaw_on(Engine::Interp, &art, &parent, &[&child], &args),
         Some(fresh)
@@ -195,11 +207,13 @@ fn a_root_that_returns_while_held_completes_the_run() {
         child_module(&child_src(true)),
     );
     let parent = parent(RETURNS_PARENT_SRC, &[17, 17]);
-    let (out, snap, mut fh, _) = run_from(&parent, &[&a, &b], |w| arm_freeze_after_backedges(w, 2));
+    let (out, snap, mut fh, _) = run_from(&parent, &[&a, &b], |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     assert_eq!(out, Out::Ret(42));
     assert_eq!(fh.take_freeze_declined(), None);
     assert_ne!(
-        read_state(&snap),
+        read_state(&snap, ARENA),
         STATE_UNWINDING,
         "the root did not freeze"
     );
@@ -219,13 +233,19 @@ fn a_thawed_pager_holds_its_relaunched_children_again() {
     );
     let parent = parent(TWO_PARENT_SRC, &[17, 22]);
     let (fresh, ..) = run_from(&parent, &[&a, &b], |_| {});
-    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| arm_freeze_after_backedges(w, 2));
+    let (art, args) = artifact(&parent, &[&a, &b], 2, |w| {
+        arm_freeze_after_backedges(w, ARENA, 2)
+    });
     let (mut h, mut win) = restored(&art, &parent, &[&a, &b]);
     // Past the parent's rewind, before its first quantum ends.
-    arm_freeze_after_backedges(&mut win, 10);
+    arm_freeze_after_backedges(&mut win, ARENA, 10);
     let (_, snap) = run(Engine::Interp, &parent, &args, &win, &mut h).expect("runs");
     assert_eq!(h.take_freeze_declined(), None);
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "the thaw froze again");
+    assert_eq!(
+        read_state(&snap, ARENA),
+        STATE_UNWINDING,
+        "the thaw froze again"
+    );
     assert_eq!(h.captured_detached().len(), 2);
     let art = temen_snapshot::freeze(&parent, &snap, &h).expect("serialize");
     assert_eq!(
@@ -241,7 +261,7 @@ fn the_jit_refuses_to_thaw_a_paged_child() {
     let child = child_module(&child_src(false));
     let parent = parent(PARENT_SRC, &[17]);
     let (art, args) = artifact(&parent, &[&child], 1, |w| {
-        arm_freeze_after_backedges(w, 2000)
+        arm_freeze_after_backedges(w, ARENA, 2000)
     });
     assert_eq!(thaw_on(Engine::Jit, &art, &parent, &[&child], &args), None);
 }

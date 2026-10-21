@@ -116,7 +116,7 @@ fn durable_overhead_probe() {
             h.clock_ns = 42;
             let clk = h.grant_clock();
             let mut win = init_durable_window(WINDOW, TEST_ARENA);
-            write_state(&mut win, STATE_UNWINDING);
+            write_state(&mut win, TEST_ARENA, STATE_UNWINDING);
             let mut fuel = 1_000_000u64;
             let (_, snap) = run_capture_reserved_with_host(
                 &inst,

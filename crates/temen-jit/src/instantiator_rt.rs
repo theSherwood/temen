@@ -113,13 +113,13 @@ impl DurableCell {
     /// answer says: whether the child was live.
     pub(crate) fn ring(&self) -> bool {
         let base = self.base.lock().unwrap_or_else(|e| e.into_inner());
-        if *base != 0 {
+        if let (true, Some(word)) = (*base != 0, self.shadow.freeze_word()) {
             // SAFETY: a nonzero base is the child's live window (its task retires the base under
-            // this lock before freeing it); `STATE_OFF` is within its first mapped page, and the
-            // word is only ever accessed as an aligned `i32`.
+            // this lock before freeing it); its freeze word is in the arena its module declared,
+            // which the verifier bounded into the window (#2518), and the word is only ever
+            // accessed as an aligned `i32`.
             unsafe {
-                (*((*base + temen_ir::durable_abi::STATE_OFF as usize)
-                    as *const std::sync::atomic::AtomicI32))
+                (*((*base + word as usize) as *const std::sync::atomic::AtomicI32))
                     .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
             }
         }
@@ -464,6 +464,12 @@ pub(crate) struct Nursery {
     /// the durable flag is applied after compile, where this nursery is built), so its children are
     /// durable detached children, which a freeze of it reaches and captures.
     durable: AtomicBool,
+    /// #2518 — the shadow arena of the module whose window this nursery's instance runs in: where the
+    /// freeze word its spawns and joins read is. [`ShadowArena::EMPTY`] when it declared none, which
+    /// no freeze can stop mid-run.
+    ///
+    /// [`ShadowArena::EMPTY`]: temen_ir::durable_abi::ShadowArena::EMPTY
+    shadow: temen_ir::durable_abi::ShadowArena,
     /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `Budget` taker
     /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ a spawn is an
     /// inert `CapFault`, like the other grant ops without hooks).
@@ -548,6 +554,7 @@ impl Nursery {
         // #1956 — the executor this nursery files its children on: a run's own (`None`, made here),
         // or the run's, shared by a detached child's nursery.
         child_exec: Option<std::sync::Arc<crate::child_exec::ChildExec>>,
+        shadow: temen_ir::durable_abi::ShadowArena,
     ) -> Nursery {
         Nursery {
             cap_thunk,
@@ -574,6 +581,7 @@ impl Nursery {
             unclaimed: Mutex::new(Vec::new()),
             grant_as_parent: std::sync::atomic::AtomicUsize::new(0),
             durable: AtomicBool::new(false),
+            shadow,
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
@@ -745,6 +753,7 @@ impl Nursery {
         &self,
         gc: &crate::GrantChild,
         funcs: &[Func],
+        shadow: temen_ir::durable_abi::ShadowArena,
     ) -> Option<std::sync::Arc<Nursery>> {
         let as_parent = self.grant_as_parent.load(Ordering::Acquire);
         // A powerbox nothing retains dies with the child, while a grandchild's teardown still hands
@@ -763,6 +772,7 @@ impl Nursery {
             self.epoch_addr,
             self.futex_sched,
             Some(std::sync::Arc::clone(&self.child_exec)),
+            shadow,
         );
         n.ancestors = self.lane_chain_of(gc);
         n.ancestors.pop(); // the child's own lane is its children's parent lane
@@ -1096,7 +1106,7 @@ impl Nursery {
         } else {
             self.cap_thunk
         };
-        let kid = self.for_child(&gc, &funcs);
+        let kid = self.for_child(&gc, &funcs, shadow);
         for c in children {
             match &kid {
                 Some(kid) => {
@@ -1155,9 +1165,10 @@ impl Nursery {
                 let rw = w.rw_mut();
                 let n = image.len().min(rw.len());
                 rw[..n].copy_from_slice(&image[..n]);
-                let s = temen_ir::durable_abi::STATE_OFF as usize;
-                if let Some(st) = rw.get_mut(s..s + 4) {
-                    st.copy_from_slice(&temen_ir::durable_abi::STATE_NORMAL.to_le_bytes());
+                if let Some(s) = shadow.freeze_word().map(|w| w as usize) {
+                    if let Some(st) = rw.get_mut(s..s + 4) {
+                        st.copy_from_slice(&temen_ir::durable_abi::STATE_NORMAL.to_le_bytes());
+                    }
                 }
                 if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
                     th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
@@ -1367,9 +1378,11 @@ unsafe fn spawn_detached_child(
     // #1956 — the nursery `code` was compiled against, if the child spawns.
     kid: Option<std::sync::Arc<Nursery>>,
 ) -> i32 {
-    // SAFETY: a durable spawner's window is live for the call, and its first page holds the word.
-    let parent_freezing =
-        || durable.is_some() && unsafe { crate::fiber_rt::window_is_unwinding(spawner_base) };
+    // SAFETY: a durable spawner's window is live for the call; its freeze word is in its arena.
+    let parent_freezing = || {
+        durable.is_some()
+            && unsafe { crate::fiber_rt::window_is_unwinding(spawner_base, rt.shadow) }
+    };
     let freezing = parent_freezing();
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
@@ -1492,16 +1505,17 @@ struct Seed {
 /// existed, so the child freezes at its first poll rather than running on until the parent's
 /// harvest reaches it — how far it got used to depend on how the OS scheduled its thread.
 fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, freezing: bool) {
-    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF, STATE_UNWINDING};
-    let s = STATE_OFF as usize;
+    use temen_ir::durable_abi::{STATE_NORMAL, STATE_UNWINDING};
     let b = a.region_base(0) as usize;
     let state = if freezing {
         STATE_UNWINDING
     } else {
         STATE_NORMAL
     };
-    if let Some(st) = rw.get_mut(s..s + 4) {
-        st.copy_from_slice(&state.to_le_bytes());
+    if let Some(s) = a.freeze_word().map(|w| w as usize) {
+        if let Some(st) = rw.get_mut(s..s + 4) {
+            st.copy_from_slice(&state.to_le_bytes());
+        }
     }
     if let Some(sp) = rw.get_mut(b..b + 8) {
         sp.copy_from_slice(&a.frame_base(0).to_le_bytes());
@@ -1736,7 +1750,7 @@ unsafe fn spawn_detached(
         .map_or(0, |c| c as *const crate::FuelCell as usize);
     // #1956 — a child that spawns gets a nursery of its own; a durable child's is durable, and a
     // freeze reaches its children through it (#2010).
-    let kid = rt.for_child(&gc, child_funcs);
+    let kid = rt.for_child(&gc, child_funcs, child_shadow);
     let compiled = rt.code_for(
         &gc,
         digest,
@@ -1979,7 +1993,7 @@ pub(crate) unsafe extern "C" fn join(
             // #1904 — a freeze reached this parent while it waits: it drives the child it is joining,
             // as the freeze drives a `thread.join`'s, by ringing the child's doorbell.
             let freezing = rt.durable.load(Ordering::Acquire)
-                && crate::fiber_rt::window_is_unwinding(mem_base);
+                && crate::fiber_rt::window_is_unwinding(mem_base, rt.shadow);
             if let Some(d) = done.durable.as_ref().filter(|_| freezing) {
                 d.ring();
             }

@@ -93,8 +93,13 @@ FLIP
 }
 ";
 
-/// The guest's state word (`STATE_OFF`), guest-addressable, and `UNWINDING`.
-const FLIP: &str = "  vsa = i64.const 16384\n  vsu = i32.const 1\n  i32.store vsa vsu";
+/// The guest's freeze word (in its arena, guest-addressable), and `UNWINDING`.
+fn flip() -> String {
+    let word = TEST_ARENA
+        .freeze_word()
+        .expect("the arena holds the freeze word");
+    format!("  vsa = i64.const {word}\n  vsu = i32.const 1\n  i32.store vsa vsu")
+}
 
 /// The guests, instrumented; `flip` makes them request the freeze themselves.
 fn instrumented(flip: bool) -> Module {
@@ -103,8 +108,8 @@ fn instrumented(flip: bool) -> Module {
 
 /// `src`'s guests, instrumented as [`instrumented`] does [`SRC`]'s.
 fn instrument(src: &str, flip: bool) -> Module {
-    let m = temen_text::parse_module(&src.replace("FLIP", if flip { FLIP } else { "" }))
-        .expect("parse");
+    let flip = if flip { self::flip() } else { String::new() };
+    let m = temen_text::parse_module(&src.replace("FLIP", &flip)).expect("parse");
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
     inst
@@ -152,7 +157,9 @@ fn run_jit(
     let (out, left) =
         temen_run::jit_cap_run(m, func, &args, layout, SIZE_LOG2, 0, host, None).expect("JIT run");
     let res = match out {
-        JitOutcome::Returned(v) if read_state(left.bytes()) != STATE_UNWINDING => Some(v[0]),
+        JitOutcome::Returned(v) if read_state(left.bytes(), TEST_ARENA) != STATE_UNWINDING => {
+            Some(v[0])
+        }
         JitOutcome::Returned(_) => None,
         other => panic!("unexpected outcome {other:?}"),
     };
@@ -183,7 +190,7 @@ fn frozen_creating() -> (Module, Host, [Value; 2], Vec<u8>, Vec<CapturedProt>) {
     let win = init_durable_window(WINDOW, TEST_ARENA);
     let (res, snap, prots) = run(&m, 0, &mut host, &args, &win, None);
     assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
     (m, host, args, snap, prots)
 }
 
@@ -280,7 +287,7 @@ fn a_region_closed_before_the_freeze_stays_out_of_it() {
     let (mut fhost, args) = creating_host();
     let (res, snap, prots) = run(&m, 0, &mut fhost, &args, &window, None);
     assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
     let held = fhost.capture_durable_handles().expect("a durable powerbox");
     let regions = held
         .iter()
@@ -413,7 +420,7 @@ fn a_region_something_outside_the_cut_holds_declines() {
         let win = init_durable_window(WINDOW, TEST_ARENA);
         let (res, snap, prots) = run(&m, 1, host, &args, &win, None);
         assert!(res.is_ok(), "{res:?}");
-        assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+        assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
         freeze_with_prots(&m, &snap, &prots, SIZE_LOG2, host)
     };
 
@@ -605,7 +612,7 @@ fn a_region_shared_with_a_detached_child_rides_and_stays_shared() {
 
     let (mut fhost, args) = sharing_host(&child, heap_region());
     let mut fwin = win.clone();
-    temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+    temen_durable::write_state(&mut fwin, TEST_ARENA, STATE_UNWINDING);
     let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
     assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
     assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
@@ -696,7 +703,7 @@ block 4 (vd: i64) {
         let (mut fhost, args) = sharing_host(&child, heap_region());
         fhost.set_lane_cap(cap);
         let mut fwin = win.clone();
-        temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+        temen_durable::write_state(&mut fwin, TEST_ARENA, STATE_UNWINDING);
         let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &fwin, None);
         assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
         assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
@@ -740,7 +747,7 @@ fn a_region_shared_with_a_detached_child_rides_a_jit_freeze() {
     );
 
     let mut fwin = fresh;
-    temen_durable::write_state(&mut fwin, STATE_UNWINDING);
+    temen_durable::write_state(&mut fwin, TEST_ARENA, STATE_UNWINDING);
     // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop before
     // the freeze reaches it; that run is not the case under test (as #1760).
     let mut attempts = 0;
@@ -902,9 +909,10 @@ block 6 () {
 const GRANTED_WANT: i64 = 2222 + 2 * 3333;
 
 fn granting_parent(flip: bool) -> Module {
-    confined(&with_spawn_rec(
-        &GRANTING_PARENT.replace("FLIP", if flip { FLIP } else { "" }),
-    ))
+    confined(&with_spawn_rec(&GRANTING_PARENT.replace(
+        "FLIP",
+        &if flip { self::flip() } else { String::new() },
+    )))
 }
 
 /// [`sharing_host`] over `mailbox`, and `region`, holding `2222` at byte 8, for the parent to grant.
@@ -961,7 +969,7 @@ fn a_region_granted_into_a_running_child_rides_a_freeze() {
     let (mut fhost, args) = granting_host(&child, heap_region(), heap_region());
     let (res, snap, prots) = run(&parent, 0, &mut fhost, &args, &win, None);
     assert!(res.is_ok(), "a freeze, not a refusal: {res:?}");
-    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(read_state(&snap, TEST_ARENA), STATE_UNWINDING, "frozen");
     assert_eq!(fhost.captured_detached().len(), 1, "the child rides live");
     assert_eq!(
         child_regions(&fhost),

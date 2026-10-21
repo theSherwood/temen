@@ -509,21 +509,26 @@ parameter combination rather than per parameter. (Owner decision 2026-09-14; sha
 
 ## 16. Runtime-private placement is the guest's
 
-The substrate fixes in a guest window only what it polls on the hot path — the durable control
-words at `[guard, guard+64)`. Where any *other* runtime-private structure lives inside a window —
-today the durable shadow arena, the per-context regions a freeze/thaw run spills into — is
-**declared by the module and verified**, never a substrate constant, and never defaulted when the
-module declares none (a module without a declaration is simply not freezable; the transform and both
-runtimes fail closed). A guest already places everything else in its window; a fixed carve-out is a
-hole in its address space it cannot see and, by invariant 2, cannot trap on — the collision is
-silent by construction. *Violated by:* a new `*_RESERVE` / `*_BASE` constant that claims window
-bytes; a runtime that applies a default placement when the declaration is absent; a second copy of
-the placement arithmetic (there is one, `temen_ir::durable_abi::ShadowArena`, and every backend
-calls it — invariant 15). (Owner decision 2026-09-16, #1503; sharpens 4 — guest = policy — and
-15. It earned its place by rejecting three real proposals in one afternoon: donating heap to move
-the guest's data around the reserve, mapping the NULL guard as scratch during freeze, and widening
-the session snapshot to make room — each a workaround for the substrate owning a placement that was
-the guest's to make.) The substrate also fixes the *protection* of the pages those words, and a
-declared arena, lie on: the host reads and writes them outside the guest's guarded code, so every
-engine refuses a page op over them, as over the NULL guard (owner decision 2026-10-15, #2426). The
-placement stays the guest's; only the protection of what it declared to the runtime is fixed.
+The substrate fixes nothing inside a guest window. Where a runtime-private structure lives inside
+one — today the durable shadow arena: the per-context regions a freeze/thaw run spills into, and
+the control words every freeze poll reads, in context 0's region header — is **declared by the
+module and verified**, never a substrate constant, and never defaulted when the module declares
+none. A module without a declaration has no runtime words in its window at all: nothing in it can
+poll a freeze, no engine reads or writes its window for one, and the transform refuses to
+instrument it (fail closed). A guest already places everything else in its window; a fixed
+carve-out is a hole in its address space it cannot see and, by invariant 2, cannot trap on — the
+collision is silent by construction, and a window too small to hold the carve-out has the runtime
+reading past its end. *Violated by:* a new `*_RESERVE` / `*_BASE` / `*_OFF` constant that claims
+window bytes; a runtime that applies a default placement when the declaration is absent; a second
+copy of the placement arithmetic (there is one, `temen_ir::durable_abi::ShadowArena`, and every
+backend calls it — invariant 15). (Owner decision 2026-09-16, #1503; sharpens 4 — guest = policy —
+and 15. It earned its place by rejecting three real proposals in one afternoon: donating heap to
+move the guest's data around the reserve, mapping the NULL guard as scratch during freeze, and
+widening the session snapshot to make room — each a workaround for the substrate owning a placement
+that was the guest's to make. Owner decision 2026-10-21, #2518: the control words, fixed one NULL
+guard up until then, joined the arena, so a window too small for that slot — 8 KiB, say — is
+durable, and no engine can address a word its window does not hold.) The substrate also fixes the
+*protection* of the pages a declared arena lies on: the host reads and writes them outside the
+guest's guarded code, so every engine refuses a page op over them, as over the NULL guard (owner
+decision 2026-10-15, #2426). The placement stays the guest's; only the protection of what it
+declared to the runtime is fixed.
