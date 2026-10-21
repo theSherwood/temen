@@ -4,8 +4,11 @@
 //! results as the generic `cap_thunk` path and the tree-walker (so interp == JIT still holds), and
 //! that a forged handle still faults.
 
-use temen_interp::{run_with_host, Host, Value};
-use temen_jit::{compile_and_run_with_host, compile_and_run_with_host_fast, JitOutcome};
+use temen_interp::{cap_id, run_with_host, Host, Value};
+use temen_jit::{
+    compile_and_run_with_host, compile_and_run_with_host_fast, InstanceAddrs, JitOutcome, TrapKind,
+    VmCtx,
+};
 use temen_run::{cap_thunk, fast_cap_resolver};
 
 // `(i32 clk) -> i64`: call `Clock.now()` (0-arg, so the fast resolver `(CLOCK,0,0,1)` engages) twice
@@ -106,4 +109,48 @@ fn resolver_never_claims_parkable_ifaces() {
             }
         }
     }
+}
+
+/// #2499 — a call that succeeds leaves its domain's end alone: a sibling vCPU may have raised it
+/// during the call, and the thunks used to answer success by writing `0` over it, which let the
+/// domain run on past a trap or an `exit`. Both thunks, called as compiled code calls them, with an
+/// end already raised.
+#[test]
+fn a_successful_call_leaves_the_domains_end() {
+    let mut host = Host::new();
+    let clk = host.grant_clock();
+    let ctx = &mut host as *mut Host as *mut core::ffi::c_void;
+    let end = TrapKind::Unreachable.code();
+    let vm = VmCtx::new(InstanceAddrs::NONE);
+    vm.raise(end);
+
+    let mut now = 0i64;
+    // SAFETY: `ctx` is a live `*mut Host`; no args, one result slot, no window.
+    unsafe {
+        cap_thunk(
+            ctx,
+            core::ptr::null_mut(),
+            0,
+            0,
+            cap_id::CLOCK,
+            0,
+            clk,
+            core::ptr::null(),
+            0,
+            &mut now,
+            1,
+            &vm,
+        );
+    }
+    assert_eq!(vm.ended(), Some(end), "the generic thunk kept the end");
+
+    // SAFETY: a pure lookup; a claimed op answers with the fast ABI for its arity.
+    let fast = unsafe { fast_cap_resolver(cap_id::CLOCK, 0, 0, 1) };
+    assert!(!fast.is_null(), "the clock read is fast-path claimed");
+    // SAFETY: the `FastCapResolver` ABI of a 0-arg, 1-result op.
+    let fast: unsafe extern "C" fn(*mut core::ffi::c_void, *mut u8, u64, i32, &VmCtx) -> i64 =
+        unsafe { core::mem::transmute(fast) };
+    // SAFETY: as for the generic call.
+    unsafe { fast(ctx, core::ptr::null_mut(), 0, clk, &vm) };
+    assert_eq!(vm.ended(), Some(end), "the fast path kept the end");
 }

@@ -5769,6 +5769,8 @@ pub struct ScheduledDebugRun {
     /// picks by the span over those turns. Sorted and disjoint; the DAP backend re-installs the list
     /// on every rebuild, like `forced`.
     step_spans: Vec<StepSpan>,
+    /// #2538 — when its threads took their parked calls' answers ([`Takes`]).
+    takes: Takes,
     /// The scheduler-event sink (#1987), if one is installed ([`set_sched_sink`]).
     ///
     /// [`set_sched_sink`]: Self::set_sched_sink
@@ -6131,9 +6133,10 @@ fn service_advance(
             complete(tasks, ti, Err(t));
         }
         // #1366 — a cap park: the call has no answer yet and the turn holds (as a stdin park).
-        // `drive` tells of the call as it is made (`SchedStop::CapPark`, #1414 D4); once nothing
-        // else can run it takes the answer (#2047), stopping `SchedStop::Idle` while the embedder
-        // owes it (#2495). Taking it re-admits the task and counts the turn.
+        // `drive` tells of the call as it is made (`SchedStop::CapPark`, #1414 D4); it takes the
+        // answer at the pick after it comes (#2538), stopping `SchedStop::Idle` while the embedder
+        // owes it and nothing else can run (#2495). Taking it re-admits the task and counts the
+        // turn.
         FiberStep::CapParked { id, dst, at } => {
             tasks[ti].state = TaskState::BlockedHostCap { id, dst, at };
         }
@@ -6667,70 +6670,163 @@ fn dbg_preview_pick(
 /// Pick the next thread to run under the session's **schedule policy** (slice 7) — the
 /// [`dbg_preview_pick`] order. First time out every wait whose deadline this engine's logical time
 /// has reached: `clock + turn`, so time moves by one ns per op as on the pump (#2224), and `clock`
-/// is only the offset the idle jumps add. If none is runnable, advance the offset to the earliest
-/// `memory.wait` deadline and wake every timed-out waiter (`WAIT_TIMED_OUT`), then retry. `None`
-/// only on a true deadlock (no runnable thread and no waiter) — mirrors `drive`. Every path is a
-/// pure function of `(seed, forced, pref, turn, task states)`, so replay reproduces it exactly —
-/// which is why the live `drive` and the replaying `tick` both pick through here.
-#[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks a clock advance wakes
+/// is only the offset the idle jumps add. A thread whose parked call's answer has come takes it
+/// first ([`dbg_take_answer`]). If none is runnable, wait for an answer until the next timer is due
+/// ([`dbg_await_answer`]); else advance the offset to the earliest `memory.wait` deadline and wake
+/// every timed-out waiter (`WAIT_TIMED_OUT`), then retry. [`Idle`] when no thread runs next —
+/// mirrors `drive`. Every pick is a pure function of `(seed, forced, pref, turn, task states)`, and
+/// a run that goes over its time again (`replay`) takes each answer where `takes` says, so replay
+/// reproduces it exactly — which is why the live `drive` and the replaying `tick` both pick through
+/// here.
+#[allow(clippy::too_many_arguments)] // the pick policy's inputs, plus the parks an idle run wakes
 fn dbg_pick_runnable(
     tasks: &mut [TaskSlot],
     fibers: &mut FiberTables,
     envs: &mut [DbgEnv],
+    host: &mut Host,
+    takes: &mut Takes,
+    replay: bool,
     clock: &mut u64,
     seed: Option<u64>,
     forced: &[(u64, usize)],
     pref: Option<(usize, bool)>,
-    turn: u64,
-) -> Option<usize> {
-    let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut fibers.fibers)
-        .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
-        .collect();
-    let mut now = clock.saturating_add(turn);
-    time_out_due(tasks, &mut regs, now);
+    turn: &mut u64,
+) -> Result<usize, Idle> {
+    let mut now = clock.saturating_add(*turn);
+    time_out_due(tasks, &mut registries(fibers, envs), now);
     loop {
-        if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, turn) {
-            return Some(i);
+        let parked = |t: &TaskSlot| matches!(t.state, TaskState::BlockedHostCap { .. });
+        if tasks.iter().any(parked) {
+            if let Some(idle) = dbg_take_answer(tasks, envs, host, takes, replay, now, turn) {
+                return Err(idle);
+            }
+        }
+        if let Some(i) = dbg_preview_pick(tasks, seed, forced, pref, *turn) {
+            return Ok(i);
+        }
+        let next = next_timeout(
+            tasks,
+            registries(fibers, envs).iter().flat_map(|r| r.iter()),
+        );
+        if dbg_await_answer(tasks, envs, host, takes, replay, now, next)? {
+            continue;
         }
         // #1638 — only a waiter with a REAL deadline is a clock-advance candidate, so "nothing
         // runnable and every remaining waiter is indefinite" is the deadlock exit, not a
         // `WAIT_TIMED_OUT` the guest never asked for.
-        if !fire_next_timeout(tasks, &mut regs, &mut now) {
-            return None;
+        if !fire_next_timeout(tasks, &mut registries(fibers, envs), &mut now) {
+            return Err(Idle::Stuck);
         }
-        *clock = now - turn;
+        *clock = now - *turn;
     }
 }
 
-/// #2047 — with nothing runnable and no timer left, a thread parked on a punted call takes its
-/// answer, counting the turn: the lowest-index one whose answer has come, or, with none come yet,
-/// the first to come (#2424 — one thread's answer never waits on another's call, which may wait on
-/// what that thread does). Taken only here, where nothing else could run meanwhile, so when it
-/// comes changes nothing a replay sees, and taped as it is taken ([`tape_answer`]).
-///
-/// `Ok` when a thread took its answer. Else, with no answer in, the lowest-index thread whose call
-/// waits on its embedder (#2495), as `(thread, id, at)`, for the run to stop on; or `None` when no
-/// thread is parked. The stop is the one found here: the embedder may answer the call from another
-/// thread before it sees the stop, and the next advance takes the answer. Looking for it again
-/// after this returned could find it answered, and the run, with its answer in, read as blocked.
-fn dbg_take_answer(
-    tasks: &mut [TaskSlot],
-    extra_envs: &mut [DbgEnv],
-    host: &mut Host,
-    turn: &mut u64,
-) -> Result<(), Option<(usize, u64, Option<super::IrPc>)>> {
-    let parked: Vec<_> = tasks
+/// Every domain's fiber registry: the root's, then each §14 child's.
+fn registries<'a>(
+    fibers: &'a mut FiberTables,
+    envs: &'a mut [DbgEnv],
+) -> Vec<&'a mut Vec<FiberState>> {
+    std::iter::once(&mut fibers.fibers)
+        .chain(envs.iter_mut().map(|e| &mut e.fibers.fibers))
+        .collect()
+}
+
+/// Why no thread runs next ([`dbg_pick_runnable`]).
+enum Idle {
+    /// A thread took its parked call's answer, which counts the turn.
+    Took,
+    /// Thread `p`'s call, made at `at`, waits on its embedder (#2495), which was told of it as it was
+    /// made and answers it once it has control back (#1414 D4), so the run stops `Idle` on it. The
+    /// stop is the one found here: the embedder may answer the call from another thread before it
+    /// sees the stop, and the next advance takes the answer. Looking for it again could find it
+    /// answered, and the run, with its answer in, read as blocked.
+    OnEmbedder(usize, Option<super::IrPc>),
+    /// Nothing can wake a thread.
+    Stuck,
+}
+
+/// #2538 — when a run's threads took their parked calls' answers, by the run's logical time
+/// (`clock + turn`), which each pick moves on. When an answer comes depends on the world, so a run
+/// that goes over its time again ([`ScheduledDebugRun::tick`], as an undo re-executes) takes each
+/// answer where the run took it, and nowhere else. A [`drive`](ScheduledDebugRun::drive) decides
+/// afresh from where it starts.
+#[derive(Clone, Debug, Default)]
+struct Takes {
+    /// `(time, thread)` for each take, in time order.
+    at: Vec<(u64, usize)>,
+    /// Every pick before this time with a call parked is decided: a take in `at`, or none.
+    decided: u64,
+}
+
+impl Takes {
+    /// The thread that took an answer at `time`, if one did.
+    fn taken_at(&self, time: u64) -> Option<usize> {
+        let i = self.at.partition_point(|&(t, _)| t < time);
+        self.at.get(i).filter(|&&(t, _)| t == time).map(|&(_, p)| p)
+    }
+
+    /// The decision at `time`: thread `took` took its answer, or (`None`) none did.
+    fn decide(&mut self, time: u64, took: Option<usize>) {
+        if let Some(p) = took {
+            self.at.push((time, p));
+        }
+        self.decided = time + 1;
+    }
+
+    /// Forget what was decided from `time` on: a run that goes on from there decides it afresh.
+    fn forget_from(&mut self, time: u64) {
+        self.at.retain(|&(t, _)| t < time);
+        self.decided = self.decided.min(time);
+    }
+
+    /// Whether a run going over its time again (`replay`) has decided the pick at `time` already.
+    fn replaying(&self, replay: bool, time: u64) -> bool {
+        replay && time < self.decided
+    }
+}
+
+/// A thread parked on a punted call: `(thread, domain, dst, call id, call site)`.
+type Parked = (usize, Option<usize>, u32, u64, Option<super::IrPc>);
+
+/// The threads parked on a punted call.
+fn dbg_parked(tasks: &[TaskSlot]) -> Vec<Parked> {
+    tasks
         .iter()
         .enumerate()
         .filter_map(|(i, t)| match t.state {
             TaskState::BlockedHostCap { id, dst, at } => Some((i, t.env, dst, id, at)),
             _ => None,
         })
-        .collect();
-    let calls: Vec<_> = parked
-        .iter()
-        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
-        .collect();
+        .collect()
+}
+
+/// #2047, #2538 — a thread parked on a punted call whose answer has come takes it at the pick at
+/// logical time `now`, counting the turn, and tapes it ([`tape_answer`]): the lowest-index one, as
+/// every engine delivers an answer as it arrives (#2477), and one thread's answer never waits on
+/// another's call, which may wait on what that thread does (#2424). The pick, take or none, joins
+/// `takes`. A run going over its time again takes an answer only where `takes` says, waiting for it
+/// if it is not in yet, or stopping on its embedder.
+///
+/// `Some(Idle::Took)` when a thread took its answer.
+#[allow(clippy::too_many_arguments)]
+fn dbg_take_answer(
+    tasks: &mut [TaskSlot],
+    extra_envs: &mut [DbgEnv],
+    host: &mut Host,
+    takes: &mut Takes,
+    replay: bool,
+    now: u64,
+    turn: &mut u64,
+) -> Option<Idle> {
+    let mut parked = dbg_parked(tasks);
+    if parked.is_empty() {
+        return None;
+    }
+    let replaying = takes.replaying(replay, now);
+    if replaying {
+        let p = takes.taken_at(now)?;
+        parked.retain(|&(i, ..)| i == p);
+    }
     loop {
         for &(p, env, dst, id, _) in &parked {
             let h = match env {
@@ -6740,22 +6836,63 @@ fn dbg_take_answer(
             if let Some(r) = take_answer(h, id) {
                 tasks[p].deliver(dst, Reg::from_i64(r));
                 tasks[p].state = TaskState::Runnable;
+                if !replaying {
+                    takes.decide(now, Some(p));
+                }
                 *turn += 1;
-                return Ok(());
+                return Some(Idle::Took);
             }
         }
+        if !replaying {
+            takes.decide(now, None);
+            return None;
+        }
+        // The thread the run took an answer on here, if it is parked here too, waits for it.
+        let &[(p, env, _, id, at)] = &parked[..] else {
+            return None;
+        };
+        let comps = dbg_completions(env, extra_envs, host);
+        if comps.is_host_owned(id) {
+            return Some(Idle::OnEmbedder(p, at));
+        }
+        super::Completions::wait_any(&[(comps, id)], None, None);
+    }
+}
+
+/// #2538 — nothing can run at logical time `now`, and no parked call's answer has come: wait for one
+/// in real time until the next timer is due (`next`), as the pump does (#1979), so a thread that
+/// keeps a timer going never starves another's answer; with no timer, until one comes, or stop on a
+/// call its embedder answers once it has control back. `Ok(true)` when an answer came, `Ok(false)`
+/// when the timer is to fire. A run going over its time again waits for none: it fires the timer
+/// wherever the run did.
+fn dbg_await_answer(
+    tasks: &[TaskSlot],
+    extra_envs: &[DbgEnv],
+    host: &Host,
+    takes: &Takes,
+    replay: bool,
+    now: u64,
+    next: Option<u64>,
+) -> Result<bool, Idle> {
+    let parked = dbg_parked(tasks);
+    if parked.is_empty() || (takes.replaying(replay, now) && next.is_some()) {
+        return Ok(false);
+    }
+    let calls: Vec<_> = parked
+        .iter()
+        .map(|&(_, env, _, id, _)| (dbg_completions(env, extra_envs, host), id))
+        .collect();
+    let within = next.map(|d| std::time::Duration::from_nanos(d.saturating_sub(now)));
+    if within.is_none() {
         let on_embedder = parked
             .iter()
             .zip(&calls)
             .find(|(_, (comps, id))| comps.is_host_owned(*id));
-        if let Some((&(p, _, _, id, at), _)) = on_embedder {
-            return Err(Some((p, id, at)));
+        if let Some((&(p, _, _, _, at), _)) = on_embedder {
+            return Err(Idle::OnEmbedder(p, at));
         }
-        if calls.is_empty() {
-            return Err(None);
-        }
-        super::Completions::wait_any(&calls, None, None);
     }
+    Ok(super::Completions::wait_any(&calls, None, within))
 }
 
 /// Whether a thread is parked on a punted call the offload pool answers (#2047): its answer comes
@@ -6849,6 +6986,7 @@ impl ScheduledDebugRun {
             sched_seed: None,
             forced: Vec::new(),
             step_spans: Vec::new(),
+            takes: Takes::default(),
             sched_sink: None,
             single_thread: false,
             last_watch: None,
@@ -7261,6 +7399,7 @@ impl ScheduledDebugRun {
             sched_seed,
             forced,
             step_spans,
+            takes,
             single_thread,
             scheduled_writes,
             write_cursor,
@@ -7274,6 +7413,8 @@ impl ScheduledDebugRun {
         } = self;
         let fn_block_base = &root_md.fn_block_base;
         *stopped = None;
+        // #2538 — a run driven on decides afresh when its threads take their answers.
+        takes.forget_from(clock.saturating_add(*turn));
         loop {
             if let TaskState::Done(res) = &tasks[0].state {
                 let res = res.clone();
@@ -7304,24 +7445,24 @@ impl ScheduledDebugRun {
                     tasks,
                     fibers,
                     extra_envs,
+                    host,
+                    takes,
+                    false,
                     clock,
                     *sched_seed,
                     forced,
                     pref,
-                    *turn,
+                    turn,
                 ) {
-                    Some(i) => i,
+                    Ok(i) => i,
+                    Err(Idle::Took) => continue,
                     // Nothing runnable and no timed waiter: a thread waiting on what only the
                     // embedder can give it (#1146 deeper, #1414 D4) makes this a live `Idle` stop on
                     // that thread (the lowest-index one), else a true deadlock.
-                    None => {
-                        let on_embedder = match dbg_take_answer(tasks, extra_envs, host, turn) {
-                            Ok(()) => continue,
-                            Err(on_embedder) => on_embedder,
-                        };
+                    Err(idle) => {
                         // #1366: a thread waits on a host-answered call its embedder was told of
                         // when the thread made it; it moves on once the embedder answers.
-                        if let Some((p, _, at)) = on_embedder {
+                        if let Idle::OnEmbedder(p, at) = idle {
                             // The stop location is the call itself, falling back to the live pc.
                             let pc = at.or_else(|| tasks[p].vm.vt.debug_active().cur_ir_pc(source));
                             if let Some(pc) = pc {
@@ -7636,6 +7777,7 @@ impl ScheduledDebugRun {
             sched_seed,
             forced,
             step_spans,
+            takes,
             scheduled_writes,
             write_cursor,
             ..
@@ -7643,26 +7785,34 @@ impl ScheduledDebugRun {
         let fn_block_base = &root_md.fn_block_base;
         // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the
         // same pin on replay reconstructs the coroutine's op sequence deterministically. The policy
-        // pick (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive
-        // schedule. A `CapParked` task is not runnable, so a parked run refuses to tick — as the
-        // single engine's.
+        // pick (seed + forced) matches `drive`'s, and so do the answers taken (#2538), so a
+        // tick-replay reproduces the interactive schedule. A `CapParked` task is not runnable, so a
+        // parked run refuses to tick — as the single engine's.
         let pre_pick = (sched_trace.is_some() || sched_sink.is_some()).then(|| trace_tags(tasks));
-        let Some(ti) = dbg_pinned_coro(tasks).or_else(|| {
-            let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
-            dbg_pick_runnable(
-                tasks,
-                fibers,
-                extra_envs,
-                clock,
-                *sched_seed,
-                forced,
-                pref,
-                *turn,
-            )
-        }) else {
+        let picked = match dbg_pinned_coro(tasks) {
+            Some(p) => Ok(p),
+            None => {
+                let pref = span_at(step_spans, *turn); // #1942: replay a recorded step's thread
+                dbg_pick_runnable(
+                    tasks,
+                    fibers,
+                    extra_envs,
+                    host,
+                    takes,
+                    true,
+                    clock,
+                    *sched_seed,
+                    forced,
+                    pref,
+                    turn,
+                )
+            }
+        };
+        let ti = match picked {
+            Ok(ti) => ti,
             // A parked thread's answer is this tick, as in `drive`; else no runnable thread and no
             // waiter (deadlock, or its embedder's to answer) — can't advance.
-            return dbg_take_answer(tasks, extra_envs, host, turn).is_ok();
+            Err(idle) => return matches!(idle, Idle::Took),
         };
         if let Some(before) = pre_pick.as_ref() {
             let mut events = Vec::new();
@@ -9872,7 +10022,15 @@ fn outstanding_calls(
     fibers: &[FiberState],
     extra_envs: &[ChildEnv],
 ) -> Vec<(Option<usize>, u64)> {
-    let parked = |t: &TaskSlot| match t.state {
+    tasks
+        .iter()
+        .filter_map(|t| call_awaited(t, fibers, extra_envs).map(|id| (t.env, id)))
+        .collect()
+}
+
+/// The punted call task `t` waits on, if it does ([`outstanding_calls`]).
+fn call_awaited(t: &TaskSlot, fibers: &[FiberState], extra_envs: &[ChildEnv]) -> Option<u64> {
+    match t.state {
         TaskState::BlockedHostCap { id, .. } => Some(id),
         TaskState::BlockedOnFiber { fiber } => {
             let reg = match t.env {
@@ -9887,11 +10045,7 @@ fn outstanding_calls(
             }
         }
         _ => None,
-    };
-    tasks
-        .iter()
-        .filter_map(|t| parked(t).map(|id| (t.env, id)))
-        .collect()
+    }
 }
 
 /// What only the world can end (#1122): the verdict on a run in which no task can run, no wait's
@@ -11953,7 +12107,9 @@ fn drive(
         sched.wall = cfg!(not(target_family = "wasm"));
         match sched.pump(&dom, mem, &root, &mut root_fuel, budget)? {
             CoopStep::Done(vals) => Ok(vals),
-            CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
+            CoopStep::Idle { .. } => {
+                unreachable!("idle suspension not enabled on the native driver")
+            }
             CoopStep::Paused => unreachable!("slicing not enabled on the native driver"),
             CoopStep::CapPark { .. } => {
                 unreachable!("only a pump its embedder drives hands control back for a call")
@@ -11990,8 +12146,10 @@ enum CoopStep {
     /// stdin read) and nothing internal can wake one. A pump its embedder drives (a [`CoopRun`])
     /// RETURNS here instead of waiting, so the embedder answers or feeds and pumps again — the whole
     /// scheduler state stays inside the `CoopSched`. The native `drive` waits instead: on the call's
-    /// answer, or on the bell for a feed (or it is the deadlock it always was).
-    Idle,
+    /// answer, or on the bell for a feed (or it is the deadlock it always was). #2557 — `timer` is
+    /// the time to the run's next timer, which waits for the embedder's clock while an answer is
+    /// owed ([`CoopEvent::Idle`]).
+    Idle { timer: Option<u64> },
     /// A task paused to run `func` of program `module` emitted ([`CoopEvent::TierUp`]) with raw i64
     /// arg slots `argv`; `mapped` is the window's committed scalar extent for the emitted `"mapped"`
     /// global (#717 host sync).
@@ -12628,6 +12786,16 @@ impl SchedCore {
         self.tasks[0].vm.vt.active.tier_up(0, emit, false);
     }
 
+    /// `ns` of the run's time passes: the clock moves by it, and every wait it reaches times out.
+    /// The pump's quanta move it so (#2224), and so does its embedder's clock ([`CoopRun::pass_time`]).
+    fn pass_time(&mut self, ns: u64) {
+        self.clock = self.clock.saturating_add(ns);
+        let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut self.fibers)
+            .chain(self.extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
+            .collect();
+        time_out_due(&mut self.tasks, &mut regs, self.clock);
+    }
+
     /// A run's initial scheduling state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`), after the once-per-run entry-fuel charge.
     /// Both executors start a run here ([`CoopSched::new`], [`drive_threads`]).
@@ -12982,8 +13150,10 @@ impl CoopSched {
                 // (#2424): a fiber's `CapParked`, a task's `BlockedHostCap`. #1953, #2495, #1414 D4
                 // — one its embedder answers, in any domain, is the embedder's to answer, and it
                 // heard of each as the call was made: with one owed, a pump the embedder drives
-                // hands control back rather than wait. Before any timer fires, as the run's clock
-                // jumps (#2439) and must not run ahead of an answer that is owed.
+                // hands control back rather than wait. The run's clock jumps (#2439), and must not
+                // run ahead of an answer that is owed, so its next timer waits for the embedder's
+                // clock: the pump hands back the time to it, and fires it once its embedder has
+                // let that time pass ([`CoopRun::pass_time`], #2557).
                 let calls: Vec<_> = outstanding_calls(tasks, fibers, extra_envs)
                     .into_iter()
                     .map(|(env, id)| {
@@ -12992,7 +13162,12 @@ impl CoopSched {
                     })
                     .collect();
                 if *embedder_pumps && calls.iter().any(|(c, id)| c.is_host_owned(*id)) {
-                    return Ok(CoopStep::Idle);
+                    let next = run_deadline(tasks, fibers, extra_envs);
+                    if !next.is_some_and(|d| d <= *clock) {
+                        return Ok(CoopStep::Idle {
+                            timer: next.map(|d| d - *clock),
+                        });
+                    }
                 }
                 // #1979 — on the native driver the time to the earliest deadline passes first.
                 if *wall && wait_out(tasks, fibers, extra_envs, clock, root, &calls, bell_gen) {
@@ -13018,7 +13193,7 @@ impl CoopSched {
                     let bell = root.lock_unpoisoned().external_wake();
                     if calls.is_empty() {
                         match stalled(tasks, *embedder_pumps, bell.is_some()) {
-                            Stalled::Idle => return Ok(CoopStep::Idle),
+                            Stalled::Idle => return Ok(CoopStep::Idle { timer: None }),
                             Stalled::Deadlock => return Err(Trap::ThreadFault),
                             Stalled::Bell => {}
                         }
@@ -13080,13 +13255,25 @@ impl CoopSched {
             // #2224 — and while a task waits with a deadline: the clock that times the wait out
             // moves with the quanta that run out (below), so a lone runnable task must still yield
             // at its quantum, or a thread that naps never wakes while another spins on it.
-            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some()
-                || tasks
-                    .iter()
-                    .filter(|t| matches!(t.state, TaskState::Runnable))
-                    .count()
-                    >= 2
-            {
+            // #2538 — and while a task waits on a call: its answer is drained between quanta, so a
+            // lone runnable task must yield to let it through, or a thread that waits on the world
+            // never wakes while another spins on it.
+            let (quantum, preemptible) = if next_wait_deadline(tasks).is_some() || {
+                let (mut runnable, mut awaits_call) = (0, false);
+                for t in tasks.iter() {
+                    if matches!(t.state, TaskState::Runnable) {
+                        runnable += 1;
+                    } else if !awaits_call
+                        && matches!(
+                            t.state,
+                            TaskState::BlockedHostCap { .. } | TaskState::BlockedOnFiber { .. }
+                        )
+                    {
+                        awaits_call = call_awaited(t, fibers, extra_envs).is_some();
+                    }
+                }
+                runnable >= 2 || awaits_call
+            } {
                 (COOP_QUANTUM, true)
             } else {
                 (budget, false)
@@ -13245,11 +13432,7 @@ impl CoopSched {
             // another task keeps running, after as much of its work as the timeout names, and
             // deterministically, as the op count is.
             if preemptible && matches!(stop, Ok(VcpuStop::Preempted)) {
-                *clock = clock.saturating_add(quantum);
-                let mut regs: Vec<&mut Vec<FiberState>> = std::iter::once(&mut *fibers)
-                    .chain(extra_envs.iter_mut().map(|e| &mut e.fibers.fibers))
-                    .collect();
-                time_out_due(tasks, &mut regs, *clock);
+                core.pass_time(quantum);
             }
             // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
             // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
@@ -14493,7 +14676,15 @@ pub enum CoopEvent {
     /// run can wake one. The run is live and resumable: answer the call, or feed input (e.g.
     /// `Posix::feed_terminal`, or a signal), and call [`run`](CoopRun::run) again. `run` returns
     /// this rather than wait on its embedder.
-    Idle,
+    ///
+    /// #2557 — `timer` is how long, in ns, until the run's next timer: the earliest deadline of a
+    /// timed wait, which can wake a task before the embedder acts. It is `None` when no wait has
+    /// one. The pump fires it only once its embedder has let that time pass
+    /// ([`CoopRun::pass_time`]), so that its clock cannot run ahead of an answer it owes. An
+    /// embedder with a clock waits for whichever comes first, its own event or the timer, lets
+    /// the time that passed pass, and pumps again. On executor 2 the timer fires on its own; pump
+    /// again after it to hear what follows.
+    Idle { timer: Option<u64> },
     /// #1953, #1414 D4 — a task has just made **host-answered cap call** `id` (a proc granted with
     /// [`crate::OffloadOutcome::Host`]), in any domain, whose request the proc's submit hook
     /// recorded, and it waits for the embedder's answer. Each call is told once, as it is made,
@@ -14584,7 +14775,7 @@ impl ThreadsRun {
             }
             match run.watch() {
                 Watched::CapPark(id) => return CoopEvent::CapPark { id },
-                Watched::Idle => return CoopEvent::Idle,
+                Watched::Idle { timer } => return CoopEvent::Idle { timer },
                 Watched::Over => {}
             }
         }
@@ -15043,6 +15234,15 @@ impl CoopRun {
         }
     }
 
+    /// #2557 — `ns` of the embedder's time has passed since the run went [`CoopEvent::Idle`]. The
+    /// pump's clock moves by it, as by a quantum's ops (#2224), and the waits it reaches time out:
+    /// they run at the next [`run`](Self::run). A no-op on executor 2, whose clock is the wall's.
+    pub fn pass_time(&mut self, ns: u64) {
+        if let Some(p) = self.pump_mut() {
+            p.sched.core.pass_time(ns);
+        }
+    }
+
     /// [`run`](Self::run), but return after about `ops` ops with [`CoopEvent::Paused`] if nothing else
     /// stopped the run first. The slice is counted in ops (fuel), so it is deterministic.
     pub fn run_for(&mut self, ops: u64) -> CoopEvent {
@@ -15072,7 +15272,7 @@ impl CoopRun {
             .pump(&p.dom, &mut p.mem, &p.host, &mut p.fuel, u64::MAX)
         {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
-            Ok(CoopStep::Idle) => CoopEvent::Idle,
+            Ok(CoopStep::Idle { timer }) => CoopEvent::Idle { timer },
             Ok(CoopStep::CapPark { id }) => CoopEvent::CapPark { id },
             Ok(CoopStep::Paused) => CoopEvent::Paused,
             Ok(CoopStep::TierUp {
@@ -17015,7 +17215,11 @@ impl ThreadRun {
             g.told.push(id);
             return Some(Watched::CapPark(id));
         }
-        g.stalled.then_some(Watched::Idle)
+        let core = &g.core;
+        g.stalled.then(|| Watched::Idle {
+            timer: run_deadline(&core.tasks, &core.fibers, &core.extra_envs)
+                .map(|d| d.saturating_sub(self.now())),
+        })
     }
 }
 
@@ -17026,8 +17230,8 @@ enum Watched {
     /// Host-answered call `id` waits for its embedder's answer ([`CoopEvent::CapPark`]).
     CapPark(u64),
     /// No task can run until the embedder acts: an answer it owes, or input it feeds
-    /// ([`CoopEvent::Idle`]).
-    Idle,
+    /// ([`CoopEvent::Idle`]). `timer` is the wall time to the run's next deadline, if a wait has one.
+    Idle { timer: Option<u64> },
 }
 
 /// Mark task `ti` finished with `res`, then wake any vCPU parked on a join of it: what the end gives
@@ -17339,6 +17543,13 @@ fn next_timeout<'a>(
         .min()
 }
 
+/// The earliest deadline among a run's timed waits: its tasks', and its event-parked fibers' in
+/// every domain (`fibers`, then `envs`').
+fn run_deadline(tasks: &[TaskSlot], fibers: &[FiberState], envs: &[ChildEnv]) -> Option<u64> {
+    let regs = std::iter::once(fibers).chain(envs.iter().map(|e| &e.fibers.fibers[..]));
+    next_timeout(tasks, regs.flat_map(|reg| reg.iter()))
+}
+
 /// #1979 — an idle native pump lets the time to its earliest deadline pass in real time, as the
 /// other engines' waits do, instead of jumping its `clock` there. The answer to any of the
 /// outstanding `calls` ends the wait early, or with none a ring of the embedder's bell past
@@ -17354,9 +17565,7 @@ fn wait_out(
     calls: &[(std::sync::Arc<super::Completions>, u64)],
     seen: u64,
 ) -> bool {
-    let regs = std::iter::once(&*fibers).chain(extra_envs.iter().map(|e| &e.fibers.fibers[..]));
-    let next = next_timeout(tasks, regs.flat_map(|reg| reg.iter()));
-    let Some(left) = next
+    let Some(left) = run_deadline(tasks, fibers, extra_envs)
         .and_then(|next| next.checked_sub(*clock))
         .filter(|&l| l > 0)
     else {

@@ -8,9 +8,9 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 ## Legend
 
-- ✅ **Full** — the capability holds on this axis
-- ⛔ **Declines** — it deliberately does not, and the note says why
-- 🚧 **Not yet** — a real gap with a tracked plan
+- ✅ **Full** — holds
+- ⛔ **Declines** — deliberately does not, and the note says why
+- 🚧 **Not yet** — a real gap, and the note cites its issue
 - 🔶 **Conditional** — holds where the note's condition does
 - ❔ **Unaudited** — nobody has established this cell
 

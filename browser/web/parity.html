@@ -31,8 +31,8 @@
         --st-notyet: #b26a00;
         --st-conditional: var(--accent);
         /* An unaudited cell is *unknown*, not passing — muted, so it reads as absent information
-           rather than a verdict. The op matrix has none; the frontier matrix (#1413) is full of them
-           while it is filled in. */
+           rather than a verdict. The op matrix has none; the frontier (#1413) and run-mode (#2545)
+           matrices are full of them while they are filled in. */
         --st-unaudited: var(--faint);
       }
       :root[data-theme="dark"] {
@@ -198,6 +198,26 @@
             rows: d.rows.map((r) => ({
               label: r.capability, group: null, cells: r.cells,
               notes: r.notes.map((n) => `${n.axis}: ${n.text}`),
+            })),
+          }),
+        },
+        modes: {
+          file: 'assets/run_modes.json',
+          title: 'Feature × run mode',
+          sub: 'Can a program that uses a feature run in a given mode, and which modes combine (#2545)? ' +
+               'A run is one executor (tree-walk, pump, parallel, Cranelift) plus any properties it adds. ' +
+               'The rows are guest features, then the properties again, so a property’s row says which ' +
+               'executors and properties it combines with. A cell claims anything but unaudited only where ' +
+               'a conformance test runs the case, and every not-yet cell names the issue tracking its gap.',
+          source: 'RUN_MODES.md',
+          rowNoun: 'rows', colNoun: 'modes', rowHead: 'uses', groupHead: 'kind',
+          search: 'Search feature or property…',
+          disagree: null,
+          adapt: (d) => ({
+            columns: d.columns.map((c) => ({ label: c.short, title: `${c.kind}: ${c.question}` })),
+            rows: d.rows.map((r) => ({
+              label: r.row, group: r.group, cells: r.cells,
+              notes: r.notes.map((n) => `${n.column}: ${n.text}`),
             })),
           }),
         },

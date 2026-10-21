@@ -182,10 +182,11 @@ impl Drop for WindowRegionPurge {
 /// # Safety
 /// Honours the `CapThunk` contract: `ctx` is a live `*mut Host`; `args`/`results` are valid for
 /// `n_args`/`n_results`; `mem_base` (when non-null) is the guest window with `mem_size` backed
-/// bytes inside a `mem_reserved` reservation; `trap_out` is the trap cell of the calling instance's
-/// live [`temen_jit::VmCtx`], as compiled code passes it — a park and a punted call's wait read the
-/// instance through it. The trap cell is encoded as the JIT expects: `0` = ok, else the host trap's
-/// wire code ([`Trap::code`], [`temen_ir::trap_code`]).
+/// bytes inside a `mem_reserved` reservation; `vm` is the calling instance's live
+/// [`temen_jit::VmCtx`], as compiled code passes it — a park and a punted call's wait read the
+/// instance through it. A host trap is raised on it as its wire code ([`Trap::code`],
+/// [`temen_ir::trap_code`]); a call that succeeds leaves it alone, since it may already hold the
+/// domain's end, raised by a sibling vCPU during the call (#2499).
 pub unsafe extern "C" fn cap_thunk(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -198,14 +199,14 @@ pub unsafe extern "C" fn cap_thunk(
     n_args: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) {
     // #1166: this thunk takes the `Host` as a raw `&mut`, so it serves one caller at a time. A call
     // from a `thread.spawn`ed vCPU means the guest is concurrent, and a concurrent guest runs
     // [`cap_thunk_locked`] (`jit_cap_run` picks it on `uses_concurrency`). Refuse rather than race the
     // `Host`: six workers entering here at once raced its lazily built page map (#1166).
     if temen_jit::on_spawned_vcpu() {
-        *trap_out = TrapKind::ThreadFault as i64;
+        vm.raise(TrapKind::ThreadFault as i64);
         return;
     }
     // F3 (FIBER_PARK.md), #2047 — a punt parks its caller, never the run: route through the
@@ -235,20 +236,20 @@ pub unsafe extern "C" fn cap_thunk(
             n_args,
             results,
             n_results,
-            trap_out,
+            vm,
             pending_face.then_some(&mut pending_id),
             &mut park,
         );
         if let Some(id) = pending_id {
             let comps = (*(ctx as *mut Host)).completions();
-            let r = cap_wait(&comps, id, temen_jit::fiber_active(), trap_out);
-            if *trap_out == 0 {
+            let r = cap_wait(&comps, id, temen_jit::fiber_active(), vm);
+            if vm.ended().is_none() {
                 *results = r;
             }
             return;
         }
         match park {
-            Some(p) if p.park(trap_out) => continue,
+            Some(p) if p.park(vm) => continue,
             _ => return,
         }
     }
@@ -283,19 +284,19 @@ impl HostParkReq {
     /// poll to unwind past, and a park no live vCPU could end is the oracle's deadlock, `ThreadFault`.
     ///
     /// # Safety
-    /// `trap_out` is the live call's trap cell; the caller holds no lock the run's other vCPUs need.
-    unsafe fn park(&self, trap_out: *mut i64) -> bool {
+    /// `vm` is the live call's context; the caller holds no lock the run's other vCPUs need.
+    unsafe fn park(&self, vm: &temen_jit::VmCtx) -> bool {
         let (probe, freeze) = match self {
-            HostParkReq::Tree { bell } => return jit_proc::wait_for_bell(trap_out, *bell),
+            HostParkReq::Tree { bell } => return jit_proc::wait_for_bell(vm, *bell),
             HostParkReq::Hub { probe, freeze } => (probe, *freeze),
         };
         let key = probe.as_ref().map_or(Self::STDIN, |p| p.gid() as u64);
         let still_parked = || probe.as_ref().is_none_or(|p| !p.ready());
-        match temen_jit::park_host_call(trap_out, freeze, key, Parks::Fiber, still_parked) {
+        match temen_jit::park_host_call(vm, freeze, key, Parks::Fiber, still_parked) {
             temen_jit::HostPark::Woken => true,
             temen_jit::HostPark::Frozen | temen_jit::HostPark::Ended => false,
             temen_jit::HostPark::Deadlock => {
-                *trap_out = TrapKind::ThreadFault as i64;
+                vm.raise(TrapKind::ThreadFault as i64);
                 false
             }
         }
@@ -308,18 +309,18 @@ impl HostParkReq {
 /// trap cell set, so the caller writes no result.
 ///
 /// # Safety
-/// `trap_out` is the live call's trap cell; with `fiber`, the call runs in a live fiber
+/// `vm` is the live call's context; with `fiber`, the call runs in a live fiber
 /// ([`fiber_cap_wait`]'s contract). The caller holds no lock the run's other vCPUs need.
 unsafe fn cap_wait(
     comps: &std::sync::Arc<temen_interp::Completions>,
     id: u64,
     fiber: bool,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i64 {
     if fiber {
-        return fiber_cap_wait(comps, id, trap_out);
+        return fiber_cap_wait(comps, id, vm);
     }
-    temen_jit::wait_outside(trap_out, |d| comps.wait_timeout(id, d)).unwrap_or(0)
+    temen_jit::wait_outside(vm, |d| comps.wait_timeout(id, d)).unwrap_or(0)
 }
 
 /// F3 (FIBER_PARK.md) — the fiber-park completion wait: register the fiber's cell (an answer
@@ -332,18 +333,18 @@ unsafe fn cap_wait(
 /// could observe the placeholder scalar.
 ///
 /// # Safety
-/// Same fiber-context contract as [`temen_jit::fiber_park_outside`]; `trap_out` is the live trap
+/// Same fiber-context contract as [`temen_jit::fiber_park_outside`]; `vm` is the live trap
 /// cell.
 unsafe fn fiber_cap_wait(
     comps: &std::sync::Arc<temen_interp::Completions>,
     id: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i64 {
     let cell = comps.fiber_register(id);
     // #2424 — a §14 child's task parked here is re-offered as soon as its answer is in. Installed
     // before the park: an answer that comes first finds the task running, and the wake it latches
     // re-offers the task once it parks.
-    if let Some(wake) = temen_jit::outside_waker(trap_out) {
+    if let Some(wake) = temen_jit::outside_waker(vm) {
         comps.set_notify(Some(wake));
     }
     loop {
@@ -351,7 +352,7 @@ unsafe fn fiber_cap_wait(
         if let Some(r) = cell.take() {
             return r;
         }
-        if *trap_out != 0 {
+        if vm.ended().is_some() {
             comps.fiber_deregister(id);
             return 0;
         }
@@ -460,7 +461,7 @@ unsafe fn cap_thunk_impl(
     n_args: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
     pending: Option<&mut Option<u64>>,
     park: &mut Option<HostParkReq>,
 ) {
@@ -505,7 +506,7 @@ unsafe fn cap_thunk_impl(
         match import_dispatch(host, op) {
             Some(t) => t,
             None => {
-                *trap_out = TrapKind::CapFault as i64;
+                vm.raise(TrapKind::CapFault as i64);
                 return;
             }
         }
@@ -520,7 +521,7 @@ unsafe fn cap_thunk_impl(
     // differential lockstep.
     if type_id == cap_id::JIT {
         jit_native_op(
-            host, op, handle, arg_slots, results, n_results, trap_out, gm, mem_base,
+            host, op, handle, arg_slots, results, n_results, vm, gm, mem_base,
         );
         return;
     }
@@ -534,8 +535,8 @@ unsafe fn cap_thunk_impl(
         h.live_impl_of(handle, type_id).map(|t| (t, h.handoff()))
     };
     if let Some(((callee, export), fast)) = target {
-        let r = live_impl_call(&callee, export, fast, op, arg_slots, trap_out);
-        if *trap_out == 0 && n_results != 0 {
+        let r = live_impl_call(&callee, export, fast, op, arg_slots, vm);
+        if vm.ended().is_none() && n_results != 0 {
             *results = r;
         }
         return;
@@ -552,7 +553,6 @@ unsafe fn cap_thunk_impl(
         if n_results != 0 {
             *results = r;
         }
-        *trap_out = 0;
         return;
     }
     // Clear the caller-request cell first, so the only request acted on is one THIS dispatch raised;
@@ -560,7 +560,7 @@ unsafe fn cap_thunk_impl(
     // and a wait is not slept through.
     let bell = if serves {
         let _ = host.take_park_request();
-        jit_proc::bell_of(trap_out)
+        jit_proc::bell_of(vm)
     } else {
         0
     };
@@ -578,7 +578,6 @@ unsafe fn cap_thunk_impl(
                     *o = r;
                 }
             }
-            *trap_out = 0;
             // Every transient the op left is drained, acted on or not: one left set would land on a
             // later call.
             let parks = host.take_park_transients();
@@ -596,19 +595,17 @@ unsafe fn cap_thunk_impl(
                     (mem_size, mem_reserved),
                     results,
                     n_results,
-                    trap_out,
+                    vm,
                     bell,
                 )
             } else {
-                host_park(
-                    host, &parks, stdin_park, mem_base, results, n_results, trap_out,
-                )
+                host_park(host, &parks, stdin_park, mem_base, results, n_results, vm)
             };
         }
         // #1735 — the host's trap, whichever it is, on the one wire code: every trap but `Exit` used
         // to become `CapFault` here, so a forged `join` handle reported `CapFault` on the JIT and
         // `ThreadFault` on the oracle (#1573).
-        Err(t) => *trap_out = t.code(),
+        Err(t) => vm.raise(t.code()),
     }
 }
 
@@ -618,7 +615,7 @@ unsafe fn cap_thunk_impl(
 /// (#1952: any fiber, as on the oracle). A deliverable signal interrupts it instead: `-EINTR`.
 ///
 /// # Safety
-/// `results`/`trap_out` as [`cap_thunk`]'s.
+/// `results`/`vm` as [`cap_thunk`]'s.
 pub(crate) unsafe fn host_park(
     host: &Host,
     parks: &temen_interp::ParkTransients,
@@ -626,14 +623,14 @@ pub(crate) unsafe fn host_park(
     mem_base: *mut u8,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> Option<HostParkReq> {
     // A wake names the pipe by its global id, the park key.
     for gid in [parks.wake_readers, parks.wake_writers]
         .into_iter()
         .flatten()
     {
-        temen_jit::wake_host_parks(trap_out, gid as u64);
+        temen_jit::wake_host_parks(vm, gid as u64);
     }
     let pipe_park = parks
         .read_park
@@ -701,7 +698,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
     n_args: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) {
     let m = &*(ctx as *const Mutex<Host>);
     // Phase 3: translate a `CAP_IMPORT_TYPE_ID` dispatch through the binding table under a short
@@ -711,7 +708,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         match import_dispatch(&guard, op) {
             Some(t) => t,
             None => {
-                *trap_out = TrapKind::CapFault as i64;
+                vm.raise(TrapKind::CapFault as i64);
                 return;
             }
         }
@@ -730,7 +727,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             mem_reserved,
             results,
             n_results,
-            trap_out,
+            vm,
         );
         return;
     }
@@ -741,7 +738,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         } else {
             std::slice::from_raw_parts(args, n_args as usize)
         };
-        jit_invoke_locked(m, handle, arg_slots, results, n_results, trap_out, mem_base);
+        jit_invoke_locked(m, handle, arg_slots, results, n_results, vm, mem_base);
         return;
     }
     // Everything else is host-side only: hold the lock across a plain delegate to the unlocked
@@ -762,8 +759,8 @@ pub unsafe extern "C" fn cap_thunk_locked(
             } else {
                 std::slice::from_raw_parts(args, n_args as usize)
             };
-            let r = live_impl_call(&callee, export, fast, op, arg_slots, trap_out);
-            if *trap_out == 0 && n_results != 0 {
+            let r = live_impl_call(&callee, export, fast, op, arg_slots, vm);
+            if vm.ended().is_none() && n_results != 0 {
                 *results = r;
             }
             return;
@@ -785,7 +782,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
             n_args,
             results,
             n_results,
-            trap_out,
+            vm,
             face,
             &mut park,
         );
@@ -793,7 +790,7 @@ pub unsafe extern "C" fn cap_thunk_locked(
         // then runs again.
         if let Some(p) = park {
             drop(guard);
-            if p.park(trap_out) {
+            if p.park(vm) {
                 continue;
             }
             return;
@@ -811,21 +808,20 @@ pub unsafe extern "C" fn cap_thunk_locked(
             // every engine: withdrawn, it declines.
             let declined = n_results != 1 && comps.withdraw(id);
             if n_results > 1 || declined {
-                *trap_out = TrapKind::CapFault as i64;
+                vm.raise(TrapKind::CapFault as i64);
                 return;
             }
             // F3, #2047 — the lock is already released: wait as a park ([`cap_wait`]). A punt
             // inside a FIBER parks the fiber, so its vCPU keeps polling its other fibers; any other
             // waits as its vCPU, with the vCPU's lane given back.
             let fiber = n_results == 1 && temen_jit::fiber_active() && !durable;
-            let r = cap_wait(&comps, id, fiber, trap_out);
-            if *trap_out != 0 {
+            let r = cap_wait(&comps, id, fiber, vm);
+            if vm.ended().is_some() {
                 return;
             }
             if n_results == 1 {
                 *results = r;
             }
-            *trap_out = 0;
         }
         return;
     }
@@ -845,10 +841,10 @@ unsafe fn jit_invoke_locked(
     args: &[i64],
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
     mem_base: *mut u8,
 ) {
-    let cap_fault = |trap_out: *mut i64| *trap_out = TrapKind::CapFault as i64;
+    let cap_fault = || vm.raise(TrapKind::CapFault as i64);
     // Read the target unit + its module pointer under the lock, then drop the guard.
     let resolved: Option<(usize, usize)> = {
         let host = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -878,7 +874,7 @@ unsafe fn jit_invoke_locked(
         })()
     };
     let Some((code, cm)) = resolved else {
-        return cap_fault(trap_out);
+        return cap_fault();
     };
     let out: &mut [i64] = if n_results == 0 {
         &mut []
@@ -894,13 +890,13 @@ unsafe fn jit_invoke_locked(
         &args[1..],
         out,
         mem_base,
-        // The thunk's `trap_out` is the running instance's `VmCtx` (its field 0 is the trap cell):
+        // The thunk's `vm` is the running instance's `VmCtx`:
         // the unit runs as the instance that invoked it.
-        trap_out as *const temen_jit::VmCtx,
+        vm as *const temen_jit::VmCtx,
     )
     .is_err()
     {
-        cap_fault(trap_out);
+        cap_fault();
     }
 }
 
@@ -941,7 +937,7 @@ fn invoke_refuses(funcs: &[temen_ir::Func]) -> bool {
 ///   [`CompiledModule`] (`define_extra`) and register its trampoline. Any failure leaves
 ///   nothing installed.
 /// - op 1 `invoke(code_handle, args…)`: strict-arity call of the unit's trampoline over the
-///   **live window** (`invoke_extra`); a trap in the invoked code lands in `trap_out` (the
+///   **live window** (`invoke_extra`); a trap in the invoked code lands in `vm` (the
 ///   run's trap cell) — terminal for the domain.
 /// - op 2 `release(code_handle)`: revoke the handle (non-fatal `-EINVAL` if forged/closed).
 ///
@@ -958,39 +954,38 @@ unsafe fn jit_native_op(
     args: &[i64],
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
     mut gm: Option<&mut dyn GuestMem>,
     mem_base: *mut u8,
 ) {
     // Negative-errno results (§3e D42), matching `temen-interp`'s private consts.
-    // One errno/handle result slot + a clean trap cell — the compile/release result shape.
-    let put = |results: *mut i64, n_results: u64, v: i64, trap_out: *mut i64| {
+    // One errno/handle result slot — the compile/release result shape.
+    let put = |results: *mut i64, n_results: u64, v: i64| {
         if n_results != 0 {
             *results = v;
         }
-        *trap_out = 0;
     };
-    let cap_fault = |trap_out: *mut i64| *trap_out = TrapKind::CapFault as i64;
+    let cap_fault = || vm.raise(TrapKind::CapFault as i64);
     match op {
         0 => {
             // compile(ptr, len) -> code_handle | -errno.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
                 // No live module registered (host wiring bug) — fail closed, non-fatally.
-                return put(results, n_results, EINVAL, trap_out);
+                return put(results, n_results, EINVAL);
             }
             let ptr = *args.first().unwrap_or(&0) as u64;
             let len = *args.get(1).unwrap_or(&0) as u64;
             let Some(bytes) = gm.as_mut().and_then(|m| m.read_bytes(ptr, len)) else {
-                return put(results, n_results, EFAULT, trap_out);
+                return put(results, n_results, EFAULT);
             };
             let compiled = match host.jit_compile(handle, &bytes) {
                 Ok(Ok(c)) => c,
-                Ok(Err(e)) => return put(results, n_results, e, trap_out),
-                Err(_) => return cap_fault(trap_out),
+                Ok(Err(e)) => return put(results, n_results, e),
+                Err(_) => return cap_fault(),
             };
             let funcs = host
                 .jit_unit_funcs(compiled.domain, compiled.unit)
@@ -1013,44 +1008,44 @@ unsafe fn jit_native_op(
                         d.code as usize,
                         d.type_id,
                     );
-                    put(results, n_results, compiled.handle as i64, trap_out);
+                    put(results, n_results, compiled.handle as i64);
                 }
                 Err(_) => {
                     // Verified but not natively lowerable (a backend gap): revoke the minted
                     // handle so nothing half-installed is guest-reachable; non-fatal errno.
                     let _ = host.jit_release(compiled.handle);
-                    put(results, n_results, EINVAL, trap_out);
+                    put(results, n_results, EINVAL);
                 }
             }
         }
         1 => {
             // invoke(code_handle, args…) -> results.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let Some(&ch) = args.first() else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let Ok((cd, cu)) = host.resolve_jit_code(ch as i32) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             // A code handle is only valid on the domain that compiled it.
             if cd != domain {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             let code = host.jit_unit_native(cd, cu);
             let cm = host.jit_native_ctx(cd) as *mut CompiledModule;
             let Some(funcs) = host.jit_unit_funcs(cd, cu) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             if code == 0 || cm.is_null() {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             // Strict arity vs the unit's entry (parity with the interp eval arm): the invoke
             // args are the call.cap args minus the code handle; results must match exactly.
             let entry = &funcs[0];
             if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             // `invoke` is a **seam-free leaf** (CONSOLIDATION.md §11): a unit that uses §12 threads
             // or the futex cannot run here — the interpreter's `run_invoke` CapFaults any scheduler
@@ -1060,7 +1055,7 @@ unsafe fn jit_native_op(
             // module-aware ops. (The unit still *compiles* — `define_extra` admits it — so it can be
             // installed; only the seam-free invoke entry is refused.)
             if invoke_refuses(&funcs) {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             let out: &mut [i64] = if n_results == 0 {
                 &mut []
@@ -1068,56 +1063,56 @@ unsafe fn jit_native_op(
                 std::slice::from_raw_parts_mut(results, n_results as usize)
             };
             // SAFETY: an in-flight run on this thread (we are inside its call.cap); `code` is
-            // the unit's finalized trampoline; arity checked above; `mem_base`/`trap_out` are
-            // the live run's window base and trap cell. On a clean return the cell stays 0; on
-            // a trap the trampoline / nested guard wrote it — either way it holds the truth.
+            // the unit's finalized trampoline; arity checked above; `mem_base`/`vm` are
+            // the live run's window base and context. A trap in the unit is raised on `vm` by the
+            // trampoline / nested guard, as any end of the run is.
             if CompiledModule::invoke_extra(
                 cm,
                 code as *const u8,
                 &args[1..],
                 out,
                 mem_base,
-                // The thunk's `trap_out` is the invoking instance's `VmCtx` (field 0 = trap cell).
-                trap_out as *const temen_jit::VmCtx,
+                // The thunk's `vm` is the invoking instance's `VmCtx`.
+                vm as *const temen_jit::VmCtx,
             )
             .is_err()
             {
-                cap_fault(trap_out);
+                cap_fault();
             }
         }
         2 => {
             // release(code_handle) -> 0 | -EINVAL (forged/double release is non-fatal: it is
             // guest-reachable in a loop and must not kill the domain).
             if host.resolve_jit_domain(handle).is_err() {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             let ch = *args.first().unwrap_or(&0) as i32;
             let v = match host.jit_release(ch) {
                 Ok(()) => 0,
                 Err(_) => EINVAL,
             };
-            put(results, n_results, v, trap_out);
+            put(results, n_results, v);
         }
         3 => {
             // install(code_handle) -> slot_index | -errno (DESIGN.md §22): write the unit's
             // natural entry + interned type_id into the live fn_table's next padding slot. The
             // slot index agrees with the interpreter's (both fill from the parent's funcs count).
             let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let Some(&ch) = args.first() else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let Ok((cd, cu)) = host.resolve_jit_code(ch as i32) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             if cd != domain {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             let cm = host.jit_native_ctx(cd) as *mut CompiledModule;
             let (code, type_id) = host.jit_unit_install(cd, cu);
             if cm.is_null() || code == 0 {
-                return cap_fault(trap_out);
+                return cap_fault();
             }
             // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended in this
             // synchronous call.cap); `code` is a natural-ABI entry the JIT registered for this
@@ -1131,17 +1126,17 @@ unsafe fn jit_native_op(
                 }
                 None => ENOSPC,
             };
-            put(results, n_results, v, trap_out);
+            put(results, n_results, v);
         }
         4 => {
             // uninstall(slot) -> 0 | -EINVAL (DESIGN.md §22 reclaim): clear an installed slot
             // so the index is reusable and a stale call.dyn of it traps.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
-                return put(results, n_results, EINVAL, trap_out);
+                return put(results, n_results, EINVAL);
             }
             let slot = *args.first().unwrap_or(&-1);
             // SAFETY: `cm` is the in-flight run's CompiledModule (guest suspended).
@@ -1152,7 +1147,7 @@ unsafe fn jit_native_op(
             } else {
                 EINVAL
             };
-            put(results, n_results, v, trap_out);
+            put(results, n_results, v);
         }
         5 => {
             // compile_linked(ir_ptr, ir_len, symtab_ptr, symtab_len) -> code_handle | -errno
@@ -1160,26 +1155,26 @@ unsafe fn jit_native_op(
             // unresolved §7 imports bound by name against the guest's symbol-table buffer before
             // verify+compile. Any failure leaves nothing installed.
             let Ok(domain) = host.resolve_jit_domain(handle) else {
-                return cap_fault(trap_out);
+                return cap_fault();
             };
             let cm = host.jit_native_ctx(domain) as *mut CompiledModule;
             if cm.is_null() {
-                return put(results, n_results, EINVAL, trap_out);
+                return put(results, n_results, EINVAL);
             }
             let ir_ptr = *args.first().unwrap_or(&0) as u64;
             let ir_len = *args.get(1).unwrap_or(&0) as u64;
             let st_ptr = *args.get(2).unwrap_or(&0) as u64;
             let st_len = *args.get(3).unwrap_or(&0) as u64;
             let Some(ir) = gm.as_mut().and_then(|m| m.read_bytes(ir_ptr, ir_len)) else {
-                return put(results, n_results, EFAULT, trap_out);
+                return put(results, n_results, EFAULT);
             };
             let Some(symtab) = gm.as_mut().and_then(|m| m.read_bytes(st_ptr, st_len)) else {
-                return put(results, n_results, EFAULT, trap_out);
+                return put(results, n_results, EFAULT);
             };
             let compiled = match host.jit_compile_linked(handle, &ir, &symtab, gm) {
                 Ok(Ok(c)) => c,
-                Ok(Err(e)) => return put(results, n_results, e, trap_out),
-                Err(_) => return cap_fault(trap_out),
+                Ok(Err(e)) => return put(results, n_results, e),
+                Err(_) => return cap_fault(),
             };
             let funcs = host
                 .jit_unit_funcs(compiled.domain, compiled.unit)
@@ -1199,11 +1194,11 @@ unsafe fn jit_native_op(
                         d.code as usize,
                         d.type_id,
                     );
-                    put(results, n_results, compiled.handle as i64, trap_out);
+                    put(results, n_results, compiled.handle as i64);
                 }
                 Err(_) => {
                     let _ = host.jit_release(compiled.handle);
-                    put(results, n_results, EINVAL, trap_out);
+                    put(results, n_results, EINVAL);
                 }
             }
         }
@@ -1211,11 +1206,11 @@ unsafe fn jit_native_op(
             // unit_info(ir_ptr, ir_len, buf_ptr, cap) -> len | -errno (#2167): what a guest loader
             // needs to place a link unit's data. No window, nothing to read (-EFAULT, like op 0).
             let Some(mem) = gm else {
-                return put(results, n_results, EFAULT, trap_out);
+                return put(results, n_results, EFAULT);
             };
             match host.jit_unit_info(handle, mem, args) {
-                Ok(v) => put(results, n_results, v, trap_out),
-                Err(_) => cap_fault(trap_out),
+                Ok(v) => put(results, n_results, v),
+                Err(_) => cap_fault(),
             }
         }
         // An op-index outside the Jit interface's defined ops (0..=6) is out of range, so it
@@ -1223,7 +1218,7 @@ unsafe fn jit_native_op(
         // the explicit op arms to the generic dispatch and faults, and §3c (an out-of-range
         // op-index is a runtime trap, not a non-fatal errno). The defined ops above own their
         // own errno-vs-fault choices; only genuinely unknown ops land here.
-        _ => cap_fault(trap_out),
+        _ => cap_fault(),
     }
 }
 
@@ -1639,12 +1634,13 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
             }
         }
         let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
-        let mut trap = 0i64;
-        // SAFETY: `gc`/`trap` are live out-cells for the call.
+        // Outside any run: a context for the build to raise on, read by no one (its failure is the
+        // `0` it returns).
+        let vm = temen_jit::VmCtx::new(temen_jit::InstanceAddrs::NONE);
+        // SAFETY: `gc` is a live out-cell for the call.
         // A thaw never re-launches a demand-paged child on this engine (#2438).
-        if unsafe {
-            finish_child_build(host, Some((r.host, 0, 0)), None, gc.as_mut_ptr(), &mut trap)
-        } == 0
+        if unsafe { finish_child_build(host, Some((r.host, 0, 0)), None, gc.as_mut_ptr(), &vm) }
+            == 0
         {
             return Err(temen_jit::JitError::Unsupported(
                 "durable JIT thaw: child powerbox",
@@ -2368,36 +2364,34 @@ pub unsafe extern "C" fn fast_cap_resolver(
 /// active, so the clock crossing is still taped/served faithfully.
 ///
 /// # Safety
-/// `ctx` is a live `*mut Host`; `trap_out` is writable — the [`temen_jit::FastCapResolver`] contract.
+/// `ctx` is a live `*mut Host`; `vm` is the caller's live context — the [`temen_jit::FastCapResolver`]
+/// contract.
 unsafe extern "C" fn fast_clock_now(
     ctx: *mut c_void,
     _mem_base: *mut u8,
     _mem_size: u64,
     handle: i32,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i64 {
     let host = &mut *(ctx as *mut Host);
     match host.fast_clock_now(handle) {
-        Some(Ok(ns)) => {
-            *trap_out = 0;
-            ns
-        }
+        Some(Ok(ns)) => ns,
         Some(Err(t)) => {
-            *trap_out = t.code();
+            vm.raise(t.code());
             0
         }
         // A W1 tape is active — take the full path so the input is recorded/replayed.
-        None => fast_dispatch(ctx, temen_interp::cap_id::CLOCK, 0, handle, &[], trap_out),
+        None => fast_dispatch(ctx, temen_interp::cap_id::CLOCK, 0, handle, &[], vm),
     }
 }
 
 /// Shared body for the fast-path fns: drive the **same** [`Host::cap_dispatch_slots`] the generic
 /// thunk uses (so the authority check + semantics are identical), with no window (`gm = None` — these
 /// ops never touch the guest window). The register args are already collected in `args`; the single
-/// result is returned and the trap cell encoded exactly as [`cap_thunk`].
+/// result is returned and a trap raised exactly as [`cap_thunk`] raises it.
 ///
 /// # Safety
-/// `ctx` is a live `*mut Host`; `trap_out` is writable.
+/// `ctx` is a live `*mut Host`; `vm` is the caller's live context.
 #[inline]
 unsafe fn fast_dispatch(
     ctx: *mut c_void,
@@ -2405,16 +2399,13 @@ unsafe fn fast_dispatch(
     op: u32,
     handle: i32,
     args: &[i64],
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i64 {
     let host = &mut *(ctx as *mut Host);
     match host.cap_dispatch_slots(type_id, op, handle, args, None) {
-        Ok(res) => {
-            *trap_out = 0;
-            res.first().copied().unwrap_or(0)
-        }
+        Ok(res) => res.first().copied().unwrap_or(0),
         Err(t) => {
-            *trap_out = t.code(); // #1735: the host's own trap, as `cap_thunk` reports it
+            vm.raise(t.code()); // #1735: the host's own trap, as `cap_thunk` reports it
             0
         }
     }
@@ -2516,7 +2507,7 @@ locked_parent_hook!(
         lane: i64,
         pager: u32,
         out: *mut temen_jit::GrantChild,
-        trap_out: *mut i64,
+        vm: &temen_jit::VmCtx,
     ) -> i32
 );
 locked_parent_hook!(
@@ -2534,7 +2525,7 @@ locked_parent_hook!(pager_admit_locked, pager_admit, (export: u32) -> i32);
 locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
-    (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
+    (region: i32, child_off: u64, child_size: u64, vm: &temen_jit::VmCtx) -> i32
 );
 locked_parent_hook!(
     premap_stage_locked,
@@ -2554,7 +2545,7 @@ locked_parent_hook!(
 locked_parent_hook!(
     child_grant_locked,
     child_grant,
-    (child_ctx: *mut c_void, handle: i64, trap_out: *mut i64) -> i32
+    (child_ctx: *mut c_void, handle: i64, vm: &temen_jit::VmCtx) -> i32
 );
 
 /// #1234 — **the parent host a run baked into its `call.cap` sites, together with the shape it
@@ -2931,12 +2922,12 @@ pub unsafe extern "C" fn child_register_serve(child_ctx: *mut c_void, serve_ctx:
 /// CALLS.md 5c.1b — the kill-path re-check a thunk-blocked wait polls (the `instantiator_rt`
 /// join-park discipline): the run's epoch cell (host-written, nonzero ⇒ fired) and the in-flight
 /// trap cell (a concurrent detect-and-kill / domain teardown).
-unsafe fn blocked_wait_interrupted(epoch_cell: usize, trap_out: *mut i64) -> bool {
-    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+unsafe fn blocked_wait_interrupted(epoch_cell: usize, vm: &temen_jit::VmCtx) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
     if epoch_cell != 0 && (*(epoch_cell as *const AtomicU64)).load(Ordering::Relaxed) != 0 {
         return true;
     }
-    (*(trap_out as *const AtomicI64)).load(Ordering::Relaxed) != 0
+    vm.ended().is_some()
 }
 
 /// #2173 — the futex key a shared cell's parks use: its bell's address with the top bit set, clear
@@ -2966,15 +2957,15 @@ unsafe fn ring(g: &Host) {
 /// can ring it: it ends only on the verdict, a kill or the teardown.
 ///
 /// # Safety
-/// `trap_out` is the live call's trap cell, and the caller holds no lock.
+/// `vm` is the live call's context, and the caller holds no lock.
 unsafe fn park_on_bell(
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
     bell: Option<&Arc<std::sync::atomic::AtomicU64>>,
     seen: u64,
     parks: Parks,
 ) -> temen_jit::HostPark {
     let key = bell.map_or(1 << 63, bell_key);
-    temen_jit::park_host_call(trap_out, None, key, parks, || {
+    temen_jit::park_host_call(vm, None, key, parks, || {
         bell.is_none_or(|b| b.load(std::sync::atomic::Ordering::Acquire) == seen)
     })
 }
@@ -3007,24 +2998,23 @@ unsafe fn serve_locked(
     mem_reserved: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) {
-    let put = |v: i64, trap_out: *mut i64| {
+    let put = |v: i64| {
         if n_results != 0 {
             *results = v;
         }
-        *trap_out = 0;
     };
     // A nested serve under a handler; or the timed `svc.wait`, oracle-only (it needs deadline
     // machinery this tier doesn't host).
     if temen_jit::serve_handlers() != 0 || n_args != 0 {
-        return put(EINVAL, trap_out);
+        return put(EINVAL);
     }
     let mut guard = m.lock().unwrap_or_else(|e| e.into_inner());
     let (serve_ctx, bell) = (guard.serve_ctx(), guard.svc_bell().cloned());
     if serve_ctx == 0 {
         // No serve context (an embedder entry that registers none, or a child already released).
-        return put(EINVAL, trap_out);
+        return put(EINVAL);
     }
     let mut count: i64 = 0;
     loop {
@@ -3036,7 +3026,7 @@ unsafe fn serve_locked(
         if handoff_trap != 0 {
             guard.set_serve_activation(None);
             drop(guard);
-            *trap_out = handoff_trap;
+            vm.raise(handoff_trap);
             return;
         }
         if guard.handoff_claimed() {
@@ -3046,9 +3036,7 @@ unsafe fn serve_locked(
             // sees the same kill and releases, so until then re-check on a short sleep.
             let seen = bell_now(bell.as_ref());
             drop(guard);
-            if park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber)
-                != temen_jit::HostPark::Woken
-            {
+            if park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber) != temen_jit::HostPark::Woken {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -3056,13 +3044,13 @@ unsafe fn serve_locked(
         }
         while let Some((export, dop, args, ticket)) = guard.svc_pop() {
             let Some(fidx) = guard.svc_handler(export, dop) else {
-                *trap_out = temen_jit::TrapKind::CapFault as i64;
+                vm.raise(temen_jit::TrapKind::CapFault as i64);
                 return;
             };
             let Some((code, n_params, n_res)) =
                 temen_jit::handler_tramp_of(serve_ctx as *const c_void, fidx)
             else {
-                *trap_out = temen_jit::TrapKind::CapFault as i64;
+                vm.raise(temen_jit::TrapKind::CapFault as i64);
                 return;
             };
             if args.len() != n_params {
@@ -3076,7 +3064,7 @@ unsafe fn serve_locked(
             // never blocks behind a running handler). SAFETY: `serve_ctx` is the live module
             // (cleared only after the domain's guest code — including this serve — has returned);
             // `mem_base` is this domain's live window, handed to this very thunk call. Served on
-            // the domain's own thread, inside its own run: the thunk's `trap_out` is its `VmCtx`.
+            // the domain's own thread, inside its own run: the thunk's `vm` is its `VmCtx`.
             drop(guard);
             temen_jit::invoke_handler(
                 serve_ctx as *const c_void,
@@ -3085,9 +3073,9 @@ unsafe fn serve_locked(
                 &mut res,
                 mem_base,
                 mem_reserved,
-                trap_out as *const temen_jit::VmCtx,
+                vm as *const temen_jit::VmCtx,
             );
-            if *trap_out != 0 {
+            if vm.ended().is_some() {
                 return; // a handler trap or fault (incl. Exit) — terminal for the domain
             }
             guard = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -3120,7 +3108,7 @@ unsafe fn serve_locked(
         let seen = bell_now(bell.as_ref());
         guard.set_serve_activation(Some((serve_ctx, mem_base as usize, mem_reserved)));
         drop(guard);
-        let parked = park_on_bell(trap_out, bell.as_ref(), seen, Parks::Fiber);
+        let parked = park_on_bell(vm, bell.as_ref(), seen, Parks::Fiber);
         guard = m.lock().unwrap_or_else(|e| e.into_inner());
         guard.set_serve_activation(None);
         // A claim taken during the park holds this domain until its release (the arm above).
@@ -3128,17 +3116,16 @@ unsafe fn serve_locked(
             continue;
         }
         drop(guard);
-        *trap_out = match parked {
+        vm.raise(match parked {
             temen_jit::HostPark::Deadlock => temen_jit::TrapKind::ThreadFault as i64,
-            // A kill (the trap cell still clear) or the domain's teardown (it already holds why).
-            _ if *trap_out == 0 => temen_jit::TrapKind::OutOfFuel as i64,
-            _ => *trap_out,
-        };
+            // A kill; the domain's teardown has already raised why it ended, which outranks this.
+            _ => temen_jit::TrapKind::OutOfFuel as i64,
+        });
         return;
     }
     guard.set_serve_activation(None);
     drop(guard);
-    put(count, trap_out);
+    put(count);
 }
 
 /// CALLS.md 5c.3 / §10.4 — the per-thread **crossing-depth bound**: inline handoff crossings are
@@ -3170,7 +3157,7 @@ unsafe fn live_impl_call(
     fast: bool,
     op: u32,
     args: &[i64],
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i64 {
     // Only the callee cell is locked from here on: the caller holds no lock of its own.
     let mut guard = callee.lock().unwrap_or_else(|e| e.into_inner());
@@ -3207,7 +3194,7 @@ unsafe fn live_impl_call(
                         &child_vm,
                     );
                     CROSSING_DEPTH.with(|d| d.set(d.get() - 1));
-                    let child_trap = child_vm.trap.load(std::sync::atomic::Ordering::Relaxed);
+                    let child_trap = child_vm.ended().unwrap_or(0);
                     let mut g2 = callee.lock().unwrap_or_else(|e| e.into_inner());
                     if child_trap != 0 {
                         // Route the trap to the child (it folds + dies on wake) and answer the
@@ -3238,7 +3225,7 @@ unsafe fn live_impl_call(
         return EAGAIN; // full queue / unservable op: probeable backpressure
     };
     ring(&guard); // the callee's serve loop, parked on its empty queue
-    await_settle(callee, guard, &bell, ticket, Parks::Fiber, trap_out).unwrap_or(0)
+    await_settle(callee, guard, &bell, ticket, Parks::Fiber, vm).unwrap_or(0)
 }
 
 /// The arm-5 caller park: wait, from `guard` on `callee`'s cell, parked as `parks` says, for its
@@ -3252,7 +3239,7 @@ unsafe fn await_settle<'a>(
     bell: &Arc<std::sync::atomic::AtomicU64>,
     ticket: u64,
     parks: Parks,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> Option<i64> {
     loop {
         if let Some(r) = guard.svc_result(ticket) {
@@ -3264,7 +3251,7 @@ unsafe fn await_settle<'a>(
         // Until the callee's settle (or its end) rings its bell.
         let seen = bell_now(Some(bell));
         drop(guard);
-        if !park_until_rung(bell, seen, parks, trap_out) {
+        if !park_until_rung(bell, seen, parks, vm) {
             return None;
         }
         guard = callee.lock().unwrap_or_else(|e| e.into_inner());
@@ -3278,19 +3265,17 @@ unsafe fn park_until_rung(
     bell: &Arc<std::sync::atomic::AtomicU64>,
     seen: u64,
     parks: Parks,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> bool {
-    match park_on_bell(trap_out, Some(bell), seen, parks) {
+    match park_on_bell(vm, Some(bell), seen, parks) {
         temen_jit::HostPark::Woken => true,
         temen_jit::HostPark::Deadlock => {
-            *trap_out = temen_jit::TrapKind::ThreadFault as i64;
+            vm.raise(temen_jit::TrapKind::ThreadFault as i64);
             false
         }
-        // A kill (the trap cell still clear) or this domain's teardown (it already holds why).
+        // A kill; this domain's teardown has already raised why it ended, which outranks this.
         _ => {
-            if *trap_out == 0 {
-                *trap_out = temen_jit::TrapKind::OutOfFuel as i64;
-            }
+            vm.raise(temen_jit::TrapKind::OutOfFuel as i64);
             false
         }
     }
@@ -3309,7 +3294,7 @@ unsafe fn request_page(
     pager: &Mutex<Host>,
     export: u32,
     sink: impl Fn() -> temen_interp::PageSink,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> Option<i64> {
     let mut guard = pager.lock().unwrap_or_else(|e| e.into_inner());
     // A pager is its spawner's domain, a JIT run's shared cell; without a bell no serve loop of it
@@ -3326,13 +3311,13 @@ unsafe fn request_page(
         }
         let seen = bell_now(Some(&bell));
         drop(guard);
-        if !park_until_rung(&bell, seen, Parks::Vcpu, trap_out) {
+        if !park_until_rung(&bell, seen, Parks::Vcpu, vm) {
             return None;
         }
         guard = pager.lock().unwrap_or_else(|e| e.into_inner());
     };
     ring(&guard); // the pager's serve loop, parked on its empty queue
-    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, trap_out);
+    let reply = await_settle(pager, guard, &bell, ticket, Parks::Vcpu, vm);
     if reply.is_none_or(|r| r == CAP_REVOKED) {
         pager
             .lock()
@@ -3358,15 +3343,14 @@ unsafe fn request_page(
 /// `[off, off + len)`, `len > 0`, lies in the reservation of its window at `base`.
 #[cfg(any(unix, windows))]
 pub unsafe extern "C" fn page_miss(
-    vm: *mut temen_jit::VmCtx,
+    vm: &temen_jit::VmCtx,
     base: *mut u8,
     off: u64,
     len: u64,
     flags: u64,
 ) {
-    let trap_out = (*vm).trap_ptr();
-    let fault = || *trap_out = temen_jit::TrapKind::MemoryFault as i64;
-    let cell = &*((*vm).cap_ctx as *const Mutex<Host>);
+    let fault = || vm.raise(temen_jit::TrapKind::MemoryFault as i64);
+    let cell = &*(vm.cap_ctx as *const Mutex<Host>);
     let (win, mapped, pager) = {
         let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
         let Some(paging) = g.jit_paging() else {
@@ -3397,8 +3381,8 @@ pub unsafe extern "C" fn page_miss(
                     off.max(start) - start,
                 )
             };
-            match request_page(pager, *export, sink, trap_out) {
-                None => return, // the trap cell unwinds the child
+            match request_page(pager, *export, sink, vm) {
+                None => return, // the end raised on `vm` unwinds the child
                 Some(r) if r < 0 => return fault(),
                 Some(_) => {} // supplied: check the page again
             }
@@ -3408,8 +3392,8 @@ pub unsafe extern "C" fn page_miss(
 
 /// No window backend, so no paged child (the JIT does not build here anyway).
 #[cfg(not(any(unix, windows)))]
-pub unsafe extern "C" fn page_miss(vm: *mut temen_jit::VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {
-    *(*vm).trap_ptr() = temen_jit::TrapKind::MemoryFault as i64;
+pub unsafe extern "C" fn page_miss(vm: &temen_jit::VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {
+    vm.raise(temen_jit::TrapKind::MemoryFault as i64);
 }
 
 /// #2164 — a demand-paged JIT child's window as a page sink writes into it
@@ -3504,12 +3488,12 @@ pub unsafe extern "C" fn child_offer_mint(
 /// # Safety
 /// `parent_ctx` is the run's `cap_ctx` (the parent `Host`, its guest suspended in the thunk);
 /// `child_ctx` is null or a live [`temen_jit::GrantChild::retained_ctx`] not yet released;
-/// `trap_out` is the live trap cell.
+/// `vm` is the live call's context.
 pub unsafe extern "C" fn child_grant(
     parent_ctx: *mut c_void,
     child_ctx: *mut c_void,
     handle: i64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i32 {
     let parent = &mut *(parent_ctx as *mut Host);
     let cell = parent.own_cell();
@@ -3521,7 +3505,7 @@ pub unsafe extern "C" fn child_grant(
     match parent.grant_running_child(cell.as_ref(), handle as i32, child.as_deref_mut()) {
         Ok(h) => h as i32,
         Err(t) => {
-            *trap_out = t.code();
+            vm.raise(t.code());
             0
         }
     }
@@ -3538,7 +3522,7 @@ pub unsafe extern "C" fn child_grant(
 ///
 /// Fails the whole spawn closed, exactly like the interpreter: an out-of-window record or name is a
 /// `MemoryFault`; a non-UTF-8 name or a forged / non-copyable handle is a `CapFault`. Returns `1` on
-/// success (`out` filled), `0` with `*trap_out` set otherwise. Frees nothing — the paired
+/// success (`out` filled), `0` with a trap raised on `vm` otherwise. Frees nothing — the paired
 /// [`grant_child_release`] does.
 ///
 /// §2.2 / #2164 — a `pager` export (not `u32::MAX`, checked by [`pager_admit`]) makes the child
@@ -3547,7 +3531,7 @@ pub unsafe extern "C" fn child_grant(
 ///
 /// # Safety
 /// `ctx` is the live parent `*mut Host`; `[mem_base, mem_base+mem_size)` is the parent's mapped window
-/// (records/names are read within it); `out`/`trap_out` are writable. The returned `ctx` must be freed
+/// (records/names are read within it); `out`/`vm` are writable. The returned `ctx` must be freed
 /// with [`grant_child_release`].
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn grant_detached_child_build(
@@ -3563,10 +3547,9 @@ pub unsafe extern "C" fn grant_detached_child_build(
     lane: i64,
     pager: u32,
     out: *mut temen_jit::GrantChild,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i32 {
-    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, trap_out)
-    else {
+    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, vm) else {
         return 0;
     };
     let parent = &mut *(ctx as *mut Host);
@@ -3583,11 +3566,11 @@ pub unsafe extern "C" fn grant_detached_child_build(
         None => None,
         Some(Some(spawner)) => Some((spawner, pager, bytes)),
         Some(None) => {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             return 0;
         }
     };
-    finish_child_build(parent, built, paging, out, trap_out)
+    finish_child_build(parent, built, paging, out, vm)
 }
 
 /// PROCESS.md S1b/S1c — install the **canonical-key futex** region recorder on `host` over the window
@@ -3629,23 +3612,23 @@ fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
 
 /// Spawn **pre-map admission** on the JIT ([`temen_jit::PremapAdmit`]): the interpreter's
 /// `Host::premap_admit` — `1` admitted, `0` refused (bad geometry; the spawn answers `-EINVAL`,
-/// charging nothing), `-1` with `*trap_out = CapFault` for a forged / wrong-kind handle.
+/// charging nothing), `-1` with a `CapFault` raised on `vm` for a forged / wrong-kind handle.
 ///
 /// # Safety
-/// `ctx` is the live `*mut Host` (the cap thunk's parent host); `trap_out` the run's trap cell.
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host)); `vm` the spawner's live context.
 pub unsafe extern "C" fn premap_admit(
     ctx: *mut c_void,
     region: i32,
     child_off: u64,
     child_size: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i32 {
     let parent = &*(ctx as *mut Host);
     match parent.premap_admit(region, child_off, child_size) {
         Ok(true) => 1,
         Ok(false) => 0,
         Err(t) => {
-            *trap_out = t.code(); // #1735: the host's own trap
+            vm.raise(t.code()); // #1735: the host's own trap
             -1
         }
     }
@@ -3803,7 +3786,7 @@ pub unsafe extern "C" fn budget_mem_give(
 }
 
 /// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
-/// `[mem_base, mem_base + mem_size)`. `None` with `*trap_out` set to the parse's trap.
+/// `[mem_base, mem_base + mem_size)`. `None` with the parse's trap raised on `vm`.
 ///
 /// # Safety
 /// `[mem_base, mem_base + mem_size)` is the parent's window (its reserved span: a read of an
@@ -3813,7 +3796,7 @@ unsafe fn read_grant_records(
     mem_size: u64,
     grants_ptr: u64,
     grants_n: u64,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> Option<Vec<(String, i32)>> {
     let read = |off: u64, len: usize| -> Result<Vec<u8>, Trap> {
         match off.checked_add(len as u64) {
@@ -3825,7 +3808,7 @@ unsafe fn read_grant_records(
         }
     };
     temen_interp::read_grant_records(grants_ptr, grants_n, read)
-        .map_err(|t| *trap_out = t.code())
+        .map_err(|t| vm.raise(t.code()))
         .ok()
 }
 
@@ -3838,7 +3821,7 @@ unsafe fn finish_child_build(
     built: Option<(Host, i32, i32)>,
     paging: Option<(Arc<Mutex<Host>>, u32, u64)>,
     out: *mut temen_jit::GrantChild,
-    trap_out: *mut i64,
+    vm: &temen_jit::VmCtx,
 ) -> i32 {
     match built {
         Some((child, inst_handle, as_handle)) => {
@@ -3901,7 +3884,7 @@ unsafe fn finish_child_build(
             1
         }
         None => {
-            *trap_out = TrapKind::CapFault as i64;
+            vm.raise(TrapKind::CapFault as i64);
             0
         }
     }
@@ -5337,8 +5320,10 @@ pub enum SessionStep {
     /// Nothing can run until the embedder acts (#1414 D4): every task is parked on input only the
     /// embedder can supply (a terminal read: feed the terminal), or on the answer to a call it was
     /// told of ([`SessionStep::CapPark`]: answer it), and pump again. The run is live and its whole
-    /// state retained in the session.
-    Idle,
+    /// state retained in the session. #2557 — `timer` is how long, in ns, until the run's next timer,
+    /// which fires once the embedder has let that time pass ([`CoopSession::pass_time`]); `None` when
+    /// no wait has a deadline ([`temen_interp::bytecode::CoopEvent::Idle`]).
+    Idle { timer: Option<u64> },
     /// #2528 — the guest has just made host-answered call `id`: a call to a capability whose proc
     /// answers with [`temen_interp::OffloadOutcome::Host`]. Answer it with the
     /// [`temen_interp::Completer`] the proc's submit hook was handed, now or later. Each call is
@@ -5361,7 +5346,7 @@ impl CoopSession {
     /// trap is the `Err` (§5 detect-and-kill).
     pub fn pump(&mut self) -> Result<SessionStep, String> {
         match self.run.run() {
-            temen_interp::bytecode::CoopEvent::Idle => Ok(SessionStep::Idle),
+            temen_interp::bytecode::CoopEvent::Idle { timer } => Ok(SessionStep::Idle { timer }),
             temen_interp::bytecode::CoopEvent::CapPark { id } => Ok(SessionStep::CapPark { id }),
             temen_interp::bytecode::CoopEvent::Done(v) => {
                 outcome_from_interp(Ok(v)).map(SessionStep::Done)
@@ -5372,6 +5357,13 @@ impl CoopSession {
             // Tier-up / `Jit.invoke` surfacing is never enabled on a session (no eligibility set).
             _ => Err("unexpected tier-up event on a cooperative session".to_string()),
         }
+    }
+
+    /// #2557 — `ns` of the embedder's time has passed since the session went
+    /// [`SessionStep::Idle`]: the run's waits that time reaches time out at the next
+    /// [`pump`](Self::pump) ([`temen_interp::bytecode::CoopRun::pass_time`]).
+    pub fn pass_time(&mut self, ns: u64) {
+        self.run.pass_time(ns);
     }
 }
 

@@ -64,9 +64,9 @@ use cranelift_codegen::ir::types::{
     F32, F32X4, F64, F64X2, I16, I16X8, I32, I32X4, I64, I64X2, I8, I8X16,
 };
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, FuncRef,
-    Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc, StackSlotData,
-    StackSlotKind, Type, UserFuncName, Value, ValueLabel,
+    AbiParam, AtomicRmwOp as ClifRmwOp, BlockArg, BlockCall, ConstantData, Endianness, ExtFuncData,
+    ExternalName, FuncRef, Function, InstBuilder, JumpTableData, MemFlags, Signature, SourceLoc,
+    StackSlotData, StackSlotKind, Type, UserExternalName, UserFuncName, Value, ValueLabel,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::CompiledCode;
@@ -88,6 +88,7 @@ use temen_ir::{
 mod dwarf;
 pub mod gdb; // W5 JIT/DWARF tier (Stage 2c): in-memory ELF wrapper + the GDB JIT registration interface
 mod mem; // guest-window allocation + the §4/§5 guard-page / detect-and-kill handler // W5 JIT/DWARF tier: synthesize DWARF from the Stage 1 machine-address → source map
+mod validate; // #2481 — machine-code validator over the emitted bytes (slice 1: x86-64, shadow mode)
 
 // JIT fiber runtime (§12): host-side fiber table + `extern "C"` thunks for `cont.new`/`resume`/
 // `suspend`, on top of the `temen-fiber` stack-switch substrate. Available where `temen_fiber::supported()`.
@@ -629,7 +630,7 @@ pub enum TrapKind {
     /// `MemoryFault` — the fault happens at stack exhaustion and the SIGSEGV handler (`SA_ONSTACK` set,
     /// but no `sigaltstack` installed) double-faults on the exhausted stack and kills the process. Only
     /// in-window memory faults (handler has ample stack) surface as `MemoryFault`. The software check
-    /// here traps through `trap_out` with no signal, so it is the only path that catches fiber overflow
+    /// here traps through `vmctx` with no signal, so it is the only path that catches fiber overflow
     /// survivably (see `temen-jit/STACK_GUARD_FLIP.md`, "sigaltstack finding").
     StackOverflow = temen_ir::trap_code::STACK_OVERFLOW as u32,
 }
@@ -685,15 +686,17 @@ impl TrapKind {
 /// The host callback the JIT invokes for `call.cap` (§9's trampoline). The caller wires
 /// it to its capability host; the JIT bakes the function + ctx addresses in as constants
 /// and calls it. Scalars cross as `i64` slots (`i32` in the low bits), buffers as the
-/// `(ptr, len)` window borrow. On return, `*trap_out` is `0` for success, a [`TrapKind`]
-/// code for a trap, or `EXIT_CODE | (exit_code << 32)` for an `Exit`.
+/// `(ptr, len)` window borrow. A call that traps or exits ends the domain: it raises a
+/// [`TrapKind`] code, or `EXIT_CODE | (exit_code << 32)` for an `Exit`, on `vm`
+/// ([`VmCtx::raise`]). A call that succeeds leaves the trap cell alone — it holds the domain's
+/// end, which a sibling vCPU may have raised during the call (#2499).
 ///
 /// # Safety
 /// `ctx` is the caller's host pointer; `args`/`results` point at `n_args`/`n_results`
 /// `i64` slots; `[mem_base, mem_base+mem_size)` is the guest window's backed prefix
 /// (`mem_base` null if none) and `mem_reserved` is the full reserved mask domain
-/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `trap_out`
-/// points at the live trap cell. All must outlive the call.
+/// (`>= mem_size`) the guest may `map`-grow into via the Memory cap (§3e/§4); `vm` is the
+/// calling instance's live context. All must outlive the call.
 pub type CapThunk = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     mem_base: *mut u8,
@@ -706,7 +709,7 @@ pub type CapThunk = unsafe extern "C" fn(
     n_args: u64,
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
 );
 
 /// The **devirtualized `call.cap` fast path** (§9 / D45). A `call.cap` to a statically-known
@@ -720,12 +723,12 @@ pub type CapThunk = unsafe extern "C" fn(
 ///
 /// The specialized function's ABI is, for a `call.cap` with `n_args` args and **one** result
 /// (multi-result ops fall back to the generic thunk):
-/// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, trap_out: *mut i64, a0: i64, …, aN: i64) -> i64`
-/// — `ctx`/`mem_base`/`mem_size`/`trap_out` are exactly as in [`CapThunk`]; the `handle` is the
+/// `unsafe extern "C" fn(ctx, mem_base, mem_size, handle: i32, vm: &VmCtx, a0: i64, …, aN: i64) -> i64`
+/// — `ctx`/`mem_base`/`mem_size`/`vm` are exactly as in [`CapThunk`]; the `handle` is the
 /// resolved capability handle (the fn still does the authority check); each `ai` is the i'th argument
 /// widened to its i64 slot (an i32/f32 in the low bits, an f64 bit-pattern); the i64 return is decoded
-/// to the result type. A 0-result op returns an ignored 0. The fn signals a trap via `trap_out`
-/// exactly like the generic thunk.
+/// to the result type. A 0-result op returns an ignored 0. The fn raises a trap on `vm` exactly like
+/// the generic thunk.
 ///
 /// **The resolver MUST gate on `(n_args, n_res)`**: the JIT builds the call signature from the IR
 /// `call.cap`'s arity, so a returned fn whose Rust signature has a *different* arity is a C-ABI
@@ -835,9 +838,9 @@ pub struct GrantChild {
 /// runs the child's window is paid for up to (#2268), and `lane`, the lane it reserved, which the
 /// child is stamped with. The thunk passes both from one spawn to the next hook, so a second vCPU's
 /// spawn between the two cannot hand this child its budget or lane (#1972). Returns nonzero and fills
-/// `out` on success; `0` with `*trap_out` set to a `MemoryFault` (out-of-window record/name) or
-/// `CapFault` (non-UTF-8 name / forged / non-copyable handle) — the whole spawn fails closed, as on
-/// the interpreter.
+/// `out` on success; `0` with a `MemoryFault` (out-of-window record/name) or `CapFault` (non-UTF-8
+/// name / forged / non-copyable handle) raised on `vm` — the whole spawn fails closed, as on the
+/// interpreter.
 ///
 /// #2164 — `pager` is the record's pager export (`u32::MAX` for none), which [`PagerAdmit`] already
 /// checked: the child is demand-paged, its faults go to that export of the spawner's program, and
@@ -845,8 +848,8 @@ pub struct GrantChild {
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`); `[mem_base, mem_base+mem_size)` is the parent's
-/// mapped window; `out`/`trap_out` are writable. The filled `ctx` is released with the
-/// [`GrantChildReleaser`] in the same [`GrantChildHooks`].
+/// mapped window; `out` is writable; `vm` is the spawner's live context. The filled `ctx` is released
+/// with the [`GrantChildReleaser`] in the same [`GrantChildHooks`].
 pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     mem_base: *mut u8,
@@ -860,7 +863,7 @@ pub type GrantDetachedChildBuilder = unsafe extern "C" fn(
     lane: i64,
     pager: u32,
     out: *mut GrantChild,
-    trap_out: *mut i64,
+    vm: &VmCtx,
 ) -> i32;
 
 /// §2.2 / #2164 — whether the spawner's program has a pager export `export`, the one a spawn record
@@ -875,13 +878,13 @@ pub type PagerAdmit = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, export: 
 /// check fails ([`emit_page_check`]), with the access's `len` bytes at window offset `off` of the
 /// window at `mem_base`, and [`PAGE_MISS_WRITE`] / [`PAGE_MISS_FATAL`] in `flags`. It returns once
 /// every page of the access admits it, having asked the child's pager for each one that may be
-/// paged in, or with a trap in the instance's trap cell, which the code propagates.
+/// paged in, or with a trap raised on `vm`, which the code propagates.
 ///
 /// # Safety
-/// `vmctx` is the faulting instance's live context; `[mem_base, mem_base + off + len)` lies in its
+/// `vm` is the faulting instance's live context; `[mem_base, mem_base + off + len)` lies in its
 /// window's reservation.
 pub type PageMissThunk =
-    unsafe extern "C" fn(vmctx: *mut VmCtx, mem_base: *mut u8, off: u64, len: u64, flags: u64);
+    unsafe extern "C" fn(vm: &VmCtx, mem_base: *mut u8, off: u64, len: u64, flags: u64);
 
 /// [`PageMissThunk`] flag: the access stores.
 pub const PAGE_MISS_WRITE: u64 = 1;
@@ -943,18 +946,18 @@ pub type BudgetMemGiver = unsafe extern "C" fn(
 /// The **pre-map admission** (the parent side of a spawn record's `region` and `child_off`): may the
 /// parent's `SharedRegion` `region` be aliased whole into a child window of
 /// `child_size` bytes at `child_off`? `1` admitted, `0` refused (bad geometry — the spawn answers
-/// `-EINVAL`, charging nothing), `-1` with `*trap_out` set for a forged handle. Runs **before** the
-/// budget take. Host-side it is the interpreter's `Host::premap_admit`, so the two backends admit
-/// identically.
+/// `-EINVAL`, charging nothing), `-1` with a `CapFault` raised on `vm` for a forged handle. Runs
+/// **before** the budget take. Host-side it is the interpreter's `Host::premap_admit`, so the two
+/// backends admit identically.
 ///
 /// # Safety
-/// `ctx` is the run's `cap_ctx` (the parent `Host`); `trap_out` the live trap cell.
+/// `ctx` is the run's `cap_ctx` (the parent `Host`); `vm` the spawner's live context.
 pub type PremapAdmit = unsafe extern "C" fn(
     ctx: *mut core::ffi::c_void,
     region: i32,
     child_off: u64,
     child_size: u64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
 ) -> i32;
 
 /// Spawn **pre-map staging**: re-grant `region` from the parent into the built child powerbox
@@ -1103,12 +1106,12 @@ pub type ChildOfferMint = unsafe extern "C" fn(
 /// #2220 — grant `handle`, resolved in the parent powerbox, into the retained powerbox `child_ctx` of
 /// a running child (null: the nursery holds no live child there) — see [`GrantChildHooks::grant`].
 /// Host-side it is the interp op-19 arm's body: the child's handle, or a negative errno. A forged
-/// `handle` sets `*trap_out` (`CapFault`), as a spawn's grant list does, and the result is unread.
+/// `handle` raises `CapFault` on `vm`, as a spawn's grant list does, and the result is unread.
 pub type ChildGrant = unsafe extern "C" fn(
     parent_ctx: *mut core::ffi::c_void,
     child_ctx: *mut core::ffi::c_void,
     handle: i64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
 ) -> i32;
 
 /// Bind a child module's import manifest against its built powerbox host — see
@@ -1136,9 +1139,9 @@ unsafe extern "C" fn empty_cap_thunk(
     _n_args: u64,
     _results: *mut i64,
     _n_results: u64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
 ) {
-    unsafe { *trap_out = TrapKind::CapFault as i64 };
+    vm.raise(TrapKind::CapFault as i64);
 }
 
 /// The inert [`CapThunk`] (every `call.cap` is a `CapFault`) for callers with no host — the
@@ -1219,11 +1222,19 @@ fn float_clif_ty(t: FloatTy) -> Type {
 /// [`JitOutcome::Trapped`] if the run trapped. Intended for the differential harness.
 ///
 /// All functions are compiled with a **natural CLIF ABI** — `(mem_base, fn_table_base,
-/// trap_out, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
+/// vmctx, params…) -> (results…)` — so direct/indirect/tail calls are ordinary CLIF
 /// calls; the entry is wrapped in a fixed buffer-ABI trampoline (any arity).
 pub fn compile_and_run(m: &IrModule, func: FuncIdx, args: &[i64]) -> Result<JitOutcome, JitError> {
     // No host: an empty powerbox, so any `call.cap` is an inert CapFault (like `run`).
     compile_and_run_with_host(m, func, args, empty_cap_thunk, core::ptr::null_mut())
+}
+
+/// #2481 — the running count of shadow-mode machine-code-validator disagreements this process, so a
+/// test or the fuzz lane can assert the compiled corpus stays clean against the policy. `0` when the
+/// validator is disabled (a production build, or a target slice 1 does not cover). See `validate`.
+#[doc(hidden)]
+pub fn jit_validate_disagreements() -> u64 {
+    validate::disagreement_count()
 }
 
 /// Compile `func` of `m` to a reusable [`CompiledModule`] with the default no-host policy (an empty
@@ -2495,8 +2506,8 @@ mod domain_teardown_tests {
     /// the exit code sat in the trap cell but the parked daemon was never woken to observe it.
     #[test]
     fn exit_tears_down_parked_daemon() {
-        /// A one-op powerbox: `call.cap 1 0` is `exit(code)` — store `EXIT_CODE | code << 32`
-        /// into the trap cell, exactly as temen-run's host thunk does for `Trap::Exit`.
+        /// A one-op powerbox: `call.cap 1 0` is `exit(code)` — raise `EXIT_CODE | code << 32`,
+        /// exactly as temen-run's host thunk does for `Trap::Exit`.
         unsafe extern "C" fn exit_thunk(
             _ctx: *mut core::ffi::c_void,
             _mem_base: *mut u8,
@@ -2509,10 +2520,10 @@ mod domain_teardown_tests {
             _n_args: u64,
             _results: *mut i64,
             _n_results: u64,
-            trap_out: *mut i64,
+            vm: &crate::VmCtx,
         ) {
             let code = *args as i32;
-            *trap_out = EXIT_CODE as i64 | ((code as i64) << 32);
+            vm.raise(EXIT_CODE as i64 | ((code as i64) << 32));
         }
 
         let src = format!(
@@ -2609,11 +2620,11 @@ mod domain_teardown_tests {
         }
     }
 
-    /// #2498 — a powerbox whose calls answer as temen-run's thunk answers a successful one: by
-    /// writing `0` to the trap cell, which the vCPUs of a domain share. Op 0 is `exit(code)`. Op 1
-    /// answers once the trap cell holds the domain's end (a sibling's call in flight when it lands);
-    /// op 2 once teardown has recorded it in the stop word. Each waits at most half of [`PROMPT`], so
-    /// a run that never records the end still ends, with whatever outcome it then reports.
+    /// #2498 — a powerbox whose calls are in flight when the domain ends. Op 0 is `exit(code)`.
+    /// Op 1 answers once the domain has ended — a sibling's call in flight when the end lands — and
+    /// succeeds, which leaves the end in place (#2499). Op 2 waits the same way, then traps. Each
+    /// waits at most half of [`PROMPT`], so a run that never ends its domain still ends, with
+    /// whatever outcome it then reports.
     unsafe extern "C" fn in_flight_thunk(
         _ctx: *mut core::ffi::c_void,
         _mem_base: *mut u8,
@@ -2626,23 +2637,19 @@ mod domain_teardown_tests {
         _n_args: u64,
         _results: *mut i64,
         _n_results: u64,
-        trap_out: *mut i64,
+        vm: &crate::VmCtx,
     ) {
-        use core::sync::atomic::Ordering;
-        let vm = crate::VmCtx::of_trap_out(trap_out);
-        let ended = |op| match op {
-            1 => vm.trap.load(Ordering::Relaxed) != 0,
-            _ => vm.stop.load(Ordering::Relaxed) != 0,
-        };
         if op == 0 {
-            *trap_out = EXIT_CODE as i64 | ((*args as i32 as i64) << 32);
+            vm.raise(EXIT_CODE as i64 | ((*args as i32 as i64) << 32));
             return;
         }
         let start = Instant::now();
-        while !ended(op) && start.elapsed() < PROMPT / 2 {
+        while vm.ended().is_none() && start.elapsed() < PROMPT / 2 {
             std::thread::sleep(Duration::from_millis(1));
         }
-        *trap_out = 0;
+        if op == 2 {
+            vm.raise(TrapKind::CapFault as i64);
+        }
     }
 
     /// Run `src` over [`in_flight_thunk`] on a thread of its own, and fail if it has not ended
@@ -2659,8 +2666,8 @@ mod domain_teardown_tests {
             .unwrap_or_else(|_| panic!("the run did not end within {PROMPT:?}"))
     }
 
-    /// The root half of every #2498 fixture: spawn func 1, wait until it has stored `1` at 16392
-    /// (it does just before its host call), then `end`.
+    /// The root half of every in-flight fixture: spawn func 1, wait until it has stored `1` at
+    /// 16392 (it does just before its host call), then `end`.
     fn root_then(ret: &str, end: &str) -> String {
         format!(
             "memory 16\n\
@@ -2678,8 +2685,8 @@ mod domain_teardown_tests {
         )
     }
 
-    /// Func 1 of every #2498 fixture: store `1` at 16392 and notify the root, make host call `op`,
-    /// then `then`, with `blocks` after.
+    /// Func 1 of every in-flight fixture: store `1` at 16392 and notify the root, make host call
+    /// `op`, then `then`, with `blocks` after.
     fn sibling_calls(op: u32, then: &str, blocks: &str) -> String {
         format!(
             "func (i64, i64) -> (i64) {{\n\
@@ -2697,13 +2704,12 @@ mod domain_teardown_tests {
         )
     }
 
-    /// #2498 — the root's completion survives a sibling's host call: a successful `call.cap`
-    /// resets the trap cell, which erased the sentinel teardown had stored there, so a sibling that
-    /// went on spinning never saw the domain end, and `join_all` waited for it forever (nim's
-    /// `parfor` corpus case: an idle pool worker's host call). The stop word, which no host call
-    /// resets, ends it at its next back-edge poll.
+    /// #2498 — the root's completion ends a sibling whose host call is in flight at teardown: the
+    /// call answers into a domain that has ended, and the sibling unwinds there instead of spinning
+    /// on (nim's `parfor` corpus case: an idle pool worker's host call). That call used to reset
+    /// the trap cell, so the sibling never saw the end and `join_all` waited for it forever.
     #[test]
-    fn root_return_tears_down_a_sibling_whose_host_call_wiped_the_trap_cell() {
+    fn root_return_tears_down_a_sibling_whose_host_call_answers_after_teardown() {
         let src = format!(
             "{}{}",
             root_then("i64", "v6 = i64.const 42\n  return v6"),
@@ -2715,11 +2721,10 @@ mod domain_teardown_tests {
         }
     }
 
-    /// #2498 — and a sibling that parks after such a call: its wait re-checks the stop word, so it
-    /// unwinds rather than being read as a deadlock, which reported `ThreadFault` for a root that
-    /// returned cleanly.
+    /// #2498 — and one that would park after such a call: it unwinds rather than parking, which a
+    /// deadlock check read as `ThreadFault` for a root that returned cleanly.
     #[test]
-    fn root_return_tears_down_a_sibling_that_parks_after_its_host_call_wiped_the_trap_cell() {
+    fn root_return_tears_down_a_sibling_that_would_park_after_its_host_call() {
         let src = format!(
             "{}{}",
             root_then("i64", "v6 = i64.const 42\n  return v6"),
@@ -2736,11 +2741,10 @@ mod domain_teardown_tests {
         }
     }
 
-    /// #2498 — the root's `exit` survives a sibling's host call that answers after teardown: the
-    /// call wipes the trap cell that held the exit, and the sibling then returns, so no poll puts
-    /// it back. Teardown recorded the exit in the stop word, which the run's outcome reads.
+    /// #2498/#2499 — the root's `exit` survives a sibling's host call that answers after it: the
+    /// call leaves the exit in the cell, and the run reports it.
     #[test]
-    fn root_exit_survives_a_sibling_host_call_that_wiped_the_trap_cell_after_teardown() {
+    fn root_exit_survives_a_sibling_host_call_that_answers_after_it() {
         let src = format!(
             "{}{}",
             root_then(
@@ -2748,11 +2752,49 @@ mod domain_teardown_tests {
                 "v6 = i32.const 0\n  v7 = i32.const 3\n  \
                  v8 = call.cap 1 0 (i32) -> (i64) v6 (v7)\n  unreachable"
             ),
-            sibling_calls(2, "v6 = i64.const 7\n  return v6", "")
+            sibling_calls(1, "v6 = i64.const 7\n  return v6", "")
         );
         match run_in_flight(src) {
             JitOutcome::Exited(code) => assert_eq!(code, 3),
             other => panic!("expected Exited(3), got {other:?}"),
+        }
+    }
+
+    /// #2499 — what a sibling does once the root has returned is unobservable (invariant 6): a trap
+    /// its host call raises after teardown loses to the end teardown raised, and the run reports the
+    /// root's result. It used to be stored over that end and reported instead.
+    #[test]
+    fn a_sibling_trap_after_the_root_returned_leaves_the_roots_result() {
+        let src = format!(
+            "{}{}",
+            root_then("i64", "v6 = i64.const 42\n  return v6"),
+            sibling_calls(2, "v6 = i64.const 7\n  return v6", "")
+        );
+        match run_in_flight(src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// #2499 — the root's own fault is what ends its domain: the run reports it, with a sibling
+    /// still parked.
+    #[test]
+    fn a_root_fault_ends_its_domain_with_the_fault() {
+        let src = format!(
+            "memory 16\n\
+             func () -> (i64) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.load v0\n\
+             \x20 return v2\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}"
+        );
+        match run_promptly(&src) {
+            JitOutcome::Trapped(k) => assert_eq!(k, TrapKind::MemoryFault),
+            other => panic!("expected Trapped(MemoryFault), got {other:?}"),
         }
     }
 }
@@ -3409,8 +3451,10 @@ impl CompiledModule {
         };
         let mut module = new_jit_module(imports)?;
 
-        // Declare every function (natural ABI) up front so calls can reference any of them.
+        // Declare every function (natural ABI) up front so calls can reference any of them, and
+        // everything else the code calls (#2482).
         let ids: Vec<FuncId> = declare_all_funcs(&mut module, &m.funcs)?;
+        let callees = Callees::new(&mut module, &ids, &m.funcs, &m.types, fast_resolver)?;
 
         // temen#2452 — the code a `CodeDir` kept for this compile, defined in place of compiling,
         // or else a record of the code the compile emits, to keep. A module's debug info or a signal
@@ -3670,7 +3714,7 @@ impl CompiledModule {
             &mut module,
             &ids,
             &mut codegen,
-            |module, ctx, fi| {
+            |ctx, fi| {
                 // Stage 3a: enable Cranelift's value-label tracking so `set_val_label` (in
                 // `lower_block`) takes effect and `value_labels_ranges` is populated. Gated on `-g`
                 // vars ⇒ no effect on an ordinary build. Must be set on the fresh `ctx.func` before
@@ -3679,12 +3723,11 @@ impl CompiledModule {
                     ctx.func.collect_debug_info();
                 }
                 build_clif(
-                    module,
+                    &callees,
                     &ids,
                     &m.funcs,
                     &distinct,
                     &m.types,
-                    fast_resolver,
                     nesting,
                     signals, // #932 async signal delivery (off unless a `SignalArm` was supplied)
                     PageEnv::NONE, // #2164 — only a §14 child is demand-paged
@@ -3768,7 +3811,7 @@ impl CompiledModule {
         let mut ctx = module.make_context();
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false)?;
+        build_trampoline(&callees, &mut ctx.func, ids[func as usize], entry, false)?;
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -3786,7 +3829,7 @@ impl CompiledModule {
                 for &f in &e.ops {
                     if (f as usize) < m.funcs.len() && seen.insert(f) {
                         build_trampoline(
-                            &mut module,
+                            &callees,
                             &mut ctx.func,
                             ids[f as usize],
                             &m.funcs[f as usize],
@@ -3811,7 +3854,7 @@ impl CompiledModule {
         // Rust). Needed by both the fiber runtime (`cont.*`) and the thread scheduler (vCPU entries).
         #[cfg(fiber_rt)]
         let fiber_tramp = if uses_fibers || uses_threads {
-            build_fiber_call_trampoline(&mut module, &mut ctx.func);
+            build_fiber_call_trampoline(&mut ctx.func);
             let id = module
                 .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                 .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -4343,7 +4386,7 @@ impl CompiledModule {
     }
 
     /// #1768 — hand this module's own instance the embedder's per-instance state (the vmctx
-    /// `embedder` slot, [`VmCtx::embedder`]): its `call.cap` thunk finds it through `trap_out`.
+    /// `embedder` slot, [`VmCtx::embedder`]): its `call.cap` thunk finds it through `vmctx`.
     pub fn set_embedder_ctx(&mut self, ctx: *mut core::ffi::c_void) {
         self.instance.embedder = ctx;
     }
@@ -4523,7 +4566,7 @@ impl CompiledModule {
     /// Invoke an extra trampoline **over the live window of an in-flight run** — the engine of
     /// the `Jit` capability's `invoke` op. Called from inside a `call.cap` handler while the
     /// guest is suspended; `mem_base`/`vmctx` are the values the cap thunk received (the run's
-    /// window base, and its `trap_out` — the running instance's [`VmCtx`]), so the invoked code
+    /// window base, and its `vmctx` — the running instance's [`VmCtx`]), so the invoked code
     /// reads/writes the guest's own memory in place, dispatches its own `call.cap`s into the same
     /// powerbox, and a trap in it propagates exactly like a guest trap.
     ///
@@ -4540,7 +4583,7 @@ impl CompiledModule {
     /// - `code` must be a trampoline returned by `define_extra` on this module; `args` must
     ///   cover its param count and `results` its result count.
     /// - `mem_base` and `vmctx` must be the live run's window base and instance context (the cap
-    ///   thunk's `mem_base` / `trap_out`).
+    ///   thunk's `mem_base` / `vmctx`).
     pub unsafe fn invoke_extra(
         this: *mut CompiledModule,
         code: *const u8,
@@ -4585,7 +4628,7 @@ impl CompiledModule {
         if faulted {
             // Detect-and-kill (§5), reported the same way the outer run reports it; the
             // guest's call.cap propagation check sees the cell and unwinds the domain.
-            (*vmctx).trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
+            (*vmctx).raise(mem::FAULT_TRAP);
         }
         Ok(())
     }
@@ -4761,14 +4804,12 @@ impl CompiledModule {
         let mut results = vec![0i64; n_results];
         // This run's instance context: the module's own instance (#1768 — the powerbox, kill-path
         // cell, fuel cell and signal arm its compile was handed), entered by the root and shared with
-        // every vCPU and fiber of the run. Its field 0 is the trap cell: 0 = ok; low 32 bits = a
-        // TrapKind / EXIT_CODE; high 32 bits = the exit code for an Exit. A trapping path (or the cap
-        // thunk) writes it. It is **shared across vCPU threads** (every spawned vCPU gets its address
-        // via `set_env`), so the Rust accesses are atomic (audit #2): the JIT writes it via an aligned
-        // `i64` store in emitted code (hardware-atomic, foreign to Rust's model); concurrent Rust
-        // writers (dying vCPUs) and this reader must not race.
+        // every vCPU and fiber of the run. Its field 0 is the trap cell — how the domain ended: 0
+        // while it runs; low 32 bits = a TrapKind / EXIT_CODE; high 32 bits = the exit code for an
+        // Exit. It is **shared across vCPU threads** (every spawned vCPU gets its address via
+        // `set_env`), so every end is a compare-and-swap from 0 — emitted code's and the runtime's
+        // alike ([`VmCtx::raise`]) — and the first end wins (#2499).
         let vm = VmCtx::new((*this).instance);
-        let trap_cell = &vm.trap;
 
         // §12: the root vCPU (`main`) runs on this thread under the §5 detect-and-kill guard; any spawned
         // vCPUs run on their own OS threads via the instance's `Domain`. Seed its per-run `Env` now
@@ -4880,7 +4921,7 @@ impl CompiledModule {
         // ---- transient `&mut *this` (define_extra / invoke_extra mid-run) aliases nothing.
         // SAFETY: `code` is a finalized buffer-ABI trampoline honouring the `Entry` ABI. It reads the
         // arg slots, writes the result slots, accesses only the guarded window (any escape faults into
-        // the guard page), reads `fn_table`, and writes `trap_cell`. All buffers outlive the call;
+        // the guard page), reads `fn_table`, and raises on `vm`. All buffers outlive the call;
         // the module owns the executable pages until `*this` drops (after every spawned vCPU is
         // joined below).
         // §12 seed the root vCPU's TLS register to 0 (its dense id), resetting any value a reused
@@ -4918,14 +4959,7 @@ impl CompiledModule {
         };
         #[cfg(fiber_rt)]
         if !root_has_lane {
-            trap_cell
-                .compare_exchange(
-                    0,
-                    TrapKind::ThreadFault as i64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .ok();
+            vm.raise(TrapKind::ThreadFault as i64);
         }
         #[cfg(not(fiber_rt))]
         let root_has_lane = true;
@@ -4948,7 +4982,7 @@ impl CompiledModule {
                 // process, then rewind this root in place with the reply it gives, as the twin will
                 // with its own. A trap or fault ends the run as usual.
                 let forked = !faulted
-                    && trap_cell.load(Ordering::Relaxed) == 0
+                    && vm.ended().is_none()
                     && !(*this).durable
                     && (*this).fork_hook.is_some()
                     && window_state(mem_base, (*this).shadow)
@@ -5083,12 +5117,17 @@ impl CompiledModule {
                 && fiber_rt::window_is_unwinding(mem_base as u64, (*this).shadow);
             (*this).detached_out = n.join_children(froze);
         }
+        // A caught guard fault is detect-and-kill (§5): the root's `MemoryFault` ends its domain,
+        // unless a sibling's end came first (#2499).
+        if faulted {
+            vm.raise(mem::FAULT_TRAP);
+        }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
             // Owner decision 2026-07-24 — domain teardown (DESIGN.md §12; ISSUES.md I37; D37
             // death-is-revocation): the root vCPU has finished, which ends the domain — a trap or
-            // `exit` from any vCPU already sits in the shared cell, and a clean root return stores
+            // `exit` from any vCPU already sits in the shared cell, and a clean root return raises
             // the internal `DOMAIN_DONE_CODE` sentinel ("root completion ends the activation").
             // Either way every parked sibling (futex wait / join) is woken to observe the non-zero
             // cell and unwind through its trailing trap-propagation guard, so `join_all` below
@@ -5141,11 +5180,6 @@ impl CompiledModule {
         let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
         #[cfg(not(fiber_rt))]
         let worker_trap_cap: Option<(usize, Vec<usize>, i64)> = None;
-        // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
-        // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.
-        if faulted {
-            trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
-        }
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
         // bytes no one reads.
@@ -5190,11 +5224,20 @@ impl CompiledModule {
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
 
+        // What ended the run: the first end raised on its domain, which nothing after it can change
+        // (#2499). Post-`join_all`, so the load sees every raise (the join is a synchronization
+        // point); Relaxed suffices.
+        let cell = vm.ended().unwrap_or(0);
+        let code = cell as u32;
+
         // Publish the trap-time backtrace + fiber for `last_trap_backtrace`/`last_trap_fiber`: the root
         // vCPU's own capture if it trapped, else a spawned vCPU's (Stage 3). The fiber handle (§23-D57)
         // rides along, captured at the trap instant. Symbolizing is pure (reads the address map), so it
-        // is fine here after teardown. Reset on a clean run (every successful run resets both).
-        match root_trap_cap.or(worker_trap_cap) {
+        // is fine here after teardown. Reset on a clean run (every successful run resets both), and on
+        // one that did not end in a trap: a sibling's capture from after its domain ended is no
+        // outcome's.
+        let trapped = TrapKind::from_code(code).is_some();
+        match root_trap_cap.or(worker_trap_cap).filter(|_| trapped) {
             Some((pc, rets, fiber)) => {
                 (*this).last_trap_backtrace = (*this).trap_backtrace(pc, &rets);
                 (*this).last_trap_fiber = Some(fiber);
@@ -5205,14 +5248,6 @@ impl CompiledModule {
             }
         };
 
-        // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
-        // synchronization point); Relaxed suffices. A cell a sibling's host call wiped after teardown
-        // falls back to the stop word, where teardown recorded what ended the domain (#2498).
-        let cell = match trap_cell.load(Ordering::Relaxed) {
-            0 => vm.stop.load(Ordering::Relaxed),
-            cell => cell,
-        };
-        let code = cell as u32;
         let outcome = if code == 0 || code == DOMAIN_DONE_CODE {
             // `DOMAIN_DONE_CODE` is the internal root-completed teardown sentinel (owner decision
             // 2026-07-24): the root returned cleanly and the sentinel only unwound leftover sibling
@@ -5302,7 +5337,7 @@ impl CompiledModule {
             .map(|f| {
                 let name = format!("x{}", self.next_extra);
                 self.next_extra += 1;
-                let sig = natural_sig(&mut *module, f);
+                let sig = natural_sig(f);
                 module
                     .declare_function(&name, Linkage::Local, &sig)
                     .map_err(|e| JitError::Backend(e.to_string()))
@@ -5341,19 +5376,19 @@ impl CompiledModule {
         };
 
         let nesting = self.nesting;
+        let callees = Callees::new(&mut *module, &ids, funcs, types, self.fast_resolver)?;
         // Byte-accurate occupancy: each function's emitted code size. A unit's code is not kept.
         let extra_bytes = define_funcs(
             &mut *module,
             &ids,
             &mut Codegen::Compile(None),
-            |module, ctx, fi| {
+            |ctx, fi| {
                 build_clif(
-                    module,
+                    &callees,
                     &ids,
                     funcs,
                     &self.distinct,
                     types,
-                    self.fast_resolver,
                     nesting,
                     false, // #932 — define_extra units are not signal-delivery armed (slice 1b)
                     self.page, // #2164 — a paged child's units check its access table, as its own code does
@@ -5381,7 +5416,7 @@ impl CompiledModule {
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&mut *module, &mut ctx.func, *id, f, false)?;
+                build_trampoline(&callees, &mut ctx.func, *id, f, false)?;
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
                 let t = module
@@ -5506,7 +5541,7 @@ impl CompiledModule {
             None => {
                 let module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
-                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -5588,7 +5623,7 @@ impl CompiledModule {
             None => {
                 let module = arena_mut(&mut self.module)?;
                 let mut ctx = module.make_context();
-                build_fiber_call_trampoline(&mut *module, &mut ctx.func);
+                build_fiber_call_trampoline(&mut ctx.func);
                 let id = module
                     .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
                     .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -5764,7 +5799,7 @@ impl CompiledModule {
 /// `code` is one of its finalized serve trampolines; `args`/`results` match the trampoline's arity;
 /// `mem_base` is the domain's live window with a `mem_reserved` reservation (what its `call.cap`
 /// thunk is handed); `vmctx` is the **domain's** instance context — its own run's (the serve loop's
-/// thunk `trap_out`), or one minted from [`instance_of`] for a handler run on another thread.
+/// thunk `vmctx`), or one minted from [`instance_of`] for a handler run on another thread.
 #[cfg(fiber_rt)]
 pub unsafe fn invoke_handler(
     cc: *const core::ffi::c_void,
@@ -5791,7 +5826,7 @@ pub unsafe fn invoke_handler(
     );
     vcpu_tls::set_serve_handlers(serve_handlers() - 1);
     if faulted {
-        (*vmctx).trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
+        (*vmctx).raise(mem::FAULT_TRAP);
     }
 }
 
@@ -5985,6 +6020,21 @@ impl HostFn {
         HostFn::PageMiss,
     ];
 
+    /// Its position in [`Self::ALL`], where [`Callees`] keeps its id.
+    fn index(self) -> usize {
+        const {
+            let mut i = 0;
+            while i < HostFn::ALL.len() {
+                assert!(
+                    HostFn::ALL[i] as usize == i,
+                    "HostFn::ALL lists every variant in order"
+                );
+                i += 1;
+            }
+        }
+        self as usize
+    }
+
     /// The symbol compiled code calls it by.
     fn symbol(self) -> &'static str {
         match self {
@@ -6026,7 +6076,7 @@ impl HostFn {
         use HostFn::*;
         let (params, returns): (&[Type], &[Type]) = match self {
             // (ctx, mem_base, mem_size, mem_reserved, type_id, op, handle, args, n_args, results,
-            // n_results, trap_out)
+            // n_results, vmctx)
             CapThunk => (
                 &[I64, I64, I64, I64, I32, I32, I32, I64, I64, I64, I64, I64],
                 &[],
@@ -6035,36 +6085,36 @@ impl HostFn {
             SigTake => (&[I64, I64], &[I32]),
             // (ctx)
             SigReturn => (&[I64], &[]),
-            // (mem_base, fn_table, trap_out, funcref, sp, fuel) -> handle (16-bit slot, 48-bit
+            // (mem_base, fn_table, vmctx, funcref, sp, fuel) -> handle (16-bit slot, 48-bit
             // generation)
             FiberNew => (&[I64, I64, I64, I32, I64, I64], &[I64]),
-            // (handle, arg, status_out, trap_out) -> value
+            // (handle, arg, status_out, vmctx) -> value
             FiberResume => (&[I64, I64, I64, I64], &[I64]),
-            // (domain, handle, arg, status_out, trap_out) -> value
+            // (domain, handle, arg, status_out, vmctx) -> value
             FiberResumeBlock => (&[I64, I64, I64, I64, I64], &[I64]),
-            // (value, trap_out) -> value
+            // (value, vmctx) -> value
             FiberSuspend => (&[I64, I64], &[I64]),
             // (args) -> the candidates found
             GcRoots => (&[I64], &[I64]),
-            // (domain, mem_base, fn_table, trap_out, func, sp, arg) -> handle
+            // (domain, mem_base, fn_table, vmctx, func, sp, arg) -> handle
             ThreadSpawn => (&[I64, I64, I64, I64, I32, I64, I64], &[I32]),
-            // (domain, handle, trap_out) -> result
+            // (domain, handle, vmctx) -> result
             ThreadJoin => (&[I64, I32, I64], &[I64]),
-            // (domain, addr, expected, width, timeout, trap_out) -> how the wait ended
+            // (domain, addr, expected, width, timeout, vmctx) -> how the wait ended
             ThreadWait => (&[I64, I64, I64, I32, I64, I64], &[I32]),
             // (domain, addr, count) -> the waiters woken
             ThreadNotify => (&[I64, I64, I32], &[I32]),
-            // (nursery, mem_base, instantiator, child, status_out, trap_out) -> value
+            // (nursery, mem_base, instantiator, child, status_out, vmctx) -> value
             InstJoin => (&[I64, I64, I32, I32, I64, I64], &[I64]),
-            // (nursery, mem_base, instantiator, child, trap_out) -> status
+            // (nursery, mem_base, instantiator, child, vmctx) -> status
             InstPoll | InstDetach | InstKill => (&[I64, I64, I32, I32, I64], &[I32]),
-            // (nursery, mem_base, mem_size, instantiator, record, trap_out) -> child
+            // (nursery, mem_base, mem_size, instantiator, record, vmctx) -> child
             InstSpawn => (&[I64, I64, I64, I32, I64, I64], &[I32]),
-            // (nursery, mem_base, instantiator, child, arg, trap_out) -> handle or -errno
+            // (nursery, mem_base, instantiator, child, arg, vmctx) -> handle or -errno
             ChildOffer | ChildGrant => (&[I64, I64, I32, I32, I64, I64], &[I32]),
             // (table, buf) -> jmp_buf
             SetjmpSlot => (&[I64, I64], &[I64]),
-            // (table, buf, trap_out) -> jmp_buf
+            // (table, buf, vmctx) -> jmp_buf
             SetjmpLookup => (&[I64, I64, I64], &[I64]),
             // (jmp_buf) -> 0, or the value a `longjmp` to it passes
             Setjmp => (&[I64], &[I32]),
@@ -6183,56 +6233,155 @@ fn c_signature(
     sig
 }
 
+/// The functions a compile's code calls, each declared in its module before any of the code is
+/// built (#2482): the unit's own functions, every [`HostFn`], and each fast-path `call.cap` target
+/// the compile's [`FastCapResolver`] claims. Building CLIF reads this, never the module, so
+/// [`define_funcs`]' workers lower functions while the calling thread defines code into it.
+struct Callees {
+    /// Each callee's signature, and whether the module defines it (an import is not colocated).
+    decls: HashMap<FuncId, (Signature, bool)>,
+    /// Each [`HostFn`]'s id, at its position in [`HostFn::ALL`].
+    host: [FuncId; HostFn::ALL.len()],
+    /// Each fast-path target's id, by [`fast_cap_key_of`]; `None` where the resolver claims none.
+    fast: HashMap<[u32; 4], Option<FuncId>>,
+    /// The target's pointer width and default calling convention, for the Cranelift
+    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
+    frontend: cranelift_codegen::isa::TargetFrontendConfig,
+}
+
+impl Callees {
+    /// Declare in `module` what code built from `funcs`, which `module` declared as `ids`, calls.
+    /// `resolver` is asked here once for each fast-path key the functions' `call.cap`s carry, on
+    /// the calling thread, and never while a worker lowers.
+    fn new(
+        module: &mut JITModule,
+        ids: &[FuncId],
+        funcs: &[Func],
+        types: &[temen_ir::TypeEntry],
+        resolver: Option<FastCapResolver>,
+    ) -> Result<Callees, JitError> {
+        let frontend = module.target_config();
+        let cc = frontend.default_call_conv;
+        let mut decls = HashMap::new();
+        for &id in ids {
+            let decl = module.declarations().get_function_decl(id);
+            decls.insert(id, (decl.signature.clone(), decl.linkage.is_final()));
+        }
+        let mut import = |name: &str, sig: Signature| {
+            let id = module
+                .declare_function(name, Linkage::Import, &sig)
+                .map_err(|e| JitError::Backend(e.to_string()))?;
+            decls.insert(id, (sig, false));
+            Ok::<_, JitError>(id)
+        };
+        let mut host = [FuncId::from_u32(0); HostFn::ALL.len()];
+        for (id, f) in host.iter_mut().zip(HostFn::ALL) {
+            *id = import(f.symbol(), f.signature(cc))?;
+        }
+        let mut fast = HashMap::new();
+        if let Some(resolver) = resolver {
+            for inst in funcs.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts) {
+                let Inst::CapCall {
+                    type_id, op, sig, ..
+                } = inst
+                else {
+                    continue;
+                };
+                let key = fast_cap_key_of(*type_id, *op, sig_of(types, *sig));
+                if let std::collections::hash_map::Entry::Vacant(slot) = fast.entry(key) {
+                    slot.insert(
+                        fast_cap_claimed(resolver, key)
+                            .then(|| import(&fast_cap_symbol(key), fast_cap_signature(cc, key)))
+                            .transpose()?,
+                    );
+                }
+            }
+        }
+        Ok(Callees {
+            decls,
+            host,
+            fast,
+            frontend,
+        })
+    }
+
+    /// Import the callee `id` into `func`, as [`Module::declare_func_in_func`] does.
+    fn import(&self, func: &mut Function, id: FuncId) -> Result<FuncRef, JitError> {
+        let (sig, colocated) = self.decls.get(&id).ok_or(JitError::Malformed)?;
+        let signature = func.import_signature(sig.clone());
+        let name = func.declare_imported_user_function(UserExternalName {
+            namespace: 0,
+            index: id.as_u32(),
+        });
+        Ok(func.import_function(ExtFuncData {
+            name: ExternalName::user(name),
+            signature,
+            colocated: *colocated,
+            patchable: false,
+        }))
+    }
+
+    /// Import the host function `f` into `func`.
+    fn host(&self, func: &mut Function, f: HostFn) -> Result<FuncRef, JitError> {
+        self.import(func, self.host[f.index()])
+    }
+
+    /// Import into `func` the fast-path target the resolver claimed for `key`; `None` when it
+    /// claimed none, and the `call.cap` takes the generic thunk.
+    fn fast_cap(&self, func: &mut Function, key: [u32; 4]) -> Option<Result<FuncRef, JitError>> {
+        let id = (*self.fast.get(&key)?)?;
+        Some(self.import(func, id))
+    }
+}
+
 /// Call the host function `f`: a call to the symbol the code names it by.
 fn call_host(
-    module: &mut JITModule,
+    callees: &Callees,
     b: &mut FunctionBuilder,
     f: HostFn,
     args: &[Value],
 ) -> Result<cranelift_codegen::ir::Inst, JitError> {
-    let callee = import_host(module, b.func, f)?;
+    let callee = callees.host(b.func, f)?;
     Ok(b.ins().call(callee, args))
 }
 
-/// Import the host function `f` into `func`.
-fn import_host(
-    module: &mut JITModule,
-    func: &mut Function,
-    f: HostFn,
-) -> Result<FuncRef, JitError> {
-    let sig = f.signature(module.isa().default_call_conv());
-    import_symbol(module, func, f.symbol(), &sig)
+/// The key a `call.cap` of `(type_id, op)` with signature `sig` takes the §9/D45 fast path by:
+/// `(type_id, op, n_args, n_res)`, what the resolver is asked.
+fn fast_cap_key_of(type_id: u32, op: u32, sig: &FuncType) -> [u32; 4] {
+    [
+        type_id,
+        op,
+        sig.params.len() as u32,
+        sig.results.len() as u32,
+    ]
 }
 
-/// Import the host symbol `name`, whose C signature is `sig`, into `func`.
-fn import_symbol(
-    module: &mut JITModule,
-    func: &mut Function,
-    name: &str,
-    sig: &Signature,
-) -> Result<FuncRef, JitError> {
-    let id = module
-        .declare_function(name, Linkage::Import, sig)
-        .map_err(|e| JitError::Backend(e.to_string()))?;
-    Ok(module.declare_func_in_func(id, func))
+/// Whether `resolver` claims the §9/D45 fast path for `key`: the op has at most one result (the
+/// register ABI returns a single i64; a multi-result op takes the generic thunk), and the resolver
+/// returns a specialized fn for it. The resolver gates on the arity it is passed, so it claims an op
+/// only when its fn's arity matches the `call.cap`'s.
+fn fast_cap_claimed(resolver: FastCapResolver, [type_id, op, n_args, n_res]: [u32; 4]) -> bool {
+    // SAFETY: `resolver` honours the `FastCapResolver` contract (the compile's caller guarantees
+    // it): a pure `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects.
+    n_res <= 1 && !unsafe { resolver(type_id, op, n_args, n_res) }.is_null()
 }
 
 /// The symbol a §9/D45 fast-path `call.cap` calls its target by: the `(type_id, op, n_args,
 /// n_res)` the compile's resolver claimed, which [`fast_cap_addr`] asks it again at link time.
-fn fast_cap_symbol(type_id: u32, op: u32, n_args: usize, n_res: usize) -> String {
+fn fast_cap_symbol([type_id, op, n_args, n_res]: [u32; 4]) -> String {
     format!("temen.fast_cap.{type_id}.{op}.{n_args}.{n_res}")
 }
 
-/// A fast-path target's C signature: `(ctx, mem_base, mem_size, handle, trap_out, args…) ->
-/// [result]`, each arg and the result in its `i64` register slot.
+/// The C signature of the fast-path target for `key` ([`fast_cap_key_of`]): `(ctx, mem_base,
+/// mem_size, handle, vmctx, args…) -> [result]`, each arg and the result in its `i64` register
+/// slot.
 fn fast_cap_signature(
     cc: cranelift_codegen::isa::CallConv,
-    n_args: usize,
-    n_res: usize,
+    [_, _, n_args, n_res]: [u32; 4],
 ) -> Signature {
     let mut params = vec![I64, I64, I64, I32, I64];
-    params.resize(5 + n_args, I64);
-    c_signature(cc, &params, &[I64][..n_res])
+    params.resize(5 + n_args as usize, I64);
+    c_signature(cc, &params, &[I64][..n_res as usize])
 }
 
 /// The `(type_id, op, n_args, n_res)` a [`fast_cap_symbol`] names; `None` for any other symbol.
@@ -6249,7 +6398,7 @@ fn fast_cap_key(name: &str) -> Option<[u32; 4]> {
 fn fast_cap_addr(resolver: FastCapResolver, name: &str) -> Option<*const u8> {
     let [type_id, op, n_args, n_res] = fast_cap_key(name)?;
     // SAFETY: `resolver` honours the `FastCapResolver` contract, which the compile's caller
-    // guaranteed: a pure lookup, which the compile already made for this key (`fast_cap_target`).
+    // guaranteed: a pure lookup, which the compile already made for this key (`Callees::new`).
     let target = unsafe { resolver(type_id, op, n_args, n_res) };
     (!target.is_null()).then_some(target as *const u8)
 }
@@ -6265,9 +6414,8 @@ fn host_import(
     if let Some(f) = HostFn::ALL.into_iter().find(|f| f.symbol() == name) {
         return f.addr(imports).map(|_| f.signature(cc));
     }
-    let [_, _, n_args, n_res] = fast_cap_key(name)?;
-    let bound = fast_cap_addr(imports.fast_resolver?, name).is_some();
-    (bound && n_res <= 1).then(|| fast_cap_signature(cc, n_args as usize, n_res as usize))
+    let key = fast_cap_key(name)?;
+    fast_cap_claimed(imports.fast_resolver?, key).then(|| fast_cap_signature(cc, key))
 }
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
@@ -6365,33 +6513,38 @@ fn jit_isa() -> Result<cranelift_codegen::isa::OwnedTargetIsa, JitError> {
     // each pass, which names the pass that broke the CLIF.
     let per_pass = cfg!(any(debug_assertions, fuzzing));
     let _ = flags.set("enable_verifier", if per_pass { "true" } else { "false" });
+    // #2481 — when the machine-code validator runs, ask Cranelift to record each function's basic
+    // block start offsets (`CompiledCode::bb_starts`), the hints the validator checks control-flow
+    // targets against instead of recovering the CFG itself. Off otherwise, so a production compile
+    // that does not validate pays nothing. The flag adds metadata only; it does not change the code.
+    // Also on under `cfg(test)`, so the decoder/validator cross-check tests see real block layout.
+    if validate::enabled() || cfg!(test) {
+        let _ = flags.set("machine_code_cfg_info", "true");
+    }
     cranelift_native::builder()
         .map_err(|e| JitError::Backend(e.to_string()))?
         .finish(settings::Flags::new(flags))
         .map_err(|e| JitError::Backend(e.to_string()))
 }
 
-/// What a worker hands back for one function: its code and relocations, the compile's error, or
-/// the payload of a panic in the compile.
-type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), String>>;
+/// What a worker hands back for one function: its code and relocations, the error of its lowering
+/// or compile, or the payload of a panic in either.
+type CompiledFn = std::thread::Result<Result<(CompiledCode, Vec<ModuleReloc>), JitError>>;
 
-/// Lower and define functions `0..ids.len()` (#2450), every compile path's one loop. `lower` builds
-/// function `i`'s CLIF on this thread, where the module's declarations are. Worker threads compile
-/// the CLIF, each function in a context of its own, and this thread defines the code in function
-/// order, `defined` seeing each function's as it goes. A function's code depends on its CLIF and the
-/// ISA alone, so the module's code is the same on any number of threads; a compile that fails or
-/// panics fails or panics here, at its function, as it would on one thread. `code` says where the
-/// code comes from: the compile, which keeps it while its record holds code, or code a [`CodeDir`]
-/// kept, defined as is (temen#2452). Returns the bytes of code defined.
+/// Lower and define functions `0..ids.len()` (#2450, #2482), every compile path's one loop. Worker
+/// threads build function `i`'s CLIF with `lower` and compile it, each function in a context of its
+/// own, and this thread defines the code in function order, `defined` seeing each function's as it
+/// goes. `lower` reads what the code calls from the [`Callees`] declared before the loop, never the
+/// module, which only this thread writes. A function's code depends on its IR, its callees and the
+/// ISA alone, so the module's code is the same on any number of threads; a function whose lowering
+/// or compile fails or panics fails or panics here, at its function, as it would on one thread.
+/// `code` says where the code comes from: the compile, which keeps it while its record holds code,
+/// or code a [`CodeDir`] kept, defined as is (temen#2452). Returns the bytes of code defined.
 fn define_funcs(
     module: &mut JITModule,
     ids: &[FuncId],
     code: &mut Codegen<'_>,
-    mut lower: impl FnMut(
-        &mut JITModule,
-        &mut cranelift_codegen::Context,
-        usize,
-    ) -> Result<(), JitError>,
+    lower: impl Fn(&mut cranelift_codegen::Context, usize) -> Result<(), JitError> + Sync,
     mut defined: impl FnMut(&JITModule, &CompiledCode, usize),
 ) -> Result<usize, JitError> {
     let keep = match code {
@@ -6402,18 +6555,20 @@ fn define_funcs(
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .clamp(1, ids.len().max(1));
-    let (work_tx, work_rx) =
-        std::sync::mpsc::sync_channel::<(usize, cranelift_codegen::Context)>(2 * workers);
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<usize>(2 * workers);
     let work_rx = std::sync::Mutex::new(work_rx);
     let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, CompiledFn)>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            let (work_rx, done_tx, isa) = (&work_rx, done_tx.clone(), &*isa);
+            let (work_rx, done_tx, isa, lower) = (&work_rx, done_tx.clone(), &*isa, &lower);
             scope.spawn(move || loop {
                 let job = work_rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
-                let Ok((i, mut ctx)) = job else { break };
+                let Ok(i) = job else { break };
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let code = compile_verified(isa, &mut ctx)?;
+                    let mut ctx = cranelift_codegen::Context::new();
+                    ctx.func.signature.call_conv = isa.default_call_conv();
+                    lower(&mut ctx, i)?;
+                    let code = compile_verified(isa, &mut ctx).map_err(JitError::Backend)?;
                     let relocs = code
                         .buffer
                         .relocs()
@@ -6435,7 +6590,7 @@ fn define_funcs(
         let mut define = |module: &mut JITModule, done: &mut [Option<CompiledFn>]| {
             while let Some(out) = done.get_mut(next).and_then(Option::take) {
                 let (code, relocs) = match out {
-                    Ok(compiled) => compiled.map_err(JitError::Backend)?,
+                    Ok(compiled) => compiled?,
                     Err(panic) => std::panic::resume_unwind(panic),
                 };
                 let align = code.buffer.alignment as u64;
@@ -6444,6 +6599,8 @@ fn define_funcs(
                     .map_err(|e| JitError::Backend(e.to_string()))?;
                 #[cfg(test)]
                 record_emitted(module, code.code_buffer(), &relocs);
+                #[cfg(all(test, target_arch = "x86_64"))]
+                validate::capture_code(code.code_buffer(), &code.bb_starts);
                 let kept = keep
                     .as_mut()
                     .is_some_and(|k| k.push(module, ids, align, code.code_buffer(), &relocs));
@@ -6457,10 +6614,8 @@ fn define_funcs(
             Ok::<(), JitError>(())
         };
         for i in 0..ids.len() {
-            let mut ctx = module.make_context();
-            lower(module, &mut ctx, i)?;
             work_tx
-                .send((i, ctx))
+                .send(i)
                 .map_err(|_| JitError::Backend("no compile worker".into()))?;
             for (j, out) in done_rx.try_iter() {
                 done[j] = Some(out);
@@ -6496,7 +6651,14 @@ fn compile_verified(
     let code = isa
         .compile_function(&ctx.func, &ctx.domtree, ctx.want_disasm, &mut ctrl)
         .map_err(|e| cranelift_module::ModuleError::from(e).to_string())?;
-    Ok(code.apply_params(&ctx.func.params))
+    let code = code.apply_params(&ctx.func.params);
+    // #2481 — shadow-mode machine-code validation: check the emitted bytes against the policy and
+    // log any disagreement, but never reject (slice 1). `enabled()` is false on a production compile,
+    // so this is inert there; `jit_isa` only records `bb_starts` when it is true.
+    if validate::enabled() {
+        validate::shadow_check(code.code_buffer(), &code.bb_starts);
+    }
+    Ok(code)
 }
 
 /// Define `id` in `module` from `ctx`'s CLIF, compiled by [`compile_verified`], and return its code.
@@ -6552,6 +6714,81 @@ fn record_emitted(module: &JITModule, code: &[u8], relocs: &[ModuleReloc]) {
             out.extend_from_slice(line.as_bytes());
         }
     });
+}
+
+/// #2482 — a compile asks its D45 fast-path resolver while it declares its [`Callees`], once for
+/// each key, on the thread that compiles: the embedder's resolver never runs on a worker.
+#[cfg(test)]
+mod callees_tests {
+    use super::*;
+    use core::ffi::c_void;
+
+    /// Each ask of [`resolver`]: the thread it ran on, and its `(type_id, op, n_args, n_res)`.
+    static ASKED: std::sync::Mutex<Vec<(std::thread::ThreadId, [u32; 4])>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// The fast path of `call.cap 3 8 (i64) -> (i64)`: its argument plus one.
+    unsafe extern "C" fn plus_one(
+        _: *mut c_void,
+        _: *mut u8,
+        _: u64,
+        _: i32,
+        _: *mut i64,
+        a: i64,
+    ) -> i64 {
+        a + 1
+    }
+
+    /// Claims `call.cap 3 8 (i64) -> (i64)` alone.
+    unsafe extern "C" fn resolver(type_id: u32, op: u32, n_args: u32, n_res: u32) -> *const c_void {
+        let key = [type_id, op, n_args, n_res];
+        ASKED
+            .lock()
+            .unwrap()
+            .push((std::thread::current().id(), key));
+        match key {
+            [3, 8, 1, 1] => plus_one as *const c_void,
+            _ => core::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn the_resolver_is_asked_once_per_key_on_the_compiling_thread() {
+        // Function 0 calls function 1, whose `call.cap` takes the fast path. Each of the other 62
+        // makes the same claimed and unclaimed `call.cap`s, so every worker lowers some of them.
+        let mut src = String::from(
+            "func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  vr = call 1 (vh, vx)\n  \
+             return vr\n  }\n}\n\
+             func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  \
+             vr = call.cap 3 8 (i64) -> (i64) vh (vx)\n  return vr\n  }\n}\n",
+        );
+        for _ in 2..64 {
+            src += "func (i32, i64) -> (i64) {\nblock 0 (vh: i32, vx: i64) {\n  \
+                    va = call.cap 3 8 (i64) -> (i64) vh (vx)\n  \
+                    vb = call.cap 4 0 (i64) -> (i64) vh (va)\n  return vb\n  }\n}\n";
+        }
+        let m = temen_text::parse_module(&src).expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let out = compile_and_run_with_host_fast(
+            &m,
+            0,
+            &[0, 41],
+            empty_cap_thunk,
+            core::ptr::null_mut(),
+            resolver,
+            None,
+        )
+        .expect("compile");
+        assert_eq!(out, JitOutcome::Returned(vec![42]), "the fast path ran");
+        let asked = ASKED.lock().unwrap();
+        let here = std::thread::current().id();
+        assert!(
+            asked.iter().all(|(thread, _)| *thread == here),
+            "a worker asked the resolver"
+        );
+        let unclaimed = asked.iter().filter(|(_, key)| *key == [4, 0, 1, 1]);
+        assert_eq!(unclaimed.count(), 1, "62 functions' key asked once");
+    }
 }
 
 /// temen#2452 — the code a compile emits names no address in its process: two processes emit the
@@ -6648,7 +6885,7 @@ block 2 (v7: i32) {
         _: u64,
         _: *mut i64,
         _: u64,
-        _: *mut i64,
+        _: &VmCtx,
     ) {
     }
 
@@ -6657,7 +6894,7 @@ block 2 (v7: i32) {
         _: *mut u8,
         _: u64,
         _: i32,
-        _: *mut i64,
+        _: &VmCtx,
         _: i64,
     ) -> i64 {
         0
@@ -6678,7 +6915,7 @@ block 2 (v7: i32) {
 
     unsafe extern "C" fn sig_return(_: *mut c_void) {}
 
-    unsafe extern "C" fn page_miss(_: *mut VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {}
+    unsafe extern "C" fn page_miss(_: &VmCtx, _: *mut u8, _: u64, _: u64, _: u64) {}
 
     /// What the test programs' compiles bind beside temen-jit's own functions.
     fn imports() -> Imports {
@@ -6841,7 +7078,7 @@ block 2 (v7: i32) {
                 assert!(!held, "the code holds the address of {}", f.symbol());
             }
         }
-        let fast = fast_cap_symbol(3, 8, 1, 1);
+        let fast = fast_cap_symbol([3, 8, 1, 1]);
         assert!(a.windows(fast.len()).any(|w| w == fast.as_bytes()));
         assert!(
             a == b,
@@ -6968,7 +7205,7 @@ fn declare_all_funcs(module: &mut JITModule, funcs: &[Func]) -> Result<Vec<FuncI
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let sig = natural_sig(module, f);
+            let sig = natural_sig(f);
             module
                 .declare_function(&format!("f{i}"), Linkage::Local, &sig)
                 .map_err(|e| JitError::Backend(e.to_string()))
@@ -7132,6 +7369,8 @@ fn compile_child_windowed(
     };
     let mut module = new_jit_module(imports)?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
+    // Nested child: its `call.cap`s go to the coroutine thunk, never a fast path.
+    let callees = Callees::new(&mut module, &ids, funcs, types, None)?;
     // temen#2452 — the code kept for this compile, defined in place of compiling, or else a record
     // of the code it emits, to keep.
     let replay = kept
@@ -7165,14 +7404,13 @@ fn compile_child_windowed(
         &mut module,
         &ids,
         &mut codegen,
-        |module, ctx, fi| {
+        |ctx, fi| {
             build_clif(
-                module,
+                &callees,
                 &ids,
                 funcs,
                 &distinct,
                 types,
-                None,    // nested child: `call.cap`s go to the coroutine thunk, not a fast path
                 nesting, // a child that spawns loads its own nursery from its vmctx (temen#2168)
                 false,   // #932 — a §14 child is not signal-delivery armed (slice 1b)
                 page,    // #2164 — its access table's check, when it is demand-paged
@@ -7195,7 +7433,7 @@ fn compile_child_windowed(
     )?;
     let mut ctx = module.make_context();
     build_trampoline(
-        &mut module,
+        &callees,
         &mut ctx.func,
         ids[child_entry as usize],
         &entry,
@@ -7210,7 +7448,7 @@ fn compile_child_windowed(
     // child resumed on a platform fiber by the executor, `child_exec`): its body passes the fiber's
     // stack low bound so the guest's prologue checks guard the fiber stack, not an inert `0`.
     build_trampoline(
-        &mut module,
+        &callees,
         &mut ctx.func,
         ids[child_entry as usize],
         &entry,
@@ -7234,7 +7472,7 @@ fn compile_child_windowed(
         for &f in impl_exports.iter().flat_map(|e| &e.ops) {
             if (f as usize) < funcs.len() && seen.insert(f) {
                 build_trampoline(
-                    &mut module,
+                    &callees,
                     &mut ctx.func,
                     ids[f as usize],
                     &funcs[f as usize],
@@ -7257,7 +7495,7 @@ fn compile_child_windowed(
     // a root's.
     #[cfg(fiber_rt)]
     let fiber_tramp = if uses_fibers || uses_threads {
-        build_fiber_call_trampoline(&mut module, &mut ctx.func);
+        build_fiber_call_trampoline(&mut ctx.func);
         let id = module
             .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -7583,8 +7821,8 @@ pub fn child_compiles() -> u64 {
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
 /// -> (results…)`. Both context pointers are threaded through every call so loads/
 /// stores reach the window and `call.dyn` reaches the function table.
-fn natural_sig(module: &mut JITModule, f: &Func) -> cranelift_codegen::ir::Signature {
-    sig_from(module, &f.params, &f.results)
+fn natural_sig(f: &Func) -> cranelift_codegen::ir::Signature {
+    sig_from(&f.params, &f.results)
 }
 
 /// Max function results returned **in registers**. Above this the JIT spills results to a
@@ -7615,18 +7853,13 @@ fn sret_blocked_by_v128(results: &[ValType]) -> bool {
 
 /// The natural signature for an explicit param/result list (shared by `natural_sig`
 /// and the `call.dyn` signature import).
-fn sig_from(
-    module: &mut JITModule,
-    params: &[ValType],
-    results: &[ValType],
-) -> cranelift_codegen::ir::Signature {
-    let mut sig = module.make_signature();
+fn sig_from(params: &[ValType], results: &[ValType]) -> cranelift_codegen::ir::Signature {
     // The `tail` calling convention so `return_call` (guaranteed tail calls, §3b) is
     // available; a normal `call` from the trampoline works against it too.
-    sig.call_conv = cranelift_codegen::isa::CallConv::Tail;
+    let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     sig.params.push(AbiParam::new(I64)); // mem_base
     sig.params.push(AbiParam::new(I64)); // fn_table_base
-    sig.params.push(AbiParam::new(I64)); // trap_out (host-owned trap cell)
+    sig.params.push(AbiParam::new(I64)); // vmctx (the instance's context; field 0 its trap cell)
                                          // §2b path B: a 4th context param — the running stack's limit: a fiber's `usable_low`, or the
                                          // root/thread-top's thread limit (`stack_check::thread_limit`, #1983). Threaded through every call (constant within
                                          // a stack's call tree; set anew at each fiber/root entry), so the prologue check reads a per-vCPU
@@ -7902,9 +8135,6 @@ struct Lower<'a> {
     /// page)`. Always `PROT_NONE`, so the D63 branchless lowering redirects an out-of-bounds access
     /// here to fault it. `0` when the module has no memory (the branchless path isn't taken).
     guard_offset: u64,
-    /// The target's frontend config (pointer width + default call conv), for the Cranelift
-    /// `call_memcpy`/`call_memmove`/`call_memset` helpers that lower the bulk-memory ops (D62).
-    frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// The function-table index mask (`next_pow2(nfuncs) - 1`) for `call.dyn`.
     fn_table_mask: u64,
     /// **Submitted-unit `ref.func` remap** (DESIGN.md §22 "unit-own funcref"). For a top-level
@@ -7916,9 +8146,10 @@ struct Lower<'a> {
     /// lets a unit `cont.new`/`thread.spawn`/`call.dyn` over its OWN function; it changes only
     /// *which constant* `ref.func` emits, never the masked-dispatch lowering (invariant I2).
     ref_slots: Option<&'a [u32]>,
-    /// The optional D45 devirtualize-to-direct-call resolver (top-level compile only; `None` for
-    /// nested children, whose `call.cap`s go to the coroutine thunk). Invoked at compile time.
-    fast_resolver: Option<FastCapResolver>,
+    /// The functions this code calls, declared before it is built (#2482): direct callees, host
+    /// functions, and the D45 fast-path `call.cap` targets (none for a nested child, whose
+    /// `call.cap`s go to the coroutine thunk).
+    callees: &'a Callees,
     /// Lower `Instantiator` `call.cap`s to the §14 nesting runtime (`false` ⇒ they take the
     /// ordinary `call.cap` path — an inert `CapFault`).
     nesting: bool,
@@ -7945,11 +8176,11 @@ struct Lower<'a> {
     /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
     /// the check out of a loop.
     fuel: bool,
-    /// DESIGN §12 domain teardown for **running** vCPUs: poll this vCPU's own trap cell at every loop
-    /// back-edge (and the entry of a function that tail-calls), and unwind when it is non-zero — a sibling's trap, the root's
-    /// completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown of a §14 child. On for code
-    /// that can run beside other vCPUs (a threaded module, every §14 child); a single-vCPU compile
-    /// emits nothing.
+    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's trap cell at every loop
+    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds an end — a
+    /// sibling's trap, the root's completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown
+    /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
+    /// child); a single-vCPU compile emits nothing.
     domain_poll: bool,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
@@ -8020,12 +8251,11 @@ fn trap_capture_addr() -> Option<*const ()> {
 /// constant into every call site — DESIGN.md §22 "the baked function-table mask").
 #[allow(clippy::too_many_arguments)]
 fn build_clif(
-    module: &mut JITModule,
+    callees: &Callees,
     ids: &[FuncId],
     funcs: &[Func],
     distinct: &[FuncType],
     type_section: &[temen_ir::TypeEntry],
-    fast_resolver: Option<FastCapResolver>,
     nesting: bool,
     signals: bool,
     page: PageEnv,
@@ -8046,7 +8276,7 @@ fn build_clif(
     if f.blocks.is_empty() {
         return Err(JitError::Malformed);
     }
-    clif.signature = natural_sig(module, f);
+    clif.signature = natural_sig(f);
     clif.name = UserFuncName::user(0, 0);
 
     let mut fbctx = FunctionBuilderContext::new();
@@ -8112,7 +8342,7 @@ fn build_clif(
     // takes the trapping frame pointer), so `emit_trap` can record an explicit trap's source
     // backtrace before unwinding. Disabled without `-g` or where the helper isn't linked.
     let trap_capture = match trap_capture_addr() {
-        Some(_) if srclocs.is_some() => Some(import_host(module, b.func, HostFn::TrapCapture)?),
+        Some(_) if srclocs.is_some() => Some(callees.host(b.func, HostFn::TrapCapture)?),
         _ => None,
     };
     // #2164 — a paged compile loads its instance's access table once, here, and imports the miss
@@ -8121,7 +8351,7 @@ fn build_clif(
         let table = b.declare_var(I64);
         let t = b.ins().load(I64, MemFlags::trusted(), vmctx, vmctx::PAGES);
         b.def_var(table, t);
-        Some((page, import_host(module, b.func, HostFn::PageMiss)?, table))
+        Some((page, callees.host(b.func, HostFn::PageMiss)?, table))
     } else {
         None
     };
@@ -8136,10 +8366,9 @@ fn build_clif(
         mask,
         mapped,
         guard_offset,
-        frontend_config: module.target_config(),
         fn_table_mask,
         ref_slots,
-        fast_resolver,
+        callees,
         nesting,
         signals,
         epoch,
@@ -8176,13 +8405,13 @@ fn build_clif(
     }) {
         emit_domain_poll(&mut b, &lower);
     }
-    emit_signal_check(module, &mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
+    emit_signal_check(&mut b, &lower)?; // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks.clif[0], &entry_args);
 
     for (i, blk) in f.blocks.iter().enumerate() {
-        lower_block(module, &mut b, blk, i, &mut blocks, &lower)?;
+        lower_block(&mut b, blk, i, &mut blocks, &lower)?;
     }
 
     b.seal_all_blocks();
@@ -8191,7 +8420,7 @@ fn build_clif(
 }
 
 /// Build the fixed buffer-ABI trampoline `fn(args_ptr, results_ptr, mem_base,
-/// fn_table_base, trap_out)` that decodes the entry function's args from `args_ptr`,
+/// fn_table_base, vmctx)` that decodes the entry function's args from `args_ptr`,
 /// calls it (natural ABI), and stores its results to `results_ptr`. This is what Rust
 /// calls, so any arity works.
 ///
@@ -8201,7 +8430,7 @@ fn build_clif(
 /// executor knows at resume time (the fiber's own `stack_low`), exactly as a guest fiber's entry does
 /// via the fiber call-trampoline. One flag on the one builder, not a second trampoline family.
 fn build_trampoline(
-    module: &mut JITModule,
+    callees: &Callees,
     clif: &mut Function,
     entry_id: FuncId,
     entry: &Func,
@@ -8211,7 +8440,7 @@ fn build_trampoline(
     clif.signature.params.push(AbiParam::new(I64)); // results_ptr
     clif.signature.params.push(AbiParam::new(I64)); // mem_base
     clif.signature.params.push(AbiParam::new(I64)); // fn_table_base
-    clif.signature.params.push(AbiParam::new(I64)); // trap_out
+    clif.signature.params.push(AbiParam::new(I64)); // vmctx
     if with_limit {
         clif.signature.params.push(AbiParam::new(I64)); // stack_limit (D66 child-domain task)
     }
@@ -8229,19 +8458,19 @@ fn build_trampoline(
     let results_ptr = b.block_params(blk)[1];
     let mem_base = b.block_params(blk)[2];
     let fn_table_base = b.block_params(blk)[3];
-    let trap_out = b.block_params(blk)[4];
+    let vmctx = b.block_params(blk)[4];
 
     // Decode args (context pointers first), call the entry, store results. When the entry returns
     // via sret, hand it `results_ptr` directly as the return-area pointer — it writes its results
     // (8-byte `encode_slot` slots) straight into the buffer Rust reads, so no register read-back.
     let sret = uses_sret(&entry.results);
-    let mut call_args = vec![mem_base, fn_table_base, trap_out];
+    let mut call_args = vec![mem_base, fn_table_base, vmctx];
     // §2b path B: the root runs on the calling thread's own stack, so it takes that stack's limit from
     // the host (#1983, `stack_check::thread_limit`); fibers get a real limit at their own entry.
     let limit = if with_limit {
         b.block_params(blk)[5]
     } else {
-        let call = call_host(module, &mut b, HostFn::StackLimit, &[])?;
+        let call = call_host(callees, &mut b, HostFn::StackLimit, &[])?;
         b.inst_results(call)[0]
     };
     call_args.push(limit);
@@ -8254,7 +8483,7 @@ fn build_trampoline(
             .load(I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
         call_args.push(decode_slot(&mut b, slot, *p));
     }
-    let callee = module.declare_func_in_func(entry_id, b.func);
+    let callee = callees.import(b.func, entry_id)?;
     let call = b.ins().call(callee, &call_args);
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
@@ -8360,15 +8589,15 @@ fn funcs_use_instantiator(funcs: &[Func]) -> bool {
 }
 
 /// Build the generic fiber **call-trampoline**: `extern "C" fn(code, mem_base, fn_table_base,
-/// trap_out, sp, arg) -> i64` that `call.dyn`s a guest fiber entry under its `Tail` ABI. Rust
+/// vmctx, sp, arg) -> i64` that `call.dyn`s a guest fiber entry under its `Tail` ABI. Rust
 /// cannot call a `Tail`-convention function directly, so the fiber runtime calls this (default C ABI)
 /// instead; one trampoline serves all fibers since every entry is `(i64 sp, i64 arg) -> i64`.
 #[cfg(fiber_rt)]
-fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
-    // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, trap_out,
+fn build_fiber_call_trampoline(clif: &mut Function) {
+    // Params: `code`, then the guest entry's Tail args in order — mem_base, fn_table_base, vmctx,
     // stack_limit (§2b path B, always present), sp, arg -> i64. `stack_limit` sits in the same relative
     // slot as in `sig_from`, so the entry call args are exactly `p[1..]` (see [`FiberCallTramp`]).
-    let np = 7; // code + (mem_base, fn_table_base, trap_out, stack_limit, sp, arg)
+    let np = 7; // code + (mem_base, fn_table_base, vmctx, stack_limit, sp, arg)
     for _ in 0..np {
         clif.signature.params.push(AbiParam::new(I64));
     }
@@ -8385,12 +8614,8 @@ fn build_fiber_call_trampoline(module: &mut JITModule, clif: &mut Function) {
     b.seal_block(blk);
     let p = b.block_params(blk).to_vec();
     let code = p[0];
-    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, trap_out, [stack_limit], sp, arg)
-    let sig = b.import_signature(sig_from(
-        module,
-        &[ValType::I64, ValType::I64],
-        &[ValType::I64],
-    ));
+    let call_args = p[1..].to_vec(); // (mem_base, fn_table_base, vmctx, [stack_limit], sp, arg)
+    let sig = b.import_signature(sig_from(&[ValType::I64, ValType::I64], &[ValType::I64]));
     let call = b.ins().call_indirect(sig, code, &call_args);
     let r = b.inst_results(call)[0];
     b.ins().return_(&[r]);
@@ -8462,7 +8687,6 @@ fn launder_across_setjmp(
 
 /// Lower one IR block's body + terminator into its CLIF block.
 fn lower_block(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     blk: &Block,
     block_idx: usize,
@@ -8512,7 +8736,7 @@ fn lower_block(
         // match (which produces exactly one value).
         if let Inst::Call { func, args } = inst {
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = module.declare_func_in_func(callee_id, b.func);
+            let callee = lower.callees.import(b.func, callee_id)?;
             let results = &lower
                 .funcs
                 .get(*func as usize)
@@ -8535,7 +8759,7 @@ fn lower_block(
         if let Inst::CallIndirect { ty, idx, args } = inst {
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
-            let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
+            let sig = b.import_signature(sig_from(&ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
             let sret = sret_call_slot(b, &mut cargs, &ty.results);
             for a in args {
@@ -8590,7 +8814,7 @@ fn lower_block(
                     // budget chain's room, asked of the cell (word 2).
                     let addr = vmctx_load(b, lower, vmctx::FUEL);
                     let rsig = {
-                        let mut s = Signature::new(lower.frontend_config.default_call_conv);
+                        let mut s = Signature::new(lower.callees.frontend.default_call_conv);
                         s.params.push(AbiParam::new(I64)); // the cell
                         s.returns.push(AbiParam::new(I64)); // the remaining fuel
                         b.import_signature(s)
@@ -8620,14 +8844,17 @@ fn lower_block(
             // needs the host compiler, which the flat `call.cap` thunk can't reach. Otherwise (a child
             // compile, or no nesting runtime) it falls through to the ordinary path (an inert CapFault).
             if *type_id == cap_id::INSTANTIATOR && lower.nesting {
-                lower_instantiator(module, b, lower, *op, sig, *handle, args, &mut vals)?;
-            } else if let Some(target) = fast_cap_target(lower, *type_id, *op, sig) {
+                lower_instantiator(b, lower, *op, sig, *handle, args, &mut vals)?;
+            } else if let Some(callee) = lower
+                .callees
+                .fast_cap(b.func, fast_cap_key_of(*type_id, *op, sig))
+            {
                 // D45 devirtualized fast path: a register-to-register direct call to the specialized
                 // host fn the resolver claimed for this `(type_id, op)`.
-                lower_cap_call_fast(module, b, lower, &target, sig, *handle, args, &mut vals)?;
+                lower_cap_call_fast(b, lower, callee?, sig, *handle, args, &mut vals)?;
             } else {
                 let h = get(&vals, *handle)?;
-                lower_cap_call(module, b, lower, *type_id, *op, sig, h, args, &mut vals)?;
+                lower_cap_call(b, lower, *type_id, *op, sig, h, args, &mut vals)?;
             }
             continue;
         }
@@ -8654,7 +8881,7 @@ fn lower_block(
                 Inst::CallImportDyn { handle, .. } => get(&vals, *handle)?,
                 _ => b.ins().iconst(I32, 0),
             };
-            lower_cap_call(module, b, lower, type_id, op, sig, h, args, &mut vals)?;
+            lower_cap_call(b, lower, type_id, op, sig, h, args, &mut vals)?;
             continue;
         }
         // §3.5 self-namespace extensions — the shared dispatch entry with `CAP_SELF_TYPE_ID` and
@@ -8683,7 +8910,6 @@ fn lower_block(
                 _ => unreachable!(),
             };
             lower_cap_call(
-                module,
                 b,
                 lower,
                 temen_ir::CAP_SELF_TYPE_ID,
@@ -8706,7 +8932,6 @@ fn lower_block(
             };
             let call_args = [*handle];
             lower_cap_call(
-                module,
                 b,
                 lower,
                 temen_ir::CAP_IMPORT_ATTACH_TYPE_ID,
@@ -8722,16 +8947,16 @@ fn lower_block(
         // a distinct IR op — the frontend emits its `call.cap CAP_SELF op N` form, lowered by the
         // generic `Inst::CapCall` arm above (a `lower_cap_call` thunk the host services directly).
         // §12 fibers: lower `cont.*` to calls to the host fiber thunks ([`HostFn`]), threading
-        // `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk that sets the trap cell
+        // `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk that sets the trap cell
         // (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, sp } = inst {
-            // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64, fuel_addr:i64) -> i32
+            // fiber_new(mem_base, fn_table_base, vmctx, funcref:i32, sp:i64, fuel_addr:i64) -> i32
             // handle. The running vCPU's fiber runtime is read from a thread-local, so threads +
             // fibers compose. `fuel_addr` (`0` ⇒ un-armed) lets the fiber's first entry refund the
             // prologue charge its starting `cont.resume` already paid (#1642).
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
-            let trap_out = b.use_var(lower.vmctx_var);
+            let vmctx = b.use_var(lower.vmctx_var);
             let funcref = get(&vals, *func)?;
             let spv = get(&vals, *sp)?;
             let fuel = if lower.fuel {
@@ -8740,10 +8965,10 @@ fn lower_block(
                 b.ins().iconst(I64, 0)
             };
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::FiberNew,
-                &[mem_base, fnt, trap_out, funcref, spv, fuel],
+                &[mem_base, fnt, vmctx, funcref, spv, fuel],
             )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
@@ -8768,23 +8993,23 @@ fn lower_block(
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let kh = get(&vals, *k)?;
             let av = get(&vals, *arg)?;
-            let trap_out = b.use_var(lower.vmctx_var);
+            let vmctx = b.use_var(lower.vmctx_var);
             let call = if blocking {
-                // fiber_resume_block(sched, handle, arg, status_out, trap_out) -> value:i64.
+                // fiber_resume_block(sched, handle, arg, status_out, vmctx) -> value:i64.
                 let sched = vmctx_load(b, lower, vmctx::SCHED);
                 call_host(
-                    module,
+                    lower.callees,
                     b,
                     HostFn::FiberResumeBlock,
-                    &[sched, kh, av, status_ptr, trap_out],
+                    &[sched, kh, av, status_ptr, vmctx],
                 )?
             } else {
-                // fiber_resume(handle, arg, status_out, trap_out) -> value:i64.
+                // fiber_resume(handle, arg, status_out, vmctx) -> value:i64.
                 call_host(
-                    module,
+                    lower.callees,
                     b,
                     HostFn::FiberResume,
-                    &[kh, av, status_ptr, trap_out],
+                    &[kh, av, status_ptr, vmctx],
                 )?
             };
             emit_trap_propagate(b, lower);
@@ -8796,10 +9021,10 @@ fn lower_block(
             continue;
         }
         if let Inst::Suspend { value } = inst {
-            // fiber_suspend(value:i64, trap_out:i64) -> next-resume arg:i64
+            // fiber_suspend(value:i64, vmctx:i64) -> next-resume arg:i64
             let v = get(&vals, *value)?;
-            let trap_out = b.use_var(lower.vmctx_var);
-            let call = call_host(module, b, HostFn::FiberSuspend, &[v, trap_out])?;
+            let vmctx = b.use_var(lower.vmctx_var);
+            let call = call_host(lower.callees, b, HostFn::FiberSuspend, &[v, vmctx])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8820,10 +9045,10 @@ fn lower_block(
             let laundered = launder_across_setjmp(b, blk, inst_idx, &vals);
             // slot = rt_setjmp_slot(rt_addr, buf) -> *mut jmp_buf
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(module, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
+            let c1 = call_host(lower.callees, b, HostFn::SetjmpSlot, &[rt_addr, bufv])?;
             let slot = b.inst_results(c1)[0];
             // r = _setjmp(slot) -> i32 — emitted inline in this JIT frame.
-            let c2 = call_host(module, b, HostFn::Setjmp, &[slot])?;
+            let c2 = call_host(lower.callees, b, HostFn::Setjmp, &[slot])?;
             let r = b.inst_results(c2)[0];
             // #2537: reload the saved values and rewrite the value map to the reloaded copies, so every
             // later use in this block — and every successor's forwarded use (which reads this block's
@@ -8846,21 +9071,26 @@ fn lower_block(
         if let Inst::LongJmp { buf, val } = inst {
             let bufv = get(&vals, *buf)?;
             let valv = get(&vals, *val)?; // i32 long-jump value (0 → 1 is applied by libc `_longjmp`)
-            let trap_out = b.use_var(lower.vmctx_var);
-            // slot = rt_setjmp_lookup(rt_addr, buf, trap_out) -> *mut jmp_buf (null + trap on miss)
+            let vmctx = b.use_var(lower.vmctx_var);
+            // slot = rt_setjmp_lookup(rt_addr, buf, vmctx) -> *mut jmp_buf (null + trap on miss)
             let rt_addr = vmctx_load(b, lower, vmctx::SETJMP);
-            let c1 = call_host(module, b, HostFn::SetjmpLookup, &[rt_addr, bufv, trap_out])?;
+            let c1 = call_host(
+                lower.callees,
+                b,
+                HostFn::SetjmpLookup,
+                &[rt_addr, bufv, vmctx],
+            )?;
             let slot = b.inst_results(c1)[0];
             emit_trap_propagate(b, lower); // bail on a miss (forged/stale token) before `_longjmp`
                                            // _longjmp(slot, val) — inline, noreturn.
-            call_host(module, b, HostFn::Longjmp, &[slot, valv])?;
+            call_host(lower.callees, b, HostFn::Longjmp, &[slot, valv])?;
             continue;
         }
         // §12 per-vCPU TLS register: thunks over a per-OS-thread word (no window/trap context —
         // a pure thread-local access that cannot fault). `get` reads the *current* vCPU's word, so it
         // is correct after a fiber migrates here.
         if let Inst::VcpuTlsGet = inst {
-            let call = call_host(module, b, HostFn::VcpuTlsGet, &[])?;
+            let call = call_host(lower.callees, b, HostFn::VcpuTlsGet, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -8868,13 +9098,13 @@ fn lower_block(
         // per-OS-thread register (a thunk, like `vcpu.tls.get`; cannot fault, no window/trap
         // context). The durable transform emits this to address this context's own shadow-SP word.
         if let Inst::DurableShadowBase = inst {
-            let call = call_host(module, b, HostFn::DurableShadowBase, &[])?;
+            let call = call_host(lower.callees, b, HostFn::DurableShadowBase, &[])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::VcpuTlsSet { val } = inst {
             let v = get(&vals, *val)?;
-            call_host(module, b, HostFn::VcpuTlsSet, &[v])?;
+            call_host(lower.callees, b, HostFn::VcpuTlsSet, &[v])?;
             continue;
         }
         if let Inst::GcRoots {
@@ -8885,7 +9115,7 @@ fn lower_block(
             cap,
         } = inst
         {
-            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, trap_out)
+            // gc_roots(heap_lo, heap_hi, payload_mask, buf, cap, mem_base, mask, mapped, vmctx)
             // -> i64 count. The thunk walks the live fiber stacks (runtime via the thread-local),
             // masks each word with `payload_mask` (§GC tagged pointers; distinct from the
             // window-confinement `mask`), filters the masked value to `[heap_lo, heap_hi)`, and
@@ -8905,7 +9135,7 @@ fn lower_block(
             let maskv = b.ins().iconst(I64, lower.mask as i64);
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mappedv = b.ins().iconst(I64, win_reserved as i64);
-            let trap_out = b.use_var(lower.vmctx_var);
+            let vmctx = b.use_var(lower.vmctx_var);
             // #2164 — a demand-paged child's thunk checks the access table before it writes: the
             // declared window's page count bounds it.
             let pages = b
@@ -8929,7 +9159,7 @@ fn lower_block(
                 mem_base,
                 maskv,
                 mappedv,
-                trap_out,
+                vmctx,
                 pages,
             ]
             .into_iter()
@@ -8938,20 +9168,20 @@ fn lower_block(
                 b.ins().stack_store(v, slot, (i * 8) as i32);
             }
             let args_ptr = b.ins().stack_addr(I64, slot, 0);
-            let call = call_host(module, b, HostFn::GcRoots, &[args_ptr])?;
+            let call = call_host(lower.callees, b, HostFn::GcRoots, &[args_ptr])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         // §12 threads: lower `thread.spawn`/`thread.join` to calls to the host scheduler thunks
-        // ([`HostFn`]), threading `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk
+        // ([`HostFn`]), threading `mem_base`/`fn_table_base`/`vmctx` like `call.cap`. A thunk
         // that sets the trap cell (forged handle, thread-bomb) propagates here.
         if let Inst::ThreadSpawn { func, sp, arg } = inst {
-            // thread_spawn(sched, mem_base, fn_table_base, trap_out, func_idx:i32, sp:i64, arg:i64) -> i32
+            // thread_spawn(sched, mem_base, fn_table_base, vmctx, func_idx:i32, sp:i64, arg:i64) -> i32
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
-            let trap_out = b.use_var(lower.vmctx_var);
+            let vmctx = b.use_var(lower.vmctx_var);
             // The spawn entry is dispatched through the shared `fn_table` (`os_thread_rt` masks it
             // into the table like any `call.dyn`). A submitted unit's own functions live in
             // auto-installed padding slots, not at their module-relative indices — so remap `func`
@@ -8966,21 +9196,21 @@ fn lower_block(
             let spv = get(&vals, *sp)?;
             let av = get(&vals, *arg)?;
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::ThreadSpawn,
-                &[sched, mem_base, fnt, trap_out, func_idx, spv, av],
+                &[sched, mem_base, fnt, vmctx, func_idx, spv, av],
             )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
         }
         if let Inst::ThreadJoin { handle } = inst {
-            // thread_join(sched, handle:i32, trap_out:i64) -> result:i64
+            // thread_join(sched, handle:i32, vmctx:i64) -> result:i64
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let h = get(&vals, *handle)?;
-            let trap_out = b.use_var(lower.vmctx_var);
-            let call = call_host(module, b, HostFn::ThreadJoin, &[sched, h, trap_out])?;
+            let vmctx = b.use_var(lower.vmctx_var);
+            let call = call_host(lower.callees, b, HostFn::ThreadJoin, &[sched, h, vmctx])?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -8992,8 +9222,8 @@ fn lower_block(
             timeout,
         } = inst
         {
-            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, trap_out:i64) ->
-            // status:i32. `trap_out` carries the §12.8 thaw fail-closed (a re-issued wait that would
+            // thread_wait(sched, phys:i64, expected:i64, width:i32, timeout:i64, vmctx:i64) ->
+            // status:i32. `vmctx` carries the §12.8 thaw fail-closed (a re-issued wait that would
             // park on the single worker traps `ThreadFault`); on a fresh run it is never written.
             let w = atomic_width(*ty);
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, w);
@@ -9010,12 +9240,12 @@ fn lower_block(
             };
             let width = b.ins().iconst(I32, w as i64);
             let to = get(&vals, *timeout)?;
-            let trap_out = b.use_var(lower.vmctx_var);
+            let vmctx = b.use_var(lower.vmctx_var);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::ThreadWait,
-                &[sched, phys, exp, width, to, trap_out],
+                &[sched, phys, exp, width, to, vmctx],
             )?;
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
@@ -9027,7 +9257,7 @@ fn lower_block(
             let phys = mask_addr(b, lower, get(&vals, *addr)?, 0, false, 4);
             let sched = vmctx_load(b, lower, vmctx::SCHED);
             let cnt = get(&vals, *count)?;
-            let call = call_host(module, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
+            let call = call_host(lower.callees, b, HostFn::ThreadNotify, &[sched, phys, cnt])?;
             vals.push(b.inst_results(call)[0]);
             continue;
         }
@@ -9742,9 +9972,9 @@ fn lower_block(
                 probe_span(b, dphys, n);
                 probe_span(b, sphys, n);
                 if matches!(inst, Inst::MemCopy { .. }) {
-                    b.call_memcpy(lower.frontend_config, dphys, sphys, n);
+                    b.call_memcpy(lower.callees.frontend, dphys, sphys, n);
                 } else {
-                    b.call_memmove(lower.frontend_config, dphys, sphys, n);
+                    b.call_memmove(lower.callees.frontend, dphys, sphys, n);
                 }
                 continue;
             }
@@ -9755,7 +9985,7 @@ fn lower_block(
                 probe_span(b, dphys, n);
                 // `call_memset` uextends the fill byte to i32, so hand it the low byte (i8).
                 let v8 = b.ins().ireduce(I8, get(&vals, *val)?);
-                b.call_memset(lower.frontend_config, dphys, v8, n);
+                b.call_memset(lower.callees.frontend, dphys, v8, n);
                 continue;
             }
             // §12 atomics. Confine like a normal access, then a natural-alignment guard (a misaligned
@@ -9907,10 +10137,10 @@ fn lower_block(
             if *target as usize <= block_idx {
                 emit_domain_poll(b, lower);
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
-                                                  // target block index is at-or-before this block's, matching the interpreters' `backedge!`
-                                                  // (`$t <= pc`). Back-edge-ness is fully static here (one target).
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
+                                          // target block index is at-or-before this block's, matching the interpreters' `backedge!`
+                                          // (`$t <= pc`). Back-edge-ness is fully static here (one target).
             if *target as usize <= block_idx {
                 emit_fuel_check(b, lower);
             }
@@ -9938,12 +10168,12 @@ fn lower_block(
             if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
-                                                  // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
-                                                  // static per edge, but which edge is taken is a runtime value — so an edge that is a
-                                                  // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
-                                                  // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
+                                          // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
+                                          // static per edge, but which edge is taken is a runtime value — so an edge that is a
+                                          // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
+                                          // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
             let then_be = lower.fuel && *then_blk as usize <= block_idx;
             let else_be = lower.fuel && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
@@ -9988,13 +10218,13 @@ fn lower_block(
             {
                 emit_domain_poll(b, lower); // (see `Br`)
             }
-            emit_signal_check(module, b, lower)?; // #932 async signal delivery (no-op when disarmed)
-                                                  // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
-                                                  // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
-                                                  // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
-                                                  // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
-                                                  // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
-                                                  // `fuel_addr != 0` so an un-armed compile builds the identical table.
+            emit_signal_check(b, lower)?; // #932 async signal delivery (no-op when disarmed)
+                                          // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
+                                          // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
+                                          // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
+                                          // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
+                                          // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
+                                          // `fuel_addr != 0` so an un-armed compile builds the identical table.
             let is_be = |t: u32| lower.fuel && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
@@ -10078,7 +10308,7 @@ fn lower_block(
         Terminator::ReturnCall { func, args } => {
             // Tail call (§3b): replace this frame with the callee, threading the context.
             let callee_id = *lower.ids.get(*func as usize).ok_or(JitError::Malformed)?;
-            let callee = module.declare_func_in_func(callee_id, b.func);
+            let callee = lower.callees.import(b.func, callee_id)?;
             let mut cargs = ctx_args(b, lower);
             // The tail callee shares this function's result type (verifier-enforced), so its sret-ness
             // matches ours: when we return via sret, forward our own return-area pointer.
@@ -10094,7 +10324,7 @@ fn lower_block(
             // Indirect tail call: table dispatch (§3c) then a guaranteed tail call.
             let ty = sig_of(lower.type_section, *ty); // #922: resolve interned call type index
             let code = indirect_dispatch(b, lower, get(&vals, *idx)?, ty);
-            let sig = b.import_signature(sig_from(module, &ty.params, &ty.results));
+            let sig = b.import_signature(sig_from(&ty.params, &ty.results));
             let mut cargs = ctx_args(b, lower);
             // `ty.results` equals this function's results (tail-call contract), so sret-ness matches:
             // forward our return-area pointer when we return via sret.
@@ -10115,7 +10345,7 @@ fn lower_block(
 }
 
 /// The leading context arguments threaded into every guest call: `(mem_base,
-/// fn_table_base, trap_out, stack_limit)`.
+/// fn_table_base, vmctx, stack_limit)`.
 /// Load one of the instance's per-run addresses from its [`VmCtx`] (a field offset from
 /// [`vmctx`](crate::vmctx)). The fields are written before an entry and never during it, so the load is
 /// `readonly` + `can_move`: Cranelift may hoist it out of a loop or share it between uses — the
@@ -10212,8 +10442,11 @@ fn emit_trap_set(b: &mut FunctionBuilder, lower: &Lower, kind: TrapKind) {
         b.ins().call(capture, &[fp]);
     }
     let cell = b.use_var(lower.vmctx_var);
+    let none = b.ins().iconst(I64, 0);
     let code = b.ins().iconst(I64, kind as u32 as i64); // full i64 cell (high bits 0)
-    b.ins().store(MemFlags::trusted(), code, cell, 0);
+                                                        // #2499 — raise, never store: the cell holds the domain's end, and an end a sibling vCPU raised
+                                                        // first stands ([`VmCtx::raise`]).
+    b.ins().atomic_cas(atomic_flags(), cell, none, code);
 }
 
 /// Emit the function `return` on a trap / early-exit path: **void** for an sret function (its results
@@ -10259,10 +10492,9 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
 }
 
 /// Emit the domain-teardown poll ([`Lower::domain_poll`]) — at loop back-edges and at the entry of
-/// a function that tail-calls: if this vCPU's trap cell is non-zero —
-/// set by a sibling's trap, the root's completion, or a parent tearing down a §14 child — or its stop
-/// word is (a parent's `kill` or teardown, #2088), return straight up the stack, as a call's
-/// trap-propagation guard does. The cell is only read, so the
+/// a function that tail-calls: if this vCPU's domain has ended — a sibling's trap or `exit`, the
+/// root's completion, or a parent's `kill` or teardown, all raised on the trap cell — return
+/// straight up the stack, as a call's trap-propagation guard does. The cell is only read, so the
 /// value that ended the domain is the one reported. The load is atomic for the reason
 /// [`emit_epoch_check`]'s is: another thread writes the cell, and a plain load could be hoisted out
 /// of the loop it bounds. A no-op when `domain_poll` is off.
@@ -10272,21 +10504,13 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
     if !lower.domain_poll {
         return;
     }
-    let trap_out = b.use_var(lower.vmctx_var);
-    let tc = b.ins().atomic_load(I64, atomic_flags(), trap_out);
-    // #2088 — and the stop word (`VmCtx::stop`), which a `call.cap` never resets as it does the trap
-    // cell, so a kill that landed during one is still seen here.
-    let stop_word = b.ins().iadd_imm(trap_out, vmctx::STOP as i64);
-    let st = b.ins().atomic_load(I64, atomic_flags(), stop_word);
-    let any = b.ins().bor(tc, st);
+    let cell = b.use_var(lower.vmctx_var);
+    let ended = b.ins().atomic_load(I64, atomic_flags(), cell);
     let stop = b.create_block();
     let cont = b.create_block();
     b.set_cold_block(stop); // taken once per vCPU lifetime: keep it off the loop's fall-through path
-    b.ins().brif(any, stop, &[], cont, &[]);
+    b.ins().brif(ended, stop, &[], cont, &[]);
     b.switch_to_block(stop);
-    // A trap already recorded wins; else the stop becomes the trap the return reports.
-    let code = b.ins().select(tc, tc, st);
-    b.ins().atomic_store(atomic_flags(), code, trap_out);
     emit_trap_return(b, lower);
     b.switch_to_block(cont);
     // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.
@@ -10310,11 +10534,7 @@ fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
 /// caller emits the real terminator / next check there. The armed flag is loaded **atomically** (as
 /// [`emit_epoch_check`] does) so Cranelift's alias analysis cannot hoist the poll out of a loop — the
 /// host sets it from another thread and the guest never stores it.
-fn emit_signal_check(
-    module: &mut JITModule,
-    b: &mut FunctionBuilder,
-    lower: &Lower,
-) -> Result<(), JitError> {
+fn emit_signal_check(b: &mut FunctionBuilder, lower: &Lower) -> Result<(), JitError> {
     if !lower.signals {
         return Ok(()); // no signal delivery armed for this compile — emit nothing
     }
@@ -10334,7 +10554,7 @@ fn emit_signal_check(
     let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
     let out = b.ins().stack_addr(I64, out_ss, 0);
     let ctx = vmctx_load(b, lower, vmctx::SIG_CTX);
-    let got = call_host(module, b, HostFn::SigTake, &[ctx, out])?;
+    let got = call_host(lower.callees, b, HostFn::SigTake, &[ctx, out])?;
     let got = b.inst_results(got)[0];
     let deliver = b.create_block();
     b.ins().brif(got, deliver, &[], cont, &[]);
@@ -10354,7 +10574,7 @@ fn emit_signal_check(
         results: vec![],
     };
     let code = indirect_dispatch(b, lower, fref, &handler_ty);
-    let hsig = b.import_signature(sig_from(module, &handler_ty.params, &handler_ty.results));
+    let hsig = b.import_signature(sig_from(&handler_ty.params, &handler_ty.results));
     let mut cargs = ctx_args(b, lower);
     cargs.push(sp);
     cargs.push(signum);
@@ -10364,7 +10584,7 @@ fn emit_signal_check(
     emit_trap_propagate(b, lower);
     // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
     let ctx2 = vmctx_load(b, lower, vmctx::SIG_CTX);
-    call_host(module, b, HostFn::SigReturn, &[ctx2])?;
+    call_host(lower.callees, b, HostFn::SigReturn, &[ctx2])?;
     b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
     b.switch_to_block(cont);
     // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
@@ -10615,11 +10835,11 @@ fn indirect_dispatch(b: &mut FunctionBuilder, lower: &Lower, idx: Value, ty: &Fu
 /// `return` of zero-valued results (the trap kind / exit code already sits in the cell, which the
 /// entry trampoline reads to decide `Trapped`/`Exited`). Used after **every** `call.cap` *and*
 /// every `call`/`call.dyn`, so a trap raised deep in a callee unwinds the whole guest stack
-/// immediately — before any later op can observe bogus zero results or overwrite the cell (a
-/// *successful* `call.cap` resets it to 0, which would otherwise mask a callee's trap).
+/// immediately — before any later op can observe bogus zero results. A sibling vCPU's end stops
+/// this one here too: the cell is the domain's, and nothing clears it during a run (#2499).
 fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
-    let trap_out = b.use_var(lower.vmctx_var);
-    let tc = b.ins().load(I64, MemFlags::trusted(), trap_out, 0);
+    let vmctx = b.use_var(lower.vmctx_var);
+    let tc = b.ins().load(I64, MemFlags::trusted(), vmctx, 0);
     let trapped = b.ins().icmp_imm(IntCC::NotEqual, tc, 0);
     let trapret = b.create_block();
     let cont = b.create_block();
@@ -10631,44 +10851,17 @@ fn emit_trap_propagate(b: &mut FunctionBuilder, lower: &Lower) {
     b.seal_block(cont);
 }
 
-/// Resolve the §9/D45 fast-path target for a `call.cap`, if one applies: there is a
-/// [`FastCapResolver`] (top-level compile), the op has **at most one result** (the register ABI
-/// returns a single i64), and the resolver claims this `(type_id, op)` (returns a non-null
-/// specialized fn). Returns the symbol the call names the target by ([`fast_cap_symbol`]).
-/// Resolution is a **compile-time** call into the embedder's resolver, which the code's link makes
-/// again to bind the symbol.
-fn fast_cap_target(lower: &Lower, type_id: u32, op: u32, sig: &FuncType) -> Option<String> {
-    let resolver = lower.fast_resolver?;
-    if sig.results.len() > 1 {
-        return None; // the fast ABI returns a single register; multi-result falls back to the thunk
-    }
-    // SAFETY: `resolver` honours the `FastCapResolver` contract (caller guarantee); it's a pure
-    // `(type_id, op, n_args, n_res) -> *const fn` lookup with no side effects, safe to call during
-    // codegen. The arity is passed so the resolver only claims an op when its specialized fn's arity
-    // matches the IR `call.cap`'s — else it returns null and the generic slot-based path is used.
-    let target = unsafe {
-        resolver(
-            type_id,
-            op,
-            sig.params.len() as u32,
-            sig.results.len() as u32,
-        )
-    };
-    (!target.is_null()).then(|| fast_cap_symbol(type_id, op, sig.params.len(), sig.results.len()))
-}
-
 /// Lower a `call.cap` via the **devirtualized fast path** (§9 / D45): a direct register-to-register
-/// call to the specialized host fn the symbol `target` names, passing
-/// `ctx`/`mem_base`/`mem_size`/`handle`/`trap_out` then each argument **in a register** (widened to
+/// call to the specialized host fn `callee` ([`Callees::fast_cap`]), passing
+/// `ctx`/`mem_base`/`mem_size`/`handle`/`vmctx` then each argument **in a register** (widened to
 /// its i64 slot), and reading the single result back from a register — no stack-slot marshalling,
 /// no `n_args`/`n_res`/`type_id`/`op` dispatch. The trap cell is checked exactly as in
 /// [`lower_cap_call`].
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call_fast(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
-    target: &str,
+    callee: FuncRef,
     sig: &FuncType,
     handle: u32,
     args: &[u32],
@@ -10684,15 +10877,13 @@ fn lower_cap_call_fast(
     // `MprotectWindow` does, not this bound alone.
     let mem_size = b.ins().iconst(I64, lower.mapped as i64);
     let h = get(vals, handle)?;
-    let trap_out = b.use_var(lower.vmctx_var);
+    let vmctx = b.use_var(lower.vmctx_var);
 
-    let tsig = fast_cap_signature(module.isa().default_call_conv(), args.len(), n_res);
-    let mut call_args = vec![ctx, mem_base, mem_size, h, trap_out];
+    let mut call_args = vec![ctx, mem_base, mem_size, h, vmctx];
     for a in args {
         let v = get(vals, *a)?;
         call_args.push(encode_slot(b, v)); // each arg widened to its i64 register slot
     }
-    let callee = import_symbol(module, b.func, target, &tsig)?;
     let call = b.ins().call(callee, &call_args);
 
     // If the specialized fn set the trap cell, propagate (the cell already holds the kind / exit code).
@@ -10711,7 +10902,6 @@ fn lower_cap_call_fast(
 /// (CapFault / Exit) propagates like any other (return early; the cell is already set).
 #[allow(clippy::too_many_arguments)]
 fn lower_cap_call(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
     type_id: u32,
@@ -10783,7 +10973,7 @@ fn lower_cap_call(
     let opc = b.ins().iconst(I32, op as i64);
     let na = b.ins().iconst(I64, n_args as i64);
     let nr = b.ins().iconst(I64, n_res as i64);
-    let trap_out = b.use_var(lower.vmctx_var);
+    let vmctx = b.use_var(lower.vmctx_var);
 
     let call_args = [
         ctx,
@@ -10797,9 +10987,9 @@ fn lower_cap_call(
         na,
         res_ptr,
         nr,
-        trap_out,
+        vmctx,
     ];
-    call_host(module, b, HostFn::CapThunk, &call_args)?;
+    call_host(lower.callees, b, HostFn::CapThunk, &call_args)?;
 
     // If the thunk set the trap cell, propagate (return early; the cell already holds
     // the kind / exit code).
@@ -10819,11 +11009,10 @@ fn lower_cap_call(
 /// reached when this (parent) compile has a live `Nursery` (`lower.nesting`). Each served op
 /// (`temen_ir::served_contract`: 17 `instantiate_rec`, 1 `join`, 9/10/12 supervision, 14
 /// `child_offer`, 19 `grant`) calls its thunk, threading `mem_base` (the live parent window) +
-/// `trap_out`; a thunk that sets the trap cell (forged handle, refused spawn, child trap) propagates
+/// `vmctx`; a thunk that sets the trap cell (forged handle, refused spawn, child trap) propagates
 /// here like any `call.cap`.
 #[allow(clippy::too_many_arguments)] // mirrors the CapCall fields + the shared lowering context
 fn lower_instantiator(
-    module: &mut JITModule,
     b: &mut FunctionBuilder,
     lower: &Lower,
     op: u32,
@@ -10840,11 +11029,11 @@ fn lower_instantiator(
     // temen#2168: the instance's own nursery, from its vmctx, so one compile serves every instance.
     let nursery = vmctx_load(b, lower, vmctx::NURSERY);
     let mem_base = b.use_var(lower.mem_var);
-    let trap_out = b.use_var(lower.vmctx_var);
+    let vmctx = b.use_var(lower.vmctx_var);
     match op {
         1 => {
             // join(nursery, mem_base, instantiator:i32, child_handle:i32, status_out:i64,
-            // trap_out:i64) -> value:i64, the status through `status_out` as `cont.resume`'s is
+            // vmctx:i64) -> value:i64, the status through `status_out` as `cont.resume`'s is
             // (#2066). The nursery owns the child table for this run; the thunk still resolves the
             // call.cap's `Instantiator` first, as the oracle does for every op (#1729).
             let h = slot_i32(b, get(vals, handle)?);
@@ -10853,10 +11042,10 @@ fn lower_instantiator(
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
             let status_ptr = b.ins().stack_addr(I64, ss, 0);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::InstJoin,
-                &[nursery, mem_base, h, child, status_ptr, trap_out],
+                &[nursery, mem_base, h, child, status_ptr, vmctx],
             )?;
             emit_trap_propagate(b, lower);
             let value = b.inst_results(call)[0];
@@ -10866,7 +11055,7 @@ fn lower_instantiator(
         }
         9 | 10 | 12 => {
             // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,
-            // trap_out:i64) -> status:i32 — resolved and dispatched as `join` is.
+            // vmctx:i64) -> status:i32 — resolved and dispatched as `join` is.
             let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let thunk = match op {
@@ -10874,14 +11063,19 @@ fn lower_instantiator(
                 10 => HostFn::InstDetach,
                 _ => HostFn::InstKill,
             };
-            let call = call_host(module, b, thunk, &[nursery, mem_base, h, child, trap_out])?;
+            let call = call_host(
+                lower.callees,
+                b,
+                thunk,
+                &[nursery, mem_base, h, child, vmctx],
+            )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
         17 => {
             // §3c instantiate_rec(nursery, mem_base, mem_size:i64, handle:i32, record_ptr:i64,
-            //   trap_out:i64) -> handle:i32 — the config-record spawn: the thunk parses the
+            //   vmctx:i64) -> handle:i32 — the config-record spawn: the thunk parses the
             //   record from the window (`mem_size` bounds the read) and spawns it. Pager records CapFault (sound: modules with impl exports fold to the
             //   oracle).
             //
@@ -10896,10 +11090,10 @@ fn lower_instantiator(
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 HostFn::InstSpawn,
-                &[nursery, mem_base, mem_size, h, record_ptr, trap_out],
+                &[nursery, mem_base, mem_size, h, record_ptr, vmctx],
             )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
@@ -10907,7 +11101,7 @@ fn lower_instantiator(
         }
         14 | 19 => {
             // CALLS.md 5c.0 child_offer(nursery, mem_base, instantiator:i32, child:i32, export:i64,
-            // trap_out) -> handle:i32. Mint a live-callee offer over a granted child's
+            // vmctx) -> handle:i32. Mint a live-callee offer over a granted child's
             // nursery-retained shared powerbox; every miss is the probeable -EINVAL (the interp op-14
             // arm, errno-for-errno). A forged `Instantiator` is the `CapFault` every op gives (#1729);
             // `mem_base` is only for that resolve — the mint reads no guest memory. #2220's `grant`
@@ -10920,10 +11114,10 @@ fn lower_instantiator(
                 _ => HostFn::ChildGrant,
             };
             let call = call_host(
-                module,
+                lower.callees,
                 b,
                 thunk,
-                &[nursery, mem_base, h, child, arg, trap_out],
+                &[nursery, mem_base, h, child, arg, vmctx],
             )?;
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);

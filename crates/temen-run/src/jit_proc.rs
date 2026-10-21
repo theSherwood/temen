@@ -753,13 +753,12 @@ impl ProcCtx {
     }
 }
 
-/// The process a thunk call's `trap_out` (the running instance's vmctx) belongs to, if any.
+/// The process a thunk call's `vm` (the running instance's vmctx) belongs to, if any.
 ///
 /// # Safety
-/// `trap_out` is the `trap_out` of a thunk call made by compiled code — which every call over a host
+/// `vm` is the `vm` of a thunk call made by compiled code — which every call over a host
 /// armed for caller requests is (only a process run arms one, [`run_process`]).
-unsafe fn proc_of<'a>(trap_out: *mut i64) -> Option<&'a ProcCtx> {
-    let vm = VmCtx::of_trap_out(trap_out);
+unsafe fn proc_of<'a>(vm: &VmCtx) -> Option<&'a ProcCtx> {
     (!vm.embedder.is_null()).then(|| &*(vm.embedder as *const ProcCtx))
 }
 
@@ -1194,7 +1193,7 @@ impl SendPtr {
 /// `mem_base` its base, and `(mapped, reserved)` its backed prefix and reservation.
 ///
 /// # Safety
-/// The [`crate::cap_thunk`] contract for `results`/`trap_out`, over a host armed for caller
+/// The [`crate::cap_thunk`] contract for `results`/`vm`, over a host armed for caller
 /// requests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn serve_request(
@@ -1207,7 +1206,7 @@ pub(crate) unsafe fn serve_request(
     (mapped, reserved): (u64, u64),
     results: *mut i64,
     n_results: u64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
     bell: u64,
 ) -> Option<HostParkReq> {
     let answer = |v: i64| {
@@ -1215,13 +1214,13 @@ pub(crate) unsafe fn serve_request(
             *results = v;
         }
     };
-    let proc = proc_of(trap_out)?;
+    let proc = proc_of(vm)?;
     if parks.wake_readers.is_some() || parks.wake_writers.is_some() {
         proc.tree.ring();
     }
     let root = !temen_jit::fiber_active();
     if root && (parks.read_park.is_some() || parks.write_park.is_some()) {
-        return tree_park(host, bell, trap_out, answer);
+        return tree_park(host, bell, vm, answer);
     }
     match parks.request.take() {
         Some(ParkEvent::ExecSelf { cmd }) => {
@@ -1243,7 +1242,7 @@ pub(crate) unsafe fn serve_request(
                         proc.tree.ring();
                     }
                     host.stash_exec_image(img);
-                    *trap_out = temen_jit::HOST_UNWIND_CODE as i64;
+                    vm.raise(temen_jit::HOST_UNWIND_CODE as i64);
                 }
                 Err(e) => answer(e),
             }
@@ -1255,7 +1254,7 @@ pub(crate) unsafe fn serve_request(
             } else if !proc.fork().is_some_and(|plan| {
                 plan.is_site(dispatch)
                     && !temen_jit::reentered()
-                    && !in_signal_handler(trap_out)
+                    && !in_signal_handler(vm)
                     && window.is_some_and(|w| begin_fork_unwind(w, plan.arena))
             }) {
                 answer(ENOSYS);
@@ -1271,11 +1270,9 @@ pub(crate) unsafe fn serve_request(
             None
         }
         Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny) if root => {
-            tree_park(host, bell, trap_out, answer)
+            tree_park(host, bell, vm, answer)
         }
-        _ => crate::host_park(
-            host, &parks, stdin_park, mem_base, results, n_results, trap_out,
-        ),
+        _ => crate::host_park(host, &parks, stdin_park, mem_base, results, n_results, vm),
     }
 }
 
@@ -1290,10 +1287,10 @@ pub(crate) unsafe fn serve_request(
 unsafe fn tree_park(
     host: &Host,
     bell: u64,
-    trap_out: *mut i64,
+    vm: &VmCtx,
     answer: impl Fn(i64),
 ) -> Option<HostParkReq> {
-    if delivers_signals(trap_out) && host.wait_interrupted() {
+    if delivers_signals(vm) && host.wait_interrupted() {
         answer(EINTR);
         return None;
     }
@@ -1302,22 +1299,19 @@ unsafe fn tree_park(
 
 /// Wait out a [`tree_park`]: wait for the tree's bell to ring past `bell` and return `true`, so the
 /// op runs again (invariant 7: the rewound park) and either proceeds or parks anew. A kill-path store
-/// (a deadline, the tree's teardown) ends the wait with the kill trap; a trap a sibling vCPU stored
-/// (its process ended) ends it with that trap. Takes no lock the process's other vCPUs need.
+/// (a deadline, the tree's teardown) ends the wait with the kill trap; any end of the process's
+/// domain — a sibling vCPU's trap or `exit`, its teardown — ends it with that end (#2499). Takes no
+/// lock the process's other vCPUs need.
 ///
 /// # Safety
-/// `trap_out` is the live call's trap cell, of a JIT process's thunk call.
-pub(crate) unsafe fn wait_for_bell(trap_out: *mut i64, bell: u64) -> bool {
-    let Some(proc) = proc_of(trap_out) else {
+/// `vm` is the live context of a JIT process's thunk call.
+pub(crate) unsafe fn wait_for_bell(vm: &VmCtx, bell: u64) -> bool {
+    let Some(proc) = proc_of(vm) else {
         return false;
     };
-    let trap = &*(trap_out as *const std::sync::atomic::AtomicI64);
-    proc.tree.wait(bell, || trap.load(Ordering::Relaxed) != 0);
-    let epoch = VmCtx::of_trap_out(trap_out).epoch as usize;
-    if blocked_wait_interrupted(epoch, trap_out) {
-        if *trap_out == 0 {
-            *trap_out = TrapKind::OutOfFuel as i64;
-        }
+    proc.tree.wait(bell, || vm.ended().is_some());
+    if blocked_wait_interrupted(vm.epoch as usize, vm) {
+        vm.raise(TrapKind::OutOfFuel as i64);
         return false;
     }
     true
@@ -1344,16 +1338,15 @@ fn begin_fork_unwind(window: &mut dyn GuestMem, arena: ShadowArena) -> bool {
 }
 
 /// Whether the run delivers #932 async signals (its compile armed the delivery check).
-unsafe fn delivers_signals(trap_out: *mut i64) -> bool {
-    !VmCtx::of_trap_out(trap_out).sig_armed.is_null()
+unsafe fn delivers_signals(vm: &VmCtx) -> bool {
+    !vm.sig_armed.is_null()
 }
 
 /// Whether the call is inside a #932 injected signal handler — a frame the JIT's safepoint pushed,
 /// which no durable unwind can save. (A process run arms no signal delivery today, so this is the
 /// gate's statement of its precondition rather than a live case.)
-unsafe fn in_signal_handler(trap_out: *mut i64) -> bool {
-    let vm = VmCtx::of_trap_out(trap_out);
-    delivers_signals(trap_out) && (*(vm.sig_ctx as *const JitSigDelivery)).depth.get() != 0
+unsafe fn in_signal_handler(vm: &VmCtx) -> bool {
+    delivers_signals(vm) && (*(vm.sig_ctx as *const JitSigDelivery)).depth.get() != 0
 }
 
 /// The tree's bell count for a thunk call of a JIT process, read before its op (see
@@ -1361,8 +1354,8 @@ unsafe fn in_signal_handler(trap_out: *mut i64) -> bool {
 ///
 /// # Safety
 /// As [`serve_request`].
-pub(crate) unsafe fn bell_of(trap_out: *mut i64) -> u64 {
-    proc_of(trap_out).map_or(0, |p| p.tree.rings.load(Ordering::SeqCst))
+pub(crate) unsafe fn bell_of(vm: &VmCtx) -> u64 {
+    proc_of(vm).map_or(0, |p| p.tree.rings.load(Ordering::SeqCst))
 }
 
 /// A process's outcome as the interpreters' result, for its reap status and trap record.

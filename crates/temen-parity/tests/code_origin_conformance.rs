@@ -59,6 +59,7 @@ mod support;
 use support::capability_probe::{
     probe_module_with, rows, unit_module_with, Row, MAX_ARGC, PROBE_BEYOND,
 };
+use support::validate_unit;
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
@@ -125,23 +126,6 @@ fn verdict(out: Option<Result<Vec<Value>, Trap>>) -> Verdict {
             other => panic!("the probe entry returns i64, got {other:?}"),
         }),
     }
-}
-
-/// The §22 `Jit` validator: a submitted unit is a real wire-encoded module, so decode and verify it
-/// exactly as a host serving `vm_jit_compile` must (#922 — the host re-reads the blob for the unit's
-/// type section, and a stub blob has none).
-fn validate_unit(
-    bytes: &[u8],
-    _mode: Option<u8>,
-    _sigs: &[u8],
-) -> Result<temen_interp::JitValidated, i64> {
-    let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
-    temen_verify::verify_module(&m).map_err(|_| -22i64)?;
-    Ok(temen_interp::JitValidated {
-        funcs: m.funcs.into(),
-        types: m.types.into(),
-        data: None,
-    })
 }
 
 /// Grant the `Jit` and compile the probe's unit, returning `(jit handle, code handle)`. Run on

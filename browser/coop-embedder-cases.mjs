@@ -135,6 +135,45 @@ block 4 (vr: i64) {
 export 0 func "_start" 0
 `;
 
+// #2557 — the root waits 1 ms on a word nobody notifies while its thread asks the embedder `ping(7)`,
+// reads the flag the thread raises once answered, and joins it: `2` (timed out) * 10000 + the flag
+// * 1000 + the answer.
+const TIMER_WHILE_OWED = `memory 16
+import 0 "ping" (i64) -> (i64)
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vaddr = i64.const 36864
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vflagat = i64.const 40960
+  vflag = i64.load vflagat
+  vr = thread.join vt
+  vst64 = i64.extend_i32_s vst
+  vk = i64.const 10000
+  vs = i64.mul vst64 vk
+  vk2 = i64.const 1000
+  vf = i64.mul vflag vk2
+  vsf = i64.add vs vf
+  vsum = i64.add vsf vr
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vseven = i64.const 7
+  vr = call.import 0 (vseven)
+  vaddr = i64.const 40960
+  vone = i64.const 1
+  i64.store vaddr vone
+  return vr
+  }
+}
+export 0 func "_start" 0
+`;
+
 export const pong = (x) => 2n * x + 1n;
 export const PINGS = 30;
 
@@ -180,7 +219,8 @@ export async function runCases({ ex, memory, drive, suspends }) {
         seen.parks++;
         if (opts.stopAtPark === seen.parks) return null;
         if (index !== 0) throw new Error(`unexpected cap ${index}`);
-        await new Promise((r) => setTimeout(r, 0)); // answered asynchronously, as a UI would
+        // Answered asynchronously, as a UI would.
+        await new Promise((r) => setTimeout(r, opts.answerAfter ?? 0));
         return pong(args[0]);
       },
       trapDeclines: opts.trapDeclines,
@@ -196,6 +236,9 @@ export async function runCases({ ex, memory, drive, suspends }) {
   results.pings = await run();
   if (open(pingGuest(PINGS), ['ping'], COOP_NO_REGIONS) !== 0) throw new Error('open ping, interpreted');
   results.pingsInterpreted = await run();
+  // #2557: the answer comes 50 ms after its call, and the root's 1 ms timer fires meanwhile.
+  if (open(TIMER_WHILE_OWED, ['ping'], COOP_NO_REGIONS) !== 0) throw new Error('open timer while owed');
+  results.timerWhileOwed = await run({ answerAfter: 50 });
   if (open(pingGuest(PINGS), ['ping'], leafMode) !== 0) throw new Error('open ping to stop');
   results.stopAtPark = await run({ stopAtPark: 3 });
   // Interpreted: emitted code is not sliced, so a root leaf that never parks would never come back

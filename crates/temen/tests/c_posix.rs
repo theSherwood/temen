@@ -7239,18 +7239,18 @@ int main(void) {{\n\
         .expect("the bytecode engine compiles this module")
         .expect("the run schedules");
     assert!(
-        matches!(run.run(), CoopEvent::Idle),
+        matches!(run.run(), CoopEvent::Idle { .. }),
         "parallel {parallel}: the first terminal read parks and the run yields Idle"
     );
     posix.feed_terminal(b"h"); // canonical mode: buffered, nothing deposited
     assert!(
-        matches!(run.run(), CoopEvent::Idle),
+        matches!(run.run(), CoopEvent::Idle { .. }),
         "parallel {parallel}: a partial line deposits nothing — the re-settle finds the reader \
          still parked, Idle again"
     );
     posix.feed_terminal(b"i\n"); // the completed line is deposited (and echoed)
     assert!(
-        matches!(run.run(), CoopEvent::Idle),
+        matches!(run.run(), CoopEvent::Idle { .. }),
         "parallel {parallel}: the line was read (3 bytes); the second read parks — Idle"
     );
     posix.feed_terminal(b"\x04"); // ^D on an empty line: one-shot EOF
@@ -7260,7 +7260,7 @@ int main(void) {{\n\
             vec![Value::I32(42)],
             "parallel {parallel}: both reads completed across the suspensions"
         ),
-        CoopEvent::Idle => panic!("parallel {parallel}: still idle after ^D"),
+        CoopEvent::Idle { .. } => panic!("parallel {parallel}: still idle after ^D"),
         CoopEvent::Trapped(t) => panic!("parallel {parallel}: trapped: {t:?}"),
         _ => panic!("parallel {parallel}: unexpected tier-up/invoke event on a plain run"),
     }

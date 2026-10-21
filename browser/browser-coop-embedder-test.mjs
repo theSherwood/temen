@@ -6,8 +6,10 @@
 // A program that asks the embedder `ping` 30 times gets each answer through `onCapPark` (answered
 // asynchronously) and ends with the right value and stdout, handed over through `onOutput`. Where
 // the host suspends (Chromium's JSPI) its root runs whole as one leaf and each park resumes the
-// leaf's frames; where it cannot (Node), it runs interpreted. Resolving a park to `null` stops the
-// run; so does `onSlice` resolving `false` on a program that never ends, after its output has streamed.
+// leaf's frames; where it cannot (Node), it runs interpreted. The run goes on while an answer is owed:
+// a root's timer fires in the page's time before an answer that comes later (#2557). Resolving a
+// park to `null` stops the run; so does `onSlice` resolving `false` on a program that never ends,
+// after its output has streamed.
 // A trap with `trapDeclines: false` returns its status, name and fault address; by default it throws.
 // Under JSPI a leaf is sliced at its own safepoints (step 4): a leaf that never ends stops at a budget
 // checkpoint when `onSlice` says so, and a long one hands its output over from inside, as it runs.
@@ -52,6 +54,13 @@ const check = (host, r, suspends) => {
   };
   ran('pings', r.pings, suspends ? 1 : 0, suspends ? PINGS : 0);
   ran('pings, interpreted', r.pingsInterpreted, 0, 0);
+  // #2557: the root's timer fired while the answer was owed, so it read the thread's flag still down.
+  const t = r.timerWhileOwed;
+  const timed = 20000n + pong(7n);
+  if (t.status !== 0 || t.value !== timed || t.parks !== 1) {
+    fail(`${host}: a timer fires while an answer is owed: status ${t.status}, value ${t.value}, `
+      + `${t.parks} parks (want 0, ${timed}, 1)`);
+  }
   if (r.stopAtPark.status !== null || r.stopAtPark.parks !== 3) {
     fail(`${host}: a park answered null stops the run: status ${r.stopAtPark.status}, ${r.stopAtPark.parks} parks`);
   }

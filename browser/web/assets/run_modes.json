@@ -1,0 +1,45 @@
+{
+  "_generated": "do not edit by hand — `cargo run -p temen-parity`",
+  "columns": [
+    { "short": "tree-walk", "question": "the tree-walk interpreter, the oracle every other mode is held to", "kind": "executor" },
+    { "short": "pump", "question": "the bytecode tier's cooperative executor: every task in turn on one thread", "kind": "executor" },
+    { "short": "parallel", "question": "executor 2: a thread per task over the pump's rules", "kind": "executor" },
+    { "short": "Cranelift", "question": "the Cranelift JIT, run through temen-run", "kind": "executor" },
+    { "short": "debugger", "question": "under a debugger: the tree-walk Inspector (the DAP's default engine) or the bytecode debug scheduler (ScheduledDebugRun, its bytecode engine)", "kind": "property" },
+    { "short": "durable", "question": "the run can freeze and thaw", "kind": "property" },
+    { "short": "pumped", "question": "the embedder holds the run and pumps it (CoopRun, CoopSession), told of each call it answers and of the run's idle point", "kind": "property" },
+    { "short": "warm", "question": "the run starts from a warm snapshot taken after its setup", "kind": "property" },
+    { "short": "reactor", "question": "the entry is re-entered a frame at a time over kept state", "kind": "property" },
+    { "short": "browser", "question": "in the wasm build, on a page (the playground)", "kind": "property" },
+    { "short": "emitted", "question": "hot code runs as emitted wasm (the browser's emitted tier)", "kind": "property" }
+  ],
+  "statuses": {
+    "full": { "glyph": "✅", "label": "Full" },
+    "declines": { "glyph": "⛔", "label": "Declines (by design — the note says why)" },
+    "notyet": { "glyph": "🚧", "label": "Not yet (a real gap)" },
+    "conditional": { "glyph": "🔶", "label": "Conditional (holds where the note's condition does)" },
+    "unaudited": { "glyph": "❔", "label": "Unaudited (nobody has established this cell)" }
+  },
+  "rows": [
+    { "row": "threads", "group": "feature", "cells": ["full", "full", "full", "conditional", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module" }] },
+    { "row": "fibers", "group": "feature", "cells": ["full", "full", "full", "conditional", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module" }] },
+    { "row": "§14 children", "group": "feature", "cells": ["full", "full", "full", "conditional", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "on the fiber_rt targets (unix x86-64, unix aarch64, Windows x86-64); elsewhere the JIT declines the module" }, { "column": "debugger", "text": "the tree-walk Inspector runs one vCPU over the powerbox, or every vCPU over none, so a child's join blocks (#2560)" }] },
+    { "row": "fork (clone_caller)", "group": "feature", "cells": ["full", "full", "full", "notyet", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "answers clone_caller and reap -EINVAL where the oracle forks (#2553); FORK.md §9.3 plans them natively. The POSIX personality's own fork runs there (§9.5)" }, { "column": "debugger", "text": "the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554); the tree-walk Inspector blocks on a fork and traps on an exec (#2560)" }] },
+    { "row": "exec (exec_module)", "group": "feature", "cells": ["full", "full", "full", "notyet", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "declines exec_module, the op C's execve replaces its image with (#2555); the POSIX personality's OP_EXECVE runs there (FORK.md §9.4)" }, { "column": "debugger", "text": "the bytecode debug scheduler declines every process seam: fork, exec, spawn, wait and pipes (#2554); the tree-walk Inspector blocks on a fork and traps on an exec (#2560)" }] },
+    { "row": "host-answered calls", "group": "feature", "cells": ["full", "full", "full", "full", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "debugger", "text": "the tree-walk Inspector traps CapFault on a host-answered call (#2560)" }] },
+    { "row": "offloaded calls", "group": "feature", "cells": ["full", "full", "full", "full", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "stdin fed later", "group": "feature", "cells": ["unaudited", "full", "full", "unaudited", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "debugger", "text": "the tree-walk Inspector has no way to feed a read (#2560)" }] },
+    { "row": "job-control signals", "group": "feature", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "a growing window", "group": "feature", "cells": ["full", "full", "full", "full", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "§13 shared regions", "group": "feature", "cells": ["full", "full", "full", "conditional", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "Cranelift", "text": "for a region over an OS shared-memory object (temen_run::new_shared_region), which the JIT maps by its descriptor; a software-only one (Host::grant_shared_region) has none, so its map answers -EINVAL there" }] },
+    { "row": "§22 guest JIT", "group": "feature", "cells": ["full", "full", "full", "full", "notyet", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "debugger", "text": "the tree-walk Inspector traps IndirectCallType at the installed unit's call.dyn (#2560)" }] },
+    { "row": "serving", "group": "feature", "cells": ["full", "full", "full", "full", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "debugger", "group": "property", "cells": ["full", "full", "declines", "declines", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [{ "column": "parallel", "text": "the debug scheduler owns the schedule, every task on one thread, which is what makes a replay see the same interleaving (DEBUGGING.md); executor 2 runs its tasks at once" }, { "column": "Cranelift", "text": "the interpreter is the debug engine and the JIT the production engine, differential-checked against it (DEBUGGING.md)" }] },
+    { "row": "durable", "group": "property", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "pumped", "group": "property", "cells": ["unaudited", "full", "full", "unaudited", "full", "unaudited", "full", "unaudited", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "warm", "group": "property", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "full", "unaudited", "unaudited", "unaudited"], "notes": [] },
+    { "row": "reactor", "group": "property", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "full", "unaudited", "unaudited"], "notes": [] },
+    { "row": "browser", "group": "property", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "full", "unaudited"], "notes": [] },
+    { "row": "emitted", "group": "property", "cells": ["unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "unaudited", "full"], "notes": [] }
+  ]
+}

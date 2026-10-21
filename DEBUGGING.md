@@ -928,7 +928,9 @@ request stop answering `false`/`None` — "single-vCPU sessions only" — now ca
 the declared call from a spawned thread and gets its value back through the join. (#2495 folded
 `deliver_cap` into the call's `Completer`: the embedder answers through it, the next advance takes
 the answer, counting the turn, and tapes it; and every driver admits such calls, so the admission
-flag is gone.)
+flag is gone. #2538: an answer is taken at the next pick after it comes, the run waiting in real
+time for one until a timer is due when nothing can run, and where each was taken is recorded by
+logical time, so an undo's re-execution takes it there again.)
 
 ---
 

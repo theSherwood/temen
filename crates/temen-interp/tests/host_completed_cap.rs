@@ -324,7 +324,7 @@ fn a_host_answered_call_is_told_once_and_the_run_idles_until_its_answer() {
             assert_eq!(filed(&recorded), vec![(id, 7)], "{exec:?}");
             for _ in 0..2 {
                 assert!(
-                    matches!(run.run(), CoopEvent::Idle),
+                    matches!(run.run(), CoopEvent::Idle { timer: None }),
                     "{exec:?}: with the answer owed and nothing else to run, the run is idle"
                 );
             }
@@ -440,7 +440,7 @@ fn each_host_answered_call_is_told_once_while_another_waits() {
                     _ => panic!("{exec:?}: each host-answered call is told"),
                 })
                 .collect();
-            let idle = matches!(run.run(), CoopEvent::Idle);
+            let idle = matches!(run.run(), CoopEvent::Idle { timer: None });
             let mut filed_ids: Vec<u64> = filed(&recorded).into_iter().map(|(id, _)| id).collect();
             told.sort_unstable();
             filed_ids.sort_unstable();
@@ -455,6 +455,94 @@ fn each_host_answered_call_is_told_once_while_another_waits() {
             matches!(r, CoopEvent::Done(ref v) if *v == vec![Value::I64(WANT)]),
             "{exec:?}"
         );
+    }
+}
+
+/// #2557 — the root waits 1 ms on a word nobody notifies while its thread waits for a
+/// host-answered call, reads the flag the thread raises once answered, and joins the thread:
+/// `2` (timed out) * 10_000 + the flag * 1000 + the thread's 107.
+const TIMER_WHILE_OWED: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  vh64 = i64.extend_i32_u vh
+  vt = thread.spawn 1 vz vh64
+  vaddr = i64.const 16384
+  vexp = i32.const 0
+  vto = i64.const 1000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vflagat = i64.const 32768
+  vflag = i64.load vflagat
+  vr = thread.join vt
+  vst64 = i64.extend_i32_s vst
+  vk = i64.const 10000
+  vs = i64.mul vst64 vk
+  vk2 = i64.const 1000
+  vf = i64.mul vflag vk2
+  vsf = i64.add vs vf
+  vsum = i64.add vsf vr
+  return vsum
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.wrap_i64 varg
+  vseven = i64.const 7
+  vr = call.cap 13 1 (i64) -> (i64) vh (vseven)
+  vaddr = i64.const 32768
+  vone = i64.const 1
+  i64.store vaddr vone
+  return vr
+  }
+}
+"#;
+
+/// The timer of the [`CoopEvent::Idle`] a pump of `run` returns.
+fn idle_timer(run: &mut bytecode::CoopRun) -> Option<u64> {
+    match run.run() {
+        CoopEvent::Idle { timer } => timer,
+        _ => panic!("the run is idle until its answer"),
+    }
+}
+
+/// #2557 — a timer fires while an answer is owed, once the embedder's time has reached it, on both
+/// executors. The run hands back the time to the root's timer with `Idle`, and the embedder lets
+/// that time pass before it answers: the root's wait times out before the answer comes. The pump's
+/// clock waits for the embedder's: pumped again at once, it is idle with the same timer, since
+/// its clock must not run ahead of an answer that is owed (#1414 D4). A pump that held its timers
+/// while an answer was owed reported none here: the embedder answered at once, and the root read
+/// the flag up (21_107).
+#[test]
+fn a_timer_fires_while_an_answer_is_owed() {
+    for exec in PUMPED {
+        let m = parse(TIMER_WHILE_OWED);
+        let (end, timers) = bounded(move || {
+            let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+            let (host, h) = host_completed(&recorded);
+            let mut run = coop(exec, &m, host, h);
+            let id = match run.run() {
+                CoopEvent::CapPark { id } => id,
+                _ => panic!("{exec:?}: the thread's call is told"),
+            };
+            let mut timers = vec![idle_timer(&mut run)];
+            if exec == Pumped::Pump {
+                timers.push(idle_timer(&mut run));
+            }
+            while let Some(&Some(ns)) = timers.last() {
+                std::thread::sleep(std::time::Duration::from_nanos(ns));
+                run.pass_time(ns);
+                timers.push(idle_timer(&mut run));
+            }
+            answer(&recorded, id);
+            (run.run(), timers)
+        });
+        assert!(
+            matches!(end, CoopEvent::Done(ref v) if *v == vec![Value::I64(20_107)]),
+            "{exec:?}: the root's wait timed out before the answer came"
+        );
+        if exec == Pumped::Pump {
+            assert_eq!(timers, [Some(1_000_000), Some(1_000_000), None]);
+        }
     }
 }
 

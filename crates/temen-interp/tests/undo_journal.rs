@@ -391,6 +391,122 @@ fn a_stateful_capability_declines_to_undo() {
     }
 }
 
+/// A root that polls for its thread's answer: thread 1 calls `call.cap 13 0` with 7 and then raises
+/// the flag at 16388; the root counts its looks until it sees the flag, waiting 1 ms on a word nobody
+/// notifies between looks when `paced`, else spinning. Returns `looks * 1000 + 7`.
+fn poller(paced: bool) -> temen_ir::Module {
+    let pace = if paced {
+        "  vpa = i64.const 17800\n  vpe = i32.const 0\n  vpt = i64.const 1000000\n  vps = i32.atomic.wait vpa vpe vpt\n"
+    } else {
+        ""
+    };
+    let src = format!(
+        "memory 17
+func (i32) -> (i64) {{
+block 0 (vh: i32) {{
+  vsp = i64.const 0
+  vha = i64.extend_i32_u vh
+  vth = thread.spawn 1 vsp vha
+  vc0 = i64.const 0
+  br 1(vth, vc0)
+}}
+block 1 (vth1: i32, vc: i64) {{
+{pace}  vone = i64.const 1
+  vc1 = i64.add vc vone
+  vfa = i64.const 16388
+  vf = i32.atomic.load vfa
+  vdown = i32.const 0
+  vup = i32.ne vf vdown
+  br_if vup 2(vth1, vc1) 1(vth1, vc1)
+}}
+block 2 (vth2: i32, vc2: i64) {{
+  vr = thread.join vth2
+  vk = i64.const 1000
+  vm = i64.mul vc2 vk
+  vsum = i64.add vm vr
+  return vsum
+}}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vh = i32.wrap_i64 varg
+  vn = i64.const 7
+  vr = call.cap 13 0 (i64) -> (i64) vh (vn)
+  vfa = i64.const 16388
+  vone = i32.const 1
+  i32.atomic.store vfa vone
+  return vr
+}}
+}}
+"
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// **#2538 — an answer is taken again where the run took it.** The offload pool answers
+/// [`poller`]'s first call 50 ms after it is made, and any later call at once. Live, the root looks
+/// for the answer until it has come, and its thread takes it as it comes: at a look the run waited
+/// out in real time when the root is paced, or between two looks of a spinning root. Undone and run
+/// forward again, the call answers at once, but its answer is taken after the same looks, so the
+/// run ends at the same turn with the same value: a replay sees what the run did, not what the
+/// world's timing does the second time.
+#[test]
+fn undoing_across_an_answer_takes_it_where_the_run_did() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    for paced in [true, false] {
+        let m = poller(paced);
+        let calls = Arc::new(AtomicU64::new(0));
+        let made = Arc::clone(&calls);
+        let mut host = temen_interp::Host::new();
+        let h = host.grant_host_proc_offloadable(
+            Box::new(move |_op, args| {
+                let (first, n) = (made.fetch_add(1, Ordering::SeqCst) == 0, args[0]);
+                temen_interp::OffloadOutcome::Offload(Box::new(move || {
+                    if first {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    n
+                }))
+            }),
+            None,
+            temen_interp::CapState::Stateless,
+        );
+        let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
+            .expect("in the debug subset");
+        r.set_journal_armed(true);
+        let mut fuel = FUEL;
+        while r.tick(&mut fuel) {}
+        let end = r.op_turn();
+        let Some(Ok(live)) = r.result().cloned() else {
+            panic!("the live run ended {:?} (paced: {paced})", r.result());
+        };
+        let [temen_interp::Value::I64(v)] = live[..] else {
+            panic!("the live run returned {live:?} (paced: {paced})");
+        };
+        assert!(
+            v / 1000 > 1,
+            "the root looked while the answer was on its way: {v} (paced: {paced})"
+        );
+
+        assert!(r.undo_to(0), "undo the whole run, back across the answer");
+        let mut fuel = FUEL;
+        while r.op_turn() < end && r.tick(&mut fuel) {}
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the replay made the call again"
+        );
+        assert_eq!(
+            (r.result().cloned(), r.op_turn()),
+            (Some(Ok(live)), end),
+            "the replay takes the answer after the looks the run made (paced: {paced})"
+        );
+    }
+}
+
 // ---- the static retention policy (#1558) ----------------------------------------------------------
 
 /// **The fine window is what it says.** With a narrow `fine_turns`, recent turns stay undoable to the

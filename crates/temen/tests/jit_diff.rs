@@ -1599,7 +1599,7 @@ mod cap {
     ///
     /// # Safety
     /// Honours the `CapThunk` contract: `ctx` is a `*mut Host`, the slot/window pointers are
-    /// valid for their lengths, and `trap_out` is live.
+    /// valid for their lengths, and `vm` is the calling instance's live context.
     unsafe extern "C" fn cap_thunk(
         ctx: *mut c_void,
         mem_base: *mut u8,
@@ -1612,7 +1612,7 @@ mod cap {
         n_args: u64,
         results: *mut i64,
         n_results: u64,
-        trap_out: *mut i64,
+        vm: &temen_jit::VmCtx,
     ) {
         let host = &mut *(ctx as *mut Host);
         // Null args pointer when there are 0 args; `from_raw_parts` needs non-null even for len 0.
@@ -1639,10 +1639,9 @@ mod cap {
                         *o = r;
                     }
                 }
-                *trap_out = 0;
             }
             // The host's trap on the one wire code, as `temen_run::cap_thunk` reports it (#1735).
-            Err(t) => *trap_out = t.code(),
+            Err(t) => vm.raise(t.code()),
         }
     }
 
@@ -1783,11 +1782,11 @@ block 0 (v0: i32) {
     /// Regression (trap propagation across calls): a trap raised in a **callee** must unwind the
     /// whole guest stack, not just the callee's own frame. A helper here `call.cap`s with a wrong
     /// `type_id` on the granted Memory handle (→ `CapFault`); the entry then makes a *successful*
-    /// `page_size` `call.cap`, which resets the host trap cell. Before the JIT re-checked the cell
-    /// after a `call`, the callee's trap merely returned zeros, the entry ran on, `page_size` reset
-    /// the cell, and the JIT **returned** where the interpreter (correctly) stays trapped — which
-    /// would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call. Both
-    /// backends must detect-and-kill.
+    /// `page_size` `call.cap`. Before the JIT re-checked the cell after a `call`, the callee's trap
+    /// merely returned zeros, the entry ran on, `page_size` reset the cell (as a successful host call
+    /// did until #2499), and the JIT **returned** where the interpreter (correctly) stays trapped —
+    /// which would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call.
+    /// Both backends must detect-and-kill.
     #[cfg(unix)]
     #[test]
     fn jit_trap_in_callee_propagates_through_caller() {
@@ -2117,7 +2116,7 @@ mod fast_cap {
         n_args: u64,
         results: *mut i64,
         n_results: u64,
-        trap_out: *mut i64,
+        _vm: &temen_jit::VmCtx,
     ) {
         let a = if n_args == 0 {
             &[][..]
@@ -2131,7 +2130,6 @@ mod fast_cap {
         if n_results != 0 {
             *results = r;
         }
-        *trap_out = 0;
     }
 
     /// The specialized (register-ABI) fast fn for `(42, 0)`: `a0 + 1` — must match the generic op-0.
@@ -2140,10 +2138,9 @@ mod fast_cap {
         _mem_base: *mut u8,
         _mem_size: u64,
         _handle: i32,
-        trap_out: *mut i64,
+        _vm: &temen_jit::VmCtx,
         a0: i64,
     ) -> i64 {
-        *trap_out = 0;
         a0.wrapping_add(1)
     }
 
