@@ -104,18 +104,18 @@ pub(crate) unsafe extern "C" fn rt_setjmp_slot(
 /// totality). Never `_longjmp`s into a missing slot.
 ///
 /// # Safety
-/// `rt` and the context at `vm` are valid for the run (baked / threaded by the lowering).
+/// `rt` is valid for the run (threaded by the lowering).
 pub(crate) unsafe extern "C" fn rt_setjmp_lookup(
     rt: *mut SetjmpRuntime,
     guest_buf: u64,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> *mut c_void {
     let rt = &*rt;
     let slots = rt.slots.lock().unwrap_or_else(|e| e.into_inner());
     match slots.get(&guest_buf) {
         Some(cell) => cell.as_ptr(),
         None => {
-            crate::VmCtx::at(vm).raise(TrapKind::SetjmpFault as i64);
+            vm.raise(TrapKind::SetjmpFault as i64);
             core::ptr::null_mut()
         }
     }

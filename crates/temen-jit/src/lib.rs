@@ -7970,11 +7970,11 @@ struct Lower<'a> {
     /// plain (non-atomic); the store⇒load dependency on the same address keeps Cranelift from hoisting
     /// the check out of a loop.
     fuel: bool,
-    /// DESIGN §12 domain teardown for **running** vCPUs: poll this vCPU's own trap cell at every loop
-    /// back-edge (and the entry of a function that tail-calls), and unwind when it is non-zero — a sibling's trap, the root's
-    /// completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown of a §14 child. On for code
-    /// that can run beside other vCPUs (a threaded module, every §14 child); a single-vCPU compile
-    /// emits nothing.
+    /// DESIGN §12 domain teardown for **running** vCPUs: poll the domain's trap cell at every loop
+    /// back-edge (and the entry of a function that tail-calls), and unwind once it holds an end — a
+    /// sibling's trap, the root's completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown
+    /// of a §14 child. On for code that can run beside other vCPUs (a threaded module, every §14
+    /// child); a single-vCPU compile emits nothing.
     domain_poll: bool,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],

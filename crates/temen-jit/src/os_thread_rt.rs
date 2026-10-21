@@ -1454,7 +1454,7 @@ struct SpawnArgs {
     /// stays valid for the thread's lifetime.
     dom: *const Domain,
 }
-// SAFETY: same contract as `Env` — the raw pointers are the run's shared window/trap cell, and a fresh
+// SAFETY: same contract as `Env` — the raw pointers are the run's shared window/context, and a fresh
 // OS thread is the sole user of its `SpawnArgs` until it stores into the (synchronized) `Done` cell.
 unsafe impl Send for SpawnArgs {}
 
@@ -1600,7 +1600,6 @@ fn run_child(a: SpawnArgs) {
     let dom = unsafe { &*a.dom };
     let chain = dom.lane_chain();
     let got_lane = dom.lane_acquire(&chain, || {
-        // SAFETY: the run's live interrupt cell / trap cell, as everywhere in this file.
         epoch_fired(env.epoch_addr) || env.ctx().ended().is_some()
     });
     let mut call = ChildCall {
@@ -1750,7 +1749,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     sched: *const Domain,
     _mem_base: u64,
     _fn_table_base: u64,
-    vm: u64,
+    vm: &crate::VmCtx,
     func_idx: u32,
     sp: u64,
     arg: u64,
@@ -1788,14 +1787,14 @@ pub(crate) unsafe extern "C" fn thread_spawn(
         let table = match dom.fiber_table() {
             Some(t) => t,
             None => {
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 return -1;
             }
         };
         let ctx = match table.reserve_vcpu_context() {
             Some(c) => c,
             None => {
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 return -1;
             }
         };
@@ -1842,7 +1841,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                     table.free_vcpu_context(dc.ctx);
                 }
             }
-            crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+            vm.raise(TrapKind::ThreadFault as i64);
             return -1;
         }
         let idx = t.cells.len();
@@ -1885,7 +1884,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 if !std::ptr::eq(hub, dom) {
                     lock(&hub.threads).live -= 1; // the slot `try_child_start` took
                 }
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 -1
             }
         }
@@ -1901,9 +1900,16 @@ pub(crate) unsafe extern "C" fn thread_spawn(
 /// yields — so the side-effect interleaving (and the frozen window) is byte-identical across backends.
 ///
 /// # Safety
-/// As [`thread_spawn`]: `dom` is the run's live `Domain`; `code` is a guest entry trampoline;
-/// `vm` is the live context's address; the durable control words + shadow arena (`[0, ShadowArena::end)`) are committed RW.
-unsafe fn defer_spawn(dom: &Domain, code: u64, func_idx: u32, sp: u64, arg: u64, vm: u64) -> i32 {
+/// As [`thread_spawn`]: `dom` is the run's live `Domain`; `code` is a guest entry trampoline; the
+/// durable control words + shadow arena (`[0, ShadowArena::end)`) are committed RW.
+unsafe fn defer_spawn(
+    dom: &Domain,
+    code: u64,
+    func_idx: u32,
+    sp: u64,
+    arg: u64,
+    vm: &crate::VmCtx,
+) -> i32 {
     // Reserve this child's shadow context top-down (`MAX_SHADOW_CTX`, −1, …) so it can't collide with
     // a fiber's `slot+1` region; fail closed (`ThreadFault`) if the reserve is full — the vCPU pool
     // growing down would meet the fiber pool growing up (same as the interp). A durable run always has
@@ -1911,14 +1917,14 @@ unsafe fn defer_spawn(dom: &Domain, code: u64, func_idx: u32, sp: u64, arg: u64,
     let table = match dom.fiber_table() {
         Some(t) => t,
         None => {
-            crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+            vm.raise(TrapKind::ThreadFault as i64);
             return -1;
         }
     };
     let ctx = match table.reserve_vcpu_context() {
         Some(c) => c,
         None => {
-            crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+            vm.raise(TrapKind::ThreadFault as i64);
             return -1;
         }
     };
@@ -1929,7 +1935,7 @@ unsafe fn defer_spawn(dom: &Domain, code: u64, func_idx: u32, sp: u64, arg: u64,
         // #2001 — and its domain's budget node, as `thread_spawn` charges it.
         if t.live >= MAX_VCPUS || !dom.charge_vcpu() {
             table.free_vcpu_context(ctx);
-            crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+            vm.raise(TrapKind::ThreadFault as i64);
             return -1;
         }
         t.live += 1;
@@ -2361,8 +2367,12 @@ impl Domain {
 /// propagates that trap here (the joiner's `emit_trap_propagate` then unwinds).
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`; `vm` is the live context's address.
-pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, vm: u64) -> i64 {
+/// `sched` is the run's live `Domain`.
+pub(crate) unsafe extern "C" fn thread_join(
+    sched: *const Domain,
+    handle: i32,
+    vm: &crate::VmCtx,
+) -> i64 {
     let dom = current_domain(sched);
     // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
     // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
@@ -2383,7 +2393,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
                     let Some(slot) =
                         temen_ir::handle_slot(tbl.cells.len(), handle).filter(|&s| !tbl.joined[s])
                     else {
-                        crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                        vm.raise(TrapKind::ThreadFault as i64);
                         return 0;
                     };
                     tbl.joined[slot] = true;
@@ -2391,7 +2401,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
                     std::sync::Arc::clone(&tbl.cells[slot])
                 }
                 None => {
-                    crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                    vm.raise(TrapKind::ThreadFault as i64);
                     return 0;
                 }
             }
@@ -2402,7 +2412,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
             // capability index: the oracle's rule (`temen_ir::handle_slot`, #2378).
             let Some(slot) = temen_ir::handle_slot(t.cells.len(), handle).filter(|&s| !t.joined[s])
             else {
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 return 0;
             };
             t.joined[slot] = true;
@@ -2419,7 +2429,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
         return match fiber_rt::current_fiber_slot() {
             Some(s) if s.is_platform() => task_join(dom, &s, &done, vm),
             _ => {
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 0
             }
         };
@@ -2456,7 +2466,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
         loop {
             if let Some((result, trap)) = *st {
                 if trap != 0 {
-                    crate::VmCtx::at(vm).raise(trap);
+                    vm.raise(trap);
                 }
                 if done.unwound.load(Ordering::Relaxed) {
                     // SAFETY: a child unwinds only on a durable run, whose window is committed.
@@ -2477,8 +2487,7 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
             // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
             // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
             // Woken promptly by [`Domain::wake_all_parked`].
-            // SAFETY: `vm` is the caller's live instance context.
-            if unsafe { crate::VmCtx::at(vm).ended().is_some() } {
+            if vm.ended().is_some() {
                 return 0;
             }
             // A timeout wait so the kill (`epoch_addr`) and freeze (`freeze`) re-checks above run
@@ -2496,11 +2505,8 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
         }
     })();
     // Back from the park; re-take the lane before the guest runs again.
-    if !dom.lane_acquire(&lane, || {
-        // SAFETY: the run's live interrupt cell / the caller's live trap cell.
-        epoch_fired(epoch_addr) || unsafe { crate::VmCtx::at(vm).ended().is_some() }
-    }) {
-        crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+    if !dom.lane_acquire(&lane, || epoch_fired(epoch_addr) || vm.ended().is_some()) {
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     }
     result
@@ -2517,12 +2523,12 @@ pub(crate) unsafe extern "C" fn thread_join(sched: *const Domain, handle: i32, v
 /// marked for re-issue too. So a teardown under that freeze wakes the park rather than poison it.
 ///
 /// # Safety
-/// Called on the task's own stack (`slot` is its platform slot); `vm` is its live context's address.
+/// Called on the task's own stack (`slot` is its platform slot).
 unsafe fn task_join(
     dom: &Domain,
     slot: &std::sync::Arc<fiber_rt::FiberSlot>,
     done: &Done,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> i64 {
     let env = dom.env();
     let freeze = dom.freeze_watch();
@@ -2532,7 +2538,7 @@ unsafe fn task_join(
             let st = lock(&done.state);
             if let Some((result, trap)) = *st {
                 if trap != 0 {
-                    crate::VmCtx::at(vm).raise(trap);
+                    vm.raise(trap);
                 }
                 if done.unwound.load(Ordering::Relaxed) {
                     // A vCPU unwinds only on a durable run, whose window is committed.
@@ -2545,7 +2551,7 @@ unsafe fn task_join(
             }
         }
         // Killed, or the child's domain is over: return; the join's trailing guards unwind.
-        if epoch_fired(env.epoch_addr) || crate::VmCtx::at(vm).ended().is_some() {
+        if epoch_fired(env.epoch_addr) || vm.ended().is_some() {
             return 0;
         }
         if let Some(f) = freeze.filter(|f| f.landed()) {
@@ -2593,15 +2599,14 @@ unsafe fn read_phys(phys: u64, width: u32) -> u64 {
 /// detection in [`futex_wait`] (no thaw-specific path; `WAIT_DEADLOCK` is intercepted below).
 ///
 /// # Safety
-/// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes; `vm` is the
-/// live context's address.
+/// `sched` is the run's live `Domain`; `phys` points at `width` readable guest bytes.
 pub(crate) unsafe extern "C" fn thread_wait(
     sched: *const Domain,
     phys: u64,
     expected: u64,
     width: u32,
     timeout: i64,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let dom = current_domain(sched);
     let hub = dom.hub();
@@ -2663,24 +2668,22 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // (`vm`) has ended ([`crate::VmCtx::ended`]), its trap cell being the one this waiter's
         // trailing guard checks, so the wake always unwinds the right thread (a §14 child parked on
         // the shared futex has its own cell and is untouched by a parent-domain teardown, as before).
-        // SAFETY: `vm` is the caller's live instance context.
-        || unsafe { crate::VmCtx::at(vm).ended().is_some() },
+        || vm.ended().is_some(),
     );
     // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
     // torn-down domain) leaves it untaken and the caller's trailing guard unwinds, exactly as the
     // wait statuses below do.
     if !dom.lane_acquire(&lane, || {
-        // SAFETY: the run's live interrupt cell / the caller's live trap cell.
-        epoch_fired(dom.env().epoch_addr) || unsafe { crate::VmCtx::at(vm).ended().is_some() }
+        epoch_fired(dom.env().epoch_addr) || vm.ended().is_some()
     }) {
-        crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     }
     // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
     // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
     #[cfg(not(loom))]
     if status == WAIT_DEADLOCK {
-        crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+        vm.raise(TrapKind::ThreadFault as i64);
         return 0;
     }
     status
@@ -2708,7 +2711,7 @@ unsafe fn fiber_futex_wait(
     width: u32,
     deadline: Option<Instant>,
     freeze: Option<FreezeWatch>,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     let mask = width_mask(width);
     let key = futex_key_of(phys);
@@ -2736,7 +2739,7 @@ unsafe fn fiber_futex_wait_loop(
     cell: &std::sync::Arc<WaitCell>,
     deadline: Option<Instant>,
     freeze: Option<FreezeWatch>,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> i32 {
     loop {
         // D66 — a **child-domain task** has no resumer to poll it, so an already-resolved wait
@@ -2766,7 +2769,7 @@ unsafe fn fiber_futex_wait_loop(
         // return as if woken — the caller's trailing guards (the epoch poll, the trap
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
         let frozen = freeze.is_some_and(|f| f.landed());
-        if epoch_fired(dom.env().epoch_addr) || crate::VmCtx::at(vm).ended().is_some() || frozen {
+        if epoch_fired(dom.env().epoch_addr) || vm.ended().is_some() || frozen {
             wait_deregister(&mut lock(&dom.hub().futex), key, cell);
             // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
             return if frozen {
@@ -2838,14 +2841,14 @@ const FIBER_PARKED_STATUS: i64 = 3;
 /// surfaced and is a separate follow-up.
 ///
 /// # Safety
-/// `sched` is the run's live [`Domain`]; `status_out`/`vm` are live `*mut i64` cells. The
+/// `sched` is the run's live [`Domain`]; `status_out` is a live `*mut i64` cell. The
 /// running vCPU's fiber runtime is [`fiber_rt::CURRENT_RT`] (read inside `fiber_resume`).
 pub(crate) unsafe extern "C" fn fiber_resume_block(
     sched: *const Domain,
     handle: i64,
     arg: i64,
     status_out: *mut i64,
-    vm: u64,
+    vm: &crate::VmCtx,
 ) -> i64 {
     let dom = current_domain(sched);
     let hub = dom.hub();
@@ -2854,10 +2857,10 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     #[cfg(not(loom))]
     let mut confirming = false;
     loop {
-        let value = fiber_rt::fiber_resume(handle, arg, status_out, vm);
+        let value = fiber_rt::fiber_resume(handle, arg, status_out, vm as *const _ as u64);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
-        if *status_out != FIBER_PARKED_STATUS || crate::VmCtx::at(vm).ended().is_some() {
+        if *status_out != FIBER_PARKED_STATUS || vm.ended().is_some() {
             return value;
         }
         // #2424 — a fiber waiting on an answer from outside the run may be woken although no vCPU
@@ -2880,7 +2883,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                     continue;
                 }
                 _ => {
-                    crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                    vm.raise(TrapKind::ThreadFault as i64);
                     return value;
                 }
             }
@@ -2955,7 +2958,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 let quiescent = !self_resolving && !claimed && !hub.peers_live();
                 if quiescent && confirming {
                     drop(g);
-                    crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                    vm.raise(TrapKind::ThreadFault as i64);
                     return value;
                 }
                 confirming = quiescent;
@@ -2964,11 +2967,9 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 }
             }
             if !dom.lane_acquire(&lane, || {
-                // SAFETY: the run's live interrupt cell / trap cell.
-                epoch_fired(dom.env().epoch_addr)
-                    || unsafe { crate::VmCtx::at(vm).ended().is_some() }
+                epoch_fired(dom.env().epoch_addr) || vm.ended().is_some()
             }) {
-                crate::VmCtx::at(vm).raise(TrapKind::ThreadFault as i64);
+                vm.raise(TrapKind::ThreadFault as i64);
                 return value;
             }
         }

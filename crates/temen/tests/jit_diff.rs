@@ -1782,11 +1782,11 @@ block 0 (v0: i32) {
     /// Regression (trap propagation across calls): a trap raised in a **callee** must unwind the
     /// whole guest stack, not just the callee's own frame. A helper here `call.cap`s with a wrong
     /// `type_id` on the granted Memory handle (→ `CapFault`); the entry then makes a *successful*
-    /// `page_size` `call.cap`, which resets the host trap cell. Before the JIT re-checked the cell
-    /// after a `call`, the callee's trap merely returned zeros, the entry ran on, `page_size` reset
-    /// the cell, and the JIT **returned** where the interpreter (correctly) stays trapped — which
-    /// would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call. Both
-    /// backends must detect-and-kill.
+    /// `page_size` `call.cap`. Before the JIT re-checked the cell after a `call`, the callee's trap
+    /// merely returned zeros, the entry ran on, `page_size` reset the cell (as a successful host call
+    /// did until #2499), and the JIT **returned** where the interpreter (correctly) stays trapped —
+    /// which would let a guest neutralize *any* trap (even `exit`) by wrapping it in a function call.
+    /// Both backends must detect-and-kill.
     #[cfg(unix)]
     #[test]
     fn jit_trap_in_callee_propagates_through_caller() {
