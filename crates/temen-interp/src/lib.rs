@@ -20711,6 +20711,10 @@ pub struct HostBuffer {
     /// How many of `bytes` a reader consumed ([`Self::consume`]) that have yet to be dropped.
     head: usize,
     room: HostCharge,
+    /// The run's stream tee, when this is the stdout or stderr a host shared ([`Host::shared_stdout`]):
+    /// what [`Self::push`] appends goes to it too, under this buffer's lock, so the tee sees every
+    /// writer's bytes in the order the buffer holds them.
+    tee: Option<(StreamRole, Arc<Mutex<StreamTee>>)>,
 }
 
 impl HostBuffer {
@@ -20733,6 +20737,7 @@ impl HostBuffer {
             bytes,
             head: 0,
             room,
+            tee: None,
         }
     }
 
@@ -20783,9 +20788,13 @@ impl HostBuffer {
         true
     }
 
-    /// Append `data`: [`Self::write_at`] its end.
+    /// Append `data`: [`Self::write_at`] its end, and hand it to the stream's tee, if any.
     pub fn push(&mut self, data: &[u8]) -> bool {
-        self.write_at(self.len() as u64, data)
+        let fits = self.write_at(self.len() as u64, data);
+        if let (true, Some((role, tee))) = (fits, &self.tee) {
+            (tee.lock_unpoisoned())(*role, data);
+        }
+        fits
     }
 
     /// Drop its first `n` bytes, as a queue's reader consumes them.
@@ -22121,10 +22130,11 @@ impl Drop for Completer {
 /// thread — the ring's own discipline, kept as the registration contract).
 pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
 
-/// A **live stdout tee** ([`Host::set_stdout_tee`]): called with each `Stream(Out)` write's bytes as the
-/// guest produces them, additively to the normal buffering. The browser playground streams output to the
-/// page through it.
-pub type StdoutTee = Box<dyn FnMut(&[u8]) + Send>;
+/// A **live stream tee** ([`Host::set_stream_tee`]): called with each write to the run's stdout or
+/// stderr, and which of the two it went to, as the guest produces it, additively to the normal
+/// buffering. A browser run relays its output to the page through it as the run makes it, on either
+/// executor (#1414 S5a).
+pub type StreamTee = Box<dyn FnMut(StreamRole, &[u8]) + Send>;
 
 /// §7c **stdin inheritance** (#1720): a `Stream(In)` promoted to shared the first time it is re-granted
 /// into a §14 child — the unread bytes, the cursor and the lazy refill move here, so the granter and
@@ -22142,7 +22152,7 @@ struct SharedStdin {
 /// an interactive guest sees input as it is typed. `Some` of an empty buffer is end of input (the
 /// read returns 0, as an exhausted buffer always did). `None` is "nothing yet": the read returns
 /// `-EAGAIN` and the guest may try again later, so a source that never blocks lets a guest wait on
-/// its terminal and something else at once (#2019). The dual of [`StdoutTee`].
+/// its terminal and something else at once (#2019). The dual of [`StreamTee`].
 pub type StdinSource = Box<dyn FnMut() -> Option<Vec<u8>> + Send>;
 
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
@@ -23353,19 +23363,17 @@ pub struct Host {
     /// [`Host::shared_stdout`]/[`Host::shared_stderr`]; read the effective bytes via [`Host::stdout_bytes`].
     out_sink: Option<Arc<Mutex<HostBuffer>>>,
     err_sink: Option<Arc<Mutex<HostBuffer>>>,
-    /// Optional **live tee** on stdout: when set, every `Stream(Out)` write is handed to this callback
-    /// *in addition to* the normal buffering (the local `stdout` Vec / shared sink are untouched, so
-    /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
-    /// playground sets it to relay each chunk to the page as the guest produces it (live streaming);
-    /// every other host leaves it `None` (zero cost — one `Option` check per write). Not carried into
-    /// forked/twin child hosts; a §14 child re-granted stdout shares it (see below).
-    /// Shared (#1720) so a §14 child re-granted this host's stdout streams live too: the child host
-    /// carries the same tee its inherited sink's bytes go through.
-    out_tee: Option<Arc<Mutex<StdoutTee>>>,
+    /// Optional **live tee** on this host's stdout and stderr ([`Host::set_stream_tee`]): every byte
+    /// that lands in either is handed to it *in addition to* the normal buffering, so captured-at-end
+    /// readers and the interp≡JIT stdout differential are unaffected. A browser run sets it to relay
+    /// its output to the page as the guest produces it; every other host leaves it `None` (one
+    /// `Option` check per write). Once a stream is shared ([`Host::shared_stdout`]), its buffer carries
+    /// the tee, so a §14 child or a fork twin writing to it streams too, and its private streams don't.
+    stream_tee: Option<Arc<Mutex<StreamTee>>>,
     /// The lazy stdin refill ([`Host::set_stdin_source`]): consulted only when a `read` finds the
     /// buffer empty and the run is not [`Self::stdin_block`]ing. `None` (every host but an interactive
     /// CLI) costs one `Option` check per exhausted read and keeps EOF semantics byte-identical. Not
-    /// carried into forked/twin child hosts, like the tee.
+    /// carried into forked/twin child hosts.
     stdin_source: Option<StdinSource>,
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
@@ -23731,6 +23739,9 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
+    /// #1414 S5a — the embedder's way to stop this host's run on executor 2 from outside it
+    /// ([`Host::set_run_stop`]). `None` (the default): only the run itself ends it.
+    run_stop: Option<Arc<bytecode::RunStop>>,
     /// #1414 B6 — how the parallel driver starts this run's threads and reads its clock
     /// ([`Host::set_thread_platform`]); the OS's unless an embedder hands it another.
     thread_platform: bytecode::ThreadPlatform,
@@ -24390,7 +24401,7 @@ impl Host {
             err_room: HostCharge::default(),
             out_sink: None,
             err_sink: None,
-            out_tee: None,
+            stream_tee: None,
             stdin_source: None,
             sinks: Vec::new(),
             in_shared: None,
@@ -24467,6 +24478,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
+            run_stop: None,
             thread_platform: bytecode::ThreadPlatform::OS,
             exec_replace: None,
             cap_pages: None,
@@ -28094,14 +28106,26 @@ impl Host {
     /// #2306 — [`Self::capture`], moved into a buffer a shared sink keeps.
     fn capture_sink(&mut self, role: StreamRole) -> HostBuffer {
         let (bytes, room) = self.capture(role);
-        HostBuffer::from_parts(std::mem::take(bytes), std::mem::take(room))
+        let mut sink = HostBuffer::from_parts(std::mem::take(bytes), std::mem::take(room));
+        sink.tee = self.stream_tee.clone().map(|t| (role, t));
+        sink
     }
 
-    /// Install a **live stdout tee** (see [`Host::out_tee`]): `tee` is called with each `Stream(Out)`
-    /// write's bytes as the guest produces them, *in addition to* the normal buffering. The browser
-    /// playground uses it to stream output to the page mid-run; it does not affect the captured bytes.
-    pub fn set_stdout_tee(&mut self, tee: StdoutTee) {
-        self.out_tee = Some(Arc::new(Mutex::new(tee)));
+    /// Install a **live stream tee** (see [`Host::stream_tee`]): `tee` is called with each write to
+    /// this host's stdout or stderr as the guest produces it, *in addition to* the normal buffering.
+    /// A browser run uses it to stream output to the page mid-run; it does not affect the captured
+    /// bytes.
+    pub fn set_stream_tee(&mut self, tee: StreamTee) {
+        let tee = Arc::new(Mutex::new(tee));
+        for (role, sink) in [
+            (StreamRole::Out, &self.out_sink),
+            (StreamRole::Err, &self.err_sink),
+        ] {
+            if let Some(s) = sink {
+                s.lock_unpoisoned().tee = Some((role, Arc::clone(&tee)));
+            }
+        }
+        self.stream_tee = Some(tee);
     }
 
     /// This host's stdin as a `(bytes, cursor)` copy, wherever it lives — its own buffer, or the shared
@@ -31006,7 +31030,8 @@ impl Host {
     /// `role` and `sink` reads or writes — its own carried cell if it was itself inherited, else this
     /// host's promoted buffer — and return the child's index of it, for a `Stream` that carries it.
     /// Inheritance rides the table entry and no other child field is touched, so revoking the entry
-    /// revokes the authority; only the live stdout tee follows, so nested output streams too.
+    /// revokes the authority. The shared buffer carries the run's stream tee, so nested output
+    /// streams too.
     fn alias_stream(
         &mut self,
         role: StreamRole,
@@ -31027,9 +31052,6 @@ impl Host {
             None => self.shared_stderr(),
         };
         child.sinks.push(shared);
-        if role == StreamRole::Out {
-            child.out_tee = self.out_tee.clone();
-        }
         Some(child.sinks.len() as u32 - 1)
     }
 
@@ -31405,6 +31427,16 @@ impl Host {
     /// How the parallel driver starts this run's threads and reads its clock.
     pub(crate) fn thread_platform(&self) -> bytecode::ThreadPlatform {
         self.thread_platform.clone()
+    }
+
+    /// #1414 S5a — let `stop` end this host's run on executor 2 ([`bytecode::RunStop`]).
+    pub fn set_run_stop(&mut self, stop: Arc<bytecode::RunStop>) {
+        self.run_stop = Some(stop);
+    }
+
+    /// The run's stop, if its embedder set one ([`Host::set_run_stop`]).
+    pub(crate) fn run_stop(&self) -> Option<Arc<bytecode::RunStop>> {
+        self.run_stop.clone()
     }
 
     pub(crate) fn wire_park_door(&self) {
@@ -33086,15 +33118,10 @@ impl Host {
                 };
                 // §7c: a re-granted stdout/stderr carries its shared sink in the table entry (so a
                 // child's output reaches the embedder that granted it); a host's own stream routes
-                // to its promoted sink if a child shares it, else the local buffer.
-                // Live tee (browser playground streaming): hand each stdout chunk to the callback as it
-                // is produced, *before* the normal buffering below — a tee, not a replacement, so the
+                // to its promoted sink if a child shares it, else the local buffer. What lands in a
+                // shared sink reaches its tee there ([`HostBuffer::push`]), and what lands in the
+                // local buffer reaches this host's below: a tee, not a replacement, so the
                 // captured-at-end bytes are identical.
-                if role == StreamRole::Out {
-                    if let Some(tee) = self.out_tee.as_ref() {
-                        (tee.lock_unpoisoned())(&bytes);
-                    }
-                }
                 // #2306 — the bytes are host memory until their reader drains them, charged to the
                 // domain the stream was granted to: a write it has no room for is `-ENOMEM`.
                 if let Some(i) = sink {
@@ -33116,6 +33143,9 @@ impl Host {
                         let fits = room.reserve(buf, (buf.len() + bytes.len()) as u64);
                         if fits {
                             buf.extend_from_slice(&bytes);
+                            if let Some(tee) = &self.stream_tee {
+                                (tee.lock_unpoisoned())(role, &bytes);
+                            }
                         }
                         fits
                     }

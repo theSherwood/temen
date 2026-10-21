@@ -8216,7 +8216,7 @@ impl Instance {
     /// [`run_with_caps`](Instance::run_with_caps), plus a **host setup hook** run on the granted
     /// powerbox `Host` just before the guest starts — for what a [`RunConfig`] cannot carry: live
     /// I/O closures. The CLI's interactive mode installs a lazy stdin source and a stdout tee here
-    /// (`Host::set_stdin_source` / `set_stdout_tee`); an embedder can set any other per-run host
+    /// (`Host::set_stdin_source` / `set_stream_tee`); an embedder can set any other per-run host
     /// policy the same way. `None` is exactly `run_with_caps`.
     pub fn run_with_caps_and_host(
         &self,

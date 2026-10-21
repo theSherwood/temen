@@ -62,12 +62,13 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
         const h = globalThis.__temen_js_cap_call;
         return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;
       },
-      // The live-stdout tee (`temen_run_onramp_stream`): each write's [ptr,ptr+len) in linear memory.
-      // A no-op unless a page installs a sink on `globalThis.__temen_stdout_chunk` (play.js does during a
-      // streaming Run) — it receives a fresh copy of the chunk (the wasm memory may move after).
-      stdout_chunk: (ptr, len) => {
-        const h = globalThis.__temen_stdout_chunk;
-        if (h) h(new Uint8Array(memory.buffer, Number(ptr), Number(len)).slice());
+      // The live output tee (#1414 S5a): each write to a run's stdout (`fd` 1) or stderr (2), as
+      // `[ptr, ptr+len)` in linear memory, numbered by `seq`. A no-op unless something installs a sink
+      // on `globalThis.__temen_stream_chunk` (the coop driver does for an `onOutput`) — it gets a
+      // fresh copy of the chunk (the wasm memory may move after).
+      stream_chunk: (fd, seq, ptr, len) => {
+        const h = globalThis.__temen_stream_chunk;
+        if (h) h(fd, seq >>> 0, new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0).slice());
       },
       // The parallel driver's platform (#1414 B6): it runs on a Worker (`worker.js`), never on the
       // page, which cannot block — so the page starts no thread of its own.
@@ -110,9 +111,13 @@ export async function loadEngine(prev = null, { maxPages: askPages } = {}) {
 //   `tierup`  ⇒ each thread runs its task's tier-ups on its own Worker, over a window of `winSize`
 //               that cannot grow; a detached child's root task runs its granted module's emit over
 //               the child's own memory (#1414 ED-2). `tierups` counts the emitted calls.
-//   `winSize` sizes the window; `signal` (an `AbortSignal`) stops the run: every Worker is
-//   terminated and the promise rejects. NOTE a stop tears down Workers mid-run — shared state (the
-//   engine's locks) may be left unusable; reload the page after a stop.
+//   `winSize` sizes the window; `signal` (an `AbortSignal`) stops the run: the engine ends it as one
+//   whose fuel ran out (`temen_x2_stop`), its Workers leave as after any run, and the promise rejects
+//   with `stopped`. The engine stays usable. Only a run that has not ended `STOP_GRACE_MS` after it
+//   was told has its Workers torn down; that error carries `broken`, as the engine's locks may then be
+//   left held;
+//   `onOutput(stdout, stderr)` (`Uint8Array`s) gets the run's output as its threads write it, in the
+//   order its buffers hold it, as the coop driver's does.
 // A run that ends in a trap rejects with an Error whose `faultAddr` is where a memory fault faulted,
 // window-relative (`-1n` for none, #2275). The page services no authority: the powerboxes are
 // in-Rust, and a Worker only hosts a thread the engine started.
@@ -120,7 +125,9 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, onOutput = null, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+    // A stop asked for a run before this one is withdrawn before this one starts.
+    ex.temen_x2_stop(0);
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     // #2251: every thread gets its own Worker, so a guest's `self.parallelism` is the page's core count.
@@ -175,17 +182,43 @@ export function makeRunner({ module, memory, ex }) {
     // be: the thread counts itself out of the run before it is done in the engine (it still drops
     // what it held). Chromium stops a terminated Worker that is still running about two seconds
     // later, wherever it is, and one stopped inside the engine's allocator holds its lock for good.
-    // Only a stop tears these down too, as the note on `signal` above says.
+    // Only a stop that the run outlasts tears these down, as the note on `signal` above says.
     let root = null;
     const threads = new Set();
     // `childMems`: how many threads ran over a detached child's own memory.
     let started = 0, childMems = 0;
+    // The run's output as its Workers post it, handed on in `seq` order (see `stream_chunk`).
+    const output = onOutput && outputInOrder(onOutput);
+    let tornDown = false;
+    // Once the run is over, neither its `signal` nor a stop it is still asking reaches the next run.
+    let finished = false, unlisten = null;
     try {
       const { value = null, exit = null } = await new Promise((resolve, reject) => {
+        let stopped = false, grace = null;
+        const stop = () => {
+          stopped = true;
+          // Asked until the run's lock was free to be told: it never waits on the page.
+          const ask = () => {
+            if (!finished && !ex.temen_x2_stop(1)) setTimeout(ask, 1);
+          };
+          ask();
+          grace = setTimeout(() => {
+            tornDown = true;
+            reject(Object.assign(new Error('stopped'), { broken: true }));
+          }, STOP_GRACE_MS);
+        };
         if (signal) {
           if (signal.aborted) return reject(new Error('stopped'));
-          signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
+          signal.addEventListener('abort', stop, { once: true });
+          unlisten = () => signal.removeEventListener('abort', stop);
         }
+        // The run is over: the rest of its output, and how it ended — a stop's, when one was asked.
+        const end = (settle) => {
+          clearTimeout(grace);
+          if (output) output.end(readParStdoutBytes({ memory, ex }), readParStderrBytes({ memory, ex }));
+          if (stopped) reject(new Error('stopped'));
+          else settle();
+        };
         const startWorker = (cfg) => {
           started++;
           const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
@@ -198,16 +231,18 @@ export function makeRunner({ module, memory, ex }) {
               // detached child's memory its window lives in, if any (B6-3c).
               if (m.x2Mem) childMems++;
               startWorker({ role: 'x2thread', start: m.start, stackTop: m.stackTop, tlsBase: m.tlsBase, x2Mem: m.x2Mem, x2MemId: m.x2MemId });
+            } else if (m.kind === 'out') {
+              if (output) output.chunk(m.fd, m.seq, m.bytes);
             } else if (m.kind === 'done') {
-              resolve({ value: BigInt(m.value) });
+              end(() => resolve({ value: BigInt(m.value) }));
             } else if (m.kind === 'exit') {
-              resolve({ exit: m.code });
+              end(() => resolve({ exit: m.code }));
             } else if (m.kind === 'trap' || m.kind === 'fail') {
-              reject(Object.assign(new Error(m.why || 'guest trap'), { faultAddr: m.faultAddr }));
+              end(() => reject(Object.assign(new Error(m.why || 'guest trap'), { faultAddr: m.faultAddr })));
             }
           };
           w.onerror = (e) => reject(new Error(e.message || 'worker error'));
-          w.postMessage({ module, memory, win, winSize, tierup, gptr, glen: guest.length, tierupCell, seedLen, ...cfg });
+          w.postMessage({ module, memory, win, winSize, tierup, gptr, glen: guest.length, tierupCell, seedLen, stream: !!onOutput, ...cfg });
         };
         // The run starts on a Worker of its own (the page can't Atomics.wait).
         const stackTop = ex.temen_par_alloc(STACK) + STACK;
@@ -217,9 +252,44 @@ export function makeRunner({ module, memory, ex }) {
       const tierups = counted ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, exit, started, tierups, childMems };
     } finally {
+      finished = true;
+      if (unlisten) unlisten();
       if (root) root.terminate();
-      if (signal && signal.aborted) for (const w of threads) w.terminate();
+      if (tornDown) for (const w of threads) w.terminate();
     }
+  };
+}
+
+// How long a stopped run may take to end before its Workers are torn down (`signal` above).
+const STOP_GRACE_MS = 5000;
+
+// `onOutput` for a run whose chunks arrive from several Workers: each is handed on once every chunk
+// numbered before it has been, so the stream reads as the run's buffers do. `end` hands on what the
+// buffers hold past what was handed on, the chunks still on their way included; any that come later
+// are dropped.
+export function outputInOrder(onOutput) {
+  const early = new Map();
+  const sent = [0, 0, 0]; // bytes handed on, by fd
+  let next = 1, over = false;
+  const give = (fd, bytes) => {
+    sent[fd] += bytes.length;
+    if (fd === 2) onOutput(new Uint8Array(0), bytes);
+    else onOutput(bytes, new Uint8Array(0));
+  };
+  return {
+    chunk(fd, seq, bytes) {
+      if (over) return;
+      early.set(seq, { fd, bytes });
+      for (let c; (c = early.get(next)); next++) {
+        early.delete(next);
+        give(c.fd, c.bytes);
+      }
+    },
+    end(out, err) {
+      over = true;
+      const rest = [out.subarray(sent[1]), err.subarray(sent[2])];
+      if (rest[0].length || rest[1].length) onOutput(rest[0], rest[1]);
+    },
   };
 }
 
@@ -235,8 +305,11 @@ export function readParStdout(eng) {
   return new TextDecoder().decode(readParStdoutBytes(eng));
 }
 // The on-ramp run's stderr (the shared host's, as the single-threaded on-ramp run returns it).
-export function readParStderr({ memory, ex }) {
+export function readParStderrBytes({ memory, ex }) {
   const len = ex.temen_par_stderr_len();
   const ptr = ex.temen_par_stderr_ptr();
-  return new TextDecoder().decode(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
+  return new Uint8Array(memory.buffer).slice(ptr, ptr + len);
+}
+export function readParStderr(eng) {
+  return new TextDecoder().decode(readParStderrBytes(eng));
 }

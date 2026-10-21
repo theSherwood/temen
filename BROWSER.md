@@ -216,7 +216,7 @@ no RO data is unaffected.
   mandatory at instantiation for *every* entry, so the first pass put the host-backed powerbox
   (`temen_run_live`: two fixed capabilities bridged to `temen_host.host_write`/`host_now_ns`) behind
   `--features live`, keeping the default build import-free. That is no longer the shape: the wasm32
-  build declares host imports unconditionally (`webgpu_op`, `stdout_chunk`, the `foreign_*` family),
+  build declares host imports unconditionally (`webgpu_op`, `stream_chunk`, the `foreign_*` family),
   every embedder already supplies them as stubs, and **`temen_jspb_*` binds *arbitrary* named
   capabilities to page functions** through one import — which subsumed the two hard-coded ones. The
   `live` feature and its entry are deleted (invariant 15: one path per behaviour); see the
@@ -405,8 +405,10 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   is `web/par.js`, extracted from `main.js` so the validation page and the playground drive the
   *same* machinery (a plain run now explicitly clears the last-published recipe via
   `temen_par_powerbox_none`, since a playground runs modes in any order). The window is sized from the
-  source's `memory N` declaration; Stop tears the Workers down (shared state may be wedged after —
-  the page says to reload). `browser-test.mjs` drives it like a human in Chromium: all five examples
+  source's `memory N` declaration. Stop ends the run through executor 2's own end path
+  (`temen_x2_stop`), so its Workers close as after any run and the engine runs the next program; only a
+  run that outlasts its stop has its Workers torn down. `browser-test.mjs` drives it like a human in
+  Chromium: all five examples
   (hello 14 + stdout, threads 4000, io 8 + 8×"tick\n", jit 1136, inst 40) plus a garbage-source
   parse-reject, all asserted.
 
@@ -719,11 +721,12 @@ in session discussion; collected here so the next slice has a home to be picked 
   sandbox children, *and* print — but not all in the same run. One combined recipe (a single `Host`
   granting `Stream(Out)` + `Jit` + `Instantiator`, seeded by entry arity like `powerbox_exec`) would
   make the playground's modes composable instead of either/or.
-- [ ] **Graceful stop / cooperative cancellation.** The playground's Stop terminates Workers
-  mid-run, which can wedge shared state (a held `Mutex<Host>`, the live-vCPU counter) — the page
-  currently just asks for a reload. A cooperative cancel (a run-wide stop flag in shared memory the
-  engine polls at its fuel/epoch check points, DESIGN.md §5) would let a stopped run leave the
-  instance reusable.
+- [x] **Graceful stop / cooperative cancellation** (#1414 S5a). `temen_x2_stop` asks the run to end
+  without waiting for it, as the page's main thread cannot block (`bytecode::RunStop`). The run ends as
+  one whose fuel ran out: a parked thread is woken for it, a running one leaves at its next look, and
+  emitted code at its next fuel check. The Workers then close as after any run, and the instance stays
+  reusable (`browser-x2-parity-test.mjs`). Only a run that outlasts the stop by `STOP_GRACE_MS` has its
+  Workers terminated, the old way.
 - [ ] **Run-wide fuel budget across Workers.** Fuel is per-vCPU today (a §14 spawn cuts the child's
   fuel from its parent's, up to a quota), but a run has no *aggregate* bound — 8 workers ×
   per-vCPU fuel is 8× the intended ceiling. A shared fuel pool (an atomic in shared linear memory,

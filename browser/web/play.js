@@ -1987,7 +1987,8 @@ function winSizeOf(src) {
 // Each demo renders as a self-contained card (its own editor + controls + output). The run functions
 // take that card's context `c`, so state never leaks between cards, and only one run is ever active at
 // a time (a fresh Run supersedes any running reactor). `eng`/`run` are the shared wasm engine; `broken`
-// latches when a threaded run is Stopped mid-flight (shared state may wedge → every card's Run disables).
+// latches when a threaded run outlasted its Stop and its Workers were torn down (shared state may wedge
+// → every card's Run disables).
 let eng, run, aborter = null, broken = false;
 let snapshotClient = null; // the snapshot worker (issue #804): owns warm-card sessions off the main thread
 let engineReady = false; // set once the wasm engine loads; gates the per-card Debug/Run enablement
@@ -4894,6 +4895,12 @@ async function runText(c) {
     winSize,
     signal: aborter.signal,
   };
+  // An I/O card's output shows as its threads write it.
+  if (mode === 'io') {
+    const dec = new TextDecoder();
+    c.el.stdout.textContent = '';
+    opts.onOutput = (out) => { c.el.stdout.textContent += dec.decode(out, { stream: true }); };
+  }
   const t0 = performance.now();
   try {
     const { value, started, tierups } = await run(guest, opts);
@@ -4909,11 +4916,12 @@ async function runText(c) {
     runEnd(rec, { ok: true, result: value });
   } catch (e) {
     if (e.message === 'stopped') {
-      // Workers were torn down mid-run; shared state (locks) may be wedged.
-      broken = true;
-      setState(c, 'stopped', 'stopped — reload the page to run again');
+      // A run that outlasted its Stop had its Workers torn down mid-run; shared state (locks) may be
+      // wedged. Any other stopped run ended as one does, and the engine runs the next.
+      broken = !!e.broken;
+      setState(c, 'stopped', broken ? 'stopped — reload the page to run again' : 'stopped');
       logTo(c, 'stopped by user');
-      for (const card of cards) { card.el.run.disabled = true; if (card.el.prove) card.el.prove.disabled = true; }
+      if (broken) for (const card of cards) { card.el.run.disabled = true; if (card.el.prove) card.el.prove.disabled = true; }
       runNote(rec, { stopped: true });
       runEnd(rec, { ok: false });
     } else {
