@@ -33843,13 +33843,6 @@ struct Mem {
     /// overwhelmingly common case — the per-byte path skips the address-space lock entirely and goes
     /// straight to `back`, since no page can be `Backed`. Shared with forked vCPUs.
     has_regions: Arc<AtomicBool>,
-    /// Set once the address space is **ever** mutated (`map`/`unmap`/`protect`, §13 region alias,
-    /// demand/supply paging, the NULL guard, read-only data) — monotonic, dirtied at the
-    /// [`Mem::space_write`] choke point. While clear, every in-prefix page is plain RW, which a fork
-    /// and a snapshot use to skip reading the map. (The access fast path is [`fast`](Mem::fast)'s:
-    /// the guard sets this in nearly every window.) Shared with the same topology as `space` (cloned
-    /// for a forked thread, fresh for a §14 child, which has its own address space).
-    prot_dirty: Arc<AtomicBool>,
     /// #1009 paged tier-up: a monotonic **page-map version**, bumped at the [`Mem::space_write`] choke
     /// point on every address-space mutation. A page-checked driver rebuilds its page-state table
     /// ([`build_pagestate_table`], `O(pages)`) only when this changes — between two tier-ups with no
@@ -33862,9 +33855,8 @@ struct Mem {
     /// pages from the NULL guard, and the span of its read-only ones. An access inside it needs
     /// neither the map nor its lock ([`Mem::in_fast_run`]). [`Mem::space_write`] empties it once it
     /// holds the lock, and its guard republishes it before releasing the lock, so it never covers a
-    /// page while that page changes. It may admit less than the map, never more. It replaces
-    /// `prot_dirty` as the fast-path gate, which the NULL guard set in every window. Shares
-    /// `space`'s topology.
+    /// page while that page changes. It may admit less than the map, never more. Shares `space`'s
+    /// topology (cloned for a forked thread, fresh for a §14 child, which has its own address space).
     fast: Arc<AtomicU64>,
     /// §14 fault-driven-yield side-channel: the confined address of the most recent **recoverable**
     /// page fault (an in-window access to an unmapped/read-only page — `check_prot` sets it,
@@ -34051,7 +34043,6 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
@@ -34128,7 +34119,6 @@ impl Mem {
             page,
             space: Arc::new(RwLock::new(AddrSpace::default())),
             has_regions: Arc::new(AtomicBool::new(false)),
-            prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
             refused_at: AtomicU64::new(NO_FAULT),
@@ -34148,13 +34138,10 @@ impl Mem {
         self.space.read_unpoisoned()
     }
     fn space_write(&self) -> SpaceWrite<'_> {
-        // Any address-space mutation (the only reason to take the write lock) marks the space ever
-        // mutated, monotonically. Set *before* acquiring the lock so a concurrent reader never
-        // observes a clear flag after a mutation has begun.
-        self.prot_dirty.store(true, Ordering::Release);
         // #1009: bump the page-map version — a paged tier-up driver reuses its page-state table
         // across events while this is unchanged (see the field). Bumped once per write-lock take
-        // (per `map`/`unmap`/`protect` op), before the mutation, same discipline as `prot_dirty`.
+        // (per `map`/`unmap`/`protect` op), before the mutation and the lock, so a concurrent reader
+        // never sees the old version once a mutation has begun.
         self.map_version.fetch_add(1, Ordering::Release);
         let space = self.space.write_unpoisoned();
         // #2577: no access takes the lock-free path while the map changes. The guard republishes
@@ -34253,7 +34240,6 @@ impl Mem {
             back: Arc::clone(&self.back),
             space: Arc::clone(&self.space),
             has_regions: Arc::clone(&self.has_regions),
-            prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
             fast: Arc::clone(&self.fast),
             last_fault: AtomicU64::new(NO_FAULT),
@@ -34280,34 +34266,31 @@ impl Mem {
         // original all-`Rw` restriction refused every personality-linked fork). An entry beyond
         // the mapped prefix stays fail-closed: its bytes are outside `window_snapshot`.
         let mapped_pages = self.window.mapped() / self.page;
+        if self.has_regions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let space = self.space_read();
+        let ok = space.regions.is_empty()
+            && space
+                .prot
+                .iter()
+                .all(|(_, p)| !matches!(p, PageProt::Backed { .. }));
+        if !ok {
+            return None;
+        }
         // #802 slice 4 — pages the guest `vm_map`-committed in the **reserved tail** (the on-ramp
         // waist malloc grows its heap there, so every malloc-using on-ramp program has them) are
         // per-domain memory a POSIX fork must duplicate: collected here for the page-wise copy
         // below. Plain `Rw`/`Ro` only; `Backed` still fails the whole fork closed (shared §13
         // bytes), and an `Unmapped` tail entry carries no bytes.
-        let mut tail_pages: Vec<u64> = Vec::new();
-        let prot_copy: BTreeMap<u64, PageProt> = if self.has_regions.load(Ordering::Relaxed) {
-            return None;
-        } else if !self.prot_dirty.load(Ordering::Acquire) {
-            BTreeMap::new() // never mutated ⇒ plain Rw throughout, nothing to clone
-        } else {
-            let space = self.space_read();
-            let ok = space.regions.is_empty()
-                && space
-                    .prot
-                    .iter()
-                    .all(|(_, p)| !matches!(p, PageProt::Backed { .. }));
-            if !ok {
-                return None;
-            }
-            tail_pages = space
-                .prot
-                .iter()
-                .filter(|(&pg, p)| pg >= mapped_pages && matches!(p, PageProt::Rw | PageProt::Ro))
-                .map(|(&pg, _)| pg)
-                .collect();
-            space.prot.clone()
-        };
+        let tail_pages: Vec<u64> = space
+            .prot
+            .iter()
+            .filter(|(&pg, p)| pg >= mapped_pages && matches!(p, PageProt::Rw | PageProt::Ro))
+            .map(|(&pg, _)| pg)
+            .collect();
+        let prot_copy = space.prot.clone();
+        drop(space);
         let reserved = self.window.reserved();
         let mapped = self.window.mapped();
         if reserved == 0 || !reserved.is_power_of_two() || !mapped.is_power_of_two() {
@@ -34463,11 +34446,6 @@ impl Mem {
     /// The admitted byte set as one bound `[0, H)`, whatever the backing holds
     /// ([`scalar_extent`](Mem::scalar_extent)'s shape test).
     fn admitted_prefix(&self) -> Option<u64> {
-        // Lock-free fast path: the address space has never been mutated, so the admitted set is
-        // the region default — exactly the mapped prefix.
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            return Some(self.window.mapped());
-        }
         let space = self.space_read();
         let mut high = self.window.mapped();
         // BTreeMap iteration is ascending, so a contiguous grown tail is consumed page-by-page at
@@ -34546,8 +34524,6 @@ impl Mem {
             };
             space.prot.insert(off / self.page, prot);
         }
-        drop(space);
-        self.prot_dirty.store(true, Ordering::Release);
     }
 
     /// The module-declared shadow arena ([`ShadowArena::EMPTY`] when it declared none).
@@ -34602,8 +34578,6 @@ impl Mem {
         for p in 0..guard.div_ceil(self.page) {
             space.prot.insert(p, PageProt::Unmapped);
         }
-        drop(space);
-        self.prot_dirty.store(true, Ordering::Release);
     }
 
     /// Record a pending recoverable page fault of the access starting at `base`, refused at `at`, and
@@ -35716,9 +35690,6 @@ impl Mem {
         if self.has_regions.load(Ordering::Relaxed) {
             return false;
         }
-        if !self.prot_dirty.load(Ordering::Acquire) {
-            return true; // never mutated ⇒ the prefix is plain Rw throughout
-        }
         let mapped_pages = self.window.mapped() / self.page;
         // The #1094 NULL guard marks pages `[0, null_guard)` `Unmapped` and dirties the prot map, but
         // it is a *deterministic* overlay re-seeded on every fresh window (`seed_null_guard`): a
@@ -35888,54 +35859,48 @@ impl Mem {
     /// ([`Host::realias_regions`]).
     fn restore_layout(&mut self, layout: &MemLayout) {
         let first = (layout.bytes.len() as u64).div_ceil(self.page);
-        // Install the captured map first, *replacing* whatever this window carries. The guard is only
-        // the fast-path one: a window with no explicit protections restoring an image that has none
-        // stays off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries
-        // the map is assigned outright — restoring into a **live** window (a reactor rewinding to an
-        // earlier moment) must drop the pages the guest has `map`-grown since, or they would survive
-        // as addressable memory the moment never had. A fresh window (the checkpoint ladder's target)
-        // has an empty map, so this is unchanged there. The layout may be in another page unit (a §12
-        // artifact's fixed 4 KiB, or a 16 KiB native capture); `rebased_to` is identity when they
-        // already agree. A `Backed` page is the host's to re-alias ([`Host::realias_regions`]), which
-        // installs its entry with the region it names.
-        if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
-            // Marks prot_dirty, matching the captured window.
-            let mut space = self.space_write();
-            // #2427 — a page a live window holds past the image that the layout does not rewrite whole
-            // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
-            // page it holds zero, or not at all, must not keep what the guest wrote there since the
-            // moment was taken. A fresh window holds nothing there.
-            let mut stale: Vec<(u64, u64)> = Vec::new();
-            for (&page, _) in self
-                .held_map(&space)
-                .range(first..)
-                .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
-            {
-                match stale.last_mut() {
-                    Some((_, end)) if *end == page => *end += 1,
-                    _ => stale.push((page, page + 1)),
-                }
-            }
-            space.prot = layout.map.rebased_to(self.page);
-            space
-                .prot
-                .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
-            // The NULL guard is this window's, not the layout's (#964): a layout captured where the
-            // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
-            // window does, and as the JIT's restore re-seeds it.
-            let guard = self.null_guard / self.page;
-            space
-                .prot
-                .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
-            drop(space);
-            for (lo, hi) in stale {
-                self.back.zero(lo * self.page, (hi - lo) * self.page);
+        // Install the captured map first, *replacing* whatever this window carries outright:
+        // restoring into a **live** window (a reactor rewinding to an earlier moment) must drop the
+        // pages the guest has `map`-grown since, or they would survive as addressable memory the
+        // moment never had. The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or
+        // a 16 KiB native capture); `rebased_to` is identity when they already agree. A `Backed` page
+        // is the host's to re-alias ([`Host::realias_regions`]), which installs its entry with the
+        // region it names.
+        let mut space = self.space_write();
+        // #2427 — a page a live window holds past the image that the layout does not rewrite whole
+        // is zeroed first, in runs: the layout writes only the pages it holds with contents, so a
+        // page it holds zero, or not at all, must not keep what the guest wrote there since the
+        // moment was taken. A fresh window holds nothing there.
+        let mut stale: Vec<(u64, u64)> = Vec::new();
+        for (&page, _) in self
+            .held_map(&space)
+            .range(first..)
+            .filter(|&(&page, p)| held_tail(p) && !layout.rewrites(page * self.page, self.page))
+        {
+            match stale.last_mut() {
+                Some((_, end)) if *end == page => *end += 1,
+                _ => stale.push((page, page + 1)),
             }
         }
+        space.prot = layout.map.rebased_to(self.page);
+        space
+            .prot
+            .retain(|_, p| !matches!(p, PageProt::Backed { .. }));
+        // The NULL guard is this window's, not the layout's (#964): a layout captured where the
+        // guard disengaged, on a host whose page is larger than it, still faults here as a fresh
+        // window does, and as the JIT's restore re-seeds it.
+        let guard = self.null_guard / self.page;
+        space
+            .prot
+            .extend((0..guard).map(|p| (p, PageProt::Unmapped)));
+        drop(space);
+        for (lo, hi) in stale {
+            self.back.zero(lo * self.page, (hi - lo) * self.page);
+        }
         // Then the image, straight into `back` (the mirror of the capture above and of `seed`). No page
-        // is `Backed` now (an alias dirties the map, so the map above replaced it), so every byte is
-        // the window's own: a region the live window aliased since the moment was taken keeps its
-        // bytes out of the restore (#2059). The prefix last overwrites what a fresh window seeded.
+        // is `Backed` now (the map above replaced every alias), so every byte is the window's own: a
+        // region the live window aliased since the moment was taken keeps its bytes out of the
+        // restore (#2059). The prefix last overwrites what a fresh window seeded.
         self.back.write_from(0, &layout.bytes);
         for (&off, bytes) in &layout.tail {
             self.back.write_from(off, bytes);
