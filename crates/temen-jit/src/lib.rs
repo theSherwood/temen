@@ -2054,10 +2054,9 @@ pub struct DurableRun {
     /// The thaw seed (empty on a freeze or an ordinary durable run).
     pub seed: DurableResidue,
     /// An async freeze controller (Phase-4 Slice A): a controller thread's
-    /// [`FreezeController::request_freeze`] lands mid-run. Its presence also engages the **concurrent**
-    /// durable path (§12.8 4A.5): a child spawned while `NORMAL` runs on its own OS thread with its own
-    /// reserved shadow context, so an async freeze reaches it in its own region — never the root's
-    /// (#1691: an async freeze without it unwound children into the root's region).
+    /// [`FreezeController::request_freeze`] lands mid-run. A child spawned while `NORMAL` runs on its
+    /// own OS thread with its own reserved shadow context, controller or not (#2543), so an async freeze
+    /// reaches it in its own region — never the root's (#1691).
     pub freeze: Option<Arc<FreezeController>>,
 }
 
@@ -2103,7 +2102,6 @@ pub fn compile_and_run_durable(
             tail: Vec::new(),
         });
         cm.set_durable(run.seed);
-        cm.concurrent_durable = run.freeze.is_some();
         cm.freeze_ctl = run.freeze;
         let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
         Ok((outcome, win, cm.take_durable_residue()))
@@ -2916,11 +2914,6 @@ pub struct CompiledModule {
     /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
     /// that declared none, which a durable run refuses at entry rather than placing by default.
     shadow: temen_ir::durable_abi::ShadowArena,
-    /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
-    /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
-    /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
-    /// entry; `false` everywhere else, so those paths are byte-identical.
-    concurrent_durable: bool,
     /// Durable **thaw** seed (slice 3.3.3): frozen fibers to re-create in the table before a
     /// `REWINDING` run, so a thaw `cont.resume` re-enters them. Empty for a freeze / ordinary run.
     frozen_seed: Vec<FrozenFiber>,
@@ -4001,7 +3994,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4309,7 +4301,6 @@ impl CompiledModule {
             tail_out: Vec::new(),
             durable: false,
             shadow: self.shadow,
-            concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
             frozen_vcpus_out: Vec::new(),
@@ -4901,14 +4892,6 @@ impl CompiledModule {
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
         durable_shadow::seed((*this).shadow.region_base(0));
-        // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
-        // root may `thread.spawn` children) so each child reserves its own shadow context.
-        #[cfg(fiber_rt)]
-        if (*this).concurrent_durable {
-            if let Some(d) = &(*this).domain {
-                d.engage_concurrent_durable();
-            }
-        }
         // Phase-4 Slice A (4A.3): publish the live window base for an async controller right before the
         // guarded call (the guest is about to block in its loop), and retire it right after — so a
         // `request_freeze` can only ever store into the window while it is mapped (freed below).
@@ -7386,7 +7369,6 @@ fn compile_child_windowed(
         restore: None,
         tail_out: Vec::new(),
         durable: false,
-        concurrent_durable: false,
         frozen_seed: Vec::new(),
         frozen_out: Vec::new(),
         frozen_vcpus_out: Vec::new(),

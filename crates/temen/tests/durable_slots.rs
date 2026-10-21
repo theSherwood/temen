@@ -814,3 +814,52 @@ fn chains_deeper_than_a_default_region_freeze_in_wider_regions() {
         assert!(depth(root, 0) > DEFAULT_SHADOW_STRIDE, "{engine:?}: root");
     }
 }
+
+/// The root stores its clock handle, spawns B (func 2: the clock + 10) and joins it, then adds its own
+/// clock read. `END` is the end of its arena.
+const SPAWNS_B: &str = r#"memory 17 shadow 16448 END
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 65536
+  i32.store v1 v0
+  v2 = i64.const 0
+  v3 = thread.spawn 2 v2 v2
+  v4 = thread.join v3
+  v5 = i32.const 0
+  v6 = call.cap 2 0 (i32) -> (i64) v0 (v5)
+  v7 = i64.add v4 v6
+  return v7
+  }
+}
+"#;
+
+/// #2543 — a spawned vCPU of a durable domain takes a shadow context of its own on every engine: an
+/// arena with room for the root alone refuses the spawn (`ThreadFault`), and one with a second region
+/// runs it. The JIT used to run such a spawn with no context of its own whenever its run had no freeze
+/// controller.
+#[test]
+fn a_durable_spawn_takes_a_context_of_its_own_on_every_engine() {
+    for (regions, want) in [(1, None), (2, Some(42 + 10 + 43))] {
+        let end = 16448 + regions * DEFAULT_SHADOW_STRIDE;
+        let inst = instrument(&format!(
+            "{}{THREADS}",
+            SPAWNS_B.replace("END", &end.to_string())
+        ));
+        for &engine in ARMED_ENGINES {
+            let fresh = init_durable_window(WINDOW, arena(&inst));
+            let Some(ran) = run(engine, &inst, &fresh, 42, None) else {
+                continue;
+            };
+            match want {
+                Some(v) => assert_eq!(ran.result, Ok(v), "{engine:?}: {regions} regions"),
+                None => assert!(
+                    ran.result
+                        .as_ref()
+                        .is_err_and(|e| e.contains("ThreadFault")),
+                    "{engine:?}: {regions} region: {:?}",
+                    ran.result
+                ),
+            }
+        }
+    }
+}
