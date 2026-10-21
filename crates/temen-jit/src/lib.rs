@@ -2724,7 +2724,7 @@ mod domain_teardown_tests {
 
     /// #2498 — the root's `exit` survives a sibling's host call that answers after teardown: the
     /// call wipes the trap cell that held the exit, and the sibling then returns, so no poll puts
-    /// it back. Teardown recorded the exit in the stop word, which the run's outcome reads.
+    /// it back. The run's outcome is the exit teardown recorded (#2499).
     #[test]
     fn root_exit_survives_a_sibling_host_call_that_wiped_the_trap_cell_after_teardown() {
         let src = format!(
@@ -2739,6 +2739,60 @@ mod domain_teardown_tests {
         match run_in_flight(src) {
             JitOutcome::Exited(code) => assert_eq!(code, 3),
             other => panic!("expected Exited(3), got {other:?}"),
+        }
+    }
+
+    /// #2499 — what a sibling does once the root has returned is unobservable (invariant 6): its
+    /// trap after teardown leaves the run the root's result. The host call that answers after
+    /// teardown wipes the cell, so the sibling runs on to its `unreachable`, whose store the run's
+    /// outcome read took for the end.
+    #[test]
+    fn a_sibling_trap_after_the_root_returned_leaves_the_roots_result() {
+        let src = format!(
+            "{}{}",
+            root_then("i64", "v6 = i64.const 42\n  return v6"),
+            sibling_calls(2, "unreachable", "")
+        );
+        match run_in_flight(src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// #2499 — and its fault: the runtime records a sibling's `MemoryFault` as it unwinds, which the
+    /// outcome read took for the end too.
+    #[test]
+    fn a_sibling_fault_after_the_root_returned_leaves_the_roots_result() {
+        let src = format!(
+            "{}{}",
+            root_then("i64", "v6 = i64.const 42\n  return v6"),
+            sibling_calls(2, "v6 = i64.const 0\n  v7 = i64.load v6\n  return v7", "")
+        );
+        match run_in_flight(src) {
+            JitOutcome::Returned(r) => assert_eq!(r, vec![42]),
+            other => panic!("expected Returned([42]), got {other:?}"),
+        }
+    }
+
+    /// #2499 — the root's own fault is what ends its domain: the run reports it, with a sibling
+    /// still parked.
+    #[test]
+    fn a_root_fault_ends_its_domain_with_the_fault() {
+        let src = format!(
+            "memory 16\n\
+             func () -> (i64) {{\n\
+             block 0 () {{\n\
+             \x20 v0 = i64.const 0\n\
+             \x20 v1 = thread.spawn 1 v0 v0\n\
+             \x20 v2 = i64.load v0\n\
+             \x20 return v2\n\
+               }}\n\
+             }}\n\
+             {PARKED_DAEMON}"
+        );
+        match run_promptly(&src) {
+            JitOutcome::Trapped(k) => assert_eq!(k, TrapKind::MemoryFault),
+            other => panic!("expected Trapped(MemoryFault), got {other:?}"),
         }
     }
 }
@@ -5073,7 +5127,17 @@ impl CompiledModule {
                 (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
             (*this).detached_out = n.join_children(froze);
         }
-        // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
+        // A caught guard fault is detect-and-kill (§5): the root's `MemoryFault` is what ends its
+        // domain, so it is in the cell before teardown records the end (#2499).
+        if faulted {
+            trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
+        }
+        // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it. What
+        // ended the domain, as its teardown recorded it, is the run's outcome (#2499).
+        #[cfg(fiber_rt)]
+        let mut ended = None;
+        #[cfg(not(fiber_rt))]
+        let ended: Option<i64> = None;
         #[cfg(fiber_rt)]
         if let Some(d) = &(*this).domain {
             // Owner decision 2026-07-24 — domain teardown (DESIGN.md §12; ISSUES.md I37; D37
@@ -5087,7 +5151,7 @@ impl CompiledModule {
             // freeze re-issue machinery (the sentinel is skipped so their residue is recorded).
             let freezing =
                 (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
-            d.begin_teardown(freezing);
+            ended = d.begin_teardown(freezing);
             d.join_all(true);
             // §12.8 4A.5 stage (ii): concurrent durable children self-unwound into their own regions
             // and recorded their `FrozenVCpu` residue before their OS threads ended; `join_all` is the
@@ -5124,11 +5188,6 @@ impl CompiledModule {
         let worker_trap_cap = (*this).domain.as_ref().and_then(|d| d.take_trap_capture());
         #[cfg(not(fiber_rt))]
         let worker_trap_cap: Option<(usize, Vec<usize>, i64)> = None;
-        // A caught guard fault is detect-and-kill (§5): report MemoryFault to the host. All vCPUs are
-        // joined by now (`join_all` above), so this store no longer races; Relaxed is fine.
-        if faulted {
-            trap_cell.store(mem::FAULT_TRAP, Ordering::Relaxed);
-        }
         // Snapshot the in-window bytes when asked (the escape-oracle; a reactor's state). #2176: a run
         // that asks for none copies nothing — a copy of a 32 MiB window is a page fault per page, for
         // bytes no one reads.
@@ -5173,11 +5232,18 @@ impl CompiledModule {
         // `*this` for the next `run` / `define_extra` / drop.
         drop(window);
 
+        // What ended the run: its domain's teardown record, else the trap cell. Post-`join_all`, so the
+        // load sees the last store (the join is a synchronization point); Relaxed suffices.
+        let cell = ended.unwrap_or_else(|| trap_cell.load(Ordering::Relaxed));
+        let code = cell as u32;
+
         // Publish the trap-time backtrace + fiber for `last_trap_backtrace`/`last_trap_fiber`: the root
         // vCPU's own capture if it trapped, else a spawned vCPU's (Stage 3). The fiber handle (§23-D57)
         // rides along, captured at the trap instant. Symbolizing is pure (reads the address map), so it
-        // is fine here after teardown. Reset on a clean run (every successful run resets both).
-        match root_trap_cap.or(worker_trap_cap) {
+        // is fine here after teardown. Reset on a clean run (every successful run resets both), and on
+        // one that did not end in a trap: a sibling's capture from after teardown is no outcome's.
+        let trapped = TrapKind::from_code(code).is_some();
+        match root_trap_cap.or(worker_trap_cap).filter(|_| trapped) {
             Some((pc, rets, fiber)) => {
                 (*this).last_trap_backtrace = (*this).trap_backtrace(pc, &rets);
                 (*this).last_trap_fiber = Some(fiber);
@@ -5188,14 +5254,6 @@ impl CompiledModule {
             }
         };
 
-        // Post-`join_all` read: every vCPU has finished, so this load sees the last store (the join is a
-        // synchronization point); Relaxed suffices. A cell a sibling's host call wiped after teardown
-        // falls back to the stop word, where teardown recorded what ended the domain (#2498).
-        let cell = match trap_cell.load(Ordering::Relaxed) {
-            0 => vm.stop.load(Ordering::Relaxed),
-            cell => cell,
-        };
-        let code = cell as u32;
         let outcome = if code == 0 || code == DOMAIN_DONE_CODE {
             // `DOMAIN_DONE_CODE` is the internal root-completed teardown sentinel (owner decision
             // 2026-07-24): the root returned cleanly and the sentinel only unwound leftover sibling

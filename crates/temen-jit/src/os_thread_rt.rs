@@ -1276,12 +1276,16 @@ impl Domain {
     /// it also goes in the stop word, which no host call resets. Then wake every parked vCPU so it
     /// observes the end and unwinds instead of waiting forever.
     ///
+    /// Returns what ended the domain: the run's outcome (#2499). What a sibling stores after this is
+    /// unobservable (invariant 6), so the run never reads the cell again for it.
+    ///
     /// `freezing` (a durable **freeze**: the root unwound under `UNWINDING`) is *not* teardown —
     /// the sentinel is skipped so parked siblings park-and-unwind through the freeze re-issue
     /// machinery and the deferred/concurrent children record their residue; the wake is still
-    /// issued (a parked waiter returns on observing `UNWINDING`, as before, just promptly).
-    pub(crate) fn begin_teardown(&self, freezing: bool) {
-        if !freezing {
+    /// issued (a parked waiter returns on observing `UNWINDING`, as before, just promptly), and
+    /// nothing is returned.
+    pub(crate) fn begin_teardown(&self, freezing: bool) -> Option<i64> {
+        let ended = (!freezing).then(|| {
             let env = self.env();
             // SAFETY: `trap_out` is the run's live instance context (its field 0 the trap cell),
             // valid until run teardown.
@@ -1298,8 +1302,10 @@ impl Domain {
             let _ = vm
                 .stop
                 .compare_exchange(0, ended, Ordering::Relaxed, Ordering::Relaxed);
-        }
+            ended
+        });
         self.wake_all_parked();
+        ended
     }
 
     /// Wake every parked vCPU in this domain so it re-evaluates its park predicate: the futex
